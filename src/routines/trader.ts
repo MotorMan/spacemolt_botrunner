@@ -1104,6 +1104,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         if (remaining > 0) {
           ctx.log("trade", `Sold ${sold}x but ${remaining}x ${route.itemName} still unsold — buyer demand exhausted`);
         }
+        // Refresh dest market cache with real post-sale data
+        await recordMarketData(ctx);
       } else {
         ctx.log("error", `Sell failed: ${sellResp.error.message}`);
       }

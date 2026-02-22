@@ -524,9 +524,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         yield "withdraw_faction";
         await ensureDocked(ctx);
 
-        // Clear cargo: keep fuel cells scaled to route length, cap at 25% cargo
-        const maxFuelFC = bot.cargoMax > 0 ? Math.floor(bot.cargoMax * 0.25) : 10;
-        const RESERVE_FC = Math.min(Math.max(3, candidate.jumps), maxFuelFC);
+        // Emergency fuel reserve — 1 cell per 4 jumps, min 3, max 10% cargo
+        const maxFuelFC = bot.cargoMax > 0 ? Math.max(3, Math.floor(bot.cargoMax * 0.1)) : 5;
+        const RESERVE_FC = Math.min(Math.max(3, Math.ceil(candidate.jumps / 4)), maxFuelFC);
         await bot.refreshCargo();
         for (const item of [...bot.inventory]) {
           if (item.quantity <= 0) continue;
@@ -718,9 +718,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
-      // Scale fuel reserve with route length — cap at 25% of cargo so trade goods fit
-      const maxFuelSlots = bot.cargoMax > 0 ? Math.floor(bot.cargoMax * 0.25) : 10;
-      const RESERVE_FUEL_CELLS = Math.min(Math.max(3, candidate.jumps), maxFuelSlots);
+      // Emergency fuel reserve — ship starts fully fueled, ensureFueled docks at
+      // stations along the route. Cells are only for systems with no station.
+      // ~1 cell per 4 jumps is plenty, min 3, max 10% of cargo.
+      const maxFuelSlots = bot.cargoMax > 0 ? Math.max(3, Math.floor(bot.cargoMax * 0.1)) : 5;
+      const RESERVE_FUEL_CELLS = Math.min(Math.max(3, Math.ceil(candidate.jumps / 4)), maxFuelSlots);
 
       // Clear cargo: keep fuel cells + trade item, deposit everything else
       await bot.refreshCargo();

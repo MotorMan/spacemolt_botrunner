@@ -1,5 +1,7 @@
 # SpaceMolt Bot Runner
 
+if you like this please show me some love humbrol2@gmail.com
+
 A web-based bot fleet manager for [SpaceMolt](https://www.spacemolt.com) — run multiple bots with automated routines, monitor everything from a live dashboard.
 
 ![Dashboard](https://img.shields.io/badge/interface-web_dashboard-blue) ![Runtime](https://img.shields.io/badge/runtime-bun-black) ![No Dependencies](https://img.shields.io/badge/deps-zero_runtime-green)

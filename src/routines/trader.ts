@@ -736,6 +736,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           buyQty = totalSold;
           investedCredits = totalSold * candidate.buyPrice;
           alreadySold = true; // items already sold in batch loop
+          mapStore.reserveTradeQuantity("", "", candidate.destSystem, candidate.destPoi, candidate.itemId, totalSold);
           ctx.log("trade", `In-station faction sale complete: ${totalSold}x ${candidate.itemName}`);
           break;
         }
@@ -770,6 +771,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         route = candidate;
         buyQty = qty;
         investedCredits = qty * candidate.buyPrice; // material cost basis
+        mapStore.reserveTradeQuantity("", "", candidate.destSystem, candidate.destPoi, candidate.itemId, qty);
         ctx.log("trade", `Withdrew ${qty}x ${candidate.itemName} from faction storage (material cost: ${investedCredits}cr)`);
         break;
       }
@@ -932,6 +934,13 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       if (qty > 0) {
         ctx.log("trade", `Purchased ${qty}x ${candidate.itemName} for ${investedCredits}cr${alreadyHave > 0 ? ` (+${alreadyHave}x already in cargo)` : ""}`);
       }
+
+      // Reserve this trade in cached market data so other bots don't chase the same route
+      mapStore.reserveTradeQuantity(
+        candidate.sourceSystem, candidate.sourcePoi,
+        candidate.destSystem, candidate.destPoi,
+        candidate.itemId, buyQty,
+      );
       break;
     }
 

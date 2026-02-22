@@ -316,6 +316,38 @@ class MapStore {
     if (poi.market.length < before) this.scheduleSave();
   }
 
+  /** Reduce cached market quantities when a bot commits to a trade route.
+   *  Decrements sell_quantity at source (fewer items for sale) and
+   *  buy_quantity at dest (less demand to fill). Prevents other bots
+   *  from chasing the same trade. */
+  reserveTradeQuantity(
+    sourceSystem: string, sourcePoi: string,
+    destSystem: string, destPoi: string,
+    itemId: string, quantity: number,
+  ): void {
+    // Reduce supply at source
+    const srcSys = this.data.systems[sourceSystem];
+    if (srcSys) {
+      const srcStation = srcSys.pois.find(p => p.id === sourcePoi);
+      const srcItem = srcStation?.market.find(m => m.item_id === itemId);
+      if (srcItem) {
+        srcItem.sell_quantity = Math.max(0, srcItem.sell_quantity - quantity);
+        if (srcItem.sell_quantity === 0) srcItem.best_sell = null;
+      }
+    }
+    // Reduce demand at dest
+    const dstSys = this.data.systems[destSystem];
+    if (dstSys) {
+      const dstStation = dstSys.pois.find(p => p.id === destPoi);
+      const dstItem = dstStation?.market.find(m => m.item_id === itemId);
+      if (dstItem) {
+        dstItem.buy_quantity = Math.max(0, dstItem.buy_quantity - quantity);
+        if (dstItem.buy_quantity === 0) dstItem.best_buy = null;
+      }
+    }
+    this.scheduleSave();
+  }
+
   /** Update player buy/sell orders at a station POI. */
   updateOrders(systemId: string, poiId: string, orders: Array<Record<string, unknown>>): void {
     const sys = this.data.systems[systemId];

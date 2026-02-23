@@ -252,13 +252,21 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   const depletedSystems = new Set<string>();
   let lastTargetOre = "";
 
-  // ── Startup: dump non-fuel cargo to storage so we mine with a clean hold ──
+  // ── Startup: return home and dump non-fuel cargo to storage ──
   await bot.refreshCargo();
   const nonFuelCargo = bot.inventory.filter(i => {
     const lower = i.itemId.toLowerCase();
     return !lower.includes("fuel") && !lower.includes("energy_cell") && i.quantity > 0;
   });
   if (nonFuelCargo.length > 0) {
+    // Navigate to home system first so deposits go to the right station
+    if (bot.system !== homeSystem && homeSystem) {
+      ctx.log("mining", `Startup: returning to home system ${homeSystem} to deposit cargo...`);
+      const fueled = await ensureFueled(ctx, 50);
+      if (fueled) {
+        await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 50, hullThresholdPct: 30 });
+      }
+    }
     await ensureDocked(ctx);
     const settings0 = getMinerSettings(bot.username);
     for (const item of nonFuelCargo) {
@@ -272,7 +280,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
     const names = nonFuelCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
-    ctx.log("mining", `Startup: deposited ${names} — clearing cargo for mining`);
+    ctx.log("mining", `Startup: deposited ${names} — cargo clear for mining`);
   }
 
   while (bot.state === "running") {

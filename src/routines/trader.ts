@@ -581,6 +581,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             listings.filter(l => ((l.buy_price as number) || 0) > 0).map(l => l.item_id as string)
           );
 
+          const soldFromStorage: string[] = [];
           for (const item of bot.storage) {
             if (item.quantity <= 0) continue;
             const lower = item.itemId.toLowerCase();
@@ -597,19 +598,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             if (wResp.error) continue;
             const sResp = await bot.exec("sell", { item_id: item.itemId, quantity: qty });
             if (!sResp.error) {
-              ctx.log("trade", `Sold ${qty}x ${item.name} from station storage`);
+              soldFromStorage.push(`${qty}x ${item.name}`);
             } else {
               await bot.exec("deposit_items", { item_id: item.itemId, quantity: qty });
             }
           }
+          await bot.refreshStatus();
+          const storageRevenue = Math.max(0, bot.credits - storageSellCredits);
+          if (soldFromStorage.length > 0) {
+            ctx.log("trade", `Sold from station storage: ${soldFromStorage.join(", ")} — earned ${storageRevenue}cr`);
+          }
+          extraRevenue += storageRevenue;
         }
       }
-      await bot.refreshStatus();
-      const storageRevenue = Math.max(0, bot.credits - storageSellCredits);
-      if (storageRevenue > 0) {
-        ctx.log("trade", `Station storage sales earned ${storageRevenue}cr`);
-      }
-      extraRevenue += storageRevenue;
     }
 
     // ── Priority 3: Find new trade opportunities ──

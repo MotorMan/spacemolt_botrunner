@@ -163,6 +163,21 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     await tryRefuel(ctx);
     await repairShip(ctx);
 
+    // ── Clear cargo before planning (dump non-fuel items to faction storage) ──
+    yield "clear_cargo";
+    await bot.refreshCargo();
+    if (bot.inventory.length > 0) {
+      for (const item of [...bot.inventory]) {
+        if (item.quantity <= 0) continue;
+        const lower = item.itemId.toLowerCase();
+        if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+        const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+        if (fResp.error) {
+          await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+        }
+      }
+    }
+
     // ── Find sell routes from faction storage ──
     yield "find_sales";
     await bot.refreshFactionStorage();
@@ -190,15 +205,27 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         await bot.refreshStatus();
         const freeSpace = getFreeSpace(bot);
         if (freeSpace <= 0) {
-          // Sell what we have first
           await bot.refreshCargo();
+          // First try to sell the trade item we already have
           const inCargo = bot.inventory.find(i => i.itemId === route.itemId);
           if (inCargo && inCargo.quantity > 0) {
             await bot.exec("sell", { item_id: route.itemId, quantity: inCargo.quantity });
             totalSold += inCargo.quantity;
-          } else {
-            break;
+            continue;
           }
+          // Cargo full of other items — dump non-fuel items to faction storage
+          let freed = false;
+          for (const item of [...bot.inventory]) {
+            if (item.quantity <= 0) continue;
+            const lower = item.itemId.toLowerCase();
+            if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+            const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+            if (fResp.error) {
+              await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+            }
+            freed = true;
+          }
+          if (!freed) break;
           continue;
         }
 
@@ -240,14 +267,25 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       yield "withdraw_faction";
       await ensureDocked(ctx);
 
-      // Clear non-fuel cargo to make room
+      // Clear non-fuel cargo to make room — deposit back to faction storage (fallback: station)
       await bot.refreshCargo();
-      for (const item of [...bot.inventory]) {
-        if (item.quantity <= 0) continue;
-        const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-        await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+      if (bot.inventory.length > 0) {
+        const deposited: string[] = [];
+        for (const item of [...bot.inventory]) {
+          if (item.quantity <= 0) continue;
+          const lower = item.itemId.toLowerCase();
+          if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+          const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+          if (fResp.error) {
+            await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+          }
+          deposited.push(`${item.quantity}x ${item.name}`);
+        }
+        if (deposited.length > 0) {
+          ctx.log("trade", `Cleared cargo: ${deposited.join(", ")} → faction storage`);
+        }
       }
+      await bot.refreshCargo();
       await bot.refreshStatus();
 
       const freeSpace = getFreeSpace(bot);

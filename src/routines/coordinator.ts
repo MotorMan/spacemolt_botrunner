@@ -9,6 +9,7 @@ import {
   writeSettings,
   sleep,
   logFactionActivity,
+  isOreBeltPoi,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -431,9 +432,14 @@ function computeOreQuotas(
 
     const rawMaterials = flattenToRawMaterials(recipe, recipeIndex);
     for (const [itemId, qtyPerBatch] of rawMaterials) {
-      // Only include items that are minable ores
+      // Only include items that are minable at ore belts (not ice fields or gas clouds)
       const oreLocations = mapStore.findOreLocations(itemId);
-      if (oreLocations.length > 0) {
+      const oreBeltLocations = oreLocations.filter(loc => {
+        const sys = mapStore.getSystem(loc.systemId);
+        const poi = sys?.pois.find(p => p.id === loc.poiId);
+        return poi ? isOreBeltPoi(poi.type) : false;
+      });
+      if (oreBeltLocations.length > 0) {
         oreNeeds[itemId] = (oreNeeds[itemId] || 0) + qtyPerBatch * limit;
       }
     }

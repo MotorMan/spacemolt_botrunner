@@ -113,6 +113,14 @@ function pickTargetOre(
 
   for (const [oreId, target] of Object.entries(oreQuotas)) {
     if (target <= 0) continue;
+    // Safety: skip ores with no known ore belt locations (ice/gas ores)
+    const locs = mapStore.findOreLocations(oreId);
+    const hasOreBelt = locs.some(loc => {
+      const sys = mapStore.getSystem(loc.systemId);
+      const poi = sys?.pois.find(p => p.id === loc.poiId);
+      return poi ? isOreBeltPoi(poi.type) : false;
+    });
+    if (locs.length > 0 && !hasOreBelt) continue;
     const current = factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
     const deficit = target - current;
     const baseValue = catalogStore.getItem(oreId)?.base_value as number || 0;

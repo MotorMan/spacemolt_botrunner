@@ -533,6 +533,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       return !lower.includes("fuel") && !lower.includes("energy_cell");
     });
 
+    // Track items sold locally so we don't plan routes to sell them here again
+    const soldLocallyIds = new Set<string>();
+
     if (cargoToSell.length > 0 && bot.docked) {
       const soldHere: string[] = [];
       const unsold: Array<{ itemId: string; name: string; quantity: number }> = [];
@@ -541,6 +544,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const sResp = await bot.exec("sell", { item_id: item.itemId, quantity: item.quantity });
         if (!sResp.error) {
           soldHere.push(`${item.quantity}x ${item.name}`);
+          soldLocallyIds.add(item.itemId);
         } else {
           unsold.push(item);
         }
@@ -636,8 +640,14 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const cargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
     const marketRoutes = findTradeOpportunities(settings, bot.system, cargoCapacity);
     const factionRoutes = findFactionStorageRoutes(ctx, settings, bot.system, cargoCapacity);
+    // Filter out routes that sell items we just sold at the current station (demand already filled)
+    const currentPoi = bot.poi;
+    const allRoutes = [...cargoRoutes, ...marketRoutes, ...factionRoutes].filter(r => {
+      if (soldLocallyIds.has(r.itemId) && r.destSystem === bot.system && r.destPoi === currentPoi) return false;
+      return true;
+    });
     // Cargo routes first (already have the goods), then by profit
-    let routes = [...cargoRoutes, ...marketRoutes, ...factionRoutes].sort((a, b) => {
+    let routes = allRoutes.sort((a, b) => {
       // Cargo routes get priority — sort them first, then by profit
       const aIsCargo = a.sourcePoi === "cargo" ? 1 : 0;
       const bIsCargo = b.sourcePoi === "cargo" ? 1 : 0;

@@ -205,6 +205,24 @@ class CatalogStore {
     };
   }
 
+  /** Check if an item appears as a component in any crafting recipe. */
+  isCraftingComponent(itemId: string): boolean {
+    for (const recipe of Object.values(this.data.recipes)) {
+      if (!recipe.components) continue;
+      if (recipe.components.some(c => c.item_id === itemId)) return true;
+    }
+    return false;
+  }
+
+  /** Check if an item is the output of any crafting recipe. */
+  isCraftedItem(itemId: string): boolean {
+    for (const recipe of Object.values(this.data.recipes)) {
+      const outputId = (recipe as Record<string, unknown>).output_item_id as string | undefined;
+      if (outputId === itemId) return true;
+    }
+    return false;
+  }
+
   /** Summary string for logging. */
   getSummary(): string {
     return `${Object.keys(this.data.items).length} items, ${Object.keys(this.data.ships).length} ships, ${Object.keys(this.data.skills).length} skills, ${Object.keys(this.data.recipes).length} recipes`;

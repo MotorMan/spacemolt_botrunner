@@ -12,6 +12,10 @@ import {
   getSystemInfo,
   findStation,
   factionDonateProfit,
+  ensureInsured,
+  detectAndRecoverFromDeath,
+  getModProfile,
+  ensureModsFitted,
   maxItemsForCargo,
   readSettings,
   sleep,
@@ -34,6 +38,8 @@ function getTraderSettings(username?: string): {
   homeSystem: string;
   tradeItems: string[];
   autoInsure: boolean;
+  stationPriority: boolean;
+  autoCloak: boolean;
 } {
   const all = readSettings();
   const t = all.trader || {};
@@ -47,6 +53,8 @@ function getTraderSettings(username?: string): {
     homeSystem: (botOverrides.homeSystem as string) || (t.homeSystem as string) || "",
     tradeItems: Array.isArray(t.tradeItems) ? (t.tradeItems as string[]) : [],
     autoInsure: (t.autoInsure as boolean) !== false,
+    stationPriority: (botOverrides.stationPriority as boolean) || false,
+    autoCloak: (t.autoCloak as boolean) ?? false,
   };
 }
 
@@ -230,55 +238,6 @@ function findFactionStorageRoutes(
   return routes;
 }
 
-// ── Market analysis ──────────────────────────────────────────
-
-/** Call analyze_market and log top insight. Builds trading XP. Must be docked. */
-async function analyzeMarket(ctx: RoutineContext): Promise<void> {
-  const { bot } = ctx;
-  const resp = await bot.exec("analyze_market", { mode: "overview" });
-  if (!resp.error && resp.result && typeof resp.result === "object") {
-    const r = resp.result as Record<string, unknown>;
-    const insights = r.top_insights as Array<Record<string, unknown>> | undefined;
-    if (Array.isArray(insights) && insights.length > 0) {
-      const top = insights[0];
-      ctx.log("trade", `Market intel: ${(top.message as string) ?? (top.category as string) ?? "no insights"}`);
-    }
-  }
-}
-
-// ── Insurance ────────────────────────────────────────────────
-
-/**
- * Buy ship insurance if not already covered and cargo value justifies it.
- * Should be called while docked at source, after loading trade goods.
- */
-async function tryInsureShip(ctx: RoutineContext, cargoValue: number): Promise<void> {
-  const { bot } = ctx;
-
-  if (cargoValue <= 0) return;
-
-  // Get a quote — also tells us if we already have coverage
-  const quoteResp = await bot.exec("get_insurance_quote");
-  if (quoteResp.error || !quoteResp.result) return;
-
-  const qr = quoteResp.result as Record<string, unknown>;
-  const quoteObj = (qr.quote as Record<string, unknown>) ?? qr;
-  const premium = (quoteObj.premium as number) ?? 0;
-
-  // Already insured?
-  const insured = (quoteObj.insured as boolean) ?? (qr.insured as boolean) ?? false;
-  if (insured) return;
-
-  // Only insure if we can comfortably afford it
-  if (!premium || premium > cargoValue * 0.1 || bot.credits < premium * 3) return;
-
-  const insureResp = await bot.exec("buy_insurance");
-  if (!insureResp.error) {
-    ctx.log("trade", `Insured ship for trade run (premium: ${premium}cr, cargo value: ~${cargoValue}cr)`);
-    await bot.refreshStatus();
-  }
-}
-
 // ── Missions ─────────────────────────────────────────────────
 
 /**
@@ -460,25 +419,30 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
   const startSystem = bot.system;
 
   while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await sleep(30000); continue; }
+
     const settings = getTraderSettings(bot.username);
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
     };
 
-    // ── Ensure docked, collect storage, record market ──
+    // ── Ensure docked (also records market data + analyzes market) ──
     yield "dock";
     await ensureDocked(ctx);
     if (bot.docked) {
-      await recordMarketData(ctx);
-      await analyzeMarket(ctx);
       await tryMissions(ctx);
     }
 
-    // ── Fuel + hull check ──
+    // ── Fuel + hull check + mods ──
     yield "maintenance";
     await tryRefuel(ctx);
     await repairShip(ctx);
+    const modProfile = getModProfile("trader");
+    if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
 
     // ── Priority 1: Sell any non-fuel items already in cargo ──
     yield "sell_cargo";
@@ -610,10 +574,23 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const cargoCapacity = bot.cargoMax > 0 ? bot.cargoMax : 50;
     const marketRoutes = findTradeOpportunities(settings, bot.system, cargoCapacity);
     const factionRoutes = findFactionStorageRoutes(ctx, settings, bot.system, cargoCapacity);
-    const routes = [...marketRoutes, ...factionRoutes].sort((a, b) => b.totalProfit - a.totalProfit);
+    let routes = [...marketRoutes, ...factionRoutes].sort((a, b) => b.totalProfit - a.totalProfit);
 
     if (factionRoutes.length > 0) {
       ctx.log("trade", `Found ${marketRoutes.length} market routes + ${factionRoutes.length} faction storage routes`);
+    }
+
+    // Station priority: put routes whose destination is the home station first
+    if (settings.stationPriority && settings.homeSystem) {
+      const homeStation = mapStore.findNearestStation(settings.homeSystem);
+      if (homeStation) {
+        const homeRoutes = routes.filter(r => r.destSystem === settings.homeSystem && r.destPoi === homeStation.id);
+        const otherRoutes = routes.filter(r => !(r.destSystem === settings.homeSystem && r.destPoi === homeStation.id));
+        if (homeRoutes.length > 0) {
+          routes = [...homeRoutes, ...otherRoutes];
+          ctx.log("trade", `Station priority: ${homeRoutes.length} route(s) to home station`);
+        }
+      }
     }
 
     if (routes.length === 0) {
@@ -1000,7 +977,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Insure the loaded ship before departing (still docked at source)
     if (route && buyQty > 0 && settings.autoInsure) {
-      await tryInsureShip(ctx, investedCredits);
+      await ensureInsured(ctx);
     }
 
     // No route worked — wait and retry
@@ -1205,35 +1182,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // Sell any other non-fuel items from cargo (extra storage items carried along)
+    // Deposit any other non-fuel items from cargo to faction/station storage
+    // (never sell — these may be crafting materials like durasteel)
     await bot.refreshCargo();
     for (const item of [...bot.inventory]) {
       if (item.itemId === route.itemId) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
       if (item.quantity <= 0) continue;
-      const sResp = await bot.exec("sell", { item_id: item.itemId, quantity: item.quantity });
-      if (!sResp.error) {
-        // Verify what actually sold
-        await bot.refreshCargo();
-        const afterSell = bot.inventory.find(i => i.itemId === item.itemId)?.quantity ?? 0;
-        const actuallySold = item.quantity - afterSell;
-        if (actuallySold > 0) {
-          ctx.log("trade", `Sold ${actuallySold}x ${item.name} (extra cargo)`);
-        }
-        if (afterSell > 0) {
-          // Sell claimed success but items remain — deposit them
-          const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: afterSell });
-          if (fResp.error) {
-            await bot.exec("deposit_items", { item_id: item.itemId, quantity: afterSell });
-          }
-        }
-      } else {
-        const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
-        if (fResp.error) {
-          await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
-        }
+      const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+      if (fResp.error) {
+        await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
       }
+      ctx.log("trade", `Deposited ${item.quantity}x ${item.name} (extra cargo)`);
     }
 
     // Sell faction storage items at this market too

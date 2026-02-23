@@ -15,6 +15,7 @@ import {
   repairShip,
   ensureFueled,
   navigateToSystem,
+  detectAndRecoverFromDeath,
   maxItemsForCargo,
   readSettings,
   sleep,
@@ -34,11 +35,11 @@ function getCleanupSettings(username?: string): {
   const t = all.cleanup || {};
   const botOverrides = username ? (all[username] || {}) : {};
   return {
-    // Faction storage station from general settings, fallback to cleanup-specific, then "sol"
-    homeSystem: (general.factionStorageSystem as string)
-      || (botOverrides.homeSystem as string) || (t.homeSystem as string) || "sol",
-    homeStation: (general.factionStorageStation as string)
-      || (botOverrides.homeStation as string) || (t.homeStation as string) || "",
+    // Per-bot override > cleanup-specific > general faction storage > "sol"
+    homeSystem: (botOverrides.homeSystem as string)
+      || (t.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
+    homeStation: (botOverrides.homeStation as string)
+      || (t.homeStation as string) || (general.factionStorageStation as string) || "",
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
   };
@@ -239,6 +240,10 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
 
   while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await sleep(30000); continue; }
+
     const settings = getCleanupSettings(bot.username);
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,

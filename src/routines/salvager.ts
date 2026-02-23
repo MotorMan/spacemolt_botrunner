@@ -1,4 +1,5 @@
 import type { Routine, RoutineContext } from "../bot.js";
+import { mapStore } from "../mapstore.js";
 import {
   isMinablePoi,
   isStationPoi,
@@ -12,8 +13,12 @@ import {
   ensureFueled,
   navigateToSystem,
   factionDonateProfit,
+  detectAndRecoverFromDeath,
+  getModProfile,
+  ensureModsFitted,
   readSettings,
   scavengeWrecks,
+  fullSalvageWrecks,
   getSystemInfo,
   sleep,
 } from "./common.js";
@@ -28,6 +33,11 @@ function getSalvagerSettings(username?: string): {
   refuelThreshold: number;
   repairThreshold: number;
   system: string;
+  homeSystem: string;
+  autoCloak: boolean;
+  enableFullSalvage: boolean;
+  enableTowing: boolean;
+  minTowValue: number;
 } {
   const all = readSettings();
   const m = all.salvager || {};
@@ -45,7 +55,12 @@ function getSalvagerSettings(username?: string): {
     cargoThreshold: (m.cargoThreshold as number) || 80,
     refuelThreshold: (m.refuelThreshold as number) || 50,
     repairThreshold: (m.repairThreshold as number) || 40,
-    system: (m.system as string) || "",
+    system: (botOverrides.system as string) || (m.system as string) || "",
+    homeSystem: (botOverrides.homeSystem as string) || (m.homeSystem as string) || "",
+    autoCloak: (m.autoCloak as boolean) ?? false,
+    enableFullSalvage: (m.enableFullSalvage as boolean) !== false,
+    enableTowing: (m.enableTowing as boolean) ?? false,
+    minTowValue: (m.minTowValue as number) || 500,
   };
 }
 
@@ -64,14 +79,20 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
   await bot.refreshStatus();
-  const homeSystem = bot.system;
+  const startSystem = bot.system;
 
   while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await sleep(30000); continue; }
+
     const settings = getSalvagerSettings(bot.username);
+    const homeSystem = settings.homeSystem || startSystem;
     const cargoThresholdRatio = settings.cargoThreshold / 100;
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
     };
 
     // ── Status + fuel/hull checks ──
@@ -163,19 +184,91 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       bot.poi = poi.id;
 
-      // Scavenge wrecks at this POI
+      // Salvage wrecks at this POI
       yield "scavenge";
-      const looted = await scavengeWrecks(ctx);
+      const looted = settings.enableFullSalvage
+        ? await fullSalvageWrecks(ctx, { enableTow: settings.enableTowing, minTowValue: settings.minTowValue })
+        : await scavengeWrecks(ctx);
       totalLooted += looted;
 
       if (looted > 0) {
-        ctx.log("scavenge", `Looted ${looted} items at ${poi.name}`);
+        ctx.log("scavenge", `Extracted ${looted} items at ${poi.name}`);
       }
     }
 
     if (bot.state !== "running") break;
 
     ctx.log("scavenge", `Salvage sweep done — ${totalLooted} items looted across ${visitPois.length} POIs`);
+
+    // ── Expand to neighbor systems if current system had no wrecks ──
+    if (totalLooted === 0 && !cargoFull && bot.state === "running") {
+      const neighbors = mapStore.getConnections(bot.system);
+      if (neighbors.length > 0) {
+        ctx.log("scavenge", `No wrecks locally — checking ${neighbors.length} neighbor system(s)`);
+      }
+
+      for (const conn of neighbors) {
+        if (bot.state !== "running" || cargoFull) break;
+
+        // Check fuel before jumping
+        await bot.refreshStatus();
+        const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        if (fuelPct < safetyOpts.fuelThresholdPct) {
+          ctx.log("scavenge", `Fuel low (${fuelPct}%) — stopping neighbor scan`);
+          break;
+        }
+
+        yield "neighbor_system";
+        ctx.log("travel", `Jumping to ${conn.system_name || conn.system_id} to check for wrecks...`);
+        await ensureUndocked(ctx);
+        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (!fueled) break;
+        const arrived = await navigateToSystem(ctx, conn.system_id, safetyOpts);
+        if (!arrived) continue;
+
+        // Scan neighbor system POIs
+        const { pois: neighborPois } = await getSystemInfo(ctx);
+        const neighborVisit = neighborPois.filter(p => !isStationPoi(p) && !isScenicPoi(p.type));
+        if (neighborVisit.length === 0) continue;
+
+        for (const poi of neighborVisit) {
+          if (bot.state !== "running") break;
+
+          await bot.refreshStatus();
+          const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+          if (fillRatio >= cargoThresholdRatio) {
+            ctx.log("scavenge", `Cargo at ${Math.round(fillRatio * 100)}% — heading to station`);
+            cargoFull = true;
+            break;
+          }
+
+          const nFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+          if (nFuelPct < safetyOpts.fuelThresholdPct) break;
+
+          yield "travel_to_poi";
+          const tResp = await bot.exec("travel", { target_poi: poi.id });
+          if (tResp.error && !tResp.error.message.includes("already")) continue;
+          bot.poi = poi.id;
+
+          yield "scavenge";
+          const looted = settings.enableFullSalvage
+            ? await fullSalvageWrecks(ctx, { enableTow: settings.enableTowing, minTowValue: settings.minTowValue })
+            : await scavengeWrecks(ctx);
+          totalLooted += looted;
+          if (looted > 0) {
+            ctx.log("scavenge", `Extracted ${looted} items at ${poi.name} (${conn.system_name || conn.system_id})`);
+          }
+        }
+
+        // If we found wrecks in this neighbor, stop expanding further
+        if (totalLooted > 0 || cargoFull) break;
+      }
+
+      if (bot.state !== "running") break;
+      if (totalLooted > 0) {
+        ctx.log("scavenge", `Neighbor sweep: ${totalLooted} items looted`);
+      }
+    }
 
     // ── Return to home system if needed ──
     if (bot.system !== homeSystem && homeSystem) {
@@ -260,6 +353,10 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     await tryRefuel(ctx);
     yield "repair";
     await repairShip(ctx);
+
+    // ── Fit mods ──
+    const modProfile = getModProfile("salvager");
+    if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
 
     yield "check_skills";
     await bot.checkSkills();

@@ -8,7 +8,7 @@ import type { ServerWebSocket } from "bun";
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec";
+  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove";
   bot?: string;
   routine?: string;
   username?: string;
@@ -175,6 +175,13 @@ export class WebServer {
 
   getBotAssignments(): Record<string, string> {
     return (this.settings.botAssignments as Record<string, string>) || {};
+  }
+
+  removePerBotSettings(username: string): void {
+    if (username in this.settings) {
+      delete this.settings[username];
+      saveSettings(this.settings);
+    }
   }
 
   start(): void {

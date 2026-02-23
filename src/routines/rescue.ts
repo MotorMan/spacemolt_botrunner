@@ -9,6 +9,7 @@ import {
   ensureFueled,
   navigateToSystem,
   scavengeWrecks,
+  detectAndRecoverFromDeath,
   readSettings,
   sleep,
   logStatus,
@@ -97,6 +98,10 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   ctx.log("system", "FuelRescue bot online — monitoring fleet for stranded ships...");
 
   while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await sleep(30000); continue; }
+
     const settings = getRescueSettings();
 
     // ── Check fleet status ──

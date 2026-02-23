@@ -21,6 +21,12 @@ function getCoordinatorSettings(): {
   autoAdjustCraft: boolean;
   targetItems: string[];
   useGlobalMarket: boolean;
+  enableOrders: boolean;
+  maxOrderBudget: number;
+  maxFactionBudget: number;
+  orderExpiryHours: number;
+  maxBuyOrders: number;
+  maxSellOrders: number;
 } {
   const all = readSettings();
   const c = all.coordinator || {};
@@ -32,6 +38,12 @@ function getCoordinatorSettings(): {
     autoAdjustCraft: c.autoAdjustCraft !== false,
     targetItems: Array.isArray(c.targetItems) ? (c.targetItems as string[]) : [],
     useGlobalMarket: c.useGlobalMarket !== false,
+    enableOrders: (c.enableOrders as boolean) ?? false,
+    maxOrderBudget: (c.maxOrderBudget as number) || 5000,
+    maxFactionBudget: (c.maxFactionBudget as number) || 10000,
+    orderExpiryHours: (c.orderExpiryHours as number) || 24,
+    maxBuyOrders: (c.maxBuyOrders as number) || 5,
+    maxSellOrders: (c.maxSellOrders as number) || 5,
   };
 }
 
@@ -398,6 +410,227 @@ function computeOreQuotas(
   return oreNeeds;
 }
 
+// ── Market orders ────────────────────────────────────────────
+
+interface ActiveOrder {
+  orderId: string;
+  itemId: string;
+  orderType: "buy" | "sell";
+  price: number;
+  quantity: number;
+  placedAt: string;
+}
+
+/** Parse orders from view_orders response, handling various response shapes. */
+function parseOrders(result: unknown): ActiveOrder[] {
+  if (!result || typeof result !== "object") return [];
+  const r = result as Record<string, unknown>;
+
+  const orders: ActiveOrder[] = [];
+
+  // Handle combined list or separate buy/sell lists
+  const combined = (
+    Array.isArray(r) ? r :
+    Array.isArray(r.orders) ? r.orders :
+    []
+  ) as Array<Record<string, unknown>>;
+
+  const buyOrders = Array.isArray(r.buy_orders) ? r.buy_orders as Array<Record<string, unknown>> : [];
+  const sellOrders = Array.isArray(r.sell_orders) ? r.sell_orders as Array<Record<string, unknown>> : [];
+
+  function mapOrder(o: Record<string, unknown>, defaultType: "buy" | "sell"): ActiveOrder | null {
+    const orderId = (o.order_id as string) || (o.id as string) || "";
+    if (!orderId) return null;
+    const typeStr = ((o.type as string) || (o.order_type as string) || defaultType).toLowerCase();
+    return {
+      orderId,
+      itemId: (o.item_id as string) || "",
+      orderType: typeStr === "sell" ? "sell" : "buy",
+      price: (o.price as number) || (o.unit_price as number) || 0,
+      quantity: (o.quantity as number) || (o.remaining as number) || 0,
+      placedAt: (o.placed_at as string) || (o.created_at as string) || "",
+    };
+  }
+
+  for (const o of combined) {
+    const mapped = mapOrder(o, "buy");
+    if (mapped) orders.push(mapped);
+  }
+  for (const o of buyOrders) {
+    const mapped = mapOrder(o, "buy");
+    if (mapped) orders.push(mapped);
+  }
+  for (const o of sellOrders) {
+    const mapped = mapOrder(o, "sell");
+    if (mapped) orders.push(mapped);
+  }
+
+  return orders;
+}
+
+/** Cancel orders older than expiryHours. Returns count of cancelled orders. */
+async function cancelStaleOrders(ctx: RoutineContext, expiryHours: number): Promise<number> {
+  const { bot } = ctx;
+  const orderData = await bot.viewOrders();
+  const orders = parseOrders(orderData);
+  if (orders.length === 0) return 0;
+
+  const now = Date.now();
+  const expiryMs = expiryHours * 60 * 60 * 1000;
+  let cancelled = 0;
+
+  for (const order of orders) {
+    if (!order.placedAt) continue;
+    const placedTime = new Date(order.placedAt).getTime();
+    if (isNaN(placedTime)) continue;
+    if (now - placedTime < expiryMs) continue;
+
+    const resp = await bot.exec("cancel_order", { order_id: order.orderId });
+    if (!resp.error) {
+      cancelled++;
+      ctx.log("coord", `Cancelled stale ${order.orderType} order: ${order.quantity}x ${order.itemId} at ${order.price}cr`);
+    }
+  }
+
+  return cancelled;
+}
+
+/** Place market buy and sell orders based on arbitrage and faction storage. */
+async function placeMarketOrders(
+  ctx: RoutineContext,
+  settings: ReturnType<typeof getCoordinatorSettings>,
+  demandMap: Map<string, DemandEntry>,
+  globalMarket?: GlobalMarketData,
+): Promise<void> {
+  const { bot } = ctx;
+
+  // Get existing orders to avoid duplicates
+  const orderData = await bot.viewOrders();
+  const existingOrders = parseOrders(orderData);
+  const existingBuyItems = new Set(existingOrders.filter(o => o.orderType === "buy").map(o => o.itemId));
+  const existingSellItems = new Set(existingOrders.filter(o => o.orderType === "sell").map(o => o.itemId));
+  const currentBuyCount = existingOrders.filter(o => o.orderType === "buy").length;
+  const currentSellCount = existingOrders.filter(o => o.orderType === "sell").length;
+
+  // Get local market
+  const marketResp = await bot.exec("view_market");
+  if (!marketResp.result || typeof marketResp.result !== "object") return;
+  const md = marketResp.result as Record<string, unknown>;
+  const listings = (
+    Array.isArray(md) ? md :
+    Array.isArray(md.items) ? md.items :
+    Array.isArray(md.listings) ? md.listings : []
+  ) as Array<Record<string, unknown>>;
+
+  // ── Buy orders (arbitrage) ──
+  let walletBudgetUsed = 0;
+  let factionBudgetUsed = 0;
+  let buyOrdersPlaced = currentBuyCount;
+
+  for (const listing of listings) {
+    if (buyOrdersPlaced >= settings.maxBuyOrders) break;
+
+    const itemId = (listing.item_id as string) || "";
+    if (!itemId) continue;
+    if (existingBuyItems.has(itemId)) continue;
+
+    // Skip crafting components / fuel
+    const lower = itemId.toLowerCase();
+    if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+
+    const localSellPrice = (listing.sell_price as number) || (listing.best_sell as number) || 0;
+    if (localSellPrice <= 0) continue;
+
+    // Find if this item sells for more elsewhere
+    const demand = demandMap.get(itemId);
+    const globalBid = globalMarket?.bidByItem.get(itemId);
+    const bestElsewhere = Math.max(demand?.bestPrice || 0, globalBid?.bestPrice || 0);
+
+    const margin = bestElsewhere - localSellPrice;
+    if (margin < settings.minProfitMargin) continue;
+
+    // Determine funding tier
+    const isHighProfit = margin >= settings.minProfitMargin * 2;
+    let fundingSource: "wallet" | "faction" | null = null;
+    const orderCost = localSellPrice * 10; // buy ~10 units
+
+    if (walletBudgetUsed + orderCost <= settings.maxOrderBudget && bot.credits >= orderCost + 500) {
+      fundingSource = "wallet";
+    } else if (isHighProfit && factionBudgetUsed + orderCost <= settings.maxFactionBudget) {
+      fundingSource = "faction";
+    }
+
+    if (!fundingSource) continue;
+
+    // Withdraw from faction if needed
+    if (fundingSource === "faction") {
+      const wResp = await bot.exec("faction_withdraw_credits", { amount: orderCost });
+      if (wResp.error) continue;
+      logFactionActivity(ctx, "withdraw", `Withdrew ${orderCost}cr for buy order on ${itemId}`);
+    }
+
+    const qty = Math.max(1, Math.floor(orderCost / localSellPrice));
+    const resp = await bot.exec("create_buy_order", {
+      item_id: itemId,
+      quantity: qty,
+      price: localSellPrice,
+    });
+
+    if (!resp.error) {
+      buyOrdersPlaced++;
+      if (fundingSource === "wallet") walletBudgetUsed += orderCost;
+      else factionBudgetUsed += orderCost;
+      ctx.log("coord", `Buy order placed: ${qty}x ${itemId} at ${localSellPrice}cr (sells for ${bestElsewhere}cr elsewhere, +${margin}cr margin)`);
+    } else {
+      // Refund faction credits on failure
+      if (fundingSource === "faction") {
+        await bot.exec("faction_deposit_credits", { amount: orderCost });
+      }
+    }
+  }
+
+  // ── Sell orders (faction storage liquidation) ──
+  await bot.refreshFactionStorage();
+  let sellOrdersPlaced = currentSellCount;
+
+  for (const item of bot.factionStorage) {
+    if (sellOrdersPlaced >= settings.maxSellOrders) break;
+    if (item.quantity <= 0) continue;
+    if (existingSellItems.has(item.itemId)) continue;
+
+    const lower = item.itemId.toLowerCase();
+    if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+
+    // Find best known sell price
+    const bestSell = mapStore.findBestSellPrice(item.itemId);
+    const globalAsk = globalMarket?.askByItem.get(item.itemId);
+    const basePrice = bestSell?.price || globalAsk || 0;
+    if (basePrice <= 0) continue;
+
+    const sellPrice = Math.ceil(basePrice * 1.15); // 15% markup
+    const qty = Math.min(item.quantity, 50); // cap at 50
+
+    // Withdraw items from faction storage
+    const wResp = await bot.exec("faction_withdraw_items", { item_id: item.itemId, quantity: qty });
+    if (wResp.error) continue;
+
+    const resp = await bot.exec("create_sell_order", {
+      item_id: item.itemId,
+      quantity: qty,
+      price: sellPrice,
+    });
+
+    if (!resp.error) {
+      sellOrdersPlaced++;
+      logFactionActivity(ctx, "withdraw", `Listed ${qty}x ${item.name} for sale at ${sellPrice}cr/ea`);
+      ctx.log("coord", `Sell order placed: ${qty}x ${item.name} at ${sellPrice}cr (base: ${basePrice}cr)`);
+    } else {
+      // Re-deposit on failure
+      await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: qty });
+    }
+  }
+}
+
 // ── Coordinator routine ──────────────────────────────────────
 
 /**
@@ -640,6 +873,16 @@ export const coordinatorRoutine: Routine = async function* (ctx: RoutineContext)
         ctx.log("coord", `Sent ${needed}cr to ${member.username} (topped off to 1000cr)`);
         logFactionActivity(ctx, "gift", `Sent ${needed}cr to ${member.username} (top-off to 1000cr)`);
       }
+    }
+
+    // ── Market orders ──
+    if (settings.enableOrders) {
+      yield "cancel_stale_orders";
+      const cancelled = await cancelStaleOrders(ctx, settings.orderExpiryHours);
+      if (cancelled > 0) ctx.log("coord", `Cancelled ${cancelled} stale order(s)`);
+
+      yield "place_orders";
+      await placeMarketOrders(ctx, settings, demandMap, globalMarket);
     }
 
     // ── Maintenance ──

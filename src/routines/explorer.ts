@@ -19,6 +19,7 @@ import {
   navigateToSystem,
   fetchSecurityLevel,
   scavengeWrecks,
+  detectAndRecoverFromDeath,
   readSettings,
   sleep,
 } from "./common.js";
@@ -225,6 +226,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await sleep(30000); continue; }
+
     // ── Get current system data ──
     yield "scan_system";
     await bot.refreshStatus();
@@ -680,6 +685,10 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
   }
 
   while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive2 = await detectAndRecoverFromDeath(ctx);
+    if (!alive2) { await sleep(30000); continue; }
+
     // Re-read settings each cycle — user might switch mode mid-run
     const modeCheck = getExplorerSettings(bot.username);
     if (modeCheck.mode !== "trade_update") {

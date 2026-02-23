@@ -4,6 +4,7 @@ import {
   tryRefuel,
   repairShip,
   ensureFueled,
+  detectAndRecoverFromDeath,
   readSettings,
   scavengeWrecks,
   sleep,
@@ -476,6 +477,10 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
 
   while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await sleep(30000); continue; }
+
     const settings = getCrafterSettings();
 
     if (settings.craftLimits.length === 0) {

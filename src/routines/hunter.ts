@@ -27,7 +27,6 @@ import { mapStore } from "../mapstore.js";
 import {
   findStation,
   isStationPoi,
-  stationHasService,
   getSystemInfo,
   collectFromStorage,
   ensureDocked,
@@ -39,6 +38,10 @@ import {
   fetchSecurityLevel,
   scavengeWrecks,
   depositNonFuelCargo,
+  ensureInsured,
+  detectAndRecoverFromDeath,
+  getModProfile,
+  ensureModsFitted,
   readSettings,
   sleep,
   logStatus,
@@ -52,6 +55,9 @@ function getHunterSettings(username?: string): {
   repairThreshold: number;
   fleeThreshold: number;
   onlyNPCs: boolean;
+  autoCloak: boolean;
+  ammoThreshold: number;
+  maxReloadAttempts: number;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -63,6 +69,9 @@ function getHunterSettings(username?: string): {
     repairThreshold: (h.repairThreshold as number) || 30,
     fleeThreshold: (h.fleeThreshold as number) || 20,
     onlyNPCs: (h.onlyNPCs as boolean) !== false,
+    autoCloak: (h.autoCloak as boolean) ?? false,
+    ammoThreshold: (h.ammoThreshold as number) || 5,
+    maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
   };
 }
 
@@ -319,40 +328,6 @@ async function navigateToSafeStation(ctx: RoutineContext, safetyOpts: { fuelThre
   return true;
 }
 
-// ── Insurance ────────────────────────────────────────────────
-
-async function ensureInsured(ctx: RoutineContext): Promise<void> {
-  const { bot } = ctx;
-  if (!bot.docked) return;
-
-  const { pois } = await getSystemInfo(ctx);
-  const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
-  if (currentStation && !stationHasService(currentStation, "insurance")) {
-    ctx.log("info", "Current station does not offer insurance — skipping");
-    return;
-  }
-
-  const quoteResp = await bot.exec("get_insurance_quote");
-  if (quoteResp.error || !quoteResp.result) return;
-
-  const q = quoteResp.result as Record<string, unknown>;
-  const cost = (q.cost as number) || (q.premium as number) || (q.price as number) || 0;
-  if (cost <= 0) return;
-
-  if (bot.credits < cost) {
-    ctx.log("info", `Insurance: can't afford ${cost}cr (have ${bot.credits}cr) — skipping`);
-    return;
-  }
-
-  const insureResp = await bot.exec("buy_insurance");
-  if (!insureResp.error) {
-    ctx.log("info", `Insurance purchased for ${cost}cr`);
-    await bot.refreshStatus();
-  } else if (insureResp.error.message.toLowerCase().includes("already")) {
-    ctx.log("info", "Insurance: already active");
-  }
-}
-
 // ── Combat ───────────────────────────────────────────────────
 
 async function engageTarget(
@@ -486,6 +461,52 @@ function findNextHuntSystem(fromSystemId: string): string | null {
   return null;
 }
 
+// ── Ammo management ──────────────────────────────────────────
+
+/**
+ * Ensure the hunter has ammo loaded. Attempts reload up to maxAttempts times.
+ * Returns false if out of ammo and needs to dock for resupply.
+ */
+async function ensureAmmoLoaded(
+  ctx: RoutineContext,
+  threshold: number,
+  maxAttempts: number,
+): Promise<boolean> {
+  const { bot } = ctx;
+  await bot.refreshStatus();
+
+  if (bot.ammo > threshold) return true;
+  if (bot.ammo < 0) return true; // ammo field not supported by this ship
+
+  ctx.log("combat", `Ammo low (${bot.ammo}) — reloading...`);
+
+  for (let i = 0; i < maxAttempts; i++) {
+    const resp = await bot.exec("reload");
+    if (resp.error) {
+      const msg = resp.error.message.toLowerCase();
+      if (msg.includes("full") || msg.includes("already")) {
+        await bot.refreshStatus();
+        return true;
+      }
+      if (msg.includes("no ammo") || msg.includes("no_ammo") || msg.includes("empty")) {
+        ctx.log("combat", "No ammo available — need to resupply at station");
+        return false;
+      }
+      ctx.log("combat", `Reload attempt ${i + 1} failed: ${resp.error.message}`);
+      continue;
+    }
+
+    await bot.refreshStatus();
+    if (bot.ammo > threshold) {
+      ctx.log("combat", `Reloaded — ammo: ${bot.ammo}`);
+      return true;
+    }
+  }
+
+  ctx.log("combat", `Could not reload after ${maxAttempts} attempts — ammo: ${bot.ammo}`);
+  return bot.ammo > 0;
+}
+
 // ── Hunter routine ───────────────────────────────────────────
 
 export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -495,10 +516,15 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   let totalKills = 0;
 
   while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await sleep(30000); continue; }
+
     const settings = getHunterSettings(bot.username);
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
     };
     const patrolSystem = settings.system || "";
 
@@ -668,6 +694,13 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
           break;
         }
 
+        // Pre-fight ammo check
+        if (bot.ammo === 0) {
+          ctx.log("combat", "Out of ammo — aborting patrol to resupply");
+          abortPatrol = true;
+          break;
+        }
+
         yield "engage";
         const won = await engageTarget(ctx, target, settings.fleeThreshold);
 
@@ -679,8 +712,15 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
           yield "loot";
           await scavengeWrecks(ctx);
 
+          // Post-kill reload
+          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          if (!hasAmmo) {
+            ctx.log("combat", "No ammo after kill — aborting patrol to resupply");
+            abortPatrol = true;
+          }
+
           await bot.refreshStatus();
-          ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | credits ${bot.credits}`);
+          ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
         } else {
           ctx.log("combat", "Retreated — aborting patrol to dock and repair");
           abortPatrol = true;
@@ -739,6 +779,13 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
 
       yield "repair";
       await repairShip(ctx);
+
+      yield "reload";
+      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+
+      yield "fit_mods";
+      const modProfile = getModProfile("hunter");
+      if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
 
       yield "check_skills";
       await bot.checkSkills();

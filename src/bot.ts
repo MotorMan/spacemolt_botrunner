@@ -106,6 +106,15 @@ export class Bot {
   /** Cached faction storage items from last view_faction_storage. */
   factionStorage: CargoItem[] = [];
 
+  /** Whether the bot's ship is currently cloaked. */
+  isCloaked = false;
+
+  /** Whether the bot's ship is dead (hull <= 0). */
+  isDead = false;
+
+  /** Cached installed mod IDs from last refreshShipMods(). */
+  installedMods: string[] = [];
+
   /** Accumulated stats for this bot. */
   stats: BotStats = { totalMined: 0, totalCrafted: 0, totalTrades: 0, totalProfit: 0, totalSystems: 0 };
 
@@ -167,7 +176,18 @@ export class Bot {
   async exec(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
     this._lastAction = command;
     debugLog("bot:exec", `${this.username} > ${command}`, payload);
-    const resp = await this.api.execute(command, payload);
+    let resp = await this.api.execute(command, payload);
+
+    // Action pending — a previous game action is still resolving (10s tick).
+    // Wait for the tick to complete then retry once.
+    if (resp.error) {
+      const msg = resp.error.message || "";
+      if (resp.error.code === "action_pending" || msg.includes("action is already pending")) {
+        debugLog("bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
+        await sleep(10_000);
+        resp = await this.api.execute(command, payload);
+      }
+    }
 
     if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
       logNotifications(resp.notifications);
@@ -263,6 +283,16 @@ export class Bot {
         this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
         this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
         this.ammo = (ship.ammo as number) ?? this.ammo;
+      }
+
+      // Cloak detection
+      this.isCloaked = !!(p.is_cloaked || p.cloaked);
+
+      // Death detection
+      if (this.hull <= 0 && this.maxHull > 0) {
+        this.isDead = true;
+      } else if (this.hull > 0 && this.isDead) {
+        this.isDead = false; // respawned
       }
 
       // Fallback: fuel at top level
@@ -393,6 +423,27 @@ export class Bot {
     this._state = "idle";
     this._routine = null;
     this.log("system", "Routine finished");
+  }
+
+  /** Fetch ship modules and cache installed mod IDs. */
+  async refreshShipMods(): Promise<string[]> {
+    const resp = await this.exec("get_ship");
+    if (resp.result && typeof resp.result === "object") {
+      const r = resp.result as Record<string, unknown>;
+      const ship = (r.ship as Record<string, unknown>) || r;
+      const modules = (
+        Array.isArray(ship.modules) ? ship.modules :
+        Array.isArray(ship.mods) ? ship.mods :
+        Array.isArray(ship.installed_mods) ? ship.installed_mods :
+        []
+      ) as Array<Record<string, unknown> | string>;
+
+      this.installedMods = modules.map(m => {
+        if (typeof m === "string") return m;
+        return (m.mod_id as string) || (m.id as string) || (m.name as string) || "";
+      }).filter(Boolean);
+    }
+    return this.installedMods;
   }
 
   /** Get the current cached level for a skill. Returns 0 if unknown. Call checkSkills() first to populate. */

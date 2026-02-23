@@ -235,6 +235,9 @@ export async function ensureDocked(ctx: RoutineContext): Promise<boolean> {
     if (!dockResp.error || dockResp.error.message.includes("already")) {
       bot.docked = true;
       await collectFromStorage(ctx);
+      await recordMarketData(ctx);
+      await analyzeMarket(ctx);
+      await ensureInsured(ctx);
       return true;
     }
   }
@@ -282,6 +285,9 @@ export async function ensureDocked(ctx: RoutineContext): Promise<boolean> {
   if (!dResp.error || dResp.error.message.includes("already")) {
     bot.docked = true;
     await collectFromStorage(ctx);
+    await recordMarketData(ctx);
+    await analyzeMarket(ctx);
+    await ensureInsured(ctx);
     return true;
   }
 
@@ -311,6 +317,21 @@ export async function recordMarketData(ctx: RoutineContext): Promise<void> {
   const marketResp = await bot.exec("view_market");
   if (marketResp.result && typeof marketResp.result === "object") {
     mapStore.updateMarket(bot.system, bot.poi, marketResp.result as Record<string, unknown>);
+  }
+}
+
+/** Call analyze_market to build Trading XP and log top insight. Must be docked. */
+export async function analyzeMarket(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  if (!bot.docked) return;
+  const resp = await bot.exec("analyze_market", { mode: "overview" });
+  if (!resp.error && resp.result && typeof resp.result === "object") {
+    const r = resp.result as Record<string, unknown>;
+    const insights = r.top_insights as Array<Record<string, unknown>> | undefined;
+    if (Array.isArray(insights) && insights.length > 0) {
+      const top = insights[0];
+      ctx.log("trade", `Market intel: ${(top.message as string) ?? (top.category as string) ?? "no insights"}`);
+    }
   }
 }
 
@@ -940,7 +961,7 @@ export async function depositNonFuelCargo(ctx: RoutineContext): Promise<boolean>
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 20;
@@ -1010,6 +1031,11 @@ export async function navigateToSystem(
     const sysResp = await bot.exec("get_system");
     if (sysResp.result && typeof sysResp.result === "object") {
       parseSystemData(sysResp.result as Record<string, unknown>);
+    }
+
+    // Auto-cloak in dangerous systems
+    if (opts.autoCloak) {
+      await autoCloakIfDangerous(ctx);
     }
 
     ctx.log("travel", `Arrived in ${bot.system}`);
@@ -1245,6 +1271,335 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
   }
 
   return totalLooted;
+}
+
+/**
+ * Full wreck salvage chain: loot → salvage → scrap for each wreck.
+ * Optionally tow high-value wrecks. Returns total items extracted.
+ */
+export async function fullSalvageWrecks(
+  ctx: RoutineContext,
+  opts?: { fuelOnly?: boolean; enableTow?: boolean; minTowValue?: number },
+): Promise<number> {
+  const { bot } = ctx;
+  if (bot.docked) return 0;
+
+  const enableTow = opts?.enableTow ?? false;
+  const minTowValue = opts?.minTowValue ?? 500;
+  const fuelOnly = opts?.fuelOnly ?? false;
+
+  const wrecksResp = await bot.exec("get_wrecks");
+  const wrecks = parseWrecks(wrecksResp.result);
+  if (wrecks.length === 0) return 0;
+
+  let totalExtracted = 0;
+  const extractedItems: string[] = [];
+
+  for (const wreck of wrecks) {
+    if (bot.state !== "running") break;
+
+    await bot.refreshStatus();
+    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
+      ctx.log("scavenge", "Cargo full — stopping salvage");
+      break;
+    }
+
+    // Step 1: Loot all items from the wreck
+    if (wreck.items.length > 0) {
+      let candidates = [...wreck.items];
+      if (fuelOnly) {
+        candidates = candidates.filter(i =>
+          LOOT_PRIORITY.some(p => i.item_id.toLowerCase().includes(p))
+        );
+      }
+
+      // Sort: fuel cells first
+      candidates.sort((a, b) => {
+        const aPri = LOOT_PRIORITY.some(p => a.item_id.includes(p)) ? 0 : 1;
+        const bPri = LOOT_PRIORITY.some(p => b.item_id.includes(p)) ? 0 : 1;
+        return aPri - bPri;
+      });
+
+      for (const item of candidates) {
+        if (bot.state !== "running") break;
+        if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) break;
+
+        const lootResp = await bot.exec("loot_wreck", {
+          wreck_id: wreck.wreck_id,
+          item_id: item.item_id,
+          quantity: item.quantity,
+        });
+
+        if (lootResp.error) {
+          const msg = lootResp.error.message.toLowerCase();
+          if (msg.includes("empty") || msg.includes("not found")) break;
+          continue;
+        }
+
+        totalExtracted++;
+        extractedItems.push(`${item.quantity}x ${item.name}`);
+      }
+    }
+
+    // Step 2: Salvage the wreck for components
+    await bot.refreshStatus();
+    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) continue;
+
+    const salvageResp = await bot.exec("salvage_wreck", { wreck_id: wreck.wreck_id });
+    if (!salvageResp.error && salvageResp.result) {
+      const sr = salvageResp.result as Record<string, unknown>;
+      const items = (sr.items as Array<Record<string, unknown>>) || [];
+      if (items.length > 0) {
+        const names = items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || (i.item_id as string) || "component"}`).join(", ");
+        extractedItems.push(names);
+        totalExtracted += items.length;
+        ctx.log("scavenge", `Salvaged components: ${names}`);
+      }
+    }
+
+    // Step 3: Scrap the wreck for raw materials
+    await bot.refreshStatus();
+    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) continue;
+
+    const scrapResp = await bot.exec("scrap_wreck", { wreck_id: wreck.wreck_id });
+    if (!scrapResp.error && scrapResp.result) {
+      const sr = scrapResp.result as Record<string, unknown>;
+      const items = (sr.items as Array<Record<string, unknown>>) || [];
+      if (items.length > 0) {
+        const names = items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || (i.item_id as string) || "material"}`).join(", ");
+        extractedItems.push(names);
+        totalExtracted += items.length;
+        ctx.log("scavenge", `Scrapped materials: ${names}`);
+      }
+    }
+
+    // Step 4: Optionally tow high-value wrecks
+    if (enableTow) {
+      const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
+      if (!towResp.error) {
+        ctx.log("scavenge", `Towing wreck: ${wreck.name}`);
+      }
+    }
+  }
+
+  if (totalExtracted > 0) {
+    await bot.refreshCargo();
+    ctx.log("scavenge", `Full salvage: ${totalExtracted} items from ${wrecks.length} wreck(s)`);
+  }
+
+  return totalExtracted;
+}
+
+// ── Role-Based Mods ──────────────────────────────────────────
+
+/**
+ * Get the desired mod profile for a routine from settings.
+ * Returns [] if autoFitMods is disabled or no profile configured.
+ */
+export function getModProfile(routineName: string): string[] {
+  const all = readSettings();
+  if ((all.general?.autoFitMods as boolean) === false) return [];
+  const profiles = (all.general?.modProfiles as Record<string, string[]>) || {};
+  return Array.isArray(profiles[routineName]) ? profiles[routineName] : [];
+}
+
+/**
+ * Ensure the bot's ship has the desired mods installed.
+ * Uninstalls unwanted mods and installs missing ones.
+ * Requires docked at a station with shipyard service.
+ */
+export async function ensureModsFitted(
+  ctx: RoutineContext,
+  desiredMods: string[],
+): Promise<void> {
+  const { bot } = ctx;
+  if (!bot.docked || desiredMods.length === 0) return;
+
+  // Check if current station has shipyard
+  const { pois } = await getSystemInfo(ctx);
+  const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+  if (currentStation && !stationHasService(currentStation, "shipyard")) return;
+
+  const installed = await bot.refreshShipMods();
+  const desiredSet = new Set(desiredMods);
+  const installedSet = new Set(installed);
+
+  // Uninstall mods not in the desired set
+  for (const mod of installed) {
+    if (!desiredSet.has(mod)) {
+      const resp = await bot.exec("uninstall_mod", { mod_id: mod });
+      if (!resp.error) {
+        ctx.log("system", `Uninstalled mod: ${mod}`);
+      }
+    }
+  }
+
+  // Install missing desired mods
+  for (const mod of desiredMods) {
+    if (!installedSet.has(mod)) {
+      const resp = await bot.exec("install_mod", { mod_id: mod });
+      if (!resp.error) {
+        ctx.log("system", `Installed mod: ${mod}`);
+      } else {
+        const msg = resp.error.message.toLowerCase();
+        if (!msg.includes("already") && !msg.includes("not found") && !msg.includes("no slot")) {
+          ctx.log("error", `Failed to install mod ${mod}: ${resp.error.message}`);
+        }
+      }
+    }
+  }
+}
+
+// ── Cloaking ─────────────────────────────────────────────────
+
+/** Check if a system's security level is dangerous (low-sec, null-sec, lawless, etc.). */
+export function isDangerousSystem(securityLevel: string | undefined): boolean {
+  if (!securityLevel) return false;
+  const level = securityLevel.toLowerCase().trim();
+
+  if (level.includes("low") || level === "null" || level.includes("unregulated") ||
+      level.includes("lawless") || level.includes("frontier") || level.includes("minimal")) {
+    return true;
+  }
+
+  const numeric = parseInt(level, 10);
+  if (!isNaN(numeric)) return numeric <= 25;
+
+  return false;
+}
+
+/**
+ * Auto-cloak if in a dangerous system. Skips if already cloaked, docked, or no cloak module.
+ * Returns true if now cloaked, false otherwise.
+ */
+export async function autoCloakIfDangerous(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  if (bot.isCloaked || bot.docked) return bot.isCloaked;
+
+  const sys = mapStore.getSystem(bot.system);
+  if (!sys || !isDangerousSystem(sys.security_level)) return false;
+
+  const resp = await bot.exec("cloak");
+  if (!resp.error) {
+    bot.isCloaked = true;
+    ctx.log("system", `Cloaked in ${bot.system} (${sys.security_level})`);
+    return true;
+  }
+
+  const msg = resp.error.message.toLowerCase();
+  if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+    bot.isCloaked = true;
+    return true;
+  }
+  // No cloak module or other error — gracefully skip
+  return false;
+}
+
+// ── Insurance ────────────────────────────────────────────────
+
+/** Minimum credits to keep when buying insurance. */
+const INSURANCE_CREDIT_FLOOR = 500;
+
+/**
+ * Universal auto-insure: buy insurance if docked at a station with the service.
+ * Checks `general.autoInsure` setting (default: true).
+ * Skips if already insured, can't afford, or no insurance service.
+ */
+export async function ensureInsured(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  if (!bot.docked) return;
+
+  const all = readSettings();
+  if ((all.general?.autoInsure as boolean) === false) return;
+
+  const { pois } = await getSystemInfo(ctx);
+  const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+  if (currentStation && !stationHasService(currentStation, "insurance")) return;
+
+  const quoteResp = await bot.exec("get_insurance_quote");
+  if (quoteResp.error || !quoteResp.result) return;
+
+  const q = quoteResp.result as Record<string, unknown>;
+  const quoteObj = (q.quote as Record<string, unknown>) ?? q;
+
+  // Already insured?
+  const insured = (quoteObj.insured as boolean) ?? (q.insured as boolean) ?? false;
+  if (insured) return;
+
+  const cost = (quoteObj.cost as number) || (quoteObj.premium as number) || (quoteObj.price as number) || 0;
+  if (cost <= 0) return;
+
+  if (bot.credits < cost + INSURANCE_CREDIT_FLOOR) {
+    ctx.log("info", `Insurance: can't afford ${cost}cr (need ${INSURANCE_CREDIT_FLOOR}cr floor) — skipping`);
+    return;
+  }
+
+  const insureResp = await bot.exec("buy_insurance");
+  if (!insureResp.error) {
+    ctx.log("info", `Insurance purchased for ${cost}cr`);
+    await bot.refreshStatus();
+  } else if (insureResp.error.message.toLowerCase().includes("already")) {
+    // silently skip
+  }
+}
+
+/**
+ * Detect death (hull=0) and attempt recovery: claim insurance, dock, refuel, repair, re-insure.
+ * Returns true if alive/recovered, false if stuck dead.
+ */
+export async function detectAndRecoverFromDeath(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  await bot.refreshStatus();
+
+  if (bot.hull > 0 && !bot.isDead) return true; // alive
+
+  ctx.log("system", "DEATH DETECTED — hull at 0. Attempting insurance claim...");
+
+  // Claim insurance
+  const claimResp = await bot.exec("claim_insurance");
+  if (!claimResp.error && claimResp.result) {
+    const r = claimResp.result as Record<string, unknown>;
+    const payout = (r.payout as number) || (r.credits as number) || 0;
+    if (payout > 0) ctx.log("info", `Insurance payout: ${payout}cr`);
+  }
+
+  // Refresh — we may have respawned
+  await bot.refreshStatus();
+
+  if (bot.hull <= 0 && bot.maxHull > 0) {
+    ctx.log("error", "Still dead after insurance claim — waiting for respawn...");
+    // Wait up to 60s for respawn
+    for (let i = 0; i < 6; i++) {
+      await sleep(10_000);
+      await bot.refreshStatus();
+      if (bot.hull > 0) break;
+    }
+    if (bot.hull <= 0 && bot.maxHull > 0) {
+      ctx.log("error", "Could not recover from death — stuck");
+      return false;
+    }
+  }
+
+  bot.isDead = false;
+  ctx.log("system", "Respawned — recovering...");
+
+  // Try to dock, refuel, repair, re-insure
+  if (bot.docked) {
+    await tryRefuel(ctx);
+    await repairShip(ctx);
+    await ensureInsured(ctx);
+  } else {
+    const docked = await ensureDocked(ctx);
+    if (docked) {
+      await tryRefuel(ctx);
+      await repairShip(ctx);
+      await ensureInsured(ctx);
+    }
+  }
+
+  await bot.refreshStatus();
+  ctx.log("system", `Recovery complete — hull: ${bot.hull}/${bot.maxHull}, credits: ${bot.credits}`);
+  return true;
 }
 
 // ── Settings ─────────────────────────────────────────────────

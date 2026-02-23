@@ -16,6 +16,7 @@ import {
   navigateToSystem,
   recordMarketData,
   factionDonateProfit,
+  detectAndRecoverFromDeath,
   maxItemsForCargo,
   readSettings,
   sleep,
@@ -25,10 +26,13 @@ import {
 
 function getFactionTraderSettings(username?: string): {
   homeSystem: string;
+  homeStation: string;
+  fuelCostPerJump: number;
   refuelThreshold: number;
   repairThreshold: number;
   minSellPrice: number;
   tradeItems: string[];
+  stationPriority: boolean;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -39,10 +43,15 @@ function getFactionTraderSettings(username?: string): {
     homeSystem: (botOverrides.homeSystem as string)
       || (t.homeSystem as string)
       || (general.factionStorageSystem as string) || "",
+    homeStation: (botOverrides.homeStation as string)
+      || (t.homeStation as string)
+      || (general.factionStorageStation as string) || "",
+    fuelCostPerJump: (t.fuelCostPerJump as number) || 50,
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     minSellPrice: (t.minSellPrice as number) || 0,
     tradeItems: Array.isArray(t.tradeItems) ? (t.tradeItems as string[]) : [],
+    stationPriority: (botOverrides.stationPriority as boolean) || false,
   };
 }
 
@@ -57,11 +66,29 @@ interface FactionSellRoute {
   destPoiName: string;
   sellPrice: number;
   sellQty: number;
-  jumps: number;
+  jumps: number;           // one-way jumps to destination
+  roundTripJumps: number;  // dest + return home
   totalRevenue: number;
+  totalProfit: number;     // revenue minus material cost and round-trip fuel
 }
 
 // ── Helpers ──────────────────────────────────────────────────
+
+/** Find the cheapest known market sell price for an item (replacement/acquisition cost). */
+function getItemMarketCost(itemId: string): number {
+  let cheapest = Infinity;
+  const systems = mapStore.getAllSystems();
+  for (const sys of Object.values(systems)) {
+    for (const poi of sys.pois) {
+      for (const m of poi.market) {
+        if (m.item_id === itemId && m.best_sell !== null && m.best_sell > 0) {
+          if (m.best_sell < cheapest) cheapest = m.best_sell;
+        }
+      }
+    }
+  }
+  return cheapest === Infinity ? 0 : cheapest;
+}
 
 /** Free cargo weight (not item count — callers must divide by item size). */
 function getFreeSpace(bot: Bot): number {
@@ -78,7 +105,7 @@ function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: num
   return { jumps, cost: jumps * costPerJump };
 }
 
-/** Find sell routes for items currently in faction storage. */
+/** Find sell routes for items currently in faction storage. Factors round-trip fuel cost. */
 function findFactionSellRoutes(
   ctx: RoutineContext,
   settings: ReturnType<typeof getFactionTraderSettings>,
@@ -91,6 +118,9 @@ function findFactionSellRoutes(
 
   const allBuys = mapStore.getAllBuyDemand();
   if (allBuys.length === 0) return routes;
+
+  const homeSystem = settings.homeSystem || currentSystem;
+  const costPerJump = settings.fuelCostPerJump;
 
   for (const item of bot.factionStorage) {
     const lower = item.itemId.toLowerCase();
@@ -111,14 +141,27 @@ function findFactionSellRoutes(
       .filter(b => b.itemId === item.itemId && b.price > 0)
       .sort((a, b) => b.price - a.price);
 
+    // Material cost = cheapest known market price (what this item is worth)
+    const materialCost = getItemMarketCost(item.itemId);
+
     for (const buy of buyers) {
       if (settings.minSellPrice > 0 && buy.price < settings.minSellPrice) continue;
 
-      const { jumps } = estimateFuelCost(currentSystem, buy.systemId);
-      if (jumps >= 999) continue;
+      // Round-trip fuel: current → dest + dest → home
+      const toDest = estimateFuelCost(currentSystem, buy.systemId, costPerJump);
+      const returnHome = estimateFuelCost(buy.systemId, homeSystem, costPerJump);
+      if (toDest.jumps >= 999) continue;
+      const roundTripJumps = toDest.jumps + (returnHome.jumps < 999 ? returnHome.jumps : 0);
+      const roundTripFuel = toDest.cost + (returnHome.jumps < 999 ? returnHome.cost : 0);
 
       const qty = Math.min(item.quantity, buy.quantity, maxItemsForCargo(cargoCapacity, item.itemId));
       if (qty <= 0) continue;
+
+      // Skip routes that sell below material cost + round-trip fuel (would lose money)
+      const costPerUnit = materialCost + (roundTripJumps > 0 ? roundTripFuel / qty : 0);
+      if (materialCost > 0 && buy.price <= costPerUnit) continue;
+
+      const totalProfit = (buy.price - costPerUnit) * qty;
 
       routes.push({
         itemId: item.itemId,
@@ -129,14 +172,17 @@ function findFactionSellRoutes(
         destPoiName: buy.poiName,
         sellPrice: buy.price,
         sellQty: qty,
-        jumps,
+        jumps: toDest.jumps,
+        roundTripJumps,
         totalRevenue: qty * buy.price,
+        totalProfit,
       });
       break; // best buyer for this item
     }
   }
 
-  routes.sort((a, b) => b.totalRevenue - a.totalRevenue);
+  // Sort by profit (not raw revenue) to pick the most profitable after fuel
+  routes.sort((a, b) => b.totalProfit - a.totalProfit);
   return routes;
 }
 
@@ -149,18 +195,19 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
   const startSystem = bot.system;
 
   while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await sleep(30000); continue; }
+
     const settings = getFactionTraderSettings(bot.username);
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
     };
 
-    // ── Dock, record market ──
+    // ── Dock (also records market data + analyzes market) ──
     yield "dock";
     await ensureDocked(ctx);
-    if (bot.docked) {
-      await recordMarketData(ctx);
-    }
 
     // ── Maintenance ──
     yield "maintenance";
@@ -201,7 +248,20 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     await bot.refreshFactionStorage();
     await bot.refreshStatus();
     const cargoCapacity = bot.cargoMax > 0 ? bot.cargoMax : 50;
-    const routes = findFactionSellRoutes(ctx, settings, bot.system, cargoCapacity);
+    let routes = findFactionSellRoutes(ctx, settings, bot.system, cargoCapacity);
+
+    // Station priority: put routes whose destination is the home station first
+    if (settings.stationPriority && settings.homeSystem) {
+      const homeStation = mapStore.findNearestStation(settings.homeSystem);
+      if (homeStation) {
+        const homeRoutes = routes.filter(r => r.destSystem === settings.homeSystem && r.destPoi === homeStation.id);
+        const otherRoutes = routes.filter(r => !(r.destSystem === settings.homeSystem && r.destPoi === homeStation.id));
+        if (homeRoutes.length > 0) {
+          routes = [...homeRoutes, ...otherRoutes];
+          ctx.log("trade", `Station priority: ${homeRoutes.length} route(s) to home station`);
+        }
+      }
+    }
 
     if (routes.length === 0) {
       ctx.log("trade", "No faction storage items to sell — waiting 60s");
@@ -210,7 +270,10 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     }
 
     const route = routes[0];
-    ctx.log("trade", `Faction sale: ${route.sellQty}x ${route.itemName} → ${route.destPoiName} (${route.sellPrice}cr/ea, ${route.jumps} jumps, est. ${route.totalRevenue}cr)`);
+    const routeLabel = route.roundTripJumps > route.jumps
+      ? `${route.jumps} jumps out, ${route.roundTripJumps} round-trip`
+      : `${route.jumps} jumps`;
+    ctx.log("trade", `Faction sale: ${route.sellQty}x ${route.itemName} → ${route.destPoiName} (${route.sellPrice}cr/ea, ${routeLabel}, profit ~${Math.round(route.totalProfit)}cr)`);
 
     const isInStation = route.jumps === 0 && route.destSystem === bot.system;
 
@@ -283,10 +346,10 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       yield "withdraw_faction";
       await ensureDocked(ctx);
 
-      // Clear ALL cargo to make room — keep only fuel cells needed for the route
+      // Clear ALL cargo to make room — keep only fuel cells needed for the round trip
       await bot.refreshCargo();
       if (bot.inventory.length > 0) {
-        const fuelReserve = Math.max(3, route.jumps * 2); // enough for round trip
+        const fuelReserve = Math.max(3, route.roundTripJumps + 2); // round trip + buffer
         let fuelKept = 0;
         const deposited: string[] = [];
         for (const item of [...bot.inventory]) {
@@ -386,16 +449,30 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         }
       }
       await recordMarketData(ctx);
+    }
 
-      // Return home
-      const homeSystem = settings.homeSystem || startSystem;
-      if (homeSystem && bot.system !== homeSystem) {
-        yield "return_home";
+    // ── Return to home station ──
+    const homeSystem = settings.homeSystem || startSystem;
+    const homeStationPoi = settings.homeStation || null;
+    const needsReturn = homeSystem && (bot.system !== homeSystem || (homeStationPoi && bot.poi !== homeStationPoi));
+
+    if (needsReturn) {
+      yield "return_home";
+      if (bot.system !== homeSystem) {
         ctx.log("travel", `Returning to home system ${homeSystem}...`);
         await ensureUndocked(ctx);
         const homeFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (homeFueled) {
           await navigateToSystem(ctx, homeSystem, safetyOpts);
+        }
+      }
+
+      // Dock at the specific home station POI
+      if (homeStationPoi && bot.poi !== homeStationPoi) {
+        await ensureUndocked(ctx);
+        const tResp = await bot.exec("travel", { target_poi: homeStationPoi });
+        if (!tResp.error || tResp.error.message.includes("already")) {
+          bot.poi = homeStationPoi;
         }
       }
     }

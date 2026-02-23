@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, appendFileSync, mkdirSync } from "fs";
+import { existsSync, readdirSync, appendFileSync, mkdirSync, rmSync } from "fs";
 import { join } from "path";
 import { Bot, type Routine } from "./bot.js";
 import { SessionManager } from "./session.js";
@@ -12,6 +12,8 @@ import { gasHarvesterRoutine } from "./routines/gas_harvester.js";
 import { iceHarvesterRoutine } from "./routines/ice_harvester.js";
 import { salvagerRoutine } from "./routines/salvager.js";
 import { hunterRoutine } from "./routines/hunter.js";
+import { factionTraderRoutine } from "./routines/faction_trader.js";
+import { cleanupRoutine } from "./routines/cleanup.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { WebServer, type WebAction, type WebActionResult } from "./web/server.js";
@@ -35,6 +37,8 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   ice_harvester: { name: "IceHarvester", fn: iceHarvesterRoutine },
   salvager: { name: "Salvager", fn: salvagerRoutine },
   hunter: { name: "Hunter", fn: hunterRoutine },
+  faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },
+  cleanup: { name: "Cleanup", fn: cleanupRoutine },
 };
 
 // ── Auto-discover existing sessions ─────────────────────────
@@ -112,6 +116,8 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleSaveSettings(action);
     case "exec":
       return handleExec(action);
+    case "remove":
+      return handleRemove(action);
     default:
       return { ok: false, error: `Unknown action: ${(action as any).type}` };
   }
@@ -170,6 +176,34 @@ async function handleStop(action: WebAction): Promise<WebActionResult> {
   server.clearBotAssignment(botName);
   server.logSystem(`Stop signal sent to ${bot.username}`);
   return { ok: true, message: `Stop signal sent to ${botName}` };
+}
+
+async function handleRemove(action: WebAction): Promise<WebActionResult> {
+  const botName = action.bot;
+  if (!botName) return { ok: false, error: "No bot specified" };
+
+  const bot = bots.get(botName);
+  if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
+
+  // Stop if running
+  if (bot.state === "running") {
+    bot.stop();
+    await new Promise((r) => setTimeout(r, 3000));
+  }
+
+  bots.delete(botName);
+  server.clearBotAssignment(botName);
+  server.removePerBotSettings(botName);
+
+  // Delete session directory
+  const sessionDir = join(SESSIONS_DIR, botName);
+  try {
+    rmSync(sessionDir, { recursive: true, force: true });
+  } catch { /* ignore if already gone */ }
+
+  server.logSystem(`Removed bot: ${botName}`);
+  refreshStatusTable();
+  return { ok: true, message: `Removed ${botName}` };
 }
 
 async function handleAdd(action: WebAction): Promise<WebActionResult> {

@@ -19,6 +19,9 @@ import {
   navigateToSystem,
   refuelAtStation,
   factionDonateProfit,
+  detectAndRecoverFromDeath,
+  getModProfile,
+  ensureModsFitted,
   readSettings,
   scavengeWrecks,
   sleep,
@@ -242,6 +245,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   let lastTargetOre = "";
 
   while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await sleep(30000); continue; }
+
     // Re-read settings each cycle so changes take effect without restart
     const settings = getMinerSettings(bot.username);
     const cargoThresholdRatio = settings.cargoThreshold / 100;
@@ -654,6 +661,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     await tryRefuel(ctx);
     yield "repair";
     await repairShip(ctx);
+
+    // ── Fit mods ──
+    const modProfile = getModProfile("miner");
+    if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
 
     // ── Check for skill level-ups ──
     yield "check_skills";

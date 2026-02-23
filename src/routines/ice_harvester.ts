@@ -15,6 +15,7 @@ import {
   factionDonateProfit,
   readSettings,
   scavengeWrecks,
+  detectAndRecoverFromDeath,
   getSystemInfo,
   sleep,
 } from "./common.js";
@@ -67,6 +68,10 @@ export const iceHarvesterRoutine: Routine = async function* (ctx: RoutineContext
   const homeSystem = bot.system;
 
   while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await sleep(30000); continue; }
+
     const settings = getIceSettings(bot.username);
     const cargoThresholdRatio = settings.cargoThreshold / 100;
     const safetyOpts = {

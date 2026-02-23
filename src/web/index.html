@@ -1857,6 +1857,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('gas_harvester')">GasHarvester</div>
         <div class="sidebar-item" onclick="switchSettingsTab('ice_harvester')">IceHarvester</div>
         <div class="sidebar-item" onclick="switchSettingsTab('salvager')">Salvager</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('cleanup')">Cleanup</div>
       </div>
       <div class="settings-panel" id="settingsContent">
         <!-- filled by JS -->
@@ -2605,6 +2606,53 @@ function renderProfileTopbar() {
       </label>`;
   }
 
+  // Per-bot station priority + home system (visible for trader and faction_trader)
+  const isTrader = (bot.state === 'running' && (bot.routine === 'trader' || bot.routine === 'faction_trader'))
+    || (bot.state !== 'running' && bot.state !== 'stopping' && (getProfileSelectedRoutine() === 'trader' || getProfileSelectedRoutine() === 'faction_trader'));
+  if (isTrader) {
+    const botSettings = settings[bot.username] || {};
+    const stationPriority = botSettings.stationPriority || false;
+    const globalHome = (bot.routine === 'faction_trader' || getProfileSelectedRoutine() === 'faction_trader')
+      ? ((settings.faction_trader || {}).homeSystem || (settings.general || {}).factionStorageSystem || '')
+      : ((settings.trader || {}).homeSystem || '');
+    const botHome = botSettings.homeSystem || '';
+    const sysOpts = [`<option value=""${!botHome ? ' selected' : ''}>(global: ${globalHome ? esc(globalHome) : 'none'})</option>`];
+    for (const sys of knownSystems) {
+      const sel = sys.id === botHome ? ' selected' : '';
+      sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+    }
+    if (botHome && !knownSystems.find(s => s.id === botHome)) {
+      sysOpts.push(`<option value="${esc(botHome)}" selected>${esc(botHome)}</option>`);
+    }
+    actions += `
+      <span class="profile-ore-label" style="margin-left:8px">Home:</span>
+      <select id="profile-homeSystem" onchange="saveProfileHomeSystem()">${sysOpts.join('')}</select>
+      <label class="profile-ore-label" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:8px">
+        <input type="checkbox" id="profile-stationPriority" onchange="saveProfileStationPriority()"${stationPriority ? ' checked' : ''}>
+        Station Priority
+      </label>`;
+  }
+
+  // Per-bot home system for salvager
+  const isSalvager = (bot.state === 'running' && bot.routine === 'salvager')
+    || (bot.state !== 'running' && bot.state !== 'stopping' && getProfileSelectedRoutine() === 'salvager');
+  if (isSalvager) {
+    const botSettings = settings[bot.username] || {};
+    const globalHome = (settings.salvager || {}).homeSystem || '';
+    const botHome = botSettings.homeSystem || '';
+    const sysOpts = [`<option value=""${!botHome ? ' selected' : ''}>(global: ${globalHome ? esc(globalHome) : 'start system'})</option>`];
+    for (const sys of knownSystems) {
+      const sel = sys.id === botHome ? ' selected' : '';
+      sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+    }
+    if (botHome && !knownSystems.find(s => s.id === botHome)) {
+      sysOpts.push(`<option value="${esc(botHome)}" selected>${esc(botHome)}</option>`);
+    }
+    actions += `
+      <span class="profile-ore-label" style="margin-left:8px">Home:</span>
+      <select id="profile-homeSystem" onchange="saveProfileHomeSystem()">${sysOpts.join('')}</select>`;
+  }
+
   document.getElementById('profileActions').innerHTML = actions;
 }
 
@@ -2650,6 +2698,28 @@ function saveProfileAcceptMissions() {
   const acceptMissions = cb.checked;
   const existing = settings[bot.username] || {};
   const updated = Object.assign({}, existing, { acceptMissions });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfileStationPriority() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const cb = document.getElementById('profile-stationPriority');
+  if (!cb) return;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { stationPriority: cb.checked });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfileHomeSystem() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const sel = document.getElementById('profile-homeSystem');
+  if (!sel) return;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { homeSystem: sel.value });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
 }
@@ -4568,6 +4638,8 @@ function renderSettingsPanel() {
     renderIceHarvesterSettings(panel);
   } else if (activeSettingsTab === 'salvager') {
     renderSalvagerSettings(panel);
+  } else if (activeSettingsTab === 'cleanup') {
+    renderCleanupSettings(panel);
   }
 }
 
@@ -4629,6 +4701,60 @@ function saveGeneralSettings() {
     factionStorageStation,
   };
   send({ type: 'saveSettings', routine: 'general', settings: s });
+}
+
+function renderCleanupSettings(panel) {
+  const cleanup = settings.cleanup || {};
+  const general = settings.general || {};
+  const cleanupSystem = cleanup.homeSystem || '';
+  const cleanupStation = cleanup.homeStation || '';
+  const generalSystem = general.factionStorageSystem || '';
+  const generalStation = general.factionStorageStation || '';
+
+  // Resolve general station name for the fallback label
+  let generalLabel = 'not set';
+  if (generalSystem && generalStation && mapData[generalSystem]) {
+    const gPoi = (mapData[generalSystem].pois || []).find(p => p.id === generalStation);
+    if (gPoi) generalLabel = (gPoi.base_name || gPoi.name || generalStation) + ' (' + (mapData[generalSystem].name || generalSystem) + ')';
+  }
+
+  // Build station options from mapData (same format as general settings: "systemId|poiId")
+  let stationOpts = `<option value="">(use general: ${esc(generalLabel)})</option>`;
+  for (const [sysId, sys] of Object.entries(mapData)) {
+    const sysName = sys.name || sysId;
+    for (const poi of (sys.pois || [])) {
+      if (!poi.has_base) continue;
+      const val = sysId + '|' + poi.id;
+      const sel = (sysId === cleanupSystem && poi.id === cleanupStation) ? ' selected' : '';
+      const label = poi.base_name || poi.name || poi.id;
+      stationOpts += `<option value="${val}"${sel}>${label} (${sysName})</option>`;
+    }
+  }
+
+  panel.innerHTML = `
+    <h3>Cleanup Settings</h3>
+    <div class="settings-desc">Settings for the cleanup agent that consolidates scattered station storage to a home base.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Deposit Station</div>
+        <div class="setting-hint">Station where the cleanup agent deposits collected items into faction storage. Overrides the general Faction Storage Station setting. Useful when your faction has multiple bases.</div>
+      </div>
+      <select id="set-cleanup-station">${stationOpts}</select>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveCleanupSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function saveCleanupSettings() {
+  const stationVal = document.getElementById('set-cleanup-station').value;
+  const [homeSystem, homeStation] = stationVal ? stationVal.split('|') : ['', ''];
+  const s = { homeSystem, homeStation };
+  send({ type: 'saveSettings', routine: 'cleanup', settings: s });
+  settings.cleanup = Object.assign(settings.cleanup || {}, s);
 }
 
 function renderMinerSettings(panel) {
@@ -7427,6 +7553,7 @@ function renderSalvagerSettings(panel) {
   const refuelThreshold = sv.refuelThreshold ?? 50;
   const repairThreshold = sv.repairThreshold ?? 40;
   const currentSystem = sv.system || '';
+  const homeSystem = sv.homeSystem || '';
 
   const systemOpts = ['<option value="">(current system)</option>'];
   for (const sys of knownSystems) {
@@ -7436,6 +7563,16 @@ function renderSalvagerSettings(panel) {
   }
   if (currentSystem && !knownSystems.find(s => s.id === currentSystem)) {
     systemOpts.push(`<option value="${esc(currentSystem)}" selected>${esc(currentSystem)}</option>`);
+  }
+
+  const homeOpts = ['<option value="">(start system)</option>'];
+  for (const sys of knownSystems) {
+    const sel = sys.id === homeSystem ? ' selected' : '';
+    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+    homeOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+  }
+  if (homeSystem && !knownSystems.find(s => s.id === homeSystem)) {
+    homeOpts.push(`<option value="${esc(homeSystem)}" selected>${esc(homeSystem)}</option>`);
   }
 
   panel.innerHTML = `
@@ -7448,6 +7585,14 @@ function renderSalvagerSettings(panel) {
         <div class="setting-hint">Override system to salvage in. Bot will jump there on start.</div>
       </div>
       <select id="set-salvager-system">${systemOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home System</div>
+        <div class="setting-hint">Station the salvager returns to for unloading. Per-bot override available in bot profile. Defaults to start system.</div>
+      </div>
+      <select id="set-salvager-homeSystem">${homeOpts.join('')}</select>
     </div>
 
     <div class="setting-row">
@@ -7509,6 +7654,7 @@ function renderSalvagerSettings(panel) {
 function saveSalvagerSettings() {
   const s = {
     system: document.getElementById('set-salvager-system').value,
+    homeSystem: document.getElementById('set-salvager-homeSystem').value,
     depositMode: (function() { const v = document.getElementById('set-salvager-depositPrimary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
     depositFallback: (function() { const v = document.getElementById('set-salvager-depositSecondary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
     cargoThreshold: parseInt(document.getElementById('set-salvager-cargoThreshold').value) || 80,

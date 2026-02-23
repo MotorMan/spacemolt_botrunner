@@ -2575,9 +2575,21 @@ function renderProfileTopbar() {
     if (botOre && !knownOres.find(o => o.item_id === botOre)) {
       oreOpts.push(`<option value="${esc(botOre)}" selected>${esc(botOre)}</option>`);
     }
+    const globalHome = (settings.miner || {}).homeSystem || '';
+    const botHome = botSettings.homeSystem || '';
+    const sysOpts = [`<option value=""${!botHome ? ' selected' : ''}>(global: ${globalHome ? esc(globalHome) : 'start system'})</option>`];
+    for (const sys of knownSystems) {
+      const sel = sys.id === botHome ? ' selected' : '';
+      sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+    }
+    if (botHome && !knownSystems.find(s => s.id === botHome)) {
+      sysOpts.push(`<option value="${esc(botHome)}" selected>${esc(botHome)}</option>`);
+    }
     actions += `
       <span class="profile-ore-label">Target Ore:</span>
-      <select id="profile-targetOre" onchange="saveProfileTargetOre()">${oreOpts.join('')}</select>`;
+      <select id="profile-targetOre" onchange="saveProfileTargetOre()">${oreOpts.join('')}</select>
+      <span class="profile-ore-label" style="margin-left:8px">Home:</span>
+      <select id="profile-homeSystem" onchange="saveProfileHomeSystem()">${sysOpts.join('')}</select>`;
   }
 
   // Per-bot explorer mode selector (visible when explorer is selected or running)

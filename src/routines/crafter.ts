@@ -575,7 +575,11 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       if (!skillCheck.ok) {
         // Skill too low — grind XP on simpler recipes instead of pulling materials
         const allowedIds = new Set(settings.craftLimits.map(cl => cl.recipeId));
-        const xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex, allowedIds);
+        let xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex, allowedIds);
+        if (xpCrafted.length === 0) {
+          // Fallback: search all recipes for anything we have ingredients for right now
+          xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex);
+        }
         if (xpCrafted.length > 0) {
           skillSummary.push(`${recipe.name} (${skillCheck.reason}, ground ${xpCrafted.join(", ")} for XP)`);
         } else {
@@ -671,7 +675,11 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       // ── Skill too low: try grinding XP on configured recipes only ──
       if (hitSkillBlock && bot.state === "running") {
         const allowedIds = new Set(settings.craftLimits.map(cl => cl.recipeId));
-        const xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex, allowedIds);
+        let xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex, allowedIds);
+        if (xpCrafted.length === 0) {
+          // Fallback: search all recipes for anything we have ingredients for right now
+          xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex);
+        }
         if (xpCrafted.length > 0) {
           skillSummary.push(`${recipe.name} (skill too low, ground ${xpCrafted.join(", ")} for XP)`);
         } else {

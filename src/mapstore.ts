@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
+import { cachedFetch } from "./httpcache.js";
 
 // ── Data model ──────────────────────────────────────────────
 
@@ -799,13 +800,15 @@ class MapStore {
    */
   async seedFromMapAPI(): Promise<{ seeded: number; known: number; failed: boolean }> {
     const MAP_API_URL = "https://game.spacemolt.com/api/map";
+    let raw: Record<string, unknown>;
     try {
-      const resp = await fetch(MAP_API_URL, { signal: AbortSignal.timeout(15_000) });
-      if (!resp.ok) {
-        return { seeded: 0, known: 0, failed: true };
-      }
-
-      const raw = (await resp.json()) as Record<string, unknown>;
+      raw = await cachedFetch<Record<string, unknown>>(MAP_API_URL, 30 * 60_000, { // 30min fallback TTL
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch {
+      return { seeded: 0, known: 0, failed: true };
+    }
+    try {
       const systems = Array.isArray(raw.systems)
         ? (raw.systems as Array<Record<string, unknown>>)
         : [];

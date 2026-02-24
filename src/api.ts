@@ -16,6 +16,114 @@ export interface ApiResponse {
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v1";
 
+// ── Response cache ────────────────────────────────────────────
+
+interface CacheEntry {
+  response: ApiResponse;
+  expiresAt: number;
+}
+
+/** In-memory cache for read-only game query responses, keyed by "command:payload". */
+class ResponseCache {
+  private entries = new Map<string, CacheEntry>();
+
+  get(key: string): ApiResponse | null {
+    const entry = this.entries.get(key);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+      this.entries.delete(key);
+      return null;
+    }
+    return entry.response;
+  }
+
+  set(key: string, response: ApiResponse, ttlMs: number): void {
+    this.entries.set(key, { response, expiresAt: Date.now() + ttlMs });
+  }
+
+  /** Delete all entries for the given commands. */
+  invalidate(commands: string[]): void {
+    for (const cmd of commands) {
+      const prefix = `${cmd}:`;
+      for (const key of this.entries.keys()) {
+        if (key.startsWith(prefix)) this.entries.delete(key);
+      }
+    }
+  }
+}
+
+// Cacheable read-only commands and their fallback TTLs (ms).
+// Server Cache-Control headers override these when present.
+const COMMAND_TTL: Record<string, number> = {
+  get_status:             15_000,
+  get_system:             30_000,
+  get_ship:               60_000,
+  get_cargo:              10_000,
+  get_nearby:             15_000,
+  get_poi:                30_000,
+  get_base:              120_000,
+  get_skills:            120_000,
+  get_missions:           60_000,
+  view_storage:           30_000,
+  view_faction_storage:   30_000,
+  find_route:            300_000,
+  survey_system:          60_000,
+  get_queue:               5_000,
+  view_market:            30_000,
+  view_orders:            30_000,
+  estimate_purchase:      30_000,
+  get_wrecks:             15_000,
+  v2_get_ship:            60_000,
+  v2_get_cargo:           10_000,
+  v2_get_player:          30_000,
+  v2_get_skills:         120_000,
+  v2_get_queue:            5_000,
+  v2_get_missions:        60_000,
+};
+
+// Cache groups for mutation invalidation
+const INV_STATUS   = ["get_status", "v2_get_player", "get_queue", "v2_get_queue"];
+const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey_system"];
+const INV_CARGO    = ["get_cargo", "v2_get_cargo"];
+const INV_SHIP     = ["get_ship", "v2_get_ship"];
+const INV_MISSIONS = ["get_missions", "v2_get_missions"];
+const INV_STORAGE  = ["view_storage", "view_faction_storage"];
+const INV_MARKET   = ["view_market", "view_orders"];
+
+/** Which cache entries to invalidate when a mutation command succeeds. */
+const MUTATION_INVALIDATIONS: Record<string, string[]> = {
+  travel:   [...INV_STATUS, ...INV_CARGO],
+  jump:     [...INV_STATUS, ...INV_LOCATION],
+  dock:     [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET],
+  undock:   INV_STATUS,
+  mine:     [...INV_STATUS, ...INV_CARGO],
+  sell:     [...INV_STATUS, ...INV_CARGO, ...INV_MARKET],
+  buy:      [...INV_STATUS, ...INV_CARGO, ...INV_MARKET],
+  jettison: [...INV_STATUS, ...INV_CARGO],
+  craft:    [...INV_STATUS, ...INV_CARGO],
+  loot:     [...INV_STATUS, ...INV_CARGO],
+  salvage:  [...INV_STATUS, ...INV_CARGO],
+  withdraw_items:           [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
+  deposit_items:            [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
+  faction_withdraw_items:   [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
+  faction_deposit_items:    [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
+  faction_deposit_credits:  INV_STATUS,
+  faction_withdraw_credits: INV_STATUS,
+  create_sell_order: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET],
+  create_buy_order:  [...INV_STATUS, ...INV_MARKET],
+  cancel_order:      [...INV_STATUS, ...INV_MARKET],
+  install_mod:   [...INV_STATUS, ...INV_SHIP, ...INV_CARGO],
+  uninstall_mod: [...INV_STATUS, ...INV_SHIP, ...INV_CARGO],
+  repair:        [...INV_STATUS, ...INV_SHIP],
+  refuel:        [...INV_STATUS, ...INV_SHIP],
+  accept_mission:   [...INV_STATUS, ...INV_MISSIONS],
+  complete_mission: [...INV_STATUS, ...INV_MISSIONS],
+  abandon_mission:  [...INV_STATUS, ...INV_MISSIONS],
+  decline_mission:  [...INV_STATUS, ...INV_MISSIONS],
+  cloak:  INV_STATUS,
+  attack: [...INV_STATUS, ...INV_SHIP],
+};
+
 // Commands with sub-actions that route through v2 endpoints instead of v1.
 // v1: POST /api/v1/{command} { action: "sub", ...params }
 // v2: POST /api/v2/spacemolt_{command}/{action} { ...params }
@@ -37,6 +145,7 @@ export class SpaceMoltAPI {
   private v2Session: ApiSession | null = null;
   private credentials: { username: string; password: string } | null = null;
   private _rateLimitRetries = 0;
+  private _cache = new ResponseCache();
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
@@ -57,6 +166,14 @@ export class SpaceMoltAPI {
   }
 
   async execute(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
+    // Return cached response for read-only commands when fresh
+    const cacheTtl = COMMAND_TTL[command];
+    const cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
+    if (cacheTtl !== undefined) {
+      const cached = this._cache.get(cacheKey);
+      if (cached) return cached;
+    }
+
     const needsV2 = this.isV2Command(command, payload);
     try {
       await this.ensureSession();
@@ -108,7 +225,8 @@ export class SpaceMoltAPI {
           this.session = null;
           await this.ensureSession();
         }
-        return this.doRequest(command, payload);
+        // Fall through with fresh request so cache logic runs below
+        resp = await this.doRequest(command, payload);
       }
     }
 
@@ -122,6 +240,16 @@ export class SpaceMoltAPI {
       } else {
         this.session = resp.session;
       }
+    }
+
+    if (!resp.error) {
+      // Cache successful read responses
+      if (cacheTtl !== undefined) {
+        this._cache.set(cacheKey, resp, cacheTtl);
+      }
+      // Invalidate affected caches on successful mutations
+      const toInvalidate = MUTATION_INVALIDATIONS[command];
+      if (toInvalidate) this._cache.invalidate(toInvalidate);
     }
 
     return resp;

@@ -1,4 +1,5 @@
 import { log, logError } from "./ui.js";
+import { cachedFetch } from "./httpcache.js";
 
 export interface GameCommandInfo {
   name: string;
@@ -18,9 +19,7 @@ export async function fetchGameCommands(baseUrl: string): Promise<GameCommandInf
 
   let spec: any;
   try {
-    const resp = await fetch(specUrl);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    spec = await resp.json();
+    spec = await cachedFetch(specUrl, 60 * 60_000); // 1hr fallback TTL
   } catch (err) {
     logError(`Failed to fetch OpenAPI spec from ${specUrl}: ${err instanceof Error ? err.message : err}`);
     log("system", "Falling back to empty command list — agent can use get_commands at runtime");

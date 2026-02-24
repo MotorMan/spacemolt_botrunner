@@ -1,6 +1,7 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
+import { cachedFetch } from "../httpcache.js";
 import {
   ensureDocked,
   tryRefuel,
@@ -91,61 +92,57 @@ const GLOBAL_MARKET_URL = "https://game.spacemolt.com/api/market";
 async function fetchGlobalMarket(
   log: (tag: string, msg: string) => void,
 ): Promise<GlobalMarketData | null> {
+  let raw: unknown;
   try {
-    const resp = await fetch(GLOBAL_MARKET_URL, {
+    raw = await cachedFetch(GLOBAL_MARKET_URL, 5 * 60_000, { // 5min fallback TTL
       signal: AbortSignal.timeout(10_000),
     });
-    if (!resp.ok) {
-      log("error", `Global market fetch failed: HTTP ${resp.status}`);
-      return null;
-    }
-
-    const raw = await resp.json() as unknown;
-    const entries: GlobalMarketEntry[] = Array.isArray(raw)
-      ? (raw as GlobalMarketEntry[])
-      : Array.isArray((raw as Record<string, unknown>).items)
-        ? ((raw as Record<string, unknown>).items as GlobalMarketEntry[])
-        : [];
-
-    const bidByItem = new Map<string, { bestPrice: number; totalQty: number; empires: string[] }>();
-    const askByItem = new Map<string, number>();
-    const baseValues = new Map<string, number>();
-
-    for (const entry of entries) {
-      const id = entry.item_id;
-      if (!id) continue;
-
-      if (entry.base_value > 0) baseValues.set(id, entry.base_value);
-
-      if (entry.best_bid > 0 && entry.bid_quantity > 0) {
-        const existing = bidByItem.get(id);
-        if (!existing) {
-          bidByItem.set(id, {
-            bestPrice: entry.best_bid,
-            totalQty: entry.bid_quantity,
-            empires: [entry.empire],
-          });
-        } else {
-          if (entry.best_bid > existing.bestPrice) existing.bestPrice = entry.best_bid;
-          existing.totalQty += entry.bid_quantity;
-          if (!existing.empires.includes(entry.empire)) existing.empires.push(entry.empire);
-        }
-      }
-
-      if (entry.best_ask > 0 && entry.ask_quantity > 0) {
-        const existing = askByItem.get(id);
-        if (existing === undefined || entry.best_ask < existing) {
-          askByItem.set(id, entry.best_ask);
-        }
-      }
-    }
-
-    log("coord", `Global market: ${entries.length} entries, ${bidByItem.size} items with buy demand`);
-    return { bidByItem, askByItem, baseValues };
   } catch (err) {
-    log("error", `Global market fetch error: ${err instanceof Error ? err.message : String(err)}`);
+    log("error", `Global market fetch failed: ${err instanceof Error ? err.message : err}`);
     return null;
   }
+
+  const entries: GlobalMarketEntry[] = Array.isArray(raw)
+    ? (raw as GlobalMarketEntry[])
+    : Array.isArray((raw as Record<string, unknown>).items)
+      ? ((raw as Record<string, unknown>).items as GlobalMarketEntry[])
+      : [];
+
+  const bidByItem = new Map<string, { bestPrice: number; totalQty: number; empires: string[] }>();
+  const askByItem = new Map<string, number>();
+  const baseValues = new Map<string, number>();
+
+  for (const entry of entries) {
+    const id = entry.item_id;
+    if (!id) continue;
+
+    if (entry.base_value > 0) baseValues.set(id, entry.base_value);
+
+    if (entry.best_bid > 0 && entry.bid_quantity > 0) {
+      const existing = bidByItem.get(id);
+      if (!existing) {
+        bidByItem.set(id, {
+          bestPrice: entry.best_bid,
+          totalQty: entry.bid_quantity,
+          empires: [entry.empire],
+        });
+      } else {
+        if (entry.best_bid > existing.bestPrice) existing.bestPrice = entry.best_bid;
+        existing.totalQty += entry.bid_quantity;
+        if (!existing.empires.includes(entry.empire)) existing.empires.push(entry.empire);
+      }
+    }
+
+    if (entry.best_ask > 0 && entry.ask_quantity > 0) {
+      const existing = askByItem.get(id);
+      if (existing === undefined || entry.best_ask < existing) {
+        askByItem.set(id, entry.best_ask);
+      }
+    }
+  }
+
+  log("coord", `Global market: ${entries.length} entries, ${bidByItem.size} items with buy demand`);
+  return { bidByItem, askByItem, baseValues };
 }
 
 // ── Recipe parsing ───────────────────────────────────────────

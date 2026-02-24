@@ -3160,6 +3160,7 @@ let autoRouteInProgress = false;
 
 function mcAutoRoute() {
   if (!profileBot) return;
+  const routeBot = profileBot; // capture now — bot switches must not redirect jumps
   const target = val('mc-jump-sys');
   if (!target) return;
   if (autoRouteInProgress) {
@@ -3174,7 +3175,7 @@ function mcAutoRoute() {
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
   logResponse(`<span class="resp-cmd">${ts} > find_route to ${esc(target)}</span>`);
 
-  sendExec(profileBot, 'find_route', { target_system: target }, async (result) => {
+  sendExec(routeBot, 'find_route', { target_system: target }, async (result) => {
     if (!result.ok || !result.data) {
       logResponse(`<span class="resp-err">Route failed: ${esc(result.error || 'no route data')}</span>`);
       autoRouteInProgress = false;
@@ -3193,7 +3194,7 @@ function mcAutoRoute() {
 
     // Route is an array of system IDs — first entry is current system, skip it
     const allHops = route.map(h => typeof h === 'string' ? h : (h.system_id || h.id || h));
-    const bot = getProfileBot();
+    const bot = bots.find(b => b.username === routeBot);
     const currentSys = bot ? (bot.system || '') : '';
     const hops = allHops[0] === currentSys ? allHops.slice(1) : allHops;
     logResponse(`<span class="resp-ok">Route: ${allHops.map(h => esc(resolveLocation(String(h)) || String(h))).join(' → ')} (${hops.length} jump${hops.length !== 1 ? 's' : ''})</span>`);
@@ -3207,7 +3208,7 @@ function mcAutoRoute() {
       logResponse(`<span class="resp-cmd">${hopTs} > jump ${esc(hop)} (${i + 1}/${hops.length})</span>`);
 
       const jumpOk = await new Promise(resolve => {
-        sendExec(profileBot, 'jump', { target_system: hop }, (jr) => {
+        sendExec(routeBot, 'jump', { target_system: hop }, (jr) => {
           if (jr.ok) {
             logResponse(`<span class="resp-ok">Arrived in ${esc(hop)}</span>`);
             resolve(true);
@@ -3232,8 +3233,8 @@ function mcAutoRoute() {
 
     // Refresh system data for new location
     setTimeout(() => {
-      if (profileBot) {
-        fetchSystemData(profileBot);
+      fetchSystemData(routeBot);
+      if (profileBot === routeBot) {
         renderProfileSidebar();
         renderManualControls();
       }

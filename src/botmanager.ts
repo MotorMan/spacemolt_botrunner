@@ -154,8 +154,9 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   bot.start(routineKey, routine.fn, startOpts).then(() => {
     server.logSystem(`Bot ${bot.username} routine finished.`);
     server.clearBotAssignment(botName);
-  }).catch((err) => {
-    server.logSystem(`Bot ${bot.username} crashed: ${err}`);
+  }).catch((err: unknown) => {
+    const msg = err instanceof Error ? err.message : String(err);
+    server.logSystem(`Bot ${bot.username} stopped with error: ${msg}`);
     server.clearBotAssignment(botName);
   });
 
@@ -256,8 +257,7 @@ async function handleRegister(action: WebAction): Promise<WebActionResult> {
     return { ok: false, error: "No password returned" };
   }
 
-  server.logSystem(`Registration successful! PASSWORD: ${password}`);
-  server.logSystem("SAVE THIS PASSWORD! It cannot be recovered.");
+  server.logSystem(`Registration successful for ${username} — password returned to dashboard only.`);
 
   const session = new SessionManager(username, BASE_DIR);
   session.saveCredentials({ username, password, empire: selectedEmpire, playerId });

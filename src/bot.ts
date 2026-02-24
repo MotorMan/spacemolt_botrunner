@@ -391,7 +391,11 @@ export class Bot {
     // Only login if we don't already have an active session
     if (!this.api.getSession()) {
       const loggedIn = await this.login();
-      if (!loggedIn) return;
+      if (!loggedIn) {
+        // login() already set _state = "error" and _error; throw so the caller's
+        // .catch() handler fires instead of .then() (which would log "routine finished").
+        throw new Error(this._error || "Login failed");
+      }
     }
 
     this.log("system", `Starting routine: ${routineName}`);
@@ -417,7 +421,9 @@ export class Bot {
       this._error = msg;
       this.log("error", `Routine error: ${msg}`);
       this._state = "error";
-      return;
+      // Re-throw so the caller's .catch() handler fires, ensuring the bot
+      // assignment is cleared and "crashed" is logged rather than "finished".
+      throw err;
     }
 
     this._state = "idle";

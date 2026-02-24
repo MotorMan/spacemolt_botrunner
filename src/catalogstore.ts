@@ -53,6 +53,7 @@ class CatalogStore {
   private data: CatalogData;
   private dirty = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private _fetchPromise: Promise<void> | null = null;
 
   constructor() {
     this.data = this.load();
@@ -115,6 +116,17 @@ class CatalogStore {
 
   /** Paginate all 4 catalog types and store results. */
   async fetchAll(api: SpaceMoltAPI): Promise<void> {
+    // If a fetch is already in progress, wait for it rather than running a
+    // concurrent fetch that would partially overwrite results.
+    if (this._fetchPromise) return this._fetchPromise;
+
+    this._fetchPromise = this._doFetchAll(api).finally(() => {
+      this._fetchPromise = null;
+    });
+    return this._fetchPromise;
+  }
+
+  private async _doFetchAll(api: SpaceMoltAPI): Promise<void> {
     const types = ["items", "ships", "skills", "recipes"] as const;
     const results: Record<string, Record<string, unknown>> = {
       items: {},

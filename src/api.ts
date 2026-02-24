@@ -61,7 +61,11 @@ export class SpaceMoltAPI {
     try {
       await this.ensureSession();
       if (needsV2) await this.ensureV2Session();
-    } catch {
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.startsWith("Login failed:")) {
+        return { error: { code: "login_failed", message: msg } };
+      }
       return { error: { code: "connection_failed", message: "Could not connect to server" } };
     }
 
@@ -77,7 +81,11 @@ export class SpaceMoltAPI {
         await this.ensureSession();
         if (needsV2) await this.ensureV2Session();
         resp = await this.doRequest(command, payload);
-      } catch {
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (msg.startsWith("Login failed:")) {
+          return { error: { code: "login_failed", message: msg } };
+        }
         return { error: { code: "connection_failed", message: "Could not reconnect to server" } };
       }
     }
@@ -161,10 +169,11 @@ export class SpaceMoltAPI {
             password: this.credentials.password,
           });
           if (loginResp.error) {
-            logError(`Login failed: ${loginResp.error.message}`);
-          } else {
-            log("system", "Logged in successfully");
+            // Throw so callers get an explicit error rather than continuing with
+            // an unauthenticated session that will fail on every subsequent request.
+            throw new Error(`Login failed: ${loginResp.error.message}`);
           }
+          log("system", "Logged in successfully");
           // Login may return a new session — capture it
           if (loginResp.session) {
             this.session = loginResp.session;

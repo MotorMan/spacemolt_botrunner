@@ -268,6 +268,32 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     }
 
     if (routes.length === 0) {
+      // If not at home, go there — faction storage is only visible at the home station
+      const homeSystem = settings.homeSystem || startSystem;
+      const homeStationPoi = settings.homeStation || null;
+      const atHome = (!homeSystem || bot.system === homeSystem) && (!homeStationPoi || bot.poi === homeStationPoi);
+      if (!atHome) {
+        ctx.log("trade", "No faction storage items to sell — returning home to check faction storage");
+        yield "return_home";
+        if (homeSystem && bot.system !== homeSystem) {
+          await ensureUndocked(ctx);
+          const homeFueled = await ensureFueled(ctx, settings.refuelThreshold);
+          if (homeFueled) {
+            await navigateToSystem(ctx, homeSystem, {
+              fuelThresholdPct: settings.refuelThreshold,
+              hullThresholdPct: settings.repairThreshold,
+            });
+          }
+        }
+        if (homeStationPoi && bot.poi !== homeStationPoi) {
+          await ensureUndocked(ctx);
+          const tResp = await bot.exec("travel", { target_poi: homeStationPoi });
+          if (!tResp.error || tResp.error.message.includes("already")) {
+            bot.poi = homeStationPoi;
+          }
+        }
+        continue;
+      }
       ctx.log("trade", "No faction storage items to sell — waiting 60s");
       await sleep(60000);
       continue;

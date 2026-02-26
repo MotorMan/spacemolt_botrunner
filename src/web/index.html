@@ -2487,15 +2487,20 @@ function refreshFactionFunds() {
   if (!pick) return;
 
   _factionFundsInFlight = true;
-  sendExec(pick.username, 'faction_info', undefined, (result) => {
+  // faction_info does not return credits/treasury — use view_faction_storage with a
+  // station_id placeholder which bypasses the docking requirement and returns credits.
+  sendExec(pick.username, 'view_faction_storage', { station_id: 'any' }, (result) => {
     _factionFundsInFlight = false;
     if (result.ok && result.data) {
-      factionData = result.data;
-      const treasury = factionData.treasury ?? factionData.credits ?? null;
-      const label = treasury != null ? num(treasury) + 'cr' : '-';
-      document.getElementById('statFaction').textContent = label;
-      const pEl = document.getElementById('pStatFaction');
-      if (pEl) pEl.textContent = label;
+      const credits = result.data.credits ?? null;
+      if (credits != null) {
+        // Merge credits into factionData so renderStats() can also use it
+        if (factionData) factionData.treasury = credits;
+        const label = num(credits) + 'cr';
+        document.getElementById('statFaction').textContent = label;
+        const pEl = document.getElementById('pStatFaction');
+        if (pEl) pEl.textContent = label;
+      }
     }
   });
 }
@@ -5898,7 +5903,13 @@ function fetchFactionInfo(username) {
       return;
     }
     factionData = result.data;
-    renderFactionContent(username);
+    // faction_info doesn't include treasury — fetch it separately
+    sendExec(username, 'view_faction_storage', { station_id: 'any' }, (storageResult) => {
+      if (storageResult.ok && storageResult.data && storageResult.data.credits != null) {
+        factionData.treasury = storageResult.data.credits;
+      }
+      if (factionSelectedBot === username) renderFactionContent(username);
+    });
   });
 }
 

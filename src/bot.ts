@@ -464,25 +464,28 @@ export class Bot {
 
     const r = resp.result as Record<string, unknown>;
 
-    // Build a unified list of { id, name, level } from various API shapes:
-    //   1. Array at top level: [{ skill_id, name, level }, ...]
-    //   2. Array nested under .skills: { skills: [...] }
-    //   3. Dict keyed by skill_id: { crafting_basic: { level: 7, name: "..." }, ... }
-    //   4. Dict keyed by skill_id with numeric values: { crafting_basic: 7, ... }
+    // Resolve the skills container — handles all known API shapes:
+    //   Array at top level:          [{ skill_id, name, level }, ...]
+    //   Array nested under .skills:  { skills: [{ skill_id, ... }] }
+    //   Dict nested under .skills:   { skills: { crafting_basic: { level, xp, ... } } }
+    //   Dict at top level:           { crafting_basic: { level, xp, ... } }
+    //   Dict with numeric values:    { crafting_basic: 7, ... }
+    let skillsContainer: unknown = r;
+    if (!Array.isArray(r) && r.skills !== undefined) {
+      skillsContainer = r.skills;
+    }
+
     const entries: Array<{ id: string; name: string; level: number }> = [];
 
-    const rawArray: unknown[] = Array.isArray(r) ? r : Array.isArray(r.skills) ? r.skills as unknown[] : [];
-
-    if (rawArray.length > 0) {
-      for (const skill of rawArray as Array<Record<string, unknown>>) {
+    if (Array.isArray(skillsContainer)) {
+      for (const skill of skillsContainer as Array<Record<string, unknown>>) {
         const id = (skill.skill_id as string) || (skill.id as string) || (skill.name as string) || "";
         const name = (skill.name as string) || id;
         const level = (skill.level as number) ?? 0;
         if (id) entries.push({ id, name, level });
       }
-    } else {
-      // Dict format
-      for (const [key, val] of Object.entries(r)) {
+    } else if (skillsContainer && typeof skillsContainer === "object") {
+      for (const [key, val] of Object.entries(skillsContainer as Record<string, unknown>)) {
         if (typeof val === "number") {
           entries.push({ id: key, name: key, level: val });
         } else if (val && typeof val === "object") {

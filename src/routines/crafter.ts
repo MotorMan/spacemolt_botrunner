@@ -657,6 +657,12 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
             hitSkillBlock = true;
           } else if (msg.includes("material") || msg.includes("component") || msg.includes("insufficient")) {
             missingSummary.push(`${recipe.name} (no materials)`);
+            // Diagnostic: log what the local recipe expects vs what's actually in cargo
+            const componentList = recipe.components.map(c => {
+              const inCargo = countInCargo(ctx, c.item_id);
+              return `${c.item_id}(need ${c.quantity}, have ${inCargo})`;
+            }).join(", ");
+            ctx.log("error", `${recipe.name} components mismatch — local recipe: [${componentList}]`);
           } else {
             ctx.log("error", `Craft ${recipe.name}: ${craftResp.error.message}`);
           }

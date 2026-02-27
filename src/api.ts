@@ -79,6 +79,7 @@ const COMMAND_TTL: Record<string, number> = {
   v2_get_skills:         120_000,
   v2_get_queue:            5_000,
   v2_get_missions:        60_000,
+  catalog:             2_592_000_000, // 30 days TTL (effectively permanent for this use case)
 };
 
 // Cache groups for mutation invalidation
@@ -122,6 +123,7 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   decline_mission:  [...INV_STATUS, ...INV_MISSIONS],
   cloak:  INV_STATUS,
   attack: [...INV_STATUS, ...INV_SHIP],
+  catalog: [], // No invalidation needed for read-only catalog
 };
 
 // Commands with sub-actions that route through v2 endpoints instead of v1.
@@ -135,6 +137,7 @@ const V2_ROUTED_COMMANDS = new Set(["facility"]);
 const V2_DIRECT_COMMANDS = new Set([
   "v2_get_ship", "v2_get_cargo", "v2_get_player",
   "v2_get_queue", "v2_get_skills", "v2_get_missions",
+  "catalog",
 ]);
 const MAX_RECONNECT_ATTEMPTS = 6;
 const RECONNECT_BASE_DELAY = 5_000; // 5s, 10s, 20s, 40s, 80s, 160s
@@ -171,7 +174,11 @@ export class SpaceMoltAPI {
     const cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
     if (cacheTtl !== undefined) {
       const cached = this._cache.get(cacheKey);
-      if (cached) return cached;
+      if (cached) {
+        log("activity", `CACHE HIT: ${command} (${cacheKey})`);
+        return cached;
+      }
+      log("activity", `CACHE MISS: ${command} (${cacheKey})`);
     }
 
     const needsV2 = this.isV2Command(command, payload);

@@ -55,12 +55,12 @@ export function isMinablePoi(type: string): boolean {
     || t.includes("belt") || t.includes("resource");
 }
 
-/** Check if a POI is an ore belt (asteroid belt/field/ring — NOT gas clouds or ice fields). */
+/** Check if a POI is an ore belt (asteroid belt/field/ring/nebula — NOT gas clouds or ice fields). */
 export function isOreBeltPoi(type: string): boolean {
   const t = type.toLowerCase();
-  if (t.includes("gas") || t.includes("cloud") || t.includes("nebula") || t.includes("ice")) return false;
+  if (t.includes("gas") || t.includes("cloud") || t.includes("ice")) return false;
   return t.includes("asteroid") || t.includes("belt") || t.includes("ring")
-    || t.includes("field") || t.includes("resource");
+    || t.includes("field") ||  t.includes("nebula") || t.includes("resource");
 }
 
 /** Check if a POI is a gas cloud. */

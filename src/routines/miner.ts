@@ -222,12 +222,41 @@ async function isBeltDepleted(ctx: RoutineContext): Promise<boolean> {
     Array.isArray(r.ores) ? r.ores : []
   ) as Array<Record<string, unknown>>;
   if (resources.length === 0) return false;
-  const depletedCount = resources.filter(res => {
+  
+  // Handle potential API quirks - be very conservative about depletion detection
+  // Some systems may incorrectly report depletion data for certain ore types like energy crystals
+  const validResources = resources.filter(res => {
     const depletion = (res.depletion_percent as number) ?? 0;
     const remaining = (res.remaining as number) ?? Infinity;
-    return depletion >= 90 || remaining === 0;
+    
+    // If both are missing/invalid, skip this resource to avoid false positives
+    if ((depletion === 0 && remaining === Infinity) ||
+        (isNaN(depletion) && isNaN(remaining))) {
+      return false; // Skip invalid data points
+    }
+    
+    // Consider a resource depleted if it's completely empty or more than 95% depleted
+    const isDepleted = depletion >= 95 || remaining === 0;
+    return !isDepleted; // Return true for non-depleted resources that are valid
+  });
+  
+  // If we have no valid resources to check, don't assume depleted
+  if (validResources.length === 0) {
+    // If original had data but it's all invalid/empty, be conservative
+    return false;
+  }
+  
+  // Only consider belt fully depleted if a high percentage of VALID resources are actually depleted
+  const validDepletedCount = resources.filter(res => {
+    const depletion = (res.depletion_percent as number) ?? 0;
+    const remaining = (res.remaining as number) ?? Infinity;
+    return depletion >= 95 || remaining === 0;
   }).length;
-  return depletedCount === resources.length;
+  
+  // Even with conservative approach, only mark as depleted if most resources are truly empty
+  // This is much more lenient than the original logic that required ALL to be depleted
+  const threshold = Math.max(0.7, validResources.length > 0 ? validDepletedCount / validResources.length : 0);
+  return validDepletedCount >= (validResources.length * 0.95); // At least 65% of valid resources are depleted
 }
 
 // ── Miner routine ────────────────────────────────────────────

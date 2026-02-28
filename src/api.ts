@@ -174,11 +174,7 @@ export class SpaceMoltAPI {
     const cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
     if (cacheTtl !== undefined) {
       const cached = this._cache.get(cacheKey);
-      if (cached) {
-        log("activity", `CACHE HIT: ${command} (${cacheKey})`);
-        return cached;
-      }
-      log("activity", `CACHE MISS: ${command} (${cacheKey})`);
+      if (cached) return cached;
     }
 
     const needsV2 = this.isV2Command(command, payload);
@@ -498,4 +494,14 @@ export class SpaceMoltAPI {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
-} //a change because i messed up staging.
+}
+
+
+
+
+
+
+
+
+
+

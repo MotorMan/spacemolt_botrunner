@@ -445,7 +445,7 @@ async function main(): Promise<void> {
     server.logSystem(`Found ${bots.size} saved bot(s): ${[...bots.keys()].join(", ")}`);
 
     // Stagger logins to avoid spamming the API
-    const LOGIN_DELAY_MS = 5000;
+    const LOGIN_DELAY_MS = 15000;
     let loginIndex = 0;
     for (const [name, bot] of bots) {
       const delay = loginIndex * LOGIN_DELAY_MS;

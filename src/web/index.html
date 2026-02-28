@@ -5557,12 +5557,23 @@ function appendLines(el, panel, lines) {
   for (const line of lines) fragment.appendChild(makeLogLine(line));
   el.appendChild(fragment);
   if (autoScroll[panel]) el.scrollTop = el.scrollHeight;
+  
+  // Limit to 200 lines maximum
+  while (el.children.length > 200) {
+    el.removeChild(el.firstChild);
+  }
 }
 
 function appendLine(panel, line) {
   const elMap = { activity: activityEl, broadcast: broadcastEl, system: systemEl };
   const el = elMap[panel];
   if (!el) return;
+  
+  // Limit to 200 lines maximum before adding new one
+  while (el.children.length >= 200) {
+    el.removeChild(el.firstChild);
+  }
+  
   el.appendChild(makeLogLine(line));
   if (autoScroll[panel]) el.scrollTop = el.scrollHeight;
 }

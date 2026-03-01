@@ -182,7 +182,7 @@ function countInCargo(ctx: RoutineContext, itemId: string): number {
 }
 
 /** Withdraw materials from station storage into cargo for a recipe. */
-async function withdrawStorageMaterials(ctx: RoutineContext, recipe: Recipe): Promise<void> {
+async function withdrawStorageMaterials(ctx: RoutineContext, recipe: Recipe, count?: number): Promise<void> {
   const { bot } = ctx;
   for (const comp of recipe.components) {
     const inCargo = countInCargo(ctx, comp.item_id);
@@ -192,7 +192,7 @@ async function withdrawStorageMaterials(ctx: RoutineContext, recipe: Recipe): Pr
     const freeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
     if (freeSpace <= 0) break;
 
-    const needed = comp.quantity - inCargo;
+    const needed = (comp.quantity * (count || 1)) - inCargo;
     const inStorage = bot.storage.find(i => i.itemId === comp.item_id);
     if (!inStorage || inStorage.quantity <= 0) continue;
 
@@ -207,7 +207,7 @@ async function withdrawStorageMaterials(ctx: RoutineContext, recipe: Recipe): Pr
 }
 
 /** Withdraw materials from faction storage into cargo for a recipe. */
-async function withdrawFactionMaterials(ctx: RoutineContext, recipe: Recipe): Promise<void> {
+async function withdrawFactionMaterials(ctx: RoutineContext, recipe: Recipe, count?: number): Promise<void> {
   const { bot } = ctx;
   for (const comp of recipe.components) {
     const inCargo = countInCargo(ctx, comp.item_id);
@@ -217,7 +217,7 @@ async function withdrawFactionMaterials(ctx: RoutineContext, recipe: Recipe): Pr
     const freeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
     if (freeSpace <= 0) break;
 
-    const needed = comp.quantity - inCargo;
+    const needed = (comp.quantity * (count || 1)) - inCargo;
     const inFaction = bot.factionStorage.find(i => i.itemId === comp.item_id);
     if (!inFaction || inFaction.quantity <= 0) continue;
 
@@ -600,12 +600,15 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
           await bot.refreshFactionStorage();
         }
 
+        const remaining = needed - crafted;
+        const batchSize = Math.min(remaining, 10); // This is what gets used in craft command!
+
         const missing = getMissingMaterial(ctx, recipe);
         if (missing) {
           // Materials not in cargo — try pulling from storage sources
           if (hasMaterialsAnywhere(ctx, recipe)) {
-            await withdrawFactionMaterials(ctx, recipe);
-            await withdrawStorageMaterials(ctx, recipe);
+            await withdrawFactionMaterials(ctx, recipe, batchSize);
+            await withdrawStorageMaterials(ctx, recipe, batchSize);
             const stillMissing = getMissingMaterial(ctx, recipe);
             if (stillMissing) {
               // Try crafting the missing prerequisites
@@ -615,8 +618,8 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
                 // Refresh and re-withdraw after crafting prereqs
                 await bot.refreshCargo();
                 if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
-                await withdrawFactionMaterials(ctx, recipe);
-                await withdrawStorageMaterials(ctx, recipe);
+                await withdrawFactionMaterials(ctx, recipe, batchSize);
+                await withdrawStorageMaterials(ctx, recipe, batchSize);
               }
               const finalMissing = getMissingMaterial(ctx, recipe);
               if (finalMissing) {
@@ -631,8 +634,8 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
               prereqSummary.push(...preCrafted);
               await bot.refreshCargo();
               if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
-              await withdrawFactionMaterials(ctx, recipe);
-              await withdrawStorageMaterials(ctx, recipe);
+              await withdrawFactionMaterials(ctx, recipe, batchSize);
+              await withdrawStorageMaterials(ctx, recipe, batchSize);
               const finalMissing = getMissingMaterial(ctx, recipe);
               if (finalMissing) {
                 missingSummary.push(`${recipe.name} (${finalMissing.need}x ${finalMissing.name})`);
@@ -645,8 +648,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
 
-        const remaining = needed - crafted;
-        const batchSize = Math.min(remaining, 10);
+        
 
         yield `craft_${recipeId}`;
         const craftResp = await bot.exec("craft", { recipe_id: recipeId, count: batchSize });
@@ -746,3 +748,4 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     await sleep(60000);
   }
 };
+

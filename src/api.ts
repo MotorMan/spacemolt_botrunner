@@ -1,4 +1,5 @@
 import { log, logError } from "./ui.js";
+import { commandLog } from "./commandLogger.js";
 
 export interface ApiSession {
   id: string;
@@ -169,6 +170,9 @@ export class SpaceMoltAPI {
   }
 
   async execute(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
+    // Log the command being executed to debugCommands.log
+    commandLog("api", `Executing command: ${command}`, { command, payload });
+
     // Return cached response for read-only commands when fresh
     const cacheTtl = COMMAND_TTL[command];
     const cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
@@ -495,13 +499,4 @@ export class SpaceMoltAPI {
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-
-
-
-
-
-
-
-
 

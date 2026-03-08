@@ -3541,7 +3541,7 @@ const QUERY_COMMANDS = new Set([
   'find_route', 'get_commands', 'get_base', 'get_notes', 'get_version',
   'estimate_purchase', 'get_insurance_quote', 'facility',
 ]);
-const TICK_COOLDOWN_MS = 10000;
+const TICK_COOLDOWN_MS = 1000; //changed to 1sec from 10.
 let lastActionTime = {};
 let cooldownTimer = null;
 
@@ -3586,7 +3586,7 @@ function mcExec(command, params) {
           const pBot = bots.find(b => b.username === profileBot);
           if (pBot && pBot.docked) fetchMarket(profileBot);
         }
-      }, 1000);
+      }, 100);
     }
   });
 }
@@ -3632,7 +3632,7 @@ function sendExec(botName, command, params, callback) {
         delete execCallbacks[seq];
       }
       delete execTimers[seq];
-    }, 30000);
+    }, 120000);
   }
   const msg = { type: 'exec', bot: botName, command, params, _seq: seq };
   if (ws && ws.readyState === WebSocket.OPEN) {

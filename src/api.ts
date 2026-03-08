@@ -94,17 +94,17 @@ const INV_MARKET   = ["view_market", "view_orders"];
 
 /** Which cache entries to invalidate when a mutation command succeeds. */
 const MUTATION_INVALIDATIONS: Record<string, string[]> = {
-  travel:   [...INV_STATUS, ...INV_CARGO],
+  travel:   [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
   jump:     [...INV_STATUS, ...INV_LOCATION],
-  dock:     [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET],
+  dock:     [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION],
   undock:   INV_STATUS,
-  mine:     [...INV_STATUS, ...INV_CARGO],
+  mine:     [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
   sell:     [...INV_STATUS, ...INV_CARGO, ...INV_MARKET],
   buy:      [...INV_STATUS, ...INV_CARGO, ...INV_MARKET],
-  jettison: [...INV_STATUS, ...INV_CARGO],
+  jettison: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
   craft:    [...INV_STATUS, ...INV_CARGO],
-  loot:     [...INV_STATUS, ...INV_CARGO],
-  salvage:  [...INV_STATUS, ...INV_CARGO],
+  loot:     [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
+  salvage:  [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
   withdraw_items:           [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
   deposit_items:            [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
   faction_withdraw_items:   [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
@@ -116,14 +116,14 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   cancel_order:      [...INV_STATUS, ...INV_MARKET],
   install_mod:   [...INV_STATUS, ...INV_SHIP, ...INV_CARGO],
   uninstall_mod: [...INV_STATUS, ...INV_SHIP, ...INV_CARGO],
-  repair:        [...INV_STATUS, ...INV_SHIP],
-  refuel:        [...INV_STATUS, ...INV_SHIP],
+  repair:        [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
+  refuel:        [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
   accept_mission:   [...INV_STATUS, ...INV_MISSIONS],
   complete_mission: [...INV_STATUS, ...INV_MISSIONS],
   abandon_mission:  [...INV_STATUS, ...INV_MISSIONS],
   decline_mission:  [...INV_STATUS, ...INV_MISSIONS],
   cloak:  INV_STATUS,
-  attack: [...INV_STATUS, ...INV_SHIP],
+  attack: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
   catalog: [], // No invalidation needed for read-only catalog
 };
 
@@ -140,8 +140,9 @@ const V2_DIRECT_COMMANDS = new Set([
   "v2_get_queue", "v2_get_skills", "v2_get_missions",
   "catalog",
 ]);
-const MAX_RECONNECT_ATTEMPTS = 6;
-const RECONNECT_BASE_DELAY = 5_000; // 5s, 10s, 20s, 40s, 80s, 160s
+const MAX_RECONNECT_ATTEMPTS = 12;
+const RECONNECT_BASE_DELAY = 10_000; // 10s, 20s, 40s, 80s, 160s, 320s, ... (exponential)
+const RECONNECT_COOLDOWN_MS = 60_000; // Minimum time between reconnection attempts after exhausting retries
 
 export class SpaceMoltAPI {
   readonly baseUrl: string;
@@ -150,6 +151,10 @@ export class SpaceMoltAPI {
   private credentials: { username: string; password: string } | null = null;
   private _rateLimitRetries = 0;
   private _cache = new ResponseCache();
+  /** Timestamp when we can next attempt reconnection (circuit breaker). */
+  private _reconnectAllowedAt = 0;
+  /** Track which reconnection attempt we're on for staggered retries. */
+  private _reconnectAttempt = 0;
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
@@ -181,7 +186,15 @@ export class SpaceMoltAPI {
       if (cached) return cached;
     }
 
+    // Circuit breaker: skip reconnection attempts if we're still in cooldown
+    const now = Date.now();
+    if (now < this._reconnectAllowedAt) {
+      const waitSecs = Math.ceil((this._reconnectAllowedAt - now) / 1000);
+      return { error: { code: "connection_failed", message: `Server unreachable — reconnecting in ${waitSecs}s` } };
+    }
+
     const needsV2 = this.isV2Command(command, payload);
+    // ensureSession() already has retry logic with exponential backoff built-in
     try {
       await this.ensureSession();
       if (needsV2) await this.ensureV2Session();
@@ -190,7 +203,13 @@ export class SpaceMoltAPI {
       if (msg.startsWith("Login failed:")) {
         return { error: { code: "login_failed", message: msg } };
       }
-      return { error: { code: "connection_failed", message: "Could not connect to server" } };
+      // ensureSession() already exhausted all retries, set circuit breaker
+      // Stagger reconnection: each bot waits longer based on its attempt count
+      const staggerDelay = this._reconnectAttempt * 5000; // 0s, 5s, 10s, 15s... per bot
+      this._reconnectAllowedAt = Date.now() + RECONNECT_COOLDOWN_MS + staggerDelay;
+      this._reconnectAttempt++;
+      log("system", `Connection failed — waiting ${RECONNECT_COOLDOWN_MS / 1000 + staggerDelay / 1000}s before next reconnect attempt`);
+      return { error: { code: "connection_failed", message: "Could not connect to server after retries" } };
     }
 
     let resp: ApiResponse;
@@ -210,6 +229,11 @@ export class SpaceMoltAPI {
         if (msg.startsWith("Login failed:")) {
           return { error: { code: "login_failed", message: msg } };
         }
+        // Connection failed — set circuit breaker to prevent rapid retries
+        const staggerDelay = this._reconnectAttempt * 5000;
+        this._reconnectAllowedAt = Date.now() + RECONNECT_COOLDOWN_MS + staggerDelay;
+        this._reconnectAttempt++;
+        log("system", `Connection failed — waiting ${RECONNECT_COOLDOWN_MS / 1000 + staggerDelay / 1000}s before next reconnect attempt`);
         return { error: { code: "connection_failed", message: "Could not reconnect to server" } };
       }
     }
@@ -219,7 +243,7 @@ export class SpaceMoltAPI {
       const code = resp.error.code;
 
       if (code === "rate_limited") {
-        const secs = resp.error.wait_seconds || 10;
+        const secs = resp.error.wait_seconds || 20;
         this._rateLimitRetries++;
         if (this._rateLimitRetries >= 5) {
           log("error", `Rate limited ${this._rateLimitRetries} times, giving up on ${command}`);
@@ -235,10 +259,32 @@ export class SpaceMoltAPI {
         log("system", `Session expired (${needsV2 ? "v2" : "v1"}), refreshing...`);
         if (needsV2) {
           this.v2Session = null;
-          await this.ensureV2Session();
+          try {
+            await this.ensureV2Session();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!msg.startsWith("Login failed:")) {
+              const staggerDelay = this._reconnectAttempt * 5000;
+              this._reconnectAllowedAt = Date.now() + RECONNECT_COOLDOWN_MS + staggerDelay;
+              this._reconnectAttempt++;
+              log("system", `Connection failed — waiting ${RECONNECT_COOLDOWN_MS / 1000 + staggerDelay / 1000}s before next reconnect attempt`);
+            }
+            return { error: { code: "connection_failed", message: "Could not reconnect to server" } };
+          }
         } else {
           this.session = null;
-          await this.ensureSession();
+          try {
+            await this.ensureSession();
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (!msg.startsWith("Login failed:")) {
+              const staggerDelay = this._reconnectAttempt * 5000;
+              this._reconnectAllowedAt = Date.now() + RECONNECT_COOLDOWN_MS + staggerDelay;
+              this._reconnectAttempt++;
+              log("system", `Connection failed — waiting ${RECONNECT_COOLDOWN_MS / 1000 + staggerDelay / 1000}s before next reconnect attempt`);
+            }
+            return { error: { code: "connection_failed", message: "Could not reconnect to server" } };
+          }
         }
         // Fall through with fresh request so cache logic runs below
         resp = await this.doRequest(command, payload);
@@ -247,6 +293,14 @@ export class SpaceMoltAPI {
 
     // Reset rate-limit counter on success
     this._rateLimitRetries = 0;
+    
+    // Reset circuit breaker on successful connection
+    // This allows immediate reconnection attempts after the server comes back
+    if (this._reconnectAllowedAt > 0) {
+      this._reconnectAllowedAt = 0;
+      this._reconnectAttempt = 0;
+      log("system", "Connection restored — circuit breaker reset");
+    }
 
     // Update session info from response
     if (resp.session) {
@@ -317,7 +371,7 @@ export class SpaceMoltAPI {
         return;
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
-        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
+        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt) + Math.floor(Math.random() * 30000); // Add jitter up to 30s
         log("system", `Server unreachable (attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS}), retrying in ${delay / 1000}s...`);
         await sleep(delay);
       }

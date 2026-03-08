@@ -143,7 +143,7 @@ function pickTargetOre(
 
 // ── Mission helpers ───────────────────────────────────────────
 
-const MINING_MISSION_KEYWORDS = ["mine", "ore", "mineral", "supply", "collect", "gather", "extract", "asteroid"];
+const MINING_MISSION_KEYWORDS = ["mine", "ore", "mineral", "supply", "collect", "gather", "extract", "copper_requisition", "mine_resource", "asteroid"];
 
 /** Accept available mining/supply missions at the current station. Respects 5-mission cap. */
 async function checkAndAcceptMissions(ctx: RoutineContext): Promise<void> {
@@ -280,7 +280,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
   const settings0 = getMinerSettings(bot.username);
   // Home system: from settings, or wherever the bot is now as fallback
-  const homeSystem = settings0.homeSystem || bot.system;
+  //  // Use factionStorageSystem from general settings instead of homeSystem for mining operations
+  const allSettings = readSettings();
+  const factionStorageSystem = (allSettings.general && allSettings.general.factionStorageSystem) || "sol";
+  const homeSystem = factionStorageSystem;
   /** Systems where all belts were depleted for the current target ore. Cleared each cycle when ore target changes. */
   const depletedSystems = new Set<string>();
   let lastTargetOre = "";
@@ -367,7 +370,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Hull check — repair immediately if low
     await bot.refreshStatus();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-    if (hullPct <= 40) {
+    if (hullPct <= 95) {
       ctx.log("system", `Hull critical (${hullPct}%) — returning to station for repair`);
       await ensureDocked(ctx);
       await repairShip(ctx);
@@ -756,3 +759,4 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("info", `Cycle done — ${bot.credits} credits, ${endFuel}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
   }
 };
+

@@ -230,7 +230,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await sleep(10000); continue; }
 
     const settings = getCleanupSettings(bot.username);
     const safetyOpts = {

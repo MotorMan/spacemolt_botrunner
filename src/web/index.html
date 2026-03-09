@@ -7798,6 +7798,13 @@ function renderHunterSettings(panel) {
   const fleeThreshold = h.fleeThreshold ?? 20;
   const onlyNPCs = h.onlyNPCs !== false;
   const responseRange = h.responseRange ?? 3;
+  const maxAttackTier = h.maxAttackTier || 'large';
+  const fleeFromTier = h.fleeFromTier || 'boss';
+  const minPiratesToFlee = h.minPiratesToFlee ?? 3;
+
+  const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
+  const tierOpts = tierOptions.map(t => `<option value="${t}"${t === maxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
+  const fleeTierOpts = tierOptions.map(t => `<option value="${t}"${t === fleeFromTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
 
   const systemOpts = ['<option value="">(auto — nearest low-sec)</option>'];
   for (const sys of knownSystems) {
@@ -7858,6 +7865,30 @@ function renderHunterSettings(panel) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Max Attack Tier</div>
+        <div class="setting-hint">Maximum pirate tier to engage. Pirates above this tier will be ignored.</div>
+      </div>
+      <select id="set-hunter-maxAttackTier">${tierOpts}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Flee From Tier</div>
+        <div class="setting-hint">Flee from combat if a pirate of this tier or higher is detected.</div>
+      </div>
+      <select id="set-hunter-fleeFromTier">${fleeTierOpts}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min Pirates to Flee</div>
+        <div class="setting-hint">Flee from combat if this many or more pirates are present in the area.</div>
+      </div>
+      <input type="number" id="set-hunter-minPiratesToFlee" min="1" max="10" value="${minPiratesToFlee}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Faction Alert Response Range (jumps)</div>
         <div class="setting-hint">Max jumps away to respond when an allied bot broadcasts a [COMBAT WARNING] or [HULL DAMAGE] alert. Set to 0 to disable.</div>
       </div>
@@ -7877,6 +7908,9 @@ function saveHunterSettings() {
     repairThreshold: parseInt(document.getElementById('set-hunter-repairThreshold').value) || 30,
     fleeThreshold: parseInt(document.getElementById('set-hunter-fleeThreshold').value) || 20,
     onlyNPCs: document.getElementById('set-hunter-onlyNPCs').value === 'true',
+    maxAttackTier: document.getElementById('set-hunter-maxAttackTier').value,
+    fleeFromTier: document.getElementById('set-hunter-fleeFromTier').value,
+    minPiratesToFlee: parseInt(document.getElementById('set-hunter-minPiratesToFlee').value) || 3,
     responseRange: parseInt(document.getElementById('set-hunter-responseRange').value) ?? 3,
   };
   send({ type: 'saveSettings', routine: 'hunter', settings: s });

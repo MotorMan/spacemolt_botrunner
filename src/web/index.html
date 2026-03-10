@@ -1860,6 +1860,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('cleanup')">Cleanup</div>
         <div class="sidebar-item" onclick="switchSettingsTab('ai')">AI</div>
         <div class="sidebar-item" onclick="switchSettingsTab('hunter')">Hunter</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('cargo_mover')">CargoMover</div>
       </div>
       <div class="settings-panel" id="settingsContent">
         <!-- filled by JS -->
@@ -2546,6 +2547,19 @@ function getProfileBot() {
 function renderProfileTopbar() {
   const bot = getProfileBot();
   if (!bot) return;
+  
+  // Defer re-render if the routine dropdown is focused (prevents closing mid-selection)
+  const active = document.activeElement;
+  if (active && active.tagName === 'SELECT' && active.id === 'profile-routine') {
+    if (!pendingBotRender) {
+      pendingBotRender = true;
+      active.addEventListener('change', () => { pendingBotRender = false; renderProfileTopbar(); }, { once: true });
+      active.addEventListener('blur', () => { if (pendingBotRender) { pendingBotRender = false; renderProfileTopbar(); } }, { once: true });
+    }
+    return;
+  }
+  pendingBotRender = false;
+  
   const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
   document.getElementById('profileName').textContent = bot.username;
   document.getElementById('profileShip').textContent = bot.shipName || 'No ship';
@@ -2556,7 +2570,7 @@ function renderProfileTopbar() {
     const prevProfileSel = document.getElementById('profile-routine');
     const prevProfileRoutine = prevProfileSel ? prevProfileSel.value : (bot.routine || 'miner');
     actions = `
-      <select id="profile-routine" onchange="renderProfileTopbar()">
+      <select id="profile-routine" onchange="pendingBotRender=false;renderProfileSidebar()">
         ${routines.map(r => `<option value="${esc(r)}"${r === prevProfileRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
       </select>
       <button class="primary sm" onclick="startBotFromProfile()">Start</button>
@@ -2829,6 +2843,18 @@ function savePerBotDepositSettings() {
 function renderProfileSidebar() {
   const bot = getProfileBot();
   if (!bot) return;
+
+  // Defer re-render if the routine dropdown is focused (prevents closing mid-selection)
+  const active = document.activeElement;
+  if (active && active.tagName === 'SELECT' && active.id === 'profile-routine') {
+    if (!pendingBotRender) {
+      pendingBotRender = true;
+      active.addEventListener('change', () => { pendingBotRender = false; renderProfileSidebar(); }, { once: true });
+      active.addEventListener('blur', () => { if (pendingBotRender) { pendingBotRender = false; renderProfileSidebar(); } }, { once: true });
+    }
+    return;
+  }
+  pendingBotRender = false;
 
   renderProfileTopbar();
 
@@ -4663,6 +4689,8 @@ function renderSettingsPanel() {
     renderAiSettings(panel);
   } else if (activeSettingsTab === 'hunter') {
     renderHunterSettings(panel);
+  } else if (activeSettingsTab === 'cargo_mover') {
+    renderCargoMoverSettings(panel);
   }
 }
 
@@ -7915,6 +7943,392 @@ function saveHunterSettings() {
   };
   send({ type: 'saveSettings', routine: 'hunter', settings: s });
   settings.hunter = s;
+}
+
+// ── Cargo Mover settings ────────────────────────────────────────
+let cmFactionItems = [];  // Cached faction storage items from source station
+let cmPersonalItems = []; // Cached personal storage items from selected bot
+
+function renderCargoMoverSettings(panel) {
+  const cm = settings.cargo_mover || {};
+  const sourceStation = cm.sourceStation || '';
+  const destinationStation = cm.destinationStation || '';
+  const destinationStorageType = cm.destinationStorageType || 'faction';
+  const destinationBotName = cm.destinationBotName || '';
+  const items = cm.items || [];
+  const refuelThreshold = cm.refuelThreshold ?? 50;
+  const repairThreshold = cm.repairThreshold ?? 40;
+  const personalStorageBot = cm.personalStorageBot || '';
+  const factionStorageBot = cm.factionStorageBot || '';
+
+  // Build station options from mapData
+  let sourceStationOpts = '<option value="">(not set)</option>';
+  let destStationOpts = '<option value="">(not set)</option>';
+
+  for (const [sysId, sys] of Object.entries(mapData)) {
+    const sysName = sys.name || sysId;
+    for (const poi of (sys.pois || [])) {
+      if (!poi.has_base) continue;
+      const val = sysId + '|' + poi.id;
+      const label = poi.base_name || poi.name || poi.id;
+
+      const srcSel = poi.id === sourceStation ? ' selected' : '';
+      sourceStationOpts += `<option value="${val}"${srcSel}>${label} (${sysName})</option>`;
+
+      const dstSel = poi.id === destinationStation ? ' selected' : '';
+      destStationOpts += `<option value="${val}"${dstSel}>${label} (${sysName})</option>`;
+    }
+  }
+
+  // Build bot options for faction and personal storage selectors
+  let factionBotOpts = '<option value="">(select bot at source)</option>';
+  let personalBotOpts = '<option value="">(select bot)</option>';
+  let giftBotOpts = '<option value="">(select recipient bot)</option>';
+  
+  for (const bot of bots) {
+    const factionSel = bot.username === factionStorageBot ? ' selected' : '';
+    const personalSel = bot.username === personalStorageBot ? ' selected' : '';
+    const giftSel = bot.username === destinationBotName ? ' selected' : '';
+    
+    factionBotOpts += `<option value="${esc(bot.username)}"${factionSel}>${esc(bot.username)}</option>`;
+    personalBotOpts += `<option value="${esc(bot.username)}"${personalSel}>${esc(bot.username)}</option>`;
+    giftBotOpts += `<option value="${esc(bot.username)}"${giftSel}>${esc(bot.username)}</option>`;
+  }
+
+  // Separate items by storage type
+  const factionItems = items.filter(i => !i.storageType || i.storageType === 'faction');
+  const personalItems = items.filter(i => i.storageType === 'personal');
+
+  // Build faction items list
+  const factionItemsList = factionItems.length > 0
+    ? factionItems.map((item, idx) => {
+        const originalIdx = items.findIndex(i => i.itemId === item.itemId && (!i.storageType || i.storageType === 'faction'));
+        const cat = item.category ? ` [${esc(item.category)}]` : '';
+        return `
+        <div class="craft-limit-row">
+          <div class="craft-limit-info">
+            <div class="craft-limit-name">${esc(item.itemName || item.itemId)}${cat}</div>
+            <div class="craft-limit-detail">Move ${item.quantity > 0 ? item.quantity + ' units' : 'all'} from Faction Storage</div>
+          </div>
+          <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeCargoMoverItem(${originalIdx})">✕</button>
+        </div>`;
+      }).join('')
+    : (cmFactionItems.length > 0 ? '<div style="color:var(--dim);padding:8px">No faction items configured. Add one below.</div>' : '<div style="color:var(--yellow);padding:8px">Select a bot at source and click "Load Faction Storage" to see available items</div>');
+
+  // Build personal items list
+  const personalItemsList = personalItems.length > 0
+    ? personalItems.map((item, idx) => {
+        const originalIdx = items.findIndex(i => i.itemId === item.itemId && i.storageType === 'personal');
+        const cat = item.category ? ` [${esc(item.category)}]` : '';
+        return `
+        <div class="craft-limit-row">
+          <div class="craft-limit-info">
+            <div class="craft-limit-name">${esc(item.itemName || item.itemId)}${cat}</div>
+            <div class="craft-limit-detail">Move ${item.quantity > 0 ? item.quantity + ' units' : 'all'} from ${esc(item.sourceBot || personalStorageBot || 'unknown')}'s Personal Storage</div>
+          </div>
+          <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeCargoMoverItem(${originalIdx})">✕</button>
+        </div>`;
+      }).join('')
+    : (cmPersonalItems.length > 0 ? '<div style="color:var(--dim);padding:8px">No personal items configured. Add one below.</div>' : '<div style="color:var(--yellow);padding:8px">Select a bot and click "Load Personal Storage" to see available items</div>');
+
+  // Build faction storage item options
+  const factionUsedIds = new Set(factionItems.map(i => i.itemId));
+  const factionAvailable = cmFactionItems.filter(i => !factionUsedIds.has(i.itemId));
+  const factionItemOpts = factionAvailable.length > 0
+    ? factionAvailable.map(i => `<option value="${esc(i.itemId)}">${esc(i.name)} (${i.quantity} available)</option>`).join('')
+    : '<option value="">No items available</option>';
+
+  // Build personal storage item options
+  const personalUsedIds = new Set(personalItems.map(i => i.itemId));
+  const personalAvailable = cmPersonalItems.filter(i => !personalUsedIds.has(i.itemId));
+  const personalItemOpts = personalAvailable.length > 0
+    ? personalAvailable.map(i => `<option value="${esc(i.itemId)}">${esc(i.name)} (${i.quantity} available)</option>`).join('')
+    : '<option value="">No items available</option>';
+
+  const showBotName = destinationStorageType === 'send_gift';
+
+  panel.innerHTML = `
+    <h3>Cargo Mover Settings</h3>
+    <div class="settings-desc">Haul items between stations. Configure source, destination, and items to move.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Source Station</div>
+        <div class="setting-hint">Station where items will be picked up</div>
+      </div>
+      <select id="set-cm-sourceStation">
+        ${sourceStationOpts}
+      </select>
+    </div>
+
+    <div class="setting-row" style="margin-top:16px">
+      <div>
+        <div class="setting-label">Destination Station</div>
+        <div class="setting-hint">Station where items will be delivered</div>
+      </div>
+      <select id="set-cm-destinationStation">
+        ${destStationOpts}
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Destination Storage</div>
+        <div class="setting-hint">Where to put items at destination</div>
+      </div>
+      <select id="set-cm-destinationStorageType" onchange="toggleCargoMoverGiftField()">
+        <option value="faction" ${destinationStorageType === 'faction' ? 'selected' : ''}>Faction Storage</option>
+        <option value="personal" ${destinationStorageType === 'personal' ? 'selected' : ''}>Personal Storage</option>
+        <option value="send_gift" ${destinationStorageType === 'send_gift' ? 'selected' : ''}>Send Gift to Bot</option>
+      </select>
+    </div>
+
+    <div class="setting-row" id="cm-gift-recipient-row" style="display: ${showBotName ? '' : 'none'}">
+      <div>
+        <div class="setting-label">Gift Recipient Bot</div>
+        <div class="setting-hint">Bot username to receive gifts</div>
+      </div>
+      <select id="set-cm-destinationBotName">${giftBotOpts}</select>
+    </div>
+
+    <!-- Faction Storage Items Section -->
+    <div style="margin-top:20px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <div style="font-weight:600;color:var(--text)">Faction Storage Items (at source)</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="cm-faction-bot-select">${factionBotOpts}</select>
+          <button class="sm" onclick="loadCargoMoverFactionStorage()">Load Faction Storage</button>
+        </div>
+      </div>
+      ${factionItemsList}
+      
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+        <select id="cm-faction-item-select" style="flex:1;min-width:0">${factionItemOpts}</select>
+        <input type="number" id="cm-faction-qty" min="1" value="10" placeholder="0=all" style="width:80px">
+        <button class="primary sm" onclick="addCargoMoverFactionItem()">+ Add</button>
+      </div>
+    </div>
+
+    <!-- Personal Storage Items Section -->
+    <div style="margin-top:16px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <div style="font-weight:600;color:var(--text)">Personal Storage Items</div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="cm-personal-bot-select">${personalBotOpts}</select>
+          <button class="sm" onclick="loadCargoMoverPersonalStorage()">Load Personal Storage</button>
+        </div>
+      </div>
+      ${personalItemsList}
+      
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+        <select id="cm-personal-item-select" style="flex:1;min-width:0">${personalItemOpts}</select>
+        <input type="number" id="cm-personal-qty" min="1" value="10" placeholder="0=all" style="width:80px">
+        <button class="primary sm" onclick="addCargoMoverPersonalItem()">+ Add</button>
+      </div>
+    </div>
+
+    <div class="setting-row" style="margin-top:16px">
+      <div>
+        <div class="setting-label">Refuel Threshold</div>
+        <div class="setting-hint">Refuel when fuel drops below this %</div>
+      </div>
+      <input type="number" id="set-cm-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold</div>
+        <div class="setting-hint">Repair hull when HP drops below this %</div>
+      </div>
+      <input type="number" id="set-cm-repairThreshold" min="20" max="80" value="${repairThreshold}">
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="sm" onclick="renderCargoMoverSettings(document.getElementById('settingsContent'))">Refresh</button>
+      <button class="primary" onclick="saveCargoMoverSettings()">Save Settings</button>
+    </div>
+  `;
+
+  // Restore bot selector values after render
+  if (factionStorageBot) {
+    const botSel = document.getElementById('cm-faction-bot-select');
+    if (botSel) botSel.value = factionStorageBot;
+  }
+  if (personalStorageBot) {
+    const botSel = document.getElementById('cm-personal-bot-select');
+    if (botSel) botSel.value = personalStorageBot;
+  }
+}
+
+function toggleCargoMoverGiftField() {
+  const storageType = document.getElementById('set-cm-destinationStorageType')?.value;
+  const giftRow = document.getElementById('cm-gift-recipient-row');
+  if (giftRow) {
+    giftRow.style.display = storageType === 'send_gift' ? '' : 'none';
+  }
+}
+
+function loadCargoMoverFactionStorage() {
+  const factionBotSel = document.getElementById('cm-faction-bot-select');
+  const botName = factionBotSel?.value;
+  if (!botName) {
+    alert('Please select a bot at the source station first');
+    return;
+  }
+
+  const bot = bots.find(b => b.username === botName);
+  if (!bot) {
+    alert('Bot not found');
+    return;
+  }
+
+  if (!bot.docked) {
+    alert('Bot must be docked to query faction storage');
+    return;
+  }
+
+  // Send exec command to view faction storage
+  // view_faction_storage returns: { items: [...], credits: N }
+  // items = faction storage items
+  sendExec(botName, 'view_faction_storage', undefined, (result) => {
+    if (result.ok && result.data) {
+      // Faction storage is in result.data.items
+      const items = Array.isArray(result.data.items) ? result.data.items : [];
+      cmFactionItems = items.map(i => ({
+        itemId: i.item_id || i.id || '',
+        name: i.name || i.item_id || '',
+        quantity: i.quantity || 0,
+        category: i.category || ''
+      })).filter(i => i.itemId && i.quantity > 0);
+      renderCargoMoverSettings(document.getElementById('settingsContent'));
+    } else {
+      alert('Failed to load faction storage: ' + (result.error || 'Unknown error'));
+    }
+  });
+}
+
+function loadCargoMoverPersonalStorage() {
+  const botSel = document.getElementById('cm-personal-bot-select');
+  const botName = botSel?.value;
+  if (!botName) {
+    alert('Please select a bot first');
+    return;
+  }
+
+  const bot = bots.find(b => b.username === botName);
+  if (!bot) {
+    alert('Bot not found');
+    return;
+  }
+
+  if (!bot.docked) {
+    alert('Bot must be docked to query personal storage');
+    return;
+  }
+
+  // Send exec command to view personal storage
+  // view_storage returns: { items: [...], storage: [...], credits: N }
+  // storage = personal storage
+  sendExec(botName, 'view_storage', undefined, (result) => {
+    if (result.ok && result.data) {
+      const d = result.data;
+      // Personal storage is in result.data.storage, but handle fallback cases
+      const items = Array.isArray(d) ? d : (Array.isArray(d.storage) ? d.storage : (Array.isArray(d.items) ? d.items : []));
+      cmPersonalItems = items.map(i => ({
+        itemId: i.item_id || i.id || '',
+        name: i.name || i.item_id || '',
+        quantity: i.quantity || 0,
+        category: i.category || ''
+      })).filter(i => i.itemId && i.quantity > 0);
+      renderCargoMoverSettings(document.getElementById('settingsContent'));
+    } else {
+      alert('Failed to load personal storage: ' + (result.error || 'Unknown error'));
+    }
+  });
+}
+
+function addCargoMoverFactionItem() {
+  const sel = document.getElementById('cm-faction-item-select');
+  const qtyEl = document.getElementById('cm-faction-qty');
+  const id = sel?.value;
+  const qty = parseInt(qtyEl?.value) || 0;
+  if (!id) return;
+
+  const item = cmFactionItems.find(i => i.itemId === id);
+  const itemName = item?.name || id;
+
+  if (!settings.cargo_mover) settings.cargo_mover = {};
+  if (!settings.cargo_mover.items) settings.cargo_mover.items = [];
+  settings.cargo_mover.items.push({ 
+    itemId: id, 
+    itemName, 
+    quantity: qty,
+    storageType: 'faction',
+    category: item?.category || ''
+  });
+  renderCargoMoverSettings(document.getElementById('settingsContent'));
+}
+
+function addCargoMoverPersonalItem() {
+  const sel = document.getElementById('cm-personal-item-select');
+  const qtyEl = document.getElementById('cm-personal-qty');
+  const botSel = document.getElementById('cm-personal-bot-select');
+  const id = sel?.value;
+  const qty = parseInt(qtyEl?.value) || 0;
+  const sourceBot = botSel?.value || '';
+  if (!id) return;
+
+  const item = cmPersonalItems.find(i => i.itemId === id);
+  const itemName = item?.name || id;
+
+  if (!settings.cargo_mover) settings.cargo_mover = {};
+  if (!settings.cargo_mover.items) settings.cargo_mover.items = [];
+  settings.cargo_mover.items.push({ 
+    itemId: id, 
+    itemName, 
+    quantity: qty,
+    storageType: 'personal',
+    sourceBot,
+    category: item?.category || ''
+  });
+  renderCargoMoverSettings(document.getElementById('settingsContent'));
+}
+
+function removeCargoMoverItem(idx) {
+  if (!settings.cargo_mover?.items) return;
+  settings.cargo_mover.items.splice(idx, 1);
+  renderCargoMoverSettings(document.getElementById('settingsContent'));
+}
+
+function saveCargoMoverSettings() {
+  const sourceStationVal = document.getElementById('set-cm-sourceStation').value;
+  const [, sourceStation] = sourceStationVal ? sourceStationVal.split('|') : ['', ''];
+
+  const destStationVal = document.getElementById('set-cm-destinationStation').value;
+  const [, destinationStation] = destStationVal ? destStationVal.split('|') : ['', ''];
+
+  const personalStorageBot = document.getElementById('cm-personal-bot-select')?.value || '';
+  const factionStorageBot = document.getElementById('cm-faction-bot-select')?.value || '';
+  
+  let destinationBotName = '';
+  if (document.getElementById('set-cm-destinationBotName')) {
+    destinationBotName = document.getElementById('set-cm-destinationBotName').value;
+  }
+
+  const s = {
+    sourceStation,
+    destinationStation,
+    destinationStorageType: document.getElementById('set-cm-destinationStorageType').value,
+    destinationBotName,
+    items: settings.cargo_mover?.items || [],
+    personalStorageBot,
+    factionStorageBot,
+    refuelThreshold: parseInt(document.getElementById('set-cm-refuelThreshold').value) || 50,
+    repairThreshold: parseInt(document.getElementById('set-cm-repairThreshold').value) || 40,
+  };
+  send({ type: 'saveSettings', routine: 'cargo_mover', settings: s });
+  settings.cargo_mover = s;
+  alert('Cargo Mover settings saved!');
 }
 
 // ── Shipyard ────────────────────────────────────────────────

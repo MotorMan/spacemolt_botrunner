@@ -2111,6 +2111,7 @@ let profileRecipes = null;    // cached recipes from catalog
 let profileMarket = null;     // cached market items from view_market (sorted by price)
 let profileSkills = {};       // cached skills { skill_id: level }
 let profileSkillsList = null;  // full skill objects for display (null = not fetched)
+let profileFactionStorage = null; // cached faction storage items (null = not fetched, [] = empty/error)
 let mapData = {};             // systems from mapStore
 let statsDaily = {};          // persisted stats: { botName: { "2026-02-20": {...} } }
 let catalog = { items: {}, ships: {}, skills: {}, recipes: {}, lastFetched: null };
@@ -2511,6 +2512,7 @@ function openProfile(username) {
   profileRecipes = null;
   profileSkills = {};
   profileSkillsList = null;
+  profileFactionStorage = null;
 
   // Hide all tabs, show profile
   document.querySelectorAll('.top-tab').forEach(t => t.classList.remove('active'));
@@ -2528,6 +2530,8 @@ function openProfile(username) {
   fetchRecipes(username);
   const botObj = bots.find(b => b.username === username);
   if (botObj && botObj.docked) fetchMarket(username);
+  // Fetch faction storage (will fail gracefully if not at station)
+  fetchFactionStorage(username);
 }
 
 function closeProfile() {
@@ -2536,6 +2540,7 @@ function closeProfile() {
   profileRecipes = null;
   profileSkills = {};
   profileSkillsList = null;
+  profileFactionStorage = null;
   document.getElementById('page-profile').classList.remove('active');
   switchTab('dashboard');
 }
@@ -2963,6 +2968,11 @@ function renderManualControls() {
     ? bot.storage.map(i => `<option value="${esc(i.itemId)}" data-max="${i.quantity}">${esc(i.name)} (${i.quantity})</option>`).join('')
     : '<option value="">No items</option>';
 
+  // Build faction storage item options
+  const factionOpts = profileFactionStorage && profileFactionStorage.length > 0
+    ? profileFactionStorage.map(i => `<option value="${esc(i.item_id)}" data-max="${i.quantity}">${esc(i.name)} (${Number(i.quantity).toLocaleString()})</option>`).join('')
+    : (profileFactionStorage === null ? '<option value="">Click Refresh to load</option>' : '<option value="">Empty or not available</option>');
+
   // Build buy options from market (sorted by lowest price)
   const marketOpts = profileMarket && profileMarket.length > 0
     ? profileMarket.map(i => {
@@ -3076,6 +3086,21 @@ function renderManualControls() {
     </div>
 
     <div class="cmd-group">
+      <label>Faction Deposit</label>
+      <select id="mc-fac-dep-item" onchange="syncQty(this,'mc-fac-dep-qty')">${storOpts}</select>
+      <input type="number" id="mc-fac-dep-qty" min="1" value="1" style="width:90px">
+      <button class="sm" onclick="mcFactionDeposit()">Deposit</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Faction Withdraw</label>
+      <select id="mc-fac-wit-item">${factionOpts}</select>
+      <input type="number" id="mc-fac-wit-qty" min="1" value="1" style="width:90px">
+      <button class="sm" onclick="mcFactionWithdraw()">Withdraw</button>
+      <button class="sm" onclick="mcRefreshFactionStorage()" title="Reload faction storage list">Refresh</button>
+    </div>
+
+    <div class="cmd-group">
       <label>Gift Item</label>
       <select id="mc-gift-target">${otherBotOpts}</select>
       <select id="mc-gift-item" onchange="syncQty(this,'mc-gift-qty')">${cargoOpts}</select>
@@ -3183,6 +3208,49 @@ function mcCraft() {
   const recipeId = recipe.recipe_id || recipe.id || recipe.name || '';
   const qty = intVal('mc-craft-qty');
   mcExec('craft', { recipe_id: recipeId, count: qty });
+}
+
+// Faction storage operations
+function mcFactionDeposit() {
+  const itemId = val('mc-fac-dep-item');
+  const qty = intVal('mc-fac-dep-qty');
+  if (!itemId) {
+    logResponse('<span class="resp-err">Select an item to deposit</span>');
+    return;
+  }
+  // Deposit from personal cargo to faction storage: take from self, deposit to faction
+  mcExec('storage', { action: 'deposit', target: 'faction', item_id: itemId, quantity: qty, source: 'storage' });
+}
+
+function mcFactionWithdraw() {
+  const itemId = val('mc-fac-wit-item');
+  const qty = intVal('mc-fac-wit-qty');
+  if (!itemId) {
+    logResponse('<span class="resp-err">Select an item to withdraw</span>');
+    return;
+  }
+  // Withdraw from faction storage to personal storage: take from faction, deposit to self
+  mcExec('storage', { action: 'deposit', target: 'self', item_id: itemId, quantity: qty, source: 'faction' });
+}
+
+function mcRefreshFactionStorage() {
+  if (!profileBot) return;
+  
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > view_faction_storage</span>`);
+  
+  sendExec(profileBot, 'view_faction_storage', {}, (result) => {
+    if (result.ok && result.data) {
+      const items = result.data.items || result.data.storage || [];
+      profileFactionStorage = items;
+      logResponse(`<span class="resp-ok">Loaded ${items.length} faction storage items</span>`);
+      renderManualControls();
+    } else {
+      profileFactionStorage = [];
+      logResponse(`<span class="resp-err">Failed to load faction storage: ${esc(result.error || 'not at station')}</span>`);
+      renderManualControls();
+    }
+  });
 }
 
 function val(id) { return document.getElementById(id)?.value || ''; }
@@ -3850,6 +3918,21 @@ function fetchSkills(username) {
 function fetchRecipes(username) {
   profileRecipes = [];
   fetchRecipesPage(username, 1);
+}
+
+function fetchFactionStorage(username) {
+  profileFactionStorage = null; // reset to loading state
+  sendExec(username, 'view_faction_storage', {}, (result) => {
+    if (profileBot !== username) return; // stale response
+    if (!result.ok && !result.data) {
+      profileFactionStorage = [];
+      renderManualControls();
+      return;
+    }
+    const d = result.data || {};
+    profileFactionStorage = d.items || d.storage || [];
+    renderManualControls();
+  });
 }
 
 function fetchRecipesPage(username, page) {

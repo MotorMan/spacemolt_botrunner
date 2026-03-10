@@ -15,6 +15,7 @@ import { hunterRoutine } from "./routines/hunter.js";
 import { factionTraderRoutine } from "./routines/faction_trader.js";
 import { cleanupRoutine } from "./routines/cleanup.js";
 import { aiRoutine } from "./routines/ai.js";
+import { cargoMoverRoutine } from "./routines/cargo_mover.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { WebServer, type WebAction, type WebActionResult } from "./web/server.js";
@@ -41,6 +42,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },
   cleanup: { name: "Cleanup", fn: cleanupRoutine },
   ai: { name: "AI", fn: aiRoutine },
+  cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },
 };
 
 // ── Auto-discover existing sessions ─────────────────────────

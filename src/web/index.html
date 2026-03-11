@@ -8087,13 +8087,22 @@ function renderCargoMoverSettings(panel) {
     ? factionItems.map((item, idx) => {
         const originalIdx = items.findIndex(i => i.itemId === item.itemId && (!i.storageType || i.storageType === 'faction'));
         const cat = item.category ? ` [${esc(item.category)}]` : '';
+        const delivered = item.totalDelivered || 0;
+        const target = item.totalToDeliver || 0;
+        const progressDisplay = target > 0 
+          ? `<div class="craft-limit-detail" style="color:var(--green)">Delivered: ${delivered}/${target}</div>`
+          : `<div class="craft-limit-detail" style="color:var(--dim)">Delivered: ${delivered} (no target set)</div>`;
         return `
         <div class="craft-limit-row">
           <div class="craft-limit-info">
             <div class="craft-limit-name">${esc(item.itemName || item.itemId)}${cat}</div>
             <div class="craft-limit-detail">Move ${item.quantity > 0 ? item.quantity + ' units' : 'all'} from Faction Storage</div>
+            ${progressDisplay}
           </div>
-          <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeCargoMoverItem(${originalIdx})">✕</button>
+          <div style="display:flex;gap:4px;align-items:center">
+            <button class="sm" style="background:#1976d2;border:none;color:#fff;padding:2px 6px;cursor:pointer;border-radius:4px" onclick="setCargoMoverDeliveryTarget(${originalIdx})" title="Set delivery target">🎯</button>
+            <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeCargoMoverItem(${originalIdx})">✕</button>
+          </div>
         </div>`;
       }).join('')
     : (cmFactionItems.length > 0 ? '<div style="color:var(--dim);padding:8px">No faction items configured. Add one below.</div>' : '<div style="color:var(--yellow);padding:8px">Select a bot at source and click "Load Faction Storage" to see available items</div>');
@@ -8103,13 +8112,22 @@ function renderCargoMoverSettings(panel) {
     ? personalItems.map((item, idx) => {
         const originalIdx = items.findIndex(i => i.itemId === item.itemId && i.storageType === 'personal');
         const cat = item.category ? ` [${esc(item.category)}]` : '';
+        const delivered = item.totalDelivered || 0;
+        const target = item.totalToDeliver || 0;
+        const progressDisplay = target > 0 
+          ? `<div class="craft-limit-detail" style="color:var(--green)">Delivered: ${delivered}/${target}</div>`
+          : `<div class="craft-limit-detail" style="color:var(--dim)">Delivered: ${delivered} (no target set)</div>`;
         return `
         <div class="craft-limit-row">
           <div class="craft-limit-info">
             <div class="craft-limit-name">${esc(item.itemName || item.itemId)}${cat}</div>
             <div class="craft-limit-detail">Move ${item.quantity > 0 ? item.quantity + ' units' : 'all'} from ${esc(item.sourceBot || personalStorageBot || 'unknown')}'s Personal Storage</div>
+            ${progressDisplay}
           </div>
-          <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeCargoMoverItem(${originalIdx})">✕</button>
+          <div style="display:flex;gap:4px;align-items:center">
+            <button class="sm" style="background:#1976d2;border:none;color:#fff;padding:2px 6px;cursor:pointer;border-radius:4px" onclick="setCargoMoverDeliveryTarget(${originalIdx})" title="Set delivery target">🎯</button>
+            <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeCargoMoverItem(${originalIdx})">✕</button>
+          </div>
         </div>`;
       }).join('')
     : (cmPersonalItems.length > 0 ? '<div style="color:var(--dim);padding:8px">No personal items configured. Add one below.</div>' : '<div style="color:var(--yellow);padding:8px">Select a bot and click "Load Personal Storage" to see available items</div>');
@@ -8380,6 +8398,43 @@ function addCargoMoverPersonalItem() {
 function removeCargoMoverItem(idx) {
   if (!settings.cargo_mover?.items) return;
   settings.cargo_mover.items.splice(idx, 1);
+  renderCargoMoverSettings(document.getElementById('settingsContent'));
+}
+
+function setCargoMoverDeliveryTarget(idx) {
+  const item = settings.cargo_mover?.items?.[idx];
+  if (!item) return;
+  
+  const currentTarget = item.totalToDeliver || 0;
+  const currentDelivered = item.totalDelivered || 0;
+  
+  const newTarget = prompt(
+    `Set delivery target for ${item.itemName}:\n` +
+    `Currently delivered: ${currentDelivered}\n` +
+    `Current target: ${currentTarget || 'none'}\n\n` +
+    `Enter total amount to deliver (0 to clear target):`,
+    currentTarget.toString()
+  );
+  
+  if (newTarget === null) return; // User cancelled
+  
+  const targetNum = parseInt(newTarget, 10);
+  if (isNaN(targetNum) || targetNum < 0) {
+    alert('Please enter a valid number >= 0');
+    return;
+  }
+  
+  if (targetNum === 0) {
+    delete item.totalToDeliver;
+  } else {
+    item.totalToDeliver = targetNum;
+  }
+  
+  // Initialize totalDelivered if not set
+  if (item.totalDelivered === undefined) {
+    item.totalDelivered = 0;
+  }
+  
   renderCargoMoverSettings(document.getElementById('settingsContent'));
 }
 

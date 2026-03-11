@@ -17,6 +17,7 @@ import {
   navigateToSystem,
   detectAndRecoverFromDeath,
   readSettings,
+  writeSettings,
   sleep,
   logFactionActivity,
 } from "./common.js";
@@ -51,6 +52,8 @@ interface CargoMoveItem {
   category?: string;
   storageType?: 'faction' | 'personal';
   sourceBot?: string;
+  totalDelivered?: number;  // Track total items delivered for this config
+  totalToDeliver?: number;  // Optional target: when totalDelivered reaches this, item is considered complete
 }
 
 interface CargoMoverSettings {
@@ -81,6 +84,8 @@ function getCargoMoverSettings(username?: string): CargoMoverSettings {
       category: item.category as string | undefined,
       storageType: (item.storageType as 'faction' | 'personal') || 'faction',
       sourceBot: item.sourceBot as string | undefined,
+      totalDelivered: item.totalDelivered as number | undefined,
+      totalToDeliver: item.totalToDeliver as number | undefined,
     }));
 
   return {
@@ -289,15 +294,24 @@ function findMoveJobs(
   ctx.log("cargo", `findMoveJobs: bot.storage has ${bot.storage.length} items, bot.factionStorage has ${bot.factionStorage.length} items`);
 
   for (const configItem of settings.items) {
+    // Skip if item has reached its delivery target (totalDelivered >= totalToDeliver)
+    if (configItem.totalToDeliver !== undefined && configItem.totalToDeliver > 0) {
+      const delivered = configItem.totalDelivered || 0;
+      if (delivered >= configItem.totalToDeliver) {
+        ctx.log("cargo", `  ${configItem.itemName}: delivery target reached (${delivered}/${configItem.totalToDeliver}) — skipping`);
+        continue;
+      }
+    }
+
     const storageType = configItem.storageType || 'faction';
     // Get quantity from configured storage (faction or personal)
     const inStorage = storageType === 'faction'
       ? (bot.factionStorage.find(i => i.itemId === configItem.itemId)?.quantity || 0)
       : (bot.storage.find(i => i.itemId === configItem.itemId)?.quantity || 0);
-    
+
     // Also count what's already in cargo hold
     const inCargo = bot.inventory.find(i => i.itemId === configItem.itemId)?.quantity || 0;
-    
+
     // Total available = in storage + already in cargo
     const availableQty = inStorage + inCargo;
     const targetQty = configItem.quantity > 0 ? configItem.quantity : availableQty;
@@ -324,6 +338,30 @@ function findMoveJobs(
   }
 
   return jobs;
+}
+
+/** Update delivery tracking for items after successful delivery. */
+function updateDeliveryTracking(itemIds: string[], quantities: number[]): void {
+  const all = readSettings();
+  const cargoMover = all.cargo_mover || {};
+  const items = (cargoMover.items as Array<Record<string, unknown>>) || [];
+  
+  let updated = false;
+  for (let i = 0; i < itemIds.length; i++) {
+    const itemId = itemIds[i];
+    const qty = quantities[i];
+    const item = items.find((it) => it.itemId === itemId);
+    if (item) {
+      const current = (item.totalDelivered as number) || 0;
+      item.totalDelivered = current + qty;
+      updated = true;
+      console.log(`[CargoMover] Updated ${itemId}: ${current} -> ${current + qty} delivered`);
+    }
+  }
+  
+  if (updated) {
+    writeSettings({ cargo_mover: { items } });
+  }
 }
 
 export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -596,6 +634,8 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     await bot.refreshCargo();
     // Deposit ALL items in cargo to the destination
     const itemsToDeposit = [...bot.inventory];
+    const deliveredItems: { itemId: string; quantity: number }[] = [];
+    
     if (itemsToDeposit.length > 0) {
       for (const item of itemsToDeposit) {
         if (item.quantity <= 0) continue;
@@ -612,11 +652,19 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         );
         if (depositResult.success) {
           ctx.log("cargo", `Delivered ${depositResult.depositedQty}x ${item.name}`);
+          deliveredItems.push({ itemId: item.itemId, quantity: depositResult.depositedQty });
         } else {
           allJobsCompleted = false;
         }
       }
       totalTrips++;
+      
+      // Update delivery tracking after successful delivery
+      if (deliveredItems.length > 0) {
+        const itemIds = deliveredItems.map((d) => d.itemId);
+        const quantities = deliveredItems.map((d) => d.quantity);
+        updateDeliveryTracking(itemIds, quantities);
+      }
     }
 
     await bot.refreshCargo();

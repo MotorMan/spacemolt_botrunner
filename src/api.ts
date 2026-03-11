@@ -66,8 +66,8 @@ const COMMAND_TTL: Record<string, number> = {
   get_skills:            120_000,
   get_missions:           60_000,
   view_storage:           30_000,
-  view_faction_storage:   30_000,
-  find_route:            300_000,
+  view_faction_storage:  120_000,
+  find_route:             30_000,
   survey_system:          60_000,
   get_queue:               5_000,
   view_market:            30_000,
@@ -85,7 +85,7 @@ const COMMAND_TTL: Record<string, number> = {
 
 // Cache groups for mutation invalidation
 const INV_STATUS   = ["get_status", "v2_get_player", "get_queue", "v2_get_queue"];
-const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey_system"];
+const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey_system", "find_route"];
 const INV_CARGO    = ["get_cargo", "v2_get_cargo"];
 const INV_SHIP     = ["get_ship", "v2_get_ship"];
 const INV_MISSIONS = ["get_missions", "v2_get_missions"];

@@ -144,6 +144,93 @@ function getAllKnownStations(homeSystem: string, homeStation: string): StationTa
   return stations;
 }
 
+/** Transfer all items from personal storage to faction storage at home station. */
+async function transferPersonalToFaction(ctx: RoutineContext, settings: ReturnType<typeof getCleanupSettings>): Promise<void> {
+  const { bot } = ctx;
+  const safetyOpts = {
+    fuelThresholdPct: settings.refuelThreshold,
+    hullThresholdPct: settings.repairThreshold,
+  };
+
+  // Navigate to home system
+  if (bot.system !== settings.homeSystem) {
+    await ensureUndocked(ctx);
+    const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+    if (!fueled) {
+      ctx.log("error", "Cannot refuel for return to home — staying put");
+      return;
+    }
+    ctx.log("travel", `Returning to home system ${settings.homeSystem}...`);
+    const arrived = await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+    if (!arrived) {
+      ctx.log("error", "Failed to reach home system");
+      return;
+    }
+  }
+
+  // Travel to home station POI
+  await ensureUndocked(ctx);
+  // Resolve home station to POI id (might be a base_id)
+  let homePoiId = settings.homeStation;
+  if (homePoiId) {
+    const resolved = resolveStation(homePoiId);
+    if (resolved) homePoiId = resolved.poiId;
+  } else {
+    // Find any station in the home system
+    const sys = mapStore.getSystem(settings.homeSystem);
+    const station = sys?.pois.find(p => p.has_base);
+    if (station) homePoiId = station.id;
+  }
+
+  if (homePoiId && bot.poi !== homePoiId) {
+    ctx.log("travel", `Traveling to home station...`);
+    const tResp = await bot.exec("travel", { target_poi: homePoiId });
+    if (tResp.error && !tResp.error.message.includes("already")) {
+      ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
+      return;
+    }
+    bot.poi = homePoiId;
+  }
+
+  // Dock
+  await ensureDocked(ctx);
+
+  // Check personal storage and transfer everything to faction storage
+  await bot.refreshStorage();
+  if (bot.storage.length === 0) {
+    ctx.log("info", "Personal storage is empty — nothing to transfer to faction");
+    return;
+  }
+
+  const transferred: string[] = [];
+  for (const item of bot.storage) {
+    if (item.quantity <= 0) continue;
+
+    // Use storage command with action=deposit, target=faction
+    const sResp = await bot.exec("storage", {
+      action: "deposit",
+      target: "faction",
+      item_id: item.itemId,
+      quantity: item.quantity,
+      source: "storage",
+    });
+
+    if (!sResp.error) {
+      transferred.push(`${item.quantity}x ${item.name}`);
+      logFactionActivity(ctx, "transfer", `Transferred ${item.quantity}x ${item.name} from personal to faction storage`);
+    } else {
+      ctx.log("error", `Failed to transfer ${item.name} to faction storage: ${sResp.error.message}`);
+    }
+  }
+
+  if (transferred.length > 0) {
+    ctx.log("trade", `Transferred to faction storage: ${transferred.join(", ")}`);
+    await bot.refreshStorage();
+  } else {
+    ctx.log("info", "No items transferred to faction storage");
+  }
+}
+
 /** Navigate to home station and deposit all non-fuel cargo to faction storage. */
 async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof getCleanupSettings>): Promise<void> {
   const { bot } = ctx;
@@ -237,6 +324,11 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
     };
+
+    // ── Phase 0: Transfer personal storage to faction storage (FIRST) ──
+    yield "transfer_personal_to_faction";
+    ctx.log("info", "Checking personal storage and transferring to faction storage...");
+    await transferPersonalToFaction(ctx, settings);
 
     // ── Phase 1: Remote scan — discover which stations have our stuff ──
     yield "remote_scan";
@@ -501,6 +593,11 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Summary
     ctx.log("info", `Cleanup complete: ${totalCredits}cr + ${totalItems} items collected from ${stationsWithStorage.length} station(s)`);
+
+    // ── Phase 4: Final personal storage to faction transfer ──
+    yield "final_personal_transfer";
+    ctx.log("info", "Final check: transferring any remaining personal storage to faction...");
+    await transferPersonalToFaction(ctx, settings);
 
     // Maintenance at home
     await ensureDocked(ctx);

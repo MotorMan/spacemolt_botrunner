@@ -22,6 +22,15 @@ import {
   readSettings,
   sleep,
 } from "./common.js";
+import {
+  getActiveSession,
+  startTradeSession,
+  updateTradeSession,
+  completeTradeSession,
+  failTradeSession,
+  createTradeSession,
+  type TradeSession,
+} from "./traderActivity.js";
 
 /** Free cargo weight (not item count — callers must divide by item size). */
 function getFreeSpace(bot: Bot): number {
@@ -58,6 +67,89 @@ function getTraderSettings(username?: string): {
     stationPriority: (botOverrides.stationPriority as boolean) || false,
     autoCloak: (t.autoCloak as boolean) ?? false,
   };
+}
+
+// ── Trade Session Recovery ──────────────────────────────────
+
+/**
+ * Check for and recover an incomplete trade session.
+ * Validates cargo, destination, and market conditions.
+ * Returns the recovered session if valid, or null if recovery is not possible.
+ */
+async function recoverTradeSession(
+  ctx: RoutineContext,
+  session: TradeSession,
+  settings: ReturnType<typeof getTraderSettings>,
+): Promise<TradeSession | null> {
+  const { bot } = ctx;
+  
+  ctx.log("trade", `Found incomplete trade session: ${session.itemName} (${session.state})`);
+  
+  // Verify items are still in cargo (for non-faction routes)
+  if (!session.isFactionRoute && !session.isCargoRoute) {
+    await bot.refreshCargo();
+    const cargoItem = bot.inventory.find(i => i.itemId === session.itemId);
+    const cargoQty = cargoItem?.quantity ?? 0;
+    
+    if (cargoQty <= 0) {
+      ctx.log("error", `Recovery failed: ${session.itemName} no longer in cargo`);
+      await failTradeSession(session.botUsername, "Items not in cargo");
+      return null;
+    }
+    
+    if (cargoQty < session.quantityBought) {
+      ctx.log("trade", `Recovered with partial cargo: ${cargoQty}/${session.quantityBought}x ${session.itemName}`);
+      session = updateTradeSession(session.botUsername, { 
+        quantityBought: cargoQty,
+        sellQuantity: cargoQty,
+        notes: (session.notes || "") + ` | Partial recovery: ${cargoQty}/${session.quantityBought}x remaining`,
+      })!;
+    }
+  }
+  
+  // Check if we're at the destination
+  if (session.state === "in_transit" || session.state === "at_destination" || session.state === "selling") {
+    // Verify the destination buyer still exists and price is still profitable
+    const allBuys = mapStore.getAllBuyDemand();
+    const destBuyer = allBuys.find(b => 
+      b.itemId === session.itemId && 
+      b.systemId === session.destSystem && 
+      b.poiId === session.destPoi
+    );
+    
+    if (!destBuyer || destBuyer.quantity <= 0) {
+      ctx.log("trade", `Destination buyer gone — finding alternative`);
+      // Find alternative buyer
+      const alternativeBuyers = allBuys
+        .filter(b => b.itemId === session.itemId && b.price > 0)
+        .sort((a, b) => b.price - a.price);
+      
+      if (alternativeBuyers.length === 0) {
+        ctx.log("error", "No alternative buyers found — abandoning session");
+        await failTradeSession(session.botUsername, "No buyers available");
+        return null;
+      }
+      
+      const bestAlt = alternativeBuyers[0];
+      ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
+      session = updateTradeSession(session.botUsername, {
+        destSystem: bestAlt.systemId,
+        destPoi: bestAlt.poiId,
+        destPoiName: bestAlt.poiName,
+        sellPricePerUnit: bestAlt.price,
+        sellQuantity: Math.min(session.sellQuantity, bestAlt.quantity),
+        totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, bestAlt.systemId, settings.fuelCostPerJump).jumps,
+        notes: (session.notes || "") + ` | Rerouted to ${bestAlt.poiName}`,
+      })!;
+    } else if (destBuyer.price < session.buyPricePerUnit) {
+      ctx.log("error", `Price dropped to ${destBuyer.price}cr (below cost ${session.buyPricePerUnit}cr) — abandoning`);
+      await failTradeSession(session.botUsername, "Price below cost");
+      return null;
+    }
+  }
+  
+  ctx.log("trade", `Session recovered: ${session.quantityBought}x ${session.itemName} → ${session.destPoiName}`);
+  return session;
 }
 
 // ── Types ────────────────────────────────────────────────────
@@ -500,6 +592,17 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Trade session recovery ──
+    const activeSession = getActiveSession(bot.username);
+    let recoveredSession: TradeSession | null = null;
+    if (activeSession) {
+      const settings = getTraderSettings(bot.username);
+      recoveredSession = await recoverTradeSession(ctx, activeSession, settings);
+      if (recoveredSession) {
+        ctx.log("trade", `Resuming trade session: ${recoveredSession.itemName} (${recoveredSession.state})`);
+      }
+    }
+
     const settings = getTraderSettings(bot.username);
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
@@ -678,20 +781,58 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     if (routes.length === 0) {
-      ctx.log("trade", "No profitable trade routes found — waiting 60s before re-scanning");
-      await sleep(60000);
-      continue;
+      // If we have a recovered session, continue with it even without new routes
+      if (!recoveredSession) {
+        ctx.log("trade", "No profitable trade routes found — waiting 60s before re-scanning");
+        await sleep(60000);
+        continue;
+      }
     }
 
-    // Try up to 3 routes — skip stale/unavailable ones
+    // If we have a recovered session, convert it to a route and execute
     let route: TradeRoute | null = null;
     let buyQty = 0;
     let investedCredits = 0;
-    let alreadySold = false; // true if in-station faction route already sold items
-    const failedSources = new Set<string>(); // "sourceSystem:sourcePoi:itemId" combos that failed
+    let alreadySold = false;
+    const failedSources = new Set<string>();
     let attempts = 0;
 
-    for (let ri = 0; ri < routes.length && attempts < 3; ri++) {
+    if (recoveredSession) {
+      ctx.log("trade", `Executing recovered session: ${recoveredSession.itemName} (${recoveredSession.quantityBought}x @ ${recoveredSession.buyPricePerUnit}cr → ${recoveredSession.destPoiName})`);
+      
+      // Convert recovered session to a route
+      route = {
+        itemId: recoveredSession.itemId,
+        itemName: recoveredSession.itemName,
+        sourceSystem: recoveredSession.sourceSystem,
+        sourcePoi: recoveredSession.sourcePoi,
+        sourcePoiName: recoveredSession.sourcePoiName,
+        buyPrice: recoveredSession.buyPricePerUnit,
+        buyQty: recoveredSession.quantityBought,
+        destSystem: recoveredSession.destSystem,
+        destPoi: recoveredSession.destPoi,
+        destPoiName: recoveredSession.destPoiName,
+        sellPrice: recoveredSession.sellPricePerUnit,
+        sellQty: recoveredSession.sellQuantity,
+        jumps: recoveredSession.totalJumps - recoveredSession.jumpsCompleted,
+        profitPerUnit: recoveredSession.expectedProfit / recoveredSession.sellQuantity,
+        totalProfit: recoveredSession.expectedProfit,
+      };
+      
+      buyQty = recoveredSession.quantityBought;
+      investedCredits = recoveredSession.investedCredits;
+      
+      // Update session state based on current position
+      if (bot.system === recoveredSession.destSystem) {
+        updateTradeSession(bot.username, { state: "at_destination" });
+      } else if (recoveredSession.jumpsCompleted > 0) {
+        updateTradeSession(bot.username, { state: "in_transit" });
+      }
+    }
+
+    // Try up to 3 routes — skip stale/unavailable ones (skip if we have a recovered session)
+    if (!recoveredSession) {
+      for (let ri = 0; ri < routes.length && attempts < 3; ri++) {
       if (bot.state !== "running") break;
       const candidate = routes[ri];
 
@@ -1069,6 +1210,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("trade", `Purchased ${actualReceived}x ${candidate.itemName} for ${actualSpent}cr (${actualSpent > 0 ? Math.round(actualSpent / Math.max(actualReceived, 1)) : candidate.buyPrice}cr/ea)${alreadyHave > 0 ? ` (+${alreadyHave}x already in cargo)` : ""}`);
       }
 
+      // Start trade session tracking (only for new trades, not recovered ones)
+      if (!recoveredSession) {
+        const session = createTradeSession({
+          botUsername: bot.username,
+          route: candidate,
+          isFactionRoute: candidate.sourcePoi === "",
+          isCargoRoute: candidate.sourcePoi === "cargo",
+          investedCredits: actualSpent,
+        });
+        startTradeSession(session);
+        ctx.log("trade", `Trade session started: ${session.sessionId}`);
+      }
+
       // Reserve this trade in cached market data so other bots don't chase the same route
       mapStore.reserveTradeQuantity(
         candidate.sourceSystem, candidate.sourcePoi,
@@ -1077,6 +1231,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       );
       break;
     }
+    } // End of route selection loop (skipped if recovered session)
 
     // Fill remaining cargo with station storage items sellable at destination
     if (route && buyQty > 0) {
@@ -1130,6 +1285,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // No route worked — deposit unsellable cargo and wait
     if (!route || buyQty <= 0) {
+      // Fail any active session
+      const activeSession = getActiveSession(bot.username);
+      if (activeSession) {
+        failTradeSession(bot.username, "No valid route found");
+      }
+      
       if (bot.docked) {
         await bot.refreshCargo();
         for (const item of [...bot.inventory]) {
@@ -1154,6 +1315,13 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       bot.stats.totalProfit += localProfit;
       await recordMarketData(ctx);
       ctx.log("trade", `Trade run complete: ${buyQty}x ${route.itemName} — profit ${localProfit}cr (${localRevenue}cr trade + ${extraRevenue}cr other sales)`);
+      
+      // Complete trade session
+      const completedSession = completeTradeSession(bot.username, localRevenue, localProfit);
+      if (completedSession) {
+        ctx.log("trade", `Session completed: ${completedSession.sessionId}`);
+      }
+      
       await factionDonateProfit(ctx, localProfit);
       yield "post_trade_maintenance";
       await tryRefuel(ctx);
@@ -1179,31 +1347,108 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (bot.system !== route.destSystem) {
       ctx.log("travel", `Heading to ${route.destPoiName} in ${route.destSystem}...`);
+      
+      // Update session state to in_transit
+      const activeSession = getActiveSession(bot.username);
+      if (activeSession) {
+        updateTradeSession(bot.username, { 
+          state: "in_transit",
+          jumpsCompleted: 0,
+        });
+      }
+      
       const arrived2 = await navigateToSystem(ctx, route.destSystem, {
         ...cargoSafetyOpts,
         onJump: async (jumpNum) => {
           if (jumpNum % 3 !== 0) return true; // validate every 3 jumps
-          const buys = mapStore.getAllBuyDemand();
-          const destBuyer = buys.find(b =>
-            b.itemId === route!.itemId && b.systemId === route!.destSystem && b.poiId === route!.destPoi
-          );
-          if (!destBuyer || destBuyer.quantity <= 0) {
-            ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer gone at ${route!.destPoiName} — aborting`);
-            return false;
+
+          // Update session jump progress
+          const session = getActiveSession(bot.username);
+          if (session) {
+            updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
           }
-          if (investedCredits > 0 && destBuyer.price * buyQty < investedCredits) {
-            ctx.log("trade", `Mid-route check (jump ${jumpNum}): price dropped to ${destBuyer.price}cr, would lose money — aborting`);
-            return false;
+
+          try {
+            const buys = mapStore.getAllBuyDemand();
+            const destBuyer = buys.find(b =>
+              b.itemId === route!.itemId && b.systemId === route!.destSystem && b.poiId === route!.destPoi
+            );
+            
+            // If no buyer found in cache, refresh market data and check again
+            if (!destBuyer) {
+              ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer not in cache — refreshing market data`);
+              await recordMarketData(ctx);
+              const refreshedBuys = mapStore.getAllBuyDemand();
+              const refreshedBuyer = refreshedBuys.find(b =>
+                b.itemId === route!.itemId && b.systemId === route!.destSystem && b.poiId === route!.destPoi
+              );
+              
+              if (!refreshedBuyer) {
+                ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer still not found — may be stale data, continuing anyway`);
+                return true; // Continue - don't abort on potentially stale cache
+              }
+              
+              // Check quantity and price with refreshed data
+              if (refreshedBuyer.quantity <= 0) {
+                ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer quantity is 0 — finding alternative`);
+                // Don't abort - we'll find alternative buyer at destination
+                return true;
+              }
+              
+              if (investedCredits > 0 && refreshedBuyer.price * buyQty < investedCredits) {
+                ctx.log("trade", `Mid-route check (jump ${jumpNum}): price dropped to ${refreshedBuyer.price}cr — will try to minimize loss`);
+                // Don't abort - we'll try to sell anyway rather than lose everything
+                return true;
+              }
+              
+              ctx.log("trade", `Mid-route check (jump ${jumpNum}): trade valid (${refreshedBuyer.price}cr × ${refreshedBuyer.quantity} at dest)`);
+            } else {
+              // Original buyer found in cache
+              if (destBuyer.quantity <= 0) {
+                ctx.log("trade", `Mid-route check (jump ${jumpNum}): buyer quantity is 0 — finding alternative`);
+                return true;
+              }
+              
+              if (investedCredits > 0 && destBuyer.price * buyQty < investedCredits) {
+                ctx.log("trade", `Mid-route check (jump ${jumpNum}): price dropped to ${destBuyer.price}cr — will try to minimize loss`);
+                return true;
+              }
+              
+              ctx.log("trade", `Mid-route check (jump ${jumpNum}): trade valid (${destBuyer.price}cr × ${destBuyer.quantity} at dest)`);
+            }
+            
+            return true;
+          } catch (err) {
+            // Network error during validation - don't abort, just continue
+            ctx.log("trade", `Mid-route check (jump ${jumpNum}): validation error — continuing anyway`);
+            return true;
           }
-          ctx.log("trade", `Mid-route check (jump ${jumpNum}): trade valid (${destBuyer.price}cr × ${destBuyer.quantity} at dest)`);
-          return true;
         },
       });
       if (!arrived2) {
-        ctx.log("error", "Failed to reach destination — selling at nearest station");
+        ctx.log("error", "Failed to reach destination — will retry on next cycle");
+
+        // CRITICAL: Do NOT fail the session or sell cargo prematurely!
+        // Network issues, server hiccups, and temporary disconnections are common.
+        // The session remains active and will be recovered on the next cycle.
+        // The bot will retry the jump with exponential backoff in navigateToSystem().
+        
+        // Update session state to reflect we're still in transit
+        const session = getActiveSession(bot.username);
+        if (session) {
+          updateTradeSession(bot.username, {
+            state: "in_transit",
+            notes: (session.notes || "") + " | Network interruption - will retry",
+          });
+        }
+
+        // Find a station to dock at and wait for network recovery
         await ensureDocked(ctx);
-        await bot.exec("sell", { item_id: route.itemId, quantity: buyQty });
-        await bot.refreshStatus();
+        ctx.log("trade", "Docked and waiting for network recovery — trade session preserved");
+        ctx.log("trade", `Session will resume: ${session?.itemId} (${session?.quantityBought}x) → ${session?.destPoiName}`);
+
+        // Wait 60 seconds before next cycle will retry (gives network time to recover)
+        await sleep(60000);
         continue;
       }
     }
@@ -1390,6 +1635,13 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Trade summary ──
     const soldLabel = totalSold < buyQty ? `${totalSold}/${buyQty}` : `${buyQty}`;
     ctx.log("trade", `Trade run complete: ${soldLabel}x ${route.itemName} — profit ${actualProfit}cr (${sellRevenue}cr sells + ${extraRevenue}cr other - ${investedCredits}cr cost, ${route.jumps} jumps)`);
+    
+    // Complete trade session
+    const actualRevenue = sellRevenue;
+    const completedSession = completeTradeSession(bot.username, actualRevenue, actualProfit);
+    if (completedSession) {
+      ctx.log("trade", `Session completed: ${completedSession.sessionId}`);
+    }
 
     // ── Faction donation (10% of profit) ──
     await factionDonateProfit(ctx, actualProfit);

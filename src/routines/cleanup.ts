@@ -444,8 +444,8 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     if (stationsWithStorage.length === 0) {
-      ctx.log("info", "No stations with stored items — waiting 5 minutes");
-      await sleep(300000);
+      ctx.log("info", "No stations with stored items — waiting 30 seconds");
+      await sleep(30000);
       continue;
     }
 
@@ -605,7 +605,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     await repairShip(ctx);
 
     // Wait before next run
-    ctx.log("info", "Next cleanup run in 5 minutes");
-    await sleep(300000);
+    ctx.log("info", "Next cleanup run in 30 seconds");
+    await sleep(30000);
   }
 };

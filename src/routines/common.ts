@@ -972,7 +972,8 @@ export async function navigateToSystem(
   opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean> },
 ): Promise<boolean> {
   const { bot } = ctx;
-  const MAX_JUMPS = 20;
+  const MAX_JUMPS = 199;
+  const MAX_RETRIES_PER_JUMP = 10;
 
   for (let attempt = 0; attempt < MAX_JUMPS; attempt++) {
     await bot.refreshStatus();
@@ -1025,11 +1026,55 @@ export async function navigateToSystem(
 
     await ensureUndocked(ctx);
 
-    // Jump
-    ctx.log("travel", `Jumping to ${nextSystem}...`);
-    const jumpResp = await bot.exec("jump", { target_system: nextSystem });
-    if (jumpResp.error) {
-      ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+    // Jump with retry logic for transient errors
+    let jumpSuccess = false;
+    let retries = 0;
+    while (!jumpSuccess && retries < MAX_RETRIES_PER_JUMP && bot.state === "running") {
+      retries++;
+      ctx.log("travel", `Jumping to ${nextSystem}... (attempt ${retries}/${MAX_RETRIES_PER_JUMP})`);
+      const jumpResp = await bot.exec("jump", { target_system: nextSystem });
+      
+      if (!jumpResp.error) {
+        jumpSuccess = true;
+        break;
+      }
+      
+      const errorMsg = jumpResp.error.message.toLowerCase();
+      
+      // Check if error is transient (network timeout, connection issue, etc.)
+      const isTransient = 
+        errorMsg.includes("timeout") ||
+        errorMsg.includes("connection") ||
+        errorMsg.includes("network") ||
+        errorMsg.includes("hiccup") ||
+        errorMsg.includes("temporarily") ||
+        errorMsg.includes("try again") ||
+        errorMsg.includes("pending") ||
+        errorMsg.includes("busy") ||
+        errorMsg.includes("systems are not connected"); // Sometimes a temporary state
+      
+      if (!isTransient) {
+        // Permanent error - don't retry
+        ctx.log("error", `Jump failed (permanent error): ${jumpResp.error.message}`);
+        return false;
+      }
+      
+      ctx.log("error", `Jump failed (transient): ${jumpResp.error.message}`);
+      
+      if (retries < MAX_RETRIES_PER_JUMP) {
+        // Wait before retrying - exponential backoff
+        const waitTime = 5000 * retries; // 5s, 10s, 15s
+        ctx.log("travel", `Waiting ${waitTime/1000}s before retry...`);
+        await sleep(waitTime);
+        
+        // Refresh status after wait
+        await bot.refreshStatus();
+        if (bot.system === targetSystemId) return true;
+      }
+    }
+    
+    if (!jumpSuccess) {
+      ctx.log("error", `Jump to ${nextSystem} failed after ${MAX_RETRIES_PER_JUMP} retries`);
       return false;
     }
 

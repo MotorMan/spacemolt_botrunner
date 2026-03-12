@@ -3777,10 +3777,10 @@ const LOG_CAT_CLASSES = {
 };
 
 function formatBotLogLine(line) {
-  // Format: "HH:MM:SS [category] message"
-  const m = line.match(/^(\d{2}:\d{2}:\d{2})\s+\[([^\]]+)\]\s+([\s\S]*)$/);
+  // Format: "HH:MM:SS [bot_name] [category] message"
+  const m = line.match(/^(\d{2}:\d{2}:\d{2})\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+([\s\S]*)$/);
   if (!m) return `<span class="log-msg">${esc(line)}</span>`;
-  const [, time, cat, msg] = m;
+  const [, time, bot, cat, msg] = m;
   const catClass = LOG_CAT_CLASSES[cat] || '';
   return `<span class="log-time">${esc(time)}</span> <span class="log-cat ${catClass}">[${esc(cat)}]</span> <span class="log-msg">${esc(msg)}</span>`;
 }
@@ -5693,8 +5693,8 @@ function makeLogLine(text) {
   const div = document.createElement('div');
   div.className = 'log-line';
   // Format: "HH:MM:SS [username] [category] msg" — capture the second bracket (category)
-  const m = text.match(/\[\w+\]\s*\[(\w+)\]/);
-  if (m) div.classList.add(`cat-${m[1].toLowerCase()}`);
+  const m = text.match(/\[[^\]]+\]\s*\[([^\]]+)\]/);
+  if (m) div.classList.add(`cat-${m[1].toLowerCase().trim()}`);
   div.textContent = text;
   return div;
 }

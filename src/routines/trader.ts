@@ -21,6 +21,7 @@ import {
   getItemSize,
   readSettings,
   sleep,
+  logFactionActivity,
 } from "./common.js";
 import {
   getActiveSession,
@@ -611,6 +612,10 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     };
     let extraRevenue = 0;
     let recoveredSessionHandled = false; // Track if we've handled a recovered session
+    let route: TradeRoute | null = null; // Declare route early for recovered session handler
+    let buyQty = 0;
+    let investedCredits = 0;
+    let alreadySold = false;
 
     // ── Handle recovered session ──
     // If we have a recovered session that's in transit, skip dock/maintenance and go directly to destination
@@ -687,6 +692,10 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       
       await ensureDocked(ctx);
       ctx.log("trade", "Arrived at destination — proceeding to sell trade items");
+      
+      // Mark as handled and skip remaining setup phases
+      recoveredSessionHandled = true;
+      // route, buyQty, investedCredits already set - will proceed to sell phase
     }
 
     // ── Ensure docked (also records market data + analyzes market) ──
@@ -724,6 +733,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       const homeSystem = settings.homeSystem || startSystem;
       const itemsToDeposit: Array<{ itemId: string; name: string; quantity: number }> = [];
       const itemsToSell: Array<{ itemId: string; name: string; quantity: number; price: number }> = [];
+      const soldLocallyIds = new Set<string>(); // Track items sold at current station
 
       for (const item of cargoItems) {
         // Find best buy order for this item
@@ -959,10 +969,6 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // If we have a recovered session that wasn't handled yet, convert it to a route and execute
-    let route: TradeRoute | null = null;
-    let buyQty = 0;
-    let investedCredits = 0;
-    let alreadySold = false;
     const failedSources = new Set<string>();
     let attempts = 0;
 

@@ -1020,9 +1020,28 @@ export async function navigateToSystem(
       return false;
     }
 
-    // Re-check in case ensureFueled moved us
+    // CRITICAL: Re-check position after ensureFueled — it may have moved us to a different system!
     await bot.refreshStatus();
     if (bot.system === targetSystemId) return true;
+    
+    // Recalculate route from CURRENT position (ensureFueled may have moved us)
+    const postFuelRoute = mapStore.findRoute(bot.system, targetSystemId);
+    if (postFuelRoute && postFuelRoute.length > 1) {
+      nextSystem = postFuelRoute[1];
+      ctx.log("travel", `Route recalculated from ${bot.system}: ${postFuelRoute.length - 1} jump${postFuelRoute.length - 1 !== 1 ? "s" : ""} remaining`);
+    } else {
+      // No mapped route — query server
+      ctx.log("travel", `No mapped route from ${bot.system} — querying server for route to ${targetSystemId}`);
+      const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
+      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number } | null;
+      if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
+        nextSystem = routeData.route[1].system_id;
+        ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
+      } else {
+        ctx.log("error", `No route from ${bot.system} to ${targetSystemId} — cannot navigate`);
+        return false;
+      }
+    }
 
     await ensureUndocked(ctx);
 
@@ -1031,7 +1050,7 @@ export async function navigateToSystem(
     let retries = 0;
     while (!jumpSuccess && retries < MAX_RETRIES_PER_JUMP && bot.state === "running") {
       retries++;
-      ctx.log("travel", `Jumping to ${nextSystem}... (attempt ${retries}/${MAX_RETRIES_PER_JUMP})`);
+      ctx.log("travel", `Jumping to ${nextSystem} from ${bot.system}... (attempt ${retries}/${MAX_RETRIES_PER_JUMP})`);
       const jumpResp = await bot.exec("jump", { target_system: nextSystem });
       
       if (!jumpResp.error) {
@@ -1066,10 +1085,17 @@ export async function navigateToSystem(
         const waitTime = 5000 * retries; // 5s, 10s, 15s
         ctx.log("travel", `Waiting ${waitTime/1000}s before retry...`);
         await sleep(waitTime);
-        
-        // Refresh status after wait
+
+        // CRITICAL: Refresh status and recalculate route after wait
         await bot.refreshStatus();
         if (bot.system === targetSystemId) return true;
+        
+        // Recalculate route from CURRENT position (may have changed during wait)
+        const retryRoute = mapStore.findRoute(bot.system, targetSystemId);
+        if (retryRoute && retryRoute.length > 1) {
+          nextSystem = retryRoute[1];
+          ctx.log("travel", `Route recalculated after wait: ${retryRoute.length - 1} jump${retryRoute.length - 1 !== 1 ? "s" : ""} remaining`);
+        }
       }
     }
     

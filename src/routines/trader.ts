@@ -718,14 +718,32 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // 2. If yes, sell here
     // 3. If no, travel home and deposit to faction storage for later sale
     // This handles: corrupt session data, human-placed trade items, failed trades
+    // IMPORTANT: Skip items that are part of an active/recovered trade session!
     yield "handle_cargo";
     await bot.refreshStatus();
     await bot.refreshCargo();
+
+    // Get the active trade session to protect those items
+    // (activeSession already declared above for recovery check)
+    const protectedItemId = activeSession?.itemId || recoveredSession?.itemId;
+
+    if (protectedItemId) {
+      ctx.log("trade", `Protecting trade session item: ${protectedItemId} (not selling in cargo phase)`);
+    }
+
+    // Track items sold locally so we don't plan routes to sell them here again
+    const soldLocallyIds = new Set<string>();
     
     const cargoItems = bot.inventory.filter(i => {
       if (i.quantity <= 0) return false;
       const lower = i.itemId.toLowerCase();
-      return !lower.includes("fuel") && !lower.includes("energy_cell");
+      if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+      // PROTECT trade session items - don't sell them in this phase!
+      if (protectedItemId && i.itemId === protectedItemId) {
+        ctx.log("trade", `Skipping ${i.quantity}x ${i.name} - part of active trade session`);
+        return false;
+      }
+      return true;
     });
 
     if (cargoItems.length > 0 && bot.docked) {
@@ -1780,20 +1798,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // Deposit any other non-fuel items from cargo to faction/station storage
-    // (never sell — these may be crafting materials like durasteel)
-    await bot.refreshCargo();
-    for (const item of [...bot.inventory]) {
-      if (item.itemId === route.itemId) continue;
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-      if (item.quantity <= 0) continue;
-      const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
-      if (fResp.error) {
-        await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
-      }
-      ctx.log("trade", `Deposited ${item.quantity}x ${item.name} (extra cargo)`);
-    }
+    // Extra cargo items stay in cargo - will be handled by next cycle's cargo handling phase
+    // (No need to deposit at trade destinations - faction storage may not exist here)
 
     // Sell faction storage items at this market too
     const { revenue: fsRevenue2 } = await sellFactionStorageItems(ctx);

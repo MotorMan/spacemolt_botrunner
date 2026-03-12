@@ -5,6 +5,8 @@ import {
   isStationPoi,
   isScenicPoi,
   findStation,
+  findSalvageYardStation,
+  getSystemForSalvageYard,
   collectFromStorage,
   ensureDocked,
   ensureUndocked,
@@ -19,6 +21,7 @@ import {
   readSettings,
   scavengeWrecks,
   fullSalvageWrecks,
+  processTowedWrecks,
   getSystemInfo,
   sleep,
 } from "./common.js";
@@ -34,10 +37,13 @@ function getSalvagerSettings(username?: string): {
   repairThreshold: number;
   system: string;
   homeSystem: string;
+  salvageYardSystem: string;
+  salvageYardStation: string;
   autoCloak: boolean;
   enableFullSalvage: boolean;
   enableTowing: boolean;
   minTowValue: number;
+  preferScrap: boolean;
 } {
   const all = readSettings();
   const m = all.salvager || {};
@@ -57,10 +63,13 @@ function getSalvagerSettings(username?: string): {
     repairThreshold: (m.repairThreshold as number) || 40,
     system: (botOverrides.system as string) || (m.system as string) || "",
     homeSystem: (botOverrides.homeSystem as string) || (m.homeSystem as string) || "",
+    salvageYardSystem: (botOverrides.salvageYardSystem as string) || (m.salvageYardSystem as string) || "",
+    salvageYardStation: (botOverrides.salvageYardStation as string) || (m.salvageYardStation as string) || "",
     autoCloak: (m.autoCloak as boolean) ?? false,
     enableFullSalvage: (m.enableFullSalvage as boolean) !== false,
     enableTowing: (m.enableTowing as boolean) ?? false,
     minTowValue: (m.minTowValue as number) || 500,
+    preferScrap: (m.preferScrap as boolean) ?? false,
   };
 }
 
@@ -306,6 +315,78 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
+    // ── Process towed wrecks: navigate to salvage yard if towing ──
+    await bot.refreshStatus();
+    if (bot.towingWreck) {
+      ctx.log("scavenge", "Towing wreck — navigating to salvage yard...");
+
+      // Determine salvage yard destination
+      const configuredStation = settings.salvageYardStation || "";
+      const configuredSystem = settings.salvageYardSystem || "";
+      let targetSystem = configuredSystem;
+      let targetStationId: string | null = null;
+
+      if (configuredStation) {
+        // User specified a specific salvage yard station
+        targetStationId = configuredStation;
+        // Try to find the system for this station
+        const sysForStation = getSystemForSalvageYard(configuredStation);
+        if (sysForStation) {
+          targetSystem = sysForStation;
+        }
+        ctx.log("scavenge", `Using configured salvage yard: ${configuredStation}`);
+      }
+
+      if (!targetSystem) {
+        // Default: Sol system (Alpha Centauri Colonial Station)
+        targetSystem = "sol";
+        targetStationId = "alpha_centauri_colonial_station";
+        ctx.log("scavenge", "No salvage yard configured — using default (Sol: Alpha Centauri Colonial Station)");
+      }
+
+      // Navigate to salvage yard system if not already there
+      if (bot.system !== targetSystem) {
+        yield "navigate_to_salvage_yard";
+        ctx.log("travel", `Traveling to salvage yard system: ${targetSystem}...`);
+        const arrived = await navigateToSystem(ctx, targetSystem, {
+          ...safetyOpts,
+          autoCloak: settings.autoCloak,
+        });
+        if (!arrived) {
+          ctx.log("error", "Failed to reach salvage yard system — docking at nearest station");
+        }
+      }
+
+      // Find and travel to salvage yard station
+      const { pois: yardPois } = await getSystemInfo(ctx);
+      let salvageYardStation = targetStationId 
+        ? yardPois.find(p => p.id === targetStationId) || findSalvageYardStation(yardPois)
+        : findSalvageYardStation(yardPois);
+
+      if (salvageYardStation) {
+        yield "travel_to_salvage_yard";
+        ctx.log("travel", `Traveling to salvage yard: ${salvageYardStation.name}...`);
+        const travelResp = await bot.exec("travel", { target_poi: salvageYardStation.id });
+        if (travelResp.error && !travelResp.error.message.includes("already")) {
+          ctx.log("error", `Travel to salvage yard failed: ${travelResp.error.message}`);
+        } else {
+          bot.poi = salvageYardStation.id;
+          stationPoi = { id: salvageYardStation.id, name: salvageYardStation.name };
+        }
+      } else {
+        // Fall back to any station
+        const fallbackStation = findStation(yardPois);
+        if (fallbackStation) {
+          ctx.log("warn", "No salvage yard found — using regular station");
+          const travelResp = await bot.exec("travel", { target_poi: fallbackStation.id });
+          if (!travelResp.error || travelResp.error.message.includes("already")) {
+            bot.poi = fallbackStation.id;
+            stationPoi = { id: fallbackStation.id, name: fallbackStation.name };
+          }
+        }
+      }
+    }
+
     // ── Return to home system if needed ──
     if (bot.system !== homeSystem && homeSystem) {
       yield "return_home";
@@ -339,6 +420,15 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
     bot.docked = true;
+
+    // ── Process towed wrecks at salvage yard ──
+    if (bot.towingWreck) {
+      yield "process_towed_wrecks";
+      const processed = await processTowedWrecks(ctx, { preferScrap: settings.preferScrap });
+      if (processed > 0) {
+        ctx.log("scavenge", `Processed ${processed} towed wreck(s) at salvage yard`);
+      }
+    }
 
     // ── Collect storage + sell/deposit cargo ──
     await collectFromStorage(ctx);

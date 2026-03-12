@@ -1770,6 +1770,7 @@
       <div class="conn-dot" id="connDot"></div>
       <span id="connText">Connecting...</span>
     </div>
+    <button class="danger sm" onclick="showShutdownModal()">Shutdown Server</button>
   </div>
 </header>
 
@@ -2088,6 +2089,23 @@
       <button onclick="toggleModalMode()" id="modalToggle">Register New</button>
       <button onclick="closeAddModal()">Cancel</button>
       <button class="primary" onclick="submitAddModal()" id="modalSubmit">Add</button>
+    </div>
+  </div>
+</div>
+
+<!-- Shutdown Confirmation Modal -->
+<div class="modal-overlay" id="shutdownModal">
+  <div class="modal">
+    <h2>Shutdown Server?</h2>
+    <p style="color: var(--text-dim); margin: 16px 0;">
+      This will gracefully stop all running bots, save data, and shut down the server.
+    </p>
+    <p style="color: var(--red); font-size: 13px;">
+      ⚠️ You will need to restart the server manually.
+    </p>
+    <div class="modal-actions">
+      <button onclick="hideShutdownModal()">Cancel</button>
+      <button class="danger" onclick="confirmShutdown()">Shutdown Server</button>
     </div>
   </div>
 </div>
@@ -5753,6 +5771,38 @@ function closeAddModal() {
   document.getElementById('addPassword').value = '';
   document.getElementById('regCode').value = '';
   document.getElementById('regUsername').value = '';
+}
+
+function showShutdownModal() {
+  document.getElementById('shutdownModal').classList.add('active');
+}
+
+function hideShutdownModal() {
+  document.getElementById('shutdownModal').classList.remove('active');
+}
+
+function confirmShutdown() {
+  fetch('/api/shutdown', { method: 'POST' })
+    .then(res => res.json())
+    .then(data => {
+      if (data.ok) {
+        appendLine('system', 'Server shutdown initiated...');
+        hideShutdownModal();
+        // Close WebSocket connection
+        if (ws) {
+          ws.close();
+          ws = null;
+        }
+        // Update connection status
+        document.getElementById('connDot').classList.remove('connected');
+        document.getElementById('connText').textContent = 'Server Stopped';
+      } else {
+        appendLine('error', `Shutdown failed: ${data.error || 'unknown'}`);
+      }
+    })
+    .catch(err => {
+      appendLine('error', `Shutdown error: ${err.message}`);
+    });
 }
 
 function toggleModalMode() {

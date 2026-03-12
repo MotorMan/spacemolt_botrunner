@@ -112,6 +112,9 @@ export class Bot {
   /** Whether the bot's ship is dead (hull <= 0). */
   isDead = false;
 
+  /** Whether the bot is currently towing a wreck. */
+  towingWreck = false;
+
   /** Cached installed mod IDs from last refreshShipMods(). */
   installedMods: string[] = [];
 
@@ -287,6 +290,19 @@ export class Bot {
 
       // Cloak detection
       this.isCloaked = !!(p.is_cloaked || p.cloaked);
+
+      // Tow detection - check for towing_wreck flag or tow_attached status
+      const towingField = (p.towing_wreck as boolean) ?? (p.towing as boolean) ?? (p.has_tow as boolean);
+      if (towingField != null) {
+        this.towingWreck = towingField;
+      }
+      // Also check ship-level tow status
+      if (ship) {
+        const shipTowing = (ship.towing_wreck as boolean) ?? (ship.towing as boolean) ?? (ship.has_tow as boolean);
+        if (shipTowing != null) {
+          this.towingWreck = shipTowing;
+        }
+      }
 
       // Death detection
       if (this.hull <= 0 && this.maxHull > 0) {

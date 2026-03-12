@@ -122,9 +122,21 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleExec(action);
     case "remove":
       return handleRemove(action);
+    case "shutdown":
+      return handleShutdown();
     default:
       return { ok: false, error: `Unknown action: ${(action as any).type}` };
   }
+}
+
+async function handleShutdown(): Promise<WebActionResult> {
+  server.logSystem("Shutdown requested from web UI");
+  // Use globalThis shutdown function if available, otherwise trigger manually
+  const shutdownFn = (globalThis as any).shutdownServer;
+  if (shutdownFn) {
+    shutdownFn("web-ui");
+  }
+  return { ok: true, message: "Server shutting down..." };
 }
 
 async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
@@ -398,6 +410,9 @@ async function main(): Promise<void> {
   server = new WebServer(port);
   server.routines = Object.keys(ROUTINES);
   server.onAction = handleAction;
+  server.onShutdown = async () => {
+    (globalThis as any).shutdownServer("web-ui");
+  };
 
   // Route global ui.log() calls through the web server
   setLogSink((category, message) => {
@@ -534,22 +549,32 @@ async function main(): Promise<void> {
   // Start HTTP + WebSocket server
   server.start();
 
-  // Graceful shutdown
-  process.on("SIGINT", () => {
-    console.log("\nShutting down...");
+  // Graceful shutdown handler
+  function gracefulShutdown(signal: string): void {
+    console.log(`\nShutting down (${signal})...`);
+    server.logSystem(`Server shutdown requested (${signal})`);
     // Clear intervals
     for (const id of intervals) clearInterval(id);
     // Flush stats before stopping bots
     const statuses = [...bots.values()].map(b => b.status());
     server.flushBotStats(statuses);
+    // Stop all running bots
     for (const [, bot] of bots) {
       if (bot.state === "running") bot.stop();
     }
+    // Flush persistent data
     mapStore.flush();
     catalogStore.flush();
     server.stop();
     process.exit(0);
-  });
+  }
+
+  // Graceful shutdown on SIGINT (Ctrl+C) and SIGTERM (Windows/taskkill)
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+
+  // Expose shutdown function for web UI
+  (globalThis as any).shutdownServer = gracefulShutdown;
 }
 
 main().catch((err) => {

@@ -20,6 +20,7 @@ export interface BaseServices {
   missions?: boolean;
   cloning?: boolean;
   insurance?: boolean;
+  salvage_yard?: boolean;
 }
 
 export interface SystemPOI {
@@ -116,6 +117,38 @@ export function stationHasService(poi: SystemPOI, service: keyof BaseServices): 
   // If services are unknown, assume the station has the service (optimistic)
   if (!poi.services) return true;
   return poi.services[service] !== false;
+}
+
+/** Known salvage yard station IDs (one per empire). */
+export const SALVAGE_YARD_STATIONS = [
+  "alpha_centauri_colonial_station", // Sol
+  "node_alpha_processing_station",   // Node
+  "the_anvil_arsenal",               // Anvil
+  "mobile_capital",                  // Mobile
+  "cargo_lanes_freight_depot",       // Cargo Lanes
+];
+
+/** Find a station with a salvage yard service. Returns null if none found. */
+export function findSalvageYardStation(pois: SystemPOI[]): SystemPOI | null {
+  // First try: check services flag
+  const byService = pois.find(p => isStationPoi(p) && p.services?.salvage_yard !== false);
+  if (byService) return byService;
+  
+  // Second try: match known salvage yard station IDs
+  return pois.find(p => isStationPoi(p) && SALVAGE_YARD_STATIONS.includes(p.id)) || null;
+}
+
+/** Get the system ID for a known salvage yard station. */
+export function getSystemForSalvageYard(stationId: string): string | null {
+  // Map salvage yard stations to their systems (update as discovered)
+  const stationToSystem: Record<string, string> = {
+    "alpha_centauri_colonial_station": "sol",            // Sol empire
+    "node_alpha_processing_station": "node_alpha",       // Node empire (guess - update if different)
+    "the_anvil_arsenal": "the_anvil",                    // Anvil empire (guess - update if different)
+    "mobile_capital": "mobile",                          // Mobile empire (guess - update if different)
+    "cargo_lanes_freight_depot": "cargo_lanes",          // Cargo Lanes empire (guess - update if different)
+  };
+  return stationToSystem[stationId] || null;
 }
 
 // ── System data parsing ──────────────────────────────────────
@@ -1366,8 +1399,13 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
 }
 
 /**
- * Full wreck salvage chain: loot → salvage → scrap for each wreck.
- * Optionally tow high-value wrecks. Returns total items extracted.
+ * Full wreck salvage chain using the new tow-based system:
+ * 1. Loot cargo from wrecks in the field (loot_wreck)
+ * 2. Tow the wreck (tow_wreck) - attaches to ship, 50% speed penalty
+ * 3. Travel to salvage yard station with the towed wreck
+ * 4. Sell wreck (sell_wreck) for credits + salvaging XP, or scrap (scrap_wreck) for materials at lvl 2+
+ *
+ * Returns total items looted from wrecks. Towed wrecks are processed at salvage yard.
  */
 export async function fullSalvageWrecks(
   ctx: RoutineContext,
@@ -1384,8 +1422,9 @@ export async function fullSalvageWrecks(
   const wrecks = parseWrecks(wrecksResp.result);
   if (wrecks.length === 0) return 0;
 
-  let totalExtracted = 0;
-  const extractedItems: string[] = [];
+  let totalLooted = 0;
+  const lootedItems: string[] = [];
+  const towedWrecks: { wreck_id: string; name: string; salvage_value: number }[] = [];
 
   for (const wreck of wrecks) {
     if (bot.state !== "running") break;
@@ -1396,7 +1435,7 @@ export async function fullSalvageWrecks(
       break;
     }
 
-    // Step 1: Loot all items from the wreck
+    // Step 1: Loot cargo from the wreck
     if (wreck.items.length > 0) {
       let candidates = [...wreck.items];
       if (fuelOnly) {
@@ -1428,58 +1467,138 @@ export async function fullSalvageWrecks(
           continue;
         }
 
-        totalExtracted++;
-        extractedItems.push(`${item.quantity}x ${item.name}`);
+        totalLooted++;
+        lootedItems.push(`${item.quantity}x ${item.name}`);
       }
     }
 
-    // Step 2: Salvage the wreck for components
-    await bot.refreshStatus();
-    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) continue;
+    // Step 2: Optionally tow high-value wrecks
+    if (enableTow) {
+      // Check if we already have a tow attached
+      await bot.refreshStatus();
+      if (bot.towingWreck) {
+        ctx.log("scavenge", "Already towing a wreck — skipping tow");
+        continue;
+      }
 
-    const salvageResp = await bot.exec("salvage_wreck", { wreck_id: wreck.wreck_id });
-    if (!salvageResp.error && salvageResp.result) {
-      const sr = salvageResp.result as Record<string, unknown>;
-      const items = (sr.items as Array<Record<string, unknown>>) || [];
-      if (items.length > 0) {
-        const names = items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || (i.item_id as string) || "component"}`).join(", ");
-        extractedItems.push(names);
-        totalExtracted += items.length;
-        ctx.log("scavenge", `Salvaged components: ${names}`);
+      const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
+      if (!towResp.error && towResp.result) {
+        const tr = towResp.result as Record<string, unknown>;
+        const salvageValue = (tr.salvage_value as number) || 0;
+        const shipClass = (tr.ship_class as string) || "unknown";
+        
+        if (salvageValue >= minTowValue) {
+          towedWrecks.push({
+            wreck_id: wreck.wreck_id,
+            name: wreck.name,
+            salvage_value: salvageValue,
+          });
+          ctx.log("scavenge", `Towed ${shipClass} wreck (${wreck.name}) - value: ${salvageValue}cr, speed penalty: 50%`);
+        } else {
+          ctx.log("scavenge", `Skipped towing ${wreck.name} - value ${salvageValue}cr below threshold ${minTowValue}cr`);
+        }
+      } else if (towResp.error) {
+        const msg = towResp.error.message.toLowerCase();
+        if (!msg.includes("already") && !msg.includes("towing")) {
+          ctx.log("error", `Failed to tow ${wreck.name}: ${towResp.error.message}`);
+        }
       }
     }
+  }
 
-    // Step 3: Scrap the wreck for raw materials
-    await bot.refreshStatus();
-    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) continue;
+  if (totalLooted > 0) {
+    await bot.refreshCargo();
+    ctx.log("scavenge", `Looted ${lootedItems.join(", ")} from ${wrecks.length} wreck(s)`);
+  }
 
-    const scrapResp = await bot.exec("scrap_wreck", { wreck_id: wreck.wreck_id });
+  if (towedWrecks.length > 0) {
+    ctx.log("scavenge", `Towing ${towedWrecks.length} wreck(s) to salvage yard: ${towedWrecks.map(w => w.name).join(", ")}`);
+  }
+
+  return totalLooted;
+}
+
+/**
+ * Process towed wrecks at a salvage yard station.
+ * - If salvaging skill < 2: sell_wreck for credits + XP
+ * - If salvaging skill >= 2: scrap_wreck for materials (or sell if preferred)
+ * 
+ * Must be docked at a station with salvage_yard service.
+ * Returns number of wrecks processed.
+ */
+export async function processTowedWrecks(
+  ctx: RoutineContext,
+  opts?: { preferScrap: boolean },
+): Promise<number> {
+  const { bot } = ctx;
+  if (!bot.docked) {
+    ctx.log("error", "Must be docked to process towed wrecks");
+    return 0;
+  }
+
+  const preferScrap = opts?.preferScrap ?? false;
+
+  // Check if we're towing a wreck
+  await bot.refreshStatus();
+  if (!bot.towingWreck) {
+    return 0; // No towed wreck to process
+  }
+
+  // Check station has salvage yard
+  const { pois } = await getSystemInfo(ctx);
+  const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+  if (currentStation?.services && currentStation.services.salvage_yard === false) {
+    ctx.log("error", "This station does not have a salvage yard - cannot process wrecks");
+    return 0;
+  }
+
+  // Check salvaging skill level
+  await bot.checkSkills();
+  const salvagingLevel = bot.getSkillLevel("salvaging");
+  const canScrap = salvagingLevel >= 2;
+
+  let processed = 0;
+
+  // Try to scrap if preferred and skill allows, otherwise sell
+  if (preferScrap && canScrap) {
+    const scrapResp = await bot.exec("scrap_wreck");
     if (!scrapResp.error && scrapResp.result) {
       const sr = scrapResp.result as Record<string, unknown>;
       const items = (sr.items as Array<Record<string, unknown>>) || [];
       if (items.length > 0) {
-        const names = items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || (i.item_id as string) || "material"}`).join(", ");
-        extractedItems.push(names);
-        totalExtracted += items.length;
-        ctx.log("scavenge", `Scrapped materials: ${names}`);
+        const names = items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || "material"}`).join(", ");
+        ctx.log("scavenge", `Scrapped wreck for: ${names}`);
+        processed++;
       }
-    }
-
-    // Step 4: Optionally tow high-value wrecks
-    if (enableTow) {
-      const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
-      if (!towResp.error) {
-        ctx.log("scavenge", `Towing wreck: ${wreck.name}`);
-      }
+    } else if (scrapResp.error) {
+      ctx.log("error", `Scrap failed: ${scrapResp.error.message} - falling back to sell`);
+      // Fall through to sell
     }
   }
 
-  if (totalExtracted > 0) {
-    await bot.refreshCargo();
-    ctx.log("scavenge", `Full salvage: ${totalExtracted} items from ${wrecks.length} wreck(s)`);
+  if (processed === 0) {
+    // Sell the wreck for credits + XP
+    const sellResp = await bot.exec("sell_wreck");
+    if (!sellResp.error && sellResp.result) {
+      const sr = sellResp.result as Record<string, unknown>;
+      const credits = (sr.credits as number) || (sr.earned as number) || 0;
+      const xp = (sr.xp as number) || (sr.experience as number) || 0;
+      if (credits > 0 || xp > 0) {
+        ctx.log("scavenge", `Sold wreck for ${credits}cr + ${xp} XP`);
+        processed++;
+      }
+    } else if (sellResp.error) {
+      ctx.log("error", `Sell wreck failed: ${sellResp.error.message}`);
+    }
   }
 
-  return totalExtracted;
+  // Reset towing flag after successful processing
+  if (processed > 0) {
+    bot.towingWreck = false;
+  }
+
+  await bot.refreshStatus();
+  return processed;
 }
 
 // ── Role-Based Mods ──────────────────────────────────────────

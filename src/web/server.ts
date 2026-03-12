@@ -8,7 +8,7 @@ import type { ServerWebSocket } from "bun";
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove";
+  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown";
   bot?: string;
   routine?: string;
   username?: string;
@@ -137,6 +137,9 @@ export class WebServer {
   // Action callback — set by botmanager
   onAction: ((action: WebAction) => Promise<WebActionResult>) | null = null;
 
+  // Shutdown callback — set by botmanager
+  onShutdown: (() => Promise<void>) | null = null;
+
   // Available routines — set by botmanager
   routines: string[] = [];
 
@@ -218,6 +221,15 @@ export class WebServer {
         }
         if (url.pathname === "/api/catalog") {
           return Response.json(catalogStore.getAll());
+        }
+
+        // Shutdown endpoint
+        if (url.pathname === "/api/shutdown" && req.method === "POST") {
+          if (this.onShutdown) {
+            await this.onShutdown();
+            return Response.json({ ok: true, message: "Shutting down..." });
+          }
+          return Response.json({ ok: false, error: "No shutdown handler" });
         }
 
         // Per-bot persistent log files

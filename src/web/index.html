@@ -7839,6 +7839,11 @@ function renderSalvagerSettings(panel) {
   const repairThreshold = sv.repairThreshold ?? 40;
   const currentSystem = sv.system || '';
   const homeSystem = sv.homeSystem || '';
+  const enableFullSalvage = sv.enableFullSalvage !== false;
+  const enableTowing = sv.enableTowing ?? false;
+  const minTowValue = sv.minTowValue ?? 500;
+  const preferScrap = sv.preferScrap ?? false;
+  const autoCloak = sv.autoCloak ?? false;
 
   const systemOpts = ['<option value="">(current system)</option>'];
   for (const sys of knownSystems) {
@@ -7930,6 +7935,46 @@ function renderSalvagerSettings(panel) {
       <input type="number" id="set-salvager-repairThreshold" min="20" max="80" value="${repairThreshold}">
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Enable Full Salvage</div>
+        <div class="setting-hint">Loot wrecks AND tow them to salvage yard. If disabled, only loot cargo in the field.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-salvager-enableFullSalvage"${enableFullSalvage ? ' checked' : ''}> Enable full salvage (loot + tow)</label>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Enable Towing</div>
+        <div class="setting-hint">Attach wrecks to your ship for processing at salvage yard. 50% speed penalty while towing.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-salvager-enableTowing"${enableTowing ? ' checked' : ''}> Enable towing wrecks</label>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min Tow Value</div>
+        <div class="setting-hint">Only tow wrecks with salvage value >= this amount (credits).</div>
+      </div>
+      <input type="number" id="set-salvager-minTowValue" min="0" max="10000" value="${minTowValue}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Prefer Scrap</div>
+        <div class="setting-hint">Scrap wrecks for materials instead of selling (requires Salvaging lvl 2+).</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-salvager-preferScrap"${preferScrap ? ' checked' : ''}> Scrap instead of sell</label>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Auto Cloak</div>
+        <div class="setting-hint">Automatically cloak when jumping to new systems for safety.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-salvager-autoCloak"${autoCloak ? ' checked' : ''}> Enable auto cloak</label>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveSalvagerSettings()">Save Settings</button>
     </div>
@@ -7945,6 +7990,11 @@ function saveSalvagerSettings() {
     cargoThreshold: parseInt(document.getElementById('set-salvager-cargoThreshold').value) || 80,
     refuelThreshold: parseInt(document.getElementById('set-salvager-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-salvager-repairThreshold').value) || 40,
+    enableFullSalvage: document.getElementById('set-salvager-enableFullSalvage').checked,
+    enableTowing: document.getElementById('set-salvager-enableTowing').checked,
+    minTowValue: parseInt(document.getElementById('set-salvager-minTowValue').value) || 1,
+    preferScrap: document.getElementById('set-salvager-preferScrap').checked,
+    autoCloak: document.getElementById('set-salvager-autoCloak').checked,
   };
   send({ type: 'saveSettings', routine: 'salvager', settings: s });
   settings.salvager = s;

@@ -183,10 +183,8 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     const station = findStation(pois);
     if (station) stationPoi = { id: station.id, name: station.name };
 
-    // Build list of POIs to visit (all non-station, non-scenic)
-    const visitPois = pois.filter(p =>
-      !isStationPoi(p) && !isScenicPoi(p.type)
-    );
+    // Build list of POIs to visit (all non-station POIs — wrecks can spawn anywhere)
+    const visitPois = pois.filter(p => !isStationPoi(p));
 
     if (visitPois.length === 0) {
       ctx.log("error", "No salvageable POIs in this system — waiting 60s");
@@ -271,9 +269,9 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         const arrived = await navigateToSystem(ctx, conn.system_id, safetyOpts);
         if (!arrived) continue;
 
-        // Scan neighbor system POIs
+        // Scan neighbor system POIs (all non-station POIs — wrecks can spawn anywhere)
         const { pois: neighborPois } = await getSystemInfo(ctx);
-        const neighborVisit = neighborPois.filter(p => !isStationPoi(p) && !isScenicPoi(p.type));
+        const neighborVisit = neighborPois.filter(p => !isStationPoi(p));
         if (neighborVisit.length === 0) continue;
 
         for (const poi of neighborVisit) {

@@ -1859,6 +1859,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('ice_harvester')">IceHarvester</div>
         <div class="sidebar-item" onclick="switchSettingsTab('salvager')">Salvager</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cleanup')">Cleanup</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('return_home')">Return Home</div>
         <div class="sidebar-item" onclick="switchSettingsTab('ai')">AI</div>
         <div class="sidebar-item" onclick="switchSettingsTab('hunter')">Hunter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cargo_mover')">CargoMover</div>
@@ -2202,7 +2203,7 @@ function connect() {
     connDot.classList.remove('connected');
     connText.textContent = 'Disconnected';
     setTimeout(connect, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 30000);
+    reconnectDelay = Math.min(reconnectDelay * 2, 10000);
   };
 
   ws.onerror = () => {};
@@ -3744,7 +3745,7 @@ function sendExec(botName, command, params, callback) {
         delete execCallbacks[seq];
       }
       delete execTimers[seq];
-    }, 120000);
+    }, 1200000);
   }
   const msg = { type: 'exec', bot: botName, command, params, _seq: seq };
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -4786,6 +4787,8 @@ function renderSettingsPanel() {
     renderSalvagerSettings(panel);
   } else if (activeSettingsTab === 'cleanup') {
     renderCleanupSettings(panel);
+  } else if (activeSettingsTab === 'return_home') {
+    renderReturnHomeSettings(panel);
   } else if (activeSettingsTab === 'ai') {
     renderAiSettings(panel);
   } else if (activeSettingsTab === 'hunter') {
@@ -4907,6 +4910,120 @@ function saveCleanupSettings() {
   const s = { homeSystem, homeStation };
   send({ type: 'saveSettings', routine: 'cleanup', settings: s });
   settings.cleanup = Object.assign(settings.cleanup || {}, s);
+}
+
+function renderReturnHomeSettings(panel) {
+  const returnHome = settings.return_home || {};
+  const homeSystem = returnHome.homeSystem || '';
+  const homeStation = returnHome.homeStation || '';
+
+  // Build station options from mapData
+  let stationOpts = '<option value="">(not set)</option>';
+  for (const [sysId, sys] of Object.entries(mapData)) {
+    const sysName = sys.name || sysId;
+    for (const poi of (sys.pois || [])) {
+      if (!poi.has_base) continue;
+      const val = sysId + '|' + poi.id;
+      const sel = (sysId === homeSystem && poi.id === homeStation) ? ' selected' : '';
+      const label = poi.base_name || poi.name || poi.id;
+      stationOpts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
+    }
+  }
+
+  // Per-bot overrides
+  const botOverrides = {};
+  for (const bot of bots) {
+    const botSettings = settings[bot.username] || {};
+    if (botSettings.homeSystem || botSettings.homeStation) {
+      botOverrides[bot.username] = botSettings;
+    }
+  }
+
+  let perBotHtml = '';
+  if (Object.keys(botOverrides).length > 0) {
+    perBotHtml = `<div class="setting-section">
+      <div class="setting-label">Per-Bot Overrides</div>
+      <div class="setting-hint">Individual bot home settings override the global defaults above.</div>
+      <table class="settings-table">
+        <thead><tr><th>Bot</th><th>Home System</th><th>Home Station</th><th>Action</th></tr></thead>
+        <tbody>`;
+    for (const [botName, botSettings] of Object.entries(botOverrides)) {
+      const bSys = botSettings.homeSystem || '-';
+      const bStation = botSettings.homeStation || '-';
+      perBotHtml += `<tr>
+        <td>${esc(botName)}</td>
+        <td>${esc(bSys)}</td>
+        <td>${esc(bStation)}</td>
+        <td><button class="danger sm" onclick="clearReturnHomeBotOverride('${esc(botName)}')">Clear Override</button></td>
+      </tr>`;
+    }
+    perBotHtml += `</tbody></table></div>`;
+  }
+
+  panel.innerHTML = `
+    <h3>Return Home Settings</h3>
+    <div class="settings-desc">Configure the home base for the Return Home routine. Bots will navigate to this station when the routine is executed.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Global Home Station</div>
+        <div class="setting-hint">Default home station for all bots using the Return Home routine. Individual bots can have overrides below.</div>
+      </div>
+      <select id="set-returnhome-station">${stationOpts}</select>
+    </div>
+
+    ${perBotHtml}
+
+    <div class="setting-section">
+      <div class="setting-label">Set Per-Bot Override</div>
+      <div class="setting-hint">Override the global home station for a specific bot.</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
+        <select id="set-returnhome-bot" style="flex:1">
+          <option value="">(select bot)</option>
+          ${bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join('')}
+        </select>
+        <select id="set-returnhome-bot-station" style="flex:1">
+          ${stationOpts}
+        </select>
+        <button class="primary" onclick="saveReturnHomeBotOverride()">Set Override</button>
+      </div>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveReturnHomeSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function saveReturnHomeSettings() {
+  const stationVal = document.getElementById('set-returnhome-station').value;
+  const [homeSystem, homeStation] = stationVal ? stationVal.split('|') : ['', ''];
+  const s = { homeSystem, homeStation };
+  send({ type: 'saveSettings', routine: 'return_home', settings: s });
+  settings.return_home = Object.assign(settings.return_home || {}, s);
+}
+
+function saveReturnHomeBotOverride() {
+  const botName = document.getElementById('set-returnhome-bot').value;
+  const stationVal = document.getElementById('set-returnhome-bot-station').value;
+  if (!botName || !stationVal) {
+    alert('Please select both a bot and a station');
+    return;
+  }
+  const [homeSystem, homeStation] = stationVal.split('|');
+  const s = { homeSystem, homeStation };
+  send({ type: 'saveSettings', routine: botName, settings: s });
+  settings[botName] = Object.assign(settings[botName] || {}, s);
+  renderReturnHomeSettings(document.getElementById('settingsContent'));
+}
+
+function clearReturnHomeBotOverride(botName) {
+  if (!confirm(`Clear home station override for ${botName}?`)) return;
+  const s = { homeSystem: undefined, homeStation: undefined };
+  send({ type: 'saveSettings', routine: botName, settings: s });
+  delete settings[botName].homeSystem;
+  delete settings[botName].homeStation;
+  renderReturnHomeSettings(document.getElementById('settingsContent'));
 }
 
 function renderMinerSettings(panel) {
@@ -7839,11 +7956,23 @@ function renderSalvagerSettings(panel) {
   const repairThreshold = sv.repairThreshold ?? 40;
   const currentSystem = sv.system || '';
   const homeSystem = sv.homeSystem || '';
+  const salvageYardSystem = sv.salvageYardSystem || '';
+  const salvageYardStation = sv.salvageYardStation || '';
   const enableFullSalvage = sv.enableFullSalvage !== false;
   const enableTowing = sv.enableTowing ?? false;
   const minTowValue = sv.minTowValue ?? 500;
   const preferScrap = sv.preferScrap ?? false;
   const autoCloak = sv.autoCloak ?? false;
+
+  // Salvage yard stations list
+  const salvageYardStations = [
+    { id: 'alpha_centauri_colonial_station', name: 'Alpha Centauri Colonial Station', system: 'alpha_centauri' },
+    { id: 'node_alpha_processing_station', name: 'Node Alpha Processing Station', system: 'node_alpha' },
+    { id: 'the_anvil_arsenal', name: 'The Anvil Arsenal', system: 'the_anvil' },
+    { id: 'mobile_capital', name: 'Mobile Capital', system: 'frontier' },
+    { id: 'cargo_lanes_freight_depot', name: 'Cargo Lanes Freight Depot', system: 'cargo_lanes' },
+    { id: 'starfall_salvage_station', name: 'Starfall Salvage Station', system: 'starfall' }
+  ];
 
   const systemOpts = ['<option value="">(current system)</option>'];
   for (const sys of knownSystems) {
@@ -7863,6 +7992,20 @@ function renderSalvagerSettings(panel) {
   }
   if (homeSystem && !knownSystems.find(s => s.id === homeSystem)) {
     homeOpts.push(`<option value="${esc(homeSystem)}" selected>${esc(homeSystem)}</option>`);
+  }
+
+  const salvageYardOpts = ['<option value="">(auto - any salvage yard)</option>'];
+  for (const station of salvageYardStations) {
+    const sel = station.id === salvageYardStation ? ' selected' : '';
+    const label = `${station.name} (${station.system})`;
+    salvageYardOpts.push(`<option value="${esc(station.id)}"${sel}>${esc(label)}</option>`);
+  }
+
+  const salvageYardSystemOpts = ['<option value="">(auto - based on station)</option>'];
+  for (const sys of knownSystems) {
+    const sel = sys.id === salvageYardSystem ? ' selected' : '';
+    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+    salvageYardSystemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
   }
 
   panel.innerHTML = `
@@ -7909,6 +8052,22 @@ function renderSalvagerSettings(panel) {
         <option value="sell"${depositFallback === 'sell' ? ' selected' : ''}>Sell at market</option>
         ${bots.map(b => `<option value="bot:${esc(b.username)}"${'bot:' + b.username === depositFallback ? ' selected' : ''}>${esc(b.username)}</option>`).join('')}
       </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Salvage Yard Station</div>
+        <div class="setting-hint">Station to process towed wrecks. Leave empty to use any salvage yard.</div>
+      </div>
+      <select id="set-salvager-salvageYardStation">${salvageYardOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Salvage Yard System</div>
+        <div class="setting-hint">Override system for salvage yard. Usually auto-detected from station.</div>
+      </div>
+      <select id="set-salvager-salvageYardSystem">${salvageYardSystemOpts.join('')}</select>
     </div>
 
     <div class="setting-row">
@@ -7995,6 +8154,8 @@ function saveSalvagerSettings() {
     minTowValue: parseInt(document.getElementById('set-salvager-minTowValue').value) || 1,
     preferScrap: document.getElementById('set-salvager-preferScrap').checked,
     autoCloak: document.getElementById('set-salvager-autoCloak').checked,
+    salvageYardStation: document.getElementById('set-salvager-salvageYardStation').value,
+    salvageYardSystem: document.getElementById('set-salvager-salvageYardSystem').value,
   };
   send({ type: 'saveSettings', routine: 'salvager', settings: s });
   settings.salvager = s;

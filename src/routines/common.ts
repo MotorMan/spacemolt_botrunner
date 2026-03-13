@@ -1405,14 +1405,14 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
  * 3. Travel to salvage yard station with the towed wreck
  * 4. Sell wreck (sell_wreck) for credits + salvaging XP, or scrap (scrap_wreck) for materials at lvl 2+
  *
- * Returns total items looted from wrecks. Towed wrecks are processed at salvage yard.
+ * Returns { itemsLooted, isTowing }. Towed wrecks are processed at salvage yard.
  */
 export async function fullSalvageWrecks(
   ctx: RoutineContext,
   opts?: { fuelOnly?: boolean; enableTow?: boolean; minTowValue?: number },
-): Promise<number> {
+): Promise<{ itemsLooted: number; isTowing: boolean }> {
   const { bot } = ctx;
-  if (bot.docked) return 0;
+  if (bot.docked) return { itemsLooted: 0, isTowing: false };
 
   const enableTow = opts?.enableTow ?? false;
   const minTowValue = opts?.minTowValue ?? 500;
@@ -1420,7 +1420,7 @@ export async function fullSalvageWrecks(
 
   const wrecksResp = await bot.exec("get_wrecks");
   const wrecks = parseWrecks(wrecksResp.result);
-  if (wrecks.length === 0) return 0;
+  if (wrecks.length === 0) return { itemsLooted: 0, isTowing: bot.towingWreck };
 
   let totalLooted = 0;
   const lootedItems: string[] = [];
@@ -1477,16 +1477,17 @@ export async function fullSalvageWrecks(
       // Check if we already have a tow attached
       await bot.refreshStatus();
       if (bot.towingWreck) {
-        ctx.log("scavenge", "Already towing a wreck — skipping tow");
-        continue;
+        ctx.log("scavenge", "Already towing a wreck — stopping salvage and heading to salvage yard");
+        break; // Exit the wrecks loop entirely
       }
 
       const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
       if (!towResp.error && towResp.result) {
         const tr = towResp.result as Record<string, unknown>;
+        ctx.log("debug", `tow_wreck response: ${JSON.stringify(tr)}`);
         const salvageValue = (tr.salvage_value as number) || 0;
         const shipClass = (tr.ship_class as string) || "unknown";
-        
+
         if (salvageValue >= minTowValue) {
           towedWrecks.push({
             wreck_id: wreck.wreck_id,
@@ -1494,12 +1495,28 @@ export async function fullSalvageWrecks(
             salvage_value: salvageValue,
           });
           ctx.log("scavenge", `Towed ${shipClass} wreck (${wreck.name}) - value: ${salvageValue}cr, speed penalty: 50%`);
+          // Set towing flag immediately - server confirms tow in the response
+          bot.towingWreck = true;
+          ctx.log("scavenge", `Set bot.towingWreck=true after successful tow`);
+          break;
         } else {
           ctx.log("scavenge", `Skipped towing ${wreck.name} - value ${salvageValue}cr below threshold ${minTowValue}cr`);
         }
       } else if (towResp.error) {
         const msg = towResp.error.message.toLowerCase();
-        if (!msg.includes("already") && !msg.includes("towing")) {
+        if (msg.includes("already")) {
+          // Check if it's "already_towing" (we're towing) vs "already_towed" (someone else has it)
+          if (msg.includes("already_towing") || msg.includes("already towing")) {
+            // We are already towing - this is a signal to head to salvage yard
+            ctx.log("warn", `Already towing a wreck — should head to salvage yard (${towResp.error.message})`);
+            bot.towingWreck = true;
+            break; // Stop scanning and go to salvage yard
+          } else {
+            // Someone else is towing this wreck - skip it and try another
+            ctx.log("scavenge", `Wreck already being towed by another player — skipping (${towResp.error.message})`);
+            continue; // Try the next wreck
+          }
+        } else {
           ctx.log("error", `Failed to tow ${wreck.name}: ${towResp.error.message}`);
         }
       }
@@ -1515,7 +1532,10 @@ export async function fullSalvageWrecks(
     ctx.log("scavenge", `Towing ${towedWrecks.length} wreck(s) to salvage yard: ${towedWrecks.map(w => w.name).join(", ")}`);
   }
 
-  return totalLooted;
+  // Refresh status to get latest towing state
+  await bot.refreshStatus();
+  ctx.log("debug", `fullSalvageWrecks returning: itemsLooted=${totalLooted}, towedWrecks=${towedWrecks.length}, bot.towingWreck=${bot.towingWreck}`);
+  return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
 }
 
 /**
@@ -1571,7 +1591,13 @@ export async function processTowedWrecks(
         processed++;
       }
     } else if (scrapResp.error) {
-      ctx.log("error", `Scrap failed: ${scrapResp.error.message} - falling back to sell`);
+      const errMsg = scrapResp.error.message.toLowerCase();
+      if (errMsg.includes("not_towing")) {
+        ctx.log("warn", "Server says not towing during scrap — clearing tow flag");
+        bot.towingWreck = false;
+      } else {
+        ctx.log("error", `Scrap failed: ${scrapResp.error.message} - falling back to sell`);
+      }
       // Fall through to sell
     }
   }
@@ -1588,7 +1614,13 @@ export async function processTowedWrecks(
         processed++;
       }
     } else if (sellResp.error) {
-      ctx.log("error", `Sell wreck failed: ${sellResp.error.message}`);
+      const errMsg = sellResp.error.message.toLowerCase();
+      if (errMsg.includes("not_towing")) {
+        ctx.log("warn", "Server says not towing during sell — clearing tow flag");
+        bot.towingWreck = false;
+      } else {
+        ctx.log("error", `Sell wreck failed: ${sellResp.error.message}`);
+      }
     }
   }
 

@@ -303,6 +303,12 @@ export class Bot {
           this.towingWreck = shipTowing;
         }
       }
+      
+      // Debug: log tow-related fields from status
+      if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
+          (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
+        this.log("debug", `Tow fields in status: p.towing_wreck=${p.towing_wreck}, p.towing=${p.towing}, p.has_tow=${p.has_tow}, ship.towing_wreck=${ship?.towing_wreck}, ship.towing=${ship?.towing}, ship.has_tow=${ship?.has_tow}, this.towingWreck=${this.towingWreck}`);
+      }
 
       // Death detection
       if (this.hull <= 0 && this.maxHull > 0) {

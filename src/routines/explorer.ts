@@ -21,7 +21,9 @@ import {
   scavengeWrecks,
   detectAndRecoverFromDeath,
   readSettings,
+  writeSettings,
   sleep,
+  isPirateSystem,
 } from "./common.js";
 
 /** Number of mine attempts per resource POI to sample ores. */
@@ -136,6 +138,13 @@ function getExplorerSettings(username?: string): {
   };
 }
 
+/** Persist explorer mode setting for a specific bot. */
+export function setExplorerMode(username: string, mode: ExplorerMode): void {
+  writeSettings({
+    [username]: { explorerMode: mode },
+  });
+}
+
 /**
  * Explorer routine — systematically maps the galaxy:
  *
@@ -229,6 +238,14 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Re-check mode after recovery — user might have changed it, or session was restarted ──
+    const modeCheck = getExplorerSettings(bot.username);
+    if (modeCheck.mode === "trade_update") {
+      ctx.log("system", "Mode changed to trade_update — switching routines...");
+      yield* tradeUpdateRoutine(ctx);
+      return;
+    }
 
     // ── Get current system data ──
     yield "scan_system";
@@ -689,7 +706,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const alive2 = await detectAndRecoverFromDeath(ctx);
     if (!alive2) { await sleep(30000); continue; }
 
-    // Re-read settings each cycle — user might switch mode mid-run
+    // ── Re-check mode after recovery — user might have changed it, or session was restarted ──
     const modeCheck = getExplorerSettings(bot.username);
     if (modeCheck.mode !== "trade_update") {
       ctx.log("system", "Mode changed to explore — restarting as explorer...");
@@ -702,6 +719,8 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const stationSystems: Array<{ systemId: string; systemName: string; stationPoi: string; stationName: string; staleMins: number }> = [];
 
     for (const [sysId, sys] of Object.entries(allSystems)) {
+      // Skip pirate systems — they are hostile!
+      if (isPirateSystem(sysId)) continue;
       for (const poi of sys.pois) {
         if (!poi.has_base) continue;
         // Find the stalest market entry, or Infinity if no market data

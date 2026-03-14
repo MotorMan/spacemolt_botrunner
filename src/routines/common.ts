@@ -103,13 +103,13 @@ export function isStationPoi(poi: SystemPOI): boolean {
 }
 
 /** Find the first station POI in a list. Optionally filter by required service. */
-export function findStation(pois: SystemPOI[], requiredService?: keyof BaseServices): SystemPOI | null {
+export function findStation(pois: SystemPOI[], requiredService?: keyof BaseServices, excludePirates: boolean = true): SystemPOI | null {
   if (requiredService) {
     // Prefer station with the required service
-    const withService = pois.find(p => isStationPoi(p) && p.services?.[requiredService] !== false);
+    const withService = pois.find(p => isStationPoi(p) && p.services?.[requiredService] !== false && !(excludePirates && isPirateSystem(p.id)));
     if (withService) return withService;
   }
-  return pois.find(p => isStationPoi(p)) || null;
+  return pois.find(p => isStationPoi(p) && !(excludePirates && isPirateSystem(p.id))) || null;
 }
 
 /** Check if a station POI is known to lack a specific service. */
@@ -127,6 +127,25 @@ export const SALVAGE_YARD_STATIONS = [
   "mobile_capital",                  // Mobile
   "cargo_lanes_freight_depot",       // Cargo Lanes
 ];
+
+/** Pirate station systems — these are hostile and should be avoided. */
+export const PIRATE_SYSTEMS = [
+  "alhena",
+  "xamidimura",
+  "algol",
+  "zaniah",
+  "sheratan",
+  "bellatrix",
+  "barnard_44",
+  "gsc_0008",
+  "gliese_581",
+];
+
+/** Check if a system ID is a pirate system. */
+export function isPirateSystem(systemId: string): boolean {
+  const lower = systemId.toLowerCase();
+  return PIRATE_SYSTEMS.some(ps => lower === ps || lower.includes(ps));
+}
 
 /** Find a station with a salvage yard service. Returns null if none found. */
 export function findSalvageYardStation(pois: SystemPOI[]): SystemPOI | null {

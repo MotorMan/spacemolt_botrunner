@@ -22,6 +22,7 @@ import {
   readSettings,
   sleep,
   logFactionActivity,
+  isPirateSystem,
 } from "./common.js";
 import {
   getActiveSession,
@@ -243,6 +244,8 @@ function getItemMarketCost(itemId: string): number {
   let cheapest = Infinity;
   const systems = mapStore.getAllSystems();
   for (const sys of Object.values(systems)) {
+    // Skip pirate systems
+    if (isPirateSystem(sys.id)) continue;
     for (const poi of sys.pois) {
       for (const m of poi.market) {
         if (m.item_id === itemId && m.best_sell !== null && m.best_sell > 0) {

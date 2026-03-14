@@ -20,6 +20,7 @@ import {
   readSettings,
   sleep,
   logFactionActivity,
+  isPirateSystem,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -119,12 +120,14 @@ function resolveStation(stationId: string): { systemId: string; poiId: string; p
   return null;
 }
 
-/** Get all known stations with bases from mapStore. */
+/** Get all known stations with bases from mapStore (excluding pirate systems). */
 function getAllKnownStations(homeSystem: string, homeStation: string): StationTarget[] {
   const stations: StationTarget[] = [];
   const allSystems = mapStore.getAllSystems();
 
   for (const [sysId, sys] of Object.entries(allSystems)) {
+    // Skip pirate systems
+    if (isPirateSystem(sysId)) continue;
     for (const poi of sys.pois) {
       if (!poi.has_base) continue;
       // Skip the home/faction storage station

@@ -22,6 +22,7 @@ import { catalogStore } from "./catalogstore.js";
 import { WebServer, type WebAction, type WebActionResult } from "./web/server.js";
 import { setLogSink } from "./ui.js";
 import { debugLog } from "./debug.js";
+import { reconnectQueue } from "./reconnectqueue.js";
 
 const BASE_DIR = process.cwd();
 const SESSIONS_DIR = join(BASE_DIR, "sessions");
@@ -564,6 +565,8 @@ async function main(): Promise<void> {
     for (const [, bot] of bots) {
       if (bot.state === "running") bot.stop();
     }
+    // Clear reconnection queue to release any pending reconnection attempts
+    reconnectQueue.clear();
     // Flush persistent data
     mapStore.flush();
     catalogStore.flush();

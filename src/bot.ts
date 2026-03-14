@@ -145,6 +145,7 @@ export class Bot {
   constructor(username: string, baseDir: string) {
     this.username = username;
     this.api = new SpaceMoltAPI();
+    this.api.setBotName(username);
     this.session = new SessionManager(username, baseDir);
     this.color = BOT_COLORS[colorIndex % BOT_COLORS.length];
     colorIndex++;

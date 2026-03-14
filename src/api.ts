@@ -1,5 +1,6 @@
 import { log, logError } from "./ui.js";
 import { commandLog } from "./commandLogger.js";
+import { reconnectQueue } from "./reconnectqueue.js";
 
 export interface ApiSession {
   id: string;
@@ -80,7 +81,7 @@ const COMMAND_TTL: Record<string, number> = {
   v2_get_skills:         120_000,
   v2_get_queue:            5_000,
   v2_get_missions:        60_000,
-  catalog:             2_592_000_000, // 30 days TTL (effectively permanent for this use case)
+  catalog:             1800_000, // 30min, should be slow enough to not hurt.
 };
 
 // Cache groups for mutation invalidation
@@ -140,9 +141,6 @@ const V2_DIRECT_COMMANDS = new Set([
   "v2_get_queue", "v2_get_skills", "v2_get_missions",
   "catalog",
 ]);
-const MAX_RECONNECT_ATTEMPTS = 12;
-const RECONNECT_BASE_DELAY = 10_000; // 10s, 20s, 40s, 80s, 160s, 320s, ... (exponential)
-const RECONNECT_COOLDOWN_MS = 60_000; // Minimum time between reconnection attempts after exhausting retries
 
 export class SpaceMoltAPI {
   readonly baseUrl: string;
@@ -151,13 +149,15 @@ export class SpaceMoltAPI {
   private credentials: { username: string; password: string } | null = null;
   private _rateLimitRetries = 0;
   private _cache = new ResponseCache();
-  /** Timestamp when we can next attempt reconnection (circuit breaker). */
-  private _reconnectAllowedAt = 0;
-  /** Track which reconnection attempt we're on for staggered retries. */
-  private _reconnectAttempt = 0;
+  /** Track bot name for reconnection queue logging */
+  private _botName: string | null = null;
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
+  }
+
+  setBotName(name: string): void {
+    this._botName = name;
   }
 
   setCredentials(username: string, password: string): void {
@@ -186,15 +186,8 @@ export class SpaceMoltAPI {
       if (cached) return cached;
     }
 
-    // Circuit breaker: skip reconnection attempts if we're still in cooldown
-    const now = Date.now();
-    if (now < this._reconnectAllowedAt) {
-      const waitSecs = Math.ceil((this._reconnectAllowedAt - now) / 1000);
-      return { error: { code: "connection_failed", message: `Server unreachable — reconnecting in ${waitSecs}s` } };
-    }
-
     const needsV2 = this.isV2Command(command, payload);
-    // ensureSession() already has retry logic with exponential backoff built-in
+    
     try {
       await this.ensureSession();
       if (needsV2) await this.ensureV2Session();
@@ -203,13 +196,8 @@ export class SpaceMoltAPI {
       if (msg.startsWith("Login failed:")) {
         return { error: { code: "login_failed", message: msg } };
       }
-      // ensureSession() already exhausted all retries, set circuit breaker
-      // Stagger reconnection: each bot waits longer based on its attempt count
-      const staggerDelay = this._reconnectAttempt * 5000; // 0s, 5s, 10s, 15s... per bot
-      this._reconnectAllowedAt = Date.now() + RECONNECT_COOLDOWN_MS + staggerDelay;
-      this._reconnectAttempt++;
-      log("system", `Connection failed — waiting ${RECONNECT_COOLDOWN_MS / 1000 + staggerDelay / 1000}s before next reconnect attempt`);
-      return { error: { code: "connection_failed", message: "Could not connect to server after retries" } };
+      // Connection failed - use the global reconnection queue
+      return this.handleReconnection(command, payload, needsV2);
     }
 
     let resp: ApiResponse;
@@ -229,12 +217,8 @@ export class SpaceMoltAPI {
         if (msg.startsWith("Login failed:")) {
           return { error: { code: "login_failed", message: msg } };
         }
-        // Connection failed — set circuit breaker to prevent rapid retries
-        const staggerDelay = this._reconnectAttempt * 5000;
-        this._reconnectAllowedAt = Date.now() + RECONNECT_COOLDOWN_MS + staggerDelay;
-        this._reconnectAttempt++;
-        log("system", `Connection failed — waiting ${RECONNECT_COOLDOWN_MS / 1000 + staggerDelay / 1000}s before next reconnect attempt`);
-        return { error: { code: "connection_failed", message: "Could not reconnect to server" } };
+        // Connection failed - use the global reconnection queue
+        return this.handleReconnection(command, payload, needsV2);
       }
     }
 
@@ -264,10 +248,7 @@ export class SpaceMoltAPI {
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             if (!msg.startsWith("Login failed:")) {
-              const staggerDelay = this._reconnectAttempt * 5000;
-              this._reconnectAllowedAt = Date.now() + RECONNECT_COOLDOWN_MS + staggerDelay;
-              this._reconnectAttempt++;
-              log("system", `Connection failed — waiting ${RECONNECT_COOLDOWN_MS / 1000 + staggerDelay / 1000}s before next reconnect attempt`);
+              return this.handleReconnection(command, payload, needsV2);
             }
             return { error: { code: "connection_failed", message: "Could not reconnect to server" } };
           }
@@ -278,10 +259,7 @@ export class SpaceMoltAPI {
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             if (!msg.startsWith("Login failed:")) {
-              const staggerDelay = this._reconnectAttempt * 5000;
-              this._reconnectAllowedAt = Date.now() + RECONNECT_COOLDOWN_MS + staggerDelay;
-              this._reconnectAttempt++;
-              log("system", `Connection failed — waiting ${RECONNECT_COOLDOWN_MS / 1000 + staggerDelay / 1000}s before next reconnect attempt`);
+              return this.handleReconnection(command, payload, needsV2);
             }
             return { error: { code: "connection_failed", message: "Could not reconnect to server" } };
           }
@@ -293,14 +271,6 @@ export class SpaceMoltAPI {
 
     // Reset rate-limit counter on success
     this._rateLimitRetries = 0;
-    
-    // Reset circuit breaker on successful connection
-    // This allows immediate reconnection attempts after the server comes back
-    if (this._reconnectAllowedAt > 0) {
-      this._reconnectAllowedAt = 0;
-      this._reconnectAttempt = 0;
-      log("system", "Connection restored — circuit breaker reset");
-    }
 
     // Update session info from response
     if (resp.session) {
@@ -324,59 +294,84 @@ export class SpaceMoltAPI {
     return resp;
   }
 
+  /**
+   * Handle reconnection through the global queue.
+   * This ensures only ONE bot attempts to reconnect at a time.
+   */
+  private async handleReconnection(
+    command: string,
+    payload: Record<string, unknown> | undefined,
+    needsV2: boolean
+  ): Promise<ApiResponse> {
+    const botName = this._botName || this.credentials?.username || "unknown";
+    log("system", `${botName} requesting reconnection via global queue...`);
+
+    try {
+      const success = await reconnectQueue.enqueue({
+        botName,
+        api: this,
+        credentials: this.credentials,
+      });
+
+      if (success) {
+        log("system", `${botName} reconnection successful, retrying ${command}...`);
+        // Retry the original request
+        try {
+          await this.ensureSession();
+          if (needsV2) await this.ensureV2Session();
+          return this.execute(command, payload);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          return { error: { code: "connection_failed", message: msg } };
+        }
+      } else {
+        return { error: { code: "connection_failed", message: "Reconnection failed after multiple attempts" } };
+      }
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log("error", `${botName} reconnection queue error: ${msg}`);
+      return { error: { code: "connection_failed", message: `Reconnection queue error: ${msg}` } };
+    }
+  }
+
   private async ensureSession(): Promise<void> {
     if (this.session && !this.isSessionExpiring()) return;
 
     log("system", this.session ? "Renewing session..." : "Creating new session...");
 
-    // Retry with backoff — server may be restarting
-    let lastError: Error | null = null;
-    for (let attempt = 0; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
-      try {
-        const resp = await fetch(`${this.baseUrl}/session`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-        });
+    // Single attempt - the reconnection queue handles retries with backoff
+    const resp = await fetch(`${this.baseUrl}/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
 
-        if (!resp.ok) {
-          throw new Error(`Failed to create session: ${resp.status} ${resp.statusText}`);
-        }
+    if (!resp.ok) {
+      throw new Error(`Failed to create session: ${resp.status} ${resp.statusText}`);
+    }
 
-        const data = (await resp.json()) as ApiResponse;
-        if (data.session) {
-          this.session = data.session;
-          log("system", `Session created: ${this.session.id.slice(0, 8)}...`);
-        } else {
-          throw new Error("No session in response");
-        }
+    const data = (await resp.json()) as ApiResponse;
+    if (data.session) {
+      this.session = data.session;
+      log("system", `Session created: ${this.session.id.slice(0, 8)}...`);
+    } else {
+      throw new Error("No session in response");
+    }
 
-        // Re-authenticate if we have credentials
-        if (this.credentials) {
-          log("system", `Logging in as ${this.credentials.username}...`);
-          const loginResp = await this.doRequest("login", {
-            username: this.credentials.username,
-            password: this.credentials.password,
-          });
-          if (loginResp.error) {
-            // Throw so callers get an explicit error rather than continuing with
-            // an unauthenticated session that will fail on every subsequent request.
-            throw new Error(`Login failed: ${loginResp.error.message}`);
-          }
-          log("system", "Logged in successfully");
-          // Login may return a new session — capture it
-          if (loginResp.session) {
-            this.session = loginResp.session;
-          }
-        }
-        return;
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt) + Math.floor(Math.random() * 30000); // Add jitter up to 30s
-        log("system", `Server unreachable (attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS}), retrying in ${delay / 1000}s...`);
-        await sleep(delay);
+    // Re-authenticate if we have credentials
+    if (this.credentials) {
+      log("system", `Logging in as ${this.credentials.username}...`);
+      const loginResp = await this.doRequest("login", {
+        username: this.credentials.username,
+        password: this.credentials.password,
+      });
+      if (loginResp.error) {
+        throw new Error(`Login failed: ${loginResp.error.message}`);
+      }
+      log("system", "Logged in successfully");
+      if (loginResp.session) {
+        this.session = loginResp.session;
       }
     }
-    throw lastError || new Error("Failed to connect to server");
   }
 
   private isSessionExpiring(): boolean {
@@ -400,76 +395,65 @@ export class SpaceMoltAPI {
     const v2Base = this.baseUrl.replace("/api/v1", "/api/v2");
     log("system", this.v2Session ? "Renewing v2 session..." : "Creating v2 session...");
 
-    let lastError: Error | null = null;
-    for (let attempt = 0; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
-      try {
-        const resp = await fetch(`${v2Base}/session`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-        });
+    // Single attempt - the reconnection queue handles retries with backoff
+    const resp = await fetch(`${v2Base}/session`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
 
-        if (!resp.ok) {
-          throw new Error(`Failed to create v2 session: ${resp.status} ${resp.statusText}`);
+    if (!resp.ok) {
+      throw new Error(`Failed to create v2 session: ${resp.status} ${resp.statusText}`);
+    }
+
+    const data = (await resp.json()) as ApiResponse;
+    if (data.session) {
+      // Normalize v2 snake_case fields
+      const s = data.session as unknown as Record<string, unknown>;
+      if (s.created_at && !s.createdAt) {
+        s.createdAt = s.created_at;
+        s.expiresAt = s.expires_at;
+        s.playerId = s.player_id;
+      }
+      this.v2Session = data.session;
+      log("system", `v2 session created: ${this.v2Session.id.slice(0, 8)}...`);
+    } else {
+      throw new Error("No session in v2 response");
+    }
+
+    // Authenticate on v2
+    if (this.credentials) {
+      const loginResp = await fetch(`${v2Base}/spacemolt_auth/login`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Session-Id": this.v2Session.id,
+        },
+        body: JSON.stringify({
+          username: this.credentials.username,
+          password: this.credentials.password,
+        }),
+      });
+
+      const loginData = (await loginResp.json()) as ApiResponse & { structuredContent?: unknown };
+      if (loginData.structuredContent !== undefined) {
+        loginData.result = loginData.structuredContent;
+      }
+      if (loginData.error) {
+        logError(`v2 login failed: ${loginData.error.message}`);
+      } else {
+        log("system", "v2 session authenticated");
+      }
+      // Capture updated session from login response
+      if (loginData.session) {
+        const ls = loginData.session as unknown as Record<string, unknown>;
+        if (ls.created_at && !ls.createdAt) {
+          ls.createdAt = ls.created_at;
+          ls.expiresAt = ls.expires_at;
+          ls.playerId = ls.player_id;
         }
-
-        const data = (await resp.json()) as ApiResponse;
-        if (data.session) {
-          // Normalize v2 snake_case fields
-          const s = data.session as Record<string, unknown>;
-          if (s.created_at && !s.createdAt) {
-            s.createdAt = s.created_at;
-            s.expiresAt = s.expires_at;
-            s.playerId = s.player_id;
-          }
-          this.v2Session = data.session;
-          log("system", `v2 session created: ${this.v2Session.id.slice(0, 8)}...`);
-        } else {
-          throw new Error("No session in v2 response");
-        }
-
-        // Authenticate on v2
-        if (this.credentials) {
-          const loginResp = await fetch(`${v2Base}/spacemolt_auth/login`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "X-Session-Id": this.v2Session.id,
-            },
-            body: JSON.stringify({
-              username: this.credentials.username,
-              password: this.credentials.password,
-            }),
-          });
-
-          const loginData = (await loginResp.json()) as ApiResponse & { structuredContent?: unknown };
-          if (loginData.structuredContent !== undefined) {
-            loginData.result = loginData.structuredContent;
-          }
-          if (loginData.error) {
-            logError(`v2 login failed: ${loginData.error.message}`);
-          } else {
-            log("system", "v2 session authenticated");
-          }
-          // Capture updated session from login response
-          if (loginData.session) {
-            const ls = loginData.session as Record<string, unknown>;
-            if (ls.created_at && !ls.createdAt) {
-              ls.createdAt = ls.created_at;
-              ls.expiresAt = ls.expires_at;
-              ls.playerId = ls.player_id;
-            }
-            this.v2Session = loginData.session;
-          }
-        }
-        return;
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
-        log("system", `v2 server unreachable (attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS}), retrying in ${delay / 1000}s...`);
-        await sleep(delay);
+        this.v2Session = loginData.session;
       }
     }
-    throw lastError || new Error("Failed to connect to v2 server");
   }
 
   private async doRequest(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
@@ -533,7 +517,7 @@ export class SpaceMoltAPI {
       }
       // Normalize v2 session fields (snake_case → camelCase)
       if (data.session) {
-        const s = data.session as Record<string, unknown>;
+        const s = data.session as unknown as Record<string, unknown>;
         if (s.created_at && !s.createdAt) {
           s.createdAt = s.created_at;
           s.expiresAt = s.expires_at;

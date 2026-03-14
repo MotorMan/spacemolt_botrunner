@@ -182,17 +182,18 @@ function countInCargo(ctx: RoutineContext, itemId: string): number {
 }
 
 /** Withdraw materials from station storage into cargo for a recipe. */
-async function withdrawStorageMaterials(ctx: RoutineContext, recipe: Recipe): Promise<void> {
+async function withdrawStorageMaterials(ctx: RoutineContext, recipe: Recipe, batchSize: number = 1): Promise<void> {
   const { bot } = ctx;
   for (const comp of recipe.components) {
     const inCargo = countInCargo(ctx, comp.item_id);
-    if (inCargo >= comp.quantity) continue;
+    const totalNeeded = comp.quantity * batchSize;
+    if (inCargo >= totalNeeded) continue;
 
     // Check cargo space before withdrawing
     const freeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
     if (freeSpace <= 0) break;
 
-    const needed = comp.quantity - inCargo;
+    const needed = totalNeeded - inCargo;
     const inStorage = bot.storage.find(i => i.itemId === comp.item_id);
     if (!inStorage || inStorage.quantity <= 0) continue;
 
@@ -207,17 +208,18 @@ async function withdrawStorageMaterials(ctx: RoutineContext, recipe: Recipe): Pr
 }
 
 /** Withdraw materials from faction storage into cargo for a recipe. */
-async function withdrawFactionMaterials(ctx: RoutineContext, recipe: Recipe): Promise<void> {
+async function withdrawFactionMaterials(ctx: RoutineContext, recipe: Recipe, batchSize: number = 1): Promise<void> {
   const { bot } = ctx;
   for (const comp of recipe.components) {
     const inCargo = countInCargo(ctx, comp.item_id);
-    if (inCargo >= comp.quantity) continue;
+    const totalNeeded = comp.quantity * batchSize;
+    if (inCargo >= totalNeeded) continue;
 
     // Check cargo space before withdrawing
     const freeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
     if (freeSpace <= 0) break;
 
-    const needed = comp.quantity - inCargo;
+    const needed = totalNeeded - inCargo;
     const inFaction = bot.factionStorage.find(i => i.itemId === comp.item_id);
     if (!inFaction || inFaction.quantity <= 0) continue;
 
@@ -233,11 +235,12 @@ async function withdrawFactionMaterials(ctx: RoutineContext, recipe: Recipe): Pr
 }
 
 /** Check if we have materials in cargo for a recipe. Returns missing item info or null if all present. */
-function getMissingMaterial(ctx: RoutineContext, recipe: Recipe): { name: string; need: number; have: number } | null {
+function getMissingMaterial(ctx: RoutineContext, recipe: Recipe, batchSize: number = 1): { name: string; need: number; have: number } | null {
   for (const comp of recipe.components) {
     const have = countInCargo(ctx, comp.item_id);
-    if (have < comp.quantity) {
-      return { name: comp.name || comp.item_id, need: comp.quantity, have };
+    const totalNeeded = comp.quantity * batchSize;
+    if (have < totalNeeded) {
+      return { name: comp.name || comp.item_id, need: totalNeeded, have };
     }
   }
   return null;
@@ -600,13 +603,16 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
           await bot.refreshFactionStorage();
         }
 
-        const missing = getMissingMaterial(ctx, recipe);
+        const remaining = needed - crafted;
+        const batchSize = Math.min(remaining, 10);
+
+        const missing = getMissingMaterial(ctx, recipe, batchSize);
         if (missing) {
           // Materials not in cargo — try pulling from storage sources
           if (hasMaterialsAnywhere(ctx, recipe)) {
-            await withdrawFactionMaterials(ctx, recipe);
-            await withdrawStorageMaterials(ctx, recipe);
-            const stillMissing = getMissingMaterial(ctx, recipe);
+            await withdrawFactionMaterials(ctx, recipe, batchSize);
+            await withdrawStorageMaterials(ctx, recipe, batchSize);
+            const stillMissing = getMissingMaterial(ctx, recipe, batchSize);
             if (stillMissing) {
               // Try crafting the missing prerequisites
               const preCrafted = await craftPrerequisites(ctx, recipe, recipeIndex);
@@ -615,10 +621,10 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
                 // Refresh and re-withdraw after crafting prereqs
                 await bot.refreshCargo();
                 if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
-                await withdrawFactionMaterials(ctx, recipe);
-                await withdrawStorageMaterials(ctx, recipe);
+                await withdrawFactionMaterials(ctx, recipe, batchSize);
+                await withdrawStorageMaterials(ctx, recipe, batchSize);
               }
-              const finalMissing = getMissingMaterial(ctx, recipe);
+              const finalMissing = getMissingMaterial(ctx, recipe, batchSize);
               if (finalMissing) {
                 missingSummary.push(`${recipe.name} (${finalMissing.need}x ${finalMissing.name})`);
                 break;
@@ -631,9 +637,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
               prereqSummary.push(...preCrafted);
               await bot.refreshCargo();
               if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
-              await withdrawFactionMaterials(ctx, recipe);
-              await withdrawStorageMaterials(ctx, recipe);
-              const finalMissing = getMissingMaterial(ctx, recipe);
+              await withdrawFactionMaterials(ctx, recipe, batchSize);
+              await withdrawStorageMaterials(ctx, recipe, batchSize);
+              const finalMissing = getMissingMaterial(ctx, recipe, batchSize);
               if (finalMissing) {
                 missingSummary.push(`${recipe.name} (${finalMissing.need}x ${finalMissing.name})`);
                 break;
@@ -644,9 +650,6 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
             }
           }
         }
-
-        const remaining = needed - crafted;
-        const batchSize = Math.min(remaining, 10);
 
         yield `craft_${recipeId}`;
         const craftResp = await bot.exec("craft", { recipe_id: recipeId, count: batchSize });

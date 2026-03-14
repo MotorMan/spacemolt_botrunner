@@ -125,6 +125,8 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleExec(action);
     case "remove":
       return handleRemove(action);
+    case "emergencyReturn":
+      return handleEmergencyReturn();
     case "shutdown":
       return handleShutdown();
     default:
@@ -196,6 +198,68 @@ async function handleStop(action: WebAction): Promise<WebActionResult> {
   server.clearBotAssignment(botName);
   server.logSystem(`Stop signal sent to ${bot.username}`);
   return { ok: true, message: `Stop signal sent to ${botName}` };
+}
+
+async function handleEmergencyReturn(): Promise<WebActionResult> {
+  server.logSystem("EMERGENCY RETURN HOME: Stopping all bots and setting to return_home routine...");
+  
+  const runningBots = [...bots.values()].filter(b => b.state === "running");
+  if (runningBots.length === 0) {
+    server.logSystem("EMERGENCY RETURN HOME: No running bots to stop");
+    return { ok: true, message: "No running bots to stop" };
+  }
+
+  // Stop all running bots
+  for (const bot of runningBots) {
+    bot.stop();
+    server.clearBotAssignment(bot.username);
+    server.logSystem(`Stop requested for ${bot.username}`);
+  }
+
+  // Wait for all bots to fully stop (state changes from "stopping" to "idle")
+  server.logSystem("Waiting for bots to stop current actions...");
+  const STOP_TIMEOUT = 15000; // 15 seconds max wait
+  const CHECK_INTERVAL = 500; // Check every 500ms
+  
+  const startTime = Date.now();
+  for (const bot of runningBots) {
+    while (bot.state === "stopping" && (Date.now() - startTime) < STOP_TIMEOUT) {
+      await new Promise(r => setTimeout(r, CHECK_INTERVAL));
+    }
+    if (bot.state === "stopping") {
+      server.logSystem(`${bot.username} did not stop gracefully — forcing restart`);
+      // Force reset the state
+      (bot as any)._state = "idle";
+      (bot as any)._routine = null;
+    } else {
+      server.logSystem(`${bot.username} stopped successfully`);
+    }
+  }
+
+  // Additional delay to ensure any in-progress API calls complete
+  await new Promise(r => setTimeout(r, 2000));
+
+  // Start all bots with return_home routine
+  for (const bot of runningBots) {
+    const routineKey = "return_home";
+    const routine = ROUTINES[routineKey];
+    
+    server.logSystem(`Starting ${bot.username} with ${routine.name} routine...`);
+    
+    bot.start(routineKey, routine.fn, undefined).then(() => {
+      server.logSystem(`Bot ${bot.username} return_home routine finished.`);
+      server.clearBotAssignment(bot.username);
+    }).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      server.logSystem(`Bot ${bot.username} stopped with error: ${msg}`);
+      server.clearBotAssignment(bot.username);
+    });
+
+    server.saveBotAssignment(bot.username, routineKey);
+  }
+
+  server.logSystem(`EMERGENCY RETURN HOME: ${runningBots.length} bot(s) set to return_home`);
+  return { ok: true, message: `Emergency Return Home initiated for ${runningBots.length} bot(s)` };
 }
 
 async function handleRemove(action: WebAction): Promise<WebActionResult> {

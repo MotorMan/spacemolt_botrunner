@@ -1792,7 +1792,10 @@
     <div class="bot-table-wrap">
       <div class="bot-table-header">
         <span>Bots</span>
-        <button class="sm" onclick="showAddModal()">+ Add Bot</button>
+        <div style="display:flex;gap:8px">
+          <button class="sm danger" onclick="emergencyReturnHome()">⚠ Emergency Return Home</button>
+          <button class="sm" onclick="showAddModal()">+ Add Bot</button>
+        </div>
       </div>
       <div class="bot-table-scroll">
         <table class="bot-table">
@@ -2689,8 +2692,8 @@ function renderProfileTopbar() {
       </label>`;
   }
 
-  // Per-bot home system for salvager, ice_harvester, gas_harvester
-  const needsHomeSystem = ['salvager', 'ice_harvester', 'gas_harvester'];
+  // Per-bot home system for salvager, ice_harvester, gas_harvester, return_home
+  const needsHomeSystem = ['salvager', 'ice_harvester', 'gas_harvester', 'return_home'];
   const currentRoutine = bot.state === 'running' ? bot.routine : (bot.state !== 'stopping' ? getProfileSelectedRoutine() : '');
   if (needsHomeSystem.includes(currentRoutine)) {
     const botSettings = settings[bot.username] || {};
@@ -5920,6 +5923,15 @@ function confirmShutdown() {
     .catch(err => {
       appendLine('error', `Shutdown error: ${err.message}`);
     });
+}
+
+// ── Emergency Return Home ───────────────────────────────────
+function emergencyReturnHome() {
+  if (!confirm('EMERGENCY RETURN HOME: This will immediately cancel all current bot routines and set all bots to return to their home stations. Continue?')) {
+    return;
+  }
+  appendLine('system', 'Emergency Return Home initiated for all bots...');
+  send({ type: 'emergencyReturn' });
 }
 
 function toggleModalMode() {

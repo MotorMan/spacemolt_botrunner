@@ -276,8 +276,10 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
 
 /** Ensure the bot is docked at a station. Finds one in current system,
  *  or navigates to the nearest known station system if none is available.
- *  Returns true if successfully docked. */
-export async function ensureDocked(ctx: RoutineContext): Promise<boolean> {
+ *  Returns true if successfully docked.
+ *  @param skipStorageCollection If true, skips automatic storage collection (withdraw credits/items).
+ */
+export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: boolean = false): Promise<boolean> {
   const { bot } = ctx;
   if (bot.docked) return true;
 
@@ -294,9 +296,11 @@ export async function ensureDocked(ctx: RoutineContext): Promise<boolean> {
     const dockResp = await bot.exec("dock");
     if (!dockResp.error || dockResp.error.message.includes("already")) {
       bot.docked = true;
-      await collectFromStorage(ctx);
-      await recordMarketData(ctx);
-      await analyzeMarket(ctx);
+      if (!skipStorageCollection) {
+        await collectFromStorage(ctx);
+        await recordMarketData(ctx);
+        await analyzeMarket(ctx);
+      }
       await ensureInsured(ctx);
       return true;
     }
@@ -344,9 +348,11 @@ export async function ensureDocked(ctx: RoutineContext): Promise<boolean> {
   const dResp = await bot.exec("dock");
   if (!dResp.error || dResp.error.message.includes("already")) {
     bot.docked = true;
-    await collectFromStorage(ctx);
-    await recordMarketData(ctx);
-    await analyzeMarket(ctx);
+    if (!skipStorageCollection) {
+      await collectFromStorage(ctx);
+      await recordMarketData(ctx);
+      await analyzeMarket(ctx);
+    }
     await ensureInsured(ctx);
     return true;
   }

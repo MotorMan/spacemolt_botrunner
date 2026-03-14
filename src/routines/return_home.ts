@@ -47,6 +47,28 @@ function getReturnHomeSettings(username?: string): {
 export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
+  // Wait for any pending action from previous routine to clear
+  // This is especially important for emergency return home scenarios
+  yield "wait_idle";
+  let waitAttempts = 0;
+  while (waitAttempts < 5) {
+    ctx.log("system", "Checking if ready to start (attempt " + (waitAttempts + 1) + "/5)...");
+    try {
+      await bot.refreshStatus();
+      break; // Success — no pending action
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("action is already pending") || msg.includes("action_pending")) {
+        ctx.log("system", "Previous action still pending — waiting 2s...");
+        await new Promise(r => setTimeout(r, 2000));
+        waitAttempts++;
+      } else {
+        // Other error — break and try to continue
+        break;
+      }
+    }
+  }
+
   // Read settings
   const settings = getReturnHomeSettings(bot.username);
   const homeSystem = settings.homeSystem;
@@ -90,8 +112,8 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
         }
       }
     } else {
-      // Need to dock first to refuel
-      const docked = await ensureDocked(ctx);
+      // Need to dock first to refuel (skip storage collection - just need fuel)
+      const docked = await ensureDocked(ctx, true);
       if (!docked) {
         ctx.log("error", "Cannot dock to refuel — aborting return home");
         return; // Cancel routine
@@ -164,9 +186,9 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     bot.poi = targetStation.id;
   }
 
-  // Dock at station
+  // Dock at station (skip storage collection - return home doesn't need to manage items)
   yield "dock";
-  const docked = await ensureDocked(ctx);
+  const docked = await ensureDocked(ctx, true);
   if (!docked) {
     ctx.log("error", "Failed to dock at home station — routine cancelled");
     return; // Cancel routine

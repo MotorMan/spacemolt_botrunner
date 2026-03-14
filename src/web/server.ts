@@ -8,7 +8,7 @@ import type { ServerWebSocket } from "bun";
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown";
+  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn";
   bot?: string;
   routine?: string;
   username?: string;

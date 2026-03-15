@@ -18,6 +18,12 @@ interface CraftLimit {
   limit: number;
 }
 
+/** Ship Passive recipe IDs that run automatically and cannot be crafted manually. */
+const SHIP_PASSIVE_RECIPE_IDS = new Set([
+  "onboard_alloy_synthesis",
+  "onboard_munitions_fabrication",
+]);
+
 function getCrafterSettings(): {
   craftLimits: CraftLimit[];
   enabledCategories: string[];
@@ -30,6 +36,10 @@ function getCrafterSettings(): {
   const craftLimits: CraftLimit[] = [];
   for (const [recipeId, limit] of Object.entries(rawLimits)) {
     if (limit > 0) {
+      // Filter out Ship Passive recipes - they can't be crafted manually
+      if (SHIP_PASSIVE_RECIPE_IDS.has(recipeId)) {
+        continue; // Skip silently
+      }
       craftLimits.push({ recipeId, limit });
     }
   }
@@ -258,7 +268,11 @@ function getMissingMaterial(ctx: RoutineContext, recipe: Recipe, batchSize: numb
 /** Check if materials exist anywhere (cargo + storage + faction). */
 function hasMaterialsAnywhere(ctx: RoutineContext, recipe: Recipe, batchSize: number = 1): boolean {
   for (const comp of recipe.components) {
-    if (countItem(ctx, comp.item_id) < comp.quantity * batchSize) return false;
+    const total = countItem(ctx, comp.item_id);
+    const needed = comp.quantity * batchSize;
+    // DEBUG LOGGING - uncomment to debug material detection issues
+    // ctx.log("craft", `  hasMaterialsAnywhere: ${comp.name || comp.item_id} have ${total}, need ${needed} for ${batchSize}x batch`);
+    if (total < needed) return false;
   }
   return true;
 }
@@ -296,7 +310,11 @@ async function craftPrerequisites(
 
     const deficit = comp.quantity - totalAvailable;
     const prereqRecipe = recipeIndex.get(comp.item_id);
-    if (!prereqRecipe) continue; // no recipe to craft this item
+    if (!prereqRecipe) {
+      // DEBUG: No recipe found to craft this component
+      // ctx.log("craft", `  No recipe found to craft ${comp.name || comp.item_id}`);
+      continue; // no recipe to craft this item
+    }
 
     // How many batches do we need? (each batch produces output_quantity)
     const batchesNeeded = Math.ceil(deficit / (prereqRecipe.output_quantity || 1));
@@ -313,7 +331,12 @@ async function craftPrerequisites(
     }
 
     // Check if we can craft the prerequisite now
-    if (!hasMaterialsAnywhere(ctx, prereqRecipe)) continue;
+    const prereqMaterialsExist = hasMaterialsAnywhere(ctx, prereqRecipe);
+    if (!prereqMaterialsExist) {
+      // DEBUG: Raw materials not available
+      // ctx.log("craft", `  Cannot craft ${prereqRecipe.name}: raw materials not available anywhere`);
+      continue;
+    }
 
     // Withdraw materials for the prerequisite
     // First deposit any crafted items in cargo to make space
@@ -337,20 +360,28 @@ async function craftPrerequisites(
     await withdrawStorageMaterials(ctx, prereqRecipe);
 
     const stillMissing = getMissingMaterial(ctx, prereqRecipe);
-    if (stillMissing) continue; // can't get all materials into cargo
+    if (stillMissing) {
+      // DEBUG: Still missing materials after withdrawal
+      // ctx.log("craft", `  Cannot craft ${prereqRecipe.name}: still missing ${stillMissing.need}x ${stillMissing.name} after withdrawal`);
+      continue; // can't get all materials into cargo
+    }
 
     // Craft the prerequisite
     for (let batch = 0; batch < batchesNeeded && bot.state === "running"; batch++) {
       const craftResp = await bot.exec("craft", { recipe_id: prereqRecipe.recipe_id, count: 1 });
-      if (craftResp.error) break;
+      if (craftResp.error) {
+        // DEBUG: Craft failed
+        // ctx.log("craft", `  Failed to craft ${prereqRecipe.name}: ${craftResp.error?.message}`);
+        break;
+      }
 
       const result = craftResp.result as Record<string, unknown> | undefined;
       let qty = 0;
       if (result) {
         qty = (result.count as number) || (result.quantity as number) || 0;
         if (qty === 0) {
-          const items = (result.items as Array<Record<string, unknown>>) || 
-                       (result.output as Array<Record<string, unknown>>) || 
+          const items = (result.items as Array<Record<string, unknown>>) ||
+                       (result.output as Array<Record<string, unknown>>) ||
                        (result.produced as Array<Record<string, unknown>>);
           if (items && items.length > 0) {
             for (const item of items) {
@@ -360,7 +391,7 @@ async function craftPrerequisites(
         }
       }
       if (qty === 0) qty = prereqRecipe.output_quantity || 1;
-      
+
       crafted.push(`${qty}x ${prereqRecipe.output_name || prereqRecipe.name}`);
       bot.stats.totalCrafted += qty;
 
@@ -384,6 +415,126 @@ async function craftPrerequisites(
         if (getMissingMaterial(ctx, prereqRecipe)) break;
       }
     }
+  }
+
+  return crafted;
+}
+
+/**
+ * Craft useful items from enabled categories when no specific recipes are configured.
+ * Prioritizes valuable outputs (refining, components) over simple XP-grinding recipes.
+ * Returns list of items crafted for logging.
+ */
+async function craftFromCategories(
+  ctx: RoutineContext,
+  recipes: Recipe[],
+  recipeIndex: Map<string, Recipe>,
+  enabledCategories: string[],
+): Promise<string[]> {
+  const { bot } = ctx;
+  const crafted: string[] = [];
+
+  // Priority order for categories - most useful first
+  const categoryPriority: Record<string, number> = {
+    "Refining": 1,
+    "Components": 2,
+    "Consumables": 3,
+    "Modules": 4,
+    "Equipment": 5,
+    "Weapons": 6,
+    "Defense": 7,
+    "Ice Refining": 8,
+    "Gas Processing": 9,
+    "Electronic Warfare": 10,
+    "Stealth": 11,
+  };
+
+  // Find recipes we can craft, sorted by category priority then complexity
+  const candidates: Array<{ recipe: Recipe; priority: number; complexity: number }> = [];
+
+  for (const recipe of recipes) {
+    // Only allow recipes from enabled categories
+    const recipeCategory = recipe.category || "";
+    if (!enabledCategories.includes(recipeCategory)) continue;
+    
+    // Skip recipes with no ingredients
+    if (recipe.components.length === 0) continue;
+    // Skip recipes that cannot be crafted manually
+    if (!isRecipeCraftable(recipe).ok) continue;
+    // Skip if we don't have materials
+    if (!hasMaterialsAnywhere(ctx, recipe)) continue;
+    // Skip if we don't have the skill
+    if (!canCraftSkillwise(ctx, recipe).ok) continue;
+    
+    const priority = categoryPriority[recipeCategory] || 99;
+    const complexity = recipe.components.reduce((sum, c) => sum + c.quantity, 0);
+    candidates.push({ recipe, priority, complexity });
+  }
+
+  if (candidates.length === 0) return crafted;
+
+  // Sort by category priority first, then by complexity (prefer simpler within same category)
+  candidates.sort((a, b) => {
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    return a.complexity - b.complexity;
+  });
+
+  // Craft from the highest priority category we have materials for
+  const target = candidates[0].recipe;
+  ctx.log("craft", `Crafting from ${target.category}: ${target.name} (${target.components.map(c => `${c.quantity}x ${c.name}`).join(", ")})...`);
+
+  // Deposit non-essential cargo to make space
+  for (const item of [...bot.inventory]) {
+    if (item.quantity <= 0) continue;
+    const lower = item.itemId.toLowerCase();
+    if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+    if (target.components.some(c => c.item_id === item.itemId)) continue;
+    const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+    if (dResp.error) {
+      await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+    }
+  }
+  await bot.refreshCargo();
+  await bot.refreshStatus();
+
+  // Craft up to 10 batches of the target recipe
+  const MAX_CRAFTS = 10;
+  for (let i = 0; i < MAX_CRAFTS && bot.state === "running"; i++) {
+    await bot.refreshCargo();
+    if (bot.docked) {
+      await bot.refreshStorage();
+      await bot.refreshFactionStorage();
+    }
+
+    if (!hasMaterialsAnywhere(ctx, target)) break;
+
+    await withdrawFactionMaterials(ctx, target);
+    await withdrawStorageMaterials(ctx, target);
+
+    if (getMissingMaterial(ctx, target)) break;
+
+    const craftResp = await bot.exec("craft", { recipe_id: target.recipe_id, count: 1 });
+    if (craftResp.error) break;
+
+    const result = craftResp.result as Record<string, unknown> | undefined;
+    let qty = 0;
+    if (result) {
+      qty = (result.count as number) || (result.quantity as number) || 0;
+      if (qty === 0) {
+        const items = (result.items as Array<Record<string, unknown>>) ||
+                     (result.output as Array<Record<string, unknown>>) ||
+                     (result.produced as Array<Record<string, unknown>>);
+        if (items && items.length > 0) {
+          for (const item of items) {
+            qty += (item.quantity as number) || (item.count as number) || 0;
+          }
+        }
+      }
+    }
+    if (qty === 0) qty = target.output_quantity || 1;
+
+    crafted.push(`${qty}x ${target.output_name || target.name}`);
+    bot.stats.totalCrafted += qty;
   }
 
   return crafted;
@@ -514,12 +665,6 @@ function canCraftSkillwise(ctx: RoutineContext, recipe: Recipe): { ok: boolean; 
   return { ok: false, reason: `${skillName} Lv${level} required (have Lv${myLevel})` };
 }
 
-/** Ship Passive recipe IDs that run automatically and cannot be crafted manually. */
-const SHIP_PASSIVE_RECIPE_IDS = new Set([
-  "onboard_alloy_synthesis",
-  "onboard_munitions_fabrication",
-]);
-
 /** Check if a recipe can be crafted manually (not ship-only or facility-only). */
 function isRecipeCraftable(recipe: Recipe): { ok: boolean; reason: string } {
   const category = (recipe.category || "").toLowerCase();
@@ -619,9 +764,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── If no specific recipes configured, use enabled categories to craft useful items ──
     if (settings.craftLimits.length === 0) {
       ctx.log("craft", `No specific recipes configured — crafting from enabled categories: ${settings.enabledCategories.join(", ")}`);
-      const xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex, undefined, settings.enabledCategories);
-      if (xpCrafted.length > 0) {
-        ctx.log("craft", `Crafted: ${xpCrafted.join(", ")}`);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, recipeIndex, settings.enabledCategories);
+      if (categoryCrafted.length > 0) {
+        ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
       } else {
         ctx.log("info", `No materials available for enabled categories. Waiting 60s...`);
         await sleep(60000);
@@ -657,7 +802,13 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       // Skip recipes that cannot be crafted manually (ship-only or facility-only)
       const craftableCheck = isRecipeCraftable(recipe);
       if (!craftableCheck.ok) {
-        ctx.log("error", `Recipe "${recipeId}" (${recipe.name}) is not craftable: ${craftableCheck.reason}`);
+        // Ship Passive recipes are expected in config (user may have enabled categories that include them)
+        // Just skip them silently with a warning instead of an error
+        if (craftableCheck.reason.includes("automatically on ships")) {
+          ctx.log("warn", `Skipping "${recipeId}" (${recipe.name}): ${craftableCheck.reason}`);
+        } else {
+          ctx.log("error", `Recipe "${recipeId}" (${recipe.name}) is not craftable: ${craftableCheck.reason}`);
+        }
         continue;
       }
 
@@ -717,8 +868,14 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
             break;
           }
 
-          // Check if materials are available somewhere (cargo + storage + faction)
-          if (hasMaterialsAnywhere(ctx, recipe, cycleTarget)) {
+          // Check if materials are available somewhere (cargo + storage + faction) for THIS batch size
+          const materialsExistAnywhere = hasMaterialsAnywhere(ctx, recipe, cycleTarget);
+          
+          // DEBUG LOGGING - uncomment to debug batch size fallback issues
+          // ctx.log("craft", `${recipe.name}: missing ${missingForCycle.name} (need ${missingForCycle.need}, have ${missingForCycle.have}) for ${cycleTarget}x batch, materialsExistAnywhere=${materialsExistAnywhere}`);
+
+          if (materialsExistAnywhere) {
+            // Materials exist but not in cargo/storage - withdraw them
             ctx.log("craft", `${recipe.name}: withdrawing materials for ${cycleTarget}x batch...`);
             await withdrawFactionMaterials(ctx, recipe, cycleTarget);
             await withdrawStorageMaterials(ctx, recipe, cycleTarget);
@@ -731,7 +888,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
               break;
             }
 
-            // Still missing - try prerequisites
+            // Still missing after withdrawal - try prerequisites
             ctx.log("craft", `${recipe.name}: still missing ${missingForCycle.need}x ${missingForCycle.name} after withdrawal, trying prerequisites...`);
             const preCrafted = await craftPrerequisites(ctx, recipe, recipeIndex);
             if (preCrafted.length > 0) {
@@ -747,37 +904,49 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
                 break;
               }
             }
-          } else {
-            // Materials don't exist anywhere — try crafting prerequisites
-            ctx.log("craft", `${recipe.name}: materials not available anywhere, trying prerequisites...`);
-            const preCrafted = await craftPrerequisites(ctx, recipe, recipeIndex);
-            if (preCrafted.length > 0) {
-              prereqSummary.push(...preCrafted);
-              await bot.refreshCargo();
-              if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
-              await withdrawFactionMaterials(ctx, recipe, cycleTarget);
-              await withdrawStorageMaterials(ctx, recipe, cycleTarget);
-              await bot.refreshStorage();
-              missingForCycle = getMissingMaterial(ctx, recipe, cycleTarget);
-              if (!missingForCycle) {
-                gotMaterials = true;
-                break;
-              }
+          }
+
+          // Materials don't exist for this batch size
+          // Try smaller batch first (100x → 10x → 1x) before crafting prerequisites
+          // DEBUG LOGGING - uncomment to debug batch size fallback issues
+          // ctx.log("craft", `${recipe.name}: cycleTarget=${cycleTarget}, checking fallback...`);
+          if (cycleTarget === 100) {
+            cycleTarget = 10;
+            ctx.log("craft", `${recipe.name}: materials not available for 100x batch, trying 10x...`);
+            continue; // Try 10x immediately
+          } else if (cycleTarget === 10) {
+            cycleTarget = 1;
+            ctx.log("craft", `${recipe.name}: materials not available for 10x batch, trying 1x...`);
+            continue; // Try 1x immediately
+          } else if (cycleTarget > 1) {
+            // Some other batch size (like 50x) - fall back to 10x
+            cycleTarget = 10;
+            ctx.log("craft", `${recipe.name}: materials not available for ${cycleTarget}x batch, trying 10x...`);
+            continue;
+          }
+
+          // At 1x and materials still don't exist anywhere - try prerequisites as last resort
+          ctx.log("craft", `${recipe.name}: materials not available anywhere, trying prerequisites...`);
+          const preCrafted = await craftPrerequisites(ctx, recipe, recipeIndex);
+          if (preCrafted.length > 0) {
+            prereqSummary.push(...preCrafted);
+            await bot.refreshCargo();
+            if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
+            await withdrawFactionMaterials(ctx, recipe, 1);
+            await withdrawStorageMaterials(ctx, recipe, 1);
+            await bot.refreshStorage();
+            missingForCycle = getMissingMaterial(ctx, recipe, 1);
+            if (!missingForCycle) {
+              gotMaterials = true;
+              break;
             }
           }
 
-          // Failed to get materials for this batch size - try smaller
-          if (cycleTarget === 100) {
-            cycleTarget = 10;
-            ctx.log("craft", `${recipe.name}: cannot get materials for 100x batch, trying 10x...`);
-          } else if (cycleTarget === 10) {
-            cycleTarget = 1;
-            ctx.log("craft", `${recipe.name}: cannot get materials for 10x batch, trying 1x...`);
-          } else {
-            break; // Already at 1x, give up
-          }
+          break; // Already at 1x and prerequisites didn't help, give up
         }
 
+        // DEBUG LOGGING - uncomment to debug loop exit conditions
+        // ctx.log("craft", `${recipe.name}: after while loop - gotMaterials=${gotMaterials}, cycleTarget=${cycleTarget}, missingForCycle=${missingForCycle ? missingForCycle.name : 'null'}`);
         if (!gotMaterials && missingForCycle) {
           ctx.log("craft", `${recipe.name}: cannot get materials for even 1x batch, skipping`);
           missingSummary.push(`${recipe.name} (${missingForCycle.need}x ${missingForCycle.name} for ${cycleTarget}x batch)`);
@@ -874,6 +1043,18 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         } else {
           skillSummary.push(`${recipe.name} (skill too low, no XP recipes available)`);
         }
+      }
+    }
+
+    // ── If all configured recipes are at their limits, fall back to enabled categories crafting ──
+    if (atLimitCount.count === settings.craftLimits.length && settings.craftLimits.length > 0) {
+      ctx.log("craft", `All ${atLimitCount.count} configured recipes at limit — crafting from enabled categories: ${settings.enabledCategories.join(", ")}`);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, recipeIndex, settings.enabledCategories);
+      if (categoryCrafted.length > 0) {
+        craftedSummary.push(...categoryCrafted);
+      } else {
+        ctx.log("info", `No materials available for enabled categories. Waiting 60s...`);
+        await sleep(60000);
       }
     }
 

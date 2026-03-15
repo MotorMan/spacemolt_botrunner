@@ -119,6 +119,8 @@ export type ExplorerMode = "explore" | "trade_update";
 function getExplorerSettings(username?: string): {
   mode: ExplorerMode;
   acceptMissions: boolean;
+  focusAreaSystem: string | null;
+  maxJumps: number;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -132,9 +134,15 @@ function getExplorerSettings(username?: string): {
       ? Boolean(e.acceptMissions)
       : true;
 
+  // Focus area settings: per-bot only (no global defaults)
+  const focusAreaSystem = (botOverrides.focusAreaSystem as string) || null;
+  const maxJumps = (botOverrides.maxJumps as number) || 5;
+
   return {
     mode: (mode === "trade_update" ? "trade_update" : "explore") as ExplorerMode,
     acceptMissions,
+    focusAreaSystem,
+    maxJumps,
   };
 }
 
@@ -142,6 +150,13 @@ function getExplorerSettings(username?: string): {
 export function setExplorerMode(username: string, mode: ExplorerMode): void {
   writeSettings({
     [username]: { explorerMode: mode },
+  });
+}
+
+/** Persist focus area settings for a specific bot. */
+export function setExplorerFocusArea(username: string, focusAreaSystem: string | null, maxJumps: number): void {
+  writeSettings({
+    [username]: { focusAreaSystem, maxJumps },
   });
 }
 
@@ -718,9 +733,23 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const allSystems = mapStore.getAllSystems();
     const stationSystems: Array<{ systemId: string; systemName: string; stationPoi: string; stationName: string; staleMins: number }> = [];
 
+    // Get focus area settings
+    const focusSettings = getExplorerSettings(bot.username);
+    const focusAreaSystem = focusSettings.focusAreaSystem;
+    const maxJumps = focusSettings.maxJumps;
+
     for (const [sysId, sys] of Object.entries(allSystems)) {
       // Skip pirate systems — they are hostile!
       if (isPirateSystem(sysId)) continue;
+
+      // If focus area is set, check if this system is within range
+      if (focusAreaSystem) {
+        const route = mapStore.findRoute(focusAreaSystem, sysId);
+        if (!route) continue; // No route = not reachable
+        const jumpsNeeded = route.length - 1; // Number of jumps = route length - 1
+        if (jumpsNeeded > maxJumps) continue; // Too far from focus area
+      }
+
       for (const poi of sys.pois) {
         if (!poi.has_base) continue;
         // Find the stalest market entry, or Infinity if no market data
@@ -747,12 +776,14 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     stationSystems.sort((a, b) => b.staleMins - a.staleMins);
 
     if (stationSystems.length === 0) {
-      ctx.log("info", "No known stations on map — run an explorer in 'explore' mode first. Waiting 60s...");
+      const focusMsg = focusAreaSystem ? ` within ${maxJumps} jumps of ${focusAreaSystem}` : '';
+      ctx.log("info", `No known stations${focusMsg} — run an explorer in 'explore' mode first. Waiting 60s...`);
       await sleep(60000);
       continue;
     }
 
-    ctx.log("info", `Found ${stationSystems.length} known stations to update`);
+    const focusLog = focusAreaSystem ? ` (focus: ${focusAreaSystem}, max ${maxJumps} jumps)` : '';
+    ctx.log("info", `Found ${stationSystems.length} known stations to update${focusLog}`);
 
     // ── Visit each station ──
     for (const target of stationSystems) {

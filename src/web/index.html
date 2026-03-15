@@ -2667,6 +2667,25 @@ function renderProfileTopbar() {
         <option value="explore"${explorerMode === 'explore' ? ' selected' : ''}>Explore new systems</option>
         <option value="trade_update"${explorerMode === 'trade_update' ? ' selected' : ''}>Update trade data</option>
       </select>`;
+
+    // Focus area settings (only visible in trade_update mode)
+    if (explorerMode === 'trade_update') {
+      const focusAreaSystem = botSettings.focusAreaSystem || '';
+      const maxJumps = botSettings.maxJumps || 5;
+      const sysOpts = [`<option value=""${!focusAreaSystem ? ' selected' : ''}>(none - all systems)</option>`];
+      for (const sys of knownSystems) {
+        const sel = sys.id === focusAreaSystem ? ' selected' : '';
+        sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+      }
+      if (focusAreaSystem && !knownSystems.find(s => s.id === focusAreaSystem)) {
+        sysOpts.push(`<option value="${esc(focusAreaSystem)}" selected>${esc(focusAreaSystem)}</option>`);
+      }
+      actions += `
+        <span class="profile-ore-label" style="margin-left:8px">Focus:</span>
+        <select id="profile-focusAreaSystem" onchange="saveProfileFocusAreaSystem()">${sysOpts.join('')}</select>
+        <span class="profile-ore-label" style="margin-left:8px">Max Jumps:</span>
+        <input type="number" id="profile-maxJumps" value="${maxJumps}" min="1" max="50" style="width:60px" onchange="saveProfileMaxJumps()">`;
+    }
   }
 
   // Per-bot missions toggle (visible for miner and explorer)
@@ -2761,6 +2780,30 @@ function saveProfileExplorerMode() {
   const explorerMode = sel.value;
   const existing = settings[bot.username] || {};
   const updated = Object.assign({}, existing, { explorerMode });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfileFocusAreaSystem() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const sel = document.getElementById('profile-focusAreaSystem');
+  if (!sel) return;
+  const focusAreaSystem = sel.value;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { focusAreaSystem });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfileMaxJumps() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const inp = document.getElementById('profile-maxJumps');
+  if (!inp) return;
+  const maxJumps = parseInt(inp.value, 10) || 5;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { maxJumps });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
 }
@@ -7750,6 +7793,42 @@ function renderExplorerSettings(panel) {
   const surveyMode = explorer.surveyMode ?? 'thorough';
   const avoidLowSec = explorer.avoidLowSec ?? false;
 
+  // Per-bot focus area overrides for trade_update mode
+  const explorerBots = bots.filter(b => {
+    const botSettings = settings[b.username] || {};
+    return (b.routine === 'explorer' || botSettings.explorerMode === 'trade_update');
+  });
+  
+  let perBotHtml = '';
+  if (explorerBots.length > 0) {
+    perBotHtml = `<div class="setting-section" style="margin-top:20px;border-top:1px solid #21262d;padding-top:16px">
+      <div class="setting-label">Trade Update Focus Areas</div>
+      <div class="setting-hint">Configure focus areas for explorer bots in trade_update mode. Bots will only visit stations within the specified jump range.</div>
+      <table class="settings-table" style="margin-top:8px;width:100%;border-collapse:collapse">
+        <thead><tr><th style="text-align:left;padding:6px;border-bottom:1px solid #21262d">Bot</th><th style="text-align:left;padding:6px;border-bottom:1px solid #21262d">Focus System</th><th style="text-align:left;padding:6px;border-bottom:1px solid #21262d">Max Jumps</th><th style="text-align:left;padding:6px;border-bottom:1px solid #21262d">Action</th></tr></thead>
+        <tbody>`;
+    for (const bot of explorerBots) {
+      const botSettings = settings[bot.username] || {};
+      const focusAreaSystem = botSettings.focusAreaSystem || '';
+      const botMaxJumps = botSettings.maxJumps ?? 5;
+      
+      // Build system options
+      let sysOpts = '<option value="">(none - all systems)</option>';
+      for (const sys of knownSystems) {
+        const sel = sys.id === focusAreaSystem ? ' selected' : '';
+        sysOpts += `<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`;
+      }
+      
+      perBotHtml += `<tr>
+        <td style="padding:6px;border-bottom:1px solid rgba(255,255,255,0.03)">${esc(bot.username)}</td>
+        <td style="padding:6px;border-bottom:1px solid rgba(255,255,255,0.03)"><select data-bot="${esc(bot.username)}" class="focus-system-select" style="width:100%;padding:4px">${sysOpts}</select></td>
+        <td style="padding:6px;border-bottom:1px solid rgba(255,255,255,0.03)"><input type="number" data-bot="${esc(bot.username)}" class="focus-maxjumps-input" value="${botMaxJumps}" min="1" max="50" style="width:60px;padding:4px"></td>
+        <td style="padding:6px;border-bottom:1px solid rgba(255,255,255,0.03)"><button class="sm primary" onclick="saveExplorerBotFocus('${esc(bot.username)}')">Save</button></td>
+      </tr>`;
+    }
+    perBotHtml += `</tbody></table></div>`;
+  }
+
   panel.innerHTML = `
     <h3>Explorer Settings</h3>
     <div class="settings-desc">Configure how explorer bots chart distant systems.</div>
@@ -7811,6 +7890,8 @@ function renderExplorerSettings(panel) {
       <input type="number" id="set-explorer-repairThreshold" min="20" max="80" value="${repairThreshold}">
     </div>
 
+    ${perBotHtml}
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveExplorerSettings()">Save Settings</button>
     </div>
@@ -7828,6 +7909,25 @@ function saveExplorerSettings() {
   };
   send({ type: 'saveSettings', routine: 'explorer', settings: s });
   settings.explorer = s;
+}
+
+function saveExplorerBotFocus(botName) {
+  const row = document.querySelector(`tr td button[onclick="saveExplorerBotFocus('${esc(botName)}')"]`).closest('tr');
+  const systemSelect = row.querySelector('.focus-system-select');
+  const maxJumpsInput = row.querySelector('.focus-maxjumps-input');
+  const focusAreaSystem = systemSelect.value;
+  const maxJumps = parseInt(maxJumpsInput.value, 10) || 5;
+  
+  const existing = settings[botName] || {};
+  const updated = Object.assign({}, existing, { focusAreaSystem, maxJumps });
+  send({ type: 'saveSettings', routine: botName, settings: updated });
+  settings[botName] = updated;
+  
+  // Show brief feedback
+  const btn = row.querySelector('button');
+  const origText = btn.textContent;
+  btn.textContent = 'Saved!';
+  setTimeout(() => { btn.textContent = origText; }, 1500);
 }
 
 // ── Gas Harvester Settings ──────────────────────────────────

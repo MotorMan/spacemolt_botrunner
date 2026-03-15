@@ -3,6 +3,7 @@ import { join } from "path";
 
 const DATA_DIR = join(process.cwd(), "data");
 const LOG_FILE = join(DATA_DIR, "debug.log");
+const COMMANDS_LOG = join(DATA_DIR, "debugCommands.log");
 
 // Ensure data directory exists once at module load
 if (!existsSync(DATA_DIR)) {
@@ -27,8 +28,13 @@ export function debugLog(source: string, message: string, data?: unknown): void 
     }
   }
   line += "\n";
+  
+  // Route command-related logs to debugCommands.log
+  const isCommandLog = source === "bot:exec" || source === "bot:response";
+  const targetFile = isCommandLog ? COMMANDS_LOG : LOG_FILE;
+  
   try {
-    appendFileSync(LOG_FILE, line);
+    appendFileSync(targetFile, line);
   } catch {
     // ignore write errors
   }

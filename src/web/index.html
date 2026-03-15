@@ -1858,6 +1858,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('explorer')">Explorer</div>
         <div class="sidebar-item" onclick="switchSettingsTab('coordinator')">Coordinator</div>
         <div class="sidebar-item" onclick="switchSettingsTab('trader')">Trader</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('faction_trader')">Faction Trader</div>
         <div class="sidebar-item" onclick="switchSettingsTab('gas_harvester')">GasHarvester</div>
         <div class="sidebar-item" onclick="switchSettingsTab('ice_harvester')">IceHarvester</div>
         <div class="sidebar-item" onclick="switchSettingsTab('salvager')">Salvager</div>
@@ -2472,7 +2473,7 @@ function renderStatsActivityLog() {
     return;
   }
   log.innerHTML = filtered.map(l => `<div class="log-entry">${formatFactionLogLine(l)}</div>`).join('');
-  log.scrollTop = log.scrollHeight;
+  log.scrollTop = 0;
 }
 
 function renderStats() {
@@ -3778,10 +3779,10 @@ function logResponse(html) {
   const div = document.createElement('div');
   div.className = 'resp-entry';
   div.innerHTML = html;
-  log.appendChild(div);
+  log.prepend(div);
   // Cap DOM entries
-  while (log.children.length > 300) log.removeChild(log.firstChild);
-  log.scrollTop = log.scrollHeight;
+  while (log.children.length > 300) log.removeChild(log.lastChild);
+  log.scrollTop = 0;
 }
 
 function clearActivityLog() {
@@ -3813,9 +3814,9 @@ function appendBotLogLine(line) {
   const div = document.createElement('div');
   div.className = 'log-entry';
   div.innerHTML = formatBotLogLine(line);
-  log.appendChild(div);
-  while (log.children.length > 300) log.removeChild(log.firstChild);
-  log.scrollTop = log.scrollHeight;
+  log.prepend(div);
+  while (log.children.length > 300) log.removeChild(log.lastChild);
+  log.scrollTop = 0;
 }
 
 function renderBotActivityLog() {
@@ -3827,9 +3828,9 @@ function renderBotActivityLog() {
     const div = document.createElement('div');
     div.className = 'log-entry';
     div.innerHTML = formatBotLogLine(line);
-    log.appendChild(div);
+    log.prepend(div);
   }
-  log.scrollTop = log.scrollHeight;
+  log.scrollTop = 0;
 }
 
 /** Load full persistent log from disk for the current profile bot. */
@@ -3851,14 +3852,14 @@ async function loadFullBotLog() {
       // Persistent log format: "YYYY-MM-DD HH:MM:SS [cat] msg" — strip date prefix for display
       const stripped = line.replace(/^\d{4}-\d{2}-\d{2}\s+/, '');
       div.innerHTML = formatBotLogLine(stripped);
-      log.appendChild(div);
+      log.prepend(div);
     }
-    log.scrollTop = log.scrollHeight;
+    log.scrollTop = 0;
     const countNote = document.createElement('div');
     countNote.className = 'log-entry';
     countNote.style.color = 'var(--dim)';
     countNote.textContent = `— Showing ${data.lines.length} of ${data.total} total log entries —`;
-    log.prepend(countNote);
+    log.appendChild(countNote);
   } catch (e) {
     log.innerHTML = `<div class="log-entry" style="color:var(--dim)">Failed to load log: ${e.message}</div>`;
   }
@@ -4782,6 +4783,8 @@ function renderSettingsPanel() {
     renderCoordinatorSettings(panel);
   } else if (activeSettingsTab === 'trader') {
     renderTraderSettings(panel);
+  } else if (activeSettingsTab === 'faction_trader') {
+    renderFactionTraderSettings(panel);
   } else if (activeSettingsTab === 'gas_harvester') {
     renderGasHarvesterSettings(panel);
   } else if (activeSettingsTab === 'ice_harvester') {
@@ -5705,6 +5708,93 @@ function saveTraderSettings() {
   settings.trader = s;
 }
 
+// ── Faction Trader Settings ────────────────────────────────────────
+function renderFactionTraderSettings(panel) {
+  const t = settings.faction_trader || {};
+  const fuelCostPerJump = t.fuelCostPerJump ?? 50;
+  const refuelThreshold = t.refuelThreshold ?? 50;
+  const repairThreshold = t.repairThreshold ?? 40;
+  const minSellPrice = t.minSellPrice ?? 0;
+  const tradeItems = Array.isArray(t.tradeItems) ? t.tradeItems.join(', ') : '';
+  const stationPriority = t.stationPriority ?? false;
+
+  panel.innerHTML = `
+    <h3>Faction Trader Settings</h3>
+    <div class="settings-desc">The faction trader bot liquidates items from faction storage. It withdraws items and sells them at the best known buyer station, then returns home. Unlike the regular trader, it never buys from markets.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Fuel Cost Per Jump (credits)</div>
+        <div class="setting-hint">Estimated fuel cost per system jump, used for profit calculations.</div>
+      </div>
+      <input type="number" id="set-faction_trader-fuelCostPerJump" min="0" max="1000" value="${fuelCostPerJump}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Refuel at station when fuel drops below this %.</div>
+      </div>
+      <input type="number" id="set-faction_trader-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold (%)</div>
+        <div class="setting-hint">Repair hull at station when HP drops below this %.</div>
+      </div>
+      <input type="number" id="set-faction_trader-repairThreshold" min="20" max="80" value="${repairThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min Sell Price (credits)</div>
+        <div class="setting-hint">Minimum price per unit to accept for sales. 0 = no minimum.</div>
+      </div>
+      <input type="number" id="set-faction_trader-minSellPrice" min="0" max="10000" value="${minSellPrice}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Trade Items Filter</div>
+        <div class="setting-hint">Comma-separated list of item names or keywords to allow trading (empty = trade all items in faction storage). Example: "aluminum,platinum,consumer"</div>
+      </div>
+      <input type="text" id="set-faction_trader-tradeItems" value="${esc(tradeItems)}" placeholder="aluminum, platinum, consumer electronics" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Station Priority</div>
+        <div class="setting-hint">Prioritize selling routes to the home station before considering other destinations.</div>
+      </div>
+      <select id="set-faction_trader-stationPriority">
+        <option value="false" ${!stationPriority ? 'selected' : ''}>Disabled</option>
+        <option value="true" ${stationPriority ? 'selected' : ''}>Enabled</option>
+      </select>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveFactionTraderSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function saveFactionTraderSettings() {
+  const tradeItemsInput = document.getElementById('set-faction_trader-tradeItems').value.trim();
+  const tradeItems = tradeItemsInput ? tradeItemsInput.split(',').map(s => s.trim()).filter(s => s) : [];
+  
+  const s = {
+    fuelCostPerJump: parseInt(document.getElementById('set-faction_trader-fuelCostPerJump').value) || 50,
+    refuelThreshold: parseInt(document.getElementById('set-faction_trader-refuelThreshold').value) || 50,
+    repairThreshold: parseInt(document.getElementById('set-faction_trader-repairThreshold').value) || 40,
+    minSellPrice: parseInt(document.getElementById('set-faction_trader-minSellPrice').value) || 0,
+    tradeItems: tradeItems,
+    stationPriority: document.getElementById('set-faction_trader-stationPriority').value === 'true',
+  };
+  send({ type: 'saveSettings', routine: 'faction_trader', settings: s });
+  settings.faction_trader = s;
+}
+
 // ── AI Settings ────────────────────────────────────────────
 function renderAiSettings(panel) {
   const a = settings.ai || {};
@@ -5804,12 +5894,12 @@ function updateChatBotSelect() {
 function appendLines(el, panel, lines) {
   const fragment = document.createDocumentFragment();
   for (const line of lines) fragment.appendChild(makeLogLine(line));
-  el.appendChild(fragment);
-  if (autoScroll[panel]) el.scrollTop = el.scrollHeight;
-  
+  el.prepend(fragment);
+  if (autoScroll[panel]) el.scrollTop = 0;
+
   // Limit to 200 lines maximum
   while (el.children.length > 200) {
-    el.removeChild(el.firstChild);
+    el.removeChild(el.lastChild);
   }
 }
 
@@ -5817,14 +5907,14 @@ function appendLine(panel, line) {
   const elMap = { activity: activityEl, broadcast: broadcastEl, system: systemEl };
   const el = elMap[panel];
   if (!el) return;
-  
+
   // Limit to 200 lines maximum before adding new one
   while (el.children.length >= 200) {
-    el.removeChild(el.firstChild);
+    el.removeChild(el.lastChild);
   }
-  
-  el.appendChild(makeLogLine(line));
-  if (autoScroll[panel]) el.scrollTop = el.scrollHeight;
+
+  el.prepend(makeLogLine(line));
+  if (autoScroll[panel]) el.scrollTop = 0;
 }
 
 function makeLogLine(text) {
@@ -6679,9 +6769,9 @@ function appendFactionLogLine(line) {
   const div = document.createElement('div');
   div.className = 'log-entry';
   div.innerHTML = formatFactionLogLine(line);
-  log.appendChild(div);
-  while (log.children.length > 300) log.removeChild(log.firstChild);
-  log.scrollTop = log.scrollHeight;
+  log.prepend(div);
+  while (log.children.length > 300) log.removeChild(log.lastChild);
+  log.scrollTop = 0;
 }
 
 // ── Faction Rooms ────────────────────────────────────────────
@@ -7703,6 +7793,7 @@ function renderGasHarvesterSettings(panel) {
   const refuelThreshold = g.refuelThreshold ?? 50;
   const repairThreshold = g.repairThreshold ?? 40;
   const currentSystem = g.system || '';
+  const homeSystem = g.homeSystem || '';
   const depositBot = g.depositBot || '';
   const gasPrimary = depositBot ? `bot:${depositBot}` : depositMode;
   const gasSecondary = depositFallback;
@@ -7716,6 +7807,16 @@ function renderGasHarvesterSettings(panel) {
   }
   if (currentSystem && !knownSystems.find(s => s.id === currentSystem)) {
     systemOpts.push(`<option value="${esc(currentSystem)}" selected>${esc(currentSystem)}</option>`);
+  }
+
+  const homeOpts = ['<option value="">(start system)</option>'];
+  for (const sys of knownSystems) {
+    const sel = sys.id === homeSystem ? ' selected' : '';
+    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+    homeOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+  }
+  if (homeSystem && !knownSystems.find(s => s.id === homeSystem)) {
+    homeOpts.push(`<option value="${esc(homeSystem)}" selected>${esc(homeSystem)}</option>`);
   }
 
   const gasOres = knownOres.filter(o => {
@@ -7762,6 +7863,14 @@ function renderGasHarvesterSettings(panel) {
         <div class="setting-hint">Override system to harvest in. Bot will jump there on start.</div>
       </div>
       <select id="set-gas-system">${systemOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home System</div>
+        <div class="setting-hint">Station system the gas harvester returns to for unloading. Per-bot override available in bot profile. Defaults to start system.</div>
+      </div>
+      <select id="set-gas-homeSystem">${homeOpts.join('')}</select>
     </div>
 
     <div class="setting-row">
@@ -7814,6 +7923,7 @@ function saveGasHarvesterSettings() {
   const s = {
     targetGas: document.getElementById('set-gas-targetGas').value,
     system: document.getElementById('set-gas-system').value,
+    homeSystem: document.getElementById('set-gas-homeSystem').value,
     depositBot: (function() { const v = document.getElementById('set-gas-depositPrimary').value; return v.startsWith('bot:') ? v.slice(4) : ''; })(),
     depositMode: (function() { const v = document.getElementById('set-gas-depositPrimary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
     depositFallback: (function() { const v = document.getElementById('set-gas-depositSecondary').value; return v.startsWith('bot:') ? 'gift' : v; })(),

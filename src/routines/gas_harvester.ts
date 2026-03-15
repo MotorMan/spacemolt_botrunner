@@ -277,6 +277,16 @@ export const gasHarvesterRoutine: Routine = async function* (ctx: RoutineContext
       stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
     }
 
+    // ── Ensure we have a valid station to dock at ──
+    // If no home system is set or we're at home, find a station in current system
+    if (!stationPoi || bot.system === homeSystem) {
+      const { pois: currentPois } = await getSystemInfo(ctx);
+      const currentStation = findStation(currentPois);
+      if (currentStation) {
+        stationPoi = { id: currentStation.id, name: currentStation.name };
+      }
+    }
+
     // ── Travel to station ──
     yield "travel_to_station";
     if (stationPoi) {
@@ -291,10 +301,16 @@ export const gasHarvesterRoutine: Routine = async function* (ctx: RoutineContext
     const dockResp = await bot.exec("dock");
     if (dockResp.error && !dockResp.error.message.includes("already")) {
       ctx.log("error", `Dock failed: ${dockResp.error.message}`);
-      await sleep(5000);
-      continue;
+      // If dock failed (e.g., no base at location), use ensureDocked as fallback
+      const docked = await ensureDocked(ctx);
+      if (!docked) {
+        ctx.log("error", "Failed to find station — waiting before retry");
+        await sleep(5000);
+        continue;
+      }
+    } else {
+      bot.docked = true;
     }
-    bot.docked = true;
 
     // ── Collect storage + unload cargo ──
     await collectFromStorage(ctx);

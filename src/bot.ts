@@ -182,9 +182,6 @@ export class Bot {
     debugLog("bot:exec", `${this.username} > ${command}`, payload);
     let resp = await this.api.execute(command, payload);
 
-    // Log the response
-    debugLog("bot:response", `${this.username} < ${command}`, resp);
-
     // Action pending — a previous game action is still resolving (10s tick).
     // Wait for the tick to complete then retry once.
     if (resp.error) {
@@ -193,8 +190,6 @@ export class Bot {
         debugLog("bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
         await sleep(10_000);
         resp = await this.api.execute(command, payload);
-        // Log the retry response
-        debugLog("bot:response", `${this.username} < ${command} (retry)`, resp);
       }
     }
 

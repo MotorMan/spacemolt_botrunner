@@ -1424,6 +1424,21 @@
     border-radius: 3px; background: #1a3a2a; color: #4ade80;
     margin-left: 6px; vertical-align: middle;
   }
+  .craft-cat-checks {
+    display: flex; flex-wrap: wrap; gap: 8px;
+    padding: 8px; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; margin-top: 8px;
+  }
+  .craft-cat-check {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 0.8em; color: var(--text); cursor: pointer;
+    padding: 4px 8px; border-radius: 4px;
+    background: var(--card-bg); border: 1px solid var(--border);
+  }
+  .craft-cat-check:hover { background: var(--bg-row-hover); }
+  .craft-cat-check input[type="checkbox"] {
+    margin: 0; cursor: pointer;
+  }
 
   /* ── Faction page ───────────────────────────────────── */
   .faction-layout {
@@ -5284,6 +5299,7 @@ function fetchSettingsRecipesPage(username, page, panel) {
 function renderCrafterSettings(panel) {
   const crafter = settings.crafter || {};
   const craftLimits = crafter.craftLimits || {};
+  const enabledCategories = crafter.enabledCategories || ["Refining", "Components", "Consumables"];
   const refuelThreshold = crafter.refuelThreshold ?? 50;
   const repairThreshold = crafter.repairThreshold ?? 40;
 
@@ -5335,6 +5351,14 @@ function renderCrafterSettings(panel) {
     ? `<option value="__all__">All (${availableRecipes.length})</option>` + [...categories.keys()].sort().map(c => `<option value="${esc(c)}">${esc(c)} (${categories.get(c).length})</option>`).join('')
     : '<option value="">All recipes added</option>';
 
+  // Build enabled categories checkboxes
+  const allCategories = [...new Set(recipes.map(r => r.category || 'Other'))].sort();
+  const categoryChecks = allCategories.map(cat => {
+    const count = recipes.filter(r => (r.category || 'Other') === cat).length;
+    const checked = enabledCategories.includes(cat) ? 'checked' : '';
+    return `<label class="craft-cat-check"><input type="checkbox" data-category="${esc(cat)}" ${checked}> ${esc(cat)} (${count})</label>`;
+  }).join('');
+
   panel.innerHTML = `
     <h3>Crafter Settings</h3>
     <div class="settings-desc">Add recipes and set stock limits. The crafter bot will craft each item up to its limit, then stop.</div>
@@ -5354,6 +5378,17 @@ function renderCrafterSettings(panel) {
         <button class="primary sm" onclick="addCraftItem()">+ Add</button>
       </div>
       <div id="craft-add-detail" style="font-size:0.75em;color:var(--dim);margin-top:4px"></div>
+    </div>
+
+    <div class="setting-row" style="margin-top:16px">
+      <div>
+        <div class="setting-label">Enabled Categories</div>
+        <div class="setting-hint">When no specific recipes are configured, the bot will craft from these categories.</div>
+      </div>
+      <div class="craft-cat-checks">
+        <label class="craft-cat-check"><input type="checkbox" id="craft-cat-toggle-all" onchange="toggleAllCategories(this)"> All</label>
+        ${categoryChecks}
+      </div>
     </div>
 
     <div class="setting-row" style="margin-top:16px">
@@ -5462,6 +5497,11 @@ function removeCraftItem(id) {
   renderCrafterSettings(document.getElementById('settingsContent'));
 }
 
+function toggleAllCategories(checkbox) {
+  const allCategories = document.querySelectorAll('.craft-cat-checks input[type="checkbox"][data-category]');
+  allCategories.forEach(el => el.checked = checkbox.checked);
+}
+
 function saveCrafterSettings() {
   // Collect from rendered inputs (in case user edited qty inline)
   const craftLimits = {};
@@ -5478,8 +5518,15 @@ function saveCrafterSettings() {
     }
   }
 
+  // Collect enabled categories
+  const enabledCategories = [];
+  document.querySelectorAll('.craft-cat-checks input[type="checkbox"][data-category]').forEach(el => {
+    if (el.checked) enabledCategories.push(el.getAttribute('data-category'));
+  });
+
   const s = {
     craftLimits,
+    enabledCategories,
     refuelThreshold: parseInt(document.getElementById('set-crafter-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-crafter-repairThreshold').value) || 40,
   };

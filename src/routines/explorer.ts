@@ -182,6 +182,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   const visitedSystems = new Set<string>();
+  let lastSystem: string | null = null;
 
   // ── Startup: dock at local station to clear cargo & refuel ──
   yield "startup_prep";
@@ -441,7 +442,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     const validConns = connections.filter(c => c.id);
-    const nextSystem = pickNextSystem(validConns, visitedSystems);
+    const nextSystem = pickNextSystem(validConns, visitedSystems, lastSystem);
     if (!nextSystem) {
       ctx.log("info", "All connected systems explored! Picking a random connection...");
       if (validConns.length > 0) {
@@ -452,7 +453,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           await sleep(30000);
           continue;
         }
-        const random = validConns[Math.floor(Math.random() * validConns.length)];
+        // Exclude the system we just came from when picking randomly
+        const candidates = lastSystem ? validConns.filter(c => c.id !== lastSystem) : validConns;
+        const pool = candidates.length > 0 ? candidates : validConns;
+        const random = pool[Math.floor(Math.random() * pool.length)];
         await ensureUndocked(ctx);
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
         const jumpResp = await bot.exec("jump", { target_system: random.id });
@@ -496,6 +500,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     ctx.log("travel", `Jumped to ${nextSystem.name || nextSystem.id}`);
     bot.stats.totalSystems++;
+    lastSystem = systemId;
   }
 };
 
@@ -899,7 +904,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 // ── Helpers ──────────────────────────────────────────────────
 
 /** Pick the best next system: prefer unvisited, then least-explored in mapStore. */
-function pickNextSystem(connections: Connection[], visited: Set<string>): Connection | null {
+function pickNextSystem(connections: Connection[], visited: Set<string>, lastSystem: string | null): Connection | null {
   const unvisited = connections.filter(c => !visited.has(c.id));
   if (unvisited.length > 0) {
     const unmapped = unvisited.filter(c => !mapStore.getSystem(c.id));

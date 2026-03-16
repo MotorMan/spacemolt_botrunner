@@ -2613,7 +2613,7 @@ function renderProfileTopbar() {
     const prevProfileSel = document.getElementById('profile-routine');
     const prevProfileRoutine = prevProfileSel ? prevProfileSel.value : (bot.routine || 'miner');
     actions = `
-      <select id="profile-routine" onchange="pendingBotRender=false;renderProfileSidebar()">
+      <select id="profile-routine" onchange="pendingBotRender=false;renderProfileSidebar()" onclick="event.stopPropagation()">
         ${routines.map(r => `<option value="${esc(r)}"${r === prevProfileRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
       </select>
       <button class="primary sm" onclick="startBotFromProfile()">Start</button>
@@ -2650,9 +2650,9 @@ function renderProfileTopbar() {
     }
     actions += `
       <span class="profile-ore-label">Target Ore:</span>
-      <select id="profile-targetOre" onchange="saveProfileTargetOre()">${oreOpts.join('')}</select>
+      <select id="profile-targetOre" onchange="saveProfileTargetOre()" onclick="event.stopPropagation()">${oreOpts.join('')}</select>
       <span class="profile-ore-label" style="margin-left:8px">Home:</span>
-      <select id="profile-homeSystem" onchange="saveProfileHomeSystem()">${sysOpts.join('')}</select>`;
+      <select id="profile-homeSystem" onchange="saveProfileHomeSystem()" onclick="event.stopPropagation()">${sysOpts.join('')}</select>`;
   }
 
   // Per-bot explorer mode selector (visible when explorer is selected or running)
@@ -2663,7 +2663,7 @@ function renderProfileTopbar() {
     const explorerMode = botSettings.explorerMode || 'explore';
     actions += `
       <span class="profile-ore-label">Mode:</span>
-      <select id="profile-explorerMode" onchange="saveProfileExplorerMode()">
+      <select id="profile-explorerMode" onchange="saveProfileExplorerMode()" onclick="event.stopPropagation()">
         <option value="explore"${explorerMode === 'explore' ? ' selected' : ''}>Explore new systems</option>
         <option value="trade_update"${explorerMode === 'trade_update' ? ' selected' : ''}>Update trade data</option>
       </select>`;
@@ -2682,7 +2682,7 @@ function renderProfileTopbar() {
       }
       actions += `
         <span class="profile-ore-label" style="margin-left:8px">Focus:</span>
-        <select id="profile-focusAreaSystem" onchange="saveProfileFocusAreaSystem()">${sysOpts.join('')}</select>
+        <select id="profile-focusAreaSystem" onchange="saveProfileFocusAreaSystem()" onclick="event.stopPropagation()">${sysOpts.join('')}</select>
         <span class="profile-ore-label" style="margin-left:8px">Max Jumps:</span>
         <input type="number" id="profile-maxJumps" value="${maxJumps}" min="1" max="50" style="width:60px" onchange="saveProfileMaxJumps()">`;
     }
@@ -2720,7 +2720,7 @@ function renderProfileTopbar() {
     }
     actions += `
       <span class="profile-ore-label" style="margin-left:8px">Home:</span>
-      <select id="profile-homeSystem" onchange="saveProfileHomeSystem()">${sysOpts.join('')}</select>
+      <select id="profile-homeSystem" onchange="saveProfileHomeSystem()" onclick="event.stopPropagation()">${sysOpts.join('')}</select>
       <label class="profile-ore-label" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:8px">
         <input type="checkbox" id="profile-stationPriority" onchange="saveProfileStationPriority()"${stationPriority ? ' checked' : ''}>
         Station Priority
@@ -2753,7 +2753,7 @@ function renderProfileTopbar() {
     }
     actions += `
       <span class="profile-ore-label" style="margin-left:8px">Focus:</span>
-      <select id="profile-focusStation" onchange="saveProfileFocusStation()">${focusOpts.join('')}</select>`;
+      <select id="profile-focusStation" onchange="saveProfileFocusStation()" onclick="event.stopPropagation()">${focusOpts.join('')}</select>`;
   }
 
   // Per-bot home system for salvager, ice_harvester, gas_harvester, return_home
@@ -2773,7 +2773,7 @@ function renderProfileTopbar() {
     }
     actions += `
       <span class="profile-ore-label" style="margin-left:8px">Home:</span>
-      <select id="profile-homeSystem" onchange="saveProfileHomeSystem()">${sysOpts.join('')}</select>`;
+      <select id="profile-homeSystem" onchange="saveProfileHomeSystem()" onclick="event.stopPropagation()">${sysOpts.join('')}</select>`;
   }
 
   document.getElementById('profileActions').innerHTML = actions;
@@ -3126,7 +3126,7 @@ function renderManualControls() {
       craftSection = `
       <div class="cmd-group craft-group">
         <label>Craft</label>
-        <select id="mc-craft-recipe" onchange="showRecipeDetails()">${recipeOpts}</select>
+        <select id="mc-craft-recipe" onchange="showRecipeDetails()" onclick="event.stopPropagation()">${recipeOpts}</select>
         <input type="number" id="mc-craft-qty" min="1" value="1" style="width:60px">
         <button class="primary sm" onclick="mcCraft()">Craft</button>
       </div>
@@ -3151,13 +3151,13 @@ function renderManualControls() {
   document.getElementById('manualControls').innerHTML = `
     <div class="cmd-group">
       <label>Travel</label>
-      <select id="mc-travel-poi">${poiOpts}</select>
+      <select id="mc-travel-poi" onclick="event.stopPropagation()">${poiOpts}</select>
       <button class="primary sm" onclick="mcExec('travel',{target_poi:val('mc-travel-poi')})">Go</button>
     </div>
 
     <div class="cmd-group">
       <label>Jump To</label>
-      <select id="mc-jump-sys">${jumpOpts}</select>
+      <select id="mc-jump-sys" onclick="event.stopPropagation()">${jumpOpts}</select>
       <button class="primary sm" id="mc-jump-btn" onclick="mcAutoRoute()">Route</button>
     </div>
 
@@ -3180,14 +3180,14 @@ function renderManualControls() {
 
     <div class="cmd-group">
       <label>Sell</label>
-      <select id="mc-sell-item" onchange="syncQty(this,'mc-sell-qty')">${cargoOpts}</select>
+      <select id="mc-sell-item" onchange="syncQty(this,'mc-sell-qty')" onclick="event.stopPropagation()">${cargoOpts}</select>
       <input type="number" id="mc-sell-qty" min="1" value="1">
       <button class="sm" onclick="mcExec('sell',{item_id:val('mc-sell-item'),quantity:intVal('mc-sell-qty')})">Sell</button>
     </div>
 
     <div class="cmd-group">
       <label>Buy</label>
-      <select id="mc-buy-item" onchange="syncBuyInfo()">${marketOpts}</select>
+      <select id="mc-buy-item" onchange="syncBuyInfo()" onclick="event.stopPropagation()">${marketOpts}</select>
       <input type="number" id="mc-buy-qty" min="1" value="1">
       <button class="sm" onclick="mcExec('buy',{item_id:val('mc-buy-item'),quantity:intVal('mc-buy-qty')})">Buy</button>
       <span id="mc-buy-info" style="font-size:0.75em;color:var(--dim)"></span>
@@ -3195,28 +3195,28 @@ function renderManualControls() {
 
     <div class="cmd-group">
       <label>Deposit</label>
-      <select id="mc-dep-item" onchange="syncQty(this,'mc-dep-qty')">${cargoOpts}</select>
+      <select id="mc-dep-item" onchange="syncQty(this,'mc-dep-qty')" onclick="event.stopPropagation()">${cargoOpts}</select>
       <input type="number" id="mc-dep-qty" min="1" value="1">
       <button class="sm" onclick="mcExec('deposit_items',{item_id:val('mc-dep-item'),quantity:intVal('mc-dep-qty')})">Deposit</button>
     </div>
 
     <div class="cmd-group">
       <label>Withdraw</label>
-      <select id="mc-wit-item" onchange="syncQty(this,'mc-wit-qty')">${storOpts}</select>
+      <select id="mc-wit-item" onchange="syncQty(this,'mc-wit-qty')" onclick="event.stopPropagation()">${storOpts}</select>
       <input type="number" id="mc-wit-qty" min="1" value="1">
       <button class="sm" onclick="mcExec('withdraw_items',{item_id:val('mc-wit-item'),quantity:intVal('mc-wit-qty')})">Withdraw</button>
     </div>
 
     <div class="cmd-group">
       <label>Faction Deposit</label>
-      <select id="mc-fac-dep-item" onchange="syncQty(this,'mc-fac-dep-qty')">${storOpts}</select>
+      <select id="mc-fac-dep-item" onchange="syncQty(this,'mc-fac-dep-qty')" onclick="event.stopPropagation()">${storOpts}</select>
       <input type="number" id="mc-fac-dep-qty" min="1" value="1" style="width:90px">
       <button class="sm" onclick="mcFactionDeposit()">Deposit</button>
     </div>
 
     <div class="cmd-group">
       <label>Faction Withdraw</label>
-      <select id="mc-fac-wit-item">${factionOpts}</select>
+      <select id="mc-fac-wit-item" onclick="event.stopPropagation()">${factionOpts}</select>
       <input type="number" id="mc-fac-wit-qty" min="1" value="1" style="width:90px">
       <button class="sm" onclick="mcFactionWithdraw()">Withdraw</button>
       <button class="sm" onclick="mcRefreshFactionStorage()" title="Reload faction storage list">Refresh</button>
@@ -3224,15 +3224,15 @@ function renderManualControls() {
 
     <div class="cmd-group">
       <label>Gift Item</label>
-      <select id="mc-gift-target">${otherBotOpts}</select>
-      <select id="mc-gift-item" onchange="syncQty(this,'mc-gift-qty')">${cargoOpts}</select>
+      <select id="mc-gift-target" onclick="event.stopPropagation()">${otherBotOpts}</select>
+      <select id="mc-gift-item" onchange="syncQty(this,'mc-gift-qty')" onclick="event.stopPropagation()">${cargoOpts}</select>
       <input type="number" id="mc-gift-qty" min="1" value="1">
       <button class="sm" onclick="mcExec('send_gift',{recipient:val('mc-gift-target'),item_id:val('mc-gift-item'),quantity:intVal('mc-gift-qty')})">Send</button>
     </div>
 
     <div class="cmd-group">
       <label>Send Credits</label>
-      <select id="mc-credits-target">${otherBotOpts}</select>
+      <select id="mc-credits-target" onclick="event.stopPropagation()">${otherBotOpts}</select>
       <input type="number" id="mc-credits-amount" min="1" value="100" style="width:90px">
       <button class="sm" onclick="mcExec('send_gift',{recipient:val('mc-credits-target'),credits:intVal('mc-credits-amount')})">Send</button>
     </div>

@@ -2727,6 +2727,35 @@ function renderProfileTopbar() {
       </label>`;
   }
 
+  // Per-bot focus station for cleanup routine
+  const isCleanup = (bot.state === 'running' && bot.routine === 'cleanup')
+    || (bot.state !== 'running' && bot.state !== 'stopping' && getProfileSelectedRoutine() === 'cleanup');
+  if (isCleanup) {
+    const botSettings = settings[bot.username] || {};
+    const globalFocus = (settings.cleanup || {}).focusStationId || '';
+    const botFocus = botSettings.focusStationId || '';
+    
+    // Build station options (use base_id for matching)
+    const focusOpts = [`<option value=""${!botFocus ? ' selected' : ''}>(global: ${globalFocus ? 'focused' : 'all stations'})</option>`];
+    for (const sys of knownSystems) {
+      const sysData = mapData[sys.id];
+      if (!sysData) continue;
+      for (const poi of (sysData.pois || [])) {
+        if (!poi.has_base) continue;
+        const focusVal = poi.base_id || poi.id;
+        const sel = focusVal === botFocus ? ' selected' : '';
+        const label = poi.base_name || poi.name || poi.id;
+        focusOpts.push(`<option value="${esc(focusVal)}"${sel}>${esc(label)} (${esc(sys.name || sys.id)})</option>`);
+      }
+    }
+    if (botFocus && !Object.values(mapData).some(sys => (sys.pois || []).some(p => (p.base_id || p.id) === botFocus))) {
+      focusOpts.push(`<option value="${esc(botFocus)}" selected>${esc(botFocus)} (custom)</option>`);
+    }
+    actions += `
+      <span class="profile-ore-label" style="margin-left:8px">Focus:</span>
+      <select id="profile-focusStation" onchange="saveProfileFocusStation()">${focusOpts.join('')}</select>`;
+  }
+
   // Per-bot home system for salvager, ice_harvester, gas_harvester, return_home
   const needsHomeSystem = ['salvager', 'ice_harvester', 'gas_harvester', 'return_home'];
   const currentRoutine = bot.state === 'running' ? bot.routine : (bot.state !== 'stopping' ? getProfileSelectedRoutine() : '');
@@ -2838,6 +2867,18 @@ function saveProfileHomeSystem() {
   if (!sel) return;
   const existing = settings[bot.username] || {};
   const updated = Object.assign({}, existing, { homeSystem: sel.value });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfileFocusStation() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const sel = document.getElementById('profile-focusStation');
+  if (!sel) return;
+  const focusStationId = sel.value;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { focusStationId });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
 }
@@ -4927,6 +4968,7 @@ function renderCleanupSettings(panel) {
   const general = settings.general || {};
   const cleanupSystem = cleanup.homeSystem || '';
   const cleanupStation = cleanup.homeStation || '';
+  const focusStationId = cleanup.focusStationId || '';
   const generalSystem = general.factionStorageSystem || '';
   const generalStation = general.factionStorageStation || '';
 
@@ -4939,14 +4981,20 @@ function renderCleanupSettings(panel) {
 
   // Build station options from mapData (same format as general settings: "systemId|poiId")
   let stationOpts = `<option value="">(use general: ${esc(generalLabel)})</option>`;
+  let focusOpts = `<option value="">(clean all stations)</option>`;
   for (const [sysId, sys] of Object.entries(mapData)) {
     const sysName = sys.name || sysId;
     for (const poi of (sys.pois || [])) {
       if (!poi.has_base) continue;
       const val = sysId + '|' + poi.id;
+      // For deposit station
       const sel = (sysId === cleanupSystem && poi.id === cleanupStation) ? ' selected' : '';
       const label = poi.base_name || poi.name || poi.id;
       stationOpts += `<option value="${val}"${sel}>${label} (${sysName})</option>`;
+      // For focus station (use base_id if available)
+      const focusVal = poi.base_id || poi.id;
+      const focusSel = focusStationId === focusVal ? ' selected' : '';
+      focusOpts += `<option value="${esc(focusVal)}"${focusSel}>${esc(label)} (${esc(sysName)})</option>`;
     }
   }
 
@@ -4962,6 +5010,14 @@ function renderCleanupSettings(panel) {
       <select id="set-cleanup-station">${stationOpts}</select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Focus Station (Optional)</div>
+        <div class="setting-hint">When set, the cleanup bot will only collect from this specific station instead of all stations. Leave empty to clean all stations.</div>
+      </div>
+      <select id="set-cleanup-focusStation">${focusOpts}</select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveCleanupSettings()">Save Settings</button>
     </div>
@@ -4971,7 +5027,8 @@ function renderCleanupSettings(panel) {
 function saveCleanupSettings() {
   const stationVal = document.getElementById('set-cleanup-station').value;
   const [homeSystem, homeStation] = stationVal ? stationVal.split('|') : ['', ''];
-  const s = { homeSystem, homeStation };
+  const focusStationId = document.getElementById('set-cleanup-focusStation').value;
+  const s = { homeSystem, homeStation, focusStationId };
   send({ type: 'saveSettings', routine: 'cleanup', settings: s });
   settings.cleanup = Object.assign(settings.cleanup || {}, s);
 }

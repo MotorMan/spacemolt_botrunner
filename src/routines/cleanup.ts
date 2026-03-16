@@ -30,6 +30,7 @@ function getCleanupSettings(username?: string): {
   homeStation: string;
   refuelThreshold: number;
   repairThreshold: number;
+  focusStationId: string;  // If set, only clean up this specific station
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -43,6 +44,7 @@ function getCleanupSettings(username?: string): {
       || (t.homeStation as string) || (general.factionStorageStation as string) || "",
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
+    focusStationId: (botOverrides.focusStationId as string) || (t.focusStationId as string) || "",
   };
 }
 
@@ -121,10 +123,36 @@ function resolveStation(stationId: string): { systemId: string; poiId: string; p
 }
 
 /** Get all known stations with bases from mapStore (excluding pirate systems). */
-function getAllKnownStations(homeSystem: string, homeStation: string): StationTarget[] {
+function getAllKnownStations(homeSystem: string, homeStation: string, focusStationId?: string): StationTarget[] {
   const stations: StationTarget[] = [];
   const allSystems = mapStore.getAllSystems();
 
+  // If focus station is set, only return that station
+  if (focusStationId) {
+    for (const [sysId, sys] of Object.entries(allSystems)) {
+      if (isPirateSystem(sysId)) continue;
+      for (const poi of sys.pois) {
+        if (!poi.has_base) continue;
+        if (poi.base_id === focusStationId || poi.id === focusStationId) {
+          // Skip the home/faction storage station
+          if (sysId === homeSystem && (poi.id === homeStation || poi.base_id === homeStation)) continue;
+          stations.push({
+            stationId: poi.base_id || poi.id,
+            systemId: sysId,
+            poiId: poi.id,
+            poiName: poi.base_name || poi.name || poi.id,
+            hasItems: false,
+            hasCredits: false,
+            hasOrders: false,
+          });
+          return stations;  // Return early - only one station in focus mode
+        }
+      }
+    }
+    return stations;  // Focus station not found
+  }
+
+  // Default: return all stations (except home)
   for (const [sysId, sys] of Object.entries(allSystems)) {
     // Skip pirate systems
     if (isPirateSystem(sysId)) continue;
@@ -335,7 +363,8 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Phase 1: Remote scan — discover which stations have our stuff ──
     yield "remote_scan";
-    ctx.log("info", "Scanning all stations for stored items (remote)...");
+    const focusMode = settings.focusStationId ? ` (focus: ${settings.focusStationId})` : "";
+    ctx.log("info", `Scanning${focusMode} for stored items (remote)...`);
 
     // Call view_storage to get the hint field
     const storageData = await bot.viewStorage();
@@ -343,7 +372,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     const hintEntries = parseStorageHints(hint);
 
     // Get all known stations for comparison
-    const allStations = getAllKnownStations(settings.homeSystem, settings.homeStation);
+    const allStations = getAllKnownStations(settings.homeSystem, settings.homeStation, settings.focusStationId);
 
     // If we got hints, mark stations that have items
     const stationsWithStorage: StationTarget[] = [];
@@ -447,12 +476,18 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     if (stationsWithStorage.length === 0) {
-      ctx.log("info", "No stations with stored items — waiting 30 seconds");
+      const waitMsg = settings.focusStationId 
+        ? `No items at focus station — waiting 30 seconds`
+        : "No stations with stored items — waiting 30 seconds";
+      ctx.log("info", waitMsg);
       await sleep(30000);
       continue;
     }
 
-    ctx.log("info", `Found ${stationsWithStorage.length} station(s) with items/credits to collect`);
+    const stationCountMsg = settings.focusStationId
+      ? `Found ${stationsWithStorage.length} station(s) in focus mode with items/credits to collect`
+      : `Found ${stationsWithStorage.length} station(s) with items/credits to collect`;
+    ctx.log("info", stationCountMsg);
 
     // ── Phase 2: Travel to each station and collect ──
     let totalCredits = 0;

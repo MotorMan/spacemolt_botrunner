@@ -30,8 +30,8 @@ import {
 const SAMPLE_MINES = 5;
 /** Minimum fuel % before heading back to refuel. */
 const FUEL_SAFETY_PCT = 40;
-/** Minimum fuel % required before attempting a system jump. */
-const JUMP_FUEL_PCT = 70;
+/** Default minimum fuel % required before attempting a system jump. */
+const DEFAULT_JUMP_FUEL_PCT = 50;
 
 // ── Mission helpers ───────────────────────────────────────────
 
@@ -121,6 +121,7 @@ function getExplorerSettings(username?: string): {
   acceptMissions: boolean;
   focusAreaSystem: string | null;
   maxJumps: number;
+  refuelThreshold: number;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -138,11 +139,15 @@ function getExplorerSettings(username?: string): {
   const focusAreaSystem = (botOverrides.focusAreaSystem as string) || null;
   const maxJumps = (botOverrides.maxJumps as number) || 5;
 
+  // Refuel threshold: per-bot > global explorer > default 50%
+  const refuelThreshold = (botOverrides.refuelThreshold as number) ?? e.refuelThreshold ?? DEFAULT_JUMP_FUEL_PCT;
+
   return {
     mode: (mode === "trade_update" ? "trade_update" : "explore") as ExplorerMode,
     acceptMissions,
     focusAreaSystem,
     maxJumps,
+    refuelThreshold,
   };
 }
 
@@ -157,6 +162,13 @@ export function setExplorerMode(username: string, mode: ExplorerMode): void {
 export function setExplorerFocusArea(username: string, focusAreaSystem: string | null, maxJumps: number): void {
   writeSettings({
     [username]: { focusAreaSystem, maxJumps },
+  });
+}
+
+/** Persist jump fuel threshold setting for a specific bot. */
+export function setExplorerJumpFuelThreshold(username: string, refuelThreshold: number): void {
+  writeSettings({
+    [username]: { refuelThreshold },
   });
 }
 
@@ -429,12 +441,15 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "check_skills";
     await bot.checkSkills();
 
+    // ── Re-get settings in case they changed ──
+    const currentSettings = getExplorerSettings(bot.username);
+
     // ── Pick next system to explore ──
     yield "pick_next_system";
 
     // ALWAYS ensure fueled before jumping — will navigate to nearest station if needed
     yield "pre_jump_fuel";
-    const jumpFueled = await ensureFueled(ctx, JUMP_FUEL_PCT);
+    const jumpFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
     if (!jumpFueled) {
       ctx.log("error", "Could not refuel before jump — waiting 30s...");
       await sleep(30000);
@@ -447,7 +462,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("info", "All connected systems explored! Picking a random connection...");
       if (validConns.length > 0) {
         // Ensure fuel before random jump
-        const rndFueled = await ensureFueled(ctx, JUMP_FUEL_PCT);
+        const rndFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
         if (!rndFueled) {
           ctx.log("error", "Cannot refuel for random jump — waiting 30s...");
           await sleep(30000);
@@ -474,7 +489,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const preJumpFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (preJumpFuel < 25) {
       ctx.log("system", `Fuel too low for jump (${preJumpFuel}%) — refueling first...`);
-      const jf = await ensureFueled(ctx, JUMP_FUEL_PCT);
+      const jf = await ensureFueled(ctx, currentSettings.refuelThreshold);
       if (!jf) {
         ctx.log("error", "Cannot refuel — waiting 30s...");
         await sleep(30000);

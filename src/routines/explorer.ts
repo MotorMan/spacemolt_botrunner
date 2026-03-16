@@ -453,10 +453,8 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           await sleep(30000);
           continue;
         }
-        // Exclude the system we just came from when picking randomly
-        const candidates = lastSystem ? validConns.filter(c => c.id !== lastSystem) : validConns;
-        const pool = candidates.length > 0 ? candidates : validConns;
-        const random = pool[Math.floor(Math.random() * pool.length)];
+        // Smart selection: avoid dead-ends and pirate systems
+        const random = pickSmartConnection(ctx, validConns, lastSystem);
         await ensureUndocked(ctx);
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
         const jumpResp = await bot.exec("jump", { target_system: random.id });
@@ -919,4 +917,49 @@ function pickNextSystem(connections: Connection[], visited: Set<string>, lastSys
   }
 
   return null;
+}
+
+/**
+ * Smart connection picker that avoids dead-ends and pirate traps.
+ * Priority:
+ * 1. Not the system we just came from
+ * 2. Not a pirate system
+ * 3. Systems with more connections (not a dead-end)
+ * 4. Unexplored systems over explored ones
+ */
+function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null): Connection {
+  // First, filter out the system we came from (if possible)
+  let candidates = lastSystem ? connections.filter(c => c.id !== lastSystem) : connections;
+  if (candidates.length === 0) candidates = connections;
+
+  // Separate into pirate and non-pirate
+  const nonPirate = candidates.filter(c => !isPirateSystem(c.id));
+  const pirate = candidates.filter(c => isPirateSystem(c.id));
+
+  // Prefer non-pirate systems
+  const pool = nonPirate.length > 0 ? nonPirate : pirate;
+
+  // Score each connection by how many exits it has (prefer systems with more connections)
+  const scored = pool.map(conn => {
+    const sys = mapStore.getSystem(conn.id);
+    // Get connection count from mapStore if known, otherwise estimate from current system's connections
+    const connectionCount = sys?.connections?.length ?? 1;
+    const isExplored = conn.id ? mapStore.getSystem(conn.id) != null : false;
+    // Higher score = better (more connections, not explored)
+    const score = connectionCount * 10 + (isExplored ? 0 : 100);
+    return { conn, score };
+  });
+
+  // Sort by score (highest first)
+  scored.sort((a, b) => b.score - a.score);
+
+  // Pick from top scored (add some randomness among top candidates)
+  const topScore = scored[0].score;
+  const topCandidates = scored.filter(s => s.score === topScore);
+  const chosen = topCandidates[Math.floor(Math.random() * topCandidates.length)];
+
+  const connInfo = scored.map(s => `${s.conn.name || s.conn.id}: ${s.score}`).join(", ");
+  ctx.log("info", `Connection scores: ${connInfo} — picking ${chosen.conn.name || chosen.conn.id}`);
+
+  return chosen.conn;
 }

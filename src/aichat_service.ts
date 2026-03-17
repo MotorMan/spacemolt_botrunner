@@ -38,6 +38,8 @@ export interface ChatMessage {
   content: string;
   timestamp: number;
   botUsername?: string; // Which bot received this
+  botSystem?: string;   // System where message was received (for local chat)
+  botPoi?: string;      // POI where message was received (for local chat)
 }
 
 interface BotLockInfo {
@@ -619,13 +621,15 @@ export class AiChatService {
 
   /**
    * Handle response logic (lock, limits, send).
+   * For local chat, verifies bot is at same location as receiving bot.
    */
   private async handleResponse(
     responder: Bot,
     msg: ChatMessage,
     settings: ReturnType<typeof getAiChatSettings>,
     humanSender: string,
-    isHumanSender: boolean
+    isHumanSender: boolean,
+    triedBots: Set<string> = new Set()
   ): Promise<void> {
     // Check conversation limits (cooldown, consecutive responses)
     const participants = [humanSender, responder.username];
@@ -642,17 +646,134 @@ export class AiChatService {
       return;
     }
 
+    // For LOCAL chat: verify responder is at same location as receiving bot
+    if (msg.channel === "local") {
+      const locationMatch = this.checkLocationMatch(responder, msg);
+      if (!locationMatch.matched) {
+        this.logFn("ai_chat", `${responder.username} at wrong location (${responder.system}/${responder.poi}), message was from ${msg.botSystem}/${msg.botPoi}`);
+        
+        // Try to find a bot at the correct location
+        const locationBot = this.findBotAtLocation(msg, triedBots);
+        if (locationBot) {
+          this.logFn("ai_chat", `Found bot at correct location: ${locationBot.username}`);
+          triedBots.add(responder.username);
+          await this.handleResponse(locationBot, msg, settings, humanSender, isHumanSender, triedBots);
+          return;
+        } else {
+          this.logFn("ai_chat", "No bot at correct location, skipping response");
+          return;
+        }
+      }
+    }
+
     // Try to acquire lock
     if (!this.tryAcquireLock(responder.username, humanSender, channelId, settings.lockDurationSec)) {
       this.logFn("ai_chat", `Failed to acquire lock`);
       return;
     }
 
-    // Generate and send response
-    await this.sendResponse(responder, msg, settings, humanSender);
+    // Generate and send response (may fail if traveling for local chat)
+    const result = await this.sendResponse(responder, msg, settings, humanSender, triedBots);
     
-    // Record this response for conversation tracking
-    this.recordResponse(msg.channel, participants, isHumanSender);
+    if (result === "traveling" && msg.channel === "local") {
+      // Bot was traveling, try to find another bot that received this message
+      this.logFn("ai_chat", `${responder.username} is traveling, trying to find alternative bot...`);
+      
+      const alternativeBot = this.findAlternativeBot(msg, responder.username, triedBots);
+      if (alternativeBot) {
+        this.logFn("ai_chat", `Found alternative: ${alternativeBot.username}`);
+        triedBots.add(responder.username);
+        await this.handleResponse(alternativeBot, msg, settings, humanSender, isHumanSender, triedBots);
+        return;
+      } else {
+        this.logFn("ai_chat", "No alternative bot available, skipping response");
+      }
+    }
+    
+    // Record this response for conversation tracking (only if not traveling)
+    if (result !== "traveling") {
+      this.recordResponse(msg.channel, participants, isHumanSender);
+    }
+  }
+
+  /**
+   * Check if responder bot is at same location as the message's receiving bot.
+   */
+  private checkLocationMatch(responder: Bot, msg: ChatMessage): { matched: boolean; reason: string } {
+    // If message has no location info, assume it's ok
+    if (!msg.botSystem || !msg.botPoi) {
+      return { matched: true, reason: "no location info" };
+    }
+    
+    // Check if responder is at same system and POI
+    if (responder.system !== msg.botSystem) {
+      return { matched: false, reason: `different system: ${responder.system} vs ${msg.botSystem}` };
+    }
+    
+    if (responder.poi !== msg.botPoi) {
+      return { matched: false, reason: `different POI: ${responder.poi} vs ${msg.botPoi}` };
+    }
+    
+    return { matched: true, reason: "location matches" };
+  }
+
+  /**
+   * Find a bot at the same location as the original message receiver.
+   */
+  private findBotAtLocation(msg: ChatMessage, triedBots: Set<string>): Bot | null {
+    const bots = AiChatService.getBots();
+    if (!bots || bots.length === 0) return null;
+    if (!msg.botSystem || !msg.botPoi) return null;
+
+    for (const bot of bots) {
+      if (triedBots.has(bot.username)) continue;
+      if (bot.state !== "running" && bot.state !== "idle") continue;
+      if (!bot.api.getSession()) continue;
+      
+      // Check if bot is at same location
+      if (bot.system === msg.botSystem && bot.poi === msg.botPoi) {
+        return bot;
+      }
+    }
+    
+    return null;
+  }
+
+  /**
+   * Find an alternative bot that also received the message and isn't traveling.
+   * For local chat, also verifies location match.
+   */
+  private findAlternativeBot(msg: ChatMessage, excludeBot: string, triedBots: Set<string>): Bot | null {
+    const bots = AiChatService.getBots();
+    if (!bots || bots.length === 0) return null;
+
+    // Find bots that aren't traveling and haven't been tried
+    for (const bot of bots) {
+      if (bot.username === excludeBot) continue;
+      if (triedBots.has(bot.username)) continue;
+      if (bot.state !== "running" && bot.state !== "idle") continue;
+      if (!bot.api.getSession()) continue;
+      
+      // Check if bot is traveling
+      if (!bot.poi || bot.poi === "") {
+        this.logFn("ai_chat_debug", `${bot.username} is traveling (no POI), skipping`);
+        continue;
+      }
+      
+      // For local chat, also check location match
+      if (msg.channel === "local") {
+        if (msg.botSystem && msg.botPoi) {
+          if (bot.system !== msg.botSystem || bot.poi !== msg.botPoi) {
+            this.logFn("ai_chat_debug", `${bot.username} at wrong location (${bot.system}/${bot.poi}), skipping`);
+            continue;
+          }
+        }
+      }
+      
+      return bot;
+    }
+    
+    return null;
   }
 
   /**
@@ -761,8 +882,9 @@ export class AiChatService {
     bot: Bot,
     msg: ChatMessage,
     settings: ReturnType<typeof getAiChatSettings>,
-    humanSender: string
-  ): Promise<void> {
+    humanSender: string,
+    triedBots: Set<string>
+  ): Promise<"sent" | "traveling" | "error"> {
     const mem = loadMemory();
     mem.responseCount++;
 
@@ -832,11 +954,24 @@ Response rules:
           mem.conversationHistory = mem.conversationHistory.slice(-50);
         }
         saveMemory(mem);
+        return "sent";
       } else {
-        this.logFn("error", `Chat send failed: ${chatResp.error.message}`);
+        // Check if error is due to traveling
+        const errorMsg = chatResp.error.message || "";
+        if (msg.channel === "local" && (
+          errorMsg.includes("traveling") || 
+          errorMsg.includes("Cannot send local chat")
+        )) {
+          this.logFn("ai_chat_debug", `${bot.username} is traveling (error: ${errorMsg})`);
+          return "traveling";
+        }
+        
+        this.logFn("error", `Chat send failed: ${errorMsg}`);
+        return "error";
       }
     } catch (llmErr) {
       this.logFn("error", `LLM error: ${llmErr instanceof Error ? llmErr.message : String(llmErr)}`);
+      return "error";
     }
   }
 

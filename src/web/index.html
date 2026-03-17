@@ -2266,8 +2266,7 @@ function connect() {
         break;
       case 'status':
         bots = msg.bots || [];
-        // Skip re-rendering the bot list if a routine select is focused (user is picking)
-        if (!document.activeElement?.closest?.('.row-actions')) renderBots();
+        renderBots();
         renderStats();
         updateChatBotSelect();
         // Update profile if open
@@ -3232,6 +3231,30 @@ function renderManualControls() {
     </div>
 
     <div class="cmd-group">
+      <label>Jettison</label>
+      <select id="mc-jettison-item" onchange="syncQty(this,'mc-jettison-qty')">${cargoOpts}</select>
+      <input type="number" id="mc-jettison-qty" min="1" value="1">
+      <button class="danger sm" onclick="mcJettison()">Jettison</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Deposit All</label>
+      <select id="mc-depall-source">
+        <option value="cargo_to_station">Cargo → Station</option>
+        <option value="cargo_to_faction">Cargo → Faction</option>
+        <option value="station_to_faction">Station → Faction</option>
+      </select>
+      <button class="primary sm" onclick="mcDepositAll()">Start Queue</button>
+      <button class="sm" onclick="mcStopDepositAll()">Stop</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Queue Status</label>
+      <span id="mc-queue-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
+      <button class="sm" onclick="mcRefreshStorageForDepositAll()" title="Refresh storage lists">Refresh</button>
+    </div>
+
+    <div class="cmd-group">
       <label>Gift Item</label>
       <select id="mc-gift-target">${otherBotOpts}</select>
       <select id="mc-gift-item" onchange="syncQty(this,'mc-gift-qty')">${cargoOpts}</select>
@@ -3366,10 +3389,10 @@ function mcFactionWithdraw() {
 
 function mcRefreshFactionStorage() {
   if (!profileBot) return;
-  
+
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
   logResponse(`<span class="resp-cmd">${ts} > view_faction_storage</span>`);
-  
+
   sendExec(profileBot, 'view_faction_storage', {}, (result) => {
     if (result.ok && result.data) {
       const items = result.data.items || result.data.storage || [];
@@ -3382,6 +3405,215 @@ function mcRefreshFactionStorage() {
       renderManualControls();
     }
   });
+}
+
+// ── Jettison Command ────────────────────────────────────────
+
+function mcJettison() {
+  const itemId = val('mc-jettison-item');
+  const qty = intVal('mc-jettison-qty');
+  if (!itemId) {
+    logResponse('<span class="resp-err">Select an item to jettison</span>');
+    return;
+  }
+  // Jettison command: "jettison item_id quantity"
+  mcExec('jettison', { item_id: itemId, quantity: qty });
+}
+
+// ── Deposit All Queue System ───────────────────────────────
+
+let depositAllQueue = null;  // { mode: string, items: Array<{item_id, quantity, source, target}>, index: number }
+let depositAllRunning = false;
+
+/** Refresh both cargo and storage before starting deposit all */
+function mcRefreshStorageForDepositAll() {
+  if (!profileBot) return;
+  
+  const bot = bots.find(b => b.username === profileBot);
+  if (!bot) return;
+  
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > refreshing storage for deposit all</span>`);
+  
+  // Refresh cargo (get_cargo returns inventory)
+  sendExec(profileBot, 'get_cargo', {}, (cargoResult) => {
+    if (cargoResult.ok && cargoResult.data) {
+      // get_cargo returns { cargo: [...], cargoMax: N } or { items: [...] }
+      const cargoData = cargoResult.data.cargo || cargoResult.data.items || [];
+      // The cargo items have itemId (camelCase) format
+      bot.inventory = cargoData;
+      logResponse(`<span class="resp-ok">Cargo: ${cargoData.length} items</span>`);
+    }
+    
+    // Refresh station storage
+    sendExec(profileBot, 'view_storage', {}, (storageResult) => {
+      if (storageResult.ok && storageResult.data) {
+        // view_storage returns { storage: [...] } or { items: [...] }
+        const storageData = storageResult.data.storage || storageResult.data.items || [];
+        bot.storage = storageData;
+        logResponse(`<span class="resp-ok">Station storage: ${storageData.length} items</span>`);
+      }
+      
+      // Refresh faction storage
+      sendExec(profileBot, 'view_faction_storage', {}, (factionResult) => {
+        if (factionResult.ok && factionResult.data) {
+          const faction = factionResult.data.items || factionResult.data.storage || [];
+          profileFactionStorage = faction;
+          logResponse(`<span class="resp-ok">Faction storage: ${faction.length} items</span>`);
+        }
+        renderManualControls();
+      });
+    });
+  });
+}
+
+/** Build the deposit queue based on mode */
+function mcBuildDepositQueue(mode) {
+  const bot = bots.find(b => b.username === profileBot);
+  if (!bot) return null;
+  
+  // Cargo is stored in bot.inventory with itemId (camelCase)
+  const cargo = bot.inventory || [];
+  // Storage uses itemId (camelCase)
+  const storage = bot.storage || [];
+  
+  const items = [];
+  
+  if (mode === 'cargo_to_station') {
+    // Deposit all items from cargo to station storage
+    // Command: storage action=deposit target=self item_id=X quantity=Y source=cargo
+    for (const item of cargo) {
+      const itemId = item.itemId || item.item_id;
+      const qty = item.quantity || item.count || 1;
+      if (qty > 0 && itemId) {
+        items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'cargo' });
+      }
+    }
+  } else if (mode === 'cargo_to_faction') {
+    // Deposit all items from cargo to faction storage
+    // Command: storage action=deposit target=faction item_id=X quantity=Y source=cargo
+    for (const item of cargo) {
+      const itemId = item.itemId || item.item_id;
+      const qty = item.quantity || item.count || 1;
+      if (qty > 0 && itemId) {
+        items.push({ item_id: itemId, quantity: qty, target: 'faction', source: 'cargo' });
+      }
+    }
+  } else if (mode === 'station_to_faction') {
+    // Deposit all items from station storage to faction storage
+    // Command: storage action=deposit target=faction item_id=X quantity=Y source=storage
+    for (const item of storage) {
+      const itemId = item.itemId || item.item_id;
+      const qty = item.quantity || item.count || 1;
+      if (qty > 0 && itemId) {
+        items.push({ item_id: itemId, quantity: qty, target: 'faction', source: 'storage' });
+      }
+    }
+  }
+  
+  return { mode, items, index: 0 };
+}
+
+/** Update the queue status display */
+function mcUpdateQueueStatus() {
+  const statusEl = document.getElementById('mc-queue-status');
+  if (!statusEl) return;
+  
+  if (!depositAllRunning || !depositAllQueue) {
+    statusEl.textContent = 'Idle';
+    statusEl.style.color = 'var(--text-dim)';
+    return;
+  }
+  
+  const { items, index } = depositAllQueue;
+  const remaining = items.length - index;
+  statusEl.textContent = `Processing: ${index}/${items.length} (${remaining} remaining)`;
+  statusEl.style.color = depositAllRunning ? 'var(--green)' : 'var(--yellow)';
+}
+
+/** Process next item in the deposit queue */
+function mcProcessDepositQueue() {
+  if (!depositAllRunning || !depositAllQueue) return;
+  
+  const { items, index } = depositAllQueue;
+  
+  if (index >= items.length) {
+    // Queue complete
+    logResponse(`<span class="resp-ok">Deposit All complete! All items transferred.</span>`);
+    depositAllRunning = false;
+    depositAllQueue = null;
+    mcUpdateQueueStatus();
+    return;
+  }
+  
+  const item = items[index];
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > depositing ${item.quantity}x ${item.item_id} (${index + 1}/${items.length})</span>`);
+  
+  // All deposit operations use the storage command
+  // Format: storage action=deposit target=X item_id=Y quantity=Z source=W
+  const command = 'storage';
+  const params = {
+    action: 'deposit',
+    target: item.target,      // 'self' (station) or 'faction'
+    item_id: item.item_id,
+    quantity: item.quantity,
+    source: item.source       // 'cargo' or 'storage'
+  };
+  
+  sendExec(profileBot, command, params, (result) => {
+    if (result.ok) {
+      logResponse(`<span class="resp-ok">OK</span>`);
+    } else {
+      logResponse(`<span class="resp-err">Failed: ${esc(result.error || 'unknown')}</span>`);
+    }
+    
+    depositAllQueue.index++;
+    mcUpdateQueueStatus();
+    
+    // Wait a bit before next item (respect tick rate)
+    setTimeout(mcProcessDepositQueue, TICK_COOLDOWN_MS + 500);
+  });
+}
+
+/** Start the deposit all queue */
+function mcDepositAll() {
+  if (!profileBot) return;
+  if (depositAllRunning) {
+    logResponse('<span class="resp-err">Deposit All already running</span>');
+    return;
+  }
+  
+  const mode = val('mc-depall-source');
+  const queue = mcBuildDepositQueue(mode);
+  
+  if (!queue || queue.items.length === 0) {
+    logResponse('<span class="resp-err">No items to deposit in source</span>');
+    return;
+  }
+  
+  depositAllQueue = queue;
+  depositAllRunning = true;
+  
+  logResponse(`<span class="resp-cmd">Starting Deposit All: ${mode} (${queue.items.length} items)</span>`);
+  mcUpdateQueueStatus();
+  
+  // Start processing
+  setTimeout(mcProcessDepositQueue, 500);
+}
+
+/** Stop the deposit all queue */
+function mcStopDepositAll() {
+  if (!depositAllRunning) {
+    logResponse('<span class="resp-err">No deposit queue running</span>');
+    return;
+  }
+  
+  depositAllRunning = false;
+  const remaining = depositAllQueue.items.length - depositAllQueue.index;
+  logResponse(`<span class="resp-err">Deposit All stopped. ${remaining} items remaining.</span>`);
+  depositAllQueue = null;
+  mcUpdateQueueStatus();
 }
 
 function val(id) { return document.getElementById(id)?.value || ''; }

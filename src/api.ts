@@ -338,12 +338,19 @@ export class SpaceMoltAPI {
   private async ensureSession(): Promise<void> {
     if (this.session && !this.isSessionExpiring()) return;
 
-    log("system", this.session ? "Renewing session..." : "Creating new session...");
+    const isRenewal = !!this.session;
+    log("system", isRenewal ? "Renewing session..." : "Creating new session...");
+
+    // Build headers — include existing session ID for renewal
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.session) {
+      headers["X-Session-Id"] = this.session.id;
+    }
 
     // Single attempt - the reconnection queue handles retries with backoff
     const resp = await fetch(`${this.baseUrl}/session`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
     });
 
     if (!resp.ok) {
@@ -353,13 +360,14 @@ export class SpaceMoltAPI {
     const data = (await resp.json()) as ApiResponse;
     if (data.session) {
       this.session = data.session;
-      log("system", `Session created: ${this.session.id.slice(0, 8)}...`);
+      log("system", isRenewal ? `Session renewed: ${this.session.id.slice(0, 8)}...` : `Session created: ${this.session.id.slice(0, 8)}...`);
     } else {
       throw new Error("No session in response");
     }
 
-    // Re-authenticate if we have credentials
-    if (this.credentials) {
+    // Only do full login if this is a fresh session (not a renewal)
+    // Renewal should preserve authentication state without re-sending credentials
+    if (!isRenewal && this.credentials) {
       log("system", `Logging in as ${this.credentials.username}...`);
       const loginResp = await this.doRequest("login", {
         username: this.credentials.username,
@@ -393,13 +401,20 @@ export class SpaceMoltAPI {
   private async ensureV2Session(): Promise<void> {
     if (this.v2Session && !this.isV2SessionExpiring()) return;
 
+    const isRenewal = !!this.v2Session;
     const v2Base = this.baseUrl.replace("/api/v1", "/api/v2");
-    log("system", this.v2Session ? "Renewing v2 session..." : "Creating v2 session...");
+    log("system", isRenewal ? "Renewing v2 session..." : "Creating v2 session...");
+
+    // Build headers — include existing session ID for renewal
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (this.v2Session) {
+      headers["X-Session-Id"] = this.v2Session.id;
+    }
 
     // Single attempt - the reconnection queue handles retries with backoff
     const resp = await fetch(`${v2Base}/session`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
     });
 
     if (!resp.ok) {
@@ -416,13 +431,14 @@ export class SpaceMoltAPI {
         s.playerId = s.player_id;
       }
       this.v2Session = data.session;
-      log("system", `v2 session created: ${this.v2Session.id.slice(0, 8)}...`);
+      log("system", isRenewal ? `v2 session renewed: ${this.v2Session.id.slice(0, 8)}...` : `v2 session created: ${this.v2Session.id.slice(0, 8)}...`);
     } else {
       throw new Error("No session in v2 response");
     }
 
-    // Authenticate on v2
-    if (this.credentials) {
+    // Only do full login if this is a fresh session (not a renewal)
+    // Renewal should preserve authentication state without re-sending credentials
+    if (!isRenewal && this.credentials) {
       const loginResp = await fetch(`${v2Base}/spacemolt_auth/login`, {
         method: "POST",
         headers: {

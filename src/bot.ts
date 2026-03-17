@@ -411,14 +411,20 @@ export class Bot {
     this._error = null;
     this._abortController = new AbortController();
 
-    // Only login if we don't already have an active session
-    if (!this.api.getSession()) {
+    // Always login if we have credentials — ensures fresh authenticated session
+    // even if a stale session object exists in memory
+    const creds = this.session.loadCredentials();
+    if (creds) {
       const loggedIn = await this.login();
       if (!loggedIn) {
         // login() already set _state = "error" and _error; throw so the caller's
         // .catch() handler fires instead of .then() (which would log "routine finished").
         throw new Error(this._error || "Login failed");
       }
+    } else {
+      this._error = "No credentials found";
+      this._state = "error";
+      throw new Error(this._error);
     }
 
     this.log("system", `Starting routine: ${routineName}`);
@@ -565,6 +571,8 @@ export class Bot {
               content,
               timestamp: Date.now(),
               botUsername: this.username,
+              botSystem: this.system,
+              botPoi: this.poi,
             });
             this.log("ai_chat", `Forwarded to AI Chat service: ${sender}`);
           } else {

@@ -1853,9 +1853,9 @@
     <div class="chat-bar">
       <select id="chatBot"></select>
       <select id="chatChannel">
-        <option value="system">System</option>
-        <option value="local">Local</option>
         <option value="faction">Faction</option>
+        <option value="local">Local</option>
+        <option value="system">System</option>
       </select>
       <input type="text" id="chatInput" placeholder="Type a message..." onkeydown="if(event.key==='Enter')sendChat()">
       <button class="primary" onclick="sendChat()">Send</button>
@@ -1903,8 +1903,8 @@
           <select id="mapSecFilter" onchange="renderMap()">
             <option value="">All</option>
             <option value="high">High Security</option>
-            <option value="medium">Medium Security</option>
             <option value="low">Low Security</option>
+            <option value="medium">Medium Security</option>
             <option value="unknown">Unknown</option>
           </select>
           <label>Resources</label>
@@ -1913,8 +1913,8 @@
           </div>
           <label>Sort By</label>
           <select id="mapSortBy" onchange="renderMap()">
-            <option value="name">Name</option>
             <option value="updated">Last Updated</option>
+            <option value="name">Name</option>
             <option value="pois">Most POIs</option>
             <option value="security">Security Level</option>
           </select>
@@ -2099,11 +2099,11 @@
       <input type="text" id="regUsername" placeholder="New username">
       <label>Empire</label>
       <select id="regEmpire">
-        <option value="solarian">Solarian Empire (mining/trade)</option>
-        <option value="nebula">Nebula Collective (exploration)</option>
         <option value="crimson">Crimson Fleet (combat)</option>
-        <option value="voidborn">Voidborn (stealth/shields)</option>
+        <option value="nebula">Nebula Collective (exploration)</option>
         <option value="outerrim">Outer Rim (crafting/cargo)</option>
+        <option value="solarian">Solarian Empire (mining/trade)</option>
+        <option value="voidborn">Voidborn (stealth/shields)</option>
       </select>
     </div>
     <div class="modal-actions">
@@ -7088,11 +7088,11 @@ function renderFactionMissions(f, username) {
           <input type="number" id="faction-mission-reward" placeholder="Reward (credits)" min="0" style="width:140px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
           <select id="faction-mission-type" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
             <option value="">Type (optional)</option>
-            <option value="delivery">Delivery</option>
-            <option value="mining">Mining</option>
             <option value="combat">Combat</option>
-            <option value="exploration">Exploration</option>
             <option value="crafting">Crafting</option>
+            <option value="delivery">Delivery</option>
+            <option value="exploration">Exploration</option>
+            <option value="mining">Mining</option>
             <option value="other">Other</option>
           </select>
           <button class="primary sm" onclick="postFactionMission('${esc(username)}')">Post Mission</button>
@@ -7911,8 +7911,8 @@ function renderExplorerSettings(panel) {
         <div class="setting-hint">Thorough visits every POI; quick only scans from arrival.</div>
       </div>
       <select id="set-explorer-surveyMode">
-        <option value="thorough"${surveyMode === 'thorough' ? ' selected' : ''}>Thorough (visit all POIs)</option>
         <option value="quick"${surveyMode === 'quick' ? ' selected' : ''}>Quick (scan only)</option>
+        <option value="thorough"${surveyMode === 'thorough' ? ' selected' : ''}>Thorough (visit all POIs)</option>
       </select>
     </div>
 
@@ -7922,8 +7922,8 @@ function renderExplorerSettings(panel) {
         <div class="setting-hint">Scan at each POI for ships and objects.</div>
       </div>
       <select id="set-explorer-scanPois">
-        <option value="true"${scanPois ? ' selected' : ''}>Yes</option>
         <option value="false"${!scanPois ? ' selected' : ''}>No</option>
+        <option value="true"${scanPois ? ' selected' : ''}>Yes</option>
       </select>
     </div>
 
@@ -8367,8 +8367,8 @@ function renderSalvagerSettings(panel) {
         <div class="setting-hint">Where to send salvaged items when returning to station.</div>
       </div>
       <select id="set-salvager-depositPrimary">
-        <option value="sell"${depositMode === 'sell' ? ' selected' : ''}>Sell at market</option>
         <option value="faction"${depositMode === 'faction' ? ' selected' : ''}>Faction storage</option>
+        <option value="sell"${depositMode === 'sell' ? ' selected' : ''}>Sell at market</option>
         <option value="storage"${depositMode === 'storage' ? ' selected' : ''}>Station storage</option>
         ${bots.map(b => `<option value="bot:${esc(b.username)}"${'bot:' + b.username === depositMode ? ' selected' : ''}>${esc(b.username)}</option>`).join('')}
       </select>
@@ -8381,8 +8381,8 @@ function renderSalvagerSettings(panel) {
       </div>
       <select id="set-salvager-depositSecondary">
         <option value="faction"${depositFallback === 'faction' ? ' selected' : ''}>Faction storage</option>
-        <option value="storage"${depositFallback === 'storage' ? ' selected' : ''}>Station storage</option>
         <option value="sell"${depositFallback === 'sell' ? ' selected' : ''}>Sell at market</option>
+        <option value="storage"${depositFallback === 'storage' ? ' selected' : ''}>Station storage</option>
         ${bots.map(b => `<option value="bot:${esc(b.username)}"${'bot:' + b.username === depositFallback ? ' selected' : ''}>${esc(b.username)}</option>`).join('')}
       </select>
     </div>

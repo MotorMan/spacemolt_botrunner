@@ -1337,9 +1337,172 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     let totalSold = 0;
     let sellRevenue = 0;
 
+    // Check if we need to obtain a cargo manifest before selling
+    // Galactic Standard Alloy sold at Haven Grand Bazaar requires manifest from The Levy Customs Station
+    const GALACTIC_ALLOY = "galactic_standard_alloy";
+    const HAVEN_BAZAAR = "haven_grand_bazaar";
+    const LEVY_SYSTEM = "the_levy";
+
     // Attempt to sell at current destination
     await bot.refreshCargo();
     let remaining = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+
+    // Check if manifest is required before first sell attempt
+    if (remaining > 0 && route.itemId === GALACTIC_ALLOY && route.destPoi === HAVEN_BAZAAR) {
+      // Check if we're at The Levy Customs Station
+      const atLevy = bot.poi && bot.poi.toLowerCase().includes("levy");
+      
+      if (!atLevy) {
+        // Need to travel to The Levy Customs Station first
+        ctx.log("trade", `${GALACTIC_ALLOY} requires cargo manifest — traveling to ${LEVY_SYSTEM} system...`);
+        
+        // Travel to The Levy system
+        if (bot.system !== LEVY_SYSTEM) {
+          await ensureUndocked(ctx);
+          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+          if (!fueled) {
+            ctx.log("error", "Cannot refuel for manifest run — will retry next cycle");
+            await sleep(30000);
+            continue;
+          }
+          const arrived = await navigateToSystem(ctx, LEVY_SYSTEM, { ...safetyOpts, noJettison: true });
+          if (!arrived) {
+            ctx.log("error", "Failed to reach The Levy system — will retry next cycle");
+            await sleep(30000);
+            continue;
+          }
+        }
+
+        // Find and dock at The Levy Customs Station
+        const { pois } = await getSystemInfo(ctx);
+        const levyStation = pois.find(p => p.id.toLowerCase().includes("levy"));
+        if (!levyStation) {
+          ctx.log("error", "Could not find The Levy Customs Station — will retry next cycle");
+          await sleep(30000);
+          continue;
+        }
+
+        if (bot.poi !== levyStation.id) {
+          await ensureUndocked(ctx);
+          const tResp = await bot.exec("travel", { target_poi: levyStation.id });
+          if (tResp.error && !tResp.error.message.includes("already")) {
+            ctx.log("error", `Travel to Levy station failed: ${tResp.error.message}`);
+            await sleep(30000);
+            continue;
+          }
+          bot.poi = levyStation.id;
+        }
+
+        await ensureDocked(ctx);
+        ctx.log("trade", "Docked at The Levy Customs Station — obtaining cargo manifest...");
+
+        // Submit cargo for inspection to obtain manifest
+        const inspectResp = await bot.exec("inspect_cargo");
+        if (inspectResp.error) {
+          ctx.log("error", `inspect_cargo failed: ${inspectResp.error.message} — will retry next cycle`);
+          await sleep(30000);
+          continue;
+        }
+
+        ctx.log("trade", "Cargo manifest obtained — tariff paid, cleared to sell at Haven Grand Bazaar");
+
+        // Now travel to Haven Grand Bazaar to complete the sale
+        ctx.log("trade", "Proceeding to Haven Grand Bazaar to complete sale...");
+        const HAVEN_SYSTEM = "haven";
+        
+        if (bot.system !== HAVEN_SYSTEM) {
+          await ensureUndocked(ctx);
+          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+          if (!fueled) {
+            ctx.log("error", "Cannot refuel for final leg to Haven — will retry next cycle");
+            await sleep(30000);
+            continue;
+          }
+          const arrived = await navigateToSystem(ctx, HAVEN_SYSTEM, { ...safetyOpts, noJettison: true });
+          if (!arrived) {
+            ctx.log("error", "Failed to reach Haven system — will retry next cycle");
+            await sleep(30000);
+            continue;
+          }
+        }
+
+        // Find and dock at Haven Grand Bazaar
+        const { pois: havenPois } = await getSystemInfo(ctx);
+        const havenStation = havenPois.find(p => p.id === HAVEN_BAZAAR || p.id.toLowerCase().includes("haven") && p.id.toLowerCase().includes("bazaar"));
+        if (!havenStation) {
+          ctx.log("error", "Could not find Haven Grand Bazaar — will retry next cycle");
+          await sleep(30000);
+          continue;
+        }
+
+        if (bot.poi !== havenStation.id) {
+          await ensureUndocked(ctx);
+          const tResp = await bot.exec("travel", { target_poi: havenStation.id });
+          if (tResp.error && !tResp.error.message.includes("already")) {
+            ctx.log("error", `Travel to Haven Grand Bazaar failed: ${tResp.error.message}`);
+            await sleep(30000);
+            continue;
+          }
+          bot.poi = havenStation.id;
+        }
+
+        await ensureDocked(ctx);
+        ctx.log("trade", "Arrived at Haven Grand Bazaar — ready to sell Galactic Standard Alloy");
+      } else {
+        // Already at Levy station - just need to run inspect_cargo
+        ctx.log("trade", "At The Levy Customs Station — obtaining cargo manifest...");
+        const inspectResp = await bot.exec("inspect_cargo");
+        if (inspectResp.error) {
+          ctx.log("error", `inspect_cargo failed: ${inspectResp.error.message} — will retry next cycle`);
+          await sleep(30000);
+          continue;
+        }
+        ctx.log("trade", "Cargo manifest obtained — tariff paid, cleared to sell at Haven Grand Bazaar");
+        
+        // Now travel to Haven Grand Bazaar
+        ctx.log("trade", "Proceeding to Haven Grand Bazaar to complete sale...");
+        const HAVEN_SYSTEM = "haven";
+        
+        if (bot.system !== HAVEN_SYSTEM) {
+          await ensureUndocked(ctx);
+          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+          if (!fueled) {
+            ctx.log("error", "Cannot refuel for final leg to Haven — will retry next cycle");
+            await sleep(30000);
+            continue;
+          }
+          const arrived = await navigateToSystem(ctx, HAVEN_SYSTEM, { ...safetyOpts, noJettison: true });
+          if (!arrived) {
+            ctx.log("error", "Failed to reach Haven system — will retry next cycle");
+            await sleep(30000);
+            continue;
+          }
+        }
+
+        // Find and dock at Haven Grand Bazaar
+        const { pois: havenPois } = await getSystemInfo(ctx);
+        const havenStation = havenPois.find(p => p.id === HAVEN_BAZAAR || p.id.toLowerCase().includes("haven") && p.id.toLowerCase().includes("bazaar"));
+        if (!havenStation) {
+          ctx.log("error", "Could not find Haven Grand Bazaar — will retry next cycle");
+          await sleep(30000);
+          continue;
+        }
+
+        if (bot.poi !== havenStation.id) {
+          await ensureUndocked(ctx);
+          const tResp = await bot.exec("travel", { target_poi: havenStation.id });
+          if (tResp.error && !tResp.error.message.includes("already")) {
+            ctx.log("error", `Travel to Haven Grand Bazaar failed: ${tResp.error.message}`);
+            await sleep(30000);
+            continue;
+          }
+          bot.poi = havenStation.id;
+        }
+
+        await ensureDocked(ctx);
+        ctx.log("trade", "Arrived at Haven Grand Bazaar — ready to sell Galactic Standard Alloy");
+      }
+    }
 
     if (remaining <= 0) {
       ctx.log("error", `No ${route.itemName} left in cargo (bought ${buyQty}, all consumed during travel)`);
@@ -1365,6 +1528,62 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         // Refresh dest market cache with real post-sale data
         await recordMarketData(ctx);
       } else {
+        // Check if error is manifest_required for Galactic Standard Alloy at Haven Grand Bazaar
+        if (sellResp.error.code === "manifest_required" || sellResp.error.message.includes("manifest_required")) {
+          ctx.log("trade", "Sell requires cargo manifest — need to visit The Levy Customs Station");
+          // Set up for manifest procurement on next cycle by resetting remaining and letting the manifest logic handle it
+          // Re-run the manifest procurement flow
+          const HAVEN_SYSTEM = "haven";
+          const LEVY_SYSTEM = "the_levy";
+          
+          // Travel to Levy system
+          await ensureUndocked(ctx);
+          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+          if (fueled && bot.system !== LEVY_SYSTEM) {
+            const arrived = await navigateToSystem(ctx, LEVY_SYSTEM, { ...safetyOpts, noJettison: true });
+            if (arrived) {
+              // Find and dock at Levy station
+              const { pois } = await getSystemInfo(ctx);
+              const levyStation = pois.find(p => p.id.toLowerCase().includes("levy"));
+              if (levyStation) {
+                if (bot.poi !== levyStation.id) {
+                  await bot.exec("travel", { target_poi: levyStation.id });
+                  bot.poi = levyStation.id;
+                }
+                await ensureDocked(ctx);
+                
+                // Run inspect_cargo
+                const inspectResp = await bot.exec("inspect_cargo");
+                if (!inspectResp.error) {
+                  ctx.log("trade", "Cargo manifest obtained — proceeding to Haven Grand Bazaar");
+                  
+                  // Travel to Haven
+                  if (bot.system !== HAVEN_SYSTEM) {
+                    await ensureUndocked(ctx);
+                    const havenFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+                    if (havenFueled) {
+                      const havenArrived = await navigateToSystem(ctx, HAVEN_SYSTEM, { ...safetyOpts, noJettison: true });
+                      if (havenArrived) {
+                        const { pois: havenPois } = await getSystemInfo(ctx);
+                        const havenStation = havenPois.find(p => p.id === HAVEN_BAZAAR || p.id.toLowerCase().includes("haven") && p.id.toLowerCase().includes("bazaar"));
+                        if (havenStation) {
+                          if (bot.poi !== havenStation.id) {
+                            await bot.exec("travel", { target_poi: havenStation.id });
+                            bot.poi = havenStation.id;
+                          }
+                          await ensureDocked(ctx);
+                          ctx.log("trade", "Back at Haven Grand Bazaar — ready to retry sale");
+                        }
+                      }
+                    }
+                  }
+                } else {
+                  ctx.log("error", `inspect_cargo failed: ${inspectResp.error.message}`);
+                }
+              }
+            }
+          }
+        }
         ctx.log("error", `Sell failed: ${sellResp.error.message}`);
       }
     }
@@ -1418,6 +1637,83 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           remaining = afterSell;
           ctx.log("trade", `Sold ${sold}x ${route.itemName} at ${buyer.poiName} (${buyer.price}cr/ea)${remaining > 0 ? ` — ${remaining}x still unsold` : ""}`);
           await recordMarketData(ctx);
+        } else {
+          // Check if error is manifest_required for Galactic Standard Alloy at Haven Grand Bazaar
+          if ((sResp.error.code === "manifest_required" || sResp.error.message.includes("manifest_required")) &&
+              route.itemId === GALACTIC_ALLOY && buyer.poiId === HAVEN_BAZAAR) {
+            ctx.log("trade", "Sell requires cargo manifest — need to visit The Levy Customs Station");
+            const LEVY_SYSTEM = "the_levy";
+            const HAVEN_SYSTEM = "haven";
+            
+            // Travel to Levy system
+            await ensureUndocked(ctx);
+            const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+            if (fueled && bot.system !== LEVY_SYSTEM) {
+              const arrived = await navigateToSystem(ctx, LEVY_SYSTEM, { ...safetyOpts, noJettison: true });
+              if (arrived) {
+                // Find and dock at Levy station
+                const { pois } = await getSystemInfo(ctx);
+                const levyStation = pois.find(p => p.id.toLowerCase().includes("levy"));
+                if (levyStation) {
+                  if (bot.poi !== levyStation.id) {
+                    await bot.exec("travel", { target_poi: levyStation.id });
+                    bot.poi = levyStation.id;
+                  }
+                  await ensureDocked(ctx);
+                  
+                  // Run inspect_cargo
+                  const inspectResp = await bot.exec("inspect_cargo");
+                  if (!inspectResp.error) {
+                    ctx.log("trade", "Cargo manifest obtained — proceeding to Haven Grand Bazaar");
+                    
+                    // Travel to Haven
+                    if (bot.system !== HAVEN_SYSTEM) {
+                      await ensureUndocked(ctx);
+                      const havenFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
+                      if (havenFueled) {
+                        const havenArrived = await navigateToSystem(ctx, HAVEN_SYSTEM, { ...safetyOpts, noJettison: true });
+                        if (havenArrived) {
+                          const { pois: havenPois } = await getSystemInfo(ctx);
+                          const havenStation = havenPois.find(p => p.id === HAVEN_BAZAAR || p.id.toLowerCase().includes("haven") && p.id.toLowerCase().includes("bazaar"));
+                          if (havenStation) {
+                            if (bot.poi !== havenStation.id) {
+                              await bot.exec("travel", { target_poi: havenStation.id });
+                              bot.poi = havenStation.id;
+                            }
+                            await ensureDocked(ctx);
+                            ctx.log("trade", "Back at Haven Grand Bazaar — ready to retry sale");
+                            
+                            // Retry the sell
+                            await bot.refreshCargo();
+                            remaining = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+                            if (remaining > 0) {
+                              const retryResp = await bot.exec("sell", { item_id: route.itemId, quantity: remaining });
+                              if (!retryResp.error) {
+                                const sr2 = retryResp.result as Record<string, unknown> | undefined;
+                                const earned2 = (sr2?.credits_earned as number) ?? (sr2?.total as number) ?? 0;
+                                await bot.refreshCargo();
+                                const afterSell2 = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+                                const sold2 = remaining - afterSell2;
+                                totalSold += sold2;
+                                sellRevenue += earned2 > 0 ? earned2 : sold2 * buyer.price;
+                                remaining = afterSell2;
+                                ctx.log("trade", `Sold ${sold2}x ${route.itemName} at ${buyer.poiName} (${buyer.price}cr/ea)`);
+                                await recordMarketData(ctx);
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  } else {
+                    ctx.log("error", `inspect_cargo failed: ${inspectResp.error.message}`);
+                  }
+                }
+              }
+            }
+          } else {
+            ctx.log("error", `Sell failed: ${sResp.error.message}`);
+          }
         }
         break; // only try one alternative buyer, then fall back to storage
       }

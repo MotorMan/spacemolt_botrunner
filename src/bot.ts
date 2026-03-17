@@ -534,6 +534,9 @@ export class Bot {
    * Uses this.api.execute() directly (not this.exec()) to avoid recursion.
    */
   private async handleNotifications(notifications: unknown[]): Promise<void> {
+    // Get AI Chat service from global scope (initialized by botmanager)
+    const aiChatService = (globalThis as any).aiChatService;
+
     for (const n of notifications) {
       if (typeof n !== "object" || !n) {
         if (typeof n === "string") this.log("info", `[NOTIFY] ${n}`);
@@ -544,8 +547,34 @@ export class Bot {
       const type = notif.type as string | undefined;
       const msgType = notif.msg_type as string | undefined;
 
-      // Chat messages are already displayed by logNotifications — skip
-      if (msgType === "chat_message") continue;
+      // Chat messages - route to AI chat handler and display
+      if (msgType === "chat_message") {
+        const data = notif.data as Record<string, unknown> | undefined;
+        if (data && typeof data === "object") {
+          const channel = (data.channel as string) || "local";
+          const sender = (data.sender as string) || "Unknown";
+          const content = (data.content as string) || "";
+
+          this.log("chat", `Received [${channel}] ${sender}: ${content}`);
+
+          // Route to AI chat handler if available
+          if (aiChatService && typeof aiChatService.addChatMessage === "function") {
+            aiChatService.addChatMessage({
+              sender,
+              channel: channel as "local" | "faction" | "system" | "private",
+              content,
+              timestamp: Date.now(),
+              botUsername: this.username,
+            });
+            this.log("ai_chat", `Forwarded to AI Chat service: ${sender}`);
+          } else {
+            this.log("debug", `AI Chat service not available (service=${!!aiChatService}, addChatMessage=${typeof aiChatService?.addChatMessage === "function"})`);
+          }
+        } else {
+          this.log("debug", `Chat message received but data is not object: ${typeof data}`);
+        }
+        continue;
+      }
 
       let data = notif.data as Record<string, unknown> | string | undefined;
       if (typeof data === "string") {

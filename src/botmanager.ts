@@ -23,12 +23,14 @@ import { WebServer, type WebAction, type WebActionResult } from "./web/server.js
 import { setLogSink } from "./ui.js";
 import { debugLog } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
+import { AiChatService } from "./aichat_service.js";
 
 const BASE_DIR = process.cwd();
 const SESSIONS_DIR = join(BASE_DIR, "sessions");
 
 const bots: Map<string, Bot> = new Map();
 let server: WebServer;
+let aiChatService: AiChatService | null = null;
 
 const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   miner: { name: "Miner", fn: minerRoutine },
@@ -507,6 +509,18 @@ async function main(): Promise<void> {
     server.logActivity(line);
   });
 
+  // Initialize and start AI Chat service
+  aiChatService = new AiChatService((category, message) => {
+    const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+    const line = `${timestamp} [AI_CHAT] [${category}] ${message}`;
+    server.logSystem(line);
+  });
+  AiChatService.setGetBotsFn(() => [...bots.values()]);
+  aiChatService.start();
+  // Expose on globalThis for bot.ts to access
+  (globalThis as any).aiChatService = aiChatService;
+  server.logSystem("AI Chat service initialized");
+
   server.logSystem("SpaceMolt Bot Manager v0.2");
   server.logSystem("Loading saved sessions...");
 
@@ -628,6 +642,11 @@ async function main(): Promise<void> {
     // Stop all running bots
     for (const [, bot] of bots) {
       if (bot.state === "running") bot.stop();
+    }
+    // Stop AI Chat service
+    if (aiChatService) {
+      aiChatService.stop();
+      aiChatService = null;
     }
     // Clear reconnection queue to release any pending reconnection attempts
     reconnectQueue.clear();

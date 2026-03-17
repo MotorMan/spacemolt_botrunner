@@ -1808,7 +1808,10 @@
     <div class="bot-table-wrap">
       <div class="bot-table-header">
         <span>Bots</span>
-        <div style="display:flex;gap:8px">
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button class="sm" id="aiChatToggleBtn" onclick="toggleAiChat()" title="Enable/Disable AI Chat">
+            <span id="aiChatToggleIcon">🔌</span> <span id="aiChatToggleText">AI Chat: Off</span>
+          </button>
           <button class="sm danger" onclick="emergencyReturnHome()">⚠ Emergency Return Home</button>
           <button class="sm" onclick="showAddModal()">+ Add Bot</button>
         </div>
@@ -1881,6 +1884,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('cleanup')">Cleanup</div>
         <div class="sidebar-item" onclick="switchSettingsTab('return_home')">Return Home</div>
         <div class="sidebar-item" onclick="switchSettingsTab('ai')">AI</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('ai_chat')">AI Chat Service</div>
         <div class="sidebar-item" onclick="switchSettingsTab('hunter')">Hunter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cargo_mover')">CargoMover</div>
       </div>
@@ -2246,6 +2250,7 @@ function connect() {
         setTimeout(refreshFactionFunds, 2000);
         updateChatBotSelect();
         renderSettingsPanel();
+        updateAiChatToggleButton();
         if (msg.logs) {
           appendLines(activityEl, 'activity', msg.logs.activity || []);
           appendLines(broadcastEl, 'broadcast', msg.logs.broadcast || []);
@@ -2284,6 +2289,7 @@ function connect() {
         }
         if (msg.settings) {
           settings = msg.settings;
+          updateAiChatToggleButton();
         }
         break;
       case 'botLog':
@@ -4903,6 +4909,8 @@ function renderSettingsPanel() {
     renderReturnHomeSettings(panel);
   } else if (activeSettingsTab === 'ai') {
     renderAiSettings(panel);
+  } else if (activeSettingsTab === 'ai_chat') {
+    renderAiChatSettings(panel);
   } else if (activeSettingsTab === 'hunter') {
     renderHunterSettings(panel);
   } else if (activeSettingsTab === 'cargo_mover') {
@@ -6030,6 +6038,179 @@ function saveAiSettings() {
   };
   send({ type: 'saveSettings', routine: 'ai', settings: s });
   settings.ai = s;
+}
+
+// ── AI Chat Settings ────────────────────────────────────────────
+
+function renderAiChatSettings(panel) {
+  const ac = settings.ai_chat || {};
+  const enabled = ac.enabled ?? false;
+  const baseUrl = ac.baseUrl || '';
+  const apiKey = ac.apiKey || '';
+  const model = ac.model || '';
+  const cycleIntervalSec = ac.cycleIntervalSec ?? 5;
+  const respondToMentions = ac.respondToMentions ?? true;
+  const respondToQuestions = ac.respondToQuestions ?? false;
+  const respondToAll = ac.respondToAll ?? false;
+  const personality = ac.personality || '';
+  const lockDurationSec = ac.lockDurationSec ?? 60;
+
+  const inputStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box"`;
+  const textareaStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box;min-height:150px;font-family:monospace;font-size:12px;white-space:pre-wrap"`;
+
+  panel.innerHTML = `
+    <h3>AI Chat Settings</h3>
+    <div class="settings-desc">Configure the AI chat bot that responds to players in local and faction chat. Values here override environment variables.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Enable AI Chat</div>
+        <div class="setting-hint">Toggle AI chat responses on/off globally. Can also be toggled from the dashboard button.</div>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+        <input type="checkbox" id="set-aichat-enabled" ${enabled ? 'checked' : ''} onchange="saveAiChatSettings()">
+        <span style="font-size:12px;color:var(--text)">${enabled ? 'Enabled' : 'Disabled'}</span>
+      </label>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Base URL</div>
+        <div class="setting-hint">OpenAI-compatible endpoint base URL, e.g. http://localhost:11434/v1</div>
+      </div>
+      <input type="text" id="set-aichat-baseUrl" value="${esc(baseUrl)}" placeholder="http://localhost:11434/v1" ${inputStyle}>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">API Key</div>
+        <div class="setting-hint">Bearer token for the LLM endpoint. Use "ollama" for local Ollama.</div>
+      </div>
+      <input type="password" id="set-aichat-apiKey" value="${esc(apiKey)}" placeholder="ollama" ${inputStyle}>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Model</div>
+        <div class="setting-hint">Model name to use, e.g. llama3.2, mistral, gpt-4o-mini</div>
+      </div>
+      <input type="text" id="set-aichat-model" value="${esc(model)}" placeholder="llama3.2" ${inputStyle}>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Response Cycle Interval (seconds)</div>
+        <div class="setting-hint">How often to check for new chat messages.</div>
+      </div>
+      <input type="number" id="set-aichat-cycleIntervalSec" min="2" max="60" value="${cycleIntervalSec}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Conversation Lock Duration (seconds)</div>
+        <div class="setting-hint">How long to lock a conversation to one bot for continuity.</div>
+      </div>
+      <input type="number" id="set-aichat-lockDurationSec" min="10" max="300" value="${lockDurationSec}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Response Modes</div>
+        <div class="setting-hint">When should the AI respond to messages?</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" id="set-aichat-respondToMentions" ${respondToMentions ? 'checked' : ''}>
+          <span style="font-size:12px;color:var(--text)">Respond to bot name mentions</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" id="set-aichat-respondToQuestions" ${respondToQuestions ? 'checked' : ''}>
+          <span style="font-size:12px;color:var(--text)">Respond to general questions</span>
+        </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" id="set-aichat-respondToAll" ${respondToAll ? 'checked' : ''}>
+          <span style="font-size:12px;color:var(--text)">Respond to ALL messages (spammy!)</span>
+        </label>
+      </div>
+    </div>
+
+    <div class="setting-row">
+      <div style="width:100%;">
+        <div class="setting-label">Bot Personality</div>
+        <div class="setting-hint">Instructions for the AI's personality and behavior. Leave blank for default friendly helper.</div>
+        <textarea id="set-aichat-personality" ${textareaStyle}>${esc(personality || DEFAULT_AI_CHAT_PERSONALITY)}</textarea>
+      </div>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveAiChatSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function saveAiChatSettings() {
+  const s = {
+    enabled: document.getElementById('set-aichat-enabled').checked,
+    baseUrl: document.getElementById('set-aichat-baseUrl').value.trim(),
+    apiKey: document.getElementById('set-aichat-apiKey').value.trim(),
+    model: document.getElementById('set-aichat-model').value.trim(),
+    cycleIntervalSec: parseInt(document.getElementById('set-aichat-cycleIntervalSec').value) || 5,
+    respondToMentions: document.getElementById('set-aichat-respondToMentions').checked,
+    respondToQuestions: document.getElementById('set-aichat-respondToQuestions').checked,
+    respondToAll: document.getElementById('set-aichat-respondToAll').checked,
+    personality: document.getElementById('set-aichat-personality').value.trim(),
+    lockDurationSec: parseInt(document.getElementById('set-aichat-lockDurationSec').value) || 60,
+  };
+  send({ type: 'saveSettings', routine: 'ai_chat', settings: s });
+  settings.ai_chat = s;
+  // Update toggle button state
+  updateAiChatToggleButton();
+}
+
+const DEFAULT_AI_CHAT_PERSONALITY = `You are a friendly and helpful AI assistant playing SpaceMolt.
+Your personality traits:
+- Friendly and welcoming to all players
+- Knowledgeable about the game but humble
+- Concise in responses (1-3 sentences max)
+- Uses casual gaming chat language
+- Helpful with tips when asked
+- Never rude or dismissive
+
+When responding:
+- Keep it brief and natural for chat
+- Don't reveal you're an AI unless directly asked
+- If you don't know something, admit it honestly
+- Use emojis sparingly if at all`;
+
+// ── AI Chat Toggle Button ────────────────────────────────────────
+
+function updateAiChatToggleButton() {
+  const btn = document.getElementById('aiChatToggleBtn');
+  const icon = document.getElementById('aiChatToggleIcon');
+  const text = document.getElementById('aiChatToggleText');
+  const enabled = settings.ai_chat?.enabled ?? false;
+  
+  if (enabled) {
+    btn.style.background = '#238636';
+    btn.style.borderColor = '#2ea043';
+    icon.textContent = '🔌';
+    text.textContent = 'AI Chat: On';
+  } else {
+    btn.style.background = 'var(--bg-input)';
+    btn.style.borderColor = 'var(--border)';
+    icon.textContent = '🔌';
+    text.textContent = 'AI Chat: Off';
+  }
+}
+
+function toggleAiChat() {
+  const current = settings.ai_chat?.enabled ?? false;
+  const s = settings.ai_chat || {};
+  s.enabled = !current;
+  settings.ai_chat = s;
+  send({ type: 'saveSettings', routine: 'ai_chat', settings: s });
+  updateAiChatToggleButton();
+  appendLine('system', `AI Chat ${!current ? 'enabled' : 'disabled'}`);
 }
 
 // ── Chat bot select ────────────────────────────────────────

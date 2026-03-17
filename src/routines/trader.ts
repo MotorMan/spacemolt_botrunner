@@ -1403,8 +1403,14 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           await sleep(30000);
           continue;
         }
-
-        ctx.log("trade", "Cargo manifest obtained — tariff paid, cleared to sell at Haven Grand Bazaar");
+        
+        // Parse manifest response
+        const manifestData = inspectResp.result as Record<string, unknown> | undefined;
+        const manifestId = manifestData?.manifest_id as string || "unknown";
+        const manifestFee = manifestData?.fee_paid as number || 0;
+        const manifestExpires = manifestData?.manifest_expires as string || "unknown";
+        
+        ctx.log("trade", `Cargo manifest obtained: ${manifestId} (fee: ${manifestFee}cr, expires: ${manifestExpires})`);
 
         // Now travel to Haven Grand Bazaar to complete the sale
         ctx.log("trade", "Proceeding to Haven Grand Bazaar to complete sale...");
@@ -1457,7 +1463,14 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           await sleep(30000);
           continue;
         }
-        ctx.log("trade", "Cargo manifest obtained — tariff paid, cleared to sell at Haven Grand Bazaar");
+        
+        // Parse manifest response
+        const manifestData = inspectResp.result as Record<string, unknown> | undefined;
+        const manifestId = manifestData?.manifest_id as string || "unknown";
+        const manifestFee = manifestData?.fee_paid as number || 0;
+        const manifestExpires = manifestData?.manifest_expires as string || "unknown";
+        
+        ctx.log("trade", `Cargo manifest obtained: ${manifestId} (fee: ${manifestFee}cr, expires: ${manifestExpires})`);
         
         // Now travel to Haven Grand Bazaar
         ctx.log("trade", "Proceeding to Haven Grand Bazaar to complete sale...");
@@ -1551,11 +1564,17 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   bot.poi = levyStation.id;
                 }
                 await ensureDocked(ctx);
-                
+
                 // Run inspect_cargo
                 const inspectResp = await bot.exec("inspect_cargo");
                 if (!inspectResp.error) {
-                  ctx.log("trade", "Cargo manifest obtained — proceeding to Haven Grand Bazaar");
+                  // Parse manifest response
+                  const manifestData = inspectResp.result as Record<string, unknown> | undefined;
+                  const manifestId = manifestData?.manifest_id as string || "unknown";
+                  const manifestFee = manifestData?.fee_paid as number || 0;
+                  const manifestExpires = manifestData?.manifest_expires as string || "unknown";
+                  
+                  ctx.log("trade", `Cargo manifest obtained: ${manifestId} (fee: ${manifestFee}cr, expires: ${manifestExpires}) — proceeding to Haven Grand Bazaar`);
                   
                   // Travel to Haven
                   if (bot.system !== HAVEN_SYSTEM) {
@@ -1660,11 +1679,17 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                     bot.poi = levyStation.id;
                   }
                   await ensureDocked(ctx);
-                  
+
                   // Run inspect_cargo
                   const inspectResp = await bot.exec("inspect_cargo");
                   if (!inspectResp.error) {
-                    ctx.log("trade", "Cargo manifest obtained — proceeding to Haven Grand Bazaar");
+                    // Parse manifest response
+                    const manifestData = inspectResp.result as Record<string, unknown> | undefined;
+                    const manifestId = manifestData?.manifest_id as string || "unknown";
+                    const manifestFee = manifestData?.fee_paid as number || 0;
+                    const manifestExpires = manifestData?.manifest_expires as string || "unknown";
+                    
+                    ctx.log("trade", `Cargo manifest obtained: ${manifestId} (fee: ${manifestFee}cr, expires: ${manifestExpires}) — proceeding to Haven Grand Bazaar`);
                     
                     // Travel to Haven
                     if (bot.system !== HAVEN_SYSTEM) {

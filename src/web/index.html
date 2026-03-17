@@ -699,15 +699,16 @@
   .log-entry { padding: 1px 0; }
   .log-entry .log-time { color: var(--text-dim); }
   .log-entry .log-cat { font-weight: 600; }
-  .log-entry .log-cat-system { color: #58a6ff; }
-  .log-entry .log-cat-error { color: #f85149; }
-  .log-entry .log-cat-travel { color: #d2a8ff; }
-  .log-entry .log-cat-mining { color: #f0883e; }
-  .log-entry .log-cat-trade { color: #3fb950; }
-  .log-entry .log-cat-rescue { color: #f778ba; }
-  .log-entry .log-cat-combat { color: #f85149; }
-  .log-entry .log-cat-info { color: #8b949e; }
   .log-entry .log-msg { color: var(--text); }
+  /* Category-based line colors for bot activity log */
+  .log-entry.log-cat-system, .log-entry.log-cat-system .log-msg { color: #58a6ff; }
+  .log-entry.log-cat-error, .log-entry.log-cat-error .log-msg { color: #f85149; }
+  .log-entry.log-cat-travel, .log-entry.log-cat-travel .log-msg { color: #39d2c0; }
+  .log-entry.log-cat-mining, .log-entry.log-cat-mining .log-msg { color: #3fb950; }
+  .log-entry.log-cat-trade, .log-entry.log-cat-trade .log-msg { color: #d29922; }
+  .log-entry.log-cat-rescue, .log-entry.log-cat-rescue .log-msg { color: #bc8cff; }
+  .log-entry.log-cat-combat, .log-entry.log-cat-combat .log-msg { color: #f85149; }
+  .log-entry.log-cat-info, .log-entry.log-cat-info .log-msg { color: #8b949e; }
   .exec-cooldown { opacity: 0.5; pointer-events: none; }
 
   /* ── Settings page ──────────────────────────────── */
@@ -3901,20 +3902,22 @@ const LOG_CAT_CLASSES = {
 };
 
 function formatBotLogLine(line) {
-  // Format: "HH:MM:SS [bot_name] [category] message"
-  const m = line.match(/^(\d{2}:\d{2}:\d{2})\s+\[([^\]]+)\]\s+\[([^\]]+)\]\s+([\s\S]*)$/);
-  if (!m) return `<span class="log-msg">${esc(line)}</span>`;
-  const [, time, bot, cat, msg] = m;
+  // Format: "HH:MM:SS [category] message"
+  const m = line.match(/^(\d{2}:\d{2}:\d{2})\s+\[([^\]]+)\]\s+([\s\S]*)$/);
+  if (!m) return { html: `<span class="log-msg">${esc(line)}</span>`, catClass: '' };
+  const [, time, cat, msg] = m;
   const catClass = LOG_CAT_CLASSES[cat] || '';
-  return `<span class="log-time">${esc(time)}</span> <span class="log-cat ${catClass}">[${esc(cat)}]</span> <span class="log-msg">${esc(msg)}</span>`;
+  const html = `<span class="log-time">${esc(time)}</span> <span class="log-cat ${catClass}">[${esc(cat)}]</span> <span class="log-msg">${esc(msg)}</span>`;
+  return { html, catClass };
 }
 
 function appendBotLogLine(line) {
   const log = document.getElementById('botActivityLog');
   if (!log) return;
+  const result = formatBotLogLine(line);
   const div = document.createElement('div');
-  div.className = 'log-entry';
-  div.innerHTML = formatBotLogLine(line);
+  div.className = `log-entry ${result.catClass}`.trim();
+  div.innerHTML = result.html;
   log.prepend(div);
   while (log.children.length > 300) log.removeChild(log.lastChild);
   log.scrollTop = 0;
@@ -3926,9 +3929,10 @@ function renderBotActivityLog() {
   log.innerHTML = '';
   const lines = botLogBuffers[profileBot] || [];
   for (const line of lines) {
+    const result = formatBotLogLine(line);
     const div = document.createElement('div');
-    div.className = 'log-entry';
-    div.innerHTML = formatBotLogLine(line);
+    div.className = `log-entry ${result.catClass}`.trim();
+    div.innerHTML = result.html;
     log.prepend(div);
   }
   log.scrollTop = 0;
@@ -3948,11 +3952,12 @@ async function loadFullBotLog() {
     }
     log.innerHTML = '';
     for (const line of data.lines) {
-      const div = document.createElement('div');
-      div.className = 'log-entry';
       // Persistent log format: "YYYY-MM-DD HH:MM:SS [cat] msg" — strip date prefix for display
       const stripped = line.replace(/^\d{4}-\d{2}-\d{2}\s+/, '');
-      div.innerHTML = formatBotLogLine(stripped);
+      const result = formatBotLogLine(stripped);
+      const div = document.createElement('div');
+      div.className = `log-entry ${result.catClass}`.trim();
+      div.innerHTML = result.html;
       log.prepend(div);
     }
     log.scrollTop = 0;

@@ -2633,7 +2633,7 @@ function renderProfileTopbar() {
     const botOre = botSettings.targetOre || '';
     const effectiveOre = botOre || globalOre;
     const oreOpts = [`<option value=""${!botOre ? ' selected' : ''}>(global: ${globalOre ? esc(getOreName(globalOre)) : 'any'})</option>`];
-    for (const ore of knownOres) {
+    for (const ore of [...knownOres].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
       const sel = ore.item_id === botOre ? ' selected' : '';
       oreOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
     }
@@ -2643,7 +2643,7 @@ function renderProfileTopbar() {
     const globalHome = (settings.miner || {}).homeSystem || '';
     const botHome = botSettings.homeSystem || '';
     const sysOpts = [`<option value=""${!botHome ? ' selected' : ''}>(global: ${globalHome ? esc(globalHome) : 'start system'})</option>`];
-    for (const sys of knownSystems) {
+    for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
       const sel = sys.id === botHome ? ' selected' : '';
       sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
     }
@@ -2675,7 +2675,7 @@ function renderProfileTopbar() {
       const focusAreaSystem = botSettings.focusAreaSystem || '';
       const maxJumps = botSettings.maxJumps || 5;
       const sysOpts = [`<option value=""${!focusAreaSystem ? ' selected' : ''}>(none - all systems)</option>`];
-      for (const sys of knownSystems) {
+      for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
         const sel = sys.id === focusAreaSystem ? ' selected' : '';
         sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
       }
@@ -2713,7 +2713,7 @@ function renderProfileTopbar() {
       : ((settings.trader || {}).homeSystem || '');
     const botHome = botSettings.homeSystem || '';
     const sysOpts = [`<option value=""${!botHome ? ' selected' : ''}>(global: ${globalHome ? esc(globalHome) : 'none'})</option>`];
-    for (const sys of knownSystems) {
+    for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
       const sel = sys.id === botHome ? ' selected' : '';
       sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
     }
@@ -2739,10 +2739,10 @@ function renderProfileTopbar() {
     
     // Build station options (use base_id for matching)
     const focusOpts = [`<option value=""${!botFocus ? ' selected' : ''}>(global: ${globalFocus ? 'focused' : 'all stations'})</option>`];
-    for (const sys of knownSystems) {
+    for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
       const sysData = mapData[sys.id];
       if (!sysData) continue;
-      for (const poi of (sysData.pois || [])) {
+      for (const poi of (sysData.pois || []).sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
         if (!poi.has_base) continue;
         const focusVal = poi.base_id || poi.id;
         const sel = focusVal === botFocus ? ' selected' : '';
@@ -2766,7 +2766,7 @@ function renderProfileTopbar() {
     const globalHome = (settings[currentRoutine] || {}).homeSystem || '';
     const botHome = botSettings.homeSystem || '';
     const sysOpts = [`<option value=""${!botHome ? ' selected' : ''}>(global: ${globalHome ? esc(globalHome) : 'start system'})</option>`];
-    for (const sys of knownSystems) {
+    for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
       const sel = sys.id === botHome ? ' selected' : '';
       sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
     }
@@ -3069,7 +3069,7 @@ function renderManualControls() {
   if (!bot) return;
 
   const poiOpts = profileSystemData && profileSystemData.pois
-    ? profileSystemData.pois.map(p => `<option value="${esc(p.id)}">${esc(p.name || p.id)} (${esc(p.type || '')})</option>`).join('')
+    ? [...profileSystemData.pois].sort((a, b) => ((a.name || a.id) || '').localeCompare((b.name || b.id) || '')).map(p => `<option value="${esc(p.id)}">${esc(p.name || p.id)} (${esc(p.type || '')})</option>`).join('')
     : '<option value="">Loading...</option>';
 
   // All known systems for auto-route jump
@@ -4920,7 +4920,7 @@ function renderGeneralSettings(panel) {
   let stationOpts = '<option value="">(not set)</option>';
   for (const [sysId, sys] of Object.entries(mapData)) {
     const sysName = sys.name || sysId;
-    for (const poi of (sys.pois || [])) {
+    for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
       if (!poi.has_base) continue;
       const val = sysId + '|' + poi.id;
       const sel = (sysId === factionStorageSystem && poi.id === factionStorageStation) ? ' selected' : '';
@@ -4991,7 +4991,7 @@ function renderCleanupSettings(panel) {
   let focusOpts = `<option value="">(clean all stations)</option>`;
   for (const [sysId, sys] of Object.entries(mapData)) {
     const sysName = sys.name || sysId;
-    for (const poi of (sys.pois || [])) {
+    for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
       if (!poi.has_base) continue;
       const val = sysId + '|' + poi.id;
       // For deposit station
@@ -5049,7 +5049,7 @@ function renderReturnHomeSettings(panel) {
   let stationOpts = '<option value="">(not set)</option>';
   for (const [sysId, sys] of Object.entries(mapData)) {
     const sysName = sys.name || sysId;
-    for (const poi of (sys.pois || [])) {
+    for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
       if (!poi.has_base) continue;
       const val = sysId + '|' + poi.id;
       const sel = (sysId === homeSystem && poi.id === homeStation) ? ' selected' : '';
@@ -5108,7 +5108,7 @@ function renderReturnHomeSettings(panel) {
       <div style="display:flex;gap:8px;align-items:center;margin-top:8px">
         <select id="set-returnhome-bot" style="flex:1">
           <option value="">(select bot)</option>
-          ${bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join('')}
+          ${[...bots].sort((a, b) => (a.username || '').localeCompare(b.username || '')).map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join('')}
         </select>
         <select id="set-returnhome-bot-station" style="flex:1">
           ${stationOpts}
@@ -5170,7 +5170,7 @@ function renderMinerSettings(panel) {
   const oreQuotas = miner.oreQuotas || {};
 
   const systemOpts = ['<option value="">(current system)</option>'];
-  for (const sys of knownSystems) {
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
     const sel = sys.id === currentSystem ? ' selected' : '';
     const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
     systemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
@@ -5180,7 +5180,7 @@ function renderMinerSettings(panel) {
   }
 
   const oreOpts = ['<option value="">(any ore — mine whatever is available)</option>'];
-  for (const ore of knownOres) {
+  for (const ore of [...knownOres].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
     const sel = ore.item_id === targetOre ? ' selected' : '';
     oreOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
   }
@@ -5193,7 +5193,7 @@ function renderMinerSettings(panel) {
     opts.push(`<option value="faction"${'faction' === current ? ' selected' : ''}>Faction storage</option>`);
     opts.push(`<option value="storage"${'storage' === current ? ' selected' : ''}>Station storage</option>`);
     opts.push(`<option value="sell"${'sell' === current ? ' selected' : ''}>Sell at market</option>`);
-    for (const bot of bots) {
+    for (const bot of [...bots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
       const val = `bot:${bot.username}`;
       opts.push(`<option value="${esc(val)}"${val === current ? ' selected' : ''}>${esc(bot.username)}</option>`);
     }
@@ -5208,14 +5208,14 @@ function renderMinerSettings(panel) {
     <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px">
       <div class="setting-label" style="margin-bottom:8px">Per-Bot Target Ore</div>
       <div class="setting-hint" style="margin-bottom:8px">Override the default target ore for individual miners. Leave as "(use default)" to use the global setting above.</div>`;
-    for (const bot of minerBots) {
+    for (const bot of [...minerBots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
       const botOre = (settings[bot.username] || {}).targetOre || '';
       perBotHtml += `
       <div class="setting-row" style="margin-bottom:4px">
         <div class="setting-label" style="min-width:120px;font-size:12px">${esc(bot.username)}</div>
         <select id="set-miner-botore-${esc(bot.username)}" data-bot="${esc(bot.username)}" class="miner-bot-ore-select">
           <option value="">(use default)</option>
-          ${knownOres.map(o => `<option value="${esc(o.item_id)}"${o.item_id === botOre ? ' selected' : ''}>${esc(o.name)}</option>`).join('')}
+          ${[...knownOres].sort((a, b) => (a.name || '').localeCompare(b.name || '')).map(o => `<option value="${esc(o.item_id)}"${o.item_id === botOre ? ' selected' : ''}>${esc(o.name)}</option>`).join('')}
           ${botOre && !knownOres.find(o => o.item_id === botOre) ? `<option value="${esc(botOre)}" selected>${esc(botOre)}</option>` : ''}
         </select>
       </div>`;
@@ -5236,7 +5236,7 @@ function renderMinerSettings(panel) {
   }
 
   const quotaOreOpts = ['<option value="">-- select ore --</option>'];
-  for (const ore of knownOres) {
+  for (const ore of [...knownOres].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
     quotaOreOpts.push(`<option value="${esc(ore.item_id)}">${esc(ore.name)}</option>`);
   }
 
@@ -6036,7 +6036,7 @@ function saveAiSettings() {
 function updateChatBotSelect() {
   const select = document.getElementById('chatBot');
   const prev = select.value;
-  select.innerHTML = bots.map(b =>
+  select.innerHTML = [...bots].sort((a, b) => (a.username || '').localeCompare(b.username || '')).map(b =>
     `<option value="${esc(b.username)}">${esc(b.username)}</option>`
   ).join('');
   if (prev && bots.find(b => b.username === prev)) {
@@ -7871,14 +7871,14 @@ function renderExplorerSettings(panel) {
       <table class="settings-table" style="margin-top:8px;width:100%;border-collapse:collapse">
         <thead><tr><th style="text-align:left;padding:6px;border-bottom:1px solid #21262d">Bot</th><th style="text-align:left;padding:6px;border-bottom:1px solid #21262d">Focus System</th><th style="text-align:left;padding:6px;border-bottom:1px solid #21262d">Max Jumps</th><th style="text-align:left;padding:6px;border-bottom:1px solid #21262d">Action</th></tr></thead>
         <tbody>`;
-    for (const bot of explorerBots) {
+    for (const bot of [...explorerBots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
       const botSettings = settings[bot.username] || {};
       const focusAreaSystem = botSettings.focusAreaSystem || '';
       const botMaxJumps = botSettings.maxJumps ?? 5;
       
       // Build system options
       let sysOpts = '<option value="">(none - all systems)</option>';
-      for (const sys of knownSystems) {
+      for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
         const sel = sys.id === focusAreaSystem ? ' selected' : '';
         sysOpts += `<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`;
       }
@@ -8011,7 +8011,7 @@ function renderGasHarvesterSettings(panel) {
   const targetGas = g.targetGas || '';
 
   const systemOpts = ['<option value="">(current system)</option>'];
-  for (const sys of knownSystems) {
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
     const sel = sys.id === currentSystem ? ' selected' : '';
     const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
     systemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
@@ -8021,7 +8021,7 @@ function renderGasHarvesterSettings(panel) {
   }
 
   const homeOpts = ['<option value="">(start system)</option>'];
-  for (const sys of knownSystems) {
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
     const sel = sys.id === homeSystem ? ' selected' : '';
     const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
     homeOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
@@ -8036,7 +8036,7 @@ function renderGasHarvesterSettings(panel) {
   });
   const oreList = gasOres.length > 0 ? gasOres : knownOres;
   const oreOpts = ['<option value="">(any gas — harvest whatever is available)</option>'];
-  for (const ore of oreList) {
+  for (const ore of [...oreList].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
     const sel = ore.item_id === targetGas ? ' selected' : '';
     oreOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
   }
@@ -8049,7 +8049,7 @@ function renderGasHarvesterSettings(panel) {
     opts.push(`<option value="faction"${'faction' === current ? ' selected' : ''}>Faction storage</option>`);
     opts.push(`<option value="storage"${'storage' === current ? ' selected' : ''}>Station storage</option>`);
     opts.push(`<option value="sell"${'sell' === current ? ' selected' : ''}>Sell at market</option>`);
-    for (const bot of bots) {
+    for (const bot of [...bots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
       const val = `bot:${bot.username}`;
       opts.push(`<option value="${esc(val)}"${val === current ? ' selected' : ''}>${esc(bot.username)}</option>`);
     }
@@ -8162,7 +8162,7 @@ function renderIceHarvesterSettings(panel) {
   const targetIce = ic.targetIce || '';
 
   const systemOpts = ['<option value="">(current system)</option>'];
-  for (const sys of knownSystems) {
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
     const sel = sys.id === currentSystem ? ' selected' : '';
     const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
     systemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
@@ -8177,7 +8177,7 @@ function renderIceHarvesterSettings(panel) {
   });
   const oreList = iceOres.length > 0 ? iceOres : knownOres;
   const oreOpts = ['<option value="">(any ice — harvest whatever is available)</option>'];
-  for (const ore of oreList) {
+  for (const ore of [...oreList].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
     const sel = ore.item_id === targetIce ? ' selected' : '';
     oreOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
   }
@@ -8190,7 +8190,7 @@ function renderIceHarvesterSettings(panel) {
     opts.push(`<option value="faction"${'faction' === current ? ' selected' : ''}>Faction storage</option>`);
     opts.push(`<option value="storage"${'storage' === current ? ' selected' : ''}>Station storage</option>`);
     opts.push(`<option value="sell"${'sell' === current ? ' selected' : ''}>Sell at market</option>`);
-    for (const bot of bots) {
+    for (const bot of [...bots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
       const val = `bot:${bot.username}`;
       opts.push(`<option value="${esc(val)}"${val === current ? ' selected' : ''}>${esc(bot.username)}</option>`);
     }
@@ -8308,7 +8308,7 @@ function renderSalvagerSettings(panel) {
   ];
 
   const systemOpts = ['<option value="">(current system)</option>'];
-  for (const sys of knownSystems) {
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
     const sel = sys.id === currentSystem ? ' selected' : '';
     const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
     systemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
@@ -8318,7 +8318,7 @@ function renderSalvagerSettings(panel) {
   }
 
   const homeOpts = ['<option value="">(start system)</option>'];
-  for (const sys of knownSystems) {
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
     const sel = sys.id === homeSystem ? ' selected' : '';
     const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
     homeOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
@@ -8328,14 +8328,14 @@ function renderSalvagerSettings(panel) {
   }
 
   const salvageYardOpts = ['<option value="">(auto - any salvage yard)</option>'];
-  for (const station of salvageYardStations) {
+  for (const station of [...salvageYardStations].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
     const sel = station.id === salvageYardStation ? ' selected' : '';
     const label = `${station.name} (${station.system})`;
     salvageYardOpts.push(`<option value="${esc(station.id)}"${sel}>${esc(label)}</option>`);
   }
 
   const salvageYardSystemOpts = ['<option value="">(auto - based on station)</option>'];
-  for (const sys of knownSystems) {
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
     const sel = sys.id === salvageYardSystem ? ' selected' : '';
     const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
     salvageYardSystemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
@@ -8370,7 +8370,7 @@ function renderSalvagerSettings(panel) {
         <option value="faction"${depositMode === 'faction' ? ' selected' : ''}>Faction storage</option>
         <option value="sell"${depositMode === 'sell' ? ' selected' : ''}>Sell at market</option>
         <option value="storage"${depositMode === 'storage' ? ' selected' : ''}>Station storage</option>
-        ${bots.map(b => `<option value="bot:${esc(b.username)}"${'bot:' + b.username === depositMode ? ' selected' : ''}>${esc(b.username)}</option>`).join('')}
+        ${[...bots].sort((a, b) => (a.username || '').localeCompare(b.username || '')).map(b => `<option value="bot:${esc(b.username)}"${'bot:' + b.username === depositMode ? ' selected' : ''}>${esc(b.username)}</option>`).join('')}
       </select>
     </div>
 
@@ -8383,7 +8383,7 @@ function renderSalvagerSettings(panel) {
         <option value="faction"${depositFallback === 'faction' ? ' selected' : ''}>Faction storage</option>
         <option value="sell"${depositFallback === 'sell' ? ' selected' : ''}>Sell at market</option>
         <option value="storage"${depositFallback === 'storage' ? ' selected' : ''}>Station storage</option>
-        ${bots.map(b => `<option value="bot:${esc(b.username)}"${'bot:' + b.username === depositFallback ? ' selected' : ''}>${esc(b.username)}</option>`).join('')}
+        ${[...bots].sort((a, b) => (a.username || '').localeCompare(b.username || '')).map(b => `<option value="bot:${esc(b.username)}"${'bot:' + b.username === depositFallback ? ' selected' : ''}>${esc(b.username)}</option>`).join('')}
       </select>
     </div>
 
@@ -8512,7 +8512,7 @@ function renderHunterSettings(panel) {
   const fleeTierOpts = tierOptions.map(t => `<option value="${t}"${t === fleeFromTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
 
   const systemOpts = ['<option value="">(auto — nearest low-sec)</option>'];
-  for (const sys of knownSystems) {
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
     const sel = sys.id === currentSystem ? ' selected' : '';
     const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
     systemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
@@ -8644,7 +8644,7 @@ function renderCargoMoverSettings(panel) {
 
   for (const [sysId, sys] of Object.entries(mapData)) {
     const sysName = sys.name || sysId;
-    for (const poi of (sys.pois || [])) {
+    for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
       if (!poi.has_base) continue;
       const val = sysId + '|' + poi.id;
       const label = poi.base_name || poi.name || poi.id;
@@ -8662,11 +8662,11 @@ function renderCargoMoverSettings(panel) {
   let personalBotOpts = '<option value="">(select bot)</option>';
   let giftBotOpts = '<option value="">(select recipient bot)</option>';
   
-  for (const bot of bots) {
+  for (const bot of [...bots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
     const factionSel = bot.username === factionStorageBot ? ' selected' : '';
     const personalSel = bot.username === personalStorageBot ? ' selected' : '';
     const giftSel = bot.username === destinationBotName ? ' selected' : '';
-    
+
     factionBotOpts += `<option value="${esc(bot.username)}"${factionSel}>${esc(bot.username)}</option>`;
     personalBotOpts += `<option value="${esc(bot.username)}"${personalSel}>${esc(bot.username)}</option>`;
     giftBotOpts += `<option value="${esc(bot.username)}"${giftSel}>${esc(bot.username)}</option>`;

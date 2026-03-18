@@ -119,6 +119,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('coordinator')">Coordinator</div>
         <div class="sidebar-item" onclick="switchSettingsTab('trader')">Trader</div>
         <div class="sidebar-item" onclick="switchSettingsTab('faction_trader')">Faction Trader</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('trade_buyer')">Trade Buyer</div>
         <div class="sidebar-item" onclick="switchSettingsTab('gas_harvester')">GasHarvester</div>
         <div class="sidebar-item" onclick="switchSettingsTab('ice_harvester')">IceHarvester</div>
         <div class="sidebar-item" onclick="switchSettingsTab('salvager')">Salvager</div>
@@ -3499,6 +3500,8 @@ function renderSettingsPanel() {
     renderTraderSettings(panel);
   } else if (activeSettingsTab === 'faction_trader') {
     renderFactionTraderSettings(panel);
+  } else if (activeSettingsTab === 'trade_buyer') {
+    renderTradeBuyerSettings(panel);
   } else if (activeSettingsTab === 'gas_harvester') {
     renderGasHarvesterSettings(panel);
   } else if (activeSettingsTab === 'ice_harvester') {
@@ -4567,6 +4570,220 @@ function saveFactionTraderSettings() {
   };
   send({ type: 'saveSettings', routine: 'faction_trader', settings: s });
   settings.faction_trader = s;
+}
+
+// ── Trade Buyer Settings ────────────────────────────────────────
+function renderTradeBuyerSettings(panel) {
+  const t = settings.trade_buyer || {};
+  const homeSystem = t.homeSystem ?? '';
+  const maxSpendPerItem = t.maxSpendPerItem ?? 5000;
+  const maxTotalSpend = t.maxTotalSpend ?? 0;
+  const fuelCostPerJump = t.fuelCostPerJump ?? 50;
+  const refuelThreshold = t.refuelThreshold ?? 50;
+  const repairThreshold = t.repairThreshold ?? 40;
+  const minQuantityToBuy = t.minQuantityToBuy ?? 10;
+  const autoInsure = t.autoInsure !== false;
+  const autoCloak = t.autoCloak ?? false;
+
+  // Build item list from catalog
+  const catalogItems = Object.values(catalog.items || {}).filter(i => i.tradeable !== false);
+  catalogItems.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+
+  // Get currently selected items
+  const buyItems = Array.isArray(t.buyItems) ? t.buyItems : [];
+
+  let itemsHtml = '';
+  for (const item of catalogItems) {
+    const itemId = item.id || item.item_id;
+    const itemName = item.name || itemId;
+    const itemSize = item.size ?? 1;
+    const isSelected = buyItems.includes(itemId);
+    const maxPrice = t.maxPrices?.[itemId] ?? '';
+    itemsHtml += `
+      <div class="trade-buyer-item-row" style="display:grid;grid-template-columns:1fr 120px 100px;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border-light)">
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
+          <input type="checkbox" class="trade-buyer-item-checkbox" data-item-id="${esc(itemId)}" ${isSelected ? 'checked' : ''}>
+          <span>${esc(itemName)}</span>
+          <span style="color:var(--text-dim);font-size:11px">(size: ${itemSize})</span>
+        </label>
+        <input type="number" class="trade-buyer-max-price" data-item-id="${esc(itemId)}" placeholder="Max price" min="0" value="${maxPrice}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:12px">
+        <button class="sm danger" onclick="removeTradeBuyerItem('${esc(itemId)}')" style="padding:4px 8px">Remove</button>
+      </div>
+    `;
+  }
+
+  panel.innerHTML = `
+    <h3>Trade Buyer Settings</h3>
+    <div class="settings-desc">The trade buyer bot finds the cheapest sellers for specified items, buys them, and deposits them at your home station faction storage. Useful for stockpiling resources or items for crafting.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home System</div>
+        <div class="setting-hint">Required. The system where items will be deposited to faction storage.</div>
+      </div>
+      <input type="text" id="set-trade_buyer-homeSystem" value="${esc(homeSystem)}" placeholder="e.g. sol" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Spend Per Item (credits)</div>
+        <div class="setting-hint">Maximum credits to spend on a single item type per run. 0 = unlimited.</div>
+      </div>
+      <input type="number" id="set-trade_buyer-maxSpendPerItem" min="0" max="1000000" value="${maxSpendPerItem}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Total Spend (credits)</div>
+        <div class="setting-hint">Maximum total credits to spend per run. 0 = unlimited.</div>
+      </div>
+      <input type="number" id="set-trade_buyer-maxTotalSpend" min="0" max="10000000" value="${maxTotalSpend}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min Quantity to Buy</div>
+        <div class="setting-hint">Minimum quantity threshold for a buy route to be considered worthwhile.</div>
+      </div>
+      <input type="number" id="set-trade_buyer-minQuantityToBuy" min="1" max="10000" value="${minQuantityToBuy}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Fuel Cost Per Jump (credits)</div>
+        <div class="setting-hint">Estimated fuel cost per system jump, used for route calculations.</div>
+      </div>
+      <input type="number" id="set-trade_buyer-fuelCostPerJump" min="0" max="1000" value="${fuelCostPerJump}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Refuel at station when fuel drops below this %.</div>
+      </div>
+      <input type="number" id="set-trade_buyer-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold (%)</div>
+        <div class="setting-hint">Repair hull at station when HP drops below this %.</div>
+      </div>
+      <input type="number" id="set-trade_buyer-repairThreshold" min="20" max="80" value="${repairThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Auto Insure</div>
+        <div class="setting-hint">Automatically insure the ship before departing on buy runs.</div>
+      </div>
+      <select id="set-trade_buyer-autoInsure" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px">
+        <option value="true" ${autoInsure ? 'selected' : ''}>Enabled</option>
+        <option value="false" ${!autoInsure ? 'selected' : ''}>Disabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Auto Cloak</div>
+        <div class="setting-hint">Automatically cloak when jumping or in dangerous situations.</div>
+      </div>
+      <select id="set-trade_buyer-autoCloak" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px">
+        <option value="true" ${autoCloak ? 'selected' : ''}>Enabled</option>
+        <option value="false" ${!autoCloak ? 'selected' : ''}>Disabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row" style="display:block">
+      <div style="margin-bottom:8px">
+        <div class="setting-label">Items to Buy</div>
+        <div class="setting-hint" style="margin-top:4px">Select items from the catalog and optionally set a maximum price for each. The bot will only buy items that are checked below. Leave all unchecked to buy nothing (bot will idle).</div>
+      </div>
+      <div style="max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:8px;background:var(--bg-tertiary)">
+        <div style="display:grid;grid-template-columns:1fr 120px 100px;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);font-weight:600;font-size:12px;color:var(--text-dim)">
+          <span>Item</span>
+          <span>Max Price (cr)</span>
+          <span>Action</span>
+        </div>
+        ${itemsHtml}
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px">
+        <button class="sm" onclick="selectAllTradeBuyerItems()">Select All</button>
+        <button class="sm" onclick="deselectAllTradeBuyerItems()">Deselect All</button>
+        <button class="sm" onclick="clearRemovedTradeBuyerItems()">Clear Removed Items</button>
+      </div>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveTradeBuyerSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function saveTradeBuyerSettings() {
+  // Collect selected items and their max prices
+  const checkboxes = document.querySelectorAll('.trade-buyer-item-checkbox:checked');
+  const buyItems = [];
+  const maxPrices = {};
+
+  checkboxes.forEach(cb => {
+    const itemId = cb.getAttribute('data-item-id');
+    buyItems.push(itemId);
+    const maxPriceInput = document.querySelector(`.trade-buyer-max-price[data-item-id="${itemId}"]`);
+    if (maxPriceInput && maxPriceInput.value) {
+      maxPrices[itemId] = parseInt(maxPriceInput.value) || 0;
+    }
+  });
+
+  const s = {
+    homeSystem: document.getElementById('set-trade_buyer-homeSystem').value.trim(),
+    maxSpendPerItem: parseInt(document.getElementById('set-trade_buyer-maxSpendPerItem').value) || 5000,
+    maxTotalSpend: parseInt(document.getElementById('set-trade_buyer-maxTotalSpend').value) || 0,
+    minQuantityToBuy: parseInt(document.getElementById('set-trade_buyer-minQuantityToBuy').value) || 10,
+    fuelCostPerJump: parseInt(document.getElementById('set-trade_buyer-fuelCostPerJump').value) || 50,
+    refuelThreshold: parseInt(document.getElementById('set-trade_buyer-refuelThreshold').value) || 50,
+    repairThreshold: parseInt(document.getElementById('set-trade_buyer-repairThreshold').value) || 40,
+    autoInsure: document.getElementById('set-trade_buyer-autoInsure').value === 'true',
+    autoCloak: document.getElementById('set-trade_buyer-autoCloak').value === 'true',
+    buyItems: buyItems,
+    maxPrices: maxPrices,
+  };
+  send({ type: 'saveSettings', routine: 'trade_buyer', settings: s });
+  settings.trade_buyer = s;
+}
+
+function selectAllTradeBuyerItems() {
+  document.querySelectorAll('.trade-buyer-item-checkbox').forEach(cb => cb.checked = true);
+}
+
+function deselectAllTradeBuyerItems() {
+  document.querySelectorAll('.trade-buyer-item-checkbox').forEach(cb => cb.checked = false);
+}
+
+function removeTradeBuyerItem(itemId) {
+  const checkbox = document.querySelector(`.trade-buyer-item-checkbox[data-item-id="${itemId}"]`);
+  if (checkbox) {
+    checkbox.checked = false;
+  }
+}
+
+function clearRemovedTradeBuyerItems() {
+  // Remove any max price entries for items no longer in catalog
+  const catalogItemIds = new Set(Object.values(catalog.items || {}).map(i => i.id || i.item_id));
+  const t = settings.trade_buyer || {};
+  const maxPrices = t.maxPrices || {};
+  let changed = false;
+  for (const itemId of Object.keys(maxPrices)) {
+    if (!catalogItemIds.has(itemId)) {
+      delete maxPrices[itemId];
+      changed = true;
+    }
+  }
+  if (changed) {
+    settings.trade_buyer = { ...t, maxPrices };
+    send({ type: 'saveSettings', routine: 'trade_buyer', settings: { maxPrices } });
+    renderTradeBuyerSettings(document.getElementById('settingsContent'));
+  }
 }
 
 // ── AI Settings ────────────────────────────────────────────

@@ -1114,10 +1114,11 @@ export async function navigateToSystem(
       }
       
       const errorMsg = jumpResp.error.message.toLowerCase();
-      
+
       // Check if error is transient (network timeout, connection issue, etc.)
-      const isTransient = 
+      const isTransient =
         errorMsg.includes("timeout") ||
+        errorMsg.includes("524") || // HTTP 524 Request Timeout
         errorMsg.includes("connection") ||
         errorMsg.includes("network") ||
         errorMsg.includes("hiccup") ||

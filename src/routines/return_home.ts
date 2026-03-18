@@ -133,21 +133,56 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     }
   }
 
-  // Navigate to home system
+  // Navigate to home system with retry logic for API timeouts
   yield "navigate";
   if (bot.system !== homeSystem) {
     ctx.log("travel", `Navigating to ${homeSystem}...`);
-    const arrived = await navigateToSystem(ctx, homeSystem, {
-      fuelThresholdPct: 30,
-      hullThresholdPct: 40,
-    });
+    
+    const MAX_NAV_ATTEMPTS = 3;
+    let navAttempts = 0;
+    let arrived = false;
 
-    if (!arrived) {
-      ctx.log("error", `Failed to reach ${homeSystem} — routine cancelled`);
-      return; // Cancel routine
+    while (navAttempts < MAX_NAV_ATTEMPTS && bot.state === "running") {
+      navAttempts++;
+      try {
+        arrived = await navigateToSystem(ctx, homeSystem, {
+          fuelThresholdPct: 30,
+          hullThresholdPct: 40,
+        });
+
+        if (arrived) {
+          ctx.log("travel", `Arrived in ${homeSystem}`);
+          break;
+        }
+
+        // Navigation returned false - check if it was a timeout error
+        ctx.log("warn", `Navigation attempt ${navAttempts}/${MAX_NAV_ATTEMPTS} failed`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTimeout = msg.includes("524") || msg.includes("timeout") || msg.includes("Timeout");
+        
+        ctx.log("error", `Navigation error (attempt ${navAttempts}/${MAX_NAV_ATTEMPTS}): ${msg}`);
+        
+        if (!isTimeout) {
+          // Non-timeout error - don't retry
+          ctx.log("error", `Failed to reach ${homeSystem} — routine cancelled`);
+          return;
+        }
+        
+        // Timeout error - wait and retry
+        if (navAttempts < MAX_NAV_ATTEMPTS) {
+          const waitTime = 10000 * navAttempts; // 10s, 20s, 30s
+          ctx.log("travel", `API timeout detected - waiting ${waitTime/1000}s before retry...`);
+          await sleep(waitTime);
+          await bot.refreshStatus();
+        }
+      }
     }
 
-    ctx.log("travel", `Arrived in ${homeSystem}`);
+    if (!arrived) {
+      ctx.log("error", `Failed to reach ${homeSystem} after ${MAX_NAV_ATTEMPTS} attempts — routine cancelled`);
+      return; // Cancel routine
+    }
   }
 
   // Find and travel to home station

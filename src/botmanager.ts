@@ -13,6 +13,7 @@ import { iceHarvesterRoutine } from "./routines/ice_harvester.js";
 import { salvagerRoutine } from "./routines/salvager.js";
 import { hunterRoutine } from "./routines/hunter.js";
 import { factionTraderRoutine } from "./routines/faction_trader.js";
+import { tradeBuyerRoutine } from "./routines/trade_buyer.js";
 import { cleanupRoutine } from "./routines/cleanup.js";
 import { aiRoutine } from "./routines/ai.js";
 import { cargoMoverRoutine } from "./routines/cargo_mover.js";
@@ -55,6 +56,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   salvager: { name: "Salvager", fn: salvagerRoutine },
   hunter: { name: "Hunter", fn: hunterRoutine },
   faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },
+  trade_buyer: { name: "TradeBuyer", fn: tradeBuyerRoutine },
   cleanup: { name: "Cleanup", fn: cleanupRoutine },
   ai: { name: "AI", fn: aiRoutine },
   cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },

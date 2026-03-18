@@ -3098,9 +3098,26 @@ function renderManualControls() {
     ? bot.storage.map(i => `<option value="${esc(i.itemId)}" data-max="${i.quantity}">${esc(i.name)} (${i.quantity})</option>`).join('')
     : '<option value="">No items</option>';
 
-  // Build faction storage item options
-  const factionOpts = profileFactionStorage && profileFactionStorage.length > 0
-    ? profileFactionStorage.map(i => `<option value="${esc(i.item_id)}" data-max="${i.quantity}">${esc(i.name)} (${Number(i.quantity).toLocaleString()})</option>`).join('')
+  // Build faction storage item options (with sorting)
+  let factionItems = profileFactionStorage && profileFactionStorage.length > 0 ? profileFactionStorage.slice() : [];
+  if (factionItems.length > 0) {
+    // Sort items based on sort order
+    if (factionWithdrawSortOrder === 'alpha') {
+      factionItems.sort((a, b) => {
+        const nameA = (a.name || a.item_name || a.item_id || a.id || '').toLowerCase();
+        const nameB = (b.name || b.item_name || b.item_id || b.id || '').toLowerCase();
+        return nameA.localeCompare(nameB);
+      });
+    } else if (factionWithdrawSortOrder === 'quantity') {
+      factionItems.sort((a, b) => {
+        const qtyA = a.quantity || a.count || 0;
+        const qtyB = b.quantity || b.count || 0;
+        return qtyB - qtyA; // Descending order (highest quantity first)
+      });
+    }
+  }
+  const factionOpts = factionItems.length > 0
+    ? factionItems.map(i => `<option value="${esc(i.item_id)}" data-max="${i.quantity}">${esc(i.name)} (${Number(i.quantity).toLocaleString()})</option>`).join('')
     : (profileFactionStorage === null ? '<option value="">Click Refresh to load</option>' : '<option value="">Empty or not available</option>');
 
   // Build buy options from market (sorted by lowest price)
@@ -3228,6 +3245,10 @@ function renderManualControls() {
       <input type="number" id="mc-fac-wit-qty" min="1" value="1" style="width:90px">
       <button class="sm" onclick="mcFactionWithdraw()">Withdraw</button>
       <button class="sm" onclick="mcRefreshFactionStorage()" title="Reload faction storage list">Refresh</button>
+      <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-dim);cursor:pointer;white-space:nowrap">
+        <input type="checkbox" id="mc-fac-wit-sort" onchange="toggleManualFactionWithdrawSort()"${factionWithdrawSortOrder === 'quantity' ? ' checked' : ''}>
+        Sort by Qty
+      </label>
     </div>
 
     <div class="cmd-group">
@@ -3405,6 +3426,14 @@ function mcRefreshFactionStorage() {
       renderManualControls();
     }
   });
+}
+
+function toggleManualFactionWithdrawSort() {
+  const checkbox = document.getElementById('mc-fac-wit-sort');
+  if (checkbox) {
+    factionWithdrawSortOrder = checkbox.checked ? 'quantity' : 'alpha';
+    renderManualControls();
+  }
 }
 
 // ── Jettison Command ────────────────────────────────────────
@@ -6642,6 +6671,7 @@ let factionTreasury = null; // cached credit balance from view_faction_storage
 let factionActivePanel = 'overview'; // overview | members | storage | facilities | diplomacy | intel | rooms | missions | activity
 let factionLogLines = [];       // all faction log entries
 let factionLogFilter = 'all';   // 'all' | 'deposit' | 'withdraw' | 'donation' | 'gift'
+let factionWithdrawSortOrder = 'alpha'; // 'alpha' | 'quantity'
 
 function renderMissionsPage() {
   renderMissionsSidebar();
@@ -7746,25 +7776,56 @@ function fetchFactionStorageForWithdraw(username) {
       return;
     }
     const d = result.data;
-    const items = Array.isArray(d) ? d : (Array.isArray(d.items) ? d.items : Array.isArray(d.storage) ? d.storage : []);
+    let items = Array.isArray(d) ? d : (Array.isArray(d.items) ? d.items : Array.isArray(d.storage) ? d.storage : []);
     if (items.length === 0) {
       container.innerHTML = '<div class="faction-no-data">No items in faction storage</div>';
       return;
     }
+    
+    // Sort items based on sort order
+    if (factionWithdrawSortOrder === 'alpha') {
+      items = items.slice().sort((a, b) => {
+        const nameA = (a.name || a.item_name || a.item_id || a.id || '').toLowerCase();
+        const nameB = (b.name || b.item_name || b.item_id || b.id || '').toLowerCase();
+        return nameA.localeCompare(nameB);
+      });
+    } else if (factionWithdrawSortOrder === 'quantity') {
+      items = items.slice().sort((a, b) => {
+        const qtyA = a.quantity || a.count || 0;
+        const qtyB = b.quantity || b.count || 0;
+        return qtyB - qtyA; // Descending order (highest quantity first)
+      });
+    }
+    
     const opts = items.map(i => {
       const id = i.item_id || i.id || '';
       const name = i.name || i.item_name || id;
       const qty = i.quantity || i.count || 0;
       return `<option value="${esc(id)}" data-max="${qty}">${esc(name)} (${qty})</option>`;
     }).join('');
+    
+    const sortChecked = factionWithdrawSortOrder === 'quantity' ? ' checked' : '';
     container.innerHTML = `
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <select id="faction-wit-item" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">${opts}</select>
         <input type="number" id="faction-wit-qty" value="1" min="1" style="width:70px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
         <button class="primary sm" onclick="factionWithdrawItems('${esc(username)}')">Withdraw</button>
+        <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-dim);cursor:pointer">
+          <input type="checkbox" id="faction-wit-sort" onchange="toggleFactionWithdrawSort('${esc(username)}')"${sortChecked}>
+          Sort by Quantity
+        </label>
       </div>
     `;
   });
+}
+
+function toggleFactionWithdrawSort(username) {
+  const checkbox = document.getElementById('faction-wit-sort');
+  if (checkbox) {
+    factionWithdrawSortOrder = checkbox.checked ? 'quantity' : 'alpha';
+    // Reload the dropdown with new sort order
+    fetchFactionStorageForWithdraw(username);
+  }
 }
 
 function factionWithdrawItems(username) {

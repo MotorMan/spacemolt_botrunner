@@ -42,6 +42,30 @@ type WSData = { id: number };
 const DATA_DIR = join(process.cwd(), "data");
 const SETTINGS_FILE = join(DATA_DIR, "settings.json");
 const STATS_FILE = join(DATA_DIR, "stats.json");
+const MAIN_LOG_FILE = join(DATA_DIR, "main_logs.json");
+
+interface MainLogs {
+  activity: string[];
+  broadcast: string[];
+  system: string[];
+  faction: string[];
+}
+
+function loadMainLogs(): MainLogs {
+  if (existsSync(MAIN_LOG_FILE)) {
+    try {
+      return JSON.parse(readFileSync(MAIN_LOG_FILE, "utf-8")) as MainLogs;
+    } catch (err) {
+      console.warn(`Warning: corrupt main_logs.json, starting fresh —`, err);
+    }
+  }
+  return { activity: [], broadcast: [], system: [], faction: [] };
+}
+
+function saveMainLogs(logs: MainLogs): void {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(MAIN_LOG_FILE, JSON.stringify(logs, null, 2) + "\n", "utf-8");
+}
 
 function loadSettings(): RoutineSettings {
   if (existsSync(SETTINGS_FILE)) {
@@ -111,6 +135,7 @@ function pruneOldDates(daily: Record<string, Record<string, DayStats>>, maxAgeDa
 // ── WebServer ──────────────────────────────────────────────
 
 const MAX_LOG_BUFFER = 200;
+const MAIN_LOG_SAVE_DEBOUNCE_MS = 5000;
 
 export class WebServer {
   private port: number;
@@ -118,11 +143,13 @@ export class WebServer {
   private clients = new Set<ServerWebSocket<WSData>>();
   private nextClientId = 1;
 
-  // Log buffers for scrollback on reconnect
-  private activityLog: string[] = [];
-  private broadcastLog: string[] = [];
-  private systemLog: string[] = [];
-  private factionLog: string[] = [];
+  // Log buffers for scrollback on reconnect (persisted to disk)
+  private activityLog: string[];
+  private broadcastLog: string[];
+  private systemLog: string[];
+  private factionLog: string[];
+  private mainLogsDirty = false;
+  private mainLogSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Per-bot activity log buffers (username -> lines)
   private botLogs = new Map<string, string[]>();
@@ -149,6 +176,30 @@ export class WebServer {
     this.port = port;
     this.settings = loadSettings();
     this.statsData = loadStats();
+    // Load persisted main logs
+    const mainLogs = loadMainLogs();
+    this.activityLog = mainLogs.activity.slice(-MAX_LOG_BUFFER);
+    this.broadcastLog = mainLogs.broadcast.slice(-MAX_LOG_BUFFER);
+    this.systemLog = mainLogs.system.slice(-MAX_LOG_BUFFER);
+    this.factionLog = mainLogs.faction.slice(-MAX_LOG_BUFFER);
+  }
+
+  /** Schedule save of main logs to disk (debounced). */
+  private scheduleMainLogSave(): void {
+    if (this.mainLogSaveTimer) return;
+    this.mainLogsDirty = true;
+    this.mainLogSaveTimer = setTimeout(() => {
+      if (this.mainLogsDirty) {
+        saveMainLogs({
+          activity: this.activityLog,
+          broadcast: this.broadcastLog,
+          system: this.systemLog,
+          faction: this.factionLog,
+        });
+        this.mainLogsDirty = false;
+        this.mainLogSaveTimer = null;
+      }
+    }, MAIN_LOG_SAVE_DEBOUNCE_MS);
   }
 
   getSettings(routine: string): Record<string, unknown> {
@@ -209,6 +260,12 @@ export class WebServer {
         if (url.pathname === "/api/bots") {
           return Response.json(this.latestStatuses);
         }
+        if (url.pathname === "/api/bots/discovered") {
+          // Return list of discovered bot usernames (even if not logged in)
+          const { getDiscoveredBots } = await import("../botmanager.js");
+          const discovered = getDiscoveredBots();
+          return Response.json({ usernames: discovered });
+        }
         if (url.pathname === "/api/map") {
           return Response.json({ systems: mapStore.getAllSystems() });
         }
@@ -223,6 +280,15 @@ export class WebServer {
         }
         if (url.pathname === "/api/catalog") {
           return Response.json(catalogStore.getAll());
+        }
+        if (url.pathname === "/api/logs/main") {
+          // Return persisted main logs (activity, broadcast, system, faction)
+          return Response.json({
+            activity: this.activityLog,
+            broadcast: this.broadcastLog,
+            system: this.systemLog,
+            faction: this.factionLog,
+          });
         }
 
         // Shutdown endpoint
@@ -358,21 +424,25 @@ export class WebServer {
 
   logActivity(line: string): void {
     this.pushLog(this.activityLog, line);
+    this.scheduleMainLogSave();
     this.broadcast({ type: "log", panel: "activity", line });
   }
 
   logBroadcast(line: string): void {
     this.pushLog(this.broadcastLog, line);
+    this.scheduleMainLogSave();
     this.broadcast({ type: "log", panel: "broadcast", line });
   }
 
   logSystem(line: string): void {
     this.pushLog(this.systemLog, line);
+    this.scheduleMainLogSave();
     this.broadcast({ type: "log", panel: "system", line });
   }
 
   logFaction(line: string): void {
     this.pushLog(this.factionLog, line);
+    this.scheduleMainLogSave();
     this.broadcast({ type: "factionLog", line });
   }
 

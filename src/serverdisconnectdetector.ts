@@ -22,19 +22,27 @@ interface ReconnectBot {
   credentials: { username: string; password: string } | null;
 }
 
+interface BotState {
+  wasRunning: boolean;
+  routine: string | null;
+}
+
 const DISCONNECT_WINDOW_MS = 10_000; // 10 second window to count disconnects
 const DISCONNECT_THRESHOLD = 3; // Number of bot disconnects to trigger server-wide detection
 const RECONNECT_WAIT_MS = 20_000; // Wait 20 seconds before starting reconnection
 const RECONNECT_BOT_DELAY_MS = 20_000; // Delay between reconnecting each bot
 
-type DisconnectCallback = (botNames: string[]) => Promise<void>;
+interface ServerDownCallback {
+  stopBots: (affectedBots: string[]) => Promise<Map<string, BotState>>;
+  restartBots: (botStates: Map<string, BotState>) => Promise<void>;
+}
 
 export class ServerDisconnectDetector {
   private disconnectEvents: DisconnectEvent[] = [];
   private serverDownDetected = false;
   private serverDownDetectedAt = 0;
   private reconnectInProgress = false;
-  private onServerDownCallback: DisconnectCallback | null = null;
+  private onServerDownCallback: ServerDownCallback | null = null;
   private registeredBots = new Map<string, ReconnectBot>();
 
   /**
@@ -104,10 +112,11 @@ export class ServerDisconnectDetector {
     // Clear the disconnect events - we've detected the issue
     this.disconnectEvents = [];
 
-    // Notify callback with affected bots
+    // Stop bots and save their state
+    let botStates = new Map<string, BotState>();
     if (this.onServerDownCallback) {
       try {
-        await this.onServerDownCallback(affectedBots);
+        botStates = await this.onServerDownCallback.stopBots(affectedBots);
       } catch (err) {
         log("error", `Server down callback error: ${err instanceof Error ? err.message : String(err)}`);
       }
@@ -118,7 +127,17 @@ export class ServerDisconnectDetector {
 
     // Start coordinated reconnection
     log("system", "🔄 Starting coordinated reconnection sequence...");
-    await this.startCoordinatedReconnect();
+    const reconnectSuccess = await this.startCoordinatedReconnect();
+
+    // Restart bots with their saved routines after reconnection
+    if (reconnectSuccess && this.onServerDownCallback) {
+      try {
+        log("system", "🔄 Restarting bots with their saved routines...");
+        await this.onServerDownCallback.restartBots(botStates);
+      } catch (err) {
+        log("error", `Failed to restart bots: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
   }
 
   /**
@@ -135,15 +154,16 @@ export class ServerDisconnectDetector {
 
   /**
    * Start coordinated reconnection of all registered bots.
+   * Returns true if at least one bot reconnected successfully.
    */
-  private async startCoordinatedReconnect(): Promise<void> {
+  private async startCoordinatedReconnect(): Promise<boolean> {
     const bots = Array.from(this.registeredBots.values());
 
     if (bots.length === 0) {
       log("system", "No bots registered for reconnection");
       this.reconnectInProgress = false;
       this.serverDownDetected = false;
-      return;
+      return false;
     }
 
     log("system", `Reconnecting ${bots.length} bot(s) sequentially...`);
@@ -186,6 +206,8 @@ export class ServerDisconnectDetector {
     this.reconnectInProgress = false;
     this.serverDownDetected = false;
     this.disconnectEvents = [];
+
+    return successCount > 0;
   }
 
   /**

@@ -26,12 +26,22 @@ import { reconnectQueue } from "./reconnectqueue.js";
 import { serverDisconnectDetector } from "./serverdisconnectdetector.js";
 import { AiChatService } from "./aichat_service.js";
 
+interface BotState {
+  wasRunning: boolean;
+  routine: string | null;
+}
+
 const BASE_DIR = process.cwd();
 const SESSIONS_DIR = join(BASE_DIR, "sessions");
 
 const bots: Map<string, Bot> = new Map();
 let server: WebServer;
 let aiChatService: AiChatService | null = null;
+
+/** Get list of discovered bot usernames (for API use). */
+export function getDiscoveredBots(): string[] {
+  return [...bots.keys()];
+}
 
 const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   miner: { name: "Miner", fn: minerRoutine },
@@ -545,15 +555,61 @@ async function main(): Promise<void> {
   server.logSystem("AI Chat service initialized");
 
   // Set up server-wide disconnect detection callback
-  serverDisconnectDetector.onServerDown(async (affectedBots) => {
-    server.logSystem(`Server disconnect detected affecting ${affectedBots.length} bot(s): ${affectedBots.join(", ")}`);
-    // Stop all running bots to prevent errors during reconnection
-    for (const [, bot] of bots) {
-      if (bot.state === "running") {
-        bot.stop();
-        server.logSystem(`Stopped ${bot.username} during server reconnection`);
+  serverDisconnectDetector.onServerDown({
+    stopBots: async (affectedBots) => {
+      server.logSystem(`Server disconnect detected affecting ${affectedBots.length} bot(s): ${affectedBots.join(", ")}`);
+      const botStates = new Map<string, BotState>();
+      
+      // Save state of all bots and stop running ones
+      for (const [, bot] of bots) {
+        const assignments = server.getBotAssignments();
+        botStates.set(bot.username, {
+          wasRunning: bot.state === "running",
+          routine: assignments[bot.username] || null,
+        });
+        
+        if (bot.state === "running") {
+          bot.stop();
+          server.logSystem(`Stopped ${bot.username} during server reconnection`);
+        }
       }
-    }
+      
+      return botStates;
+    },
+    restartBots: async (botStates) => {
+      const assignments = server.getBotAssignments();
+      let restartedCount = 0;
+      
+      for (const [botName, state] of botStates) {
+        if (!state.wasRunning || !state.routine) continue;
+        
+        const bot = bots.get(botName);
+        if (!bot) continue;
+        
+        // Check if routine still exists
+        const routine = ROUTINES[state.routine];
+        if (!routine) {
+          server.logSystem(`Skipping ${botName}: routine ${state.routine} no longer exists`);
+          continue;
+        }
+        
+        server.logSystem(`Restarting ${botName} with ${routine.name} routine...`);
+        
+        bot.start(state.routine, routine.fn).then(() => {
+          server.logSystem(`Bot ${botName} routine finished.`);
+          server.clearBotAssignment(botName);
+        }).catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          server.logSystem(`Bot ${botName} stopped with error: ${msg}`);
+          server.clearBotAssignment(botName);
+        });
+        
+        server.saveBotAssignment(botName, state.routine);
+        restartedCount++;
+      }
+      
+      server.logSystem(`Restarted ${restartedCount} bot(s) with their saved routines`);
+    },
   });
 
   server.logSystem("SpaceMolt Bot Manager v0.2");
@@ -576,16 +632,18 @@ async function main(): Promise<void> {
   if (bots.size > 0) {
     const assignments = server.getBotAssignments();
     server.logSystem(`Found ${bots.size} saved bot(s): ${[...bots.keys()].join(", ")}`);
+    // Push initial bot list to UI immediately (shows as "idle" with default values)
+    refreshStatusTable();
 
-    // Stagger logins to avoid spamming the API
-    const LOGIN_DELAY_MS = 15000;
+    // Stagger logins to avoid spamming the API (15s delay required to avoid rate limits/bans)
+    const LOGIN_DELAY_MS = 25000;
     let loginIndex = 0;
     for (const [name, bot] of bots) {
       const delay = loginIndex * LOGIN_DELAY_MS;
       loginIndex++;
       setTimeout(() => {
         bot.login().then(async (ok) => {
-          refreshStatusTable();
+          refreshStatusTable(); // Push immediately after login
           if (!ok) return;
           // Fetch catalog data if stale (first logged-in bot triggers it)
           if (catalogStore.isStale()) {
@@ -602,6 +660,7 @@ async function main(): Promise<void> {
           await handleStart({ type: "start", bot: name, routine: routineKey });
         }).catch((err) => {
           server.logSystem(`Login failed for ${name}: ${err}`);
+          refreshStatusTable(); // Still push status (will show error state)
         });
       }, delay);
     }

@@ -278,8 +278,9 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
  *  or navigates to the nearest known station system if none is available.
  *  Returns true if successfully docked.
  *  @param skipStorageCollection If true, skips automatic storage collection (withdraw credits/items).
+ *  @deprecated Automatic storage collection is no longer performed. Routines should handle storage manually.
  */
-export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: boolean = false): Promise<boolean> {
+export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: boolean = true): Promise<boolean> {
   const { bot } = ctx;
   if (bot.docked) return true;
 
@@ -296,11 +297,7 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
     const dockResp = await bot.exec("dock");
     if (!dockResp.error || dockResp.error.message.includes("already")) {
       bot.docked = true;
-      if (!skipStorageCollection) {
-        await collectFromStorage(ctx);
-        await recordMarketData(ctx);
-        await analyzeMarket(ctx);
-      }
+      // Automatic storage collection disabled - routines should handle storage manually
       await ensureInsured(ctx);
       return true;
     }

@@ -548,10 +548,29 @@ export class AiChatService {
     }
 
     // Skip messages from AI bots (prevent self-talk loops)
+    // BUT: Allow the mentioned bot to respond even if it recently sent messages
     const bots = AiChatService.getBots();
-    if (bots?.some(b => b.username === msg.sender)) {
-      this.logFn("ai_chat_debug", `Ignoring message from AI bot: ${msg.sender}`);
-      return;
+    const isFromAiBot = bots?.some(b => b.username === msg.sender);
+    
+    if (isFromAiBot) {
+      // Check if this message mentions a different bot - if so, allow it through
+      // This prevents AI-to-AI loops while allowing mentioned bots to respond
+      let mentionedBotName: string | null = null;
+      for (const bot of bots || []) {
+        if (messageMentionsBot(msg.content, bot.username)) {
+          mentionedBotName = bot.username;
+          break;
+        }
+      }
+      
+      // If message mentions a bot, it's likely a human message that got attributed wrong
+      // OR it's an AI responding to a human - either way, let it through for mention processing
+      if (mentionedBotName) {
+        this.logFn("ai_chat_debug", `Message from AI bot ${msg.sender} mentions ${mentionedBotName} - processing for mention`);
+      } else {
+        this.logFn("ai_chat_debug", `Ignoring message from AI bot: ${msg.sender}`);
+        return;
+      }
     }
 
     // Check if message mentions ANY of our bots
@@ -571,6 +590,8 @@ export class AiChatService {
       
       // Check if the receiving bot is the mentioned bot
       const receivingBot = msg.botUsername || "";
+      this.logFn("ai_chat_debug", `Receiving bot: ${receivingBot}, mentioned bot: ${mentionedBotName}`);
+      
       if (receivingBot !== mentionedBotName) {
         // This bot received the message but wasn't the one mentioned - skip silently
         this.logFn("ai_chat_debug", `Received by ${receivingBot} but mentions ${mentionedBotName} - skipping`);
@@ -578,6 +599,7 @@ export class AiChatService {
       }
       
       // The receiving bot IS the mentioned bot - proceed with mention response
+      this.logFn("ai_chat", `Processing mention: ${mentionedBotName} received message mentioning them`);
       const responder = this.selectResponderByMention(mentionedBotName);
       if (!responder) {
         this.logFn("ai_chat", `Mentioned bot ${mentionedBotName} not available to respond`);

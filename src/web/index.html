@@ -454,11 +454,110 @@ function switchTab(name) {
 }
 
 // ── WebSocket ──────────────────────────────────────────────
+let wsInitTimer = null;
+
+/** Fetch initial data via REST API as fallback if WebSocket is slow */
+async function fetchInitialData() {
+  try {
+    const [botsRes, discoveredRes, routinesRes, settingsRes, mapRes, statsRes, catalogRes, mainLogsRes] = await Promise.all([
+      fetch('/api/bots').then(r => r.json()),
+      fetch('/api/bots/discovered').then(r => r.json()),
+      fetch('/api/routines').then(r => r.json()),
+      fetch('/api/settings').then(r => r.json()),
+      fetch('/api/map').then(r => r.json()),
+      fetch('/api/stats').then(r => r.json()),
+      fetch('/api/catalog').then(r => r.json()),
+      fetch('/api/logs/main').then(r => r.json()),
+    ]);
+
+    // Merge discovered bots with status data (discovered gives us usernames even if not logged in)
+    const statusBots = botsRes || [];
+    const discoveredUsernames = discoveredRes?.usernames || [];
+    const statusByUsername = new Map(statusBots.map(b => [b.username, b]));
+
+    // Build complete bot list: include discovered bots even if no status yet
+    const botSet = new Set([...discoveredUsernames, ...statusBots.map(b => b.username)]);
+    bots = [...botSet].map(username => {
+      const status = statusByUsername.get(username);
+      if (status) return status;
+      // Bot discovered but not logged in yet - show as idle
+      return {
+        username,
+        state: 'idle',
+        routine: null,
+        credits: 0,
+        fuel: 0,
+        maxFuel: 0,
+        cargo: 0,
+        cargoMax: 0,
+        location: 'unknown',
+        system: 'unknown',
+        poi: '',
+        docked: false,
+        lastAction: '',
+        error: null,
+        shipName: '-',
+        hull: 0,
+        maxHull: 0,
+        shield: 0,
+        maxShield: 0,
+        ammo: 0,
+        inventory: [],
+        storage: [],
+        stats: { totalMined: 0, totalCrafted: 0, totalTrades: 0, totalProfit: 0, totalSystems: 0 },
+      };
+    });
+
+    routines = routinesRes || [];
+    settings = settingsRes || {};
+    mapData = mapRes.systems || {};
+    knownSystems = Object.entries(mapData).map(([id, sys]) => ({ id, name: sys?.name || id }));
+    knownOres = [];
+    statsDaily = statsRes || {};
+    catalog = catalogRes || { items: {}, ships: {}, skills: {}, recipes: {}, lastFetched: null };
+    renderBots();
+    renderStats();
+    updateChatBotSelect();
+    renderSettingsPanel();
+    updateAiChatToggleButton();
+    // Load persisted main logs
+    if (mainLogsRes) {
+      appendLines(activityEl, 'activity', mainLogsRes.activity || []);
+      appendLines(broadcastEl, 'broadcast', mainLogsRes.broadcast || []);
+      appendLines(systemEl, 'system', mainLogsRes.system || []);
+      factionLogLines = mainLogsRes.faction || [];
+    }
+    // Load per-bot logs from disk
+    for (const bot of bots) {
+      try {
+        const logRes = await fetch(`/api/logs/${encodeURIComponent(bot.username)}?tail=200`);
+        const logData = await logRes.json();
+        if (logData.lines) {
+          botLogBuffers[bot.username] = logData.lines;
+        }
+      } catch {}
+    }
+    if (profileBot) renderBotActivityLog();
+  } catch (err) {
+    console.warn('Initial REST fetch failed, waiting for WebSocket:', err);
+  }
+}
+
 function connect() {
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
 
+  // Fallback: if WebSocket doesn't connect quickly, fetch data via REST
+  clearTimeout(wsInitTimer);
+  wsInitTimer = setTimeout(() => {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      console.warn('WebSocket slow, fetching initial data via REST...');
+      fetchInitialData();
+    }
+  }, 500);
+
   ws.onopen = () => {
+    clearTimeout(wsInitTimer);
     connDot.classList.add('connected');
     connText.textContent = 'Connected';
     reconnectDelay = 1000;
@@ -478,6 +577,7 @@ function connect() {
     try { msg = JSON.parse(ev.data); } catch { return; }
     switch (msg.type) {
       case 'init':
+        clearTimeout(wsInitTimer);
         bots = msg.bots || [];
         routines = msg.routines || [];
         settings = msg.settings || {};
@@ -3422,6 +3522,7 @@ function renderSettingsPanel() {
 
 function renderGeneralSettings(panel) {
   const general = settings.general || {};
+  const port = general.port ?? 3000;
   const factionDonatePct = general.factionDonatePct ?? 10;
   const factionStorageSystem = general.factionStorageSystem || '';
   const factionStorageStation = general.factionStorageStation || '';
@@ -3442,6 +3543,14 @@ function renderGeneralSettings(panel) {
   panel.innerHTML = `
     <h3>General Settings</h3>
     <div class="settings-desc">Fleet-wide settings that apply to all bot routines.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Server Port</div>
+        <div class="setting-hint">Port number the web server listens on. Requires server restart to take effect.</div>
+      </div>
+      <input type="number" id="set-general-port" min="1" max="65535" value="${port}" style="width:100px" />
+    </div>
 
     <div class="setting-row">
       <div>
@@ -3473,6 +3582,7 @@ function saveGeneralSettings() {
   const stationVal = document.getElementById('set-general-factionStation').value;
   const [factionStorageSystem, factionStorageStation] = stationVal ? stationVal.split('|') : ['', ''];
   const s = {
+    port: parseInt(document.getElementById('set-general-port').value) || 3000,
     factionDonatePct: parseInt(document.getElementById('set-general-donatePct').value) || 0,
     factionStorageSystem,
     factionStorageStation,

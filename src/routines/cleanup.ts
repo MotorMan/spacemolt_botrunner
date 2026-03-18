@@ -21,6 +21,10 @@ import {
   sleep,
   logFactionActivity,
   isPirateSystem,
+  getSystemInfo,
+  findStation,
+  isStationPoi,
+  type SystemPOI,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -114,8 +118,13 @@ function resolveStation(stationId: string): { systemId: string; poiId: string; p
   const allSystems = mapStore.getAllSystems();
   for (const [sysId, sys] of Object.entries(allSystems)) {
     for (const poi of sys.pois) {
+      // Match on id, base_id, or base_name (case-insensitive for names)
       if (poi.id === stationId || poi.base_id === stationId) {
         return { systemId: sysId, poiId: poi.id, poiName: poi.base_name || poi.name || poi.id };
+      }
+      // Also match on base_name for convenience (e.g. "sol_central" -> base_name)
+      if (poi.base_name && poi.base_name.toLowerCase() === stationId.toLowerCase()) {
+        return { systemId: sysId, poiId: poi.id, poiName: poi.base_name };
       }
     }
   }
@@ -136,10 +145,12 @@ function getAllKnownStations(homeSystem: string, homeStation: string, focusStati
         if (poi.base_id === focusStationId || poi.id === focusStationId) {
           // Skip the home/faction storage station
           if (sysId === homeSystem && (poi.id === homeStation || poi.base_id === homeStation)) continue;
+          // For stations with bases, use base_id for travel; otherwise use poi.id
+          const travelId = poi.base_id || poi.id;
           stations.push({
-            stationId: poi.base_id || poi.id,
+            stationId: travelId,
             systemId: sysId,
-            poiId: poi.id,
+            poiId: travelId,
             poiName: poi.base_name || poi.name || poi.id,
             hasItems: false,
             hasCredits: false,
@@ -160,10 +171,12 @@ function getAllKnownStations(homeSystem: string, homeStation: string, focusStati
       if (!poi.has_base) continue;
       // Skip the home/faction storage station
       if (sysId === homeSystem && (poi.id === homeStation || poi.base_id === homeStation)) continue;
+      // For stations with bases, use base_id for travel; otherwise use poi.id
+      const travelId = poi.base_id || poi.id;
       stations.push({
-        stationId: poi.base_id || poi.id,
+        stationId: travelId,
         systemId: sysId,
-        poiId: poi.id,
+        poiId: travelId,
         poiName: poi.base_name || poi.name || poi.id,
         hasItems: false,
         hasCredits: false,
@@ -173,93 +186,6 @@ function getAllKnownStations(homeSystem: string, homeStation: string, focusStati
   }
 
   return stations;
-}
-
-/** Transfer all items from personal storage to faction storage at home station. */
-async function transferPersonalToFaction(ctx: RoutineContext, settings: ReturnType<typeof getCleanupSettings>): Promise<void> {
-  const { bot } = ctx;
-  const safetyOpts = {
-    fuelThresholdPct: settings.refuelThreshold,
-    hullThresholdPct: settings.repairThreshold,
-  };
-
-  // Navigate to home system
-  if (bot.system !== settings.homeSystem) {
-    await ensureUndocked(ctx);
-    const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-    if (!fueled) {
-      ctx.log("error", "Cannot refuel for return to home — staying put");
-      return;
-    }
-    ctx.log("travel", `Returning to home system ${settings.homeSystem}...`);
-    const arrived = await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
-    if (!arrived) {
-      ctx.log("error", "Failed to reach home system");
-      return;
-    }
-  }
-
-  // Travel to home station POI
-  await ensureUndocked(ctx);
-  // Resolve home station to POI id (might be a base_id)
-  let homePoiId = settings.homeStation;
-  if (homePoiId) {
-    const resolved = resolveStation(homePoiId);
-    if (resolved) homePoiId = resolved.poiId;
-  } else {
-    // Find any station in the home system
-    const sys = mapStore.getSystem(settings.homeSystem);
-    const station = sys?.pois.find(p => p.has_base);
-    if (station) homePoiId = station.id;
-  }
-
-  if (homePoiId && bot.poi !== homePoiId) {
-    ctx.log("travel", `Traveling to home station...`);
-    const tResp = await bot.exec("travel", { target_poi: homePoiId });
-    if (tResp.error && !tResp.error.message.includes("already")) {
-      ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
-      return;
-    }
-    bot.poi = homePoiId;
-  }
-
-  // Dock
-  await ensureDocked(ctx);
-
-  // Check personal storage and transfer everything to faction storage
-  await bot.refreshStorage();
-  if (bot.storage.length === 0) {
-    ctx.log("info", "Personal storage is empty — nothing to transfer to faction");
-    return;
-  }
-
-  const transferred: string[] = [];
-  for (const item of bot.storage) {
-    if (item.quantity <= 0) continue;
-
-    // Use storage command with action=deposit, target=faction
-    const sResp = await bot.exec("storage", {
-      action: "deposit",
-      target: "faction",
-      item_id: item.itemId,
-      quantity: item.quantity,
-      source: "storage",
-    });
-
-    if (!sResp.error) {
-      transferred.push(`${item.quantity}x ${item.name}`);
-      logFactionActivity(ctx, "transfer", `Transferred ${item.quantity}x ${item.name} from personal to faction storage`);
-    } else {
-      ctx.log("error", `Failed to transfer ${item.name} to faction storage: ${sResp.error.message}`);
-    }
-  }
-
-  if (transferred.length > 0) {
-    ctx.log("trade", `Transferred to faction storage: ${transferred.join(", ")}`);
-    await bot.refreshStorage();
-  } else {
-    ctx.log("info", "No items transferred to faction storage");
-  }
 }
 
 /** Navigate to home station and deposit all non-fuel cargo to faction storage. */
@@ -286,28 +212,91 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     }
   }
 
-  // Travel to home station POI
+  // Travel to home station POI using fresh API data (like return_home.ts)
   await ensureUndocked(ctx);
-  // Resolve home station to POI id (might be a base_id)
-  let homePoiId = settings.homeStation;
-  if (homePoiId) {
-    const resolved = resolveStation(homePoiId);
-    if (resolved) homePoiId = resolved.poiId;
-  } else {
-    // Find any station in the home system
-    const sys = mapStore.getSystem(settings.homeSystem);
-    const station = sys?.pois.find(p => p.has_base);
-    if (station) homePoiId = station.id;
+  
+  // Get fresh system data from API
+  const { pois } = await getSystemInfo(ctx);
+  
+  let targetStation = null;
+
+  // First, try to find by configured homeStation name/id
+  if (settings.homeStation) {
+    targetStation = pois.find(p => 
+      isStationPoi(p) && 
+      (p.id === settings.homeStation || p.base_id === settings.homeStation)
+    );
+    if (!targetStation) {
+      // Also try matching by base_id (case-insensitive)
+      targetStation = pois.find(p => 
+        isStationPoi(p) && 
+        p.base_id && 
+        p.base_id.toLowerCase() === settings.homeStation.toLowerCase()
+      );
+    }
   }
 
-  if (homePoiId && bot.poi !== homePoiId) {
+  // If not found, search for any station with a base in the home system
+  // Skip the focus station (we're collecting FROM there, not depositing TO there)
+  if (!targetStation) {
+    targetStation = pois.find(p =>
+      isStationPoi(p) &&
+      p.has_base &&
+      p.base_id !== settings.focusStationId &&
+      p.id !== settings.focusStationId &&
+      p.id !== bot.poi
+    );
+    if (targetStation) {
+      ctx.log("info", `Using default station in ${settings.homeSystem}: ${targetStation.base_id || targetStation.name || targetStation.id}`);
+    }
+  }
+
+  // If still not found, fall back to "sol" system (the default)
+  if (!targetStation && settings.homeSystem !== "sol") {
+    ctx.log("warn", `No valid home station in ${settings.homeSystem} — falling back to sol system`);
+    // Navigate to sol first
+    const solSystem = "sol";
+    if (bot.system !== solSystem) {
+      const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+      if (fueled) {
+        const arrived = await navigateToSystem(ctx, solSystem, safetyOpts);
+        if (!arrived) {
+          ctx.log("error", "Failed to reach sol system for fallback");
+          return;
+        }
+      } else {
+        ctx.log("error", "Cannot refuel to reach sol system");
+        return;
+      }
+    }
+    // Get fresh system data for sol
+    const { pois: solPois } = await getSystemInfo(ctx);
+    targetStation = solPois.find(p =>
+      isStationPoi(p) &&
+      p.has_base &&
+      p.id !== bot.poi
+    );
+    if (targetStation) {
+      ctx.log("info", `Using fallback station in sol: ${targetStation.base_id || targetStation.name || targetStation.id}`);
+    }
+  }
+
+  if (!targetStation) {
+    ctx.log("error", `Could not find home station (focus: ${settings.focusStationId || 'none'}, current: ${bot.poi}). Configure factionStorageStation in settings.`);
+    return;
+  }
+
+  // For stations with bases, use base_id for travel (game API expects base_id for faction stations)
+  const targetPoiId = targetStation.base_id && targetStation.has_base ? targetStation.base_id : targetStation.id;
+  
+  if (bot.poi !== targetPoiId) {
     ctx.log("travel", `Traveling to home station...`);
-    const tResp = await bot.exec("travel", { target_poi: homePoiId });
+    const tResp = await bot.exec("travel", { target_poi: targetPoiId });
     if (tResp.error && !tResp.error.message.includes("already")) {
       ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
       return;
     }
-    bot.poi = homePoiId;
+    bot.poi = targetPoiId;
   }
 
   // Dock
@@ -356,11 +345,6 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       hullThresholdPct: settings.repairThreshold,
     };
 
-    // ── Phase 0: Transfer personal storage to faction storage (FIRST) ──
-    yield "transfer_personal_to_faction";
-    ctx.log("info", "Checking personal storage and transferring to faction storage...");
-    await transferPersonalToFaction(ctx, settings);
-
     // ── Phase 1: Remote scan — discover which stations have our stuff ──
     yield "remote_scan";
     const focusMode = settings.focusStationId ? ` (focus: ${settings.focusStationId})` : "";
@@ -378,7 +362,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     const stationsWithStorage: StationTarget[] = [];
 
     if (hintEntries.length > 0) {
-      ctx.log("info", `Hint lists ${hintEntries.length} station(s) with storage`);
+      ctx.log("info", `Hint lists ${hintEntries.length} station(s) with storage — verifying each remotely...`);
       for (const entry of hintEntries) {
         const sid = entry.station_id || entry.base_id || entry.poi_id || "";
         if (!sid) continue;
@@ -398,7 +382,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
             systemId: resolved.systemId,
             poiId: resolved.poiId,
             poiName: resolved.poiName,
-            hasItems: true,
+            hasItems: false,
             hasCredits: false,
             hasOrders: false,
           };
@@ -408,15 +392,32 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
             systemId: entry.system_id,
             poiId: sid,
             poiName: entry.name || sid,
-            hasItems: true,
+            hasItems: false,
             hasCredits: false,
             hasOrders: false,
           };
         }
 
-        if (target) {
-          target.hasItems = true;
+        if (!target) continue;
+
+        // Remotely verify this station actually has items/credits
+        const remote = await bot.viewStorage(target.stationId);
+        const credits = (remote.credits as number) || (remote.stored_credits as number) || 0;
+        const itemArray = (
+          Array.isArray(remote) ? remote :
+          Array.isArray(remote.items) ? remote.items :
+          Array.isArray(remote.storage) ? remote.storage :
+          []
+        ) as Array<Record<string, unknown>>;
+        const hasItems = itemArray.some(
+          (i: Record<string, unknown>) => ((i.quantity as number) || 0) > 0
+        );
+
+        if (credits > 0 || hasItems) {
+          target.hasCredits = credits > 0;
+          target.hasItems = hasItems;
           stationsWithStorage.push(target);
+          ctx.log("info", `  ${target.poiName}: ${credits > 0 ? credits + "cr" : ""}${hasItems ? " + items" : ""}`);
         }
       }
     } else {
@@ -631,11 +632,6 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Summary
     ctx.log("info", `Cleanup complete: ${totalCredits}cr + ${totalItems} items collected from ${stationsWithStorage.length} station(s)`);
-
-    // ── Phase 4: Final personal storage to faction transfer ──
-    yield "final_personal_transfer";
-    ctx.log("info", "Final check: transferring any remaining personal storage to faction...");
-    await transferPersonalToFaction(ctx, settings);
 
     // Maintenance at home
     await ensureDocked(ctx);

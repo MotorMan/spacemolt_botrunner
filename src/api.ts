@@ -2,6 +2,7 @@ import { log, logError } from "./ui.js";
 import { commandLog } from "./commandLogger.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { serverDisconnectDetector } from "./serverdisconnectdetector.js";
+import { debugLog } from "./debug.js";
 
 export interface ApiSession {
   id: string;
@@ -351,9 +352,25 @@ export class SpaceMoltAPI {
   }
 
   private async ensureSession(): Promise<void> {
-    if (this.session && !this.isSessionExpiring()) return;
+    const botName = this._botName || "unknown";
+    
+    // Check if we have a session and if it's expiring
+    const hasSession = !!this.session;
+    const isExpiring = hasSession ? this.isSessionExpiring() : true;
+    
+    debugLog("api:ensureSession", `${botName} ensureSession called`, { 
+      hasSession, 
+      isExpiring, 
+      sessionId: this.session?.id.slice(0, 8),
+      expiresAt: this.session?.expiresAt 
+    });
+    
+    if (hasSession && !isExpiring) {
+      debugLog("api:ensureSession", `${botName} session still valid, skipping renewal`);
+      return;
+    }
 
-    const isRenewal = !!this.session;
+    const isRenewal = hasSession;
     log("system", isRenewal ? "Renewing session..." : "Creating new session...");
 
     // Build headers — include existing session ID for renewal
@@ -402,21 +419,51 @@ export class SpaceMoltAPI {
     if (!this.session) return true;
     const expiresAt = new Date(this.session.expiresAt).getTime();
     const now = Date.now();
-    return expiresAt - now < 240_000; // Less than 240s remaining
+    const remaining = expiresAt - now;
+    const remainingSecs = Math.round(remaining / 1000);
+    debugLog("api:session", `${this._botName || "unknown"} session check: ${remainingSecs}s remaining`, { 
+      expiresAt: this.session.expiresAt, 
+      now: new Date(now).toISOString(),
+      isExpiring: remaining < 240_000 
+    });
+    return remaining < 240_000; // Less than 240s remaining
   }
 
   private isV2SessionExpiring(): boolean {
     if (!this.v2Session) return true;
     const expiresAt = new Date(this.v2Session.expiresAt).getTime();
     const now = Date.now();
-    return expiresAt - now < 240_000;
+    const remaining = expiresAt - now;
+    const remainingSecs = Math.round(remaining / 1000);
+    debugLog("api:session", `${this._botName || "unknown"} v2 session check: ${remainingSecs}s remaining`, { 
+      expiresAt: this.v2Session.expiresAt, 
+      now: new Date(now).toISOString(),
+      isExpiring: remaining < 240_000 
+    });
+    return remaining < 240_000;
   }
 
   /** Create and authenticate a v2 session (separate session store from v1). */
   private async ensureV2Session(): Promise<void> {
-    if (this.v2Session && !this.isV2SessionExpiring()) return;
+    const botName = this._botName || "unknown";
+    
+    // Check if we have a v2 session and if it's expiring
+    const hasSession = !!this.v2Session;
+    const isExpiring = hasSession ? this.isV2SessionExpiring() : true;
+    
+    debugLog("api:ensureV2Session", `${botName} ensureV2Session called`, { 
+      hasSession, 
+      isExpiring, 
+      sessionId: this.v2Session?.id.slice(0, 8),
+      expiresAt: this.v2Session?.expiresAt 
+    });
+    
+    if (hasSession && !isExpiring) {
+      debugLog("api:ensureV2Session", `${botName} v2 session still valid, skipping renewal`);
+      return;
+    }
 
-    const isRenewal = !!this.v2Session;
+    const isRenewal = hasSession;
     const v2Base = this.baseUrl.replace("/api/v1", "/api/v2");
     log("system", isRenewal ? "Renewing v2 session..." : "Creating v2 session...");
 

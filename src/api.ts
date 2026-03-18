@@ -387,14 +387,14 @@ export class SpaceMoltAPI {
     if (!this.session) return true;
     const expiresAt = new Date(this.session.expiresAt).getTime();
     const now = Date.now();
-    return expiresAt - now < 60_000; // Less than 60s remaining
+    return expiresAt - now < 240_000; // Less than 240s remaining
   }
 
   private isV2SessionExpiring(): boolean {
     if (!this.v2Session) return true;
     const expiresAt = new Date(this.v2Session.expiresAt).getTime();
     const now = Date.now();
-    return expiresAt - now < 60_000;
+    return expiresAt - now < 240_000;
   }
 
   /** Create and authenticate a v2 session (separate session store from v1). */

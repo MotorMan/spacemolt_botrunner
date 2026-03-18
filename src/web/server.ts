@@ -54,6 +54,8 @@ function loadSettings(): RoutineSettings {
   return {};
 }
 
+export { loadSettings };
+
 function saveSettings(s: RoutineSettings): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
   writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2) + "\n", "utf-8");
@@ -254,6 +256,17 @@ export class WebServer {
             return Response.json(result);
           }
           return Response.json({ ok: false, error: "No action handler" });
+        }
+
+        // Serve index.css
+        if (url.pathname === "/index.css") {
+          const cssPath = join(import.meta.dir, "index.css");
+          return new Response(readFileSync(cssPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/css; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
         }
 
         // Serve index.html for all other routes (read fresh for dev, no cache)

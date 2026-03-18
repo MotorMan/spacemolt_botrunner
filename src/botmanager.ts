@@ -19,10 +19,11 @@ import { cargoMoverRoutine } from "./routines/cargo_mover.js";
 import { returnHomeRoutine } from "./routines/return_home.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
-import { WebServer, type WebAction, type WebActionResult } from "./web/server.js";
+import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
 import { setLogSink } from "./ui.js";
 import { debugLog } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
+import { serverDisconnectDetector } from "./serverdisconnectdetector.js";
 import { AiChatService } from "./aichat_service.js";
 
 const BASE_DIR = process.cwd();
@@ -64,6 +65,12 @@ function discoverBots(): void {
       const bot = new Bot(name, BASE_DIR);
       setupBotLogging(bot);
       bots.set(name, bot);
+      // Register with server disconnect detector
+      serverDisconnectDetector.registerBot({
+        name: bot.username,
+        api: bot.api,
+        credentials: bot.session.loadCredentials(),
+      });
     }
   }
 }
@@ -278,6 +285,8 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
   }
 
   bots.delete(botName);
+  // Unregister from server disconnect detector
+  serverDisconnectDetector.unregisterBot(botName);
   server.clearBotAssignment(botName);
   server.removePerBotSettings(botName);
 
@@ -304,6 +313,12 @@ async function handleAdd(action: WebAction): Promise<WebActionResult> {
   const bot = new Bot(username, BASE_DIR);
   setupBotLogging(bot);
   bots.set(username, bot);
+  // Register with server disconnect detector
+  serverDisconnectDetector.registerBot({
+    name: bot.username,
+    api: bot.api,
+    credentials: { username, password },
+  });
 
   server.logSystem(`Verifying credentials for ${username}...`);
   const ok = await bot.login();
@@ -350,6 +365,12 @@ async function handleRegister(action: WebAction): Promise<WebActionResult> {
   const bot = new Bot(username, BASE_DIR);
   setupBotLogging(bot);
   bots.set(username, bot);
+  // Register with server disconnect detector
+  serverDisconnectDetector.registerBot({
+    name: bot.username,
+    api: bot.api,
+    credentials: { username, password },
+  });
   server.logSystem(`Bot added: ${username}`);
   refreshStatusTable();
 
@@ -475,7 +496,9 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
 // ── Main ────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const port = parseInt(process.env.PORT || "3000", 10);
+  // Load port from settings.json (general.port), env var, or default to 3000
+  const settings = loadSettings();
+  const port = parseInt(process.env.PORT || String(settings.general?.port || 3000), 10);
   server = new WebServer(port);
   server.routines = Object.keys(ROUTINES);
   server.onAction = handleAction;
@@ -520,6 +543,18 @@ async function main(): Promise<void> {
   // Expose on globalThis for bot.ts to access
   (globalThis as any).aiChatService = aiChatService;
   server.logSystem("AI Chat service initialized");
+
+  // Set up server-wide disconnect detection callback
+  serverDisconnectDetector.onServerDown(async (affectedBots) => {
+    server.logSystem(`Server disconnect detected affecting ${affectedBots.length} bot(s): ${affectedBots.join(", ")}`);
+    // Stop all running bots to prevent errors during reconnection
+    for (const [, bot] of bots) {
+      if (bot.state === "running") {
+        bot.stop();
+        server.logSystem(`Stopped ${bot.username} during server reconnection`);
+      }
+    }
+  });
 
   server.logSystem("SpaceMolt Bot Manager v0.2");
   server.logSystem("Loading saved sessions...");
@@ -650,6 +685,8 @@ async function main(): Promise<void> {
     }
     // Clear reconnection queue to release any pending reconnection attempts
     reconnectQueue.clear();
+    // Reset server disconnect detector
+    serverDisconnectDetector.reset();
     // Flush persistent data
     mapStore.flush();
     catalogStore.flush();

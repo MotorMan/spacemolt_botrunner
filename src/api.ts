@@ -1,6 +1,7 @@
 import { log, logError } from "./ui.js";
 import { commandLog } from "./commandLogger.js";
 import { reconnectQueue } from "./reconnectqueue.js";
+import { serverDisconnectDetector } from "./serverdisconnectdetector.js";
 
 export interface ApiSession {
   id: string;
@@ -305,6 +306,20 @@ export class SpaceMoltAPI {
     needsV2: boolean
   ): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
+    
+    // Report disconnect to server-wide detector
+    const serverDownTriggered = serverDisconnectDetector.reportDisconnect(botName);
+    if (serverDownTriggered) {
+      log("system", `${botName} disconnect triggered server-wide detection - waiting for coordinated reconnect...`);
+      return { error: { code: "server_down", message: "Server down detected - waiting for coordinated reconnection" } };
+    }
+
+    // If server-wide reconnect is already in progress, wait for it
+    if (serverDisconnectDetector.isReconnecting()) {
+      log("system", `${botName} - coordinated reconnection in progress, waiting...`);
+      return { error: { code: "server_down", message: "Coordinated reconnection in progress" } };
+    }
+
     log("system", `${botName} requesting reconnection via global queue...`);
 
     try {

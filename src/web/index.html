@@ -129,6 +129,9 @@
         <div class="sidebar-item" onclick="switchSettingsTab('ai_chat')">AI Chat Service</div>
         <div class="sidebar-item" onclick="switchSettingsTab('hunter')">Hunter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cargo_mover')">CargoMover</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('fuel_transfer')">FuelTransfer</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('manual_rescue')">ManualRescue</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('mayday')">MaydayRescue</div>
       </div>
       <div class="settings-panel" id="settingsContent">
         <!-- filled by JS -->
@@ -605,6 +608,9 @@ function connect() {
         }
         // Load faction log
         factionLogLines = msg.logs?.faction || [];
+        
+        // Re-initialize rescue systems dropdown if profile is open
+        if (profileBot) mcInitRescueSystems();
         break;
       case 'status':
         bots = msg.bots || [];
@@ -899,6 +905,7 @@ function openProfile(username) {
   profileSkills = {};
   profileSkillsList = null;
   profileFactionStorage = null;
+  nearbyPlayersCache = [];
 
   // Hide all tabs, show profile
   document.querySelectorAll('.top-tab').forEach(t => t.classList.remove('active'));
@@ -918,6 +925,12 @@ function openProfile(username) {
   if (botObj && botObj.docked) fetchMarket(username);
   // Fetch faction storage (will fail gracefully if not at station)
   fetchFactionStorage(username);
+
+  // Refresh nearby players list for manual refuel control
+  mcRefreshNearbyPlayers();
+  
+  // Initialize rescue mission system dropdown
+  mcInitRescueSystems();
 }
 
 function closeProfile() {
@@ -1543,6 +1556,36 @@ function renderManualControls() {
       <button class="sm" onclick="mcExec('repair')">Repair</button>
     </div>
 
+    <div class="cmd-group">
+      <label>Refuel Player</label>
+      <select id="mc-refuel-player"><option value="">Loading...</option></select>
+      <button class="sm" onclick="mcRefreshNearbyPlayers()" title="Refresh nearby players list">Refresh</button>
+      <button class="primary sm" onclick="mcRefuelPlayer()">Refuel</button>
+    </div>
+
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Manual Player Rescue</label>
+    </div>
+
+    <div class="cmd-group">
+      <label>System</label>
+      <select id="mc-rescue-system" onchange="mcPopulateRescuePOIs()"><option value="">Select system...</option></select>
+    </div>
+
+    <div class="cmd-group">
+      <label>POI</label>
+      <select id="mc-rescue-poi"><option value="">Select system first...</option></select>
+    </div>
+
+    <div class="cmd-group">
+      <label>Player Name</label>
+      <input type="text" id="mc-rescue-player" placeholder="Enter player username..." style="width:100%">
+    </div>
+
+    <div class="cmd-group">
+      <button class="danger sm" onclick="mcStartManualRescue()" style="width:100%">🚀 Start Rescue Mission</button>
+    </div>
+
     ${craftSection}
 
     <div class="cmd-group">
@@ -1789,6 +1832,213 @@ function mcJettison() {
   }
   // Jettison command: "jettison item_id quantity"
   mcExec('jettison', { item_id: itemId, quantity: qty });
+}
+
+// ── Refuel Player Command ───────────────────────────────────
+
+let nearbyPlayersCache = [];
+
+/** Fetch nearby players and populate the dropdown */
+function mcRefreshNearbyPlayers() {
+  if (!profileBot) return;
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > get_nearby</span>`);
+
+  sendExec(profileBot, 'get_nearby', {}, (result) => {
+    if (result.ok && result.data) {
+      // Parse nearby players from the result
+      // Result format: { players: [...], pirates: [...], ships: [...] } or { nearby: [...] }
+      const data = result.data;
+      const players = data.players || data.nearby || data.ships || [];
+      
+      nearbyPlayersCache = players.filter(p => {
+        // Filter to only include players with valid player_id and username
+        const playerId = p.player_id || p.id;
+        const username = p.username || p.name;
+        // Exclude self
+        return playerId && username && username !== profileBot;
+      });
+
+      // Populate dropdown
+      const select = document.getElementById('mc-refuel-player');
+      if (select) {
+        if (nearbyPlayersCache.length === 0) {
+          select.innerHTML = '<option value="">No nearby players</option>';
+          logResponse('<span class="resp-warn">No nearby players found</span>');
+        } else {
+          select.innerHTML = nearbyPlayersCache.map(p => {
+            const playerId = p.player_id || p.id;
+            const username = p.username || p.name;
+            const shipType = p.ship_type ? ` (${p.ship_type})` : '';
+            return `<option value="${esc(playerId)}">${esc(username)}${esc(shipType)}</option>`;
+          }).join('');
+          logResponse(`<span class="resp-ok">Found ${nearbyPlayersCache.length} nearby player(s)</span>`);
+        }
+      }
+    } else {
+      logResponse(`<span class="resp-err">Failed to get nearby players: ${esc(result.error || 'unknown error')}</span>`);
+      const select = document.getElementById('mc-refuel-player');
+      if (select) {
+        select.innerHTML = '<option value="">Error loading players</option>';
+      }
+    }
+  });
+}
+
+/** Execute refuel command on selected player */
+function mcRefuelPlayer() {
+  if (!profileBot) return;
+
+  const select = document.getElementById('mc-refuel-player');
+  if (!select) return;
+
+  const playerId = select.value;
+  if (!playerId) {
+    logResponse('<span class="resp-err">Select a player to refuel</span>');
+    return;
+  }
+
+  // Find the player name for display
+  const player = nearbyPlayersCache.find(p => (p.player_id || p.id) === playerId);
+  const playerName = player ? (player.username || player.name) : 'Unknown';
+
+  // Execute refuel command with target parameter
+  mcExec('refuel', { target: playerId });
+}
+
+// ── Manual Player Rescue Mission ───────────────────────────
+
+let rescuePOIsBySystem = {};  // Cache of POIs by system ID (not used - we use profileSystemData now)
+
+/** Populate POI dropdown when system is selected - uses existing profileSystemData */
+function mcPopulateRescuePOIs() {
+  const systemSelect = document.getElementById('mc-rescue-system');
+  const poiSelect = document.getElementById('mc-rescue-poi');
+
+  if (!systemSelect || !poiSelect) return;
+
+  const systemId = systemSelect.value;
+
+  if (!systemId) {
+    poiSelect.innerHTML = '<option value="">Select system first...</option>';
+    return;
+  }
+
+  // Use profileSystemData if we're in the current bot's system
+  const bot = getProfileBot();
+  if (bot && bot.system === systemId && profileSystemData && profileSystemData.pois) {
+    const pois = profileSystemData.pois;
+    if (pois.length === 0) {
+      poiSelect.innerHTML = '<option value="">No POIs in this system</option>';
+    } else {
+      poiSelect.innerHTML = pois.map(p => {
+        const label = p.name ? `${p.name} (${p.type || 'unknown'})` : p.id;
+        return `<option value="${esc(p.id)}">${esc(label)}</option>`;
+      }).join('');
+    }
+    return;
+  }
+
+  // For other systems, use mapData cache
+  if (mapData && mapData[systemId]) {
+    const sysData = mapData[systemId];
+    const pois = sysData.pois || [];
+
+    if (pois.length === 0) {
+      poiSelect.innerHTML = '<option value="">No POIs in this system</option>';
+    } else {
+      poiSelect.innerHTML = pois.map(p => {
+        const label = p.name ? `${p.name} (${p.type || 'unknown'})` : p.id;
+        return `<option value="${esc(p.id)}">${esc(label)}</option>`;
+      }).join('');
+    }
+    return;
+  }
+
+  // No data available
+  poiSelect.innerHTML = '<option value="">POIs not loaded - travel there first or select current system</option>';
+}
+
+/** Initialize system dropdown - uses existing knownSystems (same as Jump To dropdown) */
+function mcInitRescueSystems() {
+  const systemSelect = document.getElementById('mc-rescue-system');
+  if (!systemSelect) {
+    console.error('mcInitRescueSystems: mc-rescue-system element not found');
+    return;
+  }
+
+  // Use knownSystems from map data (same source as Jump To dropdown)
+  if (knownSystems && knownSystems.length > 0) {
+    const currentSys = profileBot ? (bots.find(b => b.username === profileBot)?.system || '') : '';
+    systemSelect.innerHTML = '<option value="">Select a system...</option>' +
+      knownSystems
+        .filter(s => s.id !== currentSys)  // Exclude current system like Jump To does
+        .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id))
+        .map(s => {
+          const label = s.name ? `${s.name} (${s.id})` : s.id;
+          return `<option value="${esc(s.id)}">${esc(label)}</option>`;
+        }).join('');
+  } else {
+    systemSelect.innerHTML = '<option value="">No systems mapped</option>';
+  }
+}
+
+/** Start a manual player rescue mission */
+function mcStartManualRescue() {
+  if (!profileBot) {
+    logResponse('<span class="resp-err">No bot selected</span>');
+    return;
+  }
+  
+  const systemSelect = document.getElementById('mc-rescue-system');
+  const poiSelect = document.getElementById('mc-rescue-poi');
+  const playerInput = document.getElementById('mc-rescue-player');
+  
+  if (!systemSelect || !poiSelect || !playerInput) {
+    logResponse('<span class="resp-err">UI elements not found</span>');
+    return;
+  }
+  
+  const systemId = systemSelect.value;
+  const poiId = poiSelect.value;
+  const playerName = playerInput.value.trim();
+  
+  // Validate inputs
+  if (!systemId) {
+    logResponse('<span class="resp-err">Please select a system</span>');
+    return;
+  }
+  
+  if (!poiId) {
+    logResponse('<span class="resp-err">Please select a POI</span>');
+    return;
+  }
+  
+  if (!playerName) {
+    logResponse('<span class="resp-err">Please enter a player name</span>');
+    return;
+  }
+  
+  // Start the manual rescue routine
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > starting manual rescue mission</span>`);
+  logResponse(`<span class="resp-info">Target: ${esc(playerName)} at ${esc(systemId)} / ${esc(poiId)}</span>`);
+
+  // Send start action with parameters to botmanager
+  send({
+    type: 'start',
+    bot: profileBot,
+    routine: 'manual_rescue',
+    params: {
+      targetSystem: systemId,
+      targetPOI: poiId,
+      targetPlayer: playerName
+    }
+  });
+
+  logResponse(`<span class="resp-ok">✓ Rescue mission started!</span>`);
+  logResponse(`<span class="resp-info">Bot will navigate to ${esc(systemId)}, locate ${esc(playerName)}, and refuel them</span>`);
 }
 
 // ── Deposit All Queue System ───────────────────────────────
@@ -3520,6 +3770,12 @@ function renderSettingsPanel() {
     renderHunterSettings(panel);
   } else if (activeSettingsTab === 'cargo_mover') {
     renderCargoMoverSettings(panel);
+  } else if (activeSettingsTab === 'fuel_transfer') {
+    renderFuelTransferSettings(panel);
+  } else if (activeSettingsTab === 'manual_rescue') {
+    renderManualRescueSettings(panel);
+  } else if (activeSettingsTab === 'mayday') {
+    renderMaydaySettings(panel);
   }
 }
 
@@ -4327,6 +4583,102 @@ function saveRescueSettings() {
   send({ type: 'saveSettings', routine: 'rescue', settings: s });
 }
 
+// ── MaydayRescue settings ──────────────────────────────────
+function renderMaydaySettings(panel) {
+  const m = settings.mayday || {};
+  const fuelThreshold = m.fuelThreshold ?? 25;
+  const autoRefuel = m.autoRefuel !== false;
+
+  panel.innerHTML = `
+    <h3 style="margin:0 0 12px;color:var(--text)">MaydayRescue Settings</h3>
+    <p style="color:var(--dim);font-size:0.85em;margin:0 0 16px">
+      Automatically responds to MAYDAY emergency chat messages from stranded pilots.
+      Validates requests to avoid ambushes by only responding to ships with critically low fuel.
+    </p>
+
+    <div class="settings-group">
+      <label>Max fuel threshold to respond (%)</label>
+      <input type="number" id="set-mayday-fuelThreshold" value="${fuelThreshold}" min="5" max="50" style="width:80px">
+      <small style="color:var(--dim)">Only respond to MAYDAYs where pilot has less than this % fuel (avoids ambushes)</small>
+    </div>
+
+    <div class="settings-group">
+      <label style="display:flex;align-items:center;gap:8px">
+        <input type="checkbox" id="set-mayday-autoRefuel" ${autoRefuel ? 'checked' : ''}>
+        Auto-refuel after each rescue
+      </label>
+      <small style="color:var(--dim)">Automatically refuel to 100% after completing a rescue mission</small>
+    </div>
+
+    <div class="settings-hint" style="margin-top:16px;padding:12px;background:rgba(255,100,100,0.1);border-left:3px solid var(--red)">
+      <strong>⚠️ Ambush Protection:</strong> Always verify the MAYDAY sender's fuel level before responding.
+      The default 25% threshold helps filter out fake distress calls from pirates.
+    </div>
+
+    <button class="btn" onclick="saveMaydaySettings()" style="margin-top:16px">Save</button>
+  `;
+}
+
+function saveMaydaySettings() {
+  const s = {
+    fuelThreshold: parseInt(document.getElementById('set-mayday-fuelThreshold').value) || 25,
+    autoRefuel: document.getElementById('set-mayday-autoRefuel').checked,
+  };
+  send({ type: 'saveSettings', routine: 'mayday', settings: s });
+  alert('MaydayRescue settings saved!');
+}
+
+// ── FuelTransfer settings ──────────────────────────────────
+function renderFuelTransferSettings(panel) {
+  const f = settings.fuel_transfer || {};
+  const refuelThreshold = f.refuelThreshold ?? 60;
+
+  panel.innerHTML = `
+    <h3 style="margin:0 0 12px;color:var(--text)">FuelTransfer Settings</h3>
+    <p style="color:var(--dim);font-size:0.85em;margin:0 0 16px">
+      Uses a dedicated fuel transfer ship with Refueling Pump module to directly refuel stranded ships.
+      Requires the refueling_pump module to be installed on the ship.
+    </p>
+
+    <div class="settings-group">
+      <label>Self refuel threshold (%)</label>
+      <input type="number" id="set-fueltransfer-refuelThreshold" value="${refuelThreshold}" min="30" max="90" style="width:80px">
+      <small style="color:var(--dim)">Keep transfer ship's own fuel above this level</small>
+    </div>
+
+    <button class="btn" onclick="saveFuelTransferSettings()" style="margin-top:16px">Save</button>
+  `;
+}
+
+function saveFuelTransferSettings() {
+  const s = {
+    refuelThreshold: parseInt(document.getElementById('set-fueltransfer-refuelThreshold').value) || 60,
+  };
+  send({ type: 'saveSettings', routine: 'fuel_transfer', settings: s });
+  alert('FuelTransfer settings saved!');
+}
+
+// ── ManualRescue settings ──────────────────────────────────
+function renderManualRescueSettings(panel) {
+  panel.innerHTML = `
+    <h3 style="margin:0 0 12px;color:var(--text)">ManualRescue Settings</h3>
+    <p style="color:var(--dim);font-size:0.85em;margin:0 0 16px">
+      Manual player rescue missions are initiated from the bot's profile page.
+      Use the Manual Player Rescue controls to send a rescue bot to a specific player at a specific location.
+    </p>
+
+    <div class="settings-hint" style="padding:12px;background:rgba(100,100,255,0.1);border-left:3px solid var(--blue)">
+      <strong>ℹ️ How to use:</strong>
+      <ol style="margin:8px 0 0 16px;color:var(--dim)">
+        <li>Open a bot's profile page</li>
+        <li>Scroll to "Manual Player Rescue" section</li>
+        <li>Select system, POI, and enter player name</li>
+        <li>Click "🚀 Start Rescue Mission"</li>
+      </ol>
+    </div>
+  `;
+}
+
 // ── Coordinator Settings ────────────────────────────────────
 function renderCoordinatorSettings(panel) {
   const c = settings.coordinator || {};
@@ -4881,6 +5233,7 @@ function renderAiChatSettings(panel) {
   const respondToMentions = ac.respondToMentions ?? true;
   const respondToQuestions = ac.respondToQuestions ?? false;
   const respondToAll = ac.respondToAll ?? false;
+  const respondToSystem = ac.respondToSystem ?? false;
   const personality = ac.personality || '';
   const lockDurationSec = ac.lockDurationSec ?? 60;
 
@@ -4889,7 +5242,7 @@ function renderAiChatSettings(panel) {
 
   panel.innerHTML = `
     <h3>AI Chat Settings</h3>
-    <div class="settings-desc">Configure the AI chat bot that responds to players in local and faction chat. Values here override environment variables.</div>
+    <div class="settings-desc">Configure the AI chat bot that responds to players in local, faction, system, and private chat. Values here override environment variables.</div>
 
     <div class="setting-row">
       <div>
@@ -4960,6 +5313,10 @@ function renderAiChatSettings(panel) {
           <input type="checkbox" id="set-aichat-respondToAll" ${respondToAll ? 'checked' : ''}>
           <span style="font-size:12px;color:var(--text)">Respond to ALL messages (spammy!)</span>
         </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" id="set-aichat-respondToSystem" ${respondToSystem ? 'checked' : ''}>
+          <span style="font-size:12px;color:var(--text)">Respond to SYSTEM chat</span>
+        </label>
       </div>
     </div>
 
@@ -4987,6 +5344,7 @@ function saveAiChatSettings() {
     respondToMentions: document.getElementById('set-aichat-respondToMentions').checked,
     respondToQuestions: document.getElementById('set-aichat-respondToQuestions').checked,
     respondToAll: document.getElementById('set-aichat-respondToAll').checked,
+    respondToSystem: document.getElementById('set-aichat-respondToSystem').checked,
     personality: document.getElementById('set-aichat-personality').value.trim(),
     lockDurationSec: parseInt(document.getElementById('set-aichat-lockDurationSec').value) || 60,
   };

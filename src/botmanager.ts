@@ -5,7 +5,7 @@ import { SessionManager } from "./session.js";
 import { minerRoutine } from "./routines/miner.js";
 import { explorerRoutine } from "./routines/explorer.js";
 import { crafterRoutine } from "./routines/crafter.js";
-import { rescueRoutine } from "./routines/rescue.js";
+import { rescueRoutine, fuelTransferRoutine, manualPlayerRescueRoutine, maydayRescueRoutine } from "./routines/rescue.js";
 import { coordinatorRoutine } from "./routines/coordinator.js";
 import { traderRoutine } from "./routines/trader.js";
 import { gasHarvesterRoutine } from "./routines/gas_harvester.js";
@@ -49,6 +49,9 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   explorer: { name: "Explorer", fn: explorerRoutine },
   crafter: { name: "Crafter", fn: crafterRoutine },
   rescue: { name: "FuelRescue", fn: rescueRoutine },
+  fuel_transfer: { name: "FuelTransfer", fn: fuelTransferRoutine },
+  manual_rescue: { name: "ManualRescue", fn: manualPlayerRescueRoutine },
+  mayday: { name: "MaydayRescue", fn: maydayRescueRoutine },
   coordinator: { name: "Coordinator", fn: coordinatorRoutine },
   trader: { name: "Trader", fn: traderRoutine },
   gas_harvester: { name: "GasHarvester", fn: gasHarvesterRoutine },
@@ -189,6 +192,11 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
 
   server.logSystem(`Starting ${bot.username} with ${routine.name} routine...`);
 
+  // Store routine parameters on bot object if provided (for manual_rescue etc.)
+  if (action.params) {
+    (bot as unknown as Record<string, unknown>).routineParams = action.params;
+  }
+
   const startOpts = (routineKey === "rescue" || routineKey === "coordinator")
     ? { getFleetStatus: () => [...bots.values()].map(b => b.status()) }
     : undefined;
@@ -196,10 +204,14 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   bot.start(routineKey, routine.fn, startOpts).then(() => {
     server.logSystem(`Bot ${bot.username} routine finished.`);
     server.clearBotAssignment(botName);
+    // Clear params after routine completes
+    (bot as unknown as Record<string, unknown>).routineParams = undefined;
   }).catch((err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);
     server.logSystem(`Bot ${bot.username} stopped with error: ${msg}`);
     server.clearBotAssignment(botName);
+    // Clear params after error
+    (bot as unknown as Record<string, unknown>).routineParams = undefined;
   });
 
   server.saveBotAssignment(botName, routineKey);
@@ -558,10 +570,10 @@ async function main(): Promise<void> {
 
   // Set up server-wide disconnect detection callback
   serverDisconnectDetector.onServerDown({
-    stopBots: async (affectedBots) => {
+    stopBots: async (affectedBots: string[]) => {
       server.logSystem(`Server disconnect detected affecting ${affectedBots.length} bot(s): ${affectedBots.join(", ")}`);
       const botStates = new Map<string, BotState>();
-      
+
       // Save state of all bots and stop running ones
       for (const [, bot] of bots) {
         const assignments = server.getBotAssignments();
@@ -569,34 +581,44 @@ async function main(): Promise<void> {
           wasRunning: bot.state === "running",
           routine: assignments[bot.username] || null,
         });
-        
+
         if (bot.state === "running") {
           bot.stop();
           server.logSystem(`Stopped ${bot.username} during server reconnection`);
         }
       }
-      
+
       return botStates;
     },
-    restartBots: async (botStates) => {
+    restartBots: async (botStates: Map<string, BotState>) => {
       const assignments = server.getBotAssignments();
       let restartedCount = 0;
+      const BOT_RESTART_DELAY_MS = 25000; // CRITICAL: 25s delay between bot restarts to prevent login rate limiting
+
+      // Convert to array and process with delays
+      const botsToRestart = [...botStates.entries()].filter(([_, state]) => state.wasRunning && state.routine);
       
-      for (const [botName, state] of botStates) {
-        if (!state.wasRunning || !state.routine) continue;
-        
-        const bot = bots.get(botName);
-        if (!bot) continue;
-        
-        // Check if routine still exists
+      for (let i = 0; i < botsToRestart.length; i++) {
+        const [botName, state] = botsToRestart[i];
         const routine = ROUTINES[state.routine];
+        
         if (!routine) {
           server.logSystem(`Skipping ${botName}: routine ${state.routine} no longer exists`);
           continue;
         }
-        
+
+        // CRITICAL: Delay before each bot restart (except first) - prevents login storm
+        if (i > 0) {
+          server.logSystem(`Waiting ${BOT_RESTART_DELAY_MS / 1000}s before restarting ${botName}...`);
+          await new Promise(r => setTimeout(r, BOT_RESTART_DELAY_MS));
+        }
+
         server.logSystem(`Restarting ${botName} with ${routine.name} routine...`);
-        
+
+        const bot = bots.get(botName);
+        if (!bot) continue;
+
+        // Start routine immediately after login - gameplay commands don't have the same rate limits as login
         bot.start(state.routine, routine.fn).then(() => {
           server.logSystem(`Bot ${botName} routine finished.`);
           server.clearBotAssignment(botName);
@@ -605,11 +627,11 @@ async function main(): Promise<void> {
           server.logSystem(`Bot ${botName} stopped with error: ${msg}`);
           server.clearBotAssignment(botName);
         });
-        
+
         server.saveBotAssignment(botName, state.routine);
         restartedCount++;
       }
-      
+
       server.logSystem(`Restarted ${restartedCount} bot(s) with their saved routines`);
     },
   });

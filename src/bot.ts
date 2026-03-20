@@ -3,6 +3,7 @@ import { SessionManager, type Credentials } from "./session.js";
 import { log, logError, logNotifications } from "./ui.js";
 import { debugLog } from "./debug.js";
 import { mapStore } from "./mapstore.js";
+import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -562,6 +563,17 @@ export class Bot {
           const content = (data.content as string) || "";
 
           this.log("chat", `Received [${channel}] ${sender}: ${content}`);
+
+          // Check for MAYDAY emergency rescue requests
+          if (channel === "emergency" || content.includes("MAYDAY")) {
+            const mayday = parseMaydayMessage(content, sender, Date.now(), this.username, this.system, this.poi);
+            if (mayday) {
+              const added = addMaydayRequest(mayday);
+              if (added) {
+                this.log("mayday", `🚨 MAYDAY received from ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+              }
+            }
+          }
 
           // Route to AI chat handler if available
           if (aiChatService && typeof aiChatService.addChatMessage === "function") {

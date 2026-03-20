@@ -30,12 +30,14 @@ interface BotState {
 const DISCONNECT_WINDOW_MS = 10_000; // 10 second window to count disconnects
 const DISCONNECT_THRESHOLD = 3; // Number of bot disconnects to trigger server-wide detection
 const RECONNECT_WAIT_MS = 20_000; // Wait 20 seconds before starting reconnection
-const RECONNECT_BOT_DELAY_MS = 20_000; // Delay between reconnecting each bot
+const RECONNECT_BOT_DELAY_MS = 25_000; // CRITICAL: Delay between reconnecting each bot (prevents login rate limiting)
 
 interface ServerDownCallback {
   stopBots: (affectedBots: string[]) => Promise<Map<string, BotState>>;
   restartBots: (botStates: Map<string, BotState>) => Promise<void>;
 }
+
+type DisconnectCallback = ServerDownCallback;
 
 export class ServerDisconnectDetector {
   private disconnectEvents: DisconnectEvent[] = [];
@@ -129,10 +131,11 @@ export class ServerDisconnectDetector {
     log("system", "🔄 Starting coordinated reconnection sequence...");
     const reconnectSuccess = await this.startCoordinatedReconnect();
 
-    // Restart bots with their saved routines after reconnection
+    // Bots will be restarted by the callback with staggered delays (25s between each)
+    // This prevents login storms while allowing normal gameplay immediately after login
     if (reconnectSuccess && this.onServerDownCallback) {
       try {
-        log("system", "🔄 Restarting bots with their saved routines...");
+        log("system", "🔄 Restarting bots with their saved routines (staggered 25s delays)...");
         await this.onServerDownCallback.restartBots(botStates);
       } catch (err) {
         log("error", `Failed to restart bots: ${err instanceof Error ? err.message : String(err)}`);
@@ -166,7 +169,7 @@ export class ServerDisconnectDetector {
       return false;
     }
 
-    log("system", `Reconnecting ${bots.length} bot(s) sequentially...`);
+    log("system", `Reconnecting ${bots.length} bot(s) sequentially with ${RECONNECT_BOT_DELAY_MS / 1000}s delays...`);
 
     let successCount = 0;
     let failCount = 0;
@@ -195,8 +198,9 @@ export class ServerDisconnectDetector {
         failCount++;
       }
 
-      // Delay before next bot (except for the last one)
+      // CRITICAL: Delay before next bot (except for the last one)
       if (i < bots.length - 1) {
+        log("system", `Waiting ${RECONNECT_BOT_DELAY_MS / 1000}s before next bot reconnection...`);
         await sleep(RECONNECT_BOT_DELAY_MS);
       }
     }

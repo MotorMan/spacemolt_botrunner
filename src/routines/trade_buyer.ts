@@ -56,7 +56,8 @@ function getTradeBuyerSettings(username?: string): {
   maxPrices: Record<string, number>;
 } {
   const all = readSettings();
-  const t = all.trader || {};
+  // Read from trade_buyer settings (not trader)
+  const t = all.trade_buyer || {};
   const botOverrides = username ? (all[username] || {}) : {};
   return {
     maxSpendPerItem: (t.maxSpendPerItem as number) || 5000,
@@ -167,6 +168,7 @@ function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: num
 
 /** Find the cheapest known market sell prices for items. */
 function findCheapestSellers(
+  ctx: RoutineContext,
   settings: ReturnType<typeof getTradeBuyerSettings>,
   currentSystem: string,
   cargoCapacity: number = 999,
@@ -196,6 +198,9 @@ function findCheapestSellers(
     }
   }
 
+  ctx.log("trade", `Scanning ${sellListings.length} sell listings for items: ${settings.buyItems.join(", ") || "(none)"}`);
+  ctx.log("trade", `Max prices config: ${JSON.stringify(settings.maxPrices || {})}`);
+
   // Group by item to find cheapest sources
   const itemSellers = new Map<string, typeof sellListings>();
   for (const seller of sellListings) {
@@ -204,24 +209,37 @@ function findCheapestSellers(
     itemSellers.set(seller.itemId, existing);
   }
 
+  ctx.log("trade", `Found ${itemSellers.size} unique items for sale in cache`);
+
   // For each item, find the cheapest seller
   for (const [itemId, sellers] of itemSellers.entries()) {
-    // Filter by allowed items
-    if (settings.buyItems.length > 0) {
-      const match = settings.buyItems.some(t =>
-        itemId.toLowerCase().includes(t.toLowerCase())
-      );
-      if (!match) continue;
+    // Filter by allowed items - MUST be explicitly selected in buyItems list
+    if (settings.buyItems.length === 0) {
+      // No items selected - skip this item (don't buy anything if nothing is configured)
+      continue;
     }
+    
+    // Check if this item is in the buy list (exact match)
+    const match = settings.buyItems.some(t =>
+      t.toLowerCase() === itemId.toLowerCase()
+    );
+    if (!match) continue;
+
+    ctx.log("trade", `>>> Found matching item: ${itemId} (${sellers.length} sellers)`);
 
     // Check max price for this item
     const maxPrice = settings.maxPrices?.[itemId];
     if (maxPrice !== undefined && maxPrice > 0) {
       // Filter out sellers that are above the max price
       const filteredSellers = sellers.filter(s => s.price <= maxPrice);
-      if (filteredSellers.length === 0) continue; // No sellers at acceptable price
+      if (filteredSellers.length === 0) {
+        const cheapest = Math.min(...sellers.map(s => s.price));
+        ctx.log("trade", `>>> ${itemId}: No sellers at or below max price ${maxPrice}cr (cheapest available: ${cheapest}cr)`);
+        continue;
+      } // No sellers at acceptable price
       sellers.length = 0;
       sellers.push(...filteredSellers);
+      ctx.log("trade", `>>> ${itemId}: Filtered to ${sellers.length} sellers at or below ${maxPrice}cr`);
     }
 
     // Sort by price ascending (cheapest first)
@@ -412,6 +430,8 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     // Refresh settings each cycle
     settings = getTradeBuyerSettings(bot.username);
 
+    ctx.log("trade", `Settings loaded: homeSystem=${settings.homeSystem || "(not set)"}, buyItems=[${settings.buyItems.join(", ") || "(none)"}], maxPrices=${JSON.stringify(settings.maxPrices || {})}`);
+
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
@@ -572,7 +592,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     }
     const cargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
 
-    routes = findCheapestSellers(settings, bot.system, cargoCapacity);
+    routes = findCheapestSellers(ctx, settings, bot.system, cargoCapacity);
 
     // Update routes with home station info
     routes = routes.map(r => ({
@@ -581,8 +601,12 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       destPoiName: homeStation.name,
     }));
 
+    ctx.log("trade", `DEBUG: routes found = ${routes.length}`);
     if (routes.length > 0) {
       ctx.log("trade", `Found ${routes.length} buy opportunities`);
+      for (const r of routes.slice(0, 5)) {
+        ctx.log("trade", `  - ${r.itemName}: ${r.buyQty}x @ ${r.buyPrice}cr in ${r.sourceSystem}`);
+      }
     }
 
     if (routes.length === 0 && !recoveredSession) {

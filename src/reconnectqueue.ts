@@ -8,13 +8,17 @@ import { debugLog } from "./debug.js";
 
 interface ReconnectTask {
   botName: string;
-  api: { setCredentials(username: string, password: string): void; getSession(): { id: string } | null };
+  api: { 
+    setCredentials(username: string, password: string): void; 
+    getSession(): { id: string } | null;
+    execute(command: string, payload?: Record<string, unknown>): Promise<unknown>;
+  };
   credentials: { username: string; password: string } | null;
   resolve: (success: boolean) => void;
   reject: (error: Error) => void;
 }
 
-const RECONNECT_BASE_DELAY = 10_000; // 10s base delay between attempts
+const RECONNECT_BASE_DELAY = 25_000; // 25s base delay between attempts (CRITICAL: prevents rate limiting)
 const MAX_RECONNECT_ATTEMPTS = 12;
 
 class ReconnectQueue {
@@ -72,9 +76,10 @@ class ReconnectQueue {
       // Remove completed task
       this.queue.shift();
 
-      // Small delay between processing different bots
+      // CRITICAL delay between processing different bots - prevents rate limiting
       if (this.queue.length > 0) {
-        await sleep(2000);
+        log("system", `Waiting ${RECONNECT_BASE_DELAY / 1000}s before next bot reconnection...`);
+        await sleep(RECONNECT_BASE_DELAY);
       }
     }
 
@@ -95,33 +100,21 @@ class ReconnectQueue {
           task.api.setCredentials(task.credentials.username, task.credentials.password);
         }
 
-        // Try to create/renew session via the API's internal logic
-        // The API will handle the actual session creation
-        const session = task.api.getSession();
-        if (session) {
-          log("system", `Reconnection successful for ${task.botName} (existing session)`);
-          this.resetCircuitBreaker();
-          return true;
-        }
-
-        // Session needs to be created - this will be handled by the API's ensureSession
-        // We just mark this as a "pending reconnect" that the API will complete
+        // Try to create a new session - this is the actual connectivity test
         log("system", `Reconnection attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS} for ${task.botName}`);
         
-        // Success is determined by the API being able to create a session
-        // The actual session creation happens when the next API call is made
-        // For now, we just wait for the server to be reachable
-        await sleep(RECONNECT_BASE_DELAY);
-        
+        // Create a session to verify server is reachable
+        await task.api.execute("get_status");
+
         // If we get here without error, the server is reachable
-        log("system", `Server reachable for ${task.botName}`);
+        log("system", `✅ Server reachable for ${task.botName}`);
         this.resetCircuitBreaker();
         return true;
 
       } catch (err) {
         const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt) + Math.floor(Math.random() * 5000);
         log("system", `${task.botName} reconnection failed (attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS}), waiting ${delay / 1000}s...`);
-        
+
         if (attempt < MAX_RECONNECT_ATTEMPTS - 1) {
           await sleep(delay);
         }

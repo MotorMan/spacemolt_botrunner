@@ -40,6 +40,7 @@ export interface ChatMessage {
   botUsername?: string; // Which bot received this
   botSystem?: string;   // System where message was received (for local chat)
   botPoi?: string;      // POI where message was received (for local chat)
+  targetId?: string;    // Target player for private messages
 }
 
 interface BotLockInfo {
@@ -52,6 +53,79 @@ interface BotLockInfo {
 // ── Settings ─────────────────────────────────────────────────
 
 const PERSONALITIES_DIR = join(process.cwd(), "data", "personalities");
+const MAP_FILE = join(process.cwd(), "data", "map.json");
+
+/**
+ * Load and summarize map data for LLM context.
+ * Creates a concise summary of systems, connections, and resources.
+ */
+function getMapSummary(): string {
+  try {
+    if (!existsSync(MAP_FILE)) {
+      return "Map data not available.";
+    }
+    
+    const mapData = JSON.parse(readFileSync(MAP_FILE, "utf-8")) as {
+      systems?: Record<string, {
+        id: string;
+        name: string;
+        connections?: Array<{ system_id: string; system_name: string }>;
+        pois?: Array<{
+          id: string;
+          name: string;
+          type: string;
+          has_base: boolean;
+          ores_found?: Array<{ name: string; item_id: string }>;
+        }>;
+      }>;
+    };
+    
+    const systems = mapData.systems || {};
+    const systemCount = Object.keys(systems).length;
+    
+    // Build summary
+    const lines: string[] = [];
+    lines.push(`Galaxy Map Summary (${systemCount} systems total):`);
+    lines.push("");
+    
+    // List systems with their connections and notable POIs
+    const systemEntries = Object.entries(systems).slice(0, 100); // Limit to first 100 for context
+    
+    for (const [sysId, sys] of systemEntries) {
+      const connNames = sys.connections?.map(c => c.system_name).join(", ") || "none";
+      const stations = sys.pois?.filter(p => p.has_base).map(p => p.name).join(", ") || "";
+      const resourcePois = sys.pois?.filter(p => p.ores_found && p.ores_found.length > 0) || [];
+      
+      let sysLine = `- ${sys.name} (${sysId})`;
+      if (stations) sysLine += ` | Station: ${stations}`;
+      if (resourcePois.length > 0) {
+        const ores = resourcePois.flatMap(p => p.ores_found?.map(o => o.name || o.item_id) || []);
+        if (ores.length > 0) sysLine += ` | Resources: ${[...new Set(ores)].slice(0, 5).join(", ")}`;
+      }
+      lines.push(sysLine);
+      lines.push(`  Connections: ${connNames}`);
+    }
+    
+    if (systemCount > 100) {
+      lines.push(`... and ${systemCount - 100} more systems (use get_system command in-game for details)`);
+    }
+    
+    return lines.join("\n");
+  } catch (err) {
+    console.error("Error loading map data:", err);
+    return "Map data unavailable (error loading).";
+  }
+}
+
+// Cache the map summary (it doesn't change often)
+let cachedMapSummary: string | null = null;
+
+function getCachedMapSummary(): string {
+  if (!cachedMapSummary) {
+    cachedMapSummary = getMapSummary();
+  }
+  return cachedMapSummary;
+}
 
 /**
  * Load a bot's personality from data/personalities/{bot-name}.md
@@ -91,6 +165,7 @@ function getAiChatSettings(): {
   respondToMentions: boolean;
   respondToQuestions: boolean;
   respondToAll: boolean;
+  respondToSystem: boolean;
   personality: string;
   lockDurationSec: number;
 } {
@@ -121,6 +196,7 @@ function getAiChatSettings(): {
     respondToMentions: (s.respondToMentions as boolean) ?? true,
     respondToQuestions: (s.respondToQuestions as boolean) ?? false,
     respondToAll: (s.respondToAll as boolean) ?? false,
+    respondToSystem: (s.respondToSystem as boolean) ?? false,
     personality: (s.personality as string) || DEFAULT_PERSONALITY,
     lockDurationSec: (s.lockDurationSec as number) || 60,
   };
@@ -542,8 +618,14 @@ export class AiChatService {
     msg: ChatMessage,
     settings: ReturnType<typeof getAiChatSettings>
   ): Promise<void> {
-    // Only monitor local and faction chat
-    if (msg.channel !== "local" && msg.channel !== "faction") {
+    // Monitor local, faction, system, and private chat
+    if (msg.channel !== "local" && msg.channel !== "faction" && msg.channel !== "system" && msg.channel !== "private") {
+      return;
+    }
+
+    // For system chat, check if enabled
+    if (msg.channel === "system" && !settings.respondToSystem) {
+      this.logFn("ai_chat_debug", `System chat disabled, ignoring: ${msg.sender} - ${msg.content.slice(0, 50)}`);
       return;
     }
 
@@ -915,17 +997,27 @@ export class AiChatService {
     const hasCustomPersonality = personality !== DEFAULT_PERSONALITY;
     this.logFn("ai_chat_debug", `Using ${hasCustomPersonality ? "custom" : "default"} personality for ${bot.username}`);
 
+    // Load galaxy map data for factual responses
+    const mapSummary = getCachedMapSummary();
+
     const systemPrompt = `${personality}
 
-Current context:
+## Galaxy Map Data (Real Game Data)
+Use this information to help answer questions about systems, stations, resources, and connections.
+
+${mapSummary}
+
+## Your Current Context
 - Your name in the game is: ${bot.username}
 - You are currently in system: ${bot.system || "unknown"}
 - Chat channel: ${msg.channel}
 
-Response rules:
+## Response Rules
 - Keep responses short (1-3 sentences max)
 - Be natural and conversational
 - Don't spam or be repetitive
+- Use the map data above to provide accurate information about systems and resources
+- If asked about a system not listed, mention there are many more systems and suggest using /get_system in-game
 - If asked about game mechanics, share what you know`;
 
     const recentHistory = mem.conversationHistory
@@ -945,10 +1037,18 @@ Response rules:
       const response = await callLlm(llmMessages, settings);
       const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
 
-      const chatResp = await bot.exec("chat", {
+      // Build chat command parameters
+      const chatParams: Record<string, string> = {
         channel: msg.channel,
         content: cleanResponse,
-      });
+      };
+
+      // Add target_id for private messages
+      if (msg.channel === "private" && msg.targetId) {
+        chatParams.target_id = msg.targetId;
+      }
+
+      const chatResp = await bot.exec("chat", chatParams);
 
       if (!chatResp.error) {
         this.logFn("ai_chat", `→ ${bot.username} responded: ${cleanResponse}`);
@@ -997,9 +1097,84 @@ Response rules:
     }
   }
 
+  /**
+   * Send a private/direct message with LLM-generated content.
+   * Used for out-of-faction communication (e.g., MAYDAY responses).
+   */
+  async sendPrivateMessage(
+    bot: Bot,
+    targetPlayer: string,
+    context: {
+      situation: string;
+      currentSystem: string;
+      targetSystem: string;
+      jumps?: number;
+      fuelRefueled?: number;
+      playerFuelPct?: number;
+    },
+    personality?: string
+  ): Promise<{ ok: boolean; message?: string; error?: string }> {
+    const settings = getAiChatSettings();
+
+    // Build system prompt for private message generation
+    const systemPrompt = `${personality || "You are a helpful rescue pilot in SpaceMolt."}
+
+Context:
+- Your callsign: ${bot.username}
+- You are currently in: ${context.currentSystem}
+- Stranded pilot is in: ${context.targetSystem}${context.jumps ? ` (${context.jumps} jumps away)` : ""}
+- ${context.situation}
+
+Task:
+Generate a brief radio transmission message (max 2 sentences) to send via private chat to the stranded pilot.
+
+Style:
+- Keep it natural and in-character
+- Be concise (this is a radio transmission)
+- Include relevant details (ETA, jumps, etc.) if provided
+- Don't be overly verbose`;
+
+    const userMessage = `Generate a private message to ${targetPlayer}:
+
+Situation: ${context.situation}
+${context.jumps ? `Jumps remaining: ${context.jumps}` : ""}
+${context.fuelRefueled ? `Fuel transferred: ${context.fuelRefueled}` : ""}
+${context.playerFuelPct ? `Their fuel before: ${context.playerFuelPct}%` : ""}
+
+Message:`;
+
+    const llmMessages: LlmMessage[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage },
+    ];
+
+    try {
+      const response = await callLlm(llmMessages, settings);
+      const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+
+      // Send private message using: chat channel=private target_id="PlayerName" content="message"
+      const chatResp = await bot.exec("chat", {
+        channel: "private",
+        target_id: targetPlayer,
+        content: cleanResponse,
+      });
+
+      if (!chatResp.error) {
+        this.logFn("ai_chat", `→ Private message to ${targetPlayer}: ${cleanResponse}`);
+        return { ok: true, message: cleanResponse };
+      } else {
+        this.logFn("error", `Private message to ${targetPlayer} failed: ${chatResp.error.message}`);
+        return { ok: false, error: chatResp.error.message };
+      }
+    } catch (llmErr) {
+      this.logFn("error", `LLM error: ${llmErr instanceof Error ? llmErr.message : String(llmErr)}`);
+      return { ok: false, error: llmErr instanceof Error ? llmErr.message : String(llmErr) };
+    }
+  }
+
   // Static reference to bots array from botmanager
   private static getBots: () => Bot[] = () => [];
-  
+
   static setGetBotsFn(fn: () => Bot[]): void {
     AiChatService.getBots = fn;
   }

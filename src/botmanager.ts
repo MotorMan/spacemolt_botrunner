@@ -18,6 +18,7 @@ import { cleanupRoutine } from "./routines/cleanup.js";
 import { aiRoutine } from "./routines/ai.js";
 import { cargoMoverRoutine } from "./routines/cargo_mover.js";
 import { returnHomeRoutine } from "./routines/return_home.js";
+import { commandReceiverRoutine } from "./routines/command_receiver.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
@@ -64,6 +65,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   ai: { name: "AI", fn: aiRoutine },
   cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },
   return_home: { name: "ReturnHome", fn: returnHomeRoutine },
+  command_receiver: { name: "CommandReceiver", fn: commandReceiverRoutine },
 };
 
 // ── Auto-discover existing sessions ─────────────────────────

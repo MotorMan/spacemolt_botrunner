@@ -689,6 +689,7 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .resp-ok { color: var(--green); }
 .resp-err { color: var(--red); }
 .resp-data { color: var(--text-dim); margin-left: 12px; }
+.resp-bot { color: var(--cyan); font-weight: 600; margin-right: 4px; }
 .log-entry { padding: 1px 0; }
 .log-entry .log-time { color: var(--text-dim); }
 .log-entry .log-cat { font-weight: 600; }
@@ -1222,6 +1223,31 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   padding: 40px;
 }
 
+/* ── Command All page ─────────────────────────────────── */
+.commandall-layout {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  flex: 1;
+  padding: 16px;
+  overflow: auto;
+}
+.commandall-header {
+  margin-bottom: 8px;
+}
+.commandall-header h3 {
+  margin: 0;
+  color: var(--text-bright);
+  font-size: 16px;
+}
+.commandall-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
 /* ── Missions page ─────────────────────────────────── */
 .missions-layout {
   display: flex;
@@ -1271,6 +1297,7 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 }
 .mission-bot-btn:hover { background: var(--bg-row-hover); }
 .mission-bot-btn.active { background: rgba(88,166,255,0.1); border-color: var(--accent); color: var(--accent); }
+#consolidatedViewBtn.active { background: rgba(88,166,255,0.2); border-color: var(--accent); color: var(--accent); }
 .missions-content {
   flex: 1;
   background: var(--bg-card);
@@ -1372,6 +1399,51 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .mission-action-btn:hover { border-color: var(--text); color: var(--text); }
 .mission-action-btn.complete-btn:hover { border-color: var(--green); color: var(--green); }
 .mission-action-btn.abandon-btn:hover { border-color: var(--red); color: var(--red); }
+
+/* ── Consolidated Missions View ─────────────────────── */
+.consolidated-mission-card {
+  background: var(--bg-card);
+  border: 1px solid #30363d;
+}
+.mission-count-badge {
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 8px;
+  background: #1f6feb22;
+  color: #58a6ff;
+  font-weight: 600;
+}
+.consolidated-bots-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0;
+  padding: 8px;
+  background: #0d1117;
+  border-radius: 4px;
+}
+.consolidated-bot-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  background: #161b22;
+  border-radius: 4px;
+  font-size: 11px;
+}
+.consolidated-bot-item .bot-name {
+  color: var(--cyan);
+  font-weight: 500;
+}
+.mission-status-badge {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+.ms-active { background: #23863633; color: var(--green); }
+.ms-complete { background: #30363d; color: var(--text-dim); }
 
 /* ── Scrollbar (Chromium) ─────────────────────────── */
 ::-webkit-scrollbar { width: 10px; height: 10px; }

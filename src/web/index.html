@@ -13,6 +13,7 @@
     <h1>SpaceMolt Commander</h1>
     <div class="top-tabs" id="topTabs">
       <div class="top-tab active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</div>
+      <div class="top-tab" data-tab="commandall" onclick="switchTab('commandall')">Command All</div>
       <div class="top-tab" data-tab="map" onclick="switchTab('map')">Map</div>
       <div class="top-tab" data-tab="market" onclick="switchTab('market')">Market</div>
       <div class="top-tab" data-tab="missions" onclick="switchTab('missions')">Missions</div>
@@ -55,6 +56,13 @@
           </button>
           <button class="sm danger" onclick="emergencyReturnHome()">⚠ Emergency Return Home</button>
           <button class="sm" onclick="showAddModal()">+ Add Bot</button>
+          <div style="display:flex;gap:6px;align-items:center;border-left:1px solid var(--border);padding-left:8px;margin-left:4px;">
+            <select id="bulkStartRoutine" style="font-size:12px;padding:4px 8px;">
+              <!-- populated by JS -->
+            </select>
+            <button class="sm primary" onclick="bulkStartIdleBots()">▶ Start All Idle</button>
+            <button class="sm danger" onclick="bulkStopRunningBots()">⏹ Stop All Running</button>
+          </div>
         </div>
       </div>
       <div class="bot-table-scroll">
@@ -103,6 +111,33 @@
       </select>
       <input type="text" id="chatInput" placeholder="Type a message..." onkeydown="if(event.key==='Enter')sendChat()">
       <button class="primary" onclick="sendChat()">Send</button>
+    </div>
+  </div>
+
+  <!-- ══ Command All Tab ══ -->
+  <div class="tab-page" id="page-commandall">
+    <div class="commandall-layout">
+      <div class="commandall-header">
+        <h3>Command All Bots</h3>
+        <p style="color:var(--text-dim);font-size:12px;margin:4px 0 0 0">
+          Send commands to all bots simultaneously. Commands will be executed with a 250ms delay between each bot.
+        </p>
+      </div>
+      <div class="commandall-body">
+        <div class="manual-panel" style="width:100%">
+          <div class="manual-header">Fleet-Wide Manual Control</div>
+          <div class="manual-body" id="commandAllControls">
+            <!-- filled by JS -->
+          </div>
+        </div>
+        <div class="response-panel" style="width:100%">
+          <div class="response-header">
+            <span>Fleet Command Log</span>
+            <button onclick="clearCommandAllLog()">Clear</button>
+          </div>
+          <div class="response-log" id="commandAllLog"></div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -205,7 +240,10 @@
   <div class="tab-page" id="page-missions">
     <div class="missions-layout">
       <div class="missions-sidebar">
-        <div class="missions-sidebar-header">Missions</div>
+        <div class="missions-sidebar-header">
+          Missions
+          <button class="sm" id="consolidatedViewBtn" onclick="toggleConsolidatedMissionsView()" title="Show consolidated view" style="margin-left:8px;font-size:11px;padding:2px 6px;">📋 Consolidated</button>
+        </div>
         <div class="missions-sidebar-body" id="missionsSidebarBody">
           <!-- filled by JS -->
         </div>
@@ -455,6 +493,7 @@ function switchTab(name) {
   if (name === 'faction') renderFactionPage();
   if (name === 'shipyard') renderShipyardPage();
   if (name === 'stats') { renderStatsTab(); refreshFactionFunds(); }
+  if (name === 'commandall') renderCommandAllControls();
 }
 
 // ── WebSocket ──────────────────────────────────────────────
@@ -522,6 +561,7 @@ async function fetchInitialData() {
     renderBots();
     renderStats();
     updateChatBotSelect();
+    updateBulkStartDropdown();
     renderSettingsPanel();
     updateAiChatToggleButton();
     // Load persisted main logs
@@ -596,6 +636,7 @@ function connect() {
         updateChatBotSelect();
         renderSettingsPanel();
         updateAiChatToggleButton();
+        updateBulkStartDropdown();
         if (msg.logs) {
           appendLines(activityEl, 'activity', msg.logs.activity || []);
           appendLines(broadcastEl, 'broadcast', msg.logs.broadcast || []);
@@ -737,6 +778,84 @@ function renderBots() {
       <td><div class="row-actions">${actions}</div></td>
     </tr>`;
   }).join('');
+}
+
+// ── Bulk Start Idle Bots ────────────────────────────────────
+const BULK_START_DELAY_MS = 1000; // 1 second delay between bots
+
+/** Populate the bulk start routine dropdown */
+function updateBulkStartDropdown() {
+  const select = document.getElementById('bulkStartRoutine');
+  if (!select) return;
+  const currentVal = select.value;
+  select.innerHTML = routines.map(r => 
+    `<option value="${esc(r)}"${r === currentVal ? ' selected' : ''}>${esc(r)}</option>`
+  ).join('');
+}
+
+/** Start all idle bots with the selected routine */
+function bulkStartIdleBots() {
+  const select = document.getElementById('bulkStartRoutine');
+  if (!select) return;
+  
+  const routine = select.value;
+  const idleBots = bots.filter(b => b.state === 'idle');
+  
+  if (idleBots.length === 0) {
+    appendLine('system', 'No idle bots to start');
+    return;
+  }
+  
+  appendLine('system', `Starting ${idleBots.length} idle bot(s) with routine: ${routine}`);
+  
+  let index = 0;
+  function startNext() {
+    if (index >= idleBots.length) return;
+    
+    const bot = idleBots[index];
+    send({ type: 'start', bot: bot.username, routine });
+    appendLine('system', `Starting bot: ${bot.username} → ${routine}`);
+    
+    index++;
+    if (index < idleBots.length) {
+      setTimeout(startNext, BULK_START_DELAY_MS);
+    }
+  }
+  
+  startNext();
+}
+
+/** Stop all running bots */
+function bulkStopRunningBots() {
+  const runningBots = bots.filter(b => b.state === 'running');
+
+  if (runningBots.length === 0) {
+    appendLine('system', 'No running bots to stop');
+    return;
+  }
+
+  appendLine('system', `Stopping ${runningBots.length} running bot(s)...`);
+
+  let index = 0;
+  function stopNext() {
+    if (index >= runningBots.length) {
+      appendLine('system', 'All stop commands sent!');
+      return;
+    }
+
+    const bot = runningBots[index];
+    send({ type: 'stop', bot: bot.username });
+    appendLine('system', `Stopping bot: ${bot.username}`);
+
+    index++;
+    if (index < runningBots.length) {
+      setTimeout(stopNext, BULK_START_DELAY_MS);
+    } else {
+      stopNext();
+    }
+  }
+
+  stopNext();
 }
 
 // ── Fleet Stats ────────────────────────────────────────────
@@ -5591,6 +5710,7 @@ function num(n) {
 // ── Missions ───────────────────────────────────────────────
 let missionsSelectedBot = null;
 let activeMissionsCache = {};
+let showConsolidatedMissions = false; // Toggle for consolidated view
 let factionSelectedBot = null;
 let factionData = null; // cached faction_info result
 let factionTreasury = null; // cached credit balance from view_faction_storage
@@ -5598,19 +5718,67 @@ let factionActivePanel = 'overview'; // overview | members | storage | facilitie
 let factionLogLines = [];       // all faction log entries
 let factionLogFilter = 'all';   // 'all' | 'deposit' | 'withdraw' | 'donation' | 'gift'
 let factionWithdrawSortOrder = 'alpha'; // 'alpha' | 'quantity'
+let commandAllFactionStorage = null; // cached faction storage for command-all tab (null = not fetched, [] = empty/error)
 
 function renderMissionsPage() {
   renderMissionsSidebar();
-  if (missionsSelectedBot) {
+  if (showConsolidatedMissions) {
+    // Fetch active missions for all bots before rendering consolidated view
+    fetchAllActiveMissions();
+  } else if (missionsSelectedBot) {
     fetchActiveMissions(missionsSelectedBot);
   } else {
     renderMissionsFromMap();
   }
 }
 
+/** Fetch active missions for all bots (for consolidated view) */
+function fetchAllActiveMissions() {
+  let fetched = 0;
+  const total = bots.length;
+  
+  if (total === 0) {
+    renderConsolidatedMissions();
+    return;
+  }
+  
+  for (const bot of bots) {
+    sendExec(bot.username, 'get_active_missions', undefined, (result) => {
+      let activeMissions = [];
+      if (result.ok && result.data) {
+        const d = result.data;
+        activeMissions = Array.isArray(d) ? d : (d.missions || d.active_missions || d.active || []);
+      }
+      activeMissionsCache[bot.username] = activeMissions;
+      fetched++;
+      if (fetched >= total) {
+        renderConsolidatedMissions();
+      }
+    });
+  }
+}
+
+function toggleConsolidatedMissionsView() {
+  showConsolidatedMissions = !showConsolidatedMissions;
+  const btn = document.getElementById('consolidatedViewBtn');
+  if (btn) {
+    btn.textContent = showConsolidatedMissions ? '📋 Consolidated' : '📋 Consolidated';
+    btn.classList.toggle('active', showConsolidatedMissions);
+  }
+  renderMissionsSidebar();
+  renderMissionsPage();
+}
+
 function renderMissionsSidebar() {
   const body = document.getElementById('missionsSidebarBody');
   if (!body) return;
+  
+  if (showConsolidatedMissions) {
+    // In consolidated view, show a simple message
+    body.innerHTML = '<div style="padding:10px;font-size:11px;color:var(--text-dim);text-align:center">Consolidated View Active<br>Grouping missions by template across all bots</div>';
+    return;
+  }
+  
   let html = `<button class="mission-bot-btn${!missionsSelectedBot ? ' active' : ''}" onclick="selectMissionView(null)">All Available</button>`;
   for (const bot of bots) {
     const active = missionsSelectedBot === bot.username ? ' active' : '';
@@ -5766,6 +5934,152 @@ function missionAction(botName, action, missionId) {
       appendLine('system', `${action.replace('_', ' ')} failed: ${result.error || 'unknown'}`);
     }
   });
+}
+
+// ── Consolidated Missions View ─────────────────────────────
+
+const CONSOLIDATED_MISSIONS_DELAY_MS = 1000; // 1 second delay between bots
+
+/** Render consolidated missions view - groups missions by template across all bots */
+function renderConsolidatedMissions() {
+  const content = document.getElementById('missionsContent');
+  if (!content) return;
+
+  // Collect all active missions from all bots
+  const missionGroups = new Map(); // templateId -> { templateId, title, type, reward, bots: [{username, missionId, status}] }
+
+  for (const bot of bots) {
+    const botMissions = activeMissionsCache[bot.username] || [];
+    for (const m of botMissions) {
+      const templateId = m.mission_id || m.id || '';
+      const title = m.title || m.name || m.mission_template_id || templateId;
+      const type = m.type || m.mission_type || '';
+      const reward = m.reward_credits ? `${Number(m.reward_credits).toLocaleString()} cr` : (m.reward || '-');
+      const status = m.status || 'active';
+
+      if (!missionGroups.has(templateId)) {
+        missionGroups.set(templateId, {
+          templateId,
+          title,
+          type,
+          reward,
+          description: m.description || '',
+          bots: []
+        });
+      }
+      missionGroups.get(templateId).bots.push({
+        username: bot.username,
+        missionId: templateId,
+        status
+      });
+    }
+  }
+
+  let html = '';
+
+  if (missionGroups.size === 0) {
+    html = '<div class="map-empty">No active missions across all bots. Claim missions first to see them here.</div>';
+  } else {
+    html = '<div class="missions-section">';
+    html += '<div class="missions-section-title">Consolidated Missions</div>';
+    html += '<div style="color:var(--text-dim);font-size:12px;margin-bottom:12px">Grouped by mission template. Complete all instances of a mission with one click.</div>';
+
+    for (const [templateId, group] of missionGroups) {
+      const botCount = group.bots.length;
+      const activeCount = group.bots.filter(b => b.status === 'active').length;
+
+      html += `<div class="mission-card consolidated-mission-card">`;
+      html += `<div class="mission-card-head">`;
+      html += `<span class="mission-title">${esc(group.title)}</span>`;
+      if (group.type) html += `<span class="mission-type-badge">${esc(group.type)}</span>`;
+      html += `<span class="mission-count-badge">${botCount} bot${botCount > 1 ? 's' : ''} (${activeCount} active)</span>`;
+      html += `</div>`;
+
+      if (group.description) {
+        html += `<div class="mission-desc">${esc(group.description)}</div>`;
+      }
+
+      // List bots with this mission
+      html += `<div class="consolidated-bots-list">`;
+      for (const botInfo of group.bots) {
+        const statusClass = botInfo.status === 'active' ? 'active' : 'complete';
+        html += `<div class="consolidated-bot-item">`;
+        html += `<span class="bot-name">${esc(botInfo.username)}</span>`;
+        html += `<span class="mission-status-badge ms-${statusClass}">${botInfo.status}</span>`;
+        html += `</div>`;
+      }
+      html += `</div>`;
+
+      html += `<div class="mission-meta">`;
+      html += `<span class="mission-reward">${group.reward} each</span>`;
+
+      // Complete All button
+      const activeBots = group.bots.filter(b => b.status === 'active');
+      if (activeBots.length > 0) {
+        html += `<button class="mission-action-btn complete-btn" onclick="completeConsolidatedMission('${esc(templateId)}')">Complete All (${activeBots.length})</button>`;
+      }
+
+      html += `</div>`;
+      html += `</div>`;
+    }
+
+    html += '</div>';
+  }
+
+  content.innerHTML = html;
+}
+
+/** Complete a mission for all bots that have it active */
+function completeConsolidatedMission(templateId) {
+  const groupBots = [];
+  for (const bot of bots) {
+    const botMissions = activeMissionsCache[bot.username] || [];
+    for (const m of botMissions) {
+      if ((m.mission_id || m.id) === templateId && (m.status || 'active') === 'active') {
+        groupBots.push({ username: bot.username, missionId: templateId });
+        break;
+      }
+    }
+  }
+
+  if (groupBots.length === 0) {
+    appendLine('system', 'No active missions to complete');
+    return;
+  }
+
+  appendLine('system', `Completing mission "${templateId}" for ${groupBots.length} bot(s)...`);
+
+  let index = 0;
+  function completeNext() {
+    if (index >= groupBots.length) {
+      appendLine('system', 'All completion commands sent!');
+      // Refresh missions after a delay
+      setTimeout(() => {
+        if (showConsolidatedMissions) {
+          renderConsolidatedMissions();
+        }
+      }, 1000);
+      return;
+    }
+
+    const botInfo = groupBots[index];
+    sendExec(botInfo.username, 'complete_mission', { mission_id: botInfo.missionId }, (result) => {
+      if (result.ok) {
+        appendLine('system', `✓ ${botInfo.username}: mission completed`);
+      } else {
+        appendLine('system', `✗ ${botInfo.username}: ${result.error || 'failed'}`);
+      }
+    });
+
+    index++;
+    if (index < groupBots.length) {
+      setTimeout(completeNext, CONSOLIDATED_MISSIONS_DELAY_MS);
+    } else {
+      completeNext();
+    }
+  }
+
+  completeNext();
 }
 
 // ── Faction ─────────────────────────────────────────────────
@@ -9622,6 +9936,394 @@ function shipSetColors(username) {
       appendLine('system', `Set colors failed: ${result.error || 'unknown'}`);
     }
   });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// COMMAND ALL TAB - Fleet-wide manual controls
+// ═══════════════════════════════════════════════════════════════════════════
+
+const COMMAND_ALL_DELAY_MS = 1000; // 1 second delay between each bot command
+
+/** Render the Command All controls panel */
+function renderCommandAllControls() {
+  const controls = document.getElementById('commandAllControls');
+  if (!controls) return;
+
+  // Use first bot's system for POI list (assume all bots are in same system)
+  const firstBotSystem = bots[0]?.system || '';
+  const sysData = firstBotSystem && mapData[firstBotSystem] ? mapData[firstBotSystem] : null;
+  
+  // Build POI options from first bot's system
+  const poiOpts = sysData && sysData.pois && sysData.pois.length > 0
+    ? [...sysData.pois].sort((a, b) => ((a.name || a.id) || '').localeCompare((b.name || b.id) || '')).map(p => `<option value="${esc(p.id)}">${esc(p.name || p.id)} (${esc(p.type || '')})</option>`).join('')
+    : '<option value="">No POIs known (explore system first)</option>';
+
+  // Build system options for travel/jump
+  const currentSys = bots[0]?.system || '';
+  const jumpOpts = knownSystems.length > 0
+    ? knownSystems
+        .filter(s => s.id !== currentSys)
+        .map(s => {
+          const label = s.name ? `${s.name} (${s.id})` : s.id;
+          return `<option value="${esc(s.id)}">${esc(label)}</option>`;
+        }).join('')
+    : '<option value="">No systems mapped</option>';
+
+  // Build cargo item options from all bots combined
+  const allCargoItems = new Map();
+  for (const bot of bots) {
+    if (bot.inventory) {
+      for (const item of bot.inventory) {
+        const existing = allCargoItems.get(item.itemId);
+        if (existing) {
+          existing.quantity += item.quantity;
+        } else {
+          allCargoItems.set(item.itemId, { name: item.name, quantity: item.quantity });
+        }
+      }
+    }
+  }
+  const cargoOpts = allCargoItems.size > 0
+    ? [...allCargoItems].map(([id, item]) => 
+        `<option value="${esc(id)}">${esc(item.name)} (${item.quantity})</option>`
+      ).join('')
+    : '<option value="">No items in fleet cargo</option>';
+
+  // Build storage item options from all bots combined
+  const allStorageItems = new Map();
+  for (const bot of bots) {
+    if (bot.storage) {
+      for (const item of bot.storage) {
+        const existing = allStorageItems.get(item.itemId);
+        if (existing) {
+          existing.quantity += item.quantity;
+        } else {
+          allStorageItems.set(item.itemId, { name: item.name, quantity: item.quantity });
+        }
+      }
+    }
+  }
+  const storOpts = allStorageItems.size > 0
+    ? [...allStorageItems].map(([id, item]) => 
+        `<option value="${esc(id)}">${esc(item.name)} (${item.quantity})</option>`
+      ).join('')
+    : '<option value="">No items in fleet storage</option>';
+
+  // Build other bots list for trade/gift (all bots for fleet commands)
+  const allBotOpts = bots.length > 0
+    ? bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join('')
+    : '<option value="">No bots available</option>';
+
+  controls.innerHTML = `
+    <div class="cmd-group">
+      <label>Travel (All Bots)</label>
+      <select id="ca-travel-poi">${poiOpts}</select>
+      <button class="primary sm" onclick="caExec('travel',{target_poi:val('ca-travel-poi')})">Go</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Jump To (All Bots)</label>
+      <select id="ca-jump-sys">${jumpOpts}</select>
+      <button class="primary sm" id="ca-jump-btn" onclick="caExec('jump',{target_system:val('ca-jump-sys')})">Jump</button>
+    </div>
+
+    <div class="cmd-group">
+      <button class="sm" onclick="caExec('dock')">Dock All</button>
+      <button class="sm" onclick="caExec('undock')">Undock All</button>
+    </div>
+
+    <div class="cmd-group">
+      <button class="primary sm" onclick="caExec('mine')">Mine All</button>
+      <button class="sm" onclick="caExec('scan')">Scan All</button>
+    </div>
+
+    <div class="cmd-group">
+      <button class="sm" onclick="caExec('refuel')">Refuel All</button>
+      <button class="sm" onclick="caExec('repair')">Repair All</button>
+    </div>
+
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Fleet Cargo Operations</label>
+    </div>
+
+    <div class="cmd-group">
+      <label>Sell (All Bots)</label>
+      <select id="ca-sell-item">${cargoOpts}</select>
+      <input type="number" id="ca-sell-qty" min="1" value="1">
+      <button class="sm" onclick="caExec('sell',{item_id:val('ca-sell-item'),quantity:intVal('ca-sell-qty')})">Sell</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Deposit (All Bots)</label>
+      <select id="ca-dep-item">${cargoOpts}</select>
+      <input type="number" id="ca-dep-qty" min="1" value="1">
+      <button class="sm" onclick="caExec('deposit_items',{item_id:val('ca-dep-item'),quantity:intVal('ca-dep-qty')})">Deposit</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Withdraw (All Bots)</label>
+      <select id="ca-wit-item">${storOpts}</select>
+      <input type="number" id="ca-wit-qty" min="1" value="1">
+      <button class="sm" onclick="caExec('withdraw_items',{item_id:val('ca-wit-item'),quantity:intVal('ca-wit-qty')})">Withdraw</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Faction Withdraw (All Bots)</label>
+      <select id="ca-fac-wit-item">${getCommandAllFactionWithdrawOpts()}</select>
+      <input type="number" id="ca-fac-wit-qty" min="1" value="1" style="width:90px">
+      <button class="sm" onclick="caFactionWithdraw()">Withdraw</button>
+      <button class="sm" onclick="caRefreshFactionStorage()" title="Reload faction storage list">Refresh</button>
+      <label style="display:flex;align-items:center;gap:4px;font-size:11px;color:var(--text-dim);cursor:pointer;white-space:nowrap">
+        <input type="checkbox" id="ca-fac-wit-sort" onchange="toggleCommandAllFactionWithdrawSort()"${factionWithdrawSortOrder === 'quantity' ? ' checked' : ''}>
+        Sort by Qty
+      </label>
+    </div>
+
+    <div class="cmd-group">
+      <label>Jettison (All Bots)</label>
+      <select id="ca-jettison-item">${cargoOpts}</select>
+      <input type="number" id="ca-jettison-qty" min="1" value="1">
+      <button class="danger sm" onclick="caExec('jettison',{item_id:val('ca-jettison-item'),quantity:intVal('ca-jettison-qty')})">Jettison</button>
+    </div>
+
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Fleet Transfers</label>
+    </div>
+
+    <div class="cmd-group">
+      <label>Gift Item (All Bots → Target)</label>
+      <select id="ca-gift-target">${allBotOpts}</select>
+      <select id="ca-gift-item">${cargoOpts}</select>
+      <input type="number" id="ca-gift-qty" min="1" value="1">
+      <button class="sm" onclick="caExec('send_gift',{recipient:val('ca-gift-target'),item_id:val('ca-gift-item'),quantity:intVal('ca-gift-qty')})">Send</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Send Credits (All Bots → Target)</label>
+      <select id="ca-credits-target">${allBotOpts}</select>
+      <input type="number" id="ca-credits-amount" min="1" value="100" style="width:90px">
+      <button class="sm" onclick="caExec('send_gift',{recipient:val('ca-credits-target'),credits:intVal('ca-credits-amount')})">Send</button>
+    </div>
+
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Status Commands</label>
+    </div>
+
+    <div class="cmd-group">
+      <button class="sm" onclick="caExec('get_status')">Status All</button>
+      <button class="sm" onclick="caExec('get_cargo')">Cargo All</button>
+      <button class="sm" onclick="caExec('view_storage')">Storage All</button>
+      <button class="sm" onclick="caExec('view_market')">Market All</button>
+      <button class="sm" onclick="caExec('get_system')">System All</button>
+      <button class="sm" onclick="caExec('get_nearby')">Nearby All</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Custom Command (All Bots)</label>
+      <input type="text" id="ca-custom-cmd" placeholder="command" style="min-width:100px">
+      <input type="text" id="ca-custom-params" placeholder='{"key":"val"}' style="min-width:160px">
+      <button class="primary sm" onclick="caExecCustom()">Run</button>
+    </div>
+  `;
+}
+
+/** Execute a command on all bots with delay between each */
+function caExec(command, params) {
+  // Include all bots: running OR idle (command_receiver routine bots)
+  const allBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
+  if (allBots.length === 0) {
+    caLog(`<span class="resp-warn">No bots available to command</span>`);
+    return;
+  }
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  const paramStr = params ? ' ' + JSON.stringify(params) : '';
+  caLog(`<span class="resp-cmd">${ts} > FLEET: ${esc(command)}${esc(paramStr)} (${allBots.length} bots)</span>`);
+
+  // Execute on each bot with delay
+  let index = 0;
+  function executeNext() {
+    if (index >= allBots.length) return;
+
+    const bot = allBots[index];
+    const botTs = new Date().toLocaleTimeString('en-US', { hour12: false });
+
+    sendExec(bot.username, command, params, (result) => {
+      const status = result.ok ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
+      const stateLabel = bot.state === 'running' ? '(running)' : '(idle)';
+      caLog(`<span class="resp-bot">${esc(bot.username)} ${stateLabel}:</span> ${status}`);
+    });
+
+    index++;
+    if (index < allBots.length) {
+      setTimeout(executeNext, COMMAND_ALL_DELAY_MS);
+    }
+  }
+
+  executeNext();
+}
+
+function caExecCustom() {
+  const cmd = val('ca-custom-cmd');
+  if (!cmd) {
+    caLog('<span class="resp-err">Enter a command</span>');
+    return;
+  }
+  let params = undefined;
+  const raw = val('ca-custom-params').trim();
+  if (raw) {
+    try { params = JSON.parse(raw); } catch (e) {
+      caLog(`<span class="resp-err">Invalid JSON params: ${esc(e.message)}</span>`);
+      return;
+    }
+  }
+  caExec(cmd, params);
+}
+
+/** Get faction storage options for command-all faction withdraw dropdown */
+function getCommandAllFactionWithdrawOpts() {
+  if (commandAllFactionStorage === null) {
+    return '<option value="">Click Refresh to load</option>';
+  }
+  if (!commandAllFactionStorage || commandAllFactionStorage.length === 0) {
+    return '<option value="">Empty or not available</option>';
+  }
+
+  let items = [...commandAllFactionStorage];
+
+  // Sort items based on sort order
+  if (factionWithdrawSortOrder === 'alpha') {
+    items = items.sort((a, b) => {
+      const nameA = (a.name || a.item_name || a.item_id || a.id || '').toLowerCase();
+      const nameB = (b.name || b.item_name || b.item_id || b.id || '').toLowerCase();
+      return nameA.localeCompare(nameB);
+    });
+  } else if (factionWithdrawSortOrder === 'quantity') {
+    items = items.sort((a, b) => {
+      const qtyA = a.quantity || a.count || 0;
+      const qtyB = b.quantity || b.count || 0;
+      return qtyB - qtyA; // Descending order (highest quantity first)
+    });
+  }
+
+  return items.map(i => {
+    const id = i.item_id || i.id || '';
+    const name = i.name || i.item_name || id;
+    const qty = i.quantity || i.count || 0;
+    return `<option value="${esc(id)}" data-max="${qty}">${esc(name)} (${qty})</option>`;
+  }).join('');
+}
+
+/** Refresh faction storage for command-all tab */
+function caRefreshFactionStorage() {
+  if (bots.length === 0) {
+    caLog('<span class="resp-warn">No bots available to fetch faction storage</span>');
+    return;
+  }
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  caLog(`<span class="resp-cmd">${ts} > FLEET: view_faction_storage</span>`);
+
+  // Use first available bot to fetch faction storage
+  const bot = bots.find(b => b.state === 'running' || b.state === 'idle');
+  if (!bot) {
+    caLog('<span class="resp-err">No idle or running bot to fetch faction storage</span>');
+    return;
+  }
+
+  sendExec(bot.username, 'view_faction_storage', undefined, (result) => {
+    if (result.ok && result.data) {
+      const items = result.data.items || result.data.storage || [];
+      commandAllFactionStorage = items;
+      caLog(`<span class="resp-ok">Loaded ${items.length} faction storage items</span>`);
+      renderCommandAllControls();
+    } else {
+      commandAllFactionStorage = [];
+      caLog(`<span class="resp-err">Failed to load faction storage: ${esc(result.error || 'not at station')}</span>`);
+      renderCommandAllControls();
+    }
+  });
+}
+
+/** Toggle sort order for command-all faction withdraw dropdown */
+function toggleCommandAllFactionWithdrawSort() {
+  const checkbox = document.getElementById('ca-fac-wit-sort');
+  if (checkbox) {
+    factionWithdrawSortOrder = checkbox.checked ? 'quantity' : 'alpha';
+    renderCommandAllControls();
+  }
+}
+
+/** Execute faction withdraw for all bots using two-step queue */
+function caFactionWithdraw() {
+  const itemId = val('ca-fac-wit-item');
+  const qty = intVal('ca-fac-wit-qty');
+
+  if (!itemId) {
+    caLog('<span class="resp-err">Select an item to withdraw</span>');
+    return;
+  }
+
+  // Include all bots: running OR idle (command_receiver routine bots)
+  const allBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
+  if (allBots.length === 0) {
+    caLog('<span class="resp-warn">No bots available to command</span>');
+    return;
+  }
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  caLog(`<span class="resp-cmd">${ts} > FLEET: Faction Withdraw ${qty}x ${esc(itemId)} (${allBots.length} bots)</span>`);
+  caLog(`<span class="resp-info">Step 1: Faction → Personal Storage, Step 2: Personal Storage → Cargo</span>`);
+
+  // Execute on each bot with delay
+  let index = 0;
+  function executeNext() {
+    if (index >= allBots.length) return;
+
+    const bot = allBots[index];
+    const botUsername = bot.username;
+
+    // Step 1: Withdraw from faction storage to personal storage
+    sendExec(botUsername, 'storage', { action: 'deposit', target: 'self', item_id: itemId, quantity: qty, source: 'faction' }, (result) => {
+      const status = result.ok ? '<span class="resp-ok">✓ Step 1 done</span>' : `<span class="resp-err">✗ Step 1 failed: ${esc(result.error || 'unknown')}</span>`;
+      caLog(`<span class="resp-bot">${esc(botUsername)}:</span> ${status}`);
+
+      if (result.ok) {
+        // Step 2: After successful faction withdraw, move from personal storage to cargo
+        setTimeout(() => {
+          sendExec(botUsername, 'withdraw_items', { item_id: itemId, quantity: qty }, (result2) => {
+            const status2 = result2.ok ? '<span class="resp-ok">✓ Step 2 done</span>' : `<span class="resp-err">✗ Step 2 failed: ${esc(result2.error || 'unknown')}</span>`;
+            caLog(`<span class="resp-bot">${esc(botUsername)}:</span> ${status2}`);
+          });
+        }, 500); // Small delay between steps
+      }
+    });
+
+    index++;
+    if (index < allBots.length) {
+      setTimeout(executeNext, COMMAND_ALL_DELAY_MS);
+    }
+  }
+
+  executeNext();
+}
+
+/** Log to the Command All log panel */
+function caLog(html) {
+  const log = document.getElementById('commandAllLog');
+  if (!log) return;
+  const div = document.createElement('div');
+  div.className = 'resp-entry';
+  div.innerHTML = html;
+  log.prepend(div);
+  // Cap DOM entries
+  while (log.children.length > 300) log.removeChild(log.lastChild);
+  log.scrollTop = 0;
+}
+
+function clearCommandAllLog() {
+  const log = document.getElementById('commandAllLog');
+  if (log) log.innerHTML = '';
 }
 
 // ── Init ───────────────────────────────────────────────────

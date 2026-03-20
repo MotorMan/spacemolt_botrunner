@@ -160,7 +160,25 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
     const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
 
+    // ── Check for MAYDAY requests if no fleet targets ──
+    let maydayTarget: RescueTarget | null = null;
     if (targets.length === 0) {
+      const mayday = getNextMayday();
+      if (mayday && isLegitimateMayday(mayday, 25)) {
+        ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+        maydayTarget = {
+          username: mayday.sender,
+          system: mayday.system,
+          poi: mayday.poi,
+          fuelPct: mayday.fuelPct,
+          docked: false,
+        };
+        markMaydayHandled(mayday);
+        ctx.log("mayday", `✓ MAYDAY validated - launching rescue mission for ${mayday.sender}`);
+      }
+    }
+
+    if (targets.length === 0 && !maydayTarget) {
       // No one needs help — idle
       yield "idle";
       await sleep(settings.scanIntervalSec * 1000);
@@ -168,8 +186,14 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     }
 
     // ── Rescue the most critical bot ──
-    const target = targets[0];
-    ctx.log("rescue", `RESCUE NEEDED: ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
+    const target = maydayTarget || targets[0];
+    const isMaydayTarget = !!maydayTarget;
+    
+    if (maydayTarget) {
+      ctx.log("mayday", `RESCUE NEEDED (MAYDAY): ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
+    } else {
+      ctx.log("rescue", `RESCUE NEEDED: ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
+    }
 
     // ── Check for Refueling Pump before each mission ──
     const hasPumpNow = hasPump || await hasRefuelingPump(ctx);
@@ -183,7 +207,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       // Need extra fuel beyond our own threshold to transfer
       const minFuelForTransfer = Math.round(bot.maxFuel * (settings.refuelThreshold / 100)) + 100;
       if (bot.fuel < minFuelForTransfer) {
-        ctx.log("rescue", "Insufficient fuel for transfer — refueling self first...");
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", "Insufficient fuel for transfer — refueling self first...");
         const fueled = await ensureFueled(ctx, settings.refuelThreshold);
         if (!fueled) {
           ctx.log("error", "Cannot refuel self — waiting before retry...");
@@ -193,7 +217,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       }
     } else {
       // Fallback: need fuel cells instead
-      ctx.log("rescue", "No Refueling Pump — will use fuel cell delivery method");
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", "No Refueling Pump — will use fuel cell delivery method");
     }
 
     // ── Navigate to stranded bot's system ──
@@ -201,7 +225,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     await ensureUndocked(ctx);
 
     if (target.system && target.system !== bot.system) {
-      ctx.log("rescue", `Navigating to ${target.system}...`);
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Navigating to ${target.system}...`);
       const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
       const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
       if (!arrived) {
@@ -216,7 +240,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     // ── Travel to stranded bot's POI ──
     if (target.poi) {
       yield "travel_to_target";
-      ctx.log("rescue", `Traveling to ${target.username}'s location (${target.poi})...`);
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Traveling to ${target.username}'s location (${target.poi})...`);
       const travelResp = await bot.exec("travel", { target_poi: target.poi });
       if (travelResp.error && !travelResp.error.message.includes("already")) {
         ctx.log("error", `Travel failed: ${travelResp.error.message}`);
@@ -229,13 +253,17 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
     if (hasPumpNow) {
       // Use refuel command with Refueling Pump
-      ctx.log("rescue", `Initiating fuel transfer to ${target.username} using Refueling Pump...`);
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Initiating fuel transfer to ${target.username} using Refueling Pump...`);
 
       // Need to get the target's player ID for the refuel command
       const targetPlayerId = await findPlayerId(ctx, target.username);
 
       if (!targetPlayerId) {
         ctx.log("error", `Could not find player ID for ${target.username} — aborting transfer`);
+        if (isMaydayTarget) {
+          // Re-add to queue so another bot can try
+          // (For now, just log - the MAYDAY is already marked as handled)
+        }
         await sleep(settings.scanIntervalSec * 1000);
         continue;
       }
@@ -254,15 +282,15 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           const targetFuelNow = result.target_fuel_now as number || 0;
           const targetName = result.target_player_name as string || target.username;
 
-          ctx.log("rescue", `✓ Transferred ${Math.abs(fuelDelta)} fuel to ${targetName}`);
-          ctx.log("rescue", `  Our fuel: ${fuelNow}, Their fuel: ${targetFuelNow}`);
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Transferred ${Math.abs(fuelDelta)} fuel to ${targetName}`);
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `  Our fuel: ${fuelNow}, Their fuel: ${targetFuelNow}`);
         } else {
-          ctx.log("rescue", `✓ Fuel transfer complete for ${target.username}`);
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Fuel transfer complete for ${target.username}`);
         }
       }
     } else {
       // Fallback: Use fuel cell delivery method (jettison for them to collect)
-      ctx.log("rescue", `Delivering fuel cells to ${target.username} (no Refueling Pump)...`);
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Delivering fuel cells to ${target.username} (no Refueling Pump)...`);
 
       // Dock first to get fuel cells from storage
       await ensureDocked(ctx);
@@ -278,7 +306,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         // Undock and jettison at target location
         await ensureUndocked(ctx);
 
-        ctx.log("rescue", `Jettisoning ${fuelItem.quantity}x ${fuelItem.name} for ${target.username} to collect...`);
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", `Jettisoning ${fuelItem.quantity}x ${fuelItem.name} for ${target.username} to collect...`);
         const jetResp = await bot.exec("jettison", {
           item_id: fuelItem.itemId,
           quantity: fuelItem.quantity,
@@ -287,18 +315,18 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         if (jetResp.error) {
           ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
         } else {
-          ctx.log("rescue", `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them`);
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them`);
         }
       } else {
         // No fuel cells in cargo — try to buy them
-        ctx.log("rescue", "No fuel cells in cargo — attempting to purchase...");
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", "No fuel cells in cargo — attempting to purchase...");
 
         // Need to dock to buy
         const { pois } = await getSystemInfo(ctx);
         const station = findStation(pois);
 
         if (station) {
-          ctx.log("rescue", `Traveling to ${station.name} to purchase fuel cells...`);
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `Traveling to ${station.name} to purchase fuel cells...`);
           await bot.exec("travel", { target_poi: station.id });
           await bot.exec("dock");
           bot.docked = true;
@@ -329,11 +357,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
               const qty = Math.min(settings.rescueFuelCells, available);
 
               if (qty > 0 && (price * qty) <= bot.credits) {
-                ctx.log("rescue", `Buying ${qty}x fuel cells (${price}cr each)...`);
+                ctx.log(isMaydayTarget ? "mayday" : "rescue", `Buying ${qty}x fuel cells (${price}cr each)...`);
                 const buyResp = await bot.exec("buy", { item_id: fuelId, quantity: qty });
                 if (!buyResp.error) {
                   boughtCells = true;
-                  ctx.log("rescue", `Acquired ${qty}x fuel cells`);
+                  ctx.log(isMaydayTarget ? "mayday" : "rescue", `Acquired ${qty}x fuel cells`);
                 }
               }
             }
@@ -361,7 +389,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
               if (jetResp.error) {
                 ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
               } else {
-                ctx.log("rescue", `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them`);
+                ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them`);
               }
             }
           } else {
@@ -376,7 +404,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     // ── Return to home system ──
     if (homeSystem && bot.system !== homeSystem) {
       yield "return_home";
-      ctx.log("rescue", `Returning to home system ${homeSystem}...`);
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Returning to home system ${homeSystem}...`);
       await ensureUndocked(ctx);
       const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
       await navigateToSystem(ctx, homeSystem, safetyOpts);
@@ -388,7 +416,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     await bot.refreshStatus();
     logStatus(ctx);
 
-    ctx.log("rescue", `=== Fuel transfer mission for ${target.username} complete ===`);
+    if (isMaydayTarget) {
+      ctx.log("mayday", `=== MAYDAY response complete for ${target.username} ===`);
+    } else {
+      ctx.log("rescue", `=== Fuel transfer mission for ${target.username} complete ===`);
+    }
 
     // Short cooldown before next scan
     await sleep(10000);
@@ -713,7 +745,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
     // ── Validate MAYDAY (avoid ambushes) ──
     if (!isLegitimateMayday(mayday, maydayFuelThreshold)) {
-      ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - fuel at ${mayday.fuelPct}% (threshold: ${maydayFuelThreshold}%) - possible ambush`);
+      ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - fuel at ${mayday.fuelPct}% (threshold: <=${maydayFuelThreshold}%) - possible ambush`);
       markMaydayHandled(mayday); // Mark as handled so we don't process again
       continue;
     }
@@ -1018,7 +1050,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
   const homeSystem = bot.system;
 
-  ctx.log("system", "FuelRescue bot online — monitoring fleet for stranded ships...");
+  ctx.log("system", "FuelRescue bot online — monitoring fleet and MAYDAY channel for stranded ships...");
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -1038,7 +1070,25 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
     const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
 
+    // ── Check for MAYDAY requests if no fleet targets ──
+    let maydayTarget: RescueTarget | null = null;
     if (targets.length === 0) {
+      const mayday = getNextMayday();
+      if (mayday && isLegitimateMayday(mayday, 25)) {
+        ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+        maydayTarget = {
+          username: mayday.sender,
+          system: mayday.system,
+          poi: mayday.poi,
+          fuelPct: mayday.fuelPct,
+          docked: false,
+        };
+        markMaydayHandled(mayday);
+        ctx.log("mayday", `✓ MAYDAY validated - launching rescue mission for ${mayday.sender}`);
+      }
+    }
+
+    if (targets.length === 0 && !maydayTarget) {
       // No one needs help — scavenge where we are and idle
       yield "idle_scavenge";
       if (!bot.docked) {
@@ -1049,8 +1099,14 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Rescue the most critical bot ──
-    const target = targets[0];
-    ctx.log("rescue", `RESCUE NEEDED: ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
+    const target = maydayTarget || targets[0];
+    const isMaydayTarget = !!maydayTarget;
+    
+    if (maydayTarget) {
+      ctx.log("mayday", `RESCUE NEEDED (MAYDAY): ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
+    } else {
+      ctx.log("rescue", `RESCUE NEEDED: ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
+    }
 
     // ── Ensure we have fuel ourselves ──
     yield "self_check";
@@ -1132,7 +1188,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     await ensureUndocked(ctx);
 
     if (target.system && target.system !== bot.system) {
-      ctx.log("rescue", `Navigating to ${target.system}...`);
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Navigating to ${target.system}...`);
       const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
       const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
       if (!arrived) {
@@ -1147,7 +1203,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Travel to stranded bot's POI ──
     if (target.poi) {
       yield "travel_to_target";
-      ctx.log("rescue", `Traveling to ${target.username}'s location (${target.poi})...`);
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Traveling to ${target.username}'s location (${target.poi})...`);
       const travelResp = await bot.exec("travel", { target_poi: target.poi });
       if (travelResp.error && !travelResp.error.message.includes("already")) {
         ctx.log("error", `Travel failed: ${travelResp.error.message}`);
@@ -1161,7 +1217,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (target.docked) {
       // Target is docked — dock at same station and send gift
-      ctx.log("rescue", `${target.username} is docked — docking to send gift...`);
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `${target.username} is docked — docking to send gift...`);
       const dockResp = await bot.exec("dock");
       if (!dockResp.error || dockResp.error.message.includes("already")) {
         bot.docked = true;
@@ -1174,7 +1230,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             i.itemId.includes("fuel_cell") || i.itemId.includes("fuel") || i.itemId.includes("energy_cell")
           );
           if (fuelItem) {
-            ctx.log("rescue", `Sending ${fuelItem.quantity}x ${fuelItem.name} to ${target.username}...`);
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", `Sending ${fuelItem.quantity}x ${fuelItem.name} to ${target.username}...`);
             await bot.exec("send_gift", {
               recipient: target.username,
               item_id: fuelItem.itemId,
@@ -1185,7 +1241,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         }
 
         if (willSendCredits || bot.credits >= settings.rescueCredits) {
-          ctx.log("rescue", `Sending ${settings.rescueCredits} credits to ${target.username}...`);
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `Sending ${settings.rescueCredits} credits to ${target.username}...`);
           await bot.exec("send_gift", {
             recipient: target.username,
             credits: settings.rescueCredits,
@@ -1193,7 +1249,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           });
         }
 
-        ctx.log("rescue", `Delivery complete for ${target.username}!`);
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", `Delivery complete for ${target.username}!`);
       }
     } else {
       // Target is in space — jettison fuel cells for them to scavenge
@@ -1203,7 +1259,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           i.itemId.includes("fuel_cell") || i.itemId.includes("fuel") || i.itemId.includes("energy_cell")
         );
         if (fuelItem) {
-          ctx.log("rescue", `Jettisoning ${fuelItem.quantity}x ${fuelItem.name} for ${target.username} to collect...`);
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `Jettisoning ${fuelItem.quantity}x ${fuelItem.name} for ${target.username} to collect...`);
           const jetResp = await bot.exec("jettison", {
             item_id: fuelItem.itemId,
             quantity: fuelItem.quantity,
@@ -1211,16 +1267,16 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           if (jetResp.error) {
             ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
           } else {
-            ctx.log("rescue", `Fuel cells jettisoned at ${target.poi || bot.poi} — ${target.username} should scavenge them`);
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", `Fuel cells jettisoned at ${target.poi || bot.poi} — ${target.username} should scavenge them`);
           }
         }
       } else {
         // Can't help in space without fuel cells — dock at nearest station and send credits
-        ctx.log("rescue", "No fuel cells to jettison — looking for station to send credits...");
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", "No fuel cells to jettison — looking for station to send credits...");
         const { pois } = await getSystemInfo(ctx);
         const station = findStation(pois);
         if (station) {
-          ctx.log("rescue", `Docking at ${station.name} to send credits...`);
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `Docking at ${station.name} to send credits...`);
           await bot.exec("travel", { target_poi: station.id });
           await bot.exec("dock");
           bot.docked = true;
@@ -1231,7 +1287,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
               credits: settings.rescueCredits,
               message: "Emergency credits — dock here to collect and refuel!",
             });
-            ctx.log("rescue", `Sent ${settings.rescueCredits} credits to ${target.username}'s storage at ${station.name}`);
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", `Sent ${settings.rescueCredits} credits to ${target.username}'s storage at ${station.name}`);
           }
         }
       }
@@ -1240,7 +1296,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Return to home system ──
     if (homeSystem && bot.system !== homeSystem) {
       yield "return_home";
-      ctx.log("rescue", `Returning to home system ${homeSystem}...`);
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Returning to home system ${homeSystem}...`);
       await ensureUndocked(ctx);
       const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
       await navigateToSystem(ctx, homeSystem, safetyOpts);
@@ -1252,7 +1308,11 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     await bot.refreshStatus();
     logStatus(ctx);
 
-    ctx.log("rescue", `=== Rescue mission for ${target.username} complete ===`);
+    if (isMaydayTarget) {
+      ctx.log("mayday", `=== MAYDAY response complete for ${target.username} ===`);
+    } else {
+      ctx.log("rescue", `=== Rescue mission for ${target.username} complete ===`);
+    }
 
     // Short cooldown before next scan
     await sleep(10000);

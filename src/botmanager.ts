@@ -430,24 +430,13 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   const bot = bots.get(botName);
   if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
 
+  // Ensure session exists before executing command
   if (!bot.api.getSession()) {
     await bot.login();
   }
 
   debugLog("exec:handler", `${botName} > ${command}`, params);
   let resp = await bot.exec(command, params);
-
-  // If still getting auth errors after API's internal recovery, do a full re-login and retry once
-  if (resp.error) {
-    const code = resp.error.code;
-    if (code === "session_invalid" || code === "session_expired" || code === "not_authenticated") {
-      server.logSystem(`Session lost for ${botName}, re-logging in...`);
-      const ok = await bot.login();
-      if (ok) {
-        resp = await bot.exec(command, params);
-      }
-    }
-  }
 
   // Refresh cached state after mutating commands
   const refreshCommands = new Set([
@@ -597,13 +586,14 @@ async function main(): Promise<void> {
       let restartedCount = 0;
       const BOT_RESTART_DELAY_MS = 25000; // CRITICAL: 25s delay between bot restarts to prevent login rate limiting
 
-      // Convert to array and process with delays
-      const botsToRestart = [...botStates.entries()].filter(([_, state]) => state.wasRunning && state.routine);
-      
+      // Convert to array and process with delays - filter ensures routine is not null
+      const botsToRestart = [...botStates.entries()]
+        .filter(([_, state]) => state.wasRunning && state.routine !== null) as Array<[string, BotState & { routine: string }]>;
+
       for (let i = 0; i < botsToRestart.length; i++) {
         const [botName, state] = botsToRestart[i];
         const routine = ROUTINES[state.routine];
-        
+
         if (!routine) {
           server.logSystem(`Skipping ${botName}: routine ${state.routine} no longer exists`);
           continue;
@@ -661,32 +651,57 @@ async function main(): Promise<void> {
     // Push initial bot list to UI immediately (shows as "idle" with default values)
     refreshStatusTable();
 
-    // Stagger logins to avoid spamming the API (15s delay required to avoid rate limits/bans)
-    const LOGIN_DELAY_MS = 25000;
-    let loginIndex = 0;
+    // Session resume is fast (1s delay), full login requires rate limiting (25s delay)
+    const SESSION_RESUME_DELAY_MS = 1000;
+    const FULL_LOGIN_DELAY_MS = 25000;
+    let botIndex = 0;
+
     for (const [name, bot] of bots) {
-      const delay = loginIndex * LOGIN_DELAY_MS;
-      loginIndex++;
+      const delay = botIndex * SESSION_RESUME_DELAY_MS;
+      botIndex++;
       setTimeout(() => {
-        bot.login().then(async (ok) => {
-          refreshStatusTable(); // Push immediately after login
-          if (!ok) return;
-          // Fetch catalog data if stale (first logged-in bot triggers it)
-          if (catalogStore.isStale()) {
-            try {
-              await catalogStore.fetchAll(bot.api);
-              server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
-            } catch (err) {
-              server.logSystem(`Catalog fetch failed: ${err}`);
+        // Try session resume first (fast, no rate limit)
+        bot.resumeSession().then(async (ok) => {
+          refreshStatusTable();
+          if (ok) {
+            server.logSystem(`${name} session resumed (no login delay)`);
+            // Session resumed, start routine if assigned
+            const routineKey = assignments[name];
+            if (routineKey && ROUTINES[routineKey]) {
+              server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+              await handleStart({ type: "start", bot: name, routine: routineKey });
             }
+            return;
           }
-          const routineKey = assignments[name];
-          if (!routineKey || !ROUTINES[routineKey]) return;
-          server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-          await handleStart({ type: "start", bot: name, routine: routineKey });
+
+          // Session resume failed, need full login with rate-limited delay
+          server.logSystem(`${name} session expired, scheduling full login...`);
+          const loginDelay = botIndex * FULL_LOGIN_DELAY_MS;
+          setTimeout(() => {
+            bot.login().then(async (loginOk) => {
+              refreshStatusTable();
+              if (!loginOk) return;
+              // Fetch catalog data if stale (first logged-in bot triggers it)
+              if (catalogStore.isStale()) {
+                try {
+                  await catalogStore.fetchAll(bot.api);
+                  server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                } catch (err) {
+                  server.logSystem(`Catalog fetch failed: ${err}`);
+                }
+              }
+              const routineKey = assignments[name];
+              if (!routineKey || !ROUTINES[routineKey]) return;
+              server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+              await handleStart({ type: "start", bot: name, routine: routineKey });
+            }).catch((err) => {
+              server.logSystem(`Login failed for ${name}: ${err}`);
+              refreshStatusTable();
+            });
+          }, loginDelay);
         }).catch((err) => {
-          server.logSystem(`Login failed for ${name}: ${err}`);
-          refreshStatusTable(); // Still push status (will show error state)
+          server.logSystem(`Session resume failed for ${name}: ${err}`);
+          refreshStatusTable();
         });
       }, delay);
     }

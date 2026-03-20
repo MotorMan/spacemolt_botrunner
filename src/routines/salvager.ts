@@ -141,7 +141,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         bot.towingWreck = false;
       } else if (!releaseResp.error) {
         // Successfully released a tow - we were actually towing, log it
-        const releasedId = releaseResp.result?.wreck_id || "unknown";
+        const releasedId = (releaseResp.result as Record<string, unknown>)?.wreck_id as string || "unknown";
         ctx.log("scavenge", `Released towed wreck ${releasedId} — was from previous session`);
         bot.towingWreck = false;
         await bot.refreshStatus(); // Sync with server

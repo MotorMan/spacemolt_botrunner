@@ -3,6 +3,7 @@ import { commandLog } from "./commandLogger.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { serverDisconnectDetector } from "./serverdisconnectdetector.js";
 import { debugLog } from "./debug.js";
+import { SessionManager } from "./session.js";
 
 export interface ApiSession {
   id: string;
@@ -154,6 +155,8 @@ export class SpaceMoltAPI {
   private _cache = new ResponseCache();
   /** Track bot name for reconnection queue logging */
   private _botName: string | null = null;
+  /** Optional session manager for persisting session tokens across restarts */
+  private _sessionManager: SessionManager | null = null;
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
@@ -165,6 +168,54 @@ export class SpaceMoltAPI {
 
   setCredentials(username: string, password: string): void {
     this.credentials = { username, password };
+  }
+
+  setSessionManager(sessionManager: SessionManager): void {
+    this._sessionManager = sessionManager;
+  }
+
+  /** Restore session tokens from disk (called during bot initialization). Returns true if valid session restored. */
+  restoreSessionToken(): boolean {
+    if (!this._sessionManager) return false;
+    const token = this._sessionManager.loadSessionToken();
+    if (!token || !token.sessionId) return false;
+
+    // Check if session is still valid (not expired)
+    const expiresAt = new Date(token.expiresAt).getTime();
+    const now = Date.now();
+    if (expiresAt <= now) {
+      debugLog("api:restoreSession", `${this._botName || "unknown"} session expired`, { expiresAt, now });
+      this._sessionManager.clearSessionToken();
+      return false;
+    }
+
+    // Restore v1 session
+    this.session = {
+      id: token.sessionId,
+      expiresAt: token.expiresAt,
+      playerId: token.playerId,
+      createdAt: token.expiresAt, // Approximate, not critical
+    };
+
+    // Restore v2 session if available
+    if (token.v2SessionId && token.v2ExpiresAt) {
+      const v2ExpiresAt = new Date(token.v2ExpiresAt).getTime();
+      if (v2ExpiresAt > now) {
+        this.v2Session = {
+          id: token.v2SessionId,
+          expiresAt: token.v2ExpiresAt,
+          playerId: token.playerId,
+          createdAt: token.v2ExpiresAt,
+        };
+      }
+    }
+
+    debugLog("api:restoreSession", `${this._botName || "unknown"} session restored`, {
+      sessionId: this.session.id.slice(0, 8),
+      expiresAt: this.session.expiresAt,
+      hasV2: !!this.v2Session,
+    });
+    return true;
   }
 
   getSession(): ApiSession | null {
@@ -225,7 +276,7 @@ export class SpaceMoltAPI {
       }
     }
 
-    // Handle session/auth errors by refreshing and retrying
+    // Handle rate limiting by retrying after delay
     if (resp.error) {
       const code = resp.error.code;
 
@@ -240,35 +291,6 @@ export class SpaceMoltAPI {
         log("wait", `Rate limited — sleeping ${secs}s... (retry ${this._rateLimitRetries}/5)`);
         await sleep(Math.ceil(secs * 1000));
         return this.execute(command, payload);
-      }
-
-      if (code === "session_invalid" || code === "session_expired" || code === "not_authenticated") {
-        log("system", `Session expired (${needsV2 ? "v2" : "v1"}), refreshing...`);
-        if (needsV2) {
-          this.v2Session = null;
-          try {
-            await this.ensureV2Session();
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (!msg.startsWith("Login failed:")) {
-              return this.handleReconnection(command, payload, needsV2);
-            }
-            return { error: { code: "connection_failed", message: "Could not reconnect to server" } };
-          }
-        } else {
-          this.session = null;
-          try {
-            await this.ensureSession();
-          } catch (err) {
-            const msg = err instanceof Error ? err.message : String(err);
-            if (!msg.startsWith("Login failed:")) {
-              return this.handleReconnection(command, payload, needsV2);
-            }
-            return { error: { code: "connection_failed", message: "Could not reconnect to server" } };
-          }
-        }
-        // Fall through with fresh request so cache logic runs below
-        resp = await this.doRequest(command, payload);
       }
     }
 
@@ -353,36 +375,19 @@ export class SpaceMoltAPI {
 
   private async ensureSession(): Promise<void> {
     const botName = this._botName || "unknown";
-    
-    // Check if we have a session and if it's expiring
-    const hasSession = !!this.session;
-    const isExpiring = hasSession ? this.isSessionExpiring() : true;
-    
-    debugLog("api:ensureSession", `${botName} ensureSession called`, { 
-      hasSession, 
-      isExpiring, 
-      sessionId: this.session?.id.slice(0, 8),
-      expiresAt: this.session?.expiresAt 
-    });
-    
-    if (hasSession && !isExpiring) {
-      debugLog("api:ensureSession", `${botName} session still valid, skipping renewal`);
+
+    // Skip if we already have a session - game commands auto-renew sessions
+    if (this.session) {
+      debugLog("api:ensureSession", `${botName} session exists, skipping creation`);
       return;
     }
 
-    const isRenewal = hasSession;
-    log("system", isRenewal ? "Renewing session..." : "Creating new session...");
-
-    // Build headers — include existing session ID for renewal
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (this.session) {
-      headers["X-Session-Id"] = this.session.id;
-    }
+    log("system", "Creating new session...");
 
     // Single attempt - the reconnection queue handles retries with backoff
     const resp = await fetch(`${this.baseUrl}/session`, {
       method: "POST",
-      headers,
+      headers: { "Content-Type": "application/json" },
     });
 
     if (!resp.ok) {
@@ -392,14 +397,13 @@ export class SpaceMoltAPI {
     const data = (await resp.json()) as ApiResponse;
     if (data.session) {
       this.session = data.session;
-      log("system", isRenewal ? `Session renewed: ${this.session.id.slice(0, 8)}...` : `Session created: ${this.session.id.slice(0, 8)}...`);
+      log("system", `Session created: ${this.session.id.slice(0, 8)}...`);
     } else {
       throw new Error("No session in response");
     }
 
-    // Only do full login if this is a fresh session (not a renewal)
-    // Renewal should preserve authentication state without re-sending credentials
-    if (!isRenewal && this.credentials) {
+    // Do initial login with credentials to authenticate the session
+    if (this.credentials) {
       log("system", `Logging in as ${this.credentials.username}...`);
       const loginResp = await this.doRequest("login", {
         username: this.credentials.username,
@@ -413,70 +417,45 @@ export class SpaceMoltAPI {
         this.session = loginResp.session;
       }
     }
+
+    // Save session token for persistence across restarts
+    this.saveSessionToken();
   }
 
-  private isSessionExpiring(): boolean {
-    if (!this.session) return true;
-    const expiresAt = new Date(this.session.expiresAt).getTime();
-    const now = Date.now();
-    const remaining = expiresAt - now;
-    const remainingSecs = Math.round(remaining / 1000);
-    debugLog("api:session", `${this._botName || "unknown"} session check: ${remainingSecs}s remaining`, { 
-      expiresAt: this.session.expiresAt, 
-      now: new Date(now).toISOString(),
-      isExpiring: remaining < 240_000 
-    });
-    return remaining < 240_000; // Less than 240s remaining
+  /** Save current session tokens to disk via SessionManager */
+  private saveSessionToken(): void {
+    if (!this._sessionManager) return;
+    const token: import("./session.js").SessionToken = {
+      sessionId: this.session?.id || "",
+      expiresAt: this.session?.expiresAt || "",
+      playerId: this.session?.playerId,
+    };
+    // Add v2 session if available
+    if (this.v2Session) {
+      token.v2SessionId = this.v2Session.id;
+      token.v2ExpiresAt = this.v2Session.expiresAt;
+    }
+    this._sessionManager.saveSessionToken(token);
   }
 
-  private isV2SessionExpiring(): boolean {
-    if (!this.v2Session) return true;
-    const expiresAt = new Date(this.v2Session.expiresAt).getTime();
-    const now = Date.now();
-    const remaining = expiresAt - now;
-    const remainingSecs = Math.round(remaining / 1000);
-    debugLog("api:session", `${this._botName || "unknown"} v2 session check: ${remainingSecs}s remaining`, { 
-      expiresAt: this.v2Session.expiresAt, 
-      now: new Date(now).toISOString(),
-      isExpiring: remaining < 240_000 
-    });
-    return remaining < 240_000;
-  }
 
   /** Create and authenticate a v2 session (separate session store from v1). */
   private async ensureV2Session(): Promise<void> {
     const botName = this._botName || "unknown";
-    
-    // Check if we have a v2 session and if it's expiring
-    const hasSession = !!this.v2Session;
-    const isExpiring = hasSession ? this.isV2SessionExpiring() : true;
-    
-    debugLog("api:ensureV2Session", `${botName} ensureV2Session called`, { 
-      hasSession, 
-      isExpiring, 
-      sessionId: this.v2Session?.id.slice(0, 8),
-      expiresAt: this.v2Session?.expiresAt 
-    });
-    
-    if (hasSession && !isExpiring) {
-      debugLog("api:ensureV2Session", `${botName} v2 session still valid, skipping renewal`);
+
+    // Skip if we already have a v2 session - game commands auto-renew sessions
+    if (this.v2Session) {
+      debugLog("api:ensureV2Session", `${botName} v2 session exists, skipping creation`);
       return;
     }
 
-    const isRenewal = hasSession;
     const v2Base = this.baseUrl.replace("/api/v1", "/api/v2");
-    log("system", isRenewal ? "Renewing v2 session..." : "Creating v2 session...");
-
-    // Build headers — include existing session ID for renewal
-    const headers: Record<string, string> = { "Content-Type": "application/json" };
-    if (this.v2Session) {
-      headers["X-Session-Id"] = this.v2Session.id;
-    }
+    log("system", "Creating v2 session...");
 
     // Single attempt - the reconnection queue handles retries with backoff
     const resp = await fetch(`${v2Base}/session`, {
       method: "POST",
-      headers,
+      headers: { "Content-Type": "application/json" },
     });
 
     if (!resp.ok) {
@@ -493,14 +472,13 @@ export class SpaceMoltAPI {
         s.playerId = s.player_id;
       }
       this.v2Session = data.session;
-      log("system", isRenewal ? `v2 session renewed: ${this.v2Session.id.slice(0, 8)}...` : `v2 session created: ${this.v2Session.id.slice(0, 8)}...`);
+      log("system", `v2 session created: ${this.v2Session.id.slice(0, 8)}...`);
     } else {
       throw new Error("No session in v2 response");
     }
 
-    // Only do full login if this is a fresh session (not a renewal)
-    // Renewal should preserve authentication state without re-sending credentials
-    if (!isRenewal && this.credentials) {
+    // Authenticate v2 session with credentials
+    if (this.credentials) {
       const loginResp = await fetch(`${v2Base}/spacemolt_auth/login`, {
         method: "POST",
         headers: {
@@ -533,6 +511,9 @@ export class SpaceMoltAPI {
         this.v2Session = loginData.session;
       }
     }
+
+    // Save session token for persistence across restarts
+    this.saveSessionToken();
   }
 
   private async doRequest(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {

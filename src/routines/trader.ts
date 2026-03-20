@@ -1154,15 +1154,15 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     if (route && buyQty > 0) {
       await bot.refreshStorage();
       if (bot.storage.length > 0) {
-        const destSys = mapStore.getSystem(route.destSystem);
-        const destStation = destSys?.pois.find(p => p.id === route.destPoi);
+        const destSys = mapStore.getSystem(route!.destSystem);
+        const destStation = destSys?.pois.find(p => p.id === route!.destPoi);
         const destMarket = destStation?.market || [];
 
         const storageToSell: Array<{ itemId: string; name: string; qty: number }> = [];
         for (const item of bot.storage) {
           const lower = item.itemId.toLowerCase();
           if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-          if (item.itemId === route.itemId) continue; // skip the trade item itself
+          if (item.itemId === route!.itemId) continue; // skip the trade item itself
           const destItem = destMarket.find(m => m.item_id === item.itemId);
           if (destItem && destItem.best_buy !== null && destItem.best_buy > 0) {
             storageToSell.push({ itemId: item.itemId, name: item.name, qty: item.quantity });
@@ -1517,28 +1517,28 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Attempt to sell at current destination
     await bot.refreshCargo();
-    let remaining = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+    let remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
 
     if (remaining <= 0) {
-      ctx.log("error", `No ${route.itemName} left in cargo (bought ${buyQty}, all consumed during travel)`);
+      ctx.log("error", `No ${route!.itemName} left in cargo (bought ${buyQty}, all consumed during travel)`);
     } else {
       if (remaining < buyQty) {
-        ctx.log("trade", `Only ${remaining}/${buyQty}x ${route.itemName} left (${buyQty - remaining} consumed during travel)`);
+        ctx.log("trade", `Only ${remaining}/${buyQty}x ${route!.itemName} left (${buyQty - remaining} consumed during travel)`);
       }
-      ctx.log("trade", `Selling ${remaining}x ${route.itemName} at ${route.sellPrice}cr/ea...`);
-      const sellResp = await bot.exec("sell", { item_id: route.itemId, quantity: remaining });
+      ctx.log("trade", `Selling ${remaining}x ${route!.itemName} at ${route!.sellPrice}cr/ea...`);
+      const sellResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
       if (!sellResp.error) {
         const sr = sellResp.result as Record<string, unknown> | undefined;
         const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
         // Check how many actually sold
         await bot.refreshCargo();
-        const afterSell = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+        const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
         const sold = remaining - afterSell;
         totalSold += sold;
-        sellRevenue += earned > 0 ? earned : sold * route.sellPrice;
+        sellRevenue += earned > 0 ? earned : sold * route!.sellPrice;
         remaining = afterSell;
         if (remaining > 0) {
-          ctx.log("trade", `Sold ${sold}x but ${remaining}x ${route.itemName} still unsold — buyer demand exhausted`);
+          ctx.log("trade", `Sold ${sold}x but ${remaining}x ${route!.itemName} still unsold — buyer demand exhausted`);
         }
         // Refresh dest market cache with real post-sale data
         await recordMarketData(ctx);
@@ -1594,20 +1594,20 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           
           await ensureDocked(ctx);
           await bot.refreshCargo();
-          remaining = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
-          
+          remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+
           if (remaining > 0) {
-            const sResp = await bot.exec("sell", { item_id: route.itemId, quantity: remaining });
+            const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
             if (!sResp.error) {
               const sr = sResp.result as Record<string, unknown> | undefined;
               const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? 0;
               await bot.refreshCargo();
-              const afterSell = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+              const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
               const sold = remaining - afterSell;
               totalSold += sold;
               sellRevenue += earned > 0 ? earned : sold * best.buyer.price;
               remaining = afterSell;
-              ctx.log("trade", `Sold ${sold}x ${route.itemName} at ${best.buyer.poiName} (${best.buyer.price}cr/ea)`);
+              ctx.log("trade", `Sold ${sold}x ${route!.itemName} at ${best.buyer.poiName} (${best.buyer.price}cr/ea)`);
               await recordMarketData(ctx);
             }
           }
@@ -1620,7 +1620,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       if (remaining > 0) {
         const allBuys = mapStore.getAllBuyDemand();
         const buyers = allBuys
-          .filter(b => b.itemId === route.itemId && b.price > 0)
+          .filter(b => b.itemId === route!.itemId && b.price > 0)
           .filter(b => !(b.systemId === bot.system && b.poiId === bot.poi)) // skip current station
           .sort((a, b) => b.price - a.price);
 
@@ -1649,20 +1649,20 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
           await ensureDocked(ctx);
           await bot.refreshCargo();
-          remaining = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+          remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
           if (remaining <= 0) break;
 
-          const sResp = await bot.exec("sell", { item_id: route.itemId, quantity: remaining });
+          const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
           if (!sResp.error) {
             const sr = sResp.result as Record<string, unknown> | undefined;
             const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
             await bot.refreshCargo();
-            const afterSell = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+            const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
             const sold = remaining - afterSell;
             totalSold += sold;
             sellRevenue += earned > 0 ? earned : sold * buyer.price;
             remaining = afterSell;
-            ctx.log("trade", `Sold ${sold}x ${route.itemName} at ${buyer.poiName} (${buyer.price}cr/ea)${remaining > 0 ? ` — ${remaining}x still unsold` : ""}`);
+            ctx.log("trade", `Sold ${sold}x ${route!.itemName} at ${buyer.poiName} (${buyer.price}cr/ea)${remaining > 0 ? ` — ${remaining}x still unsold` : ""}`);
             await recordMarketData(ctx);
           } else {
             ctx.log("error", `Sell failed: ${sResp.error.message}`);
@@ -1707,17 +1707,17 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           
           // Deposit unsold items
           await bot.refreshCargo();
-          remaining = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+          remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
           if (remaining > 0) {
-            await bot.exec("deposit_items", { item_id: route.itemId, quantity: remaining });
-            ctx.log("trade", `Deposited ${remaining}x ${route.itemName} to faction storage at ${homeStation.name} (will sell when prices improve)`);
-            logFactionActivity(ctx, "deposit", `Deposited ${remaining}x ${route.itemName} from unprofitable trade (cost: ${investedCredits}cr)`);
+            await bot.exec("deposit_items", { item_id: route!.itemId, quantity: remaining });
+            ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to faction storage at ${homeStation.name} (will sell when prices improve)`);
+            logFactionActivity(ctx, "deposit", `Deposited ${remaining}x ${route!.itemName} from unprofitable trade (cost: ${investedCredits}cr)`);
           }
         }
       } else {
         // Profitable or break-even — deposit at Sol Central as before
         const SOL_CENTRAL = "sol_central";
-        ctx.log("trade", `${remaining}x ${route.itemName} still unsold — storing at Sol Central`);
+        ctx.log("trade", `${remaining}x ${route!.itemName} still unsold — storing at Sol Central`);
 
         // Navigate to Sol Central if needed
         const solSystem = "sol";
@@ -1737,10 +1737,10 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
         await ensureDocked(ctx);
         await bot.refreshCargo();
-        remaining = bot.inventory.find(i => i.itemId === route.itemId)?.quantity ?? 0;
+        remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
         if (remaining > 0) {
-          await bot.exec("deposit_items", { item_id: route.itemId, quantity: remaining });
-          ctx.log("trade", `Deposited ${remaining}x ${route.itemName} to Sol Central storage`);
+          await bot.exec("deposit_items", { item_id: route!.itemId, quantity: remaining });
+          ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to Sol Central storage`);
         }
       }
     }

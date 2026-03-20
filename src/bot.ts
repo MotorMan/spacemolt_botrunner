@@ -148,6 +148,8 @@ export class Bot {
     this.api = new SpaceMoltAPI();
     this.api.setBotName(username);
     this.session = new SessionManager(username, baseDir);
+    // Connect API to session manager for persistence
+    this.api.setSessionManager(this.session);
     this.color = BOT_COLORS[colorIndex % BOT_COLORS.length];
     colorIndex++;
   }
@@ -244,6 +246,26 @@ export class Bot {
     }
 
     this.log("system", "Login successful");
+    await this.refreshStatus();
+    return true;
+  }
+
+  /** Resume session from disk without full login. Returns true if session was restored and is valid. */
+  async resumeSession(): Promise<boolean> {
+    const restored = this.api.restoreSessionToken();
+    if (!restored) {
+      return false;
+    }
+
+    // Test the session with a lightweight API call
+    this.log("system", "Testing restored session...");
+    const resp = await this.exec("get_status");
+    if (resp.error) {
+      this.log("system", "Restored session invalid, will require full login");
+      return false;
+    }
+
+    this.log("system", "Session resumed successfully");
     await this.refreshStatus();
     return true;
   }
@@ -412,20 +434,27 @@ export class Bot {
     this._error = null;
     this._abortController = new AbortController();
 
-    // Always login if we have credentials — ensures fresh authenticated session
-    // even if a stale session object exists in memory
     const creds = this.session.loadCredentials();
-    if (creds) {
-      const loggedIn = await this.login();
-      if (!loggedIn) {
-        // login() already set _state = "error" and _error; throw so the caller's
-        // .catch() handler fires instead of .then() (which would log "routine finished").
-        throw new Error(this._error || "Login failed");
-      }
-    } else {
+    if (!creds) {
       this._error = "No credentials found";
       this._state = "error";
       throw new Error(this._error);
+    }
+
+    // Try to resume session from disk first (fast, no login delay)
+    // If resume fails, fall back to full login
+    if (this.api.getSession()) {
+      this.log("system", "Using existing in-memory session");
+    } else if (await this.resumeSession()) {
+      // Session resumed successfully from disk
+    } else {
+      // No valid session, need full login
+      this.log("system", "No valid session, performing full login...");
+      const loggedIn = await this.login();
+      if (!loggedIn) {
+        this._state = "error";
+        throw new Error(this._error || "Login failed");
+      }
     }
 
     this.log("system", `Starting routine: ${routineName}`);
@@ -572,6 +601,8 @@ export class Bot {
               if (added) {
                 this.log("mayday", `🚨 MAYDAY received from ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
               }
+            } else {
+              this.log("warn", `MAYDAY parse failed - message format may have changed. Content: "${content}"`);
             }
           }
 

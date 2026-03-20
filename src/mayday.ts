@@ -51,7 +51,7 @@ export function parseMaydayMessage(content: string, sender: string, timestamp: n
  * Default threshold is 25% to avoid ambushes.
  */
 export function isLegitimateMayday(mayday: MaydayRequest, fuelThresholdPct: number = 25): boolean {
-  return mayday.fuelPct < fuelThresholdPct;
+  return mayday.fuelPct <= fuelThresholdPct;
 }
 
 // ── MAYDAY Queue ────────────────────────────────────────────

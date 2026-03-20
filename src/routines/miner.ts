@@ -282,8 +282,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   // Home system: from settings, or wherever the bot is now as fallback
   //  // Use factionStorageSystem from general settings instead of homeSystem for mining operations
   const allSettings = readSettings();
-  const factionStorageSystem = (allSettings.general && allSettings.general.factionStorageSystem) || "sol";
-  const homeSystem = factionStorageSystem;
+  const factionStorageSystem: string = (allSettings.general && typeof allSettings.general.factionStorageSystem === "string")
+    ? allSettings.general.factionStorageSystem
+    : "sol";
+  const homeSystem: string = factionStorageSystem;
   /** Systems where all belts were depleted for the current target ore. Cleared each cycle when ore target changes. */
   const depletedSystems = new Set<string>();
   let lastTargetOre = "";

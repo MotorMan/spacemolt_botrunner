@@ -428,7 +428,6 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
         const remote = await bot.viewStorage(station.stationId);
         const credits = (remote.credits as number) || (remote.stored_credits as number) || 0;
-        const items = bot.parseItemList ? [] : []; // parseItemList is private, check items array
         const itemArray = (
           Array.isArray(remote) ? remote :
           Array.isArray(remote.items) ? remote.items :

@@ -417,6 +417,11 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   debugLog("exec:handler", `${botName} > ${command}`, params);
   let resp = await bot.exec(command, params);
 
+  // Track player names from get_nearby responses
+  if (!resp.error && resp.result && command === "get_nearby") {
+    bot.trackNearbyPlayers(resp.result);
+  }
+
   // Refresh cached state after mutating commands
   const refreshCommands = new Set([
     "mine", "sell", "buy", "dock", "undock", "travel", "jump",
@@ -562,8 +567,8 @@ async function main(): Promise<void> {
     // Push initial bot list to UI immediately (shows as "idle" with default values)
     refreshStatusTable();
 
-    // Session resume is fast (1s delay), full login requires rate limiting (25s delay)
-    const SESSION_RESUME_DELAY_MS = 1000;
+    // Session resume is fast (5s delay to match renewal queue), full login requires rate limiting (25s delay)
+    const SESSION_RESUME_DELAY_MS = 5000;
     const FULL_LOGIN_DELAY_MS = 25000;
     let botIndex = 0;
 

@@ -700,6 +700,9 @@ async function* visitOtherPoi(
     if (objects.length > 0) {
       ctx.log("info", `Visited ${poi.name}: ${objects.length} objects nearby`);
     }
+    
+    // Track player names from nearby scan
+    bot.trackNearbyPlayers(nearbyResp.result);
   }
 
   mapStore.markExplored(systemId, poi.id);

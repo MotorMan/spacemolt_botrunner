@@ -4,6 +4,7 @@ import { log, logError, logNotifications } from "./ui.js";
 import { debugLog } from "./debug.js";
 import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
+import { playerNameStore } from "./playernamestore.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -143,6 +144,9 @@ export class Bot {
   private lastWarningAlertMs = 0;
   private static readonly WARNING_ALERT_COOLDOWN_MS = 60_000;
 
+  /** Track ongoing login to prevent duplicate concurrent logins */
+  private _loginPromise: Promise<boolean> | null = null;
+
   constructor(username: string, baseDir: string) {
     this.username = username;
     this.api = new SpaceMoltAPI();
@@ -152,6 +156,9 @@ export class Bot {
     this.api.setSessionManager(this.session);
     this.color = BOT_COLORS[colorIndex % BOT_COLORS.length];
     colorIndex++;
+    
+    // Initialize player name tracking
+    playerNameStore.setBotName(username);
   }
 
   get state(): BotState {
@@ -220,11 +227,41 @@ export class Bot {
       }
     }
 
+    // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
+    // This helps collect player names faster as we move through the galaxy
+    if (!resp.error) {
+      const navigationCommands = ["travel", "jump", "dock", "undock"];
+      if (navigationCommands.includes(command)) {
+        // Small delay to let the navigation complete
+        await sleep(500);
+        const nearbyResp = await this.api.execute("get_nearby");
+        if (!nearbyResp.error && nearbyResp.result) {
+          this.trackNearbyPlayers(nearbyResp.result);
+        }
+      }
+    }
+
     return resp;
   }
 
-  /** Login using stored credentials. Returns true on success. */
+  /** Login using stored credentials. Returns true on success. Prevents duplicate concurrent logins. */
   async login(): Promise<boolean> {
+    // If login already in progress, wait for it instead of starting a new one
+    if (this._loginPromise) {
+      this.log("system", "Login already in progress, waiting...");
+      return this._loginPromise;
+    }
+
+    // Start new login
+    this._loginPromise = this.doLogin().finally(() => {
+      this._loginPromise = null;
+    });
+
+    return this._loginPromise;
+  }
+
+  /** Internal login implementation */
+  private async doLogin(): Promise<boolean> {
     const creds = this.session.loadCredentials();
     if (!creds) {
       this._error = "No credentials found";
@@ -593,6 +630,16 @@ export class Bot {
           const content = (data.content as string) || "";
 
           this.log("chat", `Received [${channel}] ${sender}: ${content}`);
+          
+          // Track player name from chat (but NOT from MAYDAY messages - those can be fake/pirate names)
+          if (sender && sender !== "Unknown" && sender !== this.username) {
+            const contentLower = content.toLowerCase();
+            if (!contentLower.includes("mayday")) {
+              playerNameStore.add(sender);
+            } else {
+              debugLog("playernames:skip", `${this.username}`, `Ignored MAYDAY sender: "${sender}"`);
+            }
+          }
 
           // Check for MAYDAY emergency rescue requests
           if (channel === "emergency" || content.includes("MAYDAY")) {
@@ -654,6 +701,11 @@ export class Bot {
             `UNDER ATTACK! ${pirateName}${pirateT ? ` (${pirateT})` : ""} dealt ${damage} ${damageType} dmg${hullStr}${shieldStr}`
           );
 
+          // Track pirate name
+          if (pirateName && pirateName !== "Unknown") {
+            playerNameStore.add(pirateName);
+          }
+
           // Combat chat alerts disabled — was spamming faction chat
           // const now = Date.now();
           // if (now - this.lastCombatAlertMs > Bot.COMBAT_ALERT_COOLDOWN_MS) {
@@ -713,6 +765,12 @@ export class Bot {
     try {
       let nearbyInfo = "";
       const nearbyResp = await this.api.execute("get_nearby");
+      
+      // Track players from nearby response
+      if (nearbyResp.result) {
+        this.trackNearbyPlayers(nearbyResp.result);
+      }
+      
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
         const nearby = nearbyResp.result as Record<string, unknown>;
 
@@ -756,6 +814,122 @@ export class Bot {
       this.log("combat", `Faction warning sent`);
     } catch (err) {
       this.log("error", `Warning alert failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Extract and track player names from a get_nearby response.
+   * Handles players, pirates, ships, and other entity arrays.
+   */
+  trackNearbyPlayers(nearbyResult: unknown): void {
+    if (!nearbyResult || typeof nearbyResult !== "object") {
+      this.log("debug", "trackNearbyPlayers: no result or not object");
+      return;
+    }
+
+    const data = nearbyResult as Record<string, unknown>;
+    
+    // Debug: log what keys we have
+    debugLog("playernames:track", `${this.username}`, `get_nearby result keys: ${Object.keys(data).join(", ")}`);
+
+    // Extract from various possible array formats (objects, nearby, ships, players, pirates)
+    const arraysToCheck = [
+      Array.isArray(data.objects) ? data.objects : [],
+      Array.isArray(data.nearby) ? data.nearby : [],
+      Array.isArray(data.ships) ? data.ships : [],
+      Array.isArray(data.players) ? data.players : [],
+      Array.isArray(data.pirates) ? data.pirates : [],
+      Array.isArray(data.nearby_players) ? data.nearby_players : [],
+    ];
+
+    let count = 0;
+    let totalFound = 0;
+    for (const arr of arraysToCheck) {
+      totalFound += arr.length;
+      for (const entity of arr as Array<Record<string, unknown>>) {
+        // Try various field names for player/ship names
+        const name = (entity.username as string) ||
+                     (entity.name as string) ||
+                     (entity.player_name as string) ||
+                     (entity.ship_name as string);
+
+        if (name && name.trim()) {
+          if (playerNameStore.add(name)) {
+            count++;
+          }
+        }
+      }
+    }
+
+    debugLog("playernames:track", `${this.username}`, `Found ${totalFound} entities, ${count} new names`);
+
+    if (count > 0) {
+      this.log("playernames", `Discovered ${count} new player(s) from nearby scan`);
+    }
+  }
+
+  /**
+   * Track faction member names from faction data.
+   * Call this after loading faction info to record all members.
+   */
+  trackFactionMembers(factionData: unknown): void {
+    if (!factionData || typeof factionData !== "object") {
+      return;
+    }
+
+    const data = factionData as Record<string, unknown>;
+    const members = Array.isArray(data.members) ? data.members : [];
+    
+    let count = 0;
+    for (const member of members as Array<Record<string, unknown>>) {
+      const name = (member.username as string) || (member.player_name as string) || (member.name as string);
+      if (name && name.trim()) {
+        if (playerNameStore.add(name)) {
+          count++;
+        }
+      }
+    }
+
+    if (count > 0) {
+      this.log("playernames", `Discovered ${count} new faction member(s)`);
+    }
+  }
+
+  /**
+   * Track player names from battle/scan results.
+   * Handles battle participants, scan targets, and similar arrays.
+   */
+  trackBattleParticipants(resultData: unknown): void {
+    if (!resultData || typeof resultData !== "object") {
+      return;
+    }
+
+    const data = resultData as Record<string, unknown>;
+    
+    // Extract from various possible array formats
+    const arraysToCheck = [
+      Array.isArray(data.participants) ? data.participants : [],
+      Array.isArray(data.targets) ? data.targets : [],
+      Array.isArray(data.sides) ? data.sides : [],
+    ];
+
+    let count = 0;
+    for (const arr of arraysToCheck) {
+      for (const entity of arr as Array<Record<string, unknown>>) {
+        const name = (entity.username as string) || 
+                     (entity.player_name as string) || 
+                     (entity.name as string);
+        
+        if (name && name.trim()) {
+          if (playerNameStore.add(name)) {
+            count++;
+          }
+        }
+      }
+    }
+
+    if (count > 0) {
+      this.log("playernames", `Discovered ${count} new player(s) from battle/scan`);
     }
   }
 

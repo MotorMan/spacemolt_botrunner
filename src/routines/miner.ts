@@ -492,13 +492,53 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Travel to asteroid belt ──
     yield "travel_to_belt";
-    const travelBeltResp = await bot.exec("travel", { target_poi: beltPoi.id });
-    if (travelBeltResp.error && !travelBeltResp.error.message.includes("already")) {
-      ctx.log("error", `Travel failed: ${travelBeltResp.error.message}`);
-      await sleep(5000);
+    let travelSuccess = false;
+    let travelAttempts = 0;
+    const MAX_TRAVEL_ATTEMPTS = 3;
+
+    while (travelAttempts < MAX_TRAVEL_ATTEMPTS && bot.state === "running") {
+      travelAttempts++;
+      try {
+        const travelBeltResp = await bot.exec("travel", { target_poi: beltPoi.id });
+        if (travelBeltResp.error && !travelBeltResp.error.message.includes("already")) {
+          const msg = travelBeltResp.error.message.toLowerCase();
+          const isTransient = msg.includes("timeout") || msg.includes("524") || msg.includes("connection") || msg.includes("network");
+
+          if (isTransient && travelAttempts < MAX_TRAVEL_ATTEMPTS) {
+            ctx.log("warn", `Travel to belt failed (transient): ${travelBeltResp.error.message} — retrying (${travelAttempts}/${MAX_TRAVEL_ATTEMPTS})`);
+            await sleep(5000 * travelAttempts);
+            await bot.refreshStatus();
+            continue;
+          }
+
+          ctx.log("error", `Travel to belt failed: ${travelBeltResp.error.message}`);
+          await sleep(5000);
+          break;
+        }
+        travelSuccess = true;
+        bot.poi = beltPoi.id;
+        break;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTransient = msg.includes("timeout") || msg.includes("524") || msg.includes("connection") || msg.includes("network");
+
+        ctx.log("error", `Travel to belt error (attempt ${travelAttempts}/${MAX_TRAVEL_ATTEMPTS}): ${msg}`);
+
+        if (!isTransient || travelAttempts >= MAX_TRAVEL_ATTEMPTS) {
+          ctx.log("error", "Travel to belt failed after all attempts — aborting cycle");
+          await sleep(10000);
+          break;
+        }
+
+        await sleep(5000 * travelAttempts);
+        await bot.refreshStatus();
+      }
+    }
+
+    if (!travelSuccess) {
+      await sleep(10000);
       continue;
     }
-    bot.poi = beltPoi.id;
 
     // ── Check belt depletion — switch to an alternative if exhausted ──
     yield "check_belt";
@@ -506,10 +546,53 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const altBelt = pois.find(p => isOreBeltPoi(p.type) && p.id !== beltPoi!.id);
       if (altBelt) {
         ctx.log("mining", `${beltPoi.name} depleted, switching to ${altBelt.name}`);
-        const altTravel = await bot.exec("travel", { target_poi: altBelt.id });
-        if (!altTravel.error || altTravel.error.message.includes("already")) {
-          beltPoi = { id: altBelt.id, name: altBelt.name };
-          bot.poi = altBelt.id;
+
+        // Travel to alternative belt with retry logic
+        let altTravelSuccess = false;
+        let altTravelAttempts = 0;
+        const MAX_ALT_TRAVEL_ATTEMPTS = 3;
+
+        while (altTravelAttempts < MAX_ALT_TRAVEL_ATTEMPTS && bot.state === "running") {
+          altTravelAttempts++;
+          try {
+            const altTravel = await bot.exec("travel", { target_poi: altBelt.id });
+            if (!altTravel.error || altTravel.error.message.includes("already")) {
+              altTravelSuccess = true;
+              beltPoi = { id: altBelt.id, name: altBelt.name };
+              bot.poi = altBelt.id;
+              break;
+            }
+
+            const msg = altTravel.error.message.toLowerCase();
+            const isTransient = msg.includes("timeout") || msg.includes("524") || msg.includes("connection") || msg.includes("network");
+
+            if (isTransient && altTravelAttempts < MAX_ALT_TRAVEL_ATTEMPTS) {
+              ctx.log("warn", `Travel to alt belt failed (transient): ${altTravel.error.message} — retrying (${altTravelAttempts}/${MAX_ALT_TRAVEL_ATTEMPTS})`);
+              await sleep(5000 * altTravelAttempts);
+              await bot.refreshStatus();
+              continue;
+            }
+
+            ctx.log("error", `Travel to alt belt failed: ${altTravel.error.message}`);
+            break;
+          } catch (err: unknown) {
+            const msg = err instanceof Error ? err.message : String(err);
+            const isTransient = msg.includes("timeout") || msg.includes("524") || msg.includes("connection") || msg.includes("network");
+
+            ctx.log("error", `Travel to alt belt error (attempt ${altTravelAttempts}/${MAX_ALT_TRAVEL_ATTEMPTS}): ${msg}`);
+
+            if (!isTransient || altTravelAttempts >= MAX_ALT_TRAVEL_ATTEMPTS) {
+              ctx.log("error", "Travel to alt belt failed after all attempts");
+              break;
+            }
+
+            await sleep(5000 * altTravelAttempts);
+            await bot.refreshStatus();
+          }
+        }
+
+        if (!altTravelSuccess) {
+          ctx.log("warn", "Could not switch to alternative belt — continuing with current");
         }
       }
     }
@@ -533,8 +616,41 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (midFuel < safetyOpts.fuelThresholdPct) { stopReason = `fuel low (${midFuel}%)`; break; }
 
-      const mineResp = await bot.exec("mine");
+      // Mine with retry logic for transient errors
+      let mineResp = await bot.exec("mine");
+      let mineAttempts = 0;
+      const MAX_MINE_ATTEMPTS = 3;
 
+      while (mineResp.error && mineAttempts < MAX_MINE_ATTEMPTS && bot.state === "running") {
+        const msg = mineResp.error.message.toLowerCase();
+        const isTransient = msg.includes("timeout") || msg.includes("524") || msg.includes("connection") || msg.includes("network");
+
+        // Non-transient or terminal errors — break immediately
+        if (!isTransient) {
+          if (msg.includes("no asteroids") || msg.includes("depleted") || msg.includes("no minable")) {
+            stopReason = "belt depleted"; break;
+          }
+          if (msg.includes("cargo") && msg.includes("full")) {
+            stopReason = "cargo full"; break;
+          }
+          ctx.log("error", `Mine error: ${mineResp.error.message}`);
+          break;
+        }
+
+        // Transient error — retry
+        mineAttempts++;
+        if (mineAttempts >= MAX_MINE_ATTEMPTS) {
+          ctx.log("error", `Mine failed after ${MAX_MINE_ATTEMPTS} attempts — ${mineResp.error.message}`);
+          break;
+        }
+
+        ctx.log("warn", `Mine failed (transient): ${mineResp.error.message} — retrying (${mineAttempts}/${MAX_MINE_ATTEMPTS})`);
+        await sleep(3000 * mineAttempts);
+        await bot.refreshStatus();
+        mineResp = await bot.exec("mine");
+      }
+
+      // Check if we broke out due to error
       if (mineResp.error) {
         const msg = mineResp.error.message.toLowerCase();
         if (msg.includes("no asteroids") || msg.includes("depleted") || msg.includes("no minable")) {
@@ -543,8 +659,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (msg.includes("cargo") && msg.includes("full")) {
           stopReason = "cargo full"; break;
         }
-        ctx.log("error", `Mine error: ${mineResp.error.message}`);
-        break;
+        // Other error — wait and continue loop
+        await sleep(5000);
+        continue;
       }
 
       miningCycles++;
@@ -633,21 +750,102 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Travel to station ──
     yield "travel_to_station";
     if (stationPoi) {
-      const travelStationResp = await bot.exec("travel", { target_poi: stationPoi.id });
-      if (travelStationResp.error && !travelStationResp.error.message.includes("already")) {
-        ctx.log("error", `Travel to station failed: ${travelStationResp.error.message}`);
+      let travelStationSuccess = false;
+      let travelStationAttempts = 0;
+      const MAX_STATION_TRAVEL_ATTEMPTS = 3;
+
+      while (travelStationAttempts < MAX_STATION_TRAVEL_ATTEMPTS && bot.state === "running") {
+        travelStationAttempts++;
+        try {
+          const travelStationResp = await bot.exec("travel", { target_poi: stationPoi.id });
+          if (travelStationResp.error && !travelStationResp.error.message.includes("already")) {
+            const msg = travelStationResp.error.message.toLowerCase();
+            const isTransient = msg.includes("timeout") || msg.includes("524") || msg.includes("connection") || msg.includes("network");
+
+            if (isTransient && travelStationAttempts < MAX_STATION_TRAVEL_ATTEMPTS) {
+              ctx.log("warn", `Travel to station failed (transient): ${travelStationResp.error.message} — retrying (${travelStationAttempts}/${MAX_STATION_TRAVEL_ATTEMPTS})`);
+              await sleep(5000 * travelStationAttempts);
+              await bot.refreshStatus();
+              continue;
+            }
+
+            ctx.log("error", `Travel to station failed: ${travelStationResp.error.message}`);
+            await sleep(5000);
+            break;
+          }
+          travelStationSuccess = true;
+          break;
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const isTransient = msg.includes("timeout") || msg.includes("524") || msg.includes("connection") || msg.includes("network");
+
+          ctx.log("error", `Travel to station error (attempt ${travelStationAttempts}/${MAX_STATION_TRAVEL_ATTEMPTS}): ${msg}`);
+
+          if (!isTransient || travelStationAttempts >= MAX_STATION_TRAVEL_ATTEMPTS) {
+            ctx.log("error", "Travel to station failed after all attempts");
+            break;
+          }
+
+          await sleep(5000 * travelStationAttempts);
+          await bot.refreshStatus();
+        }
+      }
+
+      if (!travelStationSuccess) {
+        ctx.log("warn", "Could not reach station — will attempt dock anyway");
       }
     }
 
     // ── Dock ──
     yield "dock";
-    const dockResp = await bot.exec("dock");
-    if (dockResp.error && !dockResp.error.message.includes("already")) {
-      ctx.log("error", `Dock failed: ${dockResp.error.message}`);
-      await sleep(5000);
+    let dockSuccess = false;
+    let dockAttempts = 0;
+    const MAX_DOCK_ATTEMPTS = 3;
+
+    while (dockAttempts < MAX_DOCK_ATTEMPTS && bot.state === "running") {
+      dockAttempts++;
+      try {
+        const dockResp = await bot.exec("dock");
+        if (dockResp.error && !dockResp.error.message.includes("already")) {
+          const msg = dockResp.error.message.toLowerCase();
+          const isTransient = msg.includes("timeout") || msg.includes("524") || msg.includes("connection") || msg.includes("network");
+
+          if (isTransient && dockAttempts < MAX_DOCK_ATTEMPTS) {
+            ctx.log("warn", `Dock failed (transient): ${dockResp.error.message} — retrying (${dockAttempts}/${MAX_DOCK_ATTEMPTS})`);
+            await sleep(5000 * dockAttempts);
+            await bot.refreshStatus();
+            continue;
+          }
+
+          ctx.log("error", `Dock failed: ${dockResp.error.message}`);
+          await sleep(5000);
+          break;
+        }
+        dockSuccess = true;
+        bot.docked = true;
+        break;
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        const isTransient = msg.includes("timeout") || msg.includes("524") || msg.includes("connection") || msg.includes("network");
+
+        ctx.log("error", `Dock error (attempt ${dockAttempts}/${MAX_DOCK_ATTEMPTS}): ${msg}`);
+
+        if (!isTransient || dockAttempts >= MAX_DOCK_ATTEMPTS) {
+          ctx.log("error", "Dock failed after all attempts — waiting before retry");
+          await sleep(10000);
+          break;
+        }
+
+        await sleep(5000 * dockAttempts);
+        await bot.refreshStatus();
+      }
+    }
+
+    if (!dockSuccess) {
+      ctx.log("warn", "Could not dock — will retry next cycle");
+      await sleep(10000);
       continue;
     }
-    bot.docked = true;
 
     // ── Collect gifted credits/items + record market prices ──
     await collectFromStorage(ctx);

@@ -552,16 +552,19 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     // ── Find the target player using get_nearby ──
     yield "scan_target";
     ctx.log("rescue", `Scanning for player: ${targetPlayer}...`);
-    
+
     const nearbyResp = await bot.exec("get_nearby");
     let nearbyPlayers: Array<{ playerId: string; username: string; shipType?: string }> = [];
-    
+
     if (!nearbyResp.error && nearbyResp.result) {
+      // Track player names from nearby scan
+      bot.trackNearbyPlayers(nearbyResp.result);
+      
       const data = nearbyResp.result as Record<string, unknown>;
       const players = Array.isArray(data.players) ? data.players :
                       Array.isArray(data.nearby) ? data.nearby :
                       Array.isArray(data.ships) ? data.ships : [];
-      
+
       for (const p of players as Array<Record<string, unknown>>) {
         const playerId = (p.player_id as string) || (p.id as string);
         const username = (p.username as string) || (p.name as string);
@@ -570,7 +573,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
           nearbyPlayers.push({ playerId, username, shipType });
         }
       }
-      
+
       ctx.log("rescue", `Found ${nearbyPlayers.length} nearby ship(s)`);
     }
 
@@ -874,6 +877,9 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     let targetFuelBefore = 0;
 
     if (!nearbyResp.error && nearbyResp.result) {
+      // Track player names from nearby scan
+      bot.trackNearbyPlayers(nearbyResp.result);
+      
       const data = nearbyResp.result as Record<string, unknown>;
       const players = Array.isArray(data.players) ? data.players :
                       Array.isArray(data.nearby) ? data.nearby :

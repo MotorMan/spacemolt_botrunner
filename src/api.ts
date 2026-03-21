@@ -19,6 +19,13 @@ export interface ApiResponse {
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v1";
+const USER_AGENT = "SpaceMolt-BotRunner-LT1428-MODDED";
+
+// Session management constants (matching Admiral)
+const MAX_RECONNECT_ATTEMPTS = 6;
+const RECONNECT_BASE_DELAY = 5_000;
+const SESSION_EXPIRY_THRESHOLD_MS = 60_000; // Renew when within 60 seconds of expiry
+const SESSION_CREATE_COOLDOWN_MS = 10_000; // Minimum 10s between session creations (rate limiting)
 
 // ── Response cache ────────────────────────────────────────────
 
@@ -156,6 +163,11 @@ export class SpaceMoltAPI {
   private _botName: string | null = null;
   /** Optional session manager for persisting session tokens across restarts */
   private _sessionManager: SessionManager | null = null;
+  /** Coalesce concurrent session creation attempts (like Admiral) */
+  private _ensureSessionPromise: Promise<void> | null = null;
+  private _ensureV2SessionPromise: Promise<void> | null = null;
+  /** Rate limiting: track last session creation time to prevent spam */
+  private _lastSessionCreateTime = 0;
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
@@ -180,9 +192,10 @@ export class SpaceMoltAPI {
     if (!token || !token.sessionId) return false;
 
     // Restore v1 session - server will validate on first command
+    // Don't restore expiresAt from disk - let server validate the session ID
     this.session = {
       id: token.sessionId,
-      expiresAt: token.expiresAt || "",
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(), // Assume 30 min validity
       playerId: token.playerId,
       createdAt: token.expiresAt || "",
     };
@@ -191,7 +204,7 @@ export class SpaceMoltAPI {
     if (token.v2SessionId) {
       this.v2Session = {
         id: token.v2SessionId,
-        expiresAt: token.v2ExpiresAt || "",
+        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(), // Assume 30 min validity
         playerId: token.playerId,
         createdAt: token.v2ExpiresAt || "",
       };
@@ -208,6 +221,20 @@ export class SpaceMoltAPI {
     return this.session;
   }
 
+  /** Check if session is missing or expiring soon (within 60 seconds). */
+  private isSessionExpiring(): boolean {
+    if (!this.session) return true;
+    const expiresAt = new Date(this.session.expiresAt).getTime();
+    return expiresAt - Date.now() < SESSION_EXPIRY_THRESHOLD_MS;
+  }
+
+  /** Check if v2 session is missing or expiring soon. */
+  private isV2SessionExpiring(): boolean {
+    if (!this.v2Session) return true;
+    const expiresAt = new Date(this.v2Session.expiresAt).getTime();
+    return expiresAt - Date.now() < SESSION_EXPIRY_THRESHOLD_MS;
+  }
+
   /** Check if a command will route to a v2 endpoint. */
   private isV2Command(command: string, payload?: Record<string, unknown>): boolean {
     return V2_DIRECT_COMMANDS.has(command)
@@ -215,6 +242,8 @@ export class SpaceMoltAPI {
   }
 
   async execute(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
+    const botName = this._botName || this.credentials?.username || "unknown";
+    
     // Log the command being executed to debugCommands.log
     commandLog("api", `Executing command: ${this.credentials?.username}:${command}`, { command, payload });
 
@@ -262,7 +291,7 @@ export class SpaceMoltAPI {
       }
     }
 
-    // Handle rate limiting by retrying after delay
+    // Handle rate limiting and session errors by retrying
     if (resp.error) {
       const code = resp.error.code;
 
@@ -277,6 +306,24 @@ export class SpaceMoltAPI {
         log("wait", `Rate limited — sleeping ${secs}s... (retry ${this._rateLimitRetries}/5)`);
         await sleep(Math.ceil(secs * 1000));
         return this.execute(command, payload);
+      }
+
+      // Session expired/invalid - create new session and retry once (like Admiral)
+      if (code === "session_invalid" || code === "session_expired" || code === "not_authenticated") {
+        log("system", `${botName} session invalid/expired, creating new session...`);
+        this.session = null;
+        if (needsV2) this.v2Session = null;
+
+        try {
+          await this.ensureSession();
+          if (needsV2) await this.ensureV2Session();
+          // Retry the original command with fresh session
+          return this.execute(command, payload);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log("error", `${botName} session renewal failed: ${msg}`);
+          return { error: { code: "session_renewal_failed", message: msg } };
+        }
       }
     }
 
@@ -351,50 +398,90 @@ export class SpaceMoltAPI {
   private async ensureSession(): Promise<void> {
     const botName = this._botName || "unknown";
 
-    // Skip if we already have a session - game commands auto-renew sessions
-    if (this.session) {
-      debugLog("api:ensureSession", `${botName} session exists, skipping creation`);
+    // Skip if session exists and not expiring soon
+    if (this.session && !this.isSessionExpiring()) {
+      debugLog("api:ensureSession", `${botName} session valid, skipping creation`);
       return;
     }
 
-    log("system", "Creating new session...");
-
-    // Single attempt - the reconnection queue handles retries with backoff
-    const resp = await fetch(`${this.baseUrl}/session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-
-    if (!resp.ok) {
-      throw new Error(`Failed to create session: ${resp.status} ${resp.statusText}`);
+    // Rate limiting: enforce cooldown between session creations
+    const now = Date.now();
+    const timeSinceLastCreate = now - this._lastSessionCreateTime;
+    if (timeSinceLastCreate < SESSION_CREATE_COOLDOWN_MS && timeSinceLastCreate > 100) {
+      const waitMs = SESSION_CREATE_COOLDOWN_MS - timeSinceLastCreate;
+      debugLog("api:ensureSession", `${botName} session creation on cooldown, waiting ${waitMs}ms`);
+      await sleep(waitMs);
+      // After waiting, check again if session is still needed
+      if (this.session && !this.isSessionExpiring()) {
+        debugLog("api:ensureSession", `${botName} session now valid after cooldown wait`);
+        return;
+      }
     }
 
-    const data = (await resp.json()) as ApiResponse;
-    if (data.session) {
-      this.session = data.session;
-      log("system", `Session created: ${this.session.id.slice(0, 8)}...`);
-    } else {
-      throw new Error("No session in response");
-    }
-
-    // Do initial login with credentials to authenticate the session
-    if (this.credentials) {
-      log("system", `Logging in as ${this.credentials.username}...`);
-      const loginResp = await this.doRequest("login", {
-        username: this.credentials.username,
-        password: this.credentials.password,
+    // Coalesce concurrent callers onto a single in-flight attempt (like Admiral)
+    // This prevents session creation storms that hit rate limits
+    if (!this._ensureSessionPromise) {
+      this._ensureSessionPromise = this.createSession().finally(() => {
+        this._ensureSessionPromise = null;
       });
-      if (loginResp.error) {
-        throw new Error(`Login failed: ${loginResp.error.message}`);
-      }
-      log("system", "Logged in successfully");
-      if (loginResp.session) {
-        this.session = loginResp.session;
+    }
+    return this._ensureSessionPromise;
+  }
+
+  private async createSession(): Promise<void> {
+    const botName = this._botName || "unknown";
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
+      try {
+        log("system", "Creating new session...");
+        const resp = await fetch(`${this.baseUrl}/session`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
+        });
+
+        if (!resp.ok) {
+          throw new Error(`Failed to create session: ${resp.status} ${resp.statusText}`);
+        }
+
+        const data = (await resp.json()) as ApiResponse;
+        if (data.session) {
+          this.session = data.session;
+          log("system", `Session created: ${this.session.id.slice(0, 8)}...`);
+          // Update cooldown timestamp AFTER successful session creation
+          this._lastSessionCreateTime = Date.now();
+        } else {
+          throw new Error("No session in response");
+        }
+
+        // Authenticate session with login (but don't update this.session from login response)
+        if (this.credentials) {
+          log("system", `Logging in as ${this.credentials.username}...`);
+          const loginResp = await this.doRequest("login", {
+            username: this.credentials.username,
+            password: this.credentials.password,
+          });
+          if (loginResp.error) {
+            log("error", `Login failed: ${loginResp.error.message}`);
+            // Don't throw - session is still valid, login can be retried on next command
+          } else {
+            log("system", "Logged in successfully");
+          }
+          // IMPORTANT: Don't update this.session from login response - keep the one from /session
+        }
+
+        // Save session token for persistence across restarts
+        this.saveSessionToken();
+        return;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
+        debugLog("api:createSession", `${botName} session creation attempt ${attempt + 1} failed, retrying in ${delay}ms`);
+        await sleep(delay);
       }
     }
 
-    // Save session token for persistence across restarts
-    this.saveSessionToken();
+    throw lastError || new Error("Failed to create session after multiple attempts");
   }
 
   /** Save current session tokens to disk via SessionManager */
@@ -418,77 +505,108 @@ export class SpaceMoltAPI {
   private async ensureV2Session(): Promise<void> {
     const botName = this._botName || "unknown";
 
-    // Skip if we already have a v2 session - game commands auto-renew sessions
-    if (this.v2Session) {
-      debugLog("api:ensureV2Session", `${botName} v2 session exists, skipping creation`);
+    // Skip if session exists and not expiring soon
+    if (this.v2Session && !this.isV2SessionExpiring()) {
+      debugLog("api:ensureV2Session", `${botName} v2 session valid, skipping creation`);
       return;
     }
 
-    const v2Base = this.baseUrl.replace("/api/v1", "/api/v2");
-    log("system", "Creating v2 session...");
-
-    // Single attempt - the reconnection queue handles retries with backoff
-    const resp = await fetch(`${v2Base}/session`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-    });
-
-    if (!resp.ok) {
-      throw new Error(`Failed to create v2 session: ${resp.status} ${resp.statusText}`);
-    }
-
-    const data = (await resp.json()) as ApiResponse;
-    if (data.session) {
-      // Normalize v2 snake_case fields
-      const s = data.session as unknown as Record<string, unknown>;
-      if (s.created_at && !s.createdAt) {
-        s.createdAt = s.created_at;
-        s.expiresAt = s.expires_at;
-        s.playerId = s.player_id;
+    // Rate limiting: enforce cooldown between session creations
+    const now = Date.now();
+    const timeSinceLastCreate = now - this._lastSessionCreateTime;
+    if (timeSinceLastCreate < SESSION_CREATE_COOLDOWN_MS && timeSinceLastCreate > 100) {
+      const waitMs = SESSION_CREATE_COOLDOWN_MS - timeSinceLastCreate;
+      debugLog("api:ensureV2Session", `${botName} v2 session creation on cooldown, waiting ${waitMs}ms`);
+      await sleep(waitMs);
+      // After waiting, check again if session is still needed
+      if (this.v2Session && !this.isV2SessionExpiring()) {
+        debugLog("api:ensureV2Session", `${botName} v2 session now valid after cooldown wait`);
+        return;
       }
-      this.v2Session = data.session;
-      log("system", `v2 session created: ${this.v2Session.id.slice(0, 8)}...`);
-    } else {
-      throw new Error("No session in v2 response");
     }
 
-    // Authenticate v2 session with credentials
-    if (this.credentials) {
-      const loginResp = await fetch(`${v2Base}/spacemolt_auth/login`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Session-Id": this.v2Session.id,
-        },
-        body: JSON.stringify({
-          username: this.credentials.username,
-          password: this.credentials.password,
-        }),
+    // Coalesce concurrent callers onto a single in-flight attempt (like Admiral)
+    if (!this._ensureV2SessionPromise) {
+      this._ensureV2SessionPromise = this.createV2Session().finally(() => {
+        this._ensureV2SessionPromise = null;
       });
+    }
+    return this._ensureV2SessionPromise;
+  }
 
-      const loginData = (await loginResp.json()) as ApiResponse & { structuredContent?: unknown };
-      if (loginData.structuredContent !== undefined) {
-        loginData.result = loginData.structuredContent;
-      }
-      if (loginData.error) {
-        logError(`v2 login failed: ${loginData.error.message}`);
-      } else {
-        log("system", "v2 session authenticated");
-      }
-      // Capture updated session from login response
-      if (loginData.session) {
-        const ls = loginData.session as unknown as Record<string, unknown>;
-        if (ls.created_at && !ls.createdAt) {
-          ls.createdAt = ls.created_at;
-          ls.expiresAt = ls.expires_at;
-          ls.playerId = ls.player_id;
+  private async createV2Session(): Promise<void> {
+    const botName = this._botName || "unknown";
+    const v2Base = this.baseUrl.replace("/api/v1", "/api/v2");
+    let lastError: Error | null = null;
+
+    for (let attempt = 0; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
+      try {
+        log("system", "Creating v2 session...");
+        const resp = await fetch(`${v2Base}/session`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
+        });
+
+        if (!resp.ok) {
+          throw new Error(`Failed to create v2 session: ${resp.status} ${resp.statusText}`);
         }
-        this.v2Session = loginData.session;
+
+        const data = (await resp.json()) as ApiResponse;
+        if (data.session) {
+          // Normalize v2 snake_case fields
+          const s = data.session as unknown as Record<string, unknown>;
+          if (s.created_at && !s.createdAt) {
+            s.createdAt = s.created_at;
+            s.expiresAt = s.expires_at;
+            s.playerId = s.player_id;
+          }
+          this.v2Session = data.session;
+          log("system", `v2 session created: ${this.v2Session.id.slice(0, 8)}...`);
+          // Update cooldown timestamp AFTER successful session creation
+          this._lastSessionCreateTime = Date.now();
+        } else {
+          throw new Error("No session in v2 response");
+        }
+
+        // Authenticate v2 session with credentials
+        if (this.credentials) {
+          const loginResp = await fetch(`${v2Base}/spacemolt_auth/login`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "User-Agent": USER_AGENT,
+              "X-Session-Id": this.v2Session.id,
+            },
+            body: JSON.stringify({
+              username: this.credentials.username,
+              password: this.credentials.password,
+            }),
+          });
+
+          const loginData = (await loginResp.json()) as ApiResponse & { structuredContent?: unknown };
+          if (loginData.structuredContent !== undefined) {
+            loginData.result = loginData.structuredContent;
+          }
+          if (loginData.error) {
+            logError(`v2 login failed: ${loginData.error.message}`);
+          } else {
+            log("system", "v2 session authenticated");
+          }
+          // Don't overwrite v2Session from login response - keep the one from /session endpoint
+        }
+
+        // Save session token for persistence across restarts
+        this.saveSessionToken();
+        return;
+      } catch (err) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
+        debugLog("api:createV2Session", `${botName} v2 session creation attempt ${attempt + 1} failed, retrying in ${delay}ms`);
+        await sleep(delay);
       }
     }
 
-    // Save session token for persistence across restarts
-    this.saveSessionToken();
+    throw lastError || new Error("Failed to create v2 session after multiple attempts");
   }
 
   private async doRequest(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
@@ -521,6 +639,7 @@ export class SpaceMoltAPI {
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
+      "User-Agent": USER_AGENT,
     };
     if (activeSession) {
       headers["X-Session-Id"] = activeSession.id;
@@ -550,13 +669,19 @@ export class SpaceMoltAPI {
       if (data.structuredContent !== undefined) {
         data.result = data.structuredContent;
       }
-      // Normalize v2 session fields (snake_case → camelCase)
+      // Normalize v2 session fields (snake_case → camelCase) and update active session
       if (data.session) {
         const s = data.session as unknown as Record<string, unknown>;
         if (s.created_at && !s.createdAt) {
           s.createdAt = s.created_at;
           s.expiresAt = s.expires_at;
           s.playerId = s.player_id;
+        }
+        // Update the active session (like Admiral) - server auto-renews on every command
+        if (isV2) {
+          this.v2Session = data.session;
+        } else {
+          this.session = data.session;
         }
       }
       return data as ApiResponse;

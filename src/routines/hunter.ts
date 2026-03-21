@@ -506,6 +506,9 @@ async function engageTarget(
     // Check for pirate-based flee conditions
     const nearbyResp = await bot.exec("get_nearby");
     if (!nearbyResp.error && nearbyResp.result) {
+      // Track player names from nearby scan
+      bot.trackNearbyPlayers(nearbyResp.result);
+      
       const entities = parseNearby(nearbyResp.result);
       const pirateCount = entities.filter(e => e.isPirate).length;
       const highestPirateTier = entities
@@ -545,6 +548,9 @@ async function engageTarget(
     let entities = [];
 
     if (!nearbyCheck.error && nearbyCheck.result) {
+      // Track player names from nearby scan
+      bot.trackNearbyPlayers(nearbyCheck.result);
+      
       entities = parseNearby(nearbyCheck.result);
 
 
@@ -600,6 +606,9 @@ async function engageTarget(
     // Additional check for the target's presence in case of API inconsistency
     const finalCheck = await bot.exec("get_nearby");
     if (!finalCheck.error && finalCheck.result) {
+      // Track player names from nearby scan
+      bot.trackNearbyPlayers(finalCheck.result);
+      
       const entitiesFinal = parseNearby(finalCheck.result);
       if (!entitiesFinal.some(e => e.id === target.id)) {
         ctx.log("combat", `${target.name} is gone — eliminated or fled`);
@@ -940,6 +949,9 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("error", `get_nearby at ${poi.name}: ${nearbyResp.error.message}`);
         continue;
       }
+
+      // Track player names from nearby scan
+      bot.trackNearbyPlayers(nearbyResp.result);
 
       const entities = parseNearby(nearbyResp.result);
       ctx.log("info", `entities: ${entities}`);

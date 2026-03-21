@@ -359,11 +359,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     const station = findStation(pois);
     if (station) stationPoi = { id: station.id, name: station.name };
 
-    miningPoi = findMiningPoi(pois, miningType, settings.miningType === "auto" ? undefined : targetResource);
+    miningPoi = findMiningPoi(pois, miningType, targetResource);
 
     if (!miningPoi) {
       // No mining POI in current system — try to find one from mapStore
-      const systemPoi = findSystemWithMiningPoi(miningType, settings.miningType === "auto" ? undefined : targetResource);
+      const systemPoi = findSystemWithMiningPoi(miningType, targetResource);
       if (systemPoi) {
         ctx.log("info", `No ${resourceLabel} here — traveling to ${systemPoi.poiName} in ${systemPoi.systemId}`);
         const navOk = await navigateToSystem(ctx, systemPoi.systemId, safetyOpts);

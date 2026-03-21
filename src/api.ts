@@ -160,7 +160,10 @@ export class SpaceMoltAPI {
   private _cache = new ResponseCache();
   private _botName: string | null = null;
   private _sessionManager: SessionManager | null = null;
-  
+  private _v2KeepaliveCounter = 0;
+  private readonly _v2KeepaliveInterval = 10; // Call v2_get_queue every N commands
+  private _v2KeepaliveInFlight = false;
+
   /** Queue for session creation - prevents duplicate concurrent creation */
   private _sessionQueue: Promise<void> = Promise.resolve();
   private _v2SessionQueue: Promise<void> = Promise.resolve();
@@ -185,10 +188,23 @@ export class SpaceMoltAPI {
     if (!this._sessionManager) return false;
     const token = this._sessionManager.loadSessionToken();
     const botName = this._botName || "unknown";
-    
+
     if (!token || !token.sessionId) {
       logSessionRestore(botName, "none", false, "No saved session token found");
       return false;
+    }
+
+    // Check if saved sessions are expired
+    const now = Date.now();
+    const v2ExpiresAt = token.v2ExpiresAt ? new Date(token.v2ExpiresAt).getTime() : 0;
+    const v2Expired = token.v2SessionId && v2ExpiresAt <= now;
+
+    if (v2Expired && token.v2SessionId) {
+      logSessionDetail(botName, "V2_EXPIRED_ON_LOAD", "V2 session expired on disk, not restoring", {
+        v2SessionId: token.v2SessionId.slice(0, 8),
+        expiresAt: token.v2ExpiresAt,
+        now: new Date(now).toISOString(),
+      });
     }
 
     const oldSession = this.session;
@@ -199,7 +215,8 @@ export class SpaceMoltAPI {
       createdAt: token.expiresAt || "",
     };
 
-    if (token.v2SessionId) {
+    // Only restore V2 session if it's still valid
+    if (token.v2SessionId && !v2Expired) {
       this.v2Session = {
         id: token.v2SessionId,
         expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
@@ -213,8 +230,9 @@ export class SpaceMoltAPI {
       fromSession: oldSession?.id?.slice(0, 8) || "none",
       toSession: this.session.id.slice(0, 8),
       hasV2: !!this.v2Session,
+      v2Skipped: v2Expired ? "expired" : "none",
     });
-    
+
     debugLog("api:restoreSession", `${botName} session restored from disk`, {
       sessionId: this.session.id.slice(0, 8),
       hasV2: !!this.v2Session,
@@ -290,15 +308,23 @@ export class SpaceMoltAPI {
         logSessionError(botName, command, payload, code, resp.error.message || "", resp);
         logSessionInvalidate(botName, "API returned session error", code, resp.error.message, this.session?.id);
         
-        debugLog("api:execute", `${botName} session invalid, creating new session`);
+        // CRITICAL: Clear BOTH v1 and v2 sessions - expired v2 session can invalidate v1!
+        debugLog("api:execute", `${botName} session invalid, clearing both v1 and v2 sessions`);
         const oldSessionId = this.session?.id;
+        const oldV2SessionId = this.v2Session?.id;
         this.session = null;
-        if (needsV2) this.v2Session = null;
+        this.v2Session = null;  // Clear expired v2 session that may be causing the issue
 
         try {
           await this.ensureSession();
           if (needsV2) await this.ensureV2Session();
           logSessionChange(botName, oldSessionId || null, (this.session as ApiSession | null)?.id || "", "recovery from session error");
+          if (oldV2SessionId) {
+            logSessionDetail(botName, "V2_CLEARED", "Expired V2 session cleared during recovery", {
+              oldV2Session: oldV2SessionId.slice(0, 8),
+              newV2Session: (this.v2Session as ApiSession | null)?.id?.slice(0, 8) || "none",
+            });
+          }
           return this.execute(command, payload);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -325,6 +351,22 @@ export class SpaceMoltAPI {
       }
       const toInvalidate = MUTATION_INVALIDATIONS[command];
       if (toInvalidate) this._cache.invalidate(toInvalidate);
+
+      // Keep V2 session alive by periodically calling v2_get_queue
+      if (this.v2Session && !needsV2 && !this._v2KeepaliveInFlight) {
+        this._v2KeepaliveCounter++;
+        if (this._v2KeepaliveCounter >= this._v2KeepaliveInterval) {
+          this._v2KeepaliveCounter = 0;
+          // Fire and forget - don't wait or care about result
+          // Schedule for next tick to avoid recursive execute() calls
+          this._v2KeepaliveInFlight = true;
+          setTimeout(() => {
+            this.execute("v2_get_queue")
+              .finally(() => { this._v2KeepaliveInFlight = false; })
+              .catch(() => {});
+          }, 0);
+        }
+      }
     }
 
     return resp;
@@ -446,19 +488,38 @@ export class SpaceMoltAPI {
 
   private saveSessionToken(): void {
     if (!this._sessionManager || !this.session) return;
-    
+
+    // Check if v2 session is expired - don't save expired sessions!
+    let v2SessionId: string | undefined;
+    if (this.v2Session) {
+      const v2ExpiresAt = new Date(this.v2Session.expiresAt).getTime();
+      const now = Date.now();
+      if (v2ExpiresAt > now) {
+        // V2 session still valid, save it
+        v2SessionId = this.v2Session.id;
+      } else {
+        // V2 session expired, clear it
+        logSessionDetail(this._botName || "unknown", "V2_EXPIRED", "V2 session expired, clearing from save", {
+          v2SessionId: this.v2Session.id.slice(0, 8),
+          expiresAt: this.v2Session.expiresAt,
+          now: new Date(now).toISOString(),
+        });
+        this.v2Session = null;  // Clear expired v2 session
+      }
+    }
+
     const token: import("./session.js").SessionToken = {
       sessionId: this.session.id,
       expiresAt: this.session.expiresAt,
       playerId: this.session.playerId,
     };
-    if (this.v2Session) {
-      token.v2SessionId = this.v2Session.id;
-      token.v2ExpiresAt = this.v2Session.expiresAt;
+    if (v2SessionId) {
+      token.v2SessionId = v2SessionId;
+      token.v2ExpiresAt = this.v2Session?.expiresAt;
     }
-    
+
     this._sessionManager.saveSessionToken(token);
-    logSessionSave(this._botName || "unknown", this.session.id, this.v2Session?.id);
+    logSessionSave(this._botName || "unknown", this.session.id, v2SessionId);
   }
 
   private async ensureV2Session(): Promise<void> {

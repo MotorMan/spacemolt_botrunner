@@ -3,6 +3,19 @@ import { commandLog } from "./commandLogger.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { debugLog } from "./debug.js";
 import { SessionManager } from "./session.js";
+import {
+  logSession,
+  logSessionCreate,
+  logSessionInvalidate,
+  logSessionChange,
+  logSessionError,
+  logSessionCheck,
+  logRenewalCooldown,
+  logRenewalQueue,
+  logSessionRestore,
+  logSessionSave,
+  logSessionDetail,
+} from "./sessiondebug.js";
 
 export interface ApiSession {
   id: string;
@@ -171,8 +184,14 @@ export class SpaceMoltAPI {
   restoreSessionToken(): boolean {
     if (!this._sessionManager) return false;
     const token = this._sessionManager.loadSessionToken();
-    if (!token || !token.sessionId) return false;
+    const botName = this._botName || "unknown";
+    
+    if (!token || !token.sessionId) {
+      logSessionRestore(botName, "none", false, "No saved session token found");
+      return false;
+    }
 
+    const oldSession = this.session;
     this.session = {
       id: token.sessionId,
       expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
@@ -189,7 +208,14 @@ export class SpaceMoltAPI {
       };
     }
 
-    debugLog("api:restoreSession", `${this._botName || "unknown"} session restored from disk`, {
+    logSessionRestore(botName, token.sessionId, true);
+    logSessionDetail(botName, "RESTORED", "Session restored from disk", {
+      fromSession: oldSession?.id?.slice(0, 8) || "none",
+      toSession: this.session.id.slice(0, 8),
+      hasV2: !!this.v2Session,
+    });
+    
+    debugLog("api:restoreSession", `${botName} session restored from disk`, {
       sessionId: this.session.id.slice(0, 8),
       hasV2: !!this.v2Session,
     });
@@ -208,6 +234,9 @@ export class SpaceMoltAPI {
   async execute(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
     commandLog("api", `Executing command: ${this.credentials?.username}:${command}`, { command, payload });
+
+    // Log session state for debugging
+    logSessionCheck(botName, !!this.session, this.session?.id || null, this.session?.expiresAt || null);
 
     const cacheTtl = COMMAND_TTL[command];
     const cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
@@ -255,19 +284,26 @@ export class SpaceMoltAPI {
         return this.execute(command, payload);
       }
 
-      // Session invalid - create new session and retry ONCE
+      // Session invalid - log full response and create new session
       if (code === "session_invalid" || code === "session_expired" || code === "not_authenticated") {
+        // Log full error response for debugging
+        logSessionError(botName, command, payload, code, resp.error.message || "", resp);
+        logSessionInvalidate(botName, "API returned session error", code, resp.error.message, this.session?.id);
+        
         debugLog("api:execute", `${botName} session invalid, creating new session`);
+        const oldSessionId = this.session?.id;
         this.session = null;
         if (needsV2) this.v2Session = null;
 
         try {
           await this.ensureSession();
           if (needsV2) await this.ensureV2Session();
+          logSessionChange(botName, oldSessionId || null, (this.session as ApiSession | null)?.id || "", "recovery from session error");
           return this.execute(command, payload);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           log("error", `${botName} session renewal failed: ${msg}`);
+          logSessionDetail(botName, "RENEWAL_FAILED", msg, { error: msg, command });
           return { error: { code: "session_renewal_failed", message: msg } };
         }
       }
@@ -357,20 +393,28 @@ export class SpaceMoltAPI {
     for (let attempt = 0; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
       try {
         log("system", "Creating new session...");
+        logSessionDetail(botName, "CREATE_START", "Starting session creation", { attempt: attempt + 1, maxAttempts: MAX_RECONNECT_ATTEMPTS });
+        
         const resp = await fetch(`${this.baseUrl}/session`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
         });
 
         if (!resp.ok) {
-          throw new Error(`Failed to create session: ${resp.status} ${resp.statusText}`);
+          const error = `Failed to create session: ${resp.status} ${resp.statusText}`;
+          logSessionDetail(botName, "CREATE_FAILED", error, { status: resp.status, statusText: resp.statusText, attempt: attempt + 1 });
+          throw new Error(error);
         }
 
         const data = (await resp.json()) as ApiResponse;
         if (data.session) {
+          const oldSession = this.session;
           this.session = data.session;
           log("system", `Session created: ${this.session.id.slice(0, 8)}...`);
+          logSessionCreate(botName, this.session.id, this.session.expiresAt, oldSession ? "renewal" : "initial", data);
+          logSessionSave(botName, this.session.id, this.v2Session?.id);
         } else {
+          logSessionDetail(botName, "CREATE_FAILED", "No session in response", { response: data });
           throw new Error("No session in response");
         }
 
@@ -401,17 +445,20 @@ export class SpaceMoltAPI {
   }
 
   private saveSessionToken(): void {
-    if (!this._sessionManager) return;
+    if (!this._sessionManager || !this.session) return;
+    
     const token: import("./session.js").SessionToken = {
-      sessionId: this.session?.id || "",
-      expiresAt: this.session?.expiresAt || "",
-      playerId: this.session?.playerId,
+      sessionId: this.session.id,
+      expiresAt: this.session.expiresAt,
+      playerId: this.session.playerId,
     };
     if (this.v2Session) {
       token.v2SessionId = this.v2Session.id;
       token.v2ExpiresAt = this.v2Session.expiresAt;
     }
+    
     this._sessionManager.saveSessionToken(token);
+    logSessionSave(this._botName || "unknown", this.session.id, this.v2Session?.id);
   }
 
   private async ensureV2Session(): Promise<void> {

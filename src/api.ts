@@ -1,7 +1,6 @@
 import { log, logError } from "./ui.js";
 import { commandLog } from "./commandLogger.js";
 import { reconnectQueue } from "./reconnectqueue.js";
-import { serverDisconnectDetector } from "./serverdisconnectdetector.js";
 import { debugLog } from "./debug.js";
 import { SessionManager } from "./session.js";
 
@@ -174,45 +173,32 @@ export class SpaceMoltAPI {
     this._sessionManager = sessionManager;
   }
 
-  /** Restore session tokens from disk (called during bot initialization). Returns true if valid session restored. */
+  /** Restore session tokens from disk (called during bot initialization). Returns true if session was restored. */
   restoreSessionToken(): boolean {
     if (!this._sessionManager) return false;
     const token = this._sessionManager.loadSessionToken();
     if (!token || !token.sessionId) return false;
 
-    // Check if session is still valid (not expired)
-    const expiresAt = new Date(token.expiresAt).getTime();
-    const now = Date.now();
-    if (expiresAt <= now) {
-      debugLog("api:restoreSession", `${this._botName || "unknown"} session expired`, { expiresAt, now });
-      this._sessionManager.clearSessionToken();
-      return false;
-    }
-
-    // Restore v1 session
+    // Restore v1 session - server will validate on first command
     this.session = {
       id: token.sessionId,
-      expiresAt: token.expiresAt,
+      expiresAt: token.expiresAt || "",
       playerId: token.playerId,
-      createdAt: token.expiresAt, // Approximate, not critical
+      createdAt: token.expiresAt || "",
     };
 
     // Restore v2 session if available
-    if (token.v2SessionId && token.v2ExpiresAt) {
-      const v2ExpiresAt = new Date(token.v2ExpiresAt).getTime();
-      if (v2ExpiresAt > now) {
-        this.v2Session = {
-          id: token.v2SessionId,
-          expiresAt: token.v2ExpiresAt,
-          playerId: token.playerId,
-          createdAt: token.v2ExpiresAt,
-        };
-      }
+    if (token.v2SessionId) {
+      this.v2Session = {
+        id: token.v2SessionId,
+        expiresAt: token.v2ExpiresAt || "",
+        playerId: token.playerId,
+        createdAt: token.v2ExpiresAt || "",
+      };
     }
 
-    debugLog("api:restoreSession", `${this._botName || "unknown"} session restored`, {
+    debugLog("api:restoreSession", `${this._botName || "unknown"} session restored from disk`, {
       sessionId: this.session.id.slice(0, 8),
-      expiresAt: this.session.expiresAt,
       hasV2: !!this.v2Session,
     });
     return true;
@@ -322,6 +308,7 @@ export class SpaceMoltAPI {
   /**
    * Handle reconnection through the global queue.
    * This ensures only ONE bot attempts to reconnect at a time.
+   * Waits for queue to process and returns success/failure.
    */
   private async handleReconnection(
     command: string,
@@ -330,22 +317,10 @@ export class SpaceMoltAPI {
   ): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
 
-    // CRITICAL: Check if server-wide reconnect is already in progress BEFORE doing anything
-    if (serverDisconnectDetector.isReconnecting()) {
-      log("system", `${botName} - coordinated reconnection in progress, waiting...`);
-      return { error: { code: "server_down", message: "Coordinated reconnection in progress" } };
-    }
-
-    // Report disconnect to server-wide detector
-    const serverDownTriggered = serverDisconnectDetector.reportDisconnect(botName);
-    if (serverDownTriggered) {
-      log("system", `${botName} disconnect triggered server-wide detection - waiting for coordinated reconnect...`);
-      return { error: { code: "server_down", message: "Server down detected - waiting for coordinated reconnection" } };
-    }
-
-    log("system", `${botName} requesting reconnection via global queue...`);
+    log("system", `${botName} connection lost, adding to reconnection queue...`);
 
     try {
+      // Wait for queue to successfully reconnect this bot
       const success = await reconnectQueue.enqueue({
         botName,
         api: this,

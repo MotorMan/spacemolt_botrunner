@@ -25,7 +25,6 @@ import { WebServer, type WebAction, type WebActionResult, loadSettings } from ".
 import { setLogSink } from "./ui.js";
 import { debugLog } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
-import { serverDisconnectDetector } from "./serverdisconnectdetector.js";
 import { AiChatService } from "./aichat_service.js";
 
 interface BotState {
@@ -82,12 +81,6 @@ function discoverBots(): void {
       const bot = new Bot(name, BASE_DIR);
       setupBotLogging(bot);
       bots.set(name, bot);
-      // Register with server disconnect detector
-      serverDisconnectDetector.registerBot({
-        name: bot.username,
-        api: bot.api,
-        credentials: bot.session.loadCredentials(),
-      });
     }
   }
 }
@@ -311,8 +304,6 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
   }
 
   bots.delete(botName);
-  // Unregister from server disconnect detector
-  serverDisconnectDetector.unregisterBot(botName);
   server.clearBotAssignment(botName);
   server.removePerBotSettings(botName);
 
@@ -339,12 +330,6 @@ async function handleAdd(action: WebAction): Promise<WebActionResult> {
   const bot = new Bot(username, BASE_DIR);
   setupBotLogging(bot);
   bots.set(username, bot);
-  // Register with server disconnect detector
-  serverDisconnectDetector.registerBot({
-    name: bot.username,
-    api: bot.api,
-    credentials: { username, password },
-  });
 
   server.logSystem(`Verifying credentials for ${username}...`);
   const ok = await bot.login();
@@ -391,12 +376,6 @@ async function handleRegister(action: WebAction): Promise<WebActionResult> {
   const bot = new Bot(username, BASE_DIR);
   setupBotLogging(bot);
   bots.set(username, bot);
-  // Register with server disconnect detector
-  serverDisconnectDetector.registerBot({
-    name: bot.username,
-    api: bot.api,
-    credentials: { username, password },
-  });
   server.logSystem(`Bot added: ${username}`);
   refreshStatusTable();
 
@@ -559,75 +538,6 @@ async function main(): Promise<void> {
   (globalThis as any).aiChatService = aiChatService;
   server.logSystem("AI Chat service initialized");
 
-  // Set up server-wide disconnect detection callback
-  serverDisconnectDetector.onServerDown({
-    stopBots: async (affectedBots: string[]) => {
-      server.logSystem(`Server disconnect detected affecting ${affectedBots.length} bot(s): ${affectedBots.join(", ")}`);
-      const botStates = new Map<string, BotState>();
-
-      // Save state of all bots and stop running ones
-      for (const [, bot] of bots) {
-        const assignments = server.getBotAssignments();
-        botStates.set(bot.username, {
-          wasRunning: bot.state === "running",
-          routine: assignments[bot.username] || null,
-        });
-
-        if (bot.state === "running") {
-          bot.stop();
-          server.logSystem(`Stopped ${bot.username} during server reconnection`);
-        }
-      }
-
-      return botStates;
-    },
-    restartBots: async (botStates: Map<string, BotState>) => {
-      const assignments = server.getBotAssignments();
-      let restartedCount = 0;
-      const BOT_RESTART_DELAY_MS = 25000; // CRITICAL: 25s delay between bot restarts to prevent login rate limiting
-
-      // Convert to array and process with delays - filter ensures routine is not null
-      const botsToRestart = [...botStates.entries()]
-        .filter(([_, state]) => state.wasRunning && state.routine !== null) as Array<[string, BotState & { routine: string }]>;
-
-      for (let i = 0; i < botsToRestart.length; i++) {
-        const [botName, state] = botsToRestart[i];
-        const routine = ROUTINES[state.routine];
-
-        if (!routine) {
-          server.logSystem(`Skipping ${botName}: routine ${state.routine} no longer exists`);
-          continue;
-        }
-
-        // CRITICAL: Delay before each bot restart (except first) - prevents login storm
-        if (i > 0) {
-          server.logSystem(`Waiting ${BOT_RESTART_DELAY_MS / 1000}s before restarting ${botName}...`);
-          await new Promise(r => setTimeout(r, BOT_RESTART_DELAY_MS));
-        }
-
-        server.logSystem(`Restarting ${botName} with ${routine.name} routine...`);
-
-        const bot = bots.get(botName);
-        if (!bot) continue;
-
-        // Start routine immediately after login - gameplay commands don't have the same rate limits as login
-        bot.start(state.routine, routine.fn).then(() => {
-          server.logSystem(`Bot ${botName} routine finished.`);
-          server.clearBotAssignment(botName);
-        }).catch((err: unknown) => {
-          const msg = err instanceof Error ? err.message : String(err);
-          server.logSystem(`Bot ${botName} stopped with error: ${msg}`);
-          server.clearBotAssignment(botName);
-        });
-
-        server.saveBotAssignment(botName, state.routine);
-        restartedCount++;
-      }
-
-      server.logSystem(`Restarted ${restartedCount} bot(s) with their saved routines`);
-    },
-  });
-
   server.logSystem("SpaceMolt Bot Manager v0.2");
   server.logSystem("Loading saved sessions...");
 
@@ -648,6 +558,7 @@ async function main(): Promise<void> {
   if (bots.size > 0) {
     const assignments = server.getBotAssignments();
     server.logSystem(`Found ${bots.size} saved bot(s): ${[...bots.keys()].join(", ")}`);
+    server.logSystem(`Bot assignments: ${JSON.stringify(assignments)}`);
     // Push initial bot list to UI immediately (shows as "idle" with default values)
     refreshStatusTable();
 
@@ -658,6 +569,7 @@ async function main(): Promise<void> {
 
     for (const [name, bot] of bots) {
       const delay = botIndex * SESSION_RESUME_DELAY_MS;
+      const loginIndex = botIndex; // Capture for closure
       botIndex++;
       setTimeout(() => {
         // Try session resume first (fast, no rate limit)
@@ -675,12 +587,18 @@ async function main(): Promise<void> {
           }
 
           // Session resume failed, need full login with rate-limited delay
-          server.logSystem(`${name} session expired, scheduling full login...`);
-          const loginDelay = botIndex * FULL_LOGIN_DELAY_MS;
+          const loginDelay = loginIndex * FULL_LOGIN_DELAY_MS;
+          server.logSystem(`${name} session expired, scheduling full login in ${loginDelay / 1000}s...`);
+          server.logSystem(`DEBUG: ${name} login scheduled with delay ${loginDelay}ms (index=${loginIndex})`);
           setTimeout(() => {
+            server.logSystem(`DEBUG: ${name} login timeout fired, calling bot.login()`);
             bot.login().then(async (loginOk) => {
+              server.logSystem(`DEBUG: ${name} login completed, ok=${loginOk}`);
               refreshStatusTable();
-              if (!loginOk) return;
+              if (!loginOk) {
+                server.logSystem(`${name} login failed`);
+                return;
+              }
               // Fetch catalog data if stale (first logged-in bot triggers it)
               if (catalogStore.isStale()) {
                 try {
@@ -691,7 +609,11 @@ async function main(): Promise<void> {
                 }
               }
               const routineKey = assignments[name];
-              if (!routineKey || !ROUTINES[routineKey]) return;
+              server.logSystem(`DEBUG: ${name} routine assignment: ${routineKey || 'none'}`);
+              if (!routineKey || !ROUTINES[routineKey]) {
+                server.logSystem(`${name} logged in but no routine assigned`);
+                return;
+              }
               server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
               await handleStart({ type: "start", bot: name, routine: routineKey });
             }).catch((err) => {
@@ -785,8 +707,6 @@ async function main(): Promise<void> {
     }
     // Clear reconnection queue to release any pending reconnection attempts
     reconnectQueue.clear();
-    // Reset server disconnect detector
-    serverDisconnectDetector.reset();
     // Flush persistent data
     mapStore.flush();
     catalogStore.flush();

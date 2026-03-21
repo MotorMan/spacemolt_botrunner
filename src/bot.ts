@@ -254,6 +254,7 @@ export class Bot {
   async resumeSession(): Promise<boolean> {
     const restored = this.api.restoreSessionToken();
     if (!restored) {
+      this.log("system", "No saved session token found, will require full login");
       return false;
     }
 
@@ -261,7 +262,7 @@ export class Bot {
     this.log("system", "Testing restored session...");
     const resp = await this.exec("get_status");
     if (resp.error) {
-      this.log("system", "Restored session invalid, will require full login");
+      this.log("system", `Restored session invalid: ${resp.error.message}, will require full login`);
       return false;
     }
 

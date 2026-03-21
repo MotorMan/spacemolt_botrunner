@@ -24,6 +24,7 @@ function getRescueSettings(): {
   rescueCredits: number;
   scanIntervalSec: number;
   refuelThreshold: number;
+  maydayMaxJumps: number;
 } {
   const all = readSettings();
   const r = all.rescue || {};
@@ -38,6 +39,8 @@ function getRescueSettings(): {
     scanIntervalSec: (r.scanIntervalSec as number) || 30,
     /** Keep own fuel above this %. */
     refuelThreshold: (r.refuelThreshold as number) || 60,
+    /** Maximum jumps away to respond to MAYDAYs (0 = unlimited). */
+    maydayMaxJumps: (r.maydayMaxJumps as number) || 12,
   };
 }
 
@@ -166,6 +169,27 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       const mayday = getNextMayday();
       if (mayday && isLegitimateMayday(mayday, 25)) {
         ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+        
+        // Check jump range for MAYDAYs (fleet rescues are always unlimited)
+        let jumpsAway = 0;
+        if (mayday.system && mayday.system !== bot.system && settings.maydayMaxJumps > 0) {
+          try {
+            const routeResp = await bot.exec("find_route", { target_system: mayday.system });
+            if (!routeResp.error && routeResp.result) {
+              const route = routeResp.result as Record<string, unknown>;
+              jumpsAway = (route.total_jumps as number) || 0;
+              
+              if (jumpsAway > settings.maydayMaxJumps) {
+                ctx.log("mayday", `⚠️ MAYDAY too far: ${jumpsAway} jumps (max: ${settings.maydayMaxJumps}) - ignoring`);
+                markMaydayHandled(mayday);
+                continue;
+              }
+            }
+          } catch (e) {
+            ctx.log("warn", `Could not calculate route to ${mayday.system}: ${e}`);
+          }
+        }
+        
         maydayTarget = {
           username: mayday.sender,
           system: mayday.system,
@@ -174,7 +198,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           docked: false,
         };
         markMaydayHandled(mayday);
-        ctx.log("mayday", `✓ MAYDAY validated - launching rescue mission for ${mayday.sender}`);
+        ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
       }
     }
 
@@ -782,7 +806,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
     if (mayday.system && mayday.system !== bot.system) {
       try {
-        const routeResp = await bot.exec("find_route", { system: mayday.system });
+        const routeResp = await bot.exec("find_route", { target_system: mayday.system });
         if (!routeResp.error && routeResp.result) {
           const route = routeResp.result as Record<string, unknown>;
           jumpsToTarget = (route.total_jumps as number) || 0;
@@ -1076,6 +1100,27 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       const mayday = getNextMayday();
       if (mayday && isLegitimateMayday(mayday, 25)) {
         ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+        
+        // Check jump range for MAYDAYs (fleet rescues are always unlimited)
+        let jumpsAway = 0;
+        if (mayday.system && mayday.system !== bot.system && settings.maydayMaxJumps > 0) {
+          try {
+            const routeResp = await bot.exec("find_route", { target_system: mayday.system });
+            if (!routeResp.error && routeResp.result) {
+              const route = routeResp.result as Record<string, unknown>;
+              jumpsAway = (route.total_jumps as number) || 0;
+              
+              if (jumpsAway > settings.maydayMaxJumps) {
+                ctx.log("mayday", `⚠️ MAYDAY too far: ${jumpsAway} jumps (max: ${settings.maydayMaxJumps}) - ignoring`);
+                markMaydayHandled(mayday);
+                continue;
+              }
+            }
+          } catch (e) {
+            ctx.log("warn", `Could not calculate route to ${mayday.system}: ${e}`);
+          }
+        }
+        
         maydayTarget = {
           username: mayday.sender,
           system: mayday.system,
@@ -1084,7 +1129,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           docked: false,
         };
         markMaydayHandled(mayday);
-        ctx.log("mayday", `✓ MAYDAY validated - launching rescue mission for ${mayday.sender}`);
+        ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
       }
     }
 
@@ -1113,74 +1158,104 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     await bot.refreshStatus();
     logStatus(ctx);
 
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    // Always refuel to 100% before heading out on a rescue mission
+    ctx.log("rescue", "Topping off fuel to 100% before rescue mission...");
+    const fueled = await ensureFueled(ctx, 100);
     if (!fueled) {
       ctx.log("error", "Cannot refuel self — waiting before retry...");
       await sleep(settings.scanIntervalSec * 1000);
       continue;
     }
 
-    // ── Stock up on fuel cells for delivery ──
-    yield "acquire_fuel";
-    await ensureDocked(ctx);
+    // ── Check for Refueling Pump ──
+    const hasPump = await hasRefuelingPump(ctx);
+    if (hasPump) {
+      ctx.log("rescue", "✓ Refueling Pump detected - will use direct refuel command");
+    }
 
-    // Try buying fuel cells from market
-    ctx.log("rescue", "Checking market for fuel cells...");
-    const marketResp = await bot.exec("view_market");
+    // ── Stock up on fuel cells for delivery (only if no pump) ──
     let hasFuelCells = false;
+    let willSendCredits = false;
+    
+    if (!hasPump) {
+      yield "acquire_fuel";
+      await ensureDocked(ctx);
 
-    if (marketResp.result && typeof marketResp.result === "object") {
-      const mData = marketResp.result as Record<string, unknown>;
-      const items = (
-        Array.isArray(mData) ? mData :
-        Array.isArray(mData.items) ? mData.items :
-        Array.isArray(mData.market) ? mData.market :
-        []
-      ) as Array<Record<string, unknown>>;
+      // First check faction storage for fuel cells
+      ctx.log("rescue", "Checking faction storage for fuel cells...");
+      await bot.refreshFactionStorage();
+      const factionFuelCells = bot.factionStorage?.find(i =>
+        i.itemId.includes("fuel_cell") || i.itemId.includes("fuel") || i.itemId.includes("energy_cell")
+      );
+      
+      if (factionFuelCells && factionFuelCells.quantity >= settings.rescueFuelCells) {
+        ctx.log("rescue", `Found ${factionFuelCells.quantity}x ${factionFuelCells.name} in faction storage`);
+        // collectFromStorage will be called after docking below
+        hasFuelCells = true;
+      }
 
-      const fuelItem = items.find(i => {
-        const id = ((i.item_id as string) || (i.id as string) || "").toLowerCase();
-        return id.includes("fuel_cell") || id.includes("fuel") || id.includes("energy_cell");
-      });
+      // If not in faction storage, check cargo
+      if (!hasFuelCells) {
+        await bot.refreshCargo();
+        const fuelInCargo = bot.inventory.find(i =>
+          i.itemId.includes("fuel_cell") || i.itemId.includes("fuel") || i.itemId.includes("energy_cell")
+        );
+        if (fuelInCargo && fuelInCargo.quantity > 0) {
+          hasFuelCells = true;
+          ctx.log("rescue", `Already have ${fuelInCargo.quantity}x ${fuelInCargo.name} in cargo`);
+        }
+      }
 
-      if (fuelItem) {
-        const fuelId = (fuelItem.item_id as string) || (fuelItem.id as string) || "";
-        const price = (fuelItem.price as number) || (fuelItem.buy_price as number) || 0;
-        const available = (fuelItem.quantity as number) || (fuelItem.stock as number) || 0;
-        const qty = Math.min(settings.rescueFuelCells, available);
+      // Try buying fuel cells from market as last resort
+      if (!hasFuelCells) {
+        ctx.log("rescue", "Checking market for fuel cells...");
+        const marketResp = await bot.exec("view_market");
 
-        if (qty > 0 && (price * qty) <= bot.credits) {
-          ctx.log("rescue", `Buying ${qty}x fuel cells (${price}cr each)...`);
-          const buyResp = await bot.exec("buy", { item_id: fuelId, quantity: qty });
-          if (!buyResp.error) {
-            hasFuelCells = true;
-            ctx.log("rescue", `Acquired ${qty}x fuel cells`);
-          } else {
-            ctx.log("rescue", `Buy failed: ${buyResp.error.message}`);
+        if (marketResp.result && typeof marketResp.result === "object") {
+          const mData = marketResp.result as Record<string, unknown>;
+          const items = (
+            Array.isArray(mData) ? mData :
+            Array.isArray(mData.items) ? mData.items :
+            Array.isArray(mData.market) ? mData.market :
+            []
+          ) as Array<Record<string, unknown>>;
+
+          const fuelItem = items.find(i => {
+            const id = ((i.item_id as string) || (i.id as string) || "").toLowerCase();
+            return id.includes("fuel_cell") || id.includes("fuel") || id.includes("energy_cell");
+          });
+
+          if (fuelItem) {
+            const fuelId = (fuelItem.item_id as string) || (fuelItem.id as string) || "";
+            const price = (fuelItem.price as number) || (fuelItem.buy_price as number) || 0;
+            const available = (fuelItem.quantity as number) || (fuelItem.stock as number) || 0;
+            const qty = Math.min(settings.rescueFuelCells, available);
+
+            if (qty > 0 && (price * qty) <= bot.credits) {
+              ctx.log("rescue", `Buying ${qty}x fuel cells (${price}cr each)...`);
+              const buyResp = await bot.exec("buy", { item_id: fuelId, quantity: qty });
+              if (!buyResp.error) {
+                hasFuelCells = true;
+                ctx.log("rescue", `Acquired ${qty}x fuel cells`);
+              } else {
+                ctx.log("rescue", `Buy failed: ${buyResp.error.message}`);
+              }
+            }
           }
         }
       }
-    }
 
-    // Check if we already have fuel cells in cargo
-    if (!hasFuelCells) {
-      await bot.refreshCargo();
-      const fuelInCargo = bot.inventory.find(i =>
-        i.itemId.includes("fuel_cell") || i.itemId.includes("fuel") || i.itemId.includes("energy_cell")
-      );
-      if (fuelInCargo && fuelInCargo.quantity > 0) {
-        hasFuelCells = true;
-        ctx.log("rescue", `Already have ${fuelInCargo.quantity}x ${fuelInCargo.name} in cargo`);
+      // If we can't get fuel cells, send credits instead (if at same station)
+      willSendCredits = !hasFuelCells && bot.credits >= settings.rescueCredits;
+
+      if (!hasFuelCells && !willSendCredits) {
+        ctx.log("error", "No fuel cells available and not enough credits to help — waiting for better situation...");
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
       }
-    }
-
-    // If we can't get fuel cells, send credits instead (if at same station)
-    const willSendCredits = !hasFuelCells && bot.credits >= settings.rescueCredits;
-
-    if (!hasFuelCells && !willSendCredits) {
-      ctx.log("error", "No fuel cells available and not enough credits to help — waiting for better situation...");
-      await sleep(settings.scanIntervalSec * 1000);
-      continue;
+    } else {
+      // Has Refueling Pump - no need for fuel cells
+      willSendCredits = false;
     }
 
     // ── Navigate to stranded bot's system ──
@@ -1215,7 +1290,35 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Deliver fuel ──
     yield "deliver_fuel";
 
-    if (target.docked) {
+    if (hasPump) {
+      // Use Refueling Pump for direct refuel
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Initiating fuel transfer to ${target.username} using Refueling Pump...`);
+      
+      // Need to get the target's player ID for the refuel command
+      const targetPlayerId = await findPlayerId(ctx, target.username);
+      
+      if (!targetPlayerId) {
+        ctx.log("error", `Could not find player ID for ${target.username} — aborting transfer`);
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
+      }
+      
+      // Issue the refuel command
+      const refuelResp = await bot.exec("refuel", { target: targetPlayerId });
+      
+      if (refuelResp.error) {
+        ctx.log("error", `Refuel command failed: ${refuelResp.error.message}`);
+      } else {
+        const result = refuelResp.result as Record<string, unknown> | undefined;
+        if (result) {
+          const fuelDelta = result.fuel as number || 0;
+          const targetFuelNow = result.target_fuel_now as number || 0;
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Transferred ${Math.abs(fuelDelta)} fuel to ${target.username}`);
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `  Their fuel: ${targetFuelNow}`);
+        }
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", `Delivery complete for ${target.username}!`);
+      }
+    } else if (target.docked) {
       // Target is docked — dock at same station and send gift
       ctx.log(isMaydayTarget ? "mayday" : "rescue", `${target.username} is docked — docking to send gift...`);
       const dockResp = await bot.exec("dock");

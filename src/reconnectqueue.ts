@@ -3,13 +3,14 @@ import { debugLog } from "./debug.js";
 
 /**
  * Global reconnection queue - ensures only ONE bot attempts to reconnect at a time.
- * This prevents rate limiting when the server restarts or goes down.
+ * Processes bots sequentially with 25s delays to avoid rate limiting.
+ * When a bot fails, it stays in the queue for retry.
  */
 
 interface ReconnectTask {
   botName: string;
-  api: { 
-    setCredentials(username: string, password: string): void; 
+  api: {
+    setCredentials(username: string, password: string): void;
     getSession(): { id: string } | null;
     execute(command: string, payload?: Record<string, unknown>): Promise<unknown>;
   };
@@ -18,24 +19,24 @@ interface ReconnectTask {
   reject: (error: Error) => void;
 }
 
-const RECONNECT_BASE_DELAY = 25_000; // 25s base delay between attempts (CRITICAL: prevents rate limiting)
-const MAX_RECONNECT_ATTEMPTS = 12;
+const RECONNECT_DELAY_MS = 25_000; // 25s delay between bot reconnections (CRITICAL: prevents rate limiting)
+const MAX_RECONNECT_ATTEMPTS = 30; // ~12.5 minutes of retry attempts
 
 class ReconnectQueue {
   private queue: ReconnectTask[] = [];
   private processing = false;
-  private reconnectAllowedAt = 0;
-  private reconnectAttempt = 0;
+  private attemptCounts = new Map<string, number>();
 
   /**
    * Add a reconnection request to the queue.
-   * Returns a promise that resolves when the reconnection attempt completes.
+   * Returns a promise that resolves when the bot successfully reconnects.
    */
   async enqueue(task: Omit<ReconnectTask, "resolve" | "reject">): Promise<boolean> {
     return new Promise((resolve, reject) => {
       this.queue.push({ ...task, resolve, reject });
       debugLog("reconnect:queue", `Added ${task.botName} to queue (position: ${this.queue.length})`);
-      
+      log("system", `${task.botName} added to reconnection queue (position: ${this.queue.length})`);
+
       // Process queue if not already running
       if (!this.processing) {
         this.processQueue();
@@ -45,6 +46,8 @@ class ReconnectQueue {
 
   /**
    * Process the queue one item at a time.
+   * First bot waits 25s before attempting (gives server time to start).
+   * After each bot completes, wait 25s before next.
    */
   private async processQueue(): Promise<void> {
     if (this.processing || this.queue.length === 0) {
@@ -55,98 +58,112 @@ class ReconnectQueue {
 
     while (this.queue.length > 0) {
       const task = this.queue[0];
-      
-      // Wait for circuit breaker cooldown if needed
-      const now = Date.now();
-      if (now < this.reconnectAllowedAt) {
-        const waitSecs = Math.ceil((this.reconnectAllowedAt - now) / 1000);
-        log("system", `Reconnection queue waiting ${waitSecs}s before next attempt...`);
-        await sleep(this.reconnectAllowedAt - now);
-      }
+
+      // First bot always waits full 25s (server may be restarting)
+      log("system", `Waiting ${RECONNECT_DELAY_MS / 1000}s before reconnection attempt...`);
+      await sleep(RECONNECT_DELAY_MS);
 
       debugLog("reconnect:process", `Processing ${task.botName} (queue: ${this.queue.length})`);
-      
+
       try {
         const success = await this.attemptReconnect(task);
-        task.resolve(success);
+        
+        if (success) {
+          // Bot reconnected successfully - remove from queue
+          task.resolve(true);
+          this.queue.shift();
+          this.attemptCounts.delete(task.botName);
+          log("system", `✅ ${task.botName} reconnected successfully, removed from queue`);
+        } else {
+          // Reconnect failed - keep in queue for retry, move to back
+          log("system", `${task.botName} reconnection failed, will retry later (queue position: ${this.queue.length})`);
+          this.queue.shift();
+          this.queue.push(task);
+        }
       } catch (err) {
-        task.reject(err instanceof Error ? err : new Error(String(err)));
+        const error = err instanceof Error ? err : new Error(String(err));
+        log("error", `${task.botName} reconnection error: ${error.message}`);
+        
+        // Check if max attempts exceeded
+        const attempts = this.attemptCounts.get(task.botName) || 0;
+        if (attempts >= MAX_RECONNECT_ATTEMPTS) {
+          log("error", `${task.botName} exceeded max reconnection attempts (${MAX_RECONNECT_ATTEMPTS}), removing from queue`);
+          task.reject(error);
+          this.queue.shift();
+          this.attemptCounts.delete(task.botName);
+        } else {
+          // Keep in queue for retry
+          this.queue.shift();
+          this.queue.push(task);
+        }
       }
 
-      // Remove completed task
-      this.queue.shift();
-
-      // CRITICAL delay between processing different bots - prevents rate limiting
-      if (this.queue.length > 0) {
-        log("system", `Waiting ${RECONNECT_BASE_DELAY / 1000}s before next bot reconnection...`);
-        await sleep(RECONNECT_BASE_DELAY);
-      }
+      // Continue to next bot in queue (will wait 25s at start of loop)
     }
 
     this.processing = false;
+    debugLog("reconnect:process", "Queue empty, processing complete");
   }
 
   /**
    * Attempt to reconnect for a single bot.
-   * Uses exponential backoff with jitter.
+   * Tests session validity with get_status command.
+   * Returns true if successful, false if should retry.
    */
   private async attemptReconnect(task: Omit<ReconnectTask, "resolve" | "reject">): Promise<boolean> {
     log("system", `Attempting reconnection for ${task.botName}...`);
 
-    for (let attempt = 0; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
-      try {
-        // Set credentials if available
-        if (task.credentials) {
-          task.api.setCredentials(task.credentials.username, task.credentials.password);
-        }
-
-        // Try to create a new session - this is the actual connectivity test
-        log("system", `Reconnection attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS} for ${task.botName}`);
-        
-        // Create a session to verify server is reachable
-        await task.api.execute("get_status");
-
-        // If we get here without error, the server is reachable
-        log("system", `✅ Server reachable for ${task.botName}`);
-        this.resetCircuitBreaker();
-        return true;
-
-      } catch (err) {
-        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt) + Math.floor(Math.random() * 5000);
-        log("system", `${task.botName} reconnection failed (attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS}), waiting ${delay / 1000}s...`);
-
-        if (attempt < MAX_RECONNECT_ATTEMPTS - 1) {
-          await sleep(delay);
-        }
+    try {
+      // Set credentials if available
+      if (task.credentials) {
+        task.api.setCredentials(task.credentials.username, task.credentials.password);
       }
+
+      // Try to execute get_status to verify connection and session
+      log("system", `Testing connection for ${task.botName} with get_status...`);
+      const resp = await task.api.execute("get_status");
+      
+      // Check if response indicates success
+      if (resp && typeof resp === "object" && !("error" in resp)) {
+        log("system", `✅ ${task.botName} connection verified successfully`);
+        return true;
+      }
+      
+      // Response has error - check if it's a connection error
+      const apiResp = resp as { error?: { code?: string; message?: string } };
+      if (apiResp.error) {
+        const errorCode = apiResp.error.code || "";
+        const errorMsg = apiResp.error.message || "";
+        
+        // Connection errors - should retry
+        if (errorCode === "connection_failed" || 
+            errorCode === "server_down" || 
+            errorCode === "network_error" ||
+            errorMsg.includes("ECONNREFUSED") ||
+            errorMsg.includes("ENOTFOUND") ||
+            errorMsg.includes("connection")) {
+          log("system", `${task.botName} connection failed: ${errorMsg}`);
+          return false;
+        }
+        
+        // Session/auth errors - session may still be valid on server, try anyway
+        // The game auto-renews sessions on command
+        log("system", `${task.botName} got ${errorCode}, but session may still work`);
+        return true;
+      }
+      
+      return true;
+      
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log("system", `${task.botName} reconnection attempt failed: ${msg}`);
+      
+      // Track attempt count
+      const attempts = (this.attemptCounts.get(task.botName) || 0) + 1;
+      this.attemptCounts.set(task.botName, attempts);
+      
+      return false;
     }
-
-    // All attempts exhausted - set circuit breaker
-    this.setCircuitBreaker();
-    log("system", `Reconnection failed for ${task.botName} after ${MAX_RECONNECT_ATTEMPTS} attempts`);
-    return false;
-  }
-
-  /**
-   * Set circuit breaker to prevent rapid reconnection attempts.
-   */
-  private setCircuitBreaker(): void {
-    const cooldownMs = 60_000; // 1 minute base cooldown
-    const staggerDelay = this.reconnectAttempt * 10_000; // Stagger by 10s per failure
-    this.reconnectAllowedAt = Date.now() + cooldownMs + staggerDelay;
-    this.reconnectAttempt++;
-    log("system", `Circuit breaker set - waiting ${cooldownMs / 1000 + staggerDelay / 1000}s before next reconnect wave`);
-  }
-
-  /**
-   * Reset circuit breaker on successful connection.
-   */
-  private resetCircuitBreaker(): void {
-    if (this.reconnectAllowedAt > 0) {
-      log("system", "Circuit breaker reset - connection restored");
-    }
-    this.reconnectAllowedAt = 0;
-    this.reconnectAttempt = 0;
   }
 
   /**
@@ -166,9 +183,17 @@ class ReconnectQueue {
     while (this.queue.length > 0) {
       const task = this.queue.pop();
       if (task) {
-        task.reject(new Error("Queue cleared"));
+        task.reject(new Error("Queue cleared - shutting down"));
       }
     }
+    this.attemptCounts.clear();
+  }
+  
+  /**
+   * Get queue length.
+   */
+  get length(): number {
+    return this.queue.length;
   }
 }
 

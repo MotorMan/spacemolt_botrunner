@@ -4649,12 +4649,13 @@ function renderRescueSettings(panel) {
   const rescueCredits = r.rescueCredits ?? 500;
   const scanIntervalSec = r.scanIntervalSec ?? 30;
   const refuelThreshold = r.refuelThreshold ?? 60;
+  const maydayMaxJumps = r.maydayMaxJumps ?? 12;
 
   panel.innerHTML = `
     <h3 style="margin:0 0 12px;color:var(--text)">FuelRescue Settings</h3>
     <p style="color:var(--dim);font-size:0.85em;margin:0 0 16px">
       Monitors fleet for stranded bots and delivers fuel cells or credits.
-      Assign this routine to a dedicated rescue bot.
+      Also responds to MAYDAY emergency calls within jump range.
     </p>
 
     <div class="settings-group">
@@ -4667,6 +4668,12 @@ function renderRescueSettings(panel) {
       <label>Rescue trigger (fuel %)</label>
       <input type="number" id="set-rescue-fuelThreshold" value="${fuelThreshold}" min="0" max="50" style="width:80px">
       <small style="color:var(--dim)">Bots below this fuel % trigger a rescue mission</small>
+    </div>
+
+    <div class="settings-group">
+      <label>MAYDAY max jumps (0 = unlimited)</label>
+      <input type="number" id="set-rescue-maydayMaxJumps" value="${maydayMaxJumps}" min="0" max="50" style="width:80px">
+      <small style="color:var(--dim)">Maximum jumps away to respond to MAYDAYs (fleet rescues always unlimited)</small>
     </div>
 
     <div class="settings-group">
@@ -4698,8 +4705,10 @@ function saveRescueSettings() {
     rescueCredits: parseInt(document.getElementById('set-rescue-credits').value) || 500,
     scanIntervalSec: parseInt(document.getElementById('set-rescue-scanInterval').value) || 30,
     refuelThreshold: parseInt(document.getElementById('set-rescue-refuelThreshold').value) || 60,
+    maydayMaxJumps: parseInt(document.getElementById('set-rescue-maydayMaxJumps').value) || 0,
   };
   send({ type: 'saveSettings', routine: 'rescue', settings: s });
+  alert('FuelRescue settings saved!');
 }
 
 // ── MaydayRescue settings ──────────────────────────────────

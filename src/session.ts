@@ -10,10 +10,10 @@ export interface Credentials {
 
 export interface SessionToken {
   sessionId: string;
-  expiresAt: string;
+  expiresAt?: string; // Kept for debugging, not used for validation
   playerId?: string;
   v2SessionId?: string;
-  v2ExpiresAt?: string;
+  v2ExpiresAt?: string; // Kept for debugging, not used for validation
 }
 
 export class SessionManager {

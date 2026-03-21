@@ -147,7 +147,6 @@
       <div class="settings-sidebar">
         <div class="sidebar-header">Bot Types</div>
         <div class="sidebar-item active" onclick="switchSettingsTab('general')">General</div>
-        <div class="sidebar-item" onclick="switchSettingsTab('miner')">Miner</div>
         <div class="sidebar-item" onclick="switchSettingsTab('crafter')">Crafter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('rescue')">FuelRescue</div>
         <div class="sidebar-item" onclick="switchSettingsTab('explorer')">Explorer</div>
@@ -155,8 +154,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('trader')">Trader</div>
         <div class="sidebar-item" onclick="switchSettingsTab('faction_trader')">Faction Trader</div>
         <div class="sidebar-item" onclick="switchSettingsTab('trade_buyer')">Trade Buyer</div>
-        <div class="sidebar-item" onclick="switchSettingsTab('gas_harvester')">GasHarvester</div>
-        <div class="sidebar-item" onclick="switchSettingsTab('ice_harvester')">IceHarvester</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('miner')">Miner</div>
         <div class="sidebar-item" onclick="switchSettingsTab('salvager')">Salvager</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cleanup')">Cleanup</div>
         <div class="sidebar-item" onclick="switchSettingsTab('return_home')">Return Home</div>
@@ -1047,9 +1045,8 @@ function openProfile(username) {
 
   // Refresh nearby players list for manual refuel control
   mcRefreshNearbyPlayers();
-  
-  // Initialize rescue mission system dropdown
-  mcInitRescueSystems();
+
+  // Rescue system dropdown is now populated by renderManualControls()
 }
 
 function closeProfile() {
@@ -1237,8 +1234,8 @@ function renderProfileTopbar() {
       <select id="profile-focusStation" onchange="saveProfileFocusStation()">${focusOpts.join('')}</select>`;
   }
 
-  // Per-bot home system for salvager, ice_harvester, gas_harvester, return_home
-  const needsHomeSystem = ['salvager', 'ice_harvester', 'gas_harvester', 'return_home'];
+  // Per-bot home system for salvager, return_home
+  const needsHomeSystem = ['salvager', 'return_home'];
   const currentRoutine = bot.state === 'running' ? bot.routine : (bot.state !== 'stopping' ? getProfileSelectedRoutine() : '');
   if (needsHomeSystem.includes(currentRoutine)) {
     const botSettings = settings[bot.username] || {};
@@ -1562,6 +1559,17 @@ function renderManualControls() {
         }).join('')
     : '<option value="">No systems mapped</option>';
 
+  // All known systems for manual rescue (same source as Jump To)
+  const rescueOpts = knownSystems.length > 0
+    ? knownSystems
+        .filter(s => s.id !== currentSys)
+        .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id))
+        .map(s => {
+          const label = s.name ? `${s.name} (${s.id})` : s.id;
+          return `<option value="${esc(s.id)}">${esc(label)}</option>`;
+        }).join('')
+    : '<option value="">No systems mapped</option>';
+
   // Build sell/deposit item options from cargo
   const cargoOpts = bot.inventory && bot.inventory.length > 0
     ? bot.inventory.map(i => `<option value="${esc(i.itemId)}" data-max="${i.quantity}">${esc(i.name)} (${i.quantity})</option>`).join('')
@@ -1688,7 +1696,7 @@ function renderManualControls() {
 
     <div class="cmd-group">
       <label>System</label>
-      <select id="mc-rescue-system" onchange="mcPopulateRescuePOIs()"><option value="">Select system...</option></select>
+      <select id="mc-rescue-system" onchange="mcPopulateRescuePOIs()">${rescueOpts}</select>
     </div>
 
     <div class="cmd-group">
@@ -3871,10 +3879,6 @@ function renderSettingsPanel() {
     renderFactionTraderSettings(panel);
   } else if (activeSettingsTab === 'trade_buyer') {
     renderTradeBuyerSettings(panel);
-  } else if (activeSettingsTab === 'gas_harvester') {
-    renderGasHarvesterSettings(panel);
-  } else if (activeSettingsTab === 'ice_harvester') {
-    renderIceHarvesterSettings(panel);
   } else if (activeSettingsTab === 'salvager') {
     renderSalvagerSettings(panel);
   } else if (activeSettingsTab === 'cleanup') {
@@ -4150,235 +4154,6 @@ function clearReturnHomeBotOverride(botName) {
   delete settings[botName].homeSystem;
   delete settings[botName].homeStation;
   renderReturnHomeSettings(document.getElementById('settingsContent'));
-}
-
-function renderMinerSettings(panel) {
-  const miner = settings.miner || {};
-  const currentSystem = miner.system || '';
-  const depositBot = miner.depositBot || '';
-  const cargoThreshold = miner.cargoThreshold ?? 80;
-  const refuelThreshold = miner.refuelThreshold ?? 50;
-  const repairThreshold = miner.repairThreshold ?? 40;
-  const depositMode = miner.depositMode || (miner.sellOre ? 'sell' : 'faction');
-  const depositFallback = miner.depositFallback || 'storage';
-  // Resolve unified primary value
-  const depositPrimary = depositBot ? `bot:${depositBot}` : depositMode;
-  const depositSecondary = depositFallback;
-  const targetOre = miner.targetOre || '';
-  const oreQuotas = miner.oreQuotas || {};
-
-  const systemOpts = ['<option value="">(current system)</option>'];
-  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
-    const sel = sys.id === currentSystem ? ' selected' : '';
-    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
-    systemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
-  }
-  if (currentSystem && !knownSystems.find(s => s.id === currentSystem)) {
-    systemOpts.push(`<option value="${esc(currentSystem)}" selected>${esc(currentSystem)}</option>`);
-  }
-
-  const oreOpts = ['<option value="">(any ore — mine whatever is available)</option>'];
-  for (const ore of [...knownOres].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
-    const sel = ore.item_id === targetOre ? ' selected' : '';
-    oreOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
-  }
-  if (targetOre && !knownOres.find(o => o.item_id === targetOre)) {
-    oreOpts.push(`<option value="${esc(targetOre)}" selected>${esc(targetOre)}</option>`);
-  }
-
-  function minerDepositOpts(current) {
-    const opts = [];
-    opts.push(`<option value="faction"${'faction' === current ? ' selected' : ''}>Faction storage</option>`);
-    opts.push(`<option value="storage"${'storage' === current ? ' selected' : ''}>Station storage</option>`);
-    opts.push(`<option value="sell"${'sell' === current ? ' selected' : ''}>Sell at market</option>`);
-    for (const bot of [...bots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
-      const val = `bot:${bot.username}`;
-      opts.push(`<option value="${esc(val)}"${val === current ? ' selected' : ''}>${esc(bot.username)}</option>`);
-    }
-    return opts.join('');
-  }
-
-  // Per-bot ore overrides
-  const minerBots = bots.filter(b => b.routine === 'miner');
-  let perBotHtml = '';
-  if (minerBots.length > 0) {
-    perBotHtml = `
-    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px">
-      <div class="setting-label" style="margin-bottom:8px">Per-Bot Target Ore</div>
-      <div class="setting-hint" style="margin-bottom:8px">Override the default target ore for individual miners. Leave as "(use default)" to use the global setting above.</div>`;
-    for (const bot of [...minerBots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
-      const botOre = (settings[bot.username] || {}).targetOre || '';
-      perBotHtml += `
-      <div class="setting-row" style="margin-bottom:4px">
-        <div class="setting-label" style="min-width:120px;font-size:12px">${esc(bot.username)}</div>
-        <select id="set-miner-botore-${esc(bot.username)}" data-bot="${esc(bot.username)}" class="miner-bot-ore-select">
-          <option value="">(use default)</option>
-          ${[...knownOres].sort((a, b) => (a.name || '').localeCompare(b.name || '')).map(o => `<option value="${esc(o.item_id)}"${o.item_id === botOre ? ' selected' : ''}>${esc(o.name)}</option>`).join('')}
-          ${botOre && !knownOres.find(o => o.item_id === botOre) ? `<option value="${esc(botOre)}" selected>${esc(botOre)}</option>` : ''}
-        </select>
-      </div>`;
-    }
-    perBotHtml += '</div>';
-  }
-
-  // Ore quotas table
-  let quotaRows = '';
-  for (const [oreId, target] of Object.entries(oreQuotas)) {
-    if (target <= 0) continue;
-    const oreName = knownOres.find(o => o.item_id === oreId)?.name || oreId;
-    quotaRows += `<tr data-ore-id="${esc(oreId)}">
-      <td style="padding:4px 8px">${esc(oreName)}</td>
-      <td style="padding:4px 8px"><input type="number" min="1" max="9999" value="${target}" class="ore-quota-qty" style="width:70px" /></td>
-      <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
-    </tr>`;
-  }
-
-  const quotaOreOpts = ['<option value="">-- select ore --</option>'];
-  for (const ore of [...knownOres].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
-    quotaOreOpts.push(`<option value="${esc(ore.item_id)}">${esc(ore.name)}</option>`);
-  }
-
-  panel.innerHTML = `
-    <h3>Miner Settings</h3>
-    <div class="settings-desc">Configure how mining bots operate. Changes apply to all bots started with the Miner routine.</div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Target Ore (default)</div>
-        <div class="setting-hint">Seek out a specific ore type. Bot will travel to the best known location on the map, mine it, and return home. Requires Explorer to have mapped ore locations first.</div>
-      </div>
-      <select id="set-miner-targetOre">${oreOpts.join('')}</select>
-    </div>
-
-    ${perBotHtml}
-
-    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:12px">
-      <div class="setting-label" style="margin-bottom:4px">Ore Quotas</div>
-      <div class="setting-hint" style="margin-bottom:8px">Maintain target stock levels per ore in faction storage. Miners will prioritize the ore with the biggest deficit, traveling cross-system as needed. When all quotas are met, miners fall back to local mining.</div>
-      <table id="ore-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
-        <thead><tr style="border-bottom:1px solid var(--border)">
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Ore</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
-          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
-        </tr></thead>
-        <tbody>${quotaRows}</tbody>
-      </table>
-      <div style="display:flex;gap:8px;align-items:center">
-        <select id="ore-quota-add-ore" style="flex:1">${quotaOreOpts.join('')}</select>
-        <input type="number" id="ore-quota-add-qty" min="1" max="9999" value="50" style="width:70px" placeholder="Qty" />
-        <button class="secondary" onclick="addOreQuotaRow()">Add</button>
-      </div>
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Mining System</div>
-        <div class="setting-hint">Override system to mine in (ignored if Target Ore is set). Bot will jump there on start.</div>
-      </div>
-      <select id="set-miner-system">${systemOpts.join('')}</select>
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Primary Deposit</div>
-        <div class="setting-hint">Where to send ore when returning to station.</div>
-      </div>
-      <select id="set-miner-depositPrimary">${minerDepositOpts(depositPrimary)}</select>
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Secondary Deposit</div>
-        <div class="setting-hint">Fallback if primary fails (e.g. faction storage full).</div>
-      </div>
-      <select id="set-miner-depositSecondary">${minerDepositOpts(depositSecondary)}</select>
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Cargo Fill Threshold</div>
-        <div class="setting-hint">Return to station when cargo reaches this % full.</div>
-      </div>
-      <input type="number" id="set-miner-cargoThreshold" min="50" max="100" value="${cargoThreshold}">
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Refuel Threshold</div>
-        <div class="setting-hint">Refuel at station when fuel drops below this %.</div>
-      </div>
-      <input type="number" id="set-miner-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Repair Threshold</div>
-        <div class="setting-hint">Repair hull at station when HP drops below this %.</div>
-      </div>
-      <input type="number" id="set-miner-repairThreshold" min="20" max="80" value="${repairThreshold}">
-    </div>
-
-    <div class="settings-save-bar">
-      <button class="primary" onclick="saveMinerSettings()">Save Settings</button>
-    </div>
-  `;
-}
-
-function addOreQuotaRow() {
-  const oreSelect = document.getElementById('ore-quota-add-ore');
-  const qtyInput = document.getElementById('ore-quota-add-qty');
-  const oreId = oreSelect.value;
-  const qty = parseInt(qtyInput.value) || 50;
-  if (!oreId) return;
-  // Check if ore already in table
-  const existing = document.querySelector(`#ore-quota-table tr[data-ore-id="${oreId}"]`);
-  if (existing) {
-    existing.querySelector('.ore-quota-qty').value = qty;
-    return;
-  }
-  const oreName = knownOres.find(o => o.item_id === oreId)?.name || oreId;
-  const tbody = document.querySelector('#ore-quota-table tbody');
-  const tr = document.createElement('tr');
-  tr.dataset.oreId = oreId;
-  tr.innerHTML = `
-    <td style="padding:4px 8px">${esc(oreName)}</td>
-    <td style="padding:4px 8px"><input type="number" min="1" max="9999" value="${qty}" class="ore-quota-qty" style="width:70px" /></td>
-    <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>`;
-  tbody.appendChild(tr);
-  oreSelect.value = '';
-}
-
-function saveMinerSettings() {
-  const s = {
-    targetOre: document.getElementById('set-miner-targetOre').value,
-    system: document.getElementById('set-miner-system').value,
-    depositBot: (function() { const v = document.getElementById('set-miner-depositPrimary').value; return v.startsWith('bot:') ? v.slice(4) : ''; })(),
-    depositMode: (function() { const v = document.getElementById('set-miner-depositPrimary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
-    depositFallback: (function() { const v = document.getElementById('set-miner-depositSecondary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
-    sellOre: document.getElementById('set-miner-depositPrimary').value === 'sell',
-    cargoThreshold: parseInt(document.getElementById('set-miner-cargoThreshold').value) || 80,
-    refuelThreshold: parseInt(document.getElementById('set-miner-refuelThreshold').value) || 50,
-    repairThreshold: parseInt(document.getElementById('set-miner-repairThreshold').value) || 40,
-  };
-  // Collect ore quotas from table
-  const oreQuotas = {};
-  for (const row of document.querySelectorAll('#ore-quota-table tbody tr')) {
-    const oreId = row.dataset.oreId;
-    const qty = parseInt(row.querySelector('.ore-quota-qty').value) || 0;
-    if (oreId && qty > 0) oreQuotas[oreId] = qty;
-  }
-  s.oreQuotas = oreQuotas;
-  send({ type: 'saveSettings', routine: 'miner', settings: s });
-
-  // Save per-bot ore overrides
-  const selects = document.querySelectorAll('.miner-bot-ore-select');
-  for (const sel of selects) {
-    const botName = sel.dataset.bot;
-    const oreVal = sel.value;
-    if (!settings[botName]) settings[botName] = {};
-    settings[botName].targetOre = oreVal;
-    send({ type: 'saveSettings', routine: botName, settings: { targetOre: oreVal } });
-  }
 }
 
 // ── Crafter Settings ────────────────────────────────────────
@@ -7717,21 +7492,24 @@ function saveExplorerBotFocus(botName) {
   setTimeout(() => { btn.textContent = origText; }, 1500);
 }
 
-// ── Gas Harvester Settings ──────────────────────────────────
+// ── Miner Settings ──────────────────────────────────────────
 
-function renderGasHarvesterSettings(panel) {
-  const g = settings.gas_harvester || {};
-  const depositMode = g.depositMode || 'faction';
-  const depositFallback = g.depositFallback || 'storage';
-  const cargoThreshold = g.cargoThreshold ?? 80;
-  const refuelThreshold = g.refuelThreshold ?? 50;
-  const repairThreshold = g.repairThreshold ?? 40;
-  const currentSystem = g.system || '';
-  const homeSystem = g.homeSystem || '';
-  const depositBot = g.depositBot || '';
-  const gasPrimary = depositBot ? `bot:${depositBot}` : depositMode;
-  const gasSecondary = depositFallback;
-  const targetGas = g.targetGas || '';
+function renderMinerSettings(panel) {
+  const m = settings.miner || {};
+  const miningType = m.miningType || 'auto';
+  const depositMode = m.depositMode || 'faction';
+  const depositFallback = m.depositFallback || 'storage';
+  const cargoThreshold = m.cargoThreshold ?? 80;
+  const refuelThreshold = m.refuelThreshold ?? 50;
+  const repairThreshold = m.repairThreshold ?? 40;
+  const currentSystem = m.system || '';
+  const homeSystem = m.homeSystem || '';
+  const depositBot = m.depositBot || '';
+  const targetOre = m.targetOre || '';
+  const targetGas = m.targetGas || '';
+  const targetIce = m.targetIce || '';
+  const orePrimary = depositBot ? `bot:${depositBot}` : depositMode;
+  const oreSecondary = depositFallback;
 
   const systemOpts = ['<option value="">(current system)</option>'];
   for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
@@ -7753,21 +7531,48 @@ function renderGasHarvesterSettings(panel) {
     homeOpts.push(`<option value="${esc(homeSystem)}" selected>${esc(homeSystem)}</option>`);
   }
 
+  // Build ore filter lists
+  const oreOres = knownOres.filter(o => {
+    const n = o.name.toLowerCase();
+    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo');
+  });
   const gasOres = knownOres.filter(o => {
     const n = o.name.toLowerCase();
     return n.includes('gas') || n.includes('nebula') || n.includes('plasma') || n.includes('hydrogen') || n.includes('helium');
   });
-  const oreList = gasOres.length > 0 ? gasOres : knownOres;
-  const oreOpts = ['<option value="">(any gas — harvest whatever is available)</option>'];
-  for (const ore of [...oreList].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
-    const sel = ore.item_id === targetGas ? ' selected' : '';
+  const iceOres = knownOres.filter(o => {
+    const n = o.name.toLowerCase();
+    return n.includes('ice') || n.includes('frost') || n.includes('cryo') || n.includes('water');
+  });
+
+  const oreOpts = ['<option value="">(any ore — harvest whatever is available)</option>'];
+  for (const ore of [...oreOres].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
+    const sel = ore.item_id === targetOre ? ' selected' : '';
     oreOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
   }
-  if (targetGas && !oreList.find(o => o.item_id === targetGas)) {
-    oreOpts.push(`<option value="${esc(targetGas)}" selected>${esc(targetGas)}</option>`);
+  if (targetOre && !oreOres.find(o => o.item_id === targetOre)) {
+    oreOpts.push(`<option value="${esc(targetOre)}" selected>${esc(targetOre)}</option>`);
   }
 
-  function gasDepositOpts(current) {
+  const gasOpts = ['<option value="">(any gas — harvest whatever is available)</option>'];
+  for (const ore of [...gasOres].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
+    const sel = ore.item_id === targetGas ? ' selected' : '';
+    gasOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
+  }
+  if (targetGas && !gasOres.find(o => o.item_id === targetGas)) {
+    gasOpts.push(`<option value="${esc(targetGas)}" selected>${esc(targetGas)}</option>`);
+  }
+
+  const iceOpts = ['<option value="">(any ice — harvest whatever is available)</option>'];
+  for (const ore of [...iceOres].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
+    const sel = ore.item_id === targetIce ? ' selected' : '';
+    iceOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
+  }
+  if (targetIce && !iceOres.find(o => o.item_id === targetIce)) {
+    iceOpts.push(`<option value="${esc(targetIce)}" selected>${esc(targetIce)}</option>`);
+  }
+
+  function minerDepositOpts(current) {
     const opts = [];
     opts.push(`<option value="faction"${'faction' === current ? ' selected' : ''}>Faction storage</option>`);
     opts.push(`<option value="storage"${'storage' === current ? ' selected' : ''}>Station storage</option>`);
@@ -7780,156 +7585,44 @@ function renderGasHarvesterSettings(panel) {
   }
 
   panel.innerHTML = `
-    <h3>Gas Harvester Settings</h3>
-    <div class="settings-desc">Configure gas cloud harvesting bots. They travel to gas clouds/nebulae and mine gas resources.</div>
+    <h3>Miner Settings</h3>
+    <div class="settings-desc">Configure mining bots. They automatically detect ship equipment and harvest ore from asteroid belts, gas from nebulae, or ice from ice fields.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Mining Type</div>
+        <div class="setting-hint">Auto-detect from ship modules, or force ore/gas/ice mining mode.</div>
+      </div>
+      <select id="set-miner-miningType">
+        <option value="auto"${miningType === 'auto' ? ' selected' : ''}>Auto-detect (recommended)</option>
+        <option value="ore"${miningType === 'ore' ? ' selected' : ''}>Ore Mining (asteroid belts)</option>
+        <option value="gas"${miningType === 'gas' ? ' selected' : ''}>Gas Harvesting (gas clouds)</option>
+        <option value="ice"${miningType === 'ice' ? ' selected' : ''}>Ice Mining (ice fields)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Target Ore</div>
+        <div class="setting-hint">Seek a specific ore type. Bot will look for asteroid belts with this resource.</div>
+      </div>
+      <select id="set-miner-targetOre">${oreOpts.join('')}</select>
+    </div>
 
     <div class="setting-row">
       <div>
         <div class="setting-label">Target Gas</div>
         <div class="setting-hint">Seek a specific gas type. Bot will look for gas clouds with this resource.</div>
       </div>
-      <select id="set-gas-targetGas">${oreOpts.join('')}</select>
+      <select id="set-miner-targetGas">${gasOpts.join('')}</select>
     </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Harvesting System</div>
-        <div class="setting-hint">Override system to harvest in. Bot will jump there on start.</div>
-      </div>
-      <select id="set-gas-system">${systemOpts.join('')}</select>
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Home System</div>
-        <div class="setting-hint">Station system the gas harvester returns to for unloading. Per-bot override available in bot profile. Defaults to start system.</div>
-      </div>
-      <select id="set-gas-homeSystem">${homeOpts.join('')}</select>
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Primary Deposit</div>
-        <div class="setting-hint">Where to send harvested gas when returning to station.</div>
-      </div>
-      <select id="set-gas-depositPrimary">${gasDepositOpts(gasPrimary)}</select>
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Secondary Deposit</div>
-        <div class="setting-hint">Fallback if primary fails.</div>
-      </div>
-      <select id="set-gas-depositSecondary">${gasDepositOpts(gasSecondary)}</select>
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Cargo Fill Threshold</div>
-        <div class="setting-hint">Return to station when cargo reaches this % full.</div>
-      </div>
-      <input type="number" id="set-gas-cargoThreshold" min="50" max="100" value="${cargoThreshold}">
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Refuel Threshold</div>
-        <div class="setting-hint">Refuel at station when fuel drops below this %.</div>
-      </div>
-      <input type="number" id="set-gas-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Repair Threshold</div>
-        <div class="setting-hint">Repair hull at station when HP drops below this %.</div>
-      </div>
-      <input type="number" id="set-gas-repairThreshold" min="20" max="80" value="${repairThreshold}">
-    </div>
-
-    <div class="settings-save-bar">
-      <button class="primary" onclick="saveGasHarvesterSettings()">Save Settings</button>
-    </div>
-  `;
-}
-
-function saveGasHarvesterSettings() {
-  const s = {
-    targetGas: document.getElementById('set-gas-targetGas').value,
-    system: document.getElementById('set-gas-system').value,
-    homeSystem: document.getElementById('set-gas-homeSystem').value,
-    depositBot: (function() { const v = document.getElementById('set-gas-depositPrimary').value; return v.startsWith('bot:') ? v.slice(4) : ''; })(),
-    depositMode: (function() { const v = document.getElementById('set-gas-depositPrimary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
-    depositFallback: (function() { const v = document.getElementById('set-gas-depositSecondary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
-    cargoThreshold: parseInt(document.getElementById('set-gas-cargoThreshold').value) || 80,
-    refuelThreshold: parseInt(document.getElementById('set-gas-refuelThreshold').value) || 50,
-    repairThreshold: parseInt(document.getElementById('set-gas-repairThreshold').value) || 40,
-  };
-  send({ type: 'saveSettings', routine: 'gas_harvester', settings: s });
-  settings.gas_harvester = s;
-}
-
-// ── Ice Harvester Settings ──────────────────────────────────
-
-function renderIceHarvesterSettings(panel) {
-  const ic = settings.ice_harvester || {};
-  const depositMode = ic.depositMode || 'faction';
-  const depositFallback = ic.depositFallback || 'storage';
-  const cargoThreshold = ic.cargoThreshold ?? 80;
-  const refuelThreshold = ic.refuelThreshold ?? 50;
-  const repairThreshold = ic.repairThreshold ?? 40;
-  const currentSystem = ic.system || '';
-  const depositBot = ic.depositBot || '';
-  const icePrimary = depositBot ? `bot:${depositBot}` : depositMode;
-  const iceSecondary = depositFallback;
-  const targetIce = ic.targetIce || '';
-
-  const systemOpts = ['<option value="">(current system)</option>'];
-  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
-    const sel = sys.id === currentSystem ? ' selected' : '';
-    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
-    systemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
-  }
-  if (currentSystem && !knownSystems.find(s => s.id === currentSystem)) {
-    systemOpts.push(`<option value="${esc(currentSystem)}" selected>${esc(currentSystem)}</option>`);
-  }
-
-  const iceOres = knownOres.filter(o => {
-    const n = o.name.toLowerCase();
-    return n.includes('ice') || n.includes('frost') || n.includes('cryo') || n.includes('water');
-  });
-  const oreList = iceOres.length > 0 ? iceOres : knownOres;
-  const oreOpts = ['<option value="">(any ice — harvest whatever is available)</option>'];
-  for (const ore of [...oreList].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
-    const sel = ore.item_id === targetIce ? ' selected' : '';
-    oreOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
-  }
-  if (targetIce && !oreList.find(o => o.item_id === targetIce)) {
-    oreOpts.push(`<option value="${esc(targetIce)}" selected>${esc(targetIce)}</option>`);
-  }
-
-  function iceDepositOpts(current) {
-    const opts = [];
-    opts.push(`<option value="faction"${'faction' === current ? ' selected' : ''}>Faction storage</option>`);
-    opts.push(`<option value="storage"${'storage' === current ? ' selected' : ''}>Station storage</option>`);
-    opts.push(`<option value="sell"${'sell' === current ? ' selected' : ''}>Sell at market</option>`);
-    for (const bot of [...bots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
-      const val = `bot:${bot.username}`;
-      opts.push(`<option value="${esc(val)}"${val === current ? ' selected' : ''}>${esc(bot.username)}</option>`);
-    }
-    return opts.join('');
-  }
-
-  panel.innerHTML = `
-    <h3>Ice Harvester Settings</h3>
-    <div class="settings-desc">Configure ice field harvesting bots. They travel to ice fields and mine ice resources.</div>
 
     <div class="setting-row">
       <div>
         <div class="setting-label">Target Ice</div>
         <div class="setting-hint">Seek a specific ice type. Bot will look for ice fields with this resource.</div>
       </div>
-      <select id="set-ice-targetIce">${oreOpts.join('')}</select>
+      <select id="set-miner-targetIce">${iceOpts.join('')}</select>
     </div>
 
     <div class="setting-row">
@@ -7937,15 +7630,23 @@ function renderIceHarvesterSettings(panel) {
         <div class="setting-label">Harvesting System</div>
         <div class="setting-hint">Override system to harvest in. Bot will jump there on start.</div>
       </div>
-      <select id="set-ice-system">${systemOpts.join('')}</select>
+      <select id="set-miner-system">${systemOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home System</div>
+        <div class="setting-hint">Station system the miner returns to for unloading. Per-bot override available in bot profile. Defaults to start system.</div>
+      </div>
+      <select id="set-miner-homeSystem">${homeOpts.join('')}</select>
     </div>
 
     <div class="setting-row">
       <div>
         <div class="setting-label">Primary Deposit</div>
-        <div class="setting-hint">Where to send harvested ice when returning to station.</div>
+        <div class="setting-hint">Where to send mined resources when returning to station.</div>
       </div>
-      <select id="set-ice-depositPrimary">${iceDepositOpts(icePrimary)}</select>
+      <select id="set-miner-depositPrimary">${minerDepositOpts(orePrimary)}</select>
     </div>
 
     <div class="setting-row">
@@ -7953,7 +7654,7 @@ function renderIceHarvesterSettings(panel) {
         <div class="setting-label">Secondary Deposit</div>
         <div class="setting-hint">Fallback if primary fails.</div>
       </div>
-      <select id="set-ice-depositSecondary">${iceDepositOpts(iceSecondary)}</select>
+      <select id="set-miner-depositSecondary">${minerDepositOpts(oreSecondary)}</select>
     </div>
 
     <div class="setting-row">
@@ -7961,7 +7662,7 @@ function renderIceHarvesterSettings(panel) {
         <div class="setting-label">Cargo Fill Threshold</div>
         <div class="setting-hint">Return to station when cargo reaches this % full.</div>
       </div>
-      <input type="number" id="set-ice-cargoThreshold" min="50" max="100" value="${cargoThreshold}">
+      <input type="number" id="set-miner-cargoThreshold" min="50" max="100" value="${cargoThreshold}">
     </div>
 
     <div class="setting-row">
@@ -7969,7 +7670,7 @@ function renderIceHarvesterSettings(panel) {
         <div class="setting-label">Refuel Threshold</div>
         <div class="setting-hint">Refuel at station when fuel drops below this %.</div>
       </div>
-      <input type="number" id="set-ice-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
+      <input type="number" id="set-miner-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
     </div>
 
     <div class="setting-row">
@@ -7977,28 +7678,32 @@ function renderIceHarvesterSettings(panel) {
         <div class="setting-label">Repair Threshold</div>
         <div class="setting-hint">Repair hull at station when HP drops below this %.</div>
       </div>
-      <input type="number" id="set-ice-repairThreshold" min="20" max="80" value="${repairThreshold}">
+      <input type="number" id="set-miner-repairThreshold" min="20" max="80" value="${repairThreshold}">
     </div>
 
     <div class="settings-save-bar">
-      <button class="primary" onclick="saveIceHarvesterSettings()">Save Settings</button>
+      <button class="primary" onclick="saveMinerSettings()">Save Settings</button>
     </div>
   `;
 }
 
-function saveIceHarvesterSettings() {
+function saveMinerSettings() {
   const s = {
-    targetIce: document.getElementById('set-ice-targetIce').value,
-    system: document.getElementById('set-ice-system').value,
-    depositBot: (function() { const v = document.getElementById('set-ice-depositPrimary').value; return v.startsWith('bot:') ? v.slice(4) : ''; })(),
-    depositMode: (function() { const v = document.getElementById('set-ice-depositPrimary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
-    depositFallback: (function() { const v = document.getElementById('set-ice-depositSecondary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
-    cargoThreshold: parseInt(document.getElementById('set-ice-cargoThreshold').value) || 80,
-    refuelThreshold: parseInt(document.getElementById('set-ice-refuelThreshold').value) || 50,
-    repairThreshold: parseInt(document.getElementById('set-ice-repairThreshold').value) || 40,
+    miningType: document.getElementById('set-miner-miningType').value,
+    targetOre: document.getElementById('set-miner-targetOre').value,
+    targetGas: document.getElementById('set-miner-targetGas').value,
+    targetIce: document.getElementById('set-miner-targetIce').value,
+    system: document.getElementById('set-miner-system').value,
+    homeSystem: document.getElementById('set-miner-homeSystem').value,
+    depositBot: (function() { const v = document.getElementById('set-miner-depositPrimary').value; return v.startsWith('bot:') ? v.slice(4) : ''; })(),
+    depositMode: (function() { const v = document.getElementById('set-miner-depositPrimary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
+    depositFallback: (function() { const v = document.getElementById('set-miner-depositSecondary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
+    cargoThreshold: parseInt(document.getElementById('set-miner-cargoThreshold').value) || 80,
+    refuelThreshold: parseInt(document.getElementById('set-miner-refuelThreshold').value) || 50,
+    repairThreshold: parseInt(document.getElementById('set-miner-repairThreshold').value) || 40,
   };
-  send({ type: 'saveSettings', routine: 'ice_harvester', settings: s });
-  settings.ice_harvester = s;
+  send({ type: 'saveSettings', routine: 'miner', settings: s });
+  settings.miner = s;
 }
 
 // ── Salvager Settings ───────────────────────────────────────

@@ -8,8 +8,6 @@ import { crafterRoutine } from "./routines/crafter.js";
 import { rescueRoutine, fuelTransferRoutine, manualPlayerRescueRoutine, maydayRescueRoutine } from "./routines/rescue.js";
 import { coordinatorRoutine } from "./routines/coordinator.js";
 import { traderRoutine } from "./routines/trader.js";
-import { gasHarvesterRoutine } from "./routines/gas_harvester.js";
-import { iceHarvesterRoutine } from "./routines/ice_harvester.js";
 import { salvagerRoutine } from "./routines/salvager.js";
 import { hunterRoutine } from "./routines/hunter.js";
 import { factionTraderRoutine } from "./routines/faction_trader.js";
@@ -54,8 +52,6 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   mayday: { name: "MaydayRescue", fn: maydayRescueRoutine },
   coordinator: { name: "Coordinator", fn: coordinatorRoutine },
   trader: { name: "Trader", fn: traderRoutine },
-  gas_harvester: { name: "GasHarvester", fn: gasHarvesterRoutine },
-  ice_harvester: { name: "IceHarvester", fn: iceHarvesterRoutine },
   salvager: { name: "Salvager", fn: salvagerRoutine },
   hunter: { name: "Hunter", fn: hunterRoutine },
   faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },

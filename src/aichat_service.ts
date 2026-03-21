@@ -574,6 +574,8 @@ export class AiChatService {
 
         // Check if enabled
         if (!settings.enabled) {
+          // Clear the queue to prevent processing stale messages when re-enabled
+          this.chatMessageQueue = [];
           await sleep(5000);
           continue;
         }

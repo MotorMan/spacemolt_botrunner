@@ -1,4 +1,4 @@
-import { existsSync, readdirSync, appendFileSync, mkdirSync, rmSync } from "fs";
+import { existsSync, readdirSync, appendFileSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { Bot, type Routine } from "./bot.js";
 import { SessionManager } from "./session.js";
@@ -40,6 +40,51 @@ let aiChatService: AiChatService | null = null;
 /** Get list of discovered bot usernames (for API use). */
 export function getDiscoveredBots(): string[] {
   return [...bots.keys()];
+}
+
+// ── Mass Disconnect Detection ───────────────────────────────
+
+const MASS_DISCONNECT_THRESHOLD = 15;  // Trigger if 15+ unique bots lose sessions
+const DISCONNECT_WINDOW_MS = 5000;     // Within 5 seconds
+
+interface SessionLossEvent {
+  botName: string;
+  timestamp: number;
+}
+
+let sessionLossEvents: SessionLossEvent[] = [];
+let shutdownInitiated = false;
+
+/** Track a session loss event and check for mass disconnect. */
+function trackSessionLoss(botName: string): void {
+  if (shutdownInitiated) return;  // Already shutting down
+
+  const now = Date.now();
+  
+  // Add new session loss event
+  sessionLossEvents.push({ botName, timestamp: now });
+  
+  // Remove old events outside the window
+  sessionLossEvents = sessionLossEvents.filter(e => now - e.timestamp < DISCONNECT_WINDOW_MS);
+  
+  // Count UNIQUE bots that lost sessions in the window
+  const uniqueBots = new Set(sessionLossEvents.map(e => e.botName));
+  
+  // Check if threshold exceeded
+  if (uniqueBots.size >= MASS_DISCONNECT_THRESHOLD) {
+    shutdownInitiated = true;
+    const affectedBots = [...uniqueBots].join(", ");
+    server.logSystem(`⚠️ MASS SESSION INVALIDATION DETECTED: ${uniqueBots.size} unique bots lost sessions within ${DISCONNECT_WINDOW_MS / 1000}s`);
+    server.logSystem(`Affected bots: ${affectedBots}`);
+    server.logSystem(`Initiating graceful shutdown for restart...`);
+    // Trigger graceful shutdown with restart flag
+    (globalThis as any).shutdownServer("mass_session_loss", true);
+  }
+}
+
+/** Export function for API module to call on session invalidation */
+export function notifySessionLoss(botName: string): void {
+  trackSessionLoss(botName);
 }
 
 const ROUTINES: Record<string, { name: string; fn: Routine }> = {
@@ -689,9 +734,9 @@ async function main(): Promise<void> {
   server.start();
 
   // Graceful shutdown handler
-  function gracefulShutdown(signal: string): void {
+  function gracefulShutdown(signal: string, restart: boolean = false): void {
     console.log(`\nShutting down (${signal})...`);
-    server.logSystem(`Server shutdown requested (${signal})`);
+    server.logSystem(`Server shutdown requested (${signal}${restart ? ", restart requested" : ""})`);
     // Clear intervals
     for (const id of intervals) clearInterval(id);
     // Flush stats before stopping bots
@@ -712,7 +757,35 @@ async function main(): Promise<void> {
     mapStore.flush();
     catalogStore.flush();
     server.stop();
-    process.exit(0);
+    
+    // If restarting due to mass session loss, clear all session files
+    // This forces fresh logins on restart, avoiding the invalid session loop
+    if (restart && signal === "mass_session_loss") {
+      server.logSystem(`Clearing session files for all bots...`);
+      const sessionsDir = join(BASE_DIR, "sessions");
+      if (existsSync(sessionsDir)) {
+        const botDirs = readdirSync(sessionsDir, { withFileTypes: true })
+          .filter(d => d.isDirectory())
+          .map(d => d.name);
+        
+        for (const botName of botDirs) {
+          const sessionFile = join(sessionsDir, botName, "session.json");
+          if (existsSync(sessionFile)) {
+            try {
+              rmSync(sessionFile);
+              debugLog("shutdown", `Deleted session file for ${botName}`);
+            } catch (err) {
+              server.logSystem(`Warning: Failed to delete session file for ${botName}: ${err}`);
+            }
+          }
+        }
+        server.logSystem(`Session files cleared for ${botDirs.length} bot(s)`);
+      }
+    }
+
+    // Exit with special code to signal watchdog to restart
+    // Code 100 = restart requested, code 0 = normal shutdown
+    process.exit(restart ? 100 : 0);
   }
 
   // Graceful shutdown on SIGINT (Ctrl+C) and SIGTERM (Windows/taskkill)

@@ -3,6 +3,7 @@ import { commandLog } from "./commandLogger.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { debugLog } from "./debug.js";
 import { SessionManager } from "./session.js";
+import { notifySessionLoss } from "./botmanager.js";
 import {
   logSession,
   logSessionCreate,
@@ -37,6 +38,14 @@ const USER_AGENT = "SpaceMolt-BotRunner-LT1428-MODDED";
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;
 const RECONNECT_BASE_DELAY = 5_000;
+
+// Global session creation rate limiter - prevents rapid session spam
+let lastSessionCreateTime = 0;
+const SESSION_CREATE_INTERVAL = 3000; // Minimum 3 seconds between any session creations
+
+// Global serial queue for ALL session creations across all bots
+let globalSessionQueue: Promise<void> = Promise.resolve();
+let globalV2SessionQueue: Promise<void> = Promise.resolve();
 
 // ── Response cache ────────────────────────────────────────────
 
@@ -160,13 +169,8 @@ export class SpaceMoltAPI {
   private _cache = new ResponseCache();
   private _botName: string | null = null;
   private _sessionManager: SessionManager | null = null;
-  private _v2KeepaliveCounter = 0;
-  private readonly _v2KeepaliveInterval = 10; // Call v2_get_queue every N commands
-  private _v2KeepaliveInFlight = false;
-
-  /** Queue for session creation - prevents duplicate concurrent creation */
-  private _sessionQueue: Promise<void> = Promise.resolve();
-  private _v2SessionQueue: Promise<void> = Promise.resolve();
+  private _lastRecoveryTime = 0;
+  private _recoveryCount = 0;
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
@@ -304,24 +308,51 @@ export class SpaceMoltAPI {
 
       // Session invalid - log full response and create new session
       if (code === "session_invalid" || code === "session_expired" || code === "not_authenticated") {
+        // Notify mass disconnect detector (tracks unique bots losing sessions)
+        notifySessionLoss(botName);
+      
+        // Rate limit session recovery attempts to prevent cascading failures
+        const now = Date.now();
+        const timeSinceLastRecovery = now - this._lastRecoveryTime;
+
+        // Reset recovery count if it's been more than 10 seconds since last recovery
+        if (timeSinceLastRecovery > 10000) {
+          this._recoveryCount = 0;
+        }
+
+        this._recoveryCount++;
+        this._lastRecoveryTime = now;
+
+        // If we've had too many recoveries in a short time, wait before trying again
+        if (this._recoveryCount > 5) {
+          const waitTime = 5000; // Wait 5 seconds
+          log("wait", `${botName} too many session recoveries (${this._recoveryCount}), waiting ${waitTime}ms...`);
+          await sleep(waitTime);
+        }
+
         // Log full error response for debugging
         logSessionError(botName, command, payload, code, resp.error.message || "", resp);
         logSessionInvalidate(botName, "API returned session error", code, resp.error.message, this.session?.id);
-        
-        // CRITICAL: Clear BOTH v1 and v2 sessions - expired v2 session can invalidate v1!
-        debugLog("api:execute", `${botName} session invalid, clearing both v1 and v2 sessions`);
+
+        // Clear sessions - the current session is invalid
+        debugLog("api:execute", `${botName} session invalid, clearing session`);
         const oldSessionId = this.session?.id;
         const oldV2SessionId = this.v2Session?.id;
         this.session = null;
-        this.v2Session = null;  // Clear expired v2 session that may be causing the issue
+        // Only clear V2 session if this command was using V2
+        // This prevents unnecessary V2 session churn for V1-only commands
+        if (needsV2) {
+          this.v2Session = null;
+        }
 
         try {
           await this.ensureSession();
+          // Only ensure V2 session if this command actually needs it
           if (needsV2) await this.ensureV2Session();
           logSessionChange(botName, oldSessionId || null, (this.session as ApiSession | null)?.id || "", "recovery from session error");
-          if (oldV2SessionId) {
-            logSessionDetail(botName, "V2_CLEARED", "Expired V2 session cleared during recovery", {
-              oldV2Session: oldV2SessionId.slice(0, 8),
+          if (needsV2 && (oldV2SessionId || this.v2Session)) {
+            logSessionDetail(botName, "V2_SESSION_DURING_RECOVERY", "V2 session ensured during recovery", {
+              hadV2: !!oldV2SessionId,
               newV2Session: (this.v2Session as ApiSession | null)?.id?.slice(0, 8) || "none",
             });
           }
@@ -351,22 +382,6 @@ export class SpaceMoltAPI {
       }
       const toInvalidate = MUTATION_INVALIDATIONS[command];
       if (toInvalidate) this._cache.invalidate(toInvalidate);
-
-      // Keep V2 session alive by periodically calling v2_get_queue
-      if (this.v2Session && !needsV2 && !this._v2KeepaliveInFlight) {
-        this._v2KeepaliveCounter++;
-        if (this._v2KeepaliveCounter >= this._v2KeepaliveInterval) {
-          this._v2KeepaliveCounter = 0;
-          // Fire and forget - don't wait or care about result
-          // Schedule for next tick to avoid recursive execute() calls
-          this._v2KeepaliveInFlight = true;
-          setTimeout(() => {
-            this.execute("v2_get_queue")
-              .finally(() => { this._v2KeepaliveInFlight = false; })
-              .catch(() => {});
-          }, 0);
-        }
-      }
     }
 
     return resp;
@@ -391,7 +406,9 @@ export class SpaceMoltAPI {
         log("system", `${botName} reconnection successful, retrying ${command}...`);
         try {
           await this.ensureSession();
-          if (needsV2) await this.ensureV2Session();
+          // CRITICAL: Always ensure V2 session exists after reconnection, even for V1 commands.
+          // The V2 keepalive mechanism requires an active V2 session to function.
+          await this.ensureV2Session();
           return this.execute(command, payload);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -410,22 +427,22 @@ export class SpaceMoltAPI {
   private async ensureSession(): Promise<void> {
     if (this.session) return; // Session exists, use it
 
-    // Add to session creation queue - ensures only one creation at a time
-    this._sessionQueue = this._sessionQueue.then(async () => {
+    // Use global serial queue - ensures only ONE session creation at a time across ALL bots
+    globalSessionQueue = globalSessionQueue.then(async () => {
       // Double-check after waiting in queue
       if (this.session) return;
-      
+
       // Small random jitter to stagger bots
       const jitter = Math.random() * 2000;
       await sleep(jitter);
-      
+
       // Check again after jitter
       if (this.session) return;
-      
+
       await this.createSession();
     });
-    
-    return this._sessionQueue;
+
+    return globalSessionQueue;
   }
 
   private async createSession(): Promise<void> {
@@ -434,9 +451,18 @@ export class SpaceMoltAPI {
 
     for (let attempt = 0; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
       try {
-        log("system", "Creating new session...");
+        // Global rate limiting - wait if another session was just created
+        const now = Date.now();
+        const timeSinceLastCreate = now - lastSessionCreateTime;
+        if (timeSinceLastCreate < SESSION_CREATE_INTERVAL) {
+          const waitTime = SESSION_CREATE_INTERVAL - timeSinceLastCreate;
+          debugLog("api:createSession", `${botName} rate limited, waiting ${waitTime}ms`);
+          await sleep(waitTime);
+        }
+
+        log("system", `Creating new session for ${botName}...`);
         logSessionDetail(botName, "CREATE_START", "Starting session creation", { attempt: attempt + 1, maxAttempts: MAX_RECONNECT_ATTEMPTS });
-        
+
         const resp = await fetch(`${this.baseUrl}/session`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
@@ -452,7 +478,8 @@ export class SpaceMoltAPI {
         if (data.session) {
           const oldSession = this.session;
           this.session = data.session;
-          log("system", `Session created: ${this.session.id.slice(0, 8)}...`);
+          lastSessionCreateTime = Date.now(); // Update global rate limiter
+          log("system", `Session created for ${botName}: ${this.session.id.slice(0, 8)}...`);
           logSessionCreate(botName, this.session.id, this.session.expiresAt, oldSession ? "renewal" : "initial", data);
           logSessionSave(botName, this.session.id, this.v2Session?.id);
         } else {
@@ -467,9 +494,9 @@ export class SpaceMoltAPI {
             password: this.credentials.password,
           });
           if (loginResp.error) {
-            log("error", `Login failed: ${loginResp.error.message}`);
+            log("error", `Login failed for ${botName}: ${loginResp.error.message}`);
           } else {
-            log("system", "Logged in successfully");
+            log("system", `Logged in successfully as ${botName}`);
           }
         }
 
@@ -525,22 +552,22 @@ export class SpaceMoltAPI {
   private async ensureV2Session(): Promise<void> {
     if (this.v2Session) return;
 
-    // Add to v2 session creation queue
-    this._v2SessionQueue = this._v2SessionQueue.then(async () => {
+    // Use global serial queue - ensures only ONE v2 session creation at a time across ALL bots
+    globalV2SessionQueue = globalV2SessionQueue.then(async () => {
       // Double-check after waiting in queue
       if (this.v2Session) return;
-      
+
       // Small random jitter to stagger bots
       const jitter = Math.random() * 2000;
       await sleep(jitter);
-      
+
       // Check again after jitter
       if (this.v2Session) return;
-      
+
       await this.createV2Session();
     });
-    
-    return this._v2SessionQueue;
+
+    return globalV2SessionQueue;
   }
 
   private async createV2Session(): Promise<void> {
@@ -550,7 +577,16 @@ export class SpaceMoltAPI {
 
     for (let attempt = 0; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
       try {
-        log("system", "Creating v2 session...");
+        // Global rate limiting - wait if another session was just created
+        const now = Date.now();
+        const timeSinceLastCreate = now - lastSessionCreateTime;
+        if (timeSinceLastCreate < SESSION_CREATE_INTERVAL) {
+          const waitTime = SESSION_CREATE_INTERVAL - timeSinceLastCreate;
+          debugLog("api:createV2Session", `${botName} rate limited, waiting ${waitTime}ms`);
+          await sleep(waitTime);
+        }
+
+        log("system", `Creating v2 session for ${botName}...`);
         const resp = await fetch(`${v2Base}/session`, {
           method: "POST",
           headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
@@ -569,7 +605,8 @@ export class SpaceMoltAPI {
             s.playerId = s.player_id;
           }
           this.v2Session = data.session;
-          log("system", `v2 session created: ${this.v2Session.id.slice(0, 8)}...`);
+          lastSessionCreateTime = Date.now(); // Update global rate limiter
+          log("system", `v2 session created for ${botName}: ${this.v2Session.id.slice(0, 8)}...`);
         } else {
           throw new Error("No session in v2 response");
         }

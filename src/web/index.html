@@ -28,7 +28,7 @@
       <div class="conn-dot" id="connDot"></div>
       <span id="connText">Connecting...</span>
     </div>
-    <button class="danger sm" onclick="showShutdownModal()">Shutdown Server</button>
+    <button class="danger sm" onclick="showShutdownModal()">Shutdown Client</button>
   </div>
 </header>
 
@@ -402,16 +402,16 @@
 <!-- Shutdown Confirmation Modal -->
 <div class="modal-overlay" id="shutdownModal">
   <div class="modal">
-    <h2>Shutdown Server?</h2>
+    <h2>Shutdown Client?</h2>
     <p style="color: var(--text-dim); margin: 16px 0;">
-      This will gracefully stop all running bots, save data, and shut down the server.
+      This will gracefully stop all running bots, save data, and shut down the client.
     </p>
     <p style="color: var(--red); font-size: 13px;">
-      ⚠️ You will need to restart the server manually.
+      ⚠️ You will need to restart the client manually.
     </p>
     <div class="modal-actions">
       <button onclick="hideShutdownModal()">Cancel</button>
-      <button class="danger" onclick="confirmShutdown()">Shutdown Server</button>
+      <button class="danger" onclick="confirmShutdown()">Shutdown Client</button>
     </div>
   </div>
 </div>
@@ -7508,6 +7508,9 @@ function renderMinerSettings(panel) {
   const targetOre = m.targetOre || '';
   const targetGas = m.targetGas || '';
   const targetIce = m.targetIce || '';
+  const oreQuotas = m.oreQuotas || {};
+  const gasQuotas = m.gasQuotas || {};
+  const iceQuotas = m.iceQuotas || {};
   const orePrimary = depositBot ? `bot:${depositBot}` : depositMode;
   const oreSecondary = depositFallback;
 
@@ -7572,6 +7575,37 @@ function renderMinerSettings(panel) {
     iceOpts.push(`<option value="${esc(targetIce)}" selected>${esc(targetIce)}</option>`);
   }
 
+  // Quota table rows
+  function buildQuotaRows(quotas, allOres) {
+    let rows = '';
+    for (const [oreId, target] of Object.entries(quotas)) {
+      if (target <= 0) continue;
+      const oreName = allOres.find(o => o.item_id === oreId)?.name || oreId;
+      rows += `<tr data-ore-id="${esc(oreId)}">
+        <td style="padding:4px 8px">${esc(oreName)}</td>
+        <td style="padding:4px 8px"><input type="number" min="1" max="999999" value="${target}" class="quota-qty" style="width:80px" /></td>
+        <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
+      </tr>`;
+    }
+    return rows;
+  }
+
+  const oreQuotaRows = buildQuotaRows(oreQuotas, oreOres);
+  const gasQuotaRows = buildQuotaRows(gasQuotas, gasOres);
+  const iceQuotaRows = buildQuotaRows(iceQuotas, iceOres);
+
+  function buildQuotaOreOpts(ores) {
+    const opts = ['<option value="">-- select --</option>'];
+    for (const ore of ores) {
+      opts.push(`<option value="${esc(ore.item_id)}">${esc(ore.name)}</option>`);
+    }
+    return opts.join('');
+  }
+
+  const quotaOreOpts = buildQuotaOreOpts(oreOres);
+  const quotaGasOpts = buildQuotaOreOpts(gasOres);
+  const quotaIceOpts = buildQuotaOreOpts(iceOres);
+
   function minerDepositOpts(current) {
     const opts = [];
     opts.push(`<option value="faction"${'faction' === current ? ' selected' : ''}>Faction storage</option>`);
@@ -7625,60 +7659,116 @@ function renderMinerSettings(panel) {
       <select id="set-miner-targetIce">${iceOpts.join('')}</select>
     </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Harvesting System</div>
-        <div class="setting-hint">Override system to harvest in. Bot will jump there on start.</div>
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">Ore Quotas</div>
+      <div class="setting-hint" style="margin-bottom:12px">Maintain target stock levels per ore in faction storage. Miners will prioritize the ore with the biggest deficit. When all quotas are met, miners fall back to local mining.</div>
+      <table id="ore-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Ore</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${oreQuotaRows}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="ore-quota-add-ore" style="flex:1">${quotaOreOpts}</select>
+        <input type="number" id="ore-quota-add-qty" min="1" max="999999" value="1000" style="width:80px" placeholder="Qty" />
+        <button class="secondary" onclick="addOreQuotaRow('ore')">Add</button>
       </div>
-      <select id="set-miner-system">${systemOpts.join('')}</select>
     </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Home System</div>
-        <div class="setting-hint">Station system the miner returns to for unloading. Per-bot override available in bot profile. Defaults to start system.</div>
+    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">Gas Quotas</div>
+      <div class="setting-hint" style="margin-bottom:12px">Target stock levels for gas resources in faction storage.</div>
+      <table id="gas-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Gas</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${gasQuotaRows}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="gas-quota-add-ore" style="flex:1">${quotaGasOpts}</select>
+        <input type="number" id="gas-quota-add-qty" min="1" max="999999" value="1000" style="width:80px" placeholder="Qty" />
+        <button class="secondary" onclick="addOreQuotaRow('gas')">Add</button>
       </div>
-      <select id="set-miner-homeSystem">${homeOpts.join('')}</select>
     </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Primary Deposit</div>
-        <div class="setting-hint">Where to send mined resources when returning to station.</div>
+    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">Ice Quotas</div>
+      <div class="setting-hint" style="margin-bottom:12px">Target stock levels for ice resources in faction storage.</div>
+      <table id="ice-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Ice</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${iceQuotaRows}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="ice-quota-add-ore" style="flex:1">${quotaIceOpts}</select>
+        <input type="number" id="ice-quota-add-qty" min="1" max="999999" value="1000" style="width:80px" placeholder="Qty" />
+        <button class="secondary" onclick="addOreQuotaRow('ice')">Add</button>
       </div>
-      <select id="set-miner-depositPrimary">${minerDepositOpts(orePrimary)}</select>
     </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Secondary Deposit</div>
-        <div class="setting-hint">Fallback if primary fails.</div>
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Harvesting System</div>
+          <div class="setting-hint">Override system to harvest in. Bot will jump there on start.</div>
+        </div>
+        <select id="set-miner-system">${systemOpts.join('')}</select>
       </div>
-      <select id="set-miner-depositSecondary">${minerDepositOpts(oreSecondary)}</select>
-    </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Cargo Fill Threshold</div>
-        <div class="setting-hint">Return to station when cargo reaches this % full.</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Home System</div>
+          <div class="setting-hint">Station system the miner returns to for unloading. Per-bot override available in bot profile. Defaults to start system.</div>
+        </div>
+        <select id="set-miner-homeSystem">${homeOpts.join('')}</select>
       </div>
-      <input type="number" id="set-miner-cargoThreshold" min="50" max="100" value="${cargoThreshold}">
-    </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Refuel Threshold</div>
-        <div class="setting-hint">Refuel at station when fuel drops below this %.</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Primary Deposit</div>
+          <div class="setting-hint">Where to send mined resources when returning to station.</div>
+        </div>
+        <select id="set-miner-depositPrimary">${minerDepositOpts(orePrimary)}</select>
       </div>
-      <input type="number" id="set-miner-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
-    </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Repair Threshold</div>
-        <div class="setting-hint">Repair hull at station when HP drops below this %.</div>
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Secondary Deposit</div>
+          <div class="setting-hint">Fallback if primary fails.</div>
+        </div>
+        <select id="set-miner-depositSecondary">${minerDepositOpts(oreSecondary)}</select>
       </div>
-      <input type="number" id="set-miner-repairThreshold" min="20" max="80" value="${repairThreshold}">
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Cargo Fill Threshold</div>
+          <div class="setting-hint">Return to station when cargo reaches this % full.</div>
+        </div>
+        <input type="number" id="set-miner-cargoThreshold" min="50" max="100" value="${cargoThreshold}">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Refuel Threshold</div>
+          <div class="setting-hint">Refuel at station when fuel drops below this %.</div>
+        </div>
+        <input type="number" id="set-miner-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Repair Threshold</div>
+          <div class="setting-hint">Repair hull at station when HP drops below this %.</div>
+        </div>
+        <input type="number" id="set-miner-repairThreshold" min="20" max="80" value="${repairThreshold}">
+      </div>
     </div>
 
     <div class="settings-save-bar">
@@ -7687,7 +7777,58 @@ function renderMinerSettings(panel) {
   `;
 }
 
+function addOreQuotaRow(type) {
+  let oreSelect, qtyInput;
+  if (type === 'ore') {
+    oreSelect = document.getElementById('ore-quota-add-ore');
+    qtyInput = document.getElementById('ore-quota-add-qty');
+  } else if (type === 'gas') {
+    oreSelect = document.getElementById('gas-quota-add-ore');
+    qtyInput = document.getElementById('gas-quota-add-qty');
+  } else if (type === 'ice') {
+    oreSelect = document.getElementById('ice-quota-add-ore');
+    qtyInput = document.getElementById('ice-quota-add-qty');
+  }
+  if (!oreSelect || !qtyInput) return;
+
+  const oreId = oreSelect.value;
+  const qty = parseInt(qtyInput.value) || 1000;
+  if (!oreId) return;
+
+  // Check if ore already in table
+  const tableId = type === 'ore' ? 'ore-quota-table' : type === 'gas' ? 'gas-quota-table' : 'ice-quota-table';
+  const existing = document.querySelector(`#${tableId} tr[data-ore-id="${oreId}"]`);
+  if (existing) {
+    existing.querySelector('.quota-qty').value = qty;
+    return;
+  }
+
+  const allOres = type === 'ore' ? knownOres.filter(o => !o.name.toLowerCase().includes('gas') && !o.name.toLowerCase().includes('ice'))
+    : type === 'gas' ? knownOres.filter(o => o.name.toLowerCase().includes('gas'))
+    : knownOres.filter(o => o.name.toLowerCase().includes('ice'));
+  const oreName = allOres.find(o => o.item_id === oreId)?.name || oreId;
+  const tbody = document.querySelector(`#${tableId} tbody`);
+  const tr = document.createElement('tr');
+  tr.dataset.oreId = oreId;
+  tr.innerHTML = `
+    <td style="padding:4px 8px">${esc(oreName)}</td>
+    <td style="padding:4px 8px"><input type="number" min="1" max="999999" value="${qty}" class="quota-qty" style="width:80px" /></td>
+    <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>`;
+  tbody.appendChild(tr);
+  oreSelect.value = '';
+}
+
 function saveMinerSettings() {
+  const collectQuotas = (tableId) => {
+    const quotas = {};
+    for (const row of document.querySelectorAll(`#${tableId} tbody tr`)) {
+      const oreId = row.dataset.oreId;
+      const qty = parseInt(row.querySelector('.quota-qty').value) || 0;
+      if (oreId && qty > 0) quotas[oreId] = qty;
+    }
+    return quotas;
+  };
+
   const s = {
     miningType: document.getElementById('set-miner-miningType').value,
     targetOre: document.getElementById('set-miner-targetOre').value,
@@ -7701,6 +7842,9 @@ function saveMinerSettings() {
     cargoThreshold: parseInt(document.getElementById('set-miner-cargoThreshold').value) || 80,
     refuelThreshold: parseInt(document.getElementById('set-miner-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-miner-repairThreshold').value) || 40,
+    oreQuotas: collectQuotas('ore-quota-table'),
+    gasQuotas: collectQuotas('gas-quota-table'),
+    iceQuotas: collectQuotas('ice-quota-table'),
   };
   send({ type: 'saveSettings', routine: 'miner', settings: s });
   settings.miner = s;

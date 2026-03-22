@@ -7,6 +7,12 @@
 import type { RoutineContext } from "../bot.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
+import { 
+  waitForCustomsInspection, 
+  pollForCustomsShip, 
+  isEmpireSystem,
+  getBotCustomsStats,
+} from "../customs.js";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -277,8 +283,7 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
 /** Ensure the bot is docked at a station. Finds one in current system,
  *  or navigates to the nearest known station system if none is available.
  *  Returns true if successfully docked.
- *  @param skipStorageCollection If true, skips automatic storage collection (withdraw credits/items).
- *  @deprecated Automatic storage collection is no longer performed. Routines should handle storage manually.
+ *  @param skipStorageCollection If true, skips automatic storage collection (withdraw credits).
  */
 export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: boolean = true): Promise<boolean> {
   const { bot } = ctx;
@@ -297,7 +302,9 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
     const dockResp = await bot.exec("dock");
     if (!dockResp.error || dockResp.error.message.includes("already")) {
       bot.docked = true;
-      // Automatic storage collection disabled - routines should handle storage manually
+      if (!skipStorageCollection) {
+        await collectFromStorage(ctx);
+      }
       await ensureInsured(ctx);
       return true;
     }
@@ -347,8 +354,6 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
     bot.docked = true;
     if (!skipStorageCollection) {
       await collectFromStorage(ctx);
-      await recordMarketData(ctx);
-      await analyzeMarket(ctx);
     }
     await ensureInsured(ctx);
     return true;
@@ -401,10 +406,9 @@ export async function analyzeMarket(ctx: RoutineContext): Promise<void> {
 // ── Storage collection ───────────────────────────────────────
 
 /**
- * Check station storage for credits and items, withdraw everything useful.
- * Withdraws credits first, then fuel cells / other items if cargo space allows.
+ * Check station storage for credits and withdraw them to the bot.
+ * Does NOT transfer items - routines should handle storage items manually if needed.
  * Also records market prices at the station.
- * Should be called every time a bot successfully docks.
  */
 export async function collectFromStorage(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
@@ -424,64 +428,21 @@ export async function collectFromStorage(ctx: RoutineContext): Promise<void> {
     }
   }
 
-  // Transfer all station storage items → faction storage (shared pool)
-  await transferStationToFaction(ctx);
-
-  await bot.refreshStatus();
-
   // Record market prices at this station
   await recordMarketData(ctx);
 }
 
 /**
+ * @deprecated This function is deprecated and no longer performs any action.
+ * Routines should handle storage transfers explicitly if needed.
  * Transfer all items from personal station storage into faction storage.
  * This centralises materials so any bot (crafters, traders, etc.) can access them.
  * Credits are kept on the bot (not transferred).
  * Assumes docked at a station with both storage and faction storage access.
  */
 export async function transferStationToFaction(ctx: RoutineContext): Promise<void> {
-  const { bot } = ctx;
-  if (!bot.docked) return;
-
-  await bot.refreshStorage();
-  if (bot.storage.length === 0) return;
-
-  await bot.refreshStatus();
-  const transferred: string[] = [];
-
-  for (const item of bot.storage) {
-    if (item.quantity <= 0) continue;
-
-    // Check available cargo space — items pass through cargo as intermediary
-    const freeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
-    if (freeSpace <= 0) break; // cargo full, can't transfer any more
-
-    const qty = Math.min(item.quantity, maxItemsForCargo(freeSpace, item.itemId));
-    if (qty <= 0) continue;
-
-    // Withdraw from station storage into cargo
-    const wResp = await bot.exec("withdraw_items", { item_id: item.itemId, quantity: qty });
-    if (wResp.error) continue;
-
-    // Deposit into faction storage
-    const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: qty });
-    if (!dResp.error) {
-      transferred.push(`${qty}x ${item.name}`);
-      logFactionActivity(ctx, "deposit", `Transferred ${qty}x ${item.name} from station → faction storage`);
-    } else {
-      // Failed to deposit to faction — put back in station storage
-      await bot.exec("deposit_items", { item_id: item.itemId, quantity: qty });
-    }
-
-    await bot.refreshStatus(); // update cargo count for next iteration
-  }
-
-  if (transferred.length > 0) {
-    ctx.log("trade", `Transferred to faction storage: ${transferred.join(", ")}`);
-    await bot.refreshCargo();
-    await bot.refreshStorage();
-    await bot.refreshFactionStorage();
-  }
+  // Deprecated - no longer performs any action
+  // Routines should handle storage transfers explicitly if needed
 }
 
 // ── Refueling ────────────────────────────────────────────────
@@ -1161,6 +1122,9 @@ export async function navigateToSystem(
     }
 
     await bot.refreshStatus();
+
+    // Check for customs inspection after entering new system
+    await checkCustomsInspection(ctx, nextSystem);
 
     // Update map data for the new system
     const sysResp = await bot.exec("get_system");
@@ -1952,3 +1916,68 @@ export async function factionDonateProfit(ctx: RoutineContext, profit: number): 
     logFactionActivity(ctx, "donation", `Deposited ${donation}cr (${pct}% of ${profit}cr profit)`);
   }
 }
+
+// ── Customs Inspection ───────────────────────────────────────
+
+/**
+ * Check for customs inspection when entering a new system.
+ * Should be called after travel/jump commands when entering empire space.
+ * 
+ * @param ctx - Routine context
+ * @param previousSystem - The system we were in before (to detect system change)
+ * @returns Object with inspection result
+ */
+export async function checkCustomsInspection(
+  ctx: RoutineContext,
+  previousSystem?: string
+): Promise<{
+  wasStopped: boolean;
+  outcome: "cleared" | "contraband" | "evasion" | "timeout" | "none";
+  chatMessages: string[];
+}> {
+  const { bot } = ctx;
+
+  // Only check if we're in an empire system (not Frontier, not pirate)
+  if (!isEmpireSystem(bot.system, bot.getEmpire())) {
+    ctx.log("customs", `System ${bot.system} is not an empire system (or bot is Frontier) - no customs check needed`);
+    return { wasStopped: false, outcome: "none", chatMessages: [] };
+  }
+
+  // Only check if we changed systems
+  if (previousSystem && previousSystem === bot.system) {
+    ctx.log("customs_debug", `Still in same system ${bot.system} - skipping customs check`);
+    return { wasStopped: false, outcome: "none", chatMessages: [] };
+  }
+
+  ctx.log("customs", `Entering empire system ${bot.system} - checking for customs...`);
+
+  // PROACTIVE: Always wait at least 2 seconds for customs message to arrive
+  // This is mandatory for all empire jumps, even if no message has arrived yet
+  ctx.log("customs", "⏱️ Mandatory customs wait - 2 second delay...");
+  await sleep(2000);
+
+  // Wait for customs inspection (up to 5 seconds total)
+  const result = await waitForCustomsInspection(bot, (cat, msg) => bot.log(cat, msg), 5000);
+
+  // If customs ship is expected but not yet visible, poll for it
+  if (result.wasStopped && result.outcome === "timeout") {
+    ctx.log("customs", "Customs scan in progress - polling for customs ship...");
+    const pollResult = await pollForCustomsShip(
+      bot,
+      (cat, msg) => bot.log(cat, msg),
+      5000, // Poll every 5 seconds
+      6     // Max 6 polls (30 seconds total)
+    );
+    
+    if (pollResult.customsShipFound && pollResult.shipName) {
+      ctx.log("customs", `Customs ship ${pollResult.shipName} detected!`);
+    }
+  }
+  
+  return result;
+}
+
+/**
+ * Get customs statistics for AI chat context.
+ */
+export { getBotCustomsStats };

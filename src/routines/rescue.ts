@@ -14,7 +14,16 @@ import {
   sleep,
   logStatus,
 } from "./common.js";
-import { getNextMayday, markMaydayHandled, isLegitimateMayday, type MaydayRequest } from "../mayday.js";
+import { getNextMayday, markMaydayHandled, type MaydayRequest } from "../mayday.js";
+import {
+  getActiveRescueSession,
+  startRescueSession,
+  updateRescueSession,
+  completeRescueSession,
+  failRescueSession,
+  type RescueSession,
+} from "./rescueActivity.js";
+import { isKnownPlayer } from "../playernames.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -150,69 +159,170 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
-    const settings = getRescueSettings();
-
-    // ── Check fleet status ──
-    yield "scan_fleet";
-    const fleet = ctx.getFleetStatus?.() || [];
-    if (fleet.length === 0) {
-      ctx.log("info", "No fleet data available — waiting...");
-      await sleep(settings.scanIntervalSec * 1000);
-      continue;
-    }
-
-    const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
-
-    // ── Check for MAYDAY requests if no fleet targets ──
-    let maydayTarget: RescueTarget | null = null;
-    if (targets.length === 0) {
-      const mayday = getNextMayday();
-      if (mayday && isLegitimateMayday(mayday, 25)) {
-        ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
-        
-        // Check jump range for MAYDAYs (fleet rescues are always unlimited)
-        let jumpsAway = 0;
-        if (mayday.system && mayday.system !== bot.system && settings.maydayMaxJumps > 0) {
-          try {
-            const routeResp = await bot.exec("find_route", { target_system: mayday.system });
-            if (!routeResp.error && routeResp.result) {
-              const route = routeResp.result as Record<string, unknown>;
-              jumpsAway = (route.total_jumps as number) || 0;
-              
-              if (jumpsAway > settings.maydayMaxJumps) {
-                ctx.log("mayday", `⚠️ MAYDAY too far: ${jumpsAway} jumps (max: ${settings.maydayMaxJumps}) - ignoring`);
-                markMaydayHandled(mayday);
-                continue;
-              }
-            }
-          } catch (e) {
-            ctx.log("warn", `Could not calculate route to ${mayday.system}: ${e}`);
-          }
+    // ── Rescue session recovery ──
+    const activeSession = getActiveRescueSession(bot.username);
+    let recoveredSession: RescueSession | null = null;
+    if (activeSession) {
+      ctx.log("rescue", `Found incomplete rescue session: ${activeSession.targetUsername} at ${activeSession.targetSystem}/${activeSession.targetPoi} (${activeSession.state})`);
+      const fleet = ctx.getFleetStatus?.() || [];
+      const targetStillStranded = fleet.find(b => b.username === activeSession.targetUsername);
+      
+      if (targetStillStranded) {
+        const fuelPct = targetStillStranded.maxFuel > 0 ? Math.round((targetStillStranded.fuel / targetStillStranded.maxFuel) * 100) : 100;
+        if (fuelPct <= 25) {
+          recoveredSession = activeSession;
+          ctx.log("rescue", `Resuming rescue mission for ${activeSession.targetUsername} (state: ${activeSession.state})`);
+        } else {
+          ctx.log("rescue", `${activeSession.targetUsername} has been refueled (${fuelPct}%) - clearing session`);
+          failRescueSession(bot.username, "Target no longer needs rescue");
         }
-        
-        maydayTarget = {
-          username: mayday.sender,
-          system: mayday.system,
-          poi: mayday.poi,
-          fuelPct: mayday.fuelPct,
-          docked: false,
-        };
-        markMaydayHandled(mayday);
-        ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
+      } else {
+        ctx.log("rescue", `Target ${activeSession.targetUsername} not in fleet - clearing session`);
+        failRescueSession(bot.username, "Target not found in fleet");
       }
     }
 
-    if (targets.length === 0 && !maydayTarget) {
-      // No one needs help — idle
-      yield "idle";
-      await sleep(settings.scanIntervalSec * 1000);
+    const settings = getRescueSettings();
+
+    // ── Handle recovered session ──
+    let target: RescueTarget | null = null;
+    let isMaydayTarget = false;
+
+    if (recoveredSession) {
+      target = {
+        username: recoveredSession.targetUsername,
+        system: recoveredSession.targetSystem,
+        poi: recoveredSession.targetPoi,
+        fuelPct: 0,
+        docked: false,
+      };
+      isMaydayTarget = recoveredSession.isMayday;
+
+      const fleet = ctx.getFleetStatus?.() || [];
+      const targetBot = fleet.find(b => b.username === target!.username);
+      if (targetBot) {
+        target.fuelPct = targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100;
+        target.docked = targetBot.docked;
+      }
+
+      ctx.log("rescue", `Continuing rescue for ${target.username} at ${target.system}/${target.poi}`);
+
+      if (recoveredSession.state === "navigating" || recoveredSession.state === "at_system") {
+        ctx.log("rescue", `Session state '${recoveredSession.state}' - navigating to ${target.system}...`);
+      } else if (recoveredSession.state === "traveling_to_poi" || recoveredSession.state === "at_poi") {
+        ctx.log("rescue", `Session state '${recoveredSession.state}' - at system, proceeding to POI...`);
+        bot.system = target.system;
+      } else if (recoveredSession.state === "delivering_fuel") {
+        ctx.log("rescue", `Session state '${recoveredSession.state}' - at POI, proceeding to fuel delivery...`);
+        bot.system = target.system;
+        bot.poi = target.poi;
+      } else if (recoveredSession.state === "returning_home") {
+        ctx.log("rescue", `Session state '${recoveredSession.state}' - continuing return to home...`);
+        bot.system = target.system;
+        bot.poi = target.poi;
+      }
+    }
+
+    // ── Check fleet status (only if not resuming) ──
+    if (!recoveredSession) {
+      yield "scan_fleet";
+      const fleet = ctx.getFleetStatus?.() || [];
+      if (fleet.length === 0) {
+        ctx.log("info", "No fleet data available — waiting...");
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
+      }
+
+      const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
+
+      // ── Check for MAYDAY requests if no fleet targets ──
+      let maydayTarget: RescueTarget | null = null;
+      if (targets.length === 0) {
+        const mayday = getNextMayday();
+        if (mayday) {
+          ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+
+          // Check if sender is a known player (from playerNames.json)
+          const knownPlayer = isKnownPlayer(mayday.sender);
+          
+          if (!knownPlayer) {
+            // Unknown sender - skip this MAYDAY (possible ambush)
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - not a known player (possible ambush)`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+          
+          ctx.log("mayday", `✓ Sender ${mayday.sender} is a KNOWN player — responding to MAYDAY`);
+
+          // Check jump range
+          let jumpsAway = 0;
+          if (mayday.system && mayday.system !== bot.system && settings.maydayMaxJumps > 0) {
+            try {
+              const routeResp = await bot.exec("find_route", { target_system: mayday.system });
+              if (!routeResp.error && routeResp.result) {
+                const route = routeResp.result as Record<string, unknown>;
+                jumpsAway = (route.total_jumps as number) || 0;
+
+                if (jumpsAway > settings.maydayMaxJumps) {
+                  ctx.log("mayday", `⚠️ MAYDAY too far: ${jumpsAway} jumps (max: ${settings.maydayMaxJumps}) - ignoring`);
+                  markMaydayHandled(mayday);
+                  continue;
+                }
+              }
+            } catch (e) {
+              ctx.log("warn", `Could not calculate route to ${mayday.system}: ${e}`);
+            }
+          }
+
+          maydayTarget = {
+            username: mayday.sender,
+            system: mayday.system,
+            poi: mayday.poi,
+            fuelPct: mayday.fuelPct,
+            docked: false,
+          };
+          markMaydayHandled(mayday);
+          ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
+        }
+      }
+
+      if (targets.length === 0 && !maydayTarget) {
+        yield "idle";
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
+      }
+
+      // ── Rescue the most critical bot ──
+      target = maydayTarget || targets[0];
+      isMaydayTarget = !!maydayTarget;
+    }
+
+    if (!target) {
+      await sleep(5000);
       continue;
     }
 
-    // ── Rescue the most critical bot ──
-    const target = maydayTarget || targets[0];
-    const isMaydayTarget = !!maydayTarget;
-    
+    // ── Create rescue session if starting new mission ──
+    if (!recoveredSession && target) {
+      const session: RescueSession = {
+        sessionId: `${bot.username}_${Date.now()}`,
+        botUsername: bot.username,
+        targetUsername: target.username,
+        targetSystem: target.system,
+        targetPoi: target.poi || "unknown",
+        isMayday: isMaydayTarget,
+        jumpsCompleted: 0,
+        totalJumps: 0,
+        startedAt: new Date().toISOString(),
+        lastUpdatedAt: new Date().toISOString(),
+        state: "navigating",
+      };
+      startRescueSession(session);
+      ctx.log("rescue", `Created rescue session for ${target.username}`);
+    }
+
+    const maydayTarget = target;
+
     if (maydayTarget) {
       ctx.log("mayday", `RESCUE NEEDED (MAYDAY): ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
     } else {
@@ -228,15 +338,42 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     logStatus(ctx);
 
     if (hasPumpNow) {
-      // Need extra fuel beyond our own threshold to transfer
-      const minFuelForTransfer = Math.round(bot.maxFuel * (settings.refuelThreshold / 100)) + 100;
-      if (bot.fuel < minFuelForTransfer) {
-        ctx.log(isMaydayTarget ? "mayday" : "rescue", "Insufficient fuel for transfer — refueling self first...");
-        const fueled = await ensureFueled(ctx, settings.refuelThreshold);
-        if (!fueled) {
-          ctx.log("error", "Cannot refuel self — waiting before retry...");
-          await sleep(settings.scanIntervalSec * 1000);
-          continue;
+      // Calculate distance from home to determine fuel strategy
+      let jumpsFromHome = 0;
+      if (homeSystem && bot.system !== homeSystem) {
+        try {
+          const routeResp = await bot.exec("find_route", { target_system: homeSystem });
+          if (!routeResp.error && routeResp.result) {
+            const route = routeResp.result as Record<string, unknown>;
+            jumpsFromHome = (route.total_jumps as number) || 0;
+          }
+        } catch (e) {
+          ctx.log("warn", `Could not calculate route home: ${e}`);
+        }
+      }
+
+      // If we're on a distant mission (>2 jumps from home), only refuel if below threshold
+      const isOnDistantMission = jumpsFromHome > 2;
+      const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      const needsRefuel = !isOnDistantMission || fuelPct < settings.refuelThreshold;
+
+      if (needsRefuel) {
+        // Need extra fuel beyond our own threshold to transfer
+        const minFuelForTransfer = Math.round(bot.maxFuel * (settings.refuelThreshold / 100)) + 100;
+        if (bot.fuel < minFuelForTransfer) {
+          if (isOnDistantMission) {
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", `On distant mission (${jumpsFromHome} jumps from home) with ${fuelPct}% fuel — proceeding without refuel`);
+          } else {
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", "Insufficient fuel for transfer — refueling self first...");
+            const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+            if (!fueled) {
+              ctx.log("error", "Cannot refuel self — waiting before retry...");
+              await sleep(settings.scanIntervalSec * 1000);
+              continue;
+            }
+          }
+        } else if (isOnDistantMission) {
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `On distant mission (${jumpsFromHome} jumps from home) with adequate fuel (${fuelPct}%) — proceeding to target`);
         }
       }
     } else {
@@ -254,8 +391,18 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Could not reach ${target.system} — will retry next scan`);
+        if (recoveredSession || getActiveRescueSession(bot.username)) {
+          failRescueSession(bot.username, "Could not reach target system");
+        }
         await sleep(settings.scanIntervalSec * 1000);
         continue;
+      }
+      // CRITICAL: Refresh status to update bot.system after navigation
+      await bot.refreshStatus();
+      ctx.log("travel", `Arrived in ${bot.system}`);
+      // Update session state after successful navigation
+      if (recoveredSession || getActiveRescueSession(bot.username)) {
+        updateRescueSession(bot.username, { state: "at_system" });
       }
     }
 
@@ -270,10 +417,19 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         ctx.log("error", `Travel failed: ${travelResp.error.message}`);
       }
       bot.poi = target.poi;
+      // Update session state after traveling to POI
+      if (recoveredSession || getActiveRescueSession(bot.username)) {
+        updateRescueSession(bot.username, { state: "at_poi" });
+      }
     }
 
     // ── Transfer fuel ──
     yield "transfer_fuel";
+
+    // Update session state before fuel delivery
+    if (recoveredSession || getActiveRescueSession(bot.username)) {
+      updateRescueSession(bot.username, { state: "delivering_fuel" });
+    }
 
     if (hasPumpNow) {
       // Use refuel command with Refueling Pump
@@ -431,7 +587,20 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       ctx.log(isMaydayTarget ? "mayday" : "rescue", `Returning to home system ${homeSystem}...`);
       await ensureUndocked(ctx);
       const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
-      await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!arrived) {
+        ctx.log("error", `Failed to return to home system ${homeSystem}`);
+      } else {
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Arrived at home system ${homeSystem}`);
+      }
+      // Update session state for return home
+      if (recoveredSession || getActiveRescueSession(bot.username)) {
+        updateRescueSession(bot.username, { state: "returning_home" });
+      }
+    } else if (!homeSystem) {
+      ctx.log("warn", "No home system set — skipping return home");
+    } else {
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Already at home system ${homeSystem}`);
     }
 
     // ── Refuel self ──
@@ -439,6 +608,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     await ensureFueled(ctx, settings.refuelThreshold);
     await bot.refreshStatus();
     logStatus(ctx);
+
+    // ── Complete the rescue session ──
+    if (recoveredSession || getActiveRescueSession(bot.username)) {
+      completeRescueSession(bot.username);
+    }
 
     if (isMaydayTarget) {
       ctx.log("mayday", `=== MAYDAY response complete for ${target.username} ===`);
@@ -748,7 +922,6 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
   ctx.log("rescue", "🚨 MaydayRescue bot online — monitoring emergency channel for distress calls...");
 
   const settings = getRescueSettings();
-  const maydayFuelThreshold = 25; // Only respond if target fuel < 25%
   const aiChatService = (globalThis as any).aiChatService;
 
   while (bot.state === "running") {
@@ -756,24 +929,84 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
-    // ── Check for pending MAYDAY requests ──
-    yield "scan_mayday";
-    const mayday = getNextMayday();
-
-    if (!mayday) {
-      // No pending MAYDAYs - idle and wait
-      ctx.log("mayday", "No pending MAYDAY requests - standing by...");
-      yield "idle";
-      await sleep(10000); // Check every 10 seconds
-      continue;
+    // ── Rescue session recovery ──
+    const activeSession = getActiveRescueSession(bot.username);
+    let recoveredSession: RescueSession | null = null;
+    if (activeSession && activeSession.isMayday) {
+      ctx.log("mayday", `Found incomplete MAYDAY rescue session: ${activeSession.targetUsername} at ${activeSession.targetSystem}/${activeSession.targetPoi} (${activeSession.state})`);
+      recoveredSession = activeSession;
+      ctx.log("mayday", `Resuming MAYDAY rescue for ${activeSession.targetUsername} (state: ${activeSession.state})`);
     }
 
-    ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+    // ── Handle recovered session ──
+    let mayday: MaydayRequest | null = null;
+    if (recoveredSession) {
+      // Reconstruct mayday from session
+      const fleet = ctx.getFleetStatus?.() || [];
+      const targetBot = fleet.find(b => b.username === recoveredSession.targetUsername);
+      const fuelPct = targetBot ? (targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100) : 0;
+      
+      mayday = {
+        sender: recoveredSession.targetUsername,
+        system: recoveredSession.targetSystem,
+        poi: recoveredSession.targetPoi,
+        fuelPct,
+        timestamp: Date.now(),
+        currentFuel: targetBot?.fuel || 0,
+        maxFuel: targetBot?.maxFuel || 100,
+        rawMessage: "",
+      };
 
-    // ── Validate MAYDAY (avoid ambushes) ──
-    if (!isLegitimateMayday(mayday, maydayFuelThreshold)) {
-      ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - fuel at ${mayday.fuelPct}% (threshold: <=${maydayFuelThreshold}%) - possible ambush`);
-      markMaydayHandled(mayday); // Mark as handled so we don't process again
+      // Skip to appropriate phase based on session state
+      if (recoveredSession.state === "navigating" || recoveredSession.state === "at_system") {
+        ctx.log("mayday", `Session state '${recoveredSession.state}' - navigating to ${recoveredSession.targetSystem}...`);
+      } else if (recoveredSession.state === "traveling_to_poi" || recoveredSession.state === "at_poi") {
+        ctx.log("mayday", `Session state '${recoveredSession.state}' - at system, proceeding to POI...`);
+        bot.system = recoveredSession.targetSystem;
+        bot.poi = recoveredSession.targetPoi;
+      } else if (recoveredSession.state === "delivering_fuel") {
+        ctx.log("mayday", `Session state '${recoveredSession.state}' - at POI, proceeding to fuel delivery...`);
+        bot.system = recoveredSession.targetSystem;
+        bot.poi = recoveredSession.targetPoi;
+      }
+      
+      ctx.log("mayday", `Resuming MAYDAY rescue for ${mayday.sender} at ${mayday.system}/${mayday.poi}`);
+    }
+
+    // ── Check for pending MAYDAY requests (only if not resuming) ──
+    if (!recoveredSession) {
+      yield "scan_mayday";
+      const nextMayday = getNextMayday();
+
+      if (!nextMayday) {
+        // No pending MAYDAYs - idle and wait
+        ctx.log("mayday", "No pending MAYDAY requests - standing by...");
+        yield "idle";
+        await sleep(10000); // Check every 10 seconds
+        continue;
+      }
+
+      ctx.log("mayday", `🚨 MAYDAY received: ${nextMayday.sender} at ${nextMayday.system}/${nextMayday.poi} (${nextMayday.fuelPct}% fuel)`);
+
+      // ── Validate MAYDAY ──
+      // Check if sender is a known player (from playerNames.json)
+      const knownPlayer = isKnownPlayer(nextMayday.sender);
+      
+      if (!knownPlayer) {
+        // Unknown sender - skip this MAYDAY (possible ambush)
+        ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - not a known player (possible ambush)`);
+        markMaydayHandled(nextMayday);
+        continue;
+      }
+      
+      ctx.log("mayday", `✓ Sender ${nextMayday.sender} is a KNOWN player — responding to MAYDAY`);
+
+      mayday = nextMayday;
+    }
+
+    // mayday is guaranteed to be set at this point (either from recovery or fresh)
+    if (!mayday) {
+      await sleep(5000);
       continue;
     }
 
@@ -821,6 +1054,37 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       }
     }
 
+    // ── Check jump limit ──
+    let maxJumps = settings.maydayMaxJumps;
+    
+    if (maxJumps > 0 && jumpsToTarget > maxJumps) {
+      ctx.log("mayday", `⚠️ MAYDAY too far: ${jumpsToTarget} jumps (max: ${maxJumps}) - ignoring`);
+      markMaydayHandled(mayday);
+      await sleep(5000);
+      continue;
+    }
+    
+    ctx.log("mayday", `✓ Jump check passed: ${jumpsToTarget} jumps (limit: ${maxJumps})`);
+
+    // ── Create rescue session if starting new mission ──
+    if (!recoveredSession) {
+      const session: RescueSession = {
+        sessionId: `${bot.username}_${Date.now()}`,
+        botUsername: bot.username,
+        targetUsername: mayday.sender,
+        targetSystem: mayday.system,
+        targetPoi: mayday.poi || "unknown",
+        isMayday: true,
+        jumpsCompleted: 0,
+        totalJumps: jumpsToTarget,
+        startedAt: new Date().toISOString(),
+        lastUpdatedAt: new Date().toISOString(),
+        state: "navigating",
+      };
+      startRescueSession(session);
+      ctx.log("mayday", `Created MAYDAY rescue session for ${mayday.sender}`);
+    }
+
     // Send AI-generated "on my way" message via private chat
     if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
       try {
@@ -851,9 +1115,16 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       const arrived = await navigateToSystem(ctx, mayday.system, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Could not reach ${mayday.system} - MAYDAY response failed`);
+        if (recoveredSession || getActiveRescueSession(bot.username)) {
+          failRescueSession(bot.username, "Could not reach target system");
+        }
         markMaydayHandled(mayday);
         await sleep(5000);
         continue;
+      }
+      // Update session state after successful navigation
+      if (recoveredSession || getActiveRescueSession(bot.username)) {
+        updateRescueSession(bot.username, { state: "at_system" });
       }
     }
 
@@ -867,10 +1138,19 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       ctx.log("error", `Travel failed: ${travelResp.error.message}`);
     }
     bot.poi = mayday.poi;
+    // Update session state after traveling to POI
+    if (recoveredSession || getActiveRescueSession(bot.username)) {
+      updateRescueSession(bot.username, { state: "at_poi" });
+    }
 
     // ── Find and refuel target ──
     yield "scan_target";
     ctx.log("mayday", `Scanning for ${mayday.sender}...`);
+
+    // Update session state before fuel delivery
+    if (recoveredSession || getActiveRescueSession(bot.username)) {
+      updateRescueSession(bot.username, { state: "delivering_fuel" });
+    }
 
     const nearbyResp = await bot.exec("get_nearby");
     let targetPlayerId: string | null = null;
@@ -966,18 +1246,40 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     markMaydayHandled(mayday);
     ctx.log("mayday", `=== MAYDAY response complete for ${mayday.sender} ===`);
 
+    // Refresh status before returning home
+    await bot.refreshStatus();
+    ctx.log("mayday", `Current location: ${bot.system}, Home: ${homeSystem || "not set"}`);
+
     // ── Return home ──
     if (homeSystem && bot.system !== homeSystem) {
       yield "return_home";
       ctx.log("mayday", `Returning to home system ${homeSystem}...`);
       await ensureUndocked(ctx);
       const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
-      await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!arrived) {
+        ctx.log("error", `Failed to return to home system ${homeSystem}`);
+      } else {
+        ctx.log("mayday", `✓ Arrived at home system ${homeSystem}`);
+      }
+      // Update session state for return home
+      if (recoveredSession || getActiveRescueSession(bot.username)) {
+        updateRescueSession(bot.username, { state: "returning_home" });
+      }
+    } else if (!homeSystem) {
+      ctx.log("warn", "No home system set — skipping return home");
+    } else {
+      ctx.log("mayday", `Already at home system ${homeSystem}`);
     }
 
     // ── Dock and refuel self ──
     yield "self_refuel";
     await ensureDocked(ctx);
+
+    // ── Complete the rescue session ──
+    if (recoveredSession || getActiveRescueSession(bot.username)) {
+      completeRescueSession(bot.username);
+    }
 
     ctx.log("mayday", "Refueling to full capacity after mission...");
     await bot.refreshStatus();
@@ -1002,7 +1304,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
 /**
  * Look up a player's ID from their username.
- * Uses view_fleet or view_player to resolve the ID.
+ * Uses get_nearby to find players at the current location.
  */
 async function findPlayerId(ctx: RoutineContext, username: string): Promise<string | null> {
   const { bot } = ctx;
@@ -1019,44 +1321,42 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
     }
   }
   
-  // Try using view_fleet to get player IDs
+  // Use get_nearby to find the player at current location
   try {
-    const resp = await bot.exec("view_fleet");
+    const resp = await bot.exec("get_nearby");
     if (!resp.error && resp.result) {
       const data = resp.result as Record<string, unknown>;
-      const members = Array.isArray(data.members) ? data.members : 
-                      Array.isArray(data.fleet) ? data.fleet :
-                      Array.isArray(data.bots) ? data.bots : [];
-      
-      for (const member of members) {
-        const m = member as Record<string, unknown>;
-        if (m.username === username || m.name === username) {
-          const playerId = m.player_id as string || m.id as string;
-          if (playerId) {
-            return playerId;
-          }
+      const players = Array.isArray(data.players) ? data.players :
+                      Array.isArray(data.nearby) ? data.nearby :
+                      Array.isArray(data.ships) ? data.ships :
+                      [];
+
+      for (const p of players as Array<Record<string, unknown>>) {
+        const playerId = (p.player_id as string) || (p.id as string);
+        const pUsername = (p.username as string) || (p.name as string);
+        
+        if (pUsername && pUsername.toLowerCase() === username.toLowerCase()) {
+          ctx.log("rescue", `Found player ID for ${username}: ${playerId}`);
+          return playerId;
+        }
+      }
+
+      // If exact match not found, try fuzzy match
+      ctx.log("warn", `Exact match not found for "${username}" — trying fuzzy match...`);
+      for (const p of players as Array<Record<string, unknown>>) {
+        const playerId = (p.player_id as string) || (p.id as string);
+        const pUsername = ((p.username as string) || (p.name as string) || "").toLowerCase();
+        
+        if (pUsername.includes(username.toLowerCase()) || username.toLowerCase().includes(pUsername)) {
+          ctx.log("rescue", `Fuzzy match found: ${pUsername} -> ${playerId}`);
+          return playerId;
         }
       }
     }
-  } catch {
-    // Ignore errors
+  } catch (e) {
+    ctx.log("warn", `Error getting nearby players: ${e}`);
   }
-  
-  // Try using view_player as fallback
-  try {
-    const resp = await bot.exec("view_player", { player: username });
-    if (!resp.error && resp.result) {
-      const data = resp.result as Record<string, unknown>;
-      const playerId = data.id as string || data.player_id as string;
-      if (playerId) {
-        return playerId;
-      }
-    }
-  } catch {
-    // Ignore errors from unsupported commands
-  }
-  
-  // If we can't find the player ID, log warning and return null
+
   ctx.log("warn", `Could not resolve player ID for ${username}`);
   return null;
 }
@@ -1087,72 +1387,189 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Rescue session recovery ──
+    const activeSession = getActiveRescueSession(bot.username);
+    let recoveredSession: RescueSession | null = null;
+    if (activeSession) {
+      ctx.log("rescue", `Found incomplete rescue session: ${activeSession.targetUsername} at ${activeSession.targetSystem}/${activeSession.targetPoi} (${activeSession.state})`);
+      // Validate the session is still relevant
+      const fleet = ctx.getFleetStatus?.() || [];
+      const targetStillStranded = fleet.find(b => b.username === activeSession.targetUsername);
+      
+      if (targetStillStranded) {
+        const fuelPct = targetStillStranded.maxFuel > 0 ? Math.round((targetStillStranded.fuel / targetStillStranded.maxFuel) * 100) : 100;
+        if (fuelPct <= 25) {
+          // Target still needs help - resume the session
+          recoveredSession = activeSession;
+          ctx.log("rescue", `Resuming rescue mission for ${activeSession.targetUsername} (state: ${activeSession.state})`);
+        } else {
+          // Target has been refueled - clear the session
+          ctx.log("rescue", `${activeSession.targetUsername} has been refueled (${fuelPct}%) - clearing session`);
+          failRescueSession(bot.username, "Target no longer needs rescue");
+        }
+      } else {
+        // Target not in fleet - they may have logged off or session is stale
+        ctx.log("rescue", `Target ${activeSession.targetUsername} not in fleet - clearing session`);
+        failRescueSession(bot.username, "Target not found in fleet");
+      }
+    }
+
     const settings = getRescueSettings();
 
-    // ── Check fleet status ──
-    yield "scan_fleet";
-    const fleet = ctx.getFleetStatus?.() || [];
-    if (fleet.length === 0) {
-      ctx.log("info", "No fleet data available — waiting...");
-      await sleep(settings.scanIntervalSec * 1000);
-      continue;
+    // ── Handle recovered session ──
+    let target: RescueTarget | null = null;
+    let isMaydayTarget = false;
+
+    if (recoveredSession) {
+      // Resume the rescued session - skip scanning and go directly to execution
+      target = {
+        username: recoveredSession.targetUsername,
+        system: recoveredSession.targetSystem,
+        poi: recoveredSession.targetPoi,
+        fuelPct: 0, // Will be updated below
+        docked: false,
+      };
+      isMaydayTarget = recoveredSession.isMayday;
+
+      // Update fleet info for target
+      const fleet = ctx.getFleetStatus?.() || [];
+      const targetBot = fleet.find(b => b.username === target!.username);
+      if (targetBot) {
+        target.fuelPct = targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100;
+        target.docked = targetBot.docked;
+      }
+
+      ctx.log("rescue", `Continuing rescue for ${target.username} at ${target.system}/${target.poi}`);
+
+      // Skip to appropriate phase based on session state
+      if (recoveredSession.state === "navigating" || recoveredSession.state === "at_system") {
+        // Need to navigate to target system
+        ctx.log("rescue", `Session state '${recoveredSession.state}' - navigating to ${target.system}...`);
+      } else if (recoveredSession.state === "traveling_to_poi" || recoveredSession.state === "at_poi") {
+        // Already at system, need to travel to POI
+        ctx.log("rescue", `Session state '${recoveredSession.state}' - at system, proceeding to POI...`);
+        bot.system = target.system;
+      } else if (recoveredSession.state === "delivering_fuel") {
+        // At POI, need to deliver fuel
+        ctx.log("rescue", `Session state '${recoveredSession.state}' - at POI, proceeding to fuel delivery...`);
+        bot.system = target.system;
+        bot.poi = target.poi;
+      } else if (recoveredSession.state === "returning_home") {
+        // Already returning home
+        ctx.log("rescue", `Session state '${recoveredSession.state}' - continuing return to home...`);
+        bot.system = target.system;
+        bot.poi = target.poi;
+      }
+
+      // Jump over setup phases and go to navigation/delivery
+      // Set up for immediate execution below
     }
 
-    const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
+    // ── Check fleet status (only if not resuming) ──
+    if (!recoveredSession) {
+      yield "scan_fleet";
+      const fleet = ctx.getFleetStatus?.() || [];
+      if (fleet.length === 0) {
+        ctx.log("info", "No fleet data available — waiting...");
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
+      }
 
-    // ── Check for MAYDAY requests if no fleet targets ──
-    let maydayTarget: RescueTarget | null = null;
-    if (targets.length === 0) {
-      const mayday = getNextMayday();
-      if (mayday && isLegitimateMayday(mayday, 25)) {
-        ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
-        
-        // Check jump range for MAYDAYs (fleet rescues are always unlimited)
-        let jumpsAway = 0;
-        if (mayday.system && mayday.system !== bot.system && settings.maydayMaxJumps > 0) {
-          try {
-            const routeResp = await bot.exec("find_route", { target_system: mayday.system });
-            if (!routeResp.error && routeResp.result) {
-              const route = routeResp.result as Record<string, unknown>;
-              jumpsAway = (route.total_jumps as number) || 0;
-              
-              if (jumpsAway > settings.maydayMaxJumps) {
-                ctx.log("mayday", `⚠️ MAYDAY too far: ${jumpsAway} jumps (max: ${settings.maydayMaxJumps}) - ignoring`);
-                markMaydayHandled(mayday);
-                continue;
-              }
-            }
-          } catch (e) {
-            ctx.log("warn", `Could not calculate route to ${mayday.system}: ${e}`);
+      const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
+
+      // ── Check for MAYDAY requests if no fleet targets ──
+      let maydayTarget: RescueTarget | null = null;
+      if (targets.length === 0) {
+        const mayday = getNextMayday();
+        if (mayday) {
+          ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+
+          // Check if sender is a known player (from playerNames.json)
+          const knownPlayer = isKnownPlayer(mayday.sender);
+          
+          if (!knownPlayer) {
+            // Unknown sender - skip this MAYDAY (possible ambush)
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - not a known player (possible ambush)`);
+            markMaydayHandled(mayday);
+            continue;
           }
+          
+          ctx.log("mayday", `✓ Sender ${mayday.sender} is a KNOWN player — responding to MAYDAY`);
+
+          // Check jump range
+          let jumpsAway = 0;
+          if (mayday.system && mayday.system !== bot.system && settings.maydayMaxJumps > 0) {
+            try {
+              const routeResp = await bot.exec("find_route", { target_system: mayday.system });
+              if (!routeResp.error && routeResp.result) {
+                const route = routeResp.result as Record<string, unknown>;
+                jumpsAway = (route.total_jumps as number) || 0;
+
+                if (jumpsAway > settings.maydayMaxJumps) {
+                  ctx.log("mayday", `⚠️ MAYDAY too far: ${jumpsAway} jumps (max: ${settings.maydayMaxJumps}) - ignoring`);
+                  markMaydayHandled(mayday);
+                  continue;
+                }
+              }
+            } catch (e) {
+              ctx.log("warn", `Could not calculate route to ${mayday.system}: ${e}`);
+            }
+          }
+
+          maydayTarget = {
+            username: mayday.sender,
+            system: mayday.system,
+            poi: mayday.poi,
+            fuelPct: mayday.fuelPct,
+            docked: false,
+          };
+          markMaydayHandled(mayday);
+          ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
         }
-        
-        maydayTarget = {
-          username: mayday.sender,
-          system: mayday.system,
-          poi: mayday.poi,
-          fuelPct: mayday.fuelPct,
-          docked: false,
-        };
-        markMaydayHandled(mayday);
-        ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
       }
+
+      if (targets.length === 0 && !maydayTarget) {
+        // No one needs help — scavenge where we are and idle
+        yield "idle_scavenge";
+        if (!bot.docked) {
+          await scavengeWrecks(ctx);
+        }
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
+      }
+
+      // ── Rescue the most critical bot ──
+      target = maydayTarget || targets[0];
+      isMaydayTarget = !!maydayTarget;
     }
 
-    if (targets.length === 0 && !maydayTarget) {
-      // No one needs help — scavenge where we are and idle
-      yield "idle_scavenge";
-      if (!bot.docked) {
-        await scavengeWrecks(ctx);
-      }
-      await sleep(settings.scanIntervalSec * 1000);
+    if (!target) {
+      // Should not happen, but safety check
+      await sleep(5000);
       continue;
     }
 
-    // ── Rescue the most critical bot ──
-    const target = maydayTarget || targets[0];
-    const isMaydayTarget = !!maydayTarget;
-    
+    // ── Create rescue session if starting new mission ──
+    if (!recoveredSession && target) {
+      const session: RescueSession = {
+        sessionId: `${bot.username}_${Date.now()}`,
+        botUsername: bot.username,
+        targetUsername: target.username,
+        targetSystem: target.system,
+        targetPoi: target.poi || "unknown",
+        isMayday: isMaydayTarget,
+        jumpsCompleted: 0,
+        totalJumps: 0,
+        startedAt: new Date().toISOString(),
+        lastUpdatedAt: new Date().toISOString(),
+        state: "navigating",
+      };
+      startRescueSession(session);
+      ctx.log("rescue", `Created rescue session for ${target.username}`);
+    }
+
+    const maydayTarget = target;
+
     if (maydayTarget) {
       ctx.log("mayday", `RESCUE NEEDED (MAYDAY): ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
     } else {
@@ -1256,6 +1673,10 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
       if (!hasFuelCells && !willSendCredits) {
         ctx.log("error", "No fuel cells available and not enough credits to help — waiting for better situation...");
+        // Fail the session if we can't acquire resources
+        if (recoveredSession || getActiveRescueSession(bot.username)) {
+          failRescueSession(bot.username, "Could not acquire fuel cells or credits");
+        }
         await sleep(settings.scanIntervalSec * 1000);
         continue;
       }
@@ -1274,8 +1695,16 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Could not reach ${target.system} — will retry next scan`);
+        // Fail the session if we can't reach the target
+        if (recoveredSession || getActiveRescueSession(bot.username)) {
+          failRescueSession(bot.username, "Could not reach target system");
+        }
         await sleep(settings.scanIntervalSec * 1000);
         continue;
+      }
+      // Update session state after successful navigation
+      if (recoveredSession || getActiveRescueSession(bot.username)) {
+        updateRescueSession(bot.username, { state: "at_system" });
       }
     }
 
@@ -1291,10 +1720,19 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         // Try docking at station to send gift instead
       }
       bot.poi = target.poi;
+      // Update session state after traveling to POI
+      if (recoveredSession || getActiveRescueSession(bot.username)) {
+        updateRescueSession(bot.username, { state: "at_poi" });
+      }
     }
 
     // ── Deliver fuel ──
     yield "deliver_fuel";
+
+    // Update session state before fuel delivery
+    if (recoveredSession || getActiveRescueSession(bot.username)) {
+      updateRescueSession(bot.username, { state: "delivering_fuel" });
+    }
 
     if (hasPump) {
       // Use Refueling Pump for direct refuel
@@ -1408,7 +1846,20 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log(isMaydayTarget ? "mayday" : "rescue", `Returning to home system ${homeSystem}...`);
       await ensureUndocked(ctx);
       const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
-      await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!arrived) {
+        ctx.log("error", `Failed to return to home system ${homeSystem}`);
+      } else {
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Arrived at home system ${homeSystem}`);
+      }
+      // Update session state for return home
+      if (recoveredSession || getActiveRescueSession(bot.username)) {
+        updateRescueSession(bot.username, { state: "returning_home" });
+      }
+    } else if (!homeSystem) {
+      ctx.log("warn", "No home system set — skipping return home");
+    } else {
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Already at home system ${homeSystem}`);
     }
 
     // ── Refuel self ──
@@ -1416,6 +1867,11 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     await ensureFueled(ctx, settings.refuelThreshold);
     await bot.refreshStatus();
     logStatus(ctx);
+
+    // ── Complete the rescue session ──
+    if (recoveredSession || getActiveRescueSession(bot.username)) {
+      completeRescueSession(bot.username);
+    }
 
     if (isMaydayTarget) {
       ctx.log("mayday", `=== MAYDAY response complete for ${target.username} ===`);

@@ -24,6 +24,7 @@ import {
   writeSettings,
   sleep,
   isPirateSystem,
+  checkCustomsInspection,
 } from "./common.js";
 
 /** Number of mine attempts per resource POI to sample ores. */
@@ -513,6 +514,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     ctx.log("travel", `Jumped to ${nextSystem.name || nextSystem.id}`);
     bot.stats.totalSystems++;
+    
+    // Check for customs inspection after jump
+    await checkCustomsInspection(ctx, systemId);
+    
     lastSystem = systemId;
   }
 };

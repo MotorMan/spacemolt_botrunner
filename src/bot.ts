@@ -5,8 +5,14 @@ import { debugLog } from "./debug.js";
 import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
+import { detectCustomsMessage, logCustomsStop } from "./customs.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
+
+// Simple sleep helper to avoid circular dependency with common.ts
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export interface CargoItem {
   itemId: string;
@@ -127,6 +133,15 @@ export class Bot {
   readonly actionLog: string[] = [];
   private maxLogEntries = 200;
 
+  /** Customs inspection state - tracks if bot is being held for customs scan. */
+  customsHold: {
+    active: boolean;
+    since: number;
+    system: string;
+    poi: string;
+    outcome: "pending" | "cleared" | "contraband" | "evasion" | null;
+  } = { active: false, since: 0, system: "", poi: "", outcome: null };
+
   /** Optional callback for routing log output (e.g. to TUI). */
   onLog?: (username: string, category: string, message: string) => void;
 
@@ -169,6 +184,12 @@ export class Bot {
     return this._routine;
   }
 
+  /** Get the bot's empire affiliation from session credentials. */
+  getEmpire(): string {
+    const creds = this.session.loadCredentials();
+    return creds?.empire || "";
+  }
+
   log(category: string, message: string): void {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
     const line = `${timestamp} [${category}] ${message}`;
@@ -188,9 +209,27 @@ export class Bot {
 
   /** Execute an API command, log the result, handle notifications. */
   async exec(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
+    // Block ALL commands while customs hold is active (except get_status which is needed for refresh)
+    if (this.isCustomsHold() && command !== "get_status") {
+      this.log("customs", `⏳ Customs hold ACTIVE - blocking ${command} until clearance...`);
+      const outcome = await this.waitForCustomsClear();
+      this.log("customs", `✅ Customs clearance received (outcome: ${outcome}), resuming ${command}`);
+    }
+
     this._lastAction = command;
     debugLog("bot:exec", `${this.username} > ${command}`, payload);
     let resp = await this.api.execute(command, payload);
+
+    // After jump/travel commands in empire space, wait for customs messages
+    // This is the PROACTIVE check - wait 2 seconds minimum for customs to respond
+    if (!resp.error && (command === "jump" || command === "travel")) {
+      await this.refreshStatus();
+      // Check if we're in empire space (not Frontier, not pirate)
+      if (this.getEmpire().toLowerCase() !== "frontier") {
+        this.log("customs", `⏱️ Post-jump customs wait @ ${this.system} - 2 second delay...`);
+        await sleep(2000);
+      }
+    }
 
     // Action pending — a previous game action is still resolving (10s tick).
     // Wait for the tick to complete then retry once.
@@ -604,6 +643,76 @@ export class Bot {
   }
 
   /**
+   * Start a customs hold - blocks travel/jump actions until cleared.
+   */
+  startCustomsHold(): void {
+    this.customsHold = {
+      active: true,
+      since: Date.now(),
+      system: this.system,
+      poi: this.poi,
+      outcome: "pending",
+    };
+    this.log("customs", `🛑 CUSTOMS HOLD: Awaiting inspection at ${this.system}/${this.poi}...`);
+  }
+
+  /**
+   * Clear the customs hold after scan completes.
+   */
+  clearCustomsHold(outcome: "cleared" | "contraband" | "evasion"): void {
+    if (!this.customsHold.active) return;
+    
+    this.customsHold.outcome = outcome;
+    this.customsHold.active = false;
+    this.log("customs", `✅ CUSTOMS CLEARED: ${outcome}`);
+  }
+
+  /**
+   * Check if bot is currently held by customs.
+   */
+  isCustomsHold(): boolean {
+    if (!this.customsHold.active) return false;
+    
+    // Auto-timeout after 30 seconds (customs ship should have arrived by then)
+    const elapsed = Date.now() - this.customsHold.since;
+    if (elapsed > 30000) {
+      this.log("customs", "⏰ CUSTOMS TIMEOUT: Proceeding after 30s wait");
+      this.customsHold.active = false;
+      this.customsHold.outcome = "cleared";
+      return false;
+    }
+    
+    return true;
+  }
+
+  /**
+   * Wait for customs hold to clear (blocks until cleared or timeout).
+   */
+  async waitForCustomsClear(maxWaitMs: number = 30000): Promise<"cleared" | "contraband" | "evasion" | "timeout"> {
+    const startTime = Date.now();
+    
+    while (this.customsHold.active && Date.now() - startTime < maxWaitMs) {
+      await sleep(500);
+      
+      // Check if outcome was set by chat handler
+      if (this.customsHold.outcome && this.customsHold.outcome !== "pending") {
+        this.customsHold.active = false;
+        return this.customsHold.outcome;
+      }
+    }
+    
+    // Timeout
+    if (this.customsHold.active) {
+      this.customsHold.active = false;
+      this.customsHold.outcome = "cleared";
+      this.log("customs", "⏰ Customs scan timeout - proceeding");
+      return "timeout";
+    }
+    
+    return this.customsHold.outcome || "cleared";
+  }
+
+  /**
    * Route notifications to the bot's own activity log and detect hull damage.
    * Uses this.api.execute() directly (not this.exec()) to avoid recursion.
    */
@@ -651,6 +760,36 @@ export class Bot {
               }
             } else {
               this.log("warn", `MAYDAY parse failed - message format may have changed. Content: "${content}"`);
+            }
+          }
+
+          // Check for CUSTOMS inspection messages
+          if (channel === "system" || channel === "local") {
+            const customsDetection = detectCustomsMessage(content);
+            if (customsDetection.type !== "none") {
+              this.log("customs", `CUSTOMS detected [${customsDetection.type}]: ${sender} - ${content.slice(0, 100)}`);
+
+              // Handle customs hold state
+              if (customsDetection.type === "stop_request") {
+                // Start customs hold - this will block travel/jump actions
+                this.startCustomsHold();
+                this.log("customs", "📋 Scan in progress - waiting for clearance...");
+                logCustomsStop(this.username, this.system, this.poi, "pending");
+              } else if (customsDetection.type === "cleared") {
+                // Clear the hold - scan complete, all good
+                this.clearCustomsHold("cleared");
+                logCustomsStop(this.username, this.system, this.poi, "cleared");
+              } else if (customsDetection.type === "contraband") {
+                // Clear hold - contraband found, penalty process complete
+                this.clearCustomsHold("contraband");
+                this.log("customs", "⚠️ Contraband detected - penalty process complete");
+                logCustomsStop(this.username, this.system, this.poi, "contraband");
+              } else if (customsDetection.type === "evasion_warning") {
+                // Clear hold - evasion noted, process complete
+                this.clearCustomsHold("evasion");
+                this.log("customs", "⚠️ Evasion warning - process complete");
+                logCustomsStop(this.username, this.system, this.poi, "evasion");
+              }
             }
           }
 

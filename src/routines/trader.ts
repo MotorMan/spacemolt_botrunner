@@ -1507,7 +1507,6 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
     bot.docked = true;
-    await collectFromStorage(ctx);
     await tryMissions(ctx);
 
     // ── Sell trade items ──

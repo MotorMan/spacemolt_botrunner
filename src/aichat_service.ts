@@ -245,6 +245,9 @@ When responding:
 
 const DEFAULT_PERSONALITY = DEFAULT_AI_CHAT_PERSONALITY;
 
+// Export getBotPersonality for use by customs service
+export { getBotPersonality };
+
 // ── Chat message detection ───────────────────────────────────
 
 /**
@@ -1179,5 +1182,93 @@ Message:`;
 
   static setGetBotsFn(fn: () => Bot[]): void {
     AiChatService.getBots = fn;
+  }
+
+  /**
+   * Trigger a customs inspection response via AI Chat.
+   * Called by the customs service when a customs interaction occurs.
+   */
+  async triggerCustomsResponse(
+    botName: string,
+    context: {
+      messageType: "stop_request" | "cleared" | "contraband" | "evasion";
+      customsMessage: string;
+      botStops: number;
+    }
+  ): Promise<void> {
+    const bots = AiChatService.getBots();
+    const bot = bots.find(b => b.username === botName);
+    
+    if (!bot) {
+      this.logFn("error", `Customs response: Bot ${botName} not found`);
+      return;
+    }
+
+    const settings = getAiChatSettings();
+    const personality = getBotPersonality(botName);
+    
+    // Build context for the LLM
+    const systemPrompt = `${personality}
+
+Context:
+- You are ${botName} in SpaceMolt
+- You are currently in an empire system
+- Customs has stopped you for a cargo scan
+- This has happened ${context.botStops} time(s) to you
+
+Task:
+Generate a brief chat message response to the customs agent.
+
+Style:
+- Keep it in-character with your personality
+- Be concise (1-2 sentences max)
+- For stop_request: Acknowledge compliance or express mild annoyance
+- For cleared: Express relief or gratitude
+- For contraband: Show surprise, denial, or acceptance depending on personality
+- For evasion: Be defensive or apologetic`;
+
+    let userMessage = "";
+    switch (context.messageType) {
+      case "stop_request":
+        userMessage = `Customs said: "${context.customsMessage}"
+Respond acknowledging you'll comply (or expressing your personality about having to wait).`;
+        break;
+      case "cleared":
+        userMessage = `Customs said: "${context.customsMessage}"
+Respond to being cleared (relief, gratitude, or your typical personality).`;
+        break;
+      case "contraband":
+        userMessage = `Customs said: "${context.customsMessage}"
+They found contraband! Respond with your personality (denial, acceptance, surprise, etc.).`;
+        break;
+      case "evasion":
+        userMessage = `Customs said: "${context.customsMessage}"
+They're warning you for not staying still. Respond defensively or apologetically.`;
+        break;
+    }
+
+    const llmMessages: LlmMessage[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage },
+    ];
+
+    try {
+      const response = await callLlm(llmMessages, settings);
+      const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+
+      // Send chat message to system channel
+      const chatResp = await bot.exec("chat", {
+        channel: "system",
+        content: cleanResponse,
+      });
+
+      if (!chatResp.error) {
+        this.logFn("ai_chat", `→ Customs response: ${cleanResponse}`);
+      } else {
+        this.logFn("error", `Customs response failed: ${chatResp.error.message}`);
+      }
+    } catch (llmErr) {
+      this.logFn("error", `Customs LLM error: ${llmErr instanceof Error ? llmErr.message : String(llmErr)}`);
+    }
   }
 }

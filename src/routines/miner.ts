@@ -40,6 +40,9 @@ function getMinerSettings(username?: string): {
   targetOre: string;
   targetGas: string;
   targetIce: string;
+  oreQuotas: Record<string, number>;
+  gasQuotas: Record<string, number>;
+  iceQuotas: Record<string, number>;
 } {
   const all = readSettings();
   const m = all.miner || {};
@@ -74,6 +77,9 @@ function getMinerSettings(username?: string): {
     targetOre: (botOverrides.targetOre as string) || (m.targetOre as string) || "",
     targetGas: (botOverrides.targetGas as string) || (m.targetGas as string) || "",
     targetIce: (botOverrides.targetIce as string) || (m.targetIce as string) || "",
+    oreQuotas: (m.oreQuotas as Record<string, number>) || {},
+    gasQuotas: (m.gasQuotas as Record<string, number>) || {},
+    iceQuotas: (m.iceQuotas as Record<string, number>) || {},
   };
 }
 
@@ -139,6 +145,30 @@ async function detectMiningType(ctx: RoutineContext): Promise<"ore" | "gas" | "i
   return null;
 }
 
+/** Pick target resource based on quota deficits. Returns the resource ID with biggest deficit. */
+function pickTargetFromQuotas(
+  quotas: Record<string, number>,
+  factionStorage: Array<{ itemId: string; quantity: number }>,
+  miningType: "ore" | "gas" | "ice"
+): string {
+  const entries: Array<{ resourceId: string; deficit: number; current: number; target: number }> = [];
+
+  for (const [resourceId, target] of Object.entries(quotas)) {
+    if (target <= 0) continue;
+    const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
+    const deficit = target - current;
+    if (deficit > 0) {
+      entries.push({ resourceId, deficit, current, target });
+    }
+  }
+
+  if (entries.length === 0) return "";
+
+  // Sort: biggest deficit first
+  entries.sort((a, b) => b.deficit - a.deficit);
+  return entries[0].resourceId;
+}
+
 /** Find appropriate POI based on mining type. */
 function findMiningPoi(
   pois: Array<{ id: string; name: string; type: string }>,
@@ -196,57 +226,6 @@ function findMiningPoi(
   }
 }
 
-/** Find a system with mining POIs from mapStore. */
-function findSystemWithMiningPoi(miningType: "ore" | "gas" | "ice", targetResource?: string): { systemId: string; poiId: string; poiName: string } | null {
-  const allSystems = mapStore.getAllSystems();
-  const candidates: Array<{ systemId: string; poiId: string; poiName: string; priority: number }> = [];
-
-  for (const [systemId, sys] of Object.entries(allSystems)) {
-    const pois = sys.pois || [];
-    for (const poi of pois) {
-      let matches = false;
-      let priority = 0;
-
-      if (miningType === "ice" && isIceFieldPoi(poi.type)) {
-        matches = true;
-        priority = poi.type.includes("ice") ? 2 : 1;
-        if (targetResource) {
-          const storedPoi = sys.pois?.find(p => p.id === poi.id);
-          if (storedPoi?.ores_found.some(o => o.item_id === targetResource)) {
-            priority = 10;
-          }
-        }
-      } else if (miningType === "ore" && isOreBeltPoi(poi.type)) {
-        matches = true;
-        priority = poi.type.includes("asteroid") || poi.type.includes("belt") ? 2 : 1;
-        if (targetResource) {
-          const storedPoi = sys.pois?.find(p => p.id === poi.id);
-          if (storedPoi?.ores_found.some(o => o.item_id === targetResource)) {
-            priority = 10;
-          }
-        }
-      } else if (miningType === "gas" && isGasCloudPoi(poi.type)) {
-        matches = true;
-        priority = poi.type.includes("gas") || poi.type.includes("cloud") ? 2 : 1;
-        if (targetResource) {
-          const storedPoi = sys.pois?.find(p => p.id === poi.id);
-          if (storedPoi?.ores_found.some(o => o.item_id === targetResource)) {
-            priority = 10;
-          }
-        }
-      }
-
-      if (matches) {
-        candidates.push({ systemId, poiId: poi.id, poiName: poi.name, priority });
-      }
-    }
-  }
-
-  if (candidates.length === 0) return null;
-  candidates.sort((a, b) => b.priority - a.priority);
-  return { systemId: candidates[0].systemId, poiId: candidates[0].poiId, poiName: candidates[0].poiName };
-}
-
 // ── Miner routine ────────────────────────────────────────────
 
 export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -272,6 +251,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
   const targetResource = miningType === "ice" ? settings0.targetIce : (miningType === "ore" ? settings0.targetOre : settings0.targetGas);
   const resourceLabel = miningType === "ice" ? "ice" : (miningType === "ore" ? "ore" : "gas");
+
+  // Log mining configuration
+  if (targetResource) {
+    ctx.log("mining", `Target ${resourceLabel}: ${targetResource} (mode: ${settings0.miningType})`);
+  } else {
+    ctx.log("mining", `Mining any ${resourceLabel} (no specific target configured)`);
+  }
 
   // ── Startup: return home and dump non-fuel cargo to storage ──
   await bot.refreshCargo();
@@ -314,6 +300,26 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       hullThresholdPct: settings.repairThreshold,
     };
 
+    // ── Quota-based target selection ──
+    let quotaTargetResource = "";
+    let quotaTargetType: "ore" | "gas" | "ice" = miningType;
+
+    // Select quotas based on mining type
+    const quotas = miningType === "ice" ? settings.iceQuotas : (miningType === "ore" ? settings.oreQuotas : settings.gasQuotas);
+
+    if (Object.keys(quotas).length > 0) {
+      await bot.refreshFactionStorage();
+      quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
+      if (quotaTargetResource) {
+        ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
+      } else {
+        ctx.log("mining", "All quotas met — using configured target or mining locally");
+      }
+    }
+
+    // Use quota target if found, otherwise use configured target
+    const effectiveTarget = quotaTargetResource || targetResource;
+
     // ── Status + fuel/hull checks ──
     yield "get_status";
     await bot.refreshStatus();
@@ -336,13 +342,53 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     await ensureUndocked(ctx);
 
-    // ── Navigate to target system if configured ──
-    const targetSystemId = settings.system || "";
+    // ── Determine mining destination ──
+    yield "find_destination";
+    let targetSystemId = settings.system || "";
+    let targetPoiId = "";
+    let targetPoiName = "";
+
+    if (effectiveTarget) {
+      const allLocations = mapStore.findOreLocations(effectiveTarget);
+      // Filter to matching POI type only
+      const locations = allLocations.filter(loc => {
+        const sys = mapStore.getSystem(loc.systemId);
+        const poi = sys?.pois.find(p => p.id === loc.poiId);
+        if (!poi) return true; // keep if type unknown
+        if (miningType === "ore") return isOreBeltPoi(poi.type);
+        if (miningType === "gas") return isGasCloudPoi(poi.type);
+        if (miningType === "ice") return isIceFieldPoi(poi.type);
+        return true;
+      });
+
+      if (locations.length === 0) {
+        ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found — mining locally`);
+      } else {
+        // Prefer location in current system
+        const inCurrentSystem = locations.find(loc => loc.systemId === bot.system);
+        if (inCurrentSystem) {
+          targetSystemId = inCurrentSystem.systemId;
+          targetPoiId = inCurrentSystem.poiId;
+          targetPoiName = inCurrentSystem.poiName;
+        } else {
+          // Pick best location (prefer systems with stations)
+          const withStation = locations.filter(loc => loc.hasStation);
+          const best = withStation.length > 0 ? withStation[0] : locations[0];
+          targetSystemId = best.systemId;
+          targetPoiId = best.poiId;
+          targetPoiName = best.poiName;
+        }
+      }
+    }
+
+    // ── Navigate to target system if needed ──
     if (targetSystemId && targetSystemId !== bot.system) {
       yield "navigate_to_target";
       const arrived = await navigateToSystem(ctx, targetSystemId, safetyOpts);
       if (!arrived) {
-        ctx.log("error", "Failed to reach target system — harvesting locally instead");
+        ctx.log("error", "Failed to reach target system — mining locally instead");
+        targetPoiId = "";
+        targetPoiName = "";
       }
     }
 
@@ -359,21 +405,53 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     const station = findStation(pois);
     if (station) stationPoi = { id: station.id, name: station.name };
 
-    miningPoi = findMiningPoi(pois, miningType, targetResource);
+    // If targeting a specific POI, prefer it
+    if (targetPoiId) {
+      const match = pois.find(p => p.id === targetPoiId);
+      if (match) {
+        miningPoi = { id: match.id, name: match.name };
+      }
+    }
 
-    if (!miningPoi) {
-      // No mining POI in current system — try to find one from mapStore
-      const systemPoi = findSystemWithMiningPoi(miningType, targetResource);
-      if (systemPoi) {
-        ctx.log("info", `No ${resourceLabel} here — traveling to ${systemPoi.poiName} in ${systemPoi.systemId}`);
-        const navOk = await navigateToSystem(ctx, systemPoi.systemId, safetyOpts);
-        if (navOk) {
-          miningPoi = { id: systemPoi.poiId, name: systemPoi.poiName };
-        } else {
-          ctx.log("error", `Failed to reach ${systemPoi.systemId} — waiting 30s`);
-          await sleep(30000);
-          continue;
+    // Fallback: find POI with target resource
+    if (!miningPoi && effectiveTarget) {
+      for (const poi of pois) {
+        if (miningType === "ice" && isIceFieldPoi(poi.type)) {
+          const sysData = mapStore.getSystem(bot.system);
+          const storedPoi = sysData?.pois.find(p => p.id === poi.id);
+          if (storedPoi?.ores_found.some(o => o.item_id === effectiveTarget)) {
+            miningPoi = { id: poi.id, name: poi.name };
+            break;
+          }
+        } else if (miningType === "ore" && isOreBeltPoi(poi.type)) {
+          const sysData = mapStore.getSystem(bot.system);
+          const storedPoi = sysData?.pois.find(p => p.id === poi.id);
+          if (storedPoi?.ores_found.some(o => o.item_id === effectiveTarget)) {
+            miningPoi = { id: poi.id, name: poi.name };
+            break;
+          }
+        } else if (miningType === "gas" && isGasCloudPoi(poi.type)) {
+          const sysData = mapStore.getSystem(bot.system);
+          const storedPoi = sysData?.pois.find(p => p.id === poi.id);
+          if (storedPoi?.ores_found.some(o => o.item_id === effectiveTarget)) {
+            miningPoi = { id: poi.id, name: poi.name };
+            break;
+          }
         }
+      }
+    }
+
+    // Fallback: any matching POI type
+    if (!miningPoi) {
+      if (miningType === "ice") {
+        const iceField = pois.find(p => isIceFieldPoi(p.type));
+        if (iceField) miningPoi = { id: iceField.id, name: iceField.name };
+      } else if (miningType === "ore") {
+        const oreBelt = pois.find(p => isOreBeltPoi(p.type));
+        if (oreBelt) miningPoi = { id: oreBelt.id, name: oreBelt.name };
+      } else if (miningType === "gas") {
+        const gasCloud = pois.find(p => isGasCloudPoi(p.type));
+        if (gasCloud) miningPoi = { id: gasCloud.id, name: gasCloud.name };
       }
     }
 

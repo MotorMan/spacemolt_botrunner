@@ -1922,14 +1922,14 @@ export async function factionDonateProfit(ctx: RoutineContext, profit: number): 
 /**
  * Check for customs inspection when entering a new system.
  * Should be called after travel/jump commands when entering empire space.
- * 
+ *
  * @param ctx - Routine context
- * @param previousSystem - The system we were in before (to detect system change)
+ * @param targetSystem - The system we jumped to (for accurate logging since bot.system may be unstable during jumps)
  * @returns Object with inspection result
  */
 export async function checkCustomsInspection(
   ctx: RoutineContext,
-  previousSystem?: string
+  targetSystem?: string
 ): Promise<{
   wasStopped: boolean;
   outcome: "cleared" | "contraband" | "evasion" | "timeout" | "none";
@@ -1937,19 +1937,16 @@ export async function checkCustomsInspection(
 }> {
   const { bot } = ctx;
 
+  // Use targetSystem if provided, otherwise fall back to bot.system
+  const systemToCheck = targetSystem || bot.system;
+
   // Only check if we're in an empire system (not Frontier, not pirate)
-  if (!isEmpireSystem(bot.system, bot.getEmpire())) {
-    ctx.log("customs", `System ${bot.system} is not an empire system (or bot is Frontier) - no customs check needed`);
+  if (!isEmpireSystem(systemToCheck, bot.getEmpire())) {
+    ctx.log("customs", `System ${systemToCheck} is not an empire system (or bot is Frontier) - no customs check needed`);
     return { wasStopped: false, outcome: "none", chatMessages: [] };
   }
 
-  // Only check if we changed systems
-  if (previousSystem && previousSystem === bot.system) {
-    ctx.log("customs_debug", `Still in same system ${bot.system} - skipping customs check`);
-    return { wasStopped: false, outcome: "none", chatMessages: [] };
-  }
-
-  ctx.log("customs", `Entering empire system ${bot.system} - checking for customs...`);
+  ctx.log("customs", `Entering empire system ${systemToCheck} - checking for customs...`);
 
   // PROACTIVE: Always wait at least 2 seconds for customs message to arrive
   // This is mandatory for all empire jumps, even if no message has arrived yet
@@ -1957,7 +1954,7 @@ export async function checkCustomsInspection(
   await sleep(2000);
 
   // Wait for customs inspection (up to 5 seconds total)
-  const result = await waitForCustomsInspection(bot, (cat, msg) => bot.log(cat, msg), 5000);
+  const result = await waitForCustomsInspection(bot, (cat, msg) => bot.log(cat, msg), systemToCheck, 5000);
 
   // If customs ship is expected but not yet visible, poll for it
   if (result.wasStopped && result.outcome === "timeout") {

@@ -187,6 +187,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     // ── Handle recovered session ──
     let target: RescueTarget | null = null;
     let isMaydayTarget = false;
+    let skipToReturnHome = false;
 
     if (recoveredSession) {
       target = {
@@ -217,9 +218,10 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         bot.system = target.system;
         bot.poi = target.poi;
       } else if (recoveredSession.state === "returning_home") {
-        ctx.log("rescue", `Session state '${recoveredSession.state}' - continuing return to home...`);
+        ctx.log("rescue", `Session state '${recoveredSession.state}' - continuing return to home (${homeSystem})...`);
         bot.system = target.system;
         bot.poi = target.poi;
+        skipToReturnHome = true;
       }
     }
 
@@ -382,203 +384,211 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     }
 
     // ── Navigate to stranded bot's system ──
-    yield "navigate_to_target";
-    await ensureUndocked(ctx);
+    if (!skipToReturnHome) {
+      yield "navigate_to_target";
+      await ensureUndocked(ctx);
 
-    if (target.system && target.system !== bot.system) {
-      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Navigating to ${target.system}...`);
-      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
-      const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
-      if (!arrived) {
-        ctx.log("error", `Could not reach ${target.system} — will retry next scan`);
+      if (target.system && target.system !== bot.system) {
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", `Navigating to ${target.system}...`);
+        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+        const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
+        if (!arrived) {
+          ctx.log("error", `Could not reach ${target.system} — will retry next scan`);
+          if (recoveredSession || getActiveRescueSession(bot.username)) {
+            failRescueSession(bot.username, "Could not reach target system");
+          }
+          await sleep(settings.scanIntervalSec * 1000);
+          continue;
+        }
+        // CRITICAL: Refresh status to update bot.system after navigation
+        await bot.refreshStatus();
+        ctx.log("travel", `Arrived in ${bot.system}`);
+        // Update session state after successful navigation
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          failRescueSession(bot.username, "Could not reach target system");
+          updateRescueSession(bot.username, { state: "at_system" });
         }
-        await sleep(settings.scanIntervalSec * 1000);
-        continue;
       }
-      // CRITICAL: Refresh status to update bot.system after navigation
-      await bot.refreshStatus();
-      ctx.log("travel", `Arrived in ${bot.system}`);
-      // Update session state after successful navigation
+
+      if (bot.state !== "running") break;
+
+      // ── Travel to stranded bot's POI ──
+      if (target.poi) {
+        yield "travel_to_target";
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", `Traveling to ${target.username}'s location (${target.poi})...`);
+        const travelResp = await bot.exec("travel", { target_poi: target.poi });
+        if (travelResp.error && !travelResp.error.message.includes("already")) {
+          ctx.log("error", `Travel failed: ${travelResp.error.message}`);
+        }
+        bot.poi = target.poi;
+        // Update session state after traveling to POI
+        if (recoveredSession || getActiveRescueSession(bot.username)) {
+          updateRescueSession(bot.username, { state: "at_poi" });
+        }
+      }
+
+      // ── Transfer fuel ──
+      yield "transfer_fuel";
+
+      // Update session state before fuel delivery
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "at_system" });
+        updateRescueSession(bot.username, { state: "delivering_fuel" });
       }
-    }
 
-    if (bot.state !== "running") break;
+      if (hasPumpNow) {
+        // Use refuel command with Refueling Pump
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", `Initiating fuel transfer to ${target.username} using Refueling Pump...`);
 
-    // ── Travel to stranded bot's POI ──
-    if (target.poi) {
-      yield "travel_to_target";
-      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Traveling to ${target.username}'s location (${target.poi})...`);
-      const travelResp = await bot.exec("travel", { target_poi: target.poi });
-      if (travelResp.error && !travelResp.error.message.includes("already")) {
-        ctx.log("error", `Travel failed: ${travelResp.error.message}`);
-      }
-      bot.poi = target.poi;
-      // Update session state after traveling to POI
-      if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "at_poi" });
-      }
-    }
+        // Need to get the target's player ID for the refuel command
+        const targetPlayerId = await findPlayerId(ctx, target.username);
 
-    // ── Transfer fuel ──
-    yield "transfer_fuel";
-
-    // Update session state before fuel delivery
-    if (recoveredSession || getActiveRescueSession(bot.username)) {
-      updateRescueSession(bot.username, { state: "delivering_fuel" });
-    }
-
-    if (hasPumpNow) {
-      // Use refuel command with Refueling Pump
-      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Initiating fuel transfer to ${target.username} using Refueling Pump...`);
-
-      // Need to get the target's player ID for the refuel command
-      const targetPlayerId = await findPlayerId(ctx, target.username);
-
-      if (!targetPlayerId) {
-        ctx.log("error", `Could not find player ID for ${target.username} — aborting transfer`);
-        if (isMaydayTarget) {
-          // Re-add to queue so another bot can try
-          // (For now, just log - the MAYDAY is already marked as handled)
+        if (!targetPlayerId) {
+          ctx.log("error", `Could not find player ID for ${target.username} — aborting transfer`);
+          if (isMaydayTarget) {
+            // Re-add to queue so another bot can try
+            // (For now, just log - the MAYDAY is already marked as handled)
+          }
+          await sleep(settings.scanIntervalSec * 1000);
+          continue;
         }
-        await sleep(settings.scanIntervalSec * 1000);
-        continue;
-      }
 
-      // Issue the refuel command
-      const refuelResp = await bot.exec("refuel", { target: targetPlayerId });
+        // Issue the refuel command
+        const refuelResp = await bot.exec("refuel", { target: targetPlayerId });
 
-      if (refuelResp.error) {
-        ctx.log("error", `Refuel command failed: ${refuelResp.error.message}`);
-      } else {
-        // Parse and log the result
-        const result = refuelResp.result as Record<string, unknown> | undefined;
-        if (result) {
-          const fuelDelta = result.fuel as number || 0;
-          const fuelNow = result.fuel_now as number || bot.fuel;
-          const targetFuelNow = result.target_fuel_now as number || 0;
-          const targetName = result.target_player_name as string || target.username;
-
-          ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Transferred ${Math.abs(fuelDelta)} fuel to ${targetName}`);
-          ctx.log(isMaydayTarget ? "mayday" : "rescue", `  Our fuel: ${fuelNow}, Their fuel: ${targetFuelNow}`);
+        if (refuelResp.error) {
+          ctx.log("error", `Refuel command failed: ${refuelResp.error.message}`);
         } else {
-          ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Fuel transfer complete for ${target.username}`);
-        }
-      }
-    } else {
-      // Fallback: Use fuel cell delivery method (jettison for them to collect)
-      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Delivering fuel cells to ${target.username} (no Refueling Pump)...`);
+          // Parse and log the result
+          const result = refuelResp.result as Record<string, unknown> | undefined;
+          if (result) {
+            const fuelDelta = result.fuel as number || 0;
+            const fuelNow = result.fuel_now as number || bot.fuel;
+            const targetFuelNow = result.target_fuel_now as number || 0;
+            const targetName = result.target_player_name as string || target.username;
 
-      // Dock first to get fuel cells from storage
-      await ensureDocked(ctx);
-      await collectFromStorage(ctx);
-
-      // Check if we have fuel cells in cargo
-      await bot.refreshCargo();
-      const fuelItem = bot.inventory.find(i =>
-        i.itemId.includes("fuel_cell") || i.itemId.includes("fuel") || i.itemId.includes("energy_cell")
-      );
-
-      if (fuelItem && fuelItem.quantity > 0) {
-        // Undock and jettison at target location
-        await ensureUndocked(ctx);
-
-        ctx.log(isMaydayTarget ? "mayday" : "rescue", `Jettisoning ${fuelItem.quantity}x ${fuelItem.name} for ${target.username} to collect...`);
-        const jetResp = await bot.exec("jettison", {
-          item_id: fuelItem.itemId,
-          quantity: fuelItem.quantity,
-        });
-
-        if (jetResp.error) {
-          ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
-        } else {
-          ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them`);
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Transferred ${Math.abs(fuelDelta)} fuel to ${targetName}`);
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", `  Our fuel: ${fuelNow}, Their fuel: ${targetFuelNow}`);
+          } else {
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Fuel transfer complete for ${target.username}`);
+          }
         }
       } else {
-        // No fuel cells in cargo — try to buy them
-        ctx.log(isMaydayTarget ? "mayday" : "rescue", "No fuel cells in cargo — attempting to purchase...");
+        // Fallback: Use fuel cell delivery method (jettison for them to collect)
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", `Delivering fuel cells to ${target.username} (no Refueling Pump)...`);
 
-        // Need to dock to buy
-        const { pois } = await getSystemInfo(ctx);
-        const station = findStation(pois);
+        // Dock first to get fuel cells from storage
+        await ensureDocked(ctx);
+        await collectFromStorage(ctx);
 
-        if (station) {
-          ctx.log(isMaydayTarget ? "mayday" : "rescue", `Traveling to ${station.name} to purchase fuel cells...`);
-          await bot.exec("travel", { target_poi: station.id });
-          await bot.exec("dock");
-          bot.docked = true;
-          await collectFromStorage(ctx);
+        // Check if we have fuel cells in cargo
+        await bot.refreshCargo();
+        const fuelItem = bot.inventory.find(i =>
+          i.itemId.includes("fuel_cell") || i.itemId.includes("fuel") || i.itemId.includes("energy_cell")
+        );
 
-          // Try buying fuel cells
-          const marketResp = await bot.exec("view_market");
-          let boughtCells = false;
+        if (fuelItem && fuelItem.quantity > 0) {
+          // Undock and jettison at target location
+          await ensureUndocked(ctx);
 
-          if (marketResp.result && typeof marketResp.result === "object") {
-            const mData = marketResp.result as Record<string, unknown>;
-            const items = (
-              Array.isArray(mData) ? mData :
-              Array.isArray(mData.items) ? mData.items :
-              Array.isArray(mData.market) ? mData.market :
-              []
-            ) as Array<Record<string, unknown>>;
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `Jettisoning ${fuelItem.quantity}x ${fuelItem.name} for ${target.username} to collect...`);
+          const jetResp = await bot.exec("jettison", {
+            item_id: fuelItem.itemId,
+            quantity: fuelItem.quantity,
+          });
 
-            const fuelItem = items.find(i => {
-              const id = ((i.item_id as string) || (i.id as string) || "").toLowerCase();
-              return id.includes("fuel_cell") || id.includes("fuel") || id.includes("energy_cell");
-            });
+          if (jetResp.error) {
+            ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
+          } else {
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them`);
+          }
+        } else {
+          // No fuel cells in cargo — try to buy them
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", "No fuel cells in cargo — attempting to purchase...");
 
-            if (fuelItem) {
-              const fuelId = (fuelItem.item_id as string) || (fuelItem.id as string) || "";
-              const price = (fuelItem.price as number) || (fuelItem.buy_price as number) || 0;
-              const available = (fuelItem.quantity as number) || (fuelItem.stock as number) || 0;
-              const qty = Math.min(settings.rescueFuelCells, available);
+          // Need to dock to buy
+          const { pois } = await getSystemInfo(ctx);
+          const station = findStation(pois);
 
-              if (qty > 0 && (price * qty) <= bot.credits) {
-                ctx.log(isMaydayTarget ? "mayday" : "rescue", `Buying ${qty}x fuel cells (${price}cr each)...`);
-                const buyResp = await bot.exec("buy", { item_id: fuelId, quantity: qty });
-                if (!buyResp.error) {
-                  boughtCells = true;
-                  ctx.log(isMaydayTarget ? "mayday" : "rescue", `Acquired ${qty}x fuel cells`);
+          if (station) {
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", `Traveling to ${station.name} to purchase fuel cells...`);
+            await bot.exec("travel", { target_poi: station.id });
+            await bot.exec("dock");
+            bot.docked = true;
+            await collectFromStorage(ctx);
+
+            // Try buying fuel cells
+            const marketResp = await bot.exec("view_market");
+            let boughtCells = false;
+
+            if (marketResp.result && typeof marketResp.result === "object") {
+              const mData = marketResp.result as Record<string, unknown>;
+              const items = (
+                Array.isArray(mData) ? mData :
+                Array.isArray(mData.items) ? mData.items :
+                Array.isArray(mData.market) ? mData.market :
+                []
+              ) as Array<Record<string, unknown>>;
+
+              const fuelItem = items.find(i => {
+                const id = ((i.item_id as string) || (i.id as string) || "").toLowerCase();
+                return id.includes("fuel_cell") || id.includes("fuel") || id.includes("energy_cell");
+              });
+
+              if (fuelItem) {
+                const fuelId = (fuelItem.item_id as string) || (fuelItem.id as string) || "";
+                const price = (fuelItem.price as number) || (fuelItem.buy_price as number) || 0;
+                const available = (fuelItem.quantity as number) || (fuelItem.stock as number) || 0;
+                const qty = Math.min(settings.rescueFuelCells, available);
+
+                if (qty > 0 && (price * qty) <= bot.credits) {
+                  ctx.log(isMaydayTarget ? "mayday" : "rescue", `Buying ${qty}x fuel cells (${price}cr each)...`);
+                  const buyResp = await bot.exec("buy", { item_id: fuelId, quantity: qty });
+                  if (!buyResp.error) {
+                    boughtCells = true;
+                    ctx.log(isMaydayTarget ? "mayday" : "rescue", `Acquired ${qty}x fuel cells`);
+                  }
                 }
               }
             }
-          }
 
-          if (boughtCells) {
-            // Return to target and jettison
-            await ensureUndocked(ctx);
-            if (target.poi) {
-              await bot.exec("travel", { target_poi: target.poi });
-              bot.poi = target.poi;
-            }
-
-            await bot.refreshCargo();
-            const purchasedItem = bot.inventory.find(i =>
-              i.itemId.includes("fuel_cell") || i.itemId.includes("fuel") || i.itemId.includes("energy_cell")
-            );
-
-            if (purchasedItem) {
-              const jetResp = await bot.exec("jettison", {
-                item_id: purchasedItem.itemId,
-                quantity: purchasedItem.quantity,
-              });
-
-              if (jetResp.error) {
-                ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
-              } else {
-                ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them`);
+            if (boughtCells) {
+              // Return to target and jettison
+              await ensureUndocked(ctx);
+              if (target.poi) {
+                await bot.exec("travel", { target_poi: target.poi });
+                bot.poi = target.poi;
               }
+
+              await bot.refreshCargo();
+              const purchasedItem = bot.inventory.find(i =>
+                i.itemId.includes("fuel_cell") || i.itemId.includes("fuel") || i.itemId.includes("energy_cell")
+              );
+
+              if (purchasedItem) {
+                const jetResp = await bot.exec("jettison", {
+                  item_id: purchasedItem.itemId,
+                  quantity: purchasedItem.quantity,
+                });
+
+                if (jetResp.error) {
+                  ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
+                } else {
+                  ctx.log(isMaydayTarget ? "mayday" : "rescue", `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them`);
+                }
+              }
+            } else {
+              ctx.log("error", "Could not acquire fuel cells — mission failed");
             }
           } else {
-            ctx.log("error", "Could not acquire fuel cells — mission failed");
+            ctx.log("error", "No station found to acquire fuel cells");
           }
-        } else {
-          ctx.log("error", "No station found to acquire fuel cells");
         }
       }
+    }
+
+    // ── Skip to return home if recovering from returning_home state ──
+    if (skipToReturnHome) {
+      ctx.log("rescue", "Recovered session was returning home - skipping to return home logic...");
+      skipToReturnHome = false;
     }
 
     // ── Return to home system ──
@@ -1566,6 +1576,25 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       };
       startRescueSession(session);
       ctx.log("rescue", `Created rescue session for ${target.username}`);
+
+      // Send faction chat announcement for rescue start
+      const aiChatService = (globalThis as any).aiChatService;
+      if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+        try {
+          await aiChatService.sendFactionMessage(bot, {
+            messageType: "rescue_start",
+            targetName: target.username,
+            isMayday: isMaydayTarget,
+            isBot: !isMaydayTarget,
+            currentSystem: bot.system,
+            targetSystem: target.system,
+            targetPoi: target.poi || undefined,
+            targetFuelPct: target.fuelPct,
+          });
+        } catch (e) {
+          ctx.log("warn", `AI faction message (start) failed: ${e}`);
+        }
+      }
     }
 
     const maydayTarget = target;
@@ -1724,6 +1753,24 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       if (recoveredSession || getActiveRescueSession(bot.username)) {
         updateRescueSession(bot.username, { state: "at_poi" });
       }
+
+      // Send faction chat announcement for arrival
+      const aiChatService = (globalThis as any).aiChatService;
+      if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+        try {
+          await aiChatService.sendFactionMessage(bot, {
+            messageType: "rescue_arrived",
+            targetName: target.username,
+            isMayday: isMaydayTarget,
+            isBot: !isMaydayTarget,
+            currentSystem: bot.system,
+            targetSystem: target.system,
+            targetPoi: target.poi || undefined,
+          });
+        } catch (e) {
+          ctx.log("warn", `AI faction message (arrived) failed: ${e}`);
+        }
+      }
     }
 
     // ── Deliver fuel ──
@@ -1734,22 +1781,70 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       updateRescueSession(bot.username, { state: "delivering_fuel" });
     }
 
+    // Check if target is actually at the location (for non-station targets)
+    let targetFound = true;
+    if (!target.docked) {
+      // Use get_nearby to verify target is present
+      const nearbyResp = await bot.exec("get_nearby");
+      if (!nearbyResp.error && nearbyResp.result) {
+        const data = nearbyResp.result as Record<string, unknown>;
+        const players = Array.isArray(data.players) ? data.players :
+                        Array.isArray(data.nearby) ? data.nearby :
+                        Array.isArray(data.ships) ? data.ships : [];
+        
+        const targetHere = players.some(p => {
+          const username = ((p.username as string) || (p.name as string) || "").toLowerCase();
+          return username === target.username.toLowerCase();
+        });
+
+        if (!targetHere) {
+          targetFound = false;
+          ctx.log("error", `Target ${target.username} not found at ${target.poi} - they may have left or it was a false alarm`);
+          
+          // Send grumpy faction chat message about being ghosted
+          const aiChatService = (globalThis as any).aiChatService;
+          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+            try {
+              await aiChatService.sendFactionMessage(bot, {
+                messageType: "rescue_no_show",
+                targetName: target.username,
+                isMayday: isMaydayTarget,
+                isBot: !isMaydayTarget,
+                currentSystem: bot.system,
+                targetSystem: target.system,
+                targetPoi: target.poi || undefined,
+              });
+            } catch (e) {
+              ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
+            }
+          }
+          
+          // Fail the session and return home
+          if (recoveredSession || getActiveRescueSession(bot.username)) {
+            failRescueSession(bot.username, "Target not found at location");
+          }
+          markMaydayHandled({ sender: target.username, system: target.system, poi: target.poi || "", fuelPct: target.fuelPct, timestamp: Date.now(), currentFuel: 0, maxFuel: 0, rawMessage: "" });
+          continue;
+        }
+      }
+    }
+
     if (hasPump) {
       // Use Refueling Pump for direct refuel
       ctx.log(isMaydayTarget ? "mayday" : "rescue", `Initiating fuel transfer to ${target.username} using Refueling Pump...`);
-      
+
       // Need to get the target's player ID for the refuel command
       const targetPlayerId = await findPlayerId(ctx, target.username);
-      
+
       if (!targetPlayerId) {
         ctx.log("error", `Could not find player ID for ${target.username} — aborting transfer`);
         await sleep(settings.scanIntervalSec * 1000);
         continue;
       }
-      
+
       // Issue the refuel command
       const refuelResp = await bot.exec("refuel", { target: targetPlayerId });
-      
+
       if (refuelResp.error) {
         ctx.log("error", `Refuel command failed: ${refuelResp.error.message}`);
       } else {
@@ -1761,6 +1856,24 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log(isMaydayTarget ? "mayday" : "rescue", `  Their fuel: ${targetFuelNow}`);
         }
         ctx.log(isMaydayTarget ? "mayday" : "rescue", `Delivery complete for ${target.username}!`);
+
+        // Send faction chat announcement for successful rescue completion
+        const aiChatService = (globalThis as any).aiChatService;
+        if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+          try {
+            await aiChatService.sendFactionMessage(bot, {
+              messageType: "rescue_complete",
+              targetName: target.username,
+              isMayday: isMaydayTarget,
+              isBot: !isMaydayTarget,
+              currentSystem: bot.system,
+              targetSystem: target.system,
+              targetPoi: target.poi || undefined,
+            });
+          } catch (e) {
+            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
+          }
+        }
       }
     } else if (target.docked) {
       // Target is docked — dock at same station and send gift
@@ -1797,6 +1910,24 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         }
 
         ctx.log(isMaydayTarget ? "mayday" : "rescue", `Delivery complete for ${target.username}!`);
+
+        // Send faction chat announcement for successful rescue completion
+        const aiChatService = (globalThis as any).aiChatService;
+        if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+          try {
+            await aiChatService.sendFactionMessage(bot, {
+              messageType: "rescue_complete",
+              targetName: target.username,
+              isMayday: isMaydayTarget,
+              isBot: !isMaydayTarget,
+              currentSystem: bot.system,
+              targetSystem: target.system,
+              targetPoi: target.poi || undefined,
+            });
+          } catch (e) {
+            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
+          }
+        }
       }
     } else {
       // Target is in space — jettison fuel cells for them to scavenge
@@ -1815,6 +1946,24 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
           } else {
             ctx.log(isMaydayTarget ? "mayday" : "rescue", `Fuel cells jettisoned at ${target.poi || bot.poi} — ${target.username} should scavenge them`);
+
+            // Send faction chat announcement for successful rescue completion
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+              try {
+                await aiChatService.sendFactionMessage(bot, {
+                  messageType: "rescue_complete",
+                  targetName: target.username,
+                  isMayday: isMaydayTarget,
+                  isBot: !isMaydayTarget,
+                  currentSystem: bot.system,
+                  targetSystem: target.system,
+                  targetPoi: target.poi || undefined,
+                });
+              } catch (e) {
+                ctx.log("warn", `AI faction message (complete) failed: ${e}`);
+              }
+            }
           }
         }
       } else {
@@ -1835,6 +1984,24 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
               message: "Emergency credits — dock here to collect and refuel!",
             });
             ctx.log(isMaydayTarget ? "mayday" : "rescue", `Sent ${settings.rescueCredits} credits to ${target.username}'s storage at ${station.name}`);
+
+            // Send faction chat announcement for successful rescue completion
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+              try {
+                await aiChatService.sendFactionMessage(bot, {
+                  messageType: "rescue_complete",
+                  targetName: target.username,
+                  isMayday: isMaydayTarget,
+                  isBot: !isMaydayTarget,
+                  currentSystem: bot.system,
+                  targetSystem: target.system,
+                  targetPoi: target.poi || undefined,
+                });
+              } catch (e) {
+                ctx.log("warn", `AI faction message (complete) failed: ${e}`);
+              }
+            }
           }
         }
       }

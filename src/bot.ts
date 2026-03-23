@@ -5,7 +5,7 @@ import { debugLog } from "./debug.js";
 import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
-import { detectCustomsMessage, logCustomsStop } from "./customs.js";
+import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse } from "./customs.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -140,7 +140,18 @@ export class Bot {
     system: string;
     poi: string;
     outcome: "pending" | "cleared" | "contraband" | "evasion" | null;
-  } = { active: false, since: 0, system: "", poi: "", outcome: null };
+    aiResponseSent: boolean; // Track if AI response was already sent
+  } = { active: false, since: 0, system: "", poi: "", outcome: null, aiResponseSent: false };
+
+  /** Timestamp when customs hold was last cleared (prevents rapid re-triggering). */
+  private customsClearedAt: number = 0;
+
+  /** Track last customs message content to prevent duplicate processing. */
+  private lastCustomsMessage: string = "";
+  private lastCustomsMessageTime: number = 0;
+
+  /** Cooldown after customs clears before new hold can start (prevents rapid re-triggering). */
+  private static readonly CUSTOMS_COOLDOWN_MS = 30000; // 30 seconds
 
   /** Optional callback for routing log output (e.g. to TUI). */
   onLog?: (username: string, category: string, message: string) => void;
@@ -209,8 +220,9 @@ export class Bot {
 
   /** Execute an API command, log the result, handle notifications. */
   async exec(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
-    // Block ALL commands while customs hold is active (except get_status which is needed for refresh)
-    if (this.isCustomsHold() && command !== "get_status") {
+    // Block travel/jump commands while customs hold is active (allow chat and get_nearby for interaction)
+    const blockedCommands = new Set(["jump", "travel", "dock", "undock", "mine", "salvage", "buy", "sell"]);
+    if (this.isCustomsHold() && blockedCommands.has(command)) {
       this.log("customs", `⏳ Customs hold ACTIVE - blocking ${command} until clearance...`);
       const outcome = await this.waitForCustomsClear();
       this.log("customs", `✅ Customs clearance received (outcome: ${outcome}), resuming ${command}`);
@@ -219,6 +231,18 @@ export class Bot {
     this._lastAction = command;
     debugLog("bot:exec", `${this.username} > ${command}`, payload);
     let resp = await this.api.execute(command, payload);
+
+    // Handle full login required (after too many session recovery failures)
+    if (resp.error && resp.error.code === "full_login_required") {
+      this.log("system", "Full login required due to session recovery failures, performing login...");
+      const loggedIn = await this.login();
+      if (loggedIn) {
+        this.log("system", "Full login successful, retrying command...");
+        resp = await this.api.execute(command, payload);
+      } else {
+        this.log("error", "Full login failed");
+      }
+    }
 
     // After jump/travel commands in empire space, wait for customs messages
     // This is the PROACTIVE check - wait 2 seconds minimum for customs to respond
@@ -322,6 +346,7 @@ export class Bot {
     }
 
     this.log("system", "Login successful");
+    this.api.resetFullLoginFlag();
     await this.refreshStatus();
     return true;
   }
@@ -520,7 +545,16 @@ export class Bot {
 
     // Try to resume session from disk first (fast, no login delay)
     // If resume fails, fall back to full login
-    if (this.api.getSession()) {
+    if (this.api.needsFullLogin()) {
+      // Full login required due to too many session recovery failures
+      this.log("system", "Full login required (session recovery failed too many times)...");
+      const loggedIn = await this.login();
+      if (!loggedIn) {
+        this._state = "error";
+        throw new Error(this._error || "Login failed");
+      }
+      this.api.resetFullLoginFlag();
+    } else if (this.api.getSession()) {
       this.log("system", "Using existing in-memory session");
     } else if (await this.resumeSession()) {
       // Session resumed successfully from disk
@@ -646,12 +680,19 @@ export class Bot {
    * Start a customs hold - blocks travel/jump actions until cleared.
    */
   startCustomsHold(): void {
+    // Don't restart if already active - prevents timer reset and AI response spam
+    if (this.customsHold.active) {
+      this.log("customs", "📋 Customs hold already active - ignoring duplicate stop request");
+      return;
+    }
+    
     this.customsHold = {
       active: true,
       since: Date.now(),
       system: this.system,
       poi: this.poi,
       outcome: "pending",
+      aiResponseSent: false, // Fresh hold = allow AI response
     };
     this.log("customs", `🛑 CUSTOMS HOLD: Awaiting inspection at ${this.system}/${this.poi}...`);
   }
@@ -660,11 +701,16 @@ export class Bot {
    * Clear the customs hold after scan completes.
    */
   clearCustomsHold(outcome: "cleared" | "contraband" | "evasion"): void {
-    if (!this.customsHold.active) return;
-    
+    if (!this.customsHold.active && this.customsHold.outcome === null) {
+      this.log("customs_debug", `Clear received but no active hold (outcome: ${outcome})`);
+      return;
+    }
+
     this.customsHold.outcome = outcome;
     this.customsHold.active = false;
-    this.log("customs", `✅ CUSTOMS CLEARED: ${outcome}`);
+    this.customsHold.aiResponseSent = false; // Reset for next customs stop
+    this.customsClearedAt = Date.now(); // Set cooldown timestamp
+    this.log("customs", `✅ CUSTOMS CLEARED: ${outcome} (30s cooldown)`);
   }
 
   /**
@@ -738,6 +784,11 @@ export class Bot {
           const sender = (data.sender as string) || "Unknown";
           const content = (data.content as string) || "";
 
+          // Skip messages from self (prevent processing our own AI responses)
+          if (sender === this.username) {
+            continue;
+          }
+
           this.log("chat", `Received [${channel}] ${sender}: ${content}`);
           
           // Track player name from chat (but NOT from MAYDAY messages - those can be fake/pirate names)
@@ -763,11 +814,70 @@ export class Bot {
             }
           }
 
-          // Check for CUSTOMS inspection messages
+          // Check for CUSTOMS inspection messages addressed to THIS BOT
           if (channel === "system" || channel === "local") {
+            // Only process if sender is actually a customs agent
+            const senderLower = sender.toLowerCase();
+            const isFromCustoms = 
+              senderLower.startsWith("[customs]") || 
+              senderLower.startsWith("confederacy customs") ||
+              senderLower.includes("customs i -") ||
+              senderLower.includes("customs ii -") ||
+              senderLower.includes("customs iii -");
+            
+            if (!isFromCustoms) {
+              // Skip - this is a player message, not a customs agent
+              continue;
+            }
+            
             const customsDetection = detectCustomsMessage(content);
             if (customsDetection.type !== "none") {
+              // Check if message is addressed to THIS bot (by player name or ship name)
+              const lowerContent = content.toLowerCase();
+              const lowerUsername = this.username.toLowerCase();
+              const lowerShipName = (this.shipName || "").toLowerCase();
+              
+              // Check if username appears in message (customs messages use player name)
+              const mentionsUsername = lowerContent.includes(lowerUsername);
+              
+              // Also check ship name as fallback
+              const mentionsShip = lowerShipName && (
+                lowerContent.includes(lowerShipName) ||
+                lowerContent.includes(lowerShipName.replace(/\s+/g, ""))
+              );
+              
+              const isAddressedToBot = mentionsUsername || mentionsShip;
+              
+              this.log("customs_debug", `Customs check: user="${this.username}", ship="${this.shipName}", mentionsUser=${mentionsUsername}, mentionsShip=${mentionsShip}, addressed=${isAddressedToBot}`);
+              
+              if (!isAddressedToBot) {
+                // Skip customs messages for other players/ships
+                this.log("customs_debug", `Skipping customs message - not addressed to this bot`);
+                continue;
+              }
+              
+              // CRITICAL: Skip if we just cleared customs (cooldown period)
+              const now = Date.now();
+              if (this.customsClearedAt && now - this.customsClearedAt < Bot.CUSTOMS_COOLDOWN_MS) {
+                const remaining = Math.round((Bot.CUSTOMS_COOLDOWN_MS - (now - this.customsClearedAt)) / 1000);
+                this.log("customs_debug", `Skipping customs message - in ${remaining}s cooldown period`);
+                continue;
+              }
+              
+              // Deduplicate: ignore if same message content within 10 seconds
+              if (content === this.lastCustomsMessage && now - this.lastCustomsMessageTime < 10000) {
+                this.log("customs_debug", "Skipping duplicate customs message");
+                continue;
+              }
+              this.lastCustomsMessage = content;
+              this.lastCustomsMessageTime = now;
+              
+              this.log("customs_debug", `Detection result: ${customsDetection.type}, keywords: ${customsDetection.matchedKeywords.join(", ")}`);
+
               this.log("customs", `CUSTOMS detected [${customsDetection.type}]: ${sender} - ${content.slice(0, 100)}`);
+
+              // Get bot's customs statistics for AI response
+              const customsStats = getBotCustomsStats(this.username);
 
               // Handle customs hold state
               if (customsDetection.type === "stop_request") {
@@ -775,25 +885,47 @@ export class Bot {
                 this.startCustomsHold();
                 this.log("customs", "📋 Scan in progress - waiting for clearance...");
                 logCustomsStop(this.username, this.system, this.poi, "pending");
+                
+                // Send AI chat response to customs (only once per entire customs encounter)
+                // Check both aiResponseSent flag AND if we're still in the same hold session
+                if (!this.customsHold.aiResponseSent) {
+                  sendCustomsChatResponse(this, (cat, msg) => this.log(cat, msg), {
+                    messageType: "stop_request",
+                    customsMessage: content,
+                    botStops: customsStats.totalStops,
+                  });
+                  this.customsHold.aiResponseSent = true;
+                  this.log("customs_debug", "AI customs response sent");
+                } else {
+                  this.log("customs_debug", "AI response already sent for this customs encounter - skipping");
+                }
               } else if (customsDetection.type === "cleared") {
                 // Clear the hold - scan complete, all good
                 this.clearCustomsHold("cleared");
                 logCustomsStop(this.username, this.system, this.poi, "cleared");
+                // No AI response for clearance - just log and continue
               } else if (customsDetection.type === "contraband") {
                 // Clear hold - contraband found, penalty process complete
                 this.clearCustomsHold("contraband");
                 this.log("customs", "⚠️ Contraband detected - penalty process complete");
                 logCustomsStop(this.username, this.system, this.poi, "contraband");
+                // No AI response for contraband - just log and continue
               } else if (customsDetection.type === "evasion_warning") {
                 // Clear hold - evasion noted, process complete
                 this.clearCustomsHold("evasion");
                 this.log("customs", "⚠️ Evasion warning - process complete");
                 logCustomsStop(this.username, this.system, this.poi, "evasion");
+                // No AI response for evasion - just log and continue
               }
             }
+            
+            // Don't forward customs messages to general AI Chat service
+            // (we handle them separately with sendCustomsChatResponse)
+            this.log("customs_debug", "Customs message - skipping general AI Chat forwarding");
+            continue; // Skip the addChatMessage() call below
           }
 
-          // Route to AI chat handler if available
+          // Route NON-customs messages to AI chat handler
           if (aiChatService && typeof aiChatService.addChatMessage === "function") {
             aiChatService.addChatMessage({
               sender,
@@ -803,6 +935,7 @@ export class Bot {
               botUsername: this.username,
               botSystem: this.system,
               botPoi: this.poi,
+              targetId: channel === "private" ? (data.sender_id as string) : undefined,
             });
             this.log("ai_chat", `Forwarded to AI Chat service: ${sender}`);
           } else {

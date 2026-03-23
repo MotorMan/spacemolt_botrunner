@@ -682,13 +682,13 @@ function connect() {
         if (msg.username && msg.line) {
           if (!botLogBuffers[msg.username]) botLogBuffers[msg.username] = [];
           botLogBuffers[msg.username].push(msg.line);
-          if (botLogBuffers[msg.username].length > 200) botLogBuffers[msg.username].shift();
+          if (botLogBuffers[msg.username].length > 1000) botLogBuffers[msg.username].shift();
           if (profileBot === msg.username) appendBotLogLine(msg.line);
         }
         break;
       case 'factionLog':
         factionLogLines.push(msg.line);
-        if (factionLogLines.length > 200) factionLogLines.shift();
+        if (factionLogLines.length > 1000) factionLogLines.shift();
         if (factionActivePanel === 'activity') appendFactionLogLine(msg.line);
         // Also update stats tab activity log if visible
         if (document.getElementById('page-stats')?.classList.contains('active')) {
@@ -5139,6 +5139,7 @@ function renderAiChatSettings(panel) {
   const respondToSystem = ac.respondToSystem ?? false;
   const personality = ac.personality || '';
   const lockDurationSec = ac.lockDurationSec ?? 60;
+  const conversationCooldownSec = ac.conversationCooldownSec ?? 15;
 
   const inputStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box"`;
   const textareaStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box;min-height:150px;font-family:monospace;font-size:12px;white-space:pre-wrap"`;
@@ -5200,6 +5201,14 @@ function renderAiChatSettings(panel) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Conversation Cooldown (seconds)</div>
+        <div class="setting-hint">Minimum time between AI responses in the same conversation. Prevents spam and allows natural conversation flow.</div>
+      </div>
+      <input type="number" id="set-aichat-conversationCooldownSec" min="5" max="120" value="${conversationCooldownSec}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Response Modes</div>
         <div class="setting-hint">When should the AI respond to messages?</div>
       </div>
@@ -5250,6 +5259,7 @@ function saveAiChatSettings() {
     respondToSystem: document.getElementById('set-aichat-respondToSystem').checked,
     personality: document.getElementById('set-aichat-personality').value.trim(),
     lockDurationSec: parseInt(document.getElementById('set-aichat-lockDurationSec').value) || 60,
+    conversationCooldownSec: parseInt(document.getElementById('set-aichat-conversationCooldownSec').value) || 15,
   };
   send({ type: 'saveSettings', routine: 'ai_chat', settings: s });
   settings.ai_chat = s;
@@ -5322,8 +5332,8 @@ function appendLines(el, panel, lines) {
   el.prepend(fragment);
   if (autoScroll[panel]) el.scrollTop = 0;
 
-  // Limit to 200 lines maximum
-  while (el.children.length > 200) {
+  // Limit to 1000 lines maximum //mm
+  while (el.children.length > 1000) {
     el.removeChild(el.lastChild);
   }
 }
@@ -5333,8 +5343,8 @@ function appendLine(panel, line) {
   const el = elMap[panel];
   if (!el) return;
 
-  // Limit to 200 lines maximum before adding new one
-  while (el.children.length >= 200) {
+  // Limit to 1000 lines maximum before adding new one //mm
+  while (el.children.length >= 1000) {
     el.removeChild(el.lastChild);
   }
 

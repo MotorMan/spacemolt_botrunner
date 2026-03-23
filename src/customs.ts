@@ -20,24 +20,8 @@ function sleep(ms: number): Promise<void> {
 
 // ── Types ────────────────────────────────────────────────────
 
-export interface CustomsStopRecord {
-  botName: string;
-  system: string;
-  poi: string;
-  timestamp: number;
-  outcome: "cleared" | "contraband" | "evasion" | "pending";
-  chatMessages: string[];
-}
-
 export interface CustomsStats {
   version: 1;
-  stops: Array<{
-    botName: string;
-    system: string;
-    poi: string;
-    count: number;
-    lastStop: number;
-  }>;
   botTotals: Record<string, number>; // botName -> total stops across all systems
   systemTotals: Record<string, number>; // systemId -> total stops by all bots
 }
@@ -69,6 +53,13 @@ const CUSTOMS_CLEAR_KEYWORDS = [
   "cargo is compliant",
   "cleared to proceed",
   "Safe travels",
+  "is cleared",
+  "items verified",
+  "verified against",
+  "Carry on",
+  "hold checks out",
+  "Inspection concluded",
+  "free to continue",
 ];
 
 const CUSTOMS_EVASION_KEYWORDS = [
@@ -116,7 +107,6 @@ function loadCustomsStats(): CustomsStats {
   
   return {
     version: 1,
-    stops: [],
     botTotals: {},
     systemTotals: {},
   };
@@ -137,52 +127,27 @@ function saveCustomsStats(stats: CustomsStats): void {
 export function logCustomsStop(
   botName: string,
   system: string,
-  poi: string,
   outcome: "cleared" | "contraband" | "evasion" | "pending" = "pending"
 ): void {
   const stats = loadCustomsStats();
-  
+
   // Update bot totals
   stats.botTotals[botName] = (stats.botTotals[botName] || 0) + 1;
-  
+
   // Update system totals
   stats.systemTotals[system] = (stats.systemTotals[system] || 0) + 1;
-  
-  // Update specific stop record
-  const existingStop = stats.stops.find(
-    s => s.botName === botName && s.system === system && s.poi === poi
-  );
-  
-  if (existingStop) {
-    existingStop.count++;
-    existingStop.lastStop = Date.now();
-  } else {
-    stats.stops.push({
-      botName,
-      system,
-      poi,
-      count: 1,
-      lastStop: Date.now(),
-    });
-  }
-  
+
   saveCustomsStats(stats);
 }
 
 /** Get customs statistics for a specific bot (for AI chat context). */
 export function getBotCustomsStats(botName: string): {
   totalStops: number;
-  systemBreakdown: Array<{ system: string; poi: string; count: number }>;
 } {
   const stats = loadCustomsStats();
-  
-  const systemBreakdown = stats.stops
-    .filter(s => s.botName === botName)
-    .map(s => ({ system: s.system, poi: s.poi, count: s.count }));
-  
+
   return {
     totalStops: stats.botTotals[botName] || 0,
-    systemBreakdown,
   };
 }
 
@@ -234,17 +199,39 @@ export function isCustomsShip(shipName: string): boolean {
 // ── Customs inspection handler ───────────────────────────────
 
 /**
+ * Check if a chat message mentions the bot's ship name.
+ * Only trigger customs handling when the bot is specifically addressed.
+ */
+function messageMentionsBotShip(content: string, botShipName: string): boolean {
+  if (!botShipName) return false;
+  
+  const lowerContent = content.toLowerCase();
+  const lowerShipName = botShipName.toLowerCase();
+  
+  // Check for exact ship name match
+  if (lowerContent.includes(lowerShipName)) return true;
+  
+  // Check for ship name without spaces (handles some formatting variations)
+  const shipNameNoSpaces = lowerShipName.replace(/\s+/g, "");
+  if (shipNameNoSpaces && lowerContent.includes(shipNameNoSpaces)) return true;
+  
+  return false;
+}
+
+/**
  * Wait for customs inspection to complete.
  * Should be called when entering a new system.
- * 
+ *
  * @param bot - The bot instance
  * @param log - Logging function
+ * @param targetSystem - The system we jumped to (use this instead of bot.system which may be unstable during jumps)
  * @param maxWaitMs - Maximum time to wait for customs message (default 5000ms)
  * @returns Object with inspection result
  */
 export async function waitForCustomsInspection(
   bot: Bot,
   log: (category: string, message: string) => void,
+  targetSystem: string,
   maxWaitMs: number = 5000
 ): Promise<{
   wasStopped: boolean;
@@ -254,21 +241,23 @@ export async function waitForCustomsInspection(
   const chatMessages: string[] = [];
   let wasStopped = false;
   let outcome: "cleared" | "contraband" | "evasion" | "timeout" | "none" = "none";
-  
+
   log("customs", "Waiting for potential customs inspection...");
-  
+
   // Wait for customs message (1-5 seconds)
   const startTime = Date.now();
   const initialWaitMs = 1000; // Minimum wait for customs message
-  
+
   await sleep(initialWaitMs);
-  
-  // Check bot's recent chat log for customs messages
-  // We need to check if any customs messages appeared
+
+  // Check bot's recent chat log for customs messages mentioning THIS bot's ship
   const recentLogs = bot.actionLog.slice(-50); // Last 50 log entries
-  const customsLogs = recentLogs.filter(line => 
-    line.includes("[chat]") && CUSTOMS_KEYWORDS.some(k => line.toLowerCase().includes(k.toLowerCase()))
-  );
+  const customsLogs = recentLogs.filter((line: string) => {
+    if (!line.includes("[chat]")) return false;
+    if (!line.includes("CUSTOMS")) return false;
+    // Only process messages that mention this bot's ship name
+    return messageMentionsBotShip(line, bot.shipName);
+  });
   
   if (customsLogs.length > 0) {
     wasStopped = true;
@@ -298,15 +287,18 @@ export async function waitForCustomsInspection(
     // If we got a stop request, wait for completion
     if (outcome === "timeout") {
       log("customs", "Waiting for scan to complete...");
-      
+
       // Poll for completion (up to maxWaitMs total)
       while (Date.now() - startTime < maxWaitMs) {
         await sleep(1000);
-        
+
         const updatedLogs = bot.actionLog.slice(-20);
-        const newCustomsLogs = updatedLogs.filter(line =>
-          line.includes("[chat]") && CUSTOMS_KEYWORDS.some(k => line.toLowerCase().includes(k.toLowerCase()))
-        );
+        const newCustomsLogs = updatedLogs.filter((line: string) => {
+          if (!line.includes("[chat]")) return false;
+          if (!line.includes("CUSTOMS")) return false;
+          // Only process messages that mention this bot's ship name
+          return messageMentionsBotShip(line, bot.shipName);
+        });
         
         for (const logLine of newCustomsLogs) {
           if (!chatMessages.includes(logLine)) {
@@ -342,7 +334,9 @@ export async function waitForCustomsInspection(
     
     // Log the stop
     if (wasStopped) {
-      logCustomsStop(bot.username, bot.system, bot.poi, outcome === "timeout" ? "cleared" : outcome);
+      const logOutcome: "cleared" | "contraband" | "evasion" | "pending" = 
+        outcome === "timeout" || outcome === "none" ? "cleared" : outcome;
+      logCustomsStop(bot.username, targetSystem, logOutcome);
     }
   } else {
     log("customs", "No customs inspection required");

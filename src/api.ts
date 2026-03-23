@@ -3,7 +3,7 @@ import { commandLog } from "./commandLogger.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { debugLog } from "./debug.js";
 import { SessionManager } from "./session.js";
-import { notifySessionLoss } from "./botmanager.js";
+import { massDisconnectDetector } from "./massdisconnect.js";
 import {
   logSession,
   logSessionCreate,
@@ -38,6 +38,7 @@ const USER_AGENT = "SpaceMolt-BotRunner-LT1428-MODDED";
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;
 const RECONNECT_BASE_DELAY = 5_000;
+const MAX_SESSION_RECOVERIES = 10; // After this many failures, force full login
 
 // Global session creation rate limiter - prevents rapid session spam
 let lastSessionCreateTime = 0;
@@ -171,6 +172,8 @@ export class SpaceMoltAPI {
   private _sessionManager: SessionManager | null = null;
   private _lastRecoveryTime = 0;
   private _recoveryCount = 0;
+  private _recoveryInProgress = false;
+  private _forceFullLogin = false;
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
@@ -248,6 +251,17 @@ export class SpaceMoltAPI {
     return this.session;
   }
 
+  /** Check if full login is required (after too many session recovery failures) */
+  needsFullLogin(): boolean {
+    return this._forceFullLogin;
+  }
+
+  /** Reset the full login flag after successful login */
+  resetFullLoginFlag(): void {
+    this._forceFullLogin = false;
+    this._recoveryCount = 0;
+  }
+
   private isV2Command(command: string, payload?: Record<string, unknown>): boolean {
     return V2_DIRECT_COMMANDS.has(command)
       || (V2_ROUTED_COMMANDS.has(command) && !!payload?.action && typeof payload.action === "string");
@@ -309,59 +323,74 @@ export class SpaceMoltAPI {
       // Session invalid - log full response and create new session
       if (code === "session_invalid" || code === "session_expired" || code === "not_authenticated") {
         // Notify mass disconnect detector (tracks unique bots losing sessions)
-        notifySessionLoss(botName);
-      
-        // Rate limit session recovery attempts to prevent cascading failures
-        const now = Date.now();
-        const timeSinceLastRecovery = now - this._lastRecoveryTime;
+        massDisconnectDetector.trackSessionLoss(botName);
 
-        // Reset recovery count if it's been more than 10 seconds since last recovery
-        if (timeSinceLastRecovery > 10000) {
-          this._recoveryCount = 0;
+        // Check if recovery is already in progress - if so, wait for it
+        if (this._recoveryInProgress) {
+          log("system", `${botName} recovery already in progress, waiting...`);
+          await sleep(1000);
+          return this.execute(command, payload);
         }
 
-        this._recoveryCount++;
-        this._lastRecoveryTime = now;
-
-        // If we've had too many recoveries in a short time, wait before trying again
-        if (this._recoveryCount > 5) {
-          const waitTime = 5000; // Wait 5 seconds
-          log("wait", `${botName} too many session recoveries (${this._recoveryCount}), waiting ${waitTime}ms...`);
-          await sleep(waitTime);
-        }
-
-        // Log full error response for debugging
-        logSessionError(botName, command, payload, code, resp.error.message || "", resp);
-        logSessionInvalidate(botName, "API returned session error", code, resp.error.message, this.session?.id);
-
-        // Clear sessions - the current session is invalid
-        debugLog("api:execute", `${botName} session invalid, clearing session`);
-        const oldSessionId = this.session?.id;
-        const oldV2SessionId = this.v2Session?.id;
-        this.session = null;
-        // Only clear V2 session if this command was using V2
-        // This prevents unnecessary V2 session churn for V1-only commands
-        if (needsV2) {
-          this.v2Session = null;
-        }
+        this._recoveryInProgress = true;
 
         try {
-          await this.ensureSession();
-          // Only ensure V2 session if this command actually needs it
-          if (needsV2) await this.ensureV2Session();
-          logSessionChange(botName, oldSessionId || null, (this.session as ApiSession | null)?.id || "", "recovery from session error");
-          if (needsV2 && (oldV2SessionId || this.v2Session)) {
-            logSessionDetail(botName, "V2_SESSION_DURING_RECOVERY", "V2 session ensured during recovery", {
-              hadV2: !!oldV2SessionId,
-              newV2Session: (this.v2Session as ApiSession | null)?.id?.slice(0, 8) || "none",
-            });
+          // Cap recovery attempts - force full login after too many failures
+          if (this._recoveryCount >= MAX_SESSION_RECOVERIES) {
+            log("system", `${botName} exceeded max session recoveries (${MAX_SESSION_RECOVERIES}), full login required`);
+            this._forceFullLogin = true;
+            this._recoveryCount = 0;
+            this.session = null;
+            this.v2Session = null;
+            return { error: { code: "full_login_required", message: "Session recovery failed too many times, full login required" } };
           }
-          return this.execute(command, payload);
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          log("error", `${botName} session renewal failed: ${msg}`);
-          logSessionDetail(botName, "RENEWAL_FAILED", msg, { error: msg, command });
-          return { error: { code: "session_renewal_failed", message: msg } };
+
+          this._recoveryCount++;
+          this._lastRecoveryTime = Date.now();
+
+          // If we've had too many recoveries in a short time, wait before trying again
+          if (this._recoveryCount > 5) {
+            const waitTime = 5000; // Wait 5 seconds
+            log("wait", `${botName} too many session recoveries (${this._recoveryCount}), waiting ${waitTime}ms...`);
+            await sleep(waitTime);
+          }
+
+          // Log full error response for debugging
+          logSessionError(botName, command, payload, code, resp.error.message || "", resp);
+          logSessionInvalidate(botName, "API returned session error", code, resp.error.message, this.session?.id);
+
+          // Clear sessions - the current session is invalid
+          debugLog("api:execute", `${botName} session invalid, clearing session`);
+          const oldSessionId = this.session?.id;
+          const oldV2SessionId = this.v2Session?.id;
+          this.session = null;
+          // Only clear V2 session if this command was using V2
+          if (needsV2) {
+            this.v2Session = null;
+          }
+
+          try {
+            await this.ensureSession();
+            // Only ensure V2 session if this command actually needs it
+            if (needsV2) await this.ensureV2Session();
+            logSessionChange(botName, oldSessionId || null, (this.session as ApiSession | null)?.id || "", "recovery from session error");
+            if (needsV2 && (oldV2SessionId || this.v2Session)) {
+              logSessionDetail(botName, "V2_SESSION_DURING_RECOVERY", "V2 session ensured during recovery", {
+                hadV2: !!oldV2SessionId,
+                newV2Session: (this.v2Session as ApiSession | null)?.id?.slice(0, 8) || "none",
+              });
+            }
+            // Reset recovery count on successful session creation
+            this._recoveryCount = 0;
+            return this.execute(command, payload);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log("error", `${botName} session renewal failed: ${msg}`);
+            logSessionDetail(botName, "RENEWAL_FAILED", msg, { error: msg, command });
+            return { error: { code: "session_renewal_failed", message: msg } };
+          }
+        } finally {
+          this._recoveryInProgress = false;
         }
       }
     }
@@ -377,6 +406,8 @@ export class SpaceMoltAPI {
     }
 
     if (!resp.error) {
+      // Success - reset recovery count
+      this._recoveryCount = 0;
       if (cacheTtl !== undefined) {
         this._cache.set(cacheKey, resp, cacheTtl);
       }

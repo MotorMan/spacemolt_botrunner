@@ -24,6 +24,7 @@ import { setLogSink } from "./ui.js";
 import { debugLog } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { AiChatService } from "./aichat_service.js";
+import { massDisconnectDetector } from "./massdisconnect.js";
 
 interface BotState {
   wasRunning: boolean;
@@ -40,51 +41,6 @@ let aiChatService: AiChatService | null = null;
 /** Get list of discovered bot usernames (for API use). */
 export function getDiscoveredBots(): string[] {
   return [...bots.keys()];
-}
-
-// ── Mass Disconnect Detection ───────────────────────────────
-
-const MASS_DISCONNECT_THRESHOLD = 15;  // Trigger if 15+ unique bots lose sessions
-const DISCONNECT_WINDOW_MS = 5000;     // Within 5 seconds
-
-interface SessionLossEvent {
-  botName: string;
-  timestamp: number;
-}
-
-let sessionLossEvents: SessionLossEvent[] = [];
-let shutdownInitiated = false;
-
-/** Track a session loss event and check for mass disconnect. */
-function trackSessionLoss(botName: string): void {
-  if (shutdownInitiated) return;  // Already shutting down
-
-  const now = Date.now();
-  
-  // Add new session loss event
-  sessionLossEvents.push({ botName, timestamp: now });
-  
-  // Remove old events outside the window
-  sessionLossEvents = sessionLossEvents.filter(e => now - e.timestamp < DISCONNECT_WINDOW_MS);
-  
-  // Count UNIQUE bots that lost sessions in the window
-  const uniqueBots = new Set(sessionLossEvents.map(e => e.botName));
-  
-  // Check if threshold exceeded
-  if (uniqueBots.size >= MASS_DISCONNECT_THRESHOLD) {
-    shutdownInitiated = true;
-    const affectedBots = [...uniqueBots].join(", ");
-    server.logSystem(`⚠️ MASS SESSION INVALIDATION DETECTED: ${uniqueBots.size} unique bots lost sessions within ${DISCONNECT_WINDOW_MS / 1000}s`);
-    server.logSystem(`Affected bots: ${affectedBots}`);
-    server.logSystem(`Initiating graceful shutdown for restart...`);
-    // Trigger graceful shutdown with restart flag
-    (globalThis as any).shutdownServer("mass_session_loss", true);
-  }
-}
-
-/** Export function for API module to call on session invalidation */
-export function notifySessionLoss(botName: string): void {
-  trackSessionLoss(botName);
 }
 
 const ROUTINES: Record<string, { name: string; fn: Routine }> = {
@@ -583,6 +539,15 @@ async function main(): Promise<void> {
   // Expose on globalThis for bot.ts to access
   (globalThis as any).aiChatService = aiChatService;
   server.logSystem("AI Chat service initialized");
+
+  // Set up mass disconnect detector callback
+  massDisconnectDetector.setTriggerCallback((affectedBots) => {
+    server.logSystem(`⚠️ MASS SESSION INVALIDATION DETECTED: ${affectedBots.length} unique bots lost sessions within 5s`);
+    server.logSystem(`Affected bots: ${affectedBots.join(", ")}`);
+    server.logSystem(`Initiating graceful shutdown for restart...`);
+    (globalThis as any).shutdownServer("mass_session_loss", true);
+  });
+  server.logSystem("Mass disconnect detector initialized");
 
   server.logSystem("SpaceMolt Bot Manager v0.2");
   server.logSystem("Loading saved sessions...");

@@ -168,6 +168,7 @@ function getAiChatSettings(): {
   respondToSystem: boolean;
   personality: string;
   lockDurationSec: number;
+  conversationCooldownSec: number;
 } {
   const all = readSettings();
   const s = (all.ai_chat || {}) as Record<string, unknown>;
@@ -199,6 +200,7 @@ function getAiChatSettings(): {
     respondToSystem: (s.respondToSystem as boolean) ?? false,
     personality: (s.personality as string) || DEFAULT_PERSONALITY,
     lockDurationSec: (s.lockDurationSec as number) || 60,
+    conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
   };
 }
 
@@ -367,8 +369,16 @@ export class AiChatService {
   
   // Conversation tracking: prevent infinite loops
   // Track last AI response time per channel+sender pair
+  // Cooldown is configurable via settings (default 15 seconds)
   private conversationCooldowns = new Map<string, number>();
-  private readonly CONVERSATION_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes between AI responses in same conversation
+  private getConversationCooldownMs(): number {
+    try {
+      const settings = getAiChatSettings();
+      return (settings.conversationCooldownSec || 15) * 1000;
+    } catch {
+      return 15 * 1000; // fallback to 15 seconds
+    }
+  }
   
   // Track consecutive AI responses to prevent loops
   private consecutiveResponses = new Map<string, number>();
@@ -433,23 +443,24 @@ export class AiChatService {
   private checkConversationLimits(channel: string, participants: string[]): { allowed: boolean; reason: string } {
     const now = Date.now();
     const convKey = this.getConversationKey(channel, participants);
-    
+    const cooldownMs = this.getConversationCooldownMs();
+
     // Check cooldown
     const lastResponse = this.conversationCooldowns.get(convKey);
     if (lastResponse !== undefined) {
       const timeSinceLast = now - lastResponse;
-      if (timeSinceLast < this.CONVERSATION_COOLDOWN_MS) {
-        const remaining = Math.round((this.CONVERSATION_COOLDOWN_MS - timeSinceLast) / 1000);
+      if (timeSinceLast < cooldownMs) {
+        const remaining = Math.round((cooldownMs - timeSinceLast) / 1000);
         return { allowed: false, reason: `cooldown (${remaining}s remaining)` };
       }
     }
-    
+
     // Check consecutive responses
     const consecutive = this.consecutiveResponses.get(convKey) || 0;
     if (consecutive >= this.MAX_CONSECUTIVE_RESPONSES) {
       return { allowed: false, reason: `max consecutive responses (${consecutive})` };
     }
-    
+
     return { allowed: true, reason: 'ok' };
   }
 
@@ -459,10 +470,11 @@ export class AiChatService {
   private recordResponse(channel: string, participants: string[], isHumanSender: boolean): void {
     const now = Date.now();
     const convKey = this.getConversationKey(channel, participants);
-    
+    const cooldownMs = this.getConversationCooldownMs();
+
     // Update cooldown
     this.conversationCooldowns.set(convKey, now);
-    
+
     // Update consecutive counter
     if (isHumanSender) {
       // Human spoke, reset counter
@@ -472,11 +484,11 @@ export class AiChatService {
       const current = this.consecutiveResponses.get(convKey) || 0;
       this.consecutiveResponses.set(convKey, current + 1);
     }
-    
+
     // Clean up old entries periodically
     if (this.conversationCooldowns.size > 100) {
       for (const [key, timestamp] of this.conversationCooldowns.entries()) {
-        if (now - timestamp > this.CONVERSATION_COOLDOWN_MS * 2) {
+        if (now - timestamp > cooldownMs * 2) {
           this.conversationCooldowns.delete(key);
           this.consecutiveResponses.delete(key);
         }
@@ -625,6 +637,29 @@ export class AiChatService {
   ): Promise<void> {
     // Monitor local, faction, system, and private chat
     if (msg.channel !== "local" && msg.channel !== "faction" && msg.channel !== "system" && msg.channel !== "private") {
+      return;
+    }
+
+    // For private messages: ALWAYS respond with the bot that received the message
+    // This prevents bot2 from responding to a DM intended for bot1
+    if (msg.channel === "private") {
+      const receivingBot = msg.botUsername;
+      if (!receivingBot) {
+        this.logFn("ai_chat_debug", "Private message received but no botUsername set - cannot respond");
+        return;
+      }
+
+      this.logFn("ai_chat_debug", `Private message to ${receivingBot} from ${msg.sender}`);
+
+      // Check if message mentions a different bot - if so, still let the receiving bot respond
+      // (the player DM'd this bot, so this bot should respond regardless of mentions)
+      const responder = this.selectResponderByMention(receivingBot);
+      if (!responder) {
+        this.logFn("ai_chat", `Bot ${receivingBot} not available to respond to private message`);
+        return;
+      }
+
+      await this.handleResponse(responder, msg, settings, msg.sender, true);
       return;
     }
 
@@ -1169,6 +1204,114 @@ Message:`;
         return { ok: true, message: cleanResponse };
       } else {
         this.logFn("error", `Private message to ${targetPlayer} failed: ${chatResp.error.message}`);
+        return { ok: false, error: chatResp.error.message };
+      }
+    } catch (llmErr) {
+      this.logFn("error", `LLM error: ${llmErr instanceof Error ? llmErr.message : String(llmErr)}`);
+      return { ok: false, error: llmErr instanceof Error ? llmErr.message : String(llmErr) };
+    }
+  }
+
+  /**
+   * Send a faction chat message with LLM-generated content.
+   * Used for announcing rescue operations to faction members.
+   */
+  async sendFactionMessage(
+    bot: Bot,
+    context: {
+      messageType: "rescue_start" | "rescue_arrived" | "rescue_complete" | "rescue_no_show";
+      targetName: string;
+      isMayday?: boolean;
+      isBot?: boolean;
+      currentSystem: string;
+      targetSystem: string;
+      targetPoi?: string;
+      targetFuelPct?: number;
+      jumps?: number;
+    },
+    personality?: string
+  ): Promise<{ ok: boolean; message?: string; error?: string }> {
+    const settings = getAiChatSettings();
+
+    const { messageType, targetName, isMayday = false, isBot = false, targetFuelPct, jumps } = context;
+
+    // Build situation description based on message type
+    let situation: string;
+    let styleGuide: string;
+
+    switch (messageType) {
+      case "rescue_start":
+        situation = isMayday
+          ? `You received a MAYDAY distress call from ${targetName} and are launching a rescue mission.`
+          : `One of your faction bots (${targetName}) needs emergency fuel rescue.`;
+        styleGuide = isMayday
+          ? "Be heroic and reassuring. Let faction members know you're responding to an emergency."
+          : "Be helpful and team-oriented. Let faction members know you're helping a fellow bot.";
+        break;
+      case "rescue_arrived":
+        situation = `You have arrived at ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""} to assist ${targetName}.`;
+        styleGuide = "Be confident and professional. Announce your arrival.";
+        break;
+      case "rescue_complete":
+        situation = `You have successfully refueled ${targetName} and they are now safe.`;
+        styleGuide = "Be triumphant and positive. Celebrate the successful rescue.";
+        break;
+      case "rescue_no_show":
+        situation = `You traveled all the way to ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""} to help ${targetName}, but they were not there.`;
+        styleGuide = "Be grumpy and annoyed. Express frustration about the wasted trip. Maybe mutter about being ghosted.";
+        break;
+    }
+
+    // Build system prompt for faction message generation
+    const systemPrompt = `${personality || "You are a rescue pilot in SpaceMolt."}
+
+Context:
+- Your callsign: ${bot.username}
+- You are currently in: ${context.currentSystem}
+- Target is in: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}${jumps ? ` (${jumps} jumps from your previous location)` : ""}
+- ${situation}
+- This message goes to FACTION chat (all faction members can see it)
+
+Task:
+Generate a brief faction chat message (max 2 sentences) about the rescue operation.
+
+Style:
+- Keep it natural and in-character
+- Be concise (faction chat is public)
+- ${styleGuide}
+- ${messageType === "rescue_no_show" ? "Show genuine annoyance - you wasted fuel and time!" : "Include relevant details (who, where, status) if appropriate"}
+- Don't be overly verbose`;
+
+    const userMessage = `Generate a faction chat message:
+
+Message type: ${messageType}
+Target: ${targetName} (${isBot ? "faction bot" : "player"}${isMayday ? ", MAYDAY distress call" : ""})
+${targetFuelPct ? `Their fuel level: ${targetFuelPct}%` : ""}
+Location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}
+${jumps ? `Jumps to get there: ${jumps}` : ""}
+
+Message:`;
+
+    const llmMessages: LlmMessage[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage },
+    ];
+
+    try {
+      const response = await callLlm(llmMessages, settings);
+      const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+
+      // Send faction chat message
+      const chatResp = await bot.exec("chat", {
+        channel: "faction",
+        content: cleanResponse,
+      });
+
+      if (!chatResp.error) {
+        this.logFn("ai_chat", `→ Faction chat: ${cleanResponse}`);
+        return { ok: true, message: cleanResponse };
+      } else {
+        this.logFn("error", `Faction message failed: ${chatResp.error.message}`);
         return { ok: false, error: chatResp.error.message };
       }
     } catch (llmErr) {

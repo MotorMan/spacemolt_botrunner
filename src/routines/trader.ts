@@ -113,25 +113,25 @@ async function recoverTradeSession(
   if (session.state === "in_transit" || session.state === "at_destination" || session.state === "selling") {
     // Verify the destination buyer still exists and price is still profitable
     const allBuys = mapStore.getAllBuyDemand();
-    const destBuyer = allBuys.find(b => 
-      b.itemId === session.itemId && 
-      b.systemId === session.destSystem && 
+    const destBuyer = allBuys.find(b =>
+      b.itemId === session.itemId &&
+      b.systemId === session.destSystem &&
       b.poiId === session.destPoi
     );
-    
+
     if (!destBuyer || destBuyer.quantity <= 0) {
       ctx.log("trade", `Destination buyer gone — finding alternative`);
       // Find alternative buyer
       const alternativeBuyers = allBuys
         .filter(b => b.itemId === session.itemId && b.price > 0)
         .sort((a, b) => b.price - a.price);
-      
+
       if (alternativeBuyers.length === 0) {
         ctx.log("error", "No alternative buyers found — abandoning session");
         await failTradeSession(session.botUsername, "No buyers available");
         return null;
       }
-      
+
       const bestAlt = alternativeBuyers[0];
       ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
       session = updateTradeSession(session.botUsername, {
@@ -147,6 +147,37 @@ async function recoverTradeSession(
       ctx.log("error", `Price dropped to ${destBuyer.price}cr (below cost ${session.buyPricePerUnit}cr) — abandoning`);
       await failTradeSession(session.botUsername, "Price below cost");
       return null;
+    }
+
+    // Validate that the destination POI actually has a station (can dock there)
+    const destSystem = mapStore.getSystem(session.destSystem);
+    const destPoiData = destSystem?.pois.find(p => p.id === session.destPoi);
+    const hasStation = destPoiData?.market && destPoiData.market.length > 0;
+
+    if (!hasStation) {
+      ctx.log("error", `Destination ${session.destPoiName} has no station — finding alternative buyer`);
+      const alternativeBuyers = allBuys
+        .filter(b => b.itemId === session.itemId && b.price > 0)
+        .sort((a, b) => b.price - a.price);
+
+      if (alternativeBuyers.length === 0) {
+        ctx.log("error", "No alternative buyers found — abandoning session");
+        await failTradeSession(session.botUsername, "No station at destination");
+        return null;
+      }
+
+      const bestAlt = alternativeBuyers[0];
+      ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
+      session = updateTradeSession(session.botUsername, {
+        destSystem: bestAlt.systemId,
+        destPoi: bestAlt.poiId,
+        destPoiName: bestAlt.poiName,
+        sellPricePerUnit: bestAlt.price,
+        sellQuantity: Math.min(session.sellQuantity, bestAlt.quantity),
+        totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, bestAlt.systemId, settings.fuelCostPerJump).jumps,
+        state: "in_transit" as const,
+        notes: (session.notes || "") + ` | Rerouted from ${session.destPoiName} (no station) to ${bestAlt.poiName}`,
+      })!;
     }
   }
   
@@ -564,10 +595,44 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         await bot.exec("travel", { target_poi: recoveredSession.destPoi });
         bot.poi = recoveredSession.destPoi;
       }
-      
-      await ensureDocked(ctx);
+
+      const dockResp = await bot.exec("dock");
+      if (dockResp.error && !dockResp.error.message.includes("already")) {
+        ctx.log("error", `Dock failed at destination: ${dockResp.error.message} — finding alternative buyer`);
+        // Destination has no station - find alternative buyer
+        const allBuys = mapStore.getAllBuyDemand();
+        const alternativeBuyers = allBuys
+          .filter(b => b.itemId === recoveredSession.itemId && b.price > 0)
+          .sort((a, b) => b.price - a.price);
+
+        if (alternativeBuyers.length === 0) {
+          ctx.log("error", "No alternative buyers found — abandoning session");
+          await failTradeSession(recoveredSession.botUsername, "No station at destination");
+          recoveredSessionHandled = true; // Mark as handled to prevent re-recovery
+          await ensureDocked(ctx);
+          await sleep(60000);
+          continue;
+        }
+
+        const bestAlt = alternativeBuyers[0];
+        ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
+        updateTradeSession(bot.username, {
+          destSystem: bestAlt.systemId,
+          destPoi: bestAlt.poiId,
+          destPoiName: bestAlt.poiName,
+          sellPricePerUnit: bestAlt.price,
+          sellQuantity: Math.min(recoveredSession.sellQuantity, bestAlt.quantity),
+          state: "in_transit",
+          notes: (recoveredSession.notes || "") + ` | Rerouted from ${recoveredSession.destPoiName} (no station) to ${bestAlt.poiName}`,
+        });
+        // Don't mark as handled - let the normal route selection pick it up
+        recoveredSessionHandled = false;
+        await ensureDocked(ctx);
+        continue; // Restart the loop with the updated session
+      }
+      bot.docked = true;
       ctx.log("trade", "Arrived at destination — proceeding to sell trade items");
-      
+
       // Mark as handled and skip remaining setup phases
       recoveredSessionHandled = true;
       // route, buyQty, investedCredits already set - will proceed to sell phase

@@ -18,6 +18,19 @@ export interface OreRecord {
   total_mined: number;
   times_seen: number;
   last_seen: string;
+  depleted?: boolean;
+  depleted_at?: string;
+}
+
+/** Depletion timeout in milliseconds - POIs can be re-checked after this long. */
+export const DEPLETION_TIMEOUT_MS = 3 * 60 * 60 * 1000; // 3 hours
+
+/** Check if an ore depletion has expired (can be re-mined). */
+export function isDepletionExpired(depletedAt: string | undefined, timeoutMs: number = DEPLETION_TIMEOUT_MS): boolean {
+  if (!depletedAt) return true;
+  const depletedTime = new Date(depletedAt).getTime();
+  const now = Date.now();
+  return (now - depletedTime) > timeoutMs;
 }
 
 export interface MarketRecord {
@@ -481,6 +494,7 @@ class MapStore {
       existing.total_mined++;
       existing.times_seen++;
       existing.last_seen = now();
+      existing.depleted = false; // Reset depleted flag on successful mining
     } else {
       poi.ores_found.push({
         item_id: oreItem.item_id,
@@ -492,6 +506,22 @@ class MapStore {
     }
 
     this.scheduleSave();
+  }
+
+  /** Mark an ore as depleted at a POI. */
+  markOreDepleted(systemId: string, poiId: string, oreId: string): void {
+    const sys = this.data.systems[systemId];
+    if (!sys) return;
+
+    const poi = sys.pois.find((p) => p.id === poiId);
+    if (!poi) return;
+
+    const existing = poi.ores_found.find((o) => o.item_id === oreId);
+    if (existing) {
+      existing.depleted = true;
+      existing.depleted_at = now();
+      this.scheduleSave();
+    }
   }
 
   /** Record a pirate sighting in a system. */

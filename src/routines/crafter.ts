@@ -29,6 +29,8 @@ function getCrafterSettings(): {
   enabledCategories: string[];
   refuelThreshold: number;
   repairThreshold: number;
+  categoryAssignments: Record<string, string[]>;
+  botQuotaOverrides: Record<string, Record<string, number>>;
 } {
   const all = readSettings();
   const c = all.crafter || {};
@@ -46,11 +48,17 @@ function getCrafterSettings(): {
   // Default enabled categories for when no specific recipes are configured
   const defaultCategories = ["Refining", "Components", "Consumables"];
   const enabledCategories = (c.enabledCategories as string[]) || defaultCategories;
+  // Per-bot category assignments: { botName: ["Refining", "Components"] }
+  const categoryAssignments = (c.categoryAssignments as Record<string, string[]>) || {};
+  // Per-bot quota overrides: { botName: { recipeId: limit } }
+  const botQuotaOverrides = (c.botQuotaOverrides as Record<string, Record<string, number>>) || {};
   return {
     craftLimits,
     enabledCategories,
     refuelThreshold: (c.refuelThreshold as number) || 50,
     repairThreshold: (c.repairThreshold as number) || 40,
+    categoryAssignments,
+    botQuotaOverrides,
   };
 }
 
@@ -642,34 +650,43 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Build recipe index for prerequisite lookup ──
     const recipeIndex = buildRecipeIndex(recipes);
 
-    // ── If no specific recipes configured, use enabled categories to craft useful items ──
-    if (settings.craftLimits.length === 0) {
-      ctx.log("craft", `No specific recipes configured — crafting from enabled categories: ${settings.enabledCategories.join(", ")}`);
-      const categoryCrafted = await craftFromCategories(ctx, recipes, recipeIndex, settings.enabledCategories, craftingSkillLevel);
-      if (categoryCrafted.length > 0) {
-        ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
-      } else {
-        ctx.log("info", `No materials available for enabled categories. Waiting 60s...`);
-        await sleep(60000);
-      }
-      continue;
+    // ── Determine which categories this bot should craft from ──
+    const botName = bot.username;
+    const assignedCategories = settings.categoryAssignments[botName];
+    const isSpecializedBot = assignedCategories && assignedCategories.length > 0;
+    
+    if (isSpecializedBot) {
+      ctx.log("craft", `Bot is assigned to categories: ${assignedCategories.join(", ")}`);
     }
 
-    // ── Process each configured limit ──
-    let totalCrafted = 0;
-    const craftedSummary: string[] = [];   // "5x Fuel Cells"
-    const prereqSummary: string[] = [];    // "3x Refined Alloy (prereq)"
-    const missingSummary: string[] = [];   // "Armor Plate (2x refined_titanium)"
-    const atLimitCount = { count: 0 };
-
+    // ── Determine effective quotas for this bot (global + bot-specific overrides) ──
+    const effectiveQuotas = new Map<string, number>();
+    // First, add global quotas
     for (const { recipeId, limit } of settings.craftLimits) {
-      if (bot.state !== "running") break;
+      effectiveQuotas.set(recipeId, limit);
+    }
+    // Then apply bot-specific overrides
+    const botOverrides = settings.botQuotaOverrides[botName] || {};
+    for (const [recipeId, limit] of Object.entries(botOverrides)) {
+      if (limit > 0) {
+        effectiveQuotas.set(recipeId, limit);
+      } else {
+        effectiveQuotas.delete(recipeId);
+      }
+    }
 
+    // ── Build list of recipes to craft based on category assignments ──
+    const recipesToCraft: Array<{ recipeId: string; limit: number; recipe: Recipe }> = [];
+
+    for (const [recipeId, limit] of Array.from(effectiveQuotas.entries())) {
+      if (bot.state !== "running") break;
+      
       const recipe = recipes.find(r =>
         r.recipe_id === recipeId ||
         r.name === recipeId ||
         r.name.toLowerCase() === recipeId.toLowerCase()
       );
+      
       if (!recipe) {
         const similar = recipes
           .filter(r => r.recipe_id.toLowerCase().includes(recipeId.toLowerCase()) || r.name.toLowerCase().includes(recipeId.toLowerCase()))
@@ -682,8 +699,6 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       // Skip recipes that cannot be crafted manually (ship-only or facility-only)
       const craftableCheck = isRecipeCraftable(recipe);
       if (!craftableCheck.ok) {
-        // Ship Passive recipes are expected in config (user may have enabled categories that include them)
-        // Just skip them silently with a warning instead of an error
         if (craftableCheck.reason.includes("automatically on ships")) {
           ctx.log("warn", `Skipping "${recipeId}" (${recipe.name}): ${craftableCheck.reason}`);
         } else {
@@ -691,6 +706,52 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         }
         continue;
       }
+
+      // Check if recipe matches bot's assigned categories
+      const recipeCategory = recipe.category || "";
+      if (isSpecializedBot && !assignedCategories.includes(recipeCategory)) {
+        ctx.log("craft", `Skipping "${recipeId}" (${recipe.name}): category "${recipeCategory}" not assigned to this bot`);
+        continue;
+      }
+
+      recipesToCraft.push({ recipeId, limit, recipe });
+    }
+
+    // ── If no quota recipes match assigned categories, craft from assigned categories ──
+    if (recipesToCraft.length === 0 && isSpecializedBot) {
+      ctx.log("craft", `No quota recipes match assigned categories — crafting from assigned categories: ${assignedCategories.join(", ")}`);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, recipeIndex, assignedCategories, craftingSkillLevel);
+      if (categoryCrafted.length > 0) {
+        ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
+      } else {
+        ctx.log("info", `No materials available for assigned categories. Waiting 60s...`);
+        await sleep(60000);
+      }
+      continue;
+    }
+
+    // ── If no specific recipes configured (or none match), use enabled categories ──
+    if (recipesToCraft.length === 0 && !isSpecializedBot) {
+      ctx.log("craft", `No specific recipes configured — crafting from enabled categories: ${settings.enabledCategories.join(", ")}`);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, recipeIndex, settings.enabledCategories, craftingSkillLevel);
+      if (categoryCrafted.length > 0) {
+        ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
+      } else {
+        ctx.log("info", `No materials available for enabled categories. Waiting 60s...`);
+        await sleep(60000);
+      }
+      continue;
+    }
+
+    // ── Process each recipe to craft ──
+    let totalCrafted = 0;
+    const craftedSummary: string[] = [];   // "5x Fuel Cells"
+    const prereqSummary: string[] = [];    // "3x Refined Alloy (prereq)"
+    const missingSummary: string[] = [];   // "Armor Plate (2x refined_titanium)"
+    const atLimitCount = { count: 0 };
+
+    for (const { recipeId, limit, recipe } of recipesToCraft) {
+      if (bot.state !== "running") break;
 
       const outputId = recipe.output_item_id || recipeId;
       const currentStock = countItem(ctx, outputId);

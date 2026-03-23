@@ -14,7 +14,7 @@ export interface MassDisconnectDetector {
   isShutdownInitiated(): boolean;
 }
 
-const MASS_DISCONNECT_THRESHOLD = 15;  // Trigger if 15+ unique bots lose sessions
+const MASS_DISCONNECT_THRESHOLD = 5;  // Trigger if 5+ unique bots lose sessions
 const DISCONNECT_WINDOW_MS = 5000;     // Within 5 seconds
 
 interface SessionLossEvent {

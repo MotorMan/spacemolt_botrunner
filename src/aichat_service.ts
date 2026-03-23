@@ -1339,15 +1339,21 @@ Message:`;
       botStops: number;
     }
   ): Promise<void> {
+    const settings = getAiChatSettings();
+
+    // Check if AI Chat is enabled
+    if (!settings.enabled) {
+      this.logFn("ai_chat_debug", "Customs response skipped: AI Chat is disabled");
+      return;
+    }
+
     const bots = AiChatService.getBots();
     const bot = bots.find(b => b.username === botName);
-    
+
     if (!bot) {
       this.logFn("error", `Customs response: Bot ${botName} not found`);
       return;
     }
-
-    const settings = getAiChatSettings();
     const personality = getBotPersonality(botName);
     
     // Build context for the LLM

@@ -60,6 +60,8 @@ const CUSTOMS_CLEAR_KEYWORDS = [
   "hold checks out",
   "Inspection concluded",
   "free to continue",
+  "nothing of concern",
+  "verification complete",
 ];
 
 const CUSTOMS_EVASION_KEYWORDS = [
@@ -241,6 +243,8 @@ export async function waitForCustomsInspection(
   const chatMessages: string[] = [];
   let wasStopped = false;
   let outcome: "cleared" | "contraband" | "evasion" | "timeout" | "none" = "none";
+  let stopRequestProcessed = false;
+  let clearanceProcessed = false;
 
   log("customs", "Waiting for potential customs inspection...");
 
@@ -258,35 +262,45 @@ export async function waitForCustomsInspection(
     // Only process messages that mention this bot's ship name
     return messageMentionsBotShip(line, bot.shipName);
   });
-  
+
   if (customsLogs.length > 0) {
     wasStopped = true;
     log("customs", `Customs stop detected! Messages: ${customsLogs.length}`);
-    
+
+    // Process only the FIRST stop_request message to avoid duplicate AI responses
     for (const logLine of customsLogs) {
       chatMessages.push(logLine);
-      
+
       // Detect message type
       const msgMatch = logLine.match(/\[chat\].*CUSTOMS.*:\s*(.*)/i);
       if (msgMatch) {
         const content = msgMatch[1];
         const detection = detectCustomsMessage(content);
-        
-        if (detection.type === "cleared") {
-          outcome = "cleared";
-        } else if (detection.type === "contraband") {
-          outcome = "contraband";
-        } else if (detection.type === "evasion_warning") {
-          outcome = "evasion";
-        } else if (detection.type === "stop_request") {
+
+        // Only process the first stop_request - ignore duplicates
+        if (detection.type === "stop_request" && !stopRequestProcessed) {
+          stopRequestProcessed = true;
           outcome = "timeout"; // Still waiting
+          log("customs", `🛑 CUSTOMS HOLD: Awaiting inspection at ${targetSystem}`);
+        } else if (detection.type === "stop_request" && stopRequestProcessed) {
+          // Skip duplicate stop requests
+          log("customs_debug", "Skipping duplicate customs stop request");
+        } else if (detection.type === "cleared" && !clearanceProcessed) {
+          clearanceProcessed = true;
+          outcome = "cleared";
+        } else if (detection.type === "contraband" && !clearanceProcessed) {
+          clearanceProcessed = true;
+          outcome = "contraband";
+        } else if (detection.type === "evasion_warning" && !clearanceProcessed) {
+          clearanceProcessed = true;
+          outcome = "evasion";
         }
       }
     }
-    
+
     // If we got a stop request, wait for completion
     if (outcome === "timeout") {
-      log("customs", "Waiting for scan to complete...");
+      log("customs", "⏳ Customs hold ACTIVE - blocking travel until clearance...");
 
       // Poll for completion (up to maxWaitMs total)
       while (Date.now() - startTime < maxWaitMs) {
@@ -299,49 +313,55 @@ export async function waitForCustomsInspection(
           // Only process messages that mention this bot's ship name
           return messageMentionsBotShip(line, bot.shipName);
         });
-        
+
         for (const logLine of newCustomsLogs) {
           if (!chatMessages.includes(logLine)) {
             chatMessages.push(logLine);
-            
+
             const msgMatch = logLine.match(/\[chat\].*CUSTOMS.*:\s*(.*)/i);
             if (msgMatch) {
               const content = msgMatch[1];
               const detection = detectCustomsMessage(content);
-              
-              if (detection.type === "cleared") {
-                outcome = "cleared";
-                log("customs", "Customs scan complete - cleared!");
+
+              // Only process clearance/contraband if we haven't already
+              if ((detection.type === "cleared" || detection.type === "contraband") && !clearanceProcessed) {
+                clearanceProcessed = true;
+                if (detection.type === "cleared") {
+                  outcome = "cleared";
+                  log("customs", "Customs scan complete - cleared!");
+                } else {
+                  outcome = "contraband";
+                  log("customs", "CUSTOMS: CONTRABAND DETECTED!");
+                }
                 break;
-              } else if (detection.type === "contraband") {
-                outcome = "contraband";
-                log("customs", "CUSTOMS: CONTRABAND DETECTED!");
-                break;
+              } else if (detection.type === "stop_request" && stopRequestProcessed) {
+                // Ignore additional stop requests while hold is active
+                log("customs_debug", "Ignoring duplicate stop request - hold already active");
               }
             }
           }
         }
-        
+
         if (outcome === "cleared" || outcome === "contraband") {
           break;
         }
       }
-      
+
       if (outcome === "timeout") {
-        log("customs", "Customs scan timeout - proceeding anyway");
+        log("customs", "⏰ Customs scan timeout - proceeding");
       }
     }
-    
+
     // Log the stop
     if (wasStopped) {
-      const logOutcome: "cleared" | "contraband" | "evasion" | "pending" = 
+      const logOutcome: "cleared" | "contraband" | "evasion" | "pending" =
         outcome === "timeout" || outcome === "none" ? "cleared" : outcome;
       logCustomsStop(bot.username, targetSystem, logOutcome);
     }
   } else {
     log("customs", "No customs inspection required");
   }
-  
+
   return { wasStopped, outcome, chatMessages };
 }
 

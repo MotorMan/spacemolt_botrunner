@@ -150,8 +150,8 @@ export function createMiningSession(params: {
 }): MiningSession {
   const now = new Date().toISOString();
   return {
-    sessionId: botUsername + "_" + Date.now(),
-    botUsername,
+    sessionId: params.botUsername + "_" + Date.now(),
+    botUsername: params.botUsername,
     miningType: params.miningType,
     targetResourceId: params.targetResourceId,
     targetResourceName: params.targetResourceName,

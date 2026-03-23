@@ -1,5 +1,5 @@
 import type { Routine, RoutineContext } from "../bot.js";
-import { mapStore } from "../mapstore.js";
+import { mapStore, isDepletionExpired } from "../mapstore.js";
 import {
   isOreBeltPoi,
   isGasCloudPoi,
@@ -52,6 +52,7 @@ function getMinerSettings(username?: string): {
   oreQuotas: Record<string, number>;
   gasQuotas: Record<string, number>;
   iceQuotas: Record<string, number>;
+  depletionTimeoutHours: number;
 } {
   const all = readSettings();
   const m = all.miner || {};
@@ -89,6 +90,7 @@ function getMinerSettings(username?: string): {
     oreQuotas: (m.oreQuotas as Record<string, number>) || {},
     gasQuotas: (m.gasQuotas as Record<string, number>) || {},
     iceQuotas: (m.iceQuotas as Record<string, number>) || {},
+    depletionTimeoutHours: (m.depletionTimeoutHours as number) || 3,
   };
 }
 
@@ -329,6 +331,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
     };
+    const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
 
     // ── Recovered session handling ──
     // If we have a recovered session, use its target instead of recalculating
@@ -397,7 +400,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (effectiveTarget) {
       const allLocations = mapStore.findOreLocations(effectiveTarget);
-      // Filter to matching POI type only
+      // Filter to matching POI type only (skip depleted)
       const locations = allLocations.filter(loc => {
         const sys = mapStore.getSystem(loc.systemId);
         const poi = sys?.pois.find(p => p.id === loc.poiId);
@@ -406,6 +409,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (miningType === "gas") return isGasCloudPoi(poi.type);
         if (miningType === "ice") return isIceFieldPoi(poi.type);
         return true;
+      }).filter(loc => {
+        // Skip depleted ores (unless depletion has expired)
+        const sys = mapStore.getSystem(loc.systemId);
+        const poi = sys?.pois.find(p => p.id === loc.poiId);
+        const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+        if (!oreEntry?.depleted) return true;
+        // Depleted but expired - can re-check
+        return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
       });
 
       if (locations.length === 0) {
@@ -506,27 +517,39 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // Fallback: find POI with target resource
+    // Fallback: find POI with target resource (skip depleted unless expired)
     if (!miningPoi && effectiveTarget) {
       for (const poi of pois) {
         if (miningType === "ice" && isIceFieldPoi(poi.type)) {
           const sysData = mapStore.getSystem(bot.system);
           const storedPoi = sysData?.pois.find(p => p.id === poi.id);
-          if (storedPoi?.ores_found.some(o => o.item_id === effectiveTarget)) {
+          const oreEntry = storedPoi?.ores_found.find(o => o.item_id === effectiveTarget);
+          if (oreEntry && (!oreEntry.depleted || isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs))) {
+            if (oreEntry.depleted) {
+              ctx.log("mining", `Re-checking depleted ${effectiveTarget} at ${poi.name} (depletion expired)`);
+            }
             miningPoi = { id: poi.id, name: poi.name };
             break;
           }
         } else if (miningType === "ore" && isOreBeltPoi(poi.type)) {
           const sysData = mapStore.getSystem(bot.system);
           const storedPoi = sysData?.pois.find(p => p.id === poi.id);
-          if (storedPoi?.ores_found.some(o => o.item_id === effectiveTarget)) {
+          const oreEntry = storedPoi?.ores_found.find(o => o.item_id === effectiveTarget);
+          if (oreEntry && (!oreEntry.depleted || isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs))) {
+            if (oreEntry.depleted) {
+              ctx.log("mining", `Re-checking depleted ${effectiveTarget} at ${poi.name} (depletion expired)`);
+            }
             miningPoi = { id: poi.id, name: poi.name };
             break;
           }
         } else if (miningType === "gas" && isGasCloudPoi(poi.type)) {
           const sysData = mapStore.getSystem(bot.system);
           const storedPoi = sysData?.pois.find(p => p.id === poi.id);
-          if (storedPoi?.ores_found.some(o => o.item_id === effectiveTarget)) {
+          const oreEntry = storedPoi?.ores_found.find(o => o.item_id === effectiveTarget);
+          if (oreEntry && (!oreEntry.depleted || isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs))) {
+            if (oreEntry.depleted) {
+              ctx.log("mining", `Re-checking depleted ${effectiveTarget} at ${poi.name} (depletion expired)`);
+            }
             miningPoi = { id: poi.id, name: poi.name };
             break;
           }
@@ -597,7 +620,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (mineResp.error) {
         const msg = mineResp.error.message.toLowerCase();
         if (msg.includes("depleted") || msg.includes("no resources") || msg.includes("no gas") || msg.includes("no ice") || msg.includes("no minable")) {
-          stopReason = `${resourceLabel} field depleted`; break;
+          stopReason = `${resourceLabel} field depleted`;
+          // Mark this ore as depleted in the map
+          if (effectiveTarget && bot.poi) {
+            mapStore.markOreDepleted(bot.system, bot.poi, effectiveTarget);
+            ctx.log("mining", `Marked ${effectiveTarget} at ${bot.poi} as depleted`);
+          }
+          break;
         }
         if (msg.includes("cargo") && msg.includes("full")) {
           stopReason = "cargo full"; break;

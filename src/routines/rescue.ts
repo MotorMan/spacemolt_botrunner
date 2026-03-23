@@ -218,6 +218,9 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
     const settings = getRescueSettings();
 
+    // ── Determine log category early (needed for skipToReturnHome case) ──
+    let logCategory: string = "rescue";
+
     // ── Handle recovered session or manual rescue ──
     let target: RescueTarget | null = null;
     let isMaydayTarget = false;
@@ -238,6 +241,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         docked: false,
       };
       isMaydayTarget = recoveredSession.isMayday;
+      logCategory = isMaydayTarget ? "mayday" : "rescue";
 
       const fleet = ctx.getFleetStatus?.() || [];
       const targetBot = fleet.find(b => b.username === target!.username);
@@ -351,6 +355,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       // ── Rescue the most critical bot ──
       target = maydayTarget || targets[0];
       isMaydayTarget = !!maydayTarget;
+      logCategory = isMaydayTarget ? "mayday" : "rescue";
     }
 
     // ── Check if we should return home due to idle timeout ──
@@ -407,9 +412,6 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       await sleep(5000);
       continue;
     }
-
-    // ── Determine log category (manual rescue and fleet rescues use "rescue", MAYDAY uses "mayday") ──
-    const logCategory = isMaydayTarget ? "mayday" : "rescue";
 
     // ── Create rescue session if starting new mission ──
     if (!recoveredSession && target) {
@@ -1132,6 +1134,9 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
   const settings = getRescueSettings();
   const aiChatService = (globalThis as any).aiChatService;
 
+  // Log category for this routine (always "mayday" since it's MAYDAY-specific)
+  const logCategory = "mayday";
+
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -1595,6 +1600,9 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
   ctx.log("system", "FuelRescue bot online — monitoring fleet and MAYDAY channel for stranded ships...");
 
+  // Log category - determined when target is selected
+  let logCategory: string = "rescue";
+
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -1643,6 +1651,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         docked: false,
       };
       isMaydayTarget = recoveredSession.isMayday;
+      logCategory = isMaydayTarget ? "mayday" : "rescue";
 
       // Update fleet info for target
       const fleet = ctx.getFleetStatus?.() || [];
@@ -1754,6 +1763,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       // ── Rescue the most critical bot ──
       target = maydayTarget || targets[0];
       isMaydayTarget = !!maydayTarget;
+      logCategory = isMaydayTarget ? "mayday" : "rescue";
     }
 
     if (!target) {

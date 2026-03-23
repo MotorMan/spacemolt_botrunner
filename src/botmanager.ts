@@ -25,6 +25,7 @@ import { debugLog } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { AiChatService } from "./aichat_service.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
+import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
 
 interface BotState {
   wasRunning: boolean;
@@ -145,6 +146,8 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleEmergencyReturn();
     case "shutdown":
       return handleShutdown();
+    case "manual_rescue_request":
+      return handleManualRescueRequest(action);
     default:
       return { ok: false, error: `Unknown action: ${(action as any).type}` };
   }
@@ -168,6 +171,45 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
   server.saveRoutineSettings(routine, s);
   server.logSystem(`Settings saved for ${routine}`);
   return { ok: true, message: `${routine} settings saved`, settings: server.settings };
+}
+
+async function handleManualRescueRequest(action: WebAction): Promise<WebActionResult> {
+  const botName = action.bot;
+  if (!botName) return { ok: false, error: "No bot specified" };
+
+  const bot = bots.get(botName);
+  if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
+
+  const targetSystem = (action as any).targetSystem as string;
+  const targetPOI = (action as any).targetPOI as string;
+  const targetPlayer = (action as any).targetPlayer as string;
+
+  if (!targetSystem) return { ok: false, error: "No target system specified" };
+  if (!targetPOI) return { ok: false, error: "No target POI specified" };
+  if (!targetPlayer) return { ok: false, error: "No target player specified" };
+
+  // Check if the bot is running the rescue routine
+  const botStatus = bot.status();
+  if (botStatus.routine !== "rescue") {
+    return { ok: false, error: `Bot is not running the rescue routine (current: ${botStatus.routine || "idle"})` };
+  }
+
+  // Add the manual rescue request to the queue
+  const request: ManualRescueRequest = {
+    targetPlayer,
+    targetSystem,
+    targetPOI,
+    timestamp: Date.now(),
+    botUsername: botName,
+  };
+
+  const added = addManualRescueRequest(request);
+  if (!added) {
+    return { ok: false, error: "Duplicate rescue request - already queued" };
+  }
+
+  server.logSystem(`Manual rescue request queued: ${targetPlayer} at ${targetSystem}/${targetPOI} (for bot ${botName})`);
+  return { ok: true, message: `Rescue request queued for ${targetPlayer}` };
 }
 
 async function handleStart(action: WebAction): Promise<WebActionResult> {

@@ -325,10 +325,12 @@ export class SpaceMoltAPI {
         // Notify mass disconnect detector (tracks unique bots losing sessions)
         massDisconnectDetector.trackSessionLoss(botName);
 
-        // Check if recovery is already in progress - if so, wait for it
+        // Check if recovery is already in progress - if so, wait for it to complete
         if (this._recoveryInProgress) {
-          log("system", `${botName} recovery already in progress, waiting...`);
-          await sleep(1000);
+          debugLog("api:execute", `${botName} recovery already in progress, waiting for completion...`);
+          // Wait longer to allow recovery to complete (session creation can take time due to rate limiting)
+          await sleep(5000);
+          // After waiting, just retry - the sessions should be refreshed now
           return this.execute(command, payload);
         }
 
@@ -359,27 +361,29 @@ export class SpaceMoltAPI {
           logSessionError(botName, command, payload, code, resp.error.message || "", resp);
           logSessionInvalidate(botName, "API returned session error", code, resp.error.message, this.session?.id);
 
-          // Clear sessions - the current session is invalid
-          debugLog("api:execute", `${botName} session invalid, clearing session`);
+          // Clear BOTH sessions - they may both be expired (especially V2 expiring first)
+          // This prevents the loop where V1 is renewed but V2 stays expired
+          debugLog("api:execute", `${botName} session invalid, clearing both V1 and V2 sessions`);
           const oldSessionId = this.session?.id;
           const oldV2SessionId = this.v2Session?.id;
           this.session = null;
-          // Only clear V2 session if this command was using V2
-          if (needsV2) {
-            this.v2Session = null;
-          }
+          this.v2Session = null;
 
           try {
+            debugLog("api:recovery", `${botName} starting session recovery (old V1: ${oldSessionId?.slice(0, 8) || "none"}, old V2: ${oldV2SessionId?.slice(0, 8) || "none"})`);
             await this.ensureSession();
-            // Only ensure V2 session if this command actually needs it
-            if (needsV2) await this.ensureV2Session();
+            // CRITICAL: Always ensure V2 session exists after recovery, even if the
+            // failing command was V1-only. V2 session expiration can cause V1 commands
+            // to fail indirectly, so we must renew both to break the recovery loop.
+            await this.ensureV2Session();
+            const newV1Id = this.session?.id?.slice(0, 8) || "none";
+            const newV2Id = this.v2Session?.id?.slice(0, 8) || "none";
+            debugLog("api:recovery", `${botName} session recovery complete (new V1: ${newV1Id}, new V2: ${newV2Id})`);
             logSessionChange(botName, oldSessionId || null, (this.session as ApiSession | null)?.id || "", "recovery from session error");
-            if (needsV2 && (oldV2SessionId || this.v2Session)) {
-              logSessionDetail(botName, "V2_SESSION_DURING_RECOVERY", "V2 session ensured during recovery", {
-                hadV2: !!oldV2SessionId,
-                newV2Session: (this.v2Session as ApiSession | null)?.id?.slice(0, 8) || "none",
-              });
-            }
+            logSessionDetail(botName, "V2_SESSION_DURING_RECOVERY", "V2 session ensured during recovery", {
+              hadV2: !!oldV2SessionId,
+              newV2Session: (this.v2Session as ApiSession | null)?.id?.slice(0, 8) || "none",
+            });
             // Reset recovery count on successful session creation
             this._recoveryCount = 0;
             return this.execute(command, payload);
@@ -391,6 +395,7 @@ export class SpaceMoltAPI {
           }
         } finally {
           this._recoveryInProgress = false;
+          debugLog("api:recovery", `${botName} recovery flag cleared`);
         }
       }
     }

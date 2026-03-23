@@ -993,7 +993,11 @@ export async function navigateToSystem(
 
   for (let attempt = 0; attempt < MAX_JUMPS; attempt++) {
     await bot.refreshStatus();
-    if (bot.system === targetSystemId) return true;
+    // Case-insensitive comparison for system names
+    if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) {
+      ctx.log("travel", `Already at ${targetSystemId} (case-insensitive match)`);
+      return true;
+    }
 
     // Plan route from current position
     const route = mapStore.findRoute(bot.system, targetSystemId);
@@ -1010,8 +1014,31 @@ export async function navigateToSystem(
         nextSystem = routeData.route[1].system_id;
         ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
       } else {
-        ctx.log("error", `No route to ${targetSystemId} — cannot navigate`);
-        return false;
+        // Server returned no route - check if we might already be at the target
+        // This can happen due to case mismatch or if we're already there
+        ctx.log("warn", `Server returned no route to ${targetSystemId} — checking if already arrived...`);
+        await bot.refreshStatus();
+        if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) {
+          ctx.log("travel", `Confirmed at ${targetSystemId} after failed route lookup`);
+          return true;
+        }
+        // Also check if we're in a neighboring system (1 jump away)
+        const currentSystemData = mapStore.getSystem(bot.system);
+        if (currentSystemData) {
+          const isNeighbor = currentSystemData.connections.some(
+            c => c.system_id.toLowerCase() === targetSystemId.toLowerCase()
+          );
+          if (isNeighbor) {
+            ctx.log("travel", `Target ${targetSystemId} is adjacent - attempting direct jump`);
+            nextSystem = targetSystemId;
+          } else {
+            ctx.log("error", `No route to ${targetSystemId} from ${bot.system} — cannot navigate`);
+            return false;
+          }
+        } else {
+          ctx.log("error", `No route to ${targetSystemId} — cannot navigate`);
+          return false;
+        }
       }
     }
 
@@ -1038,8 +1065,8 @@ export async function navigateToSystem(
 
     // CRITICAL: Re-check position after ensureFueled — it may have moved us to a different system!
     await bot.refreshStatus();
-    if (bot.system === targetSystemId) return true;
-    
+    if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
+
     // Recalculate route from CURRENT position (ensureFueled may have moved us)
     const postFuelRoute = mapStore.findRoute(bot.system, targetSystemId);
     if (postFuelRoute && postFuelRoute.length > 1) {
@@ -1105,8 +1132,8 @@ export async function navigateToSystem(
 
         // CRITICAL: Refresh status and recalculate route after wait
         await bot.refreshStatus();
-        if (bot.system === targetSystemId) return true;
-        
+        if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
+
         // Recalculate route from CURRENT position (may have changed during wait)
         const retryRoute = mapStore.findRoute(bot.system, targetSystemId);
         if (retryRoute && retryRoute.length > 1) {
@@ -1144,7 +1171,7 @@ export async function navigateToSystem(
     }
 
     ctx.log("travel", `Arrived in ${bot.system}`);
-    if (bot.system === targetSystemId) return true;
+    if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
     if (bot.state !== "running") return false;
   }
 

@@ -342,7 +342,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     if (hasPumpNow) {
       // Calculate distance from home to determine fuel strategy
       let jumpsFromHome = 0;
-      if (homeSystem && bot.system !== homeSystem) {
+      if (homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
         try {
           const routeResp = await bot.exec("find_route", { target_system: homeSystem });
           if (!routeResp.error && routeResp.result) {
@@ -354,29 +354,37 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         }
       }
 
-      // If we're on a distant mission (>2 jumps from home), only refuel if below threshold
-      const isOnDistantMission = jumpsFromHome > 2;
+      // Check current fuel level
       const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      const needsRefuel = !isOnDistantMission || fuelPct < settings.refuelThreshold;
-
-      if (needsRefuel) {
-        // Need extra fuel beyond our own threshold to transfer
-        const minFuelForTransfer = Math.round(bot.maxFuel * (settings.refuelThreshold / 100)) + 100;
-        if (bot.fuel < minFuelForTransfer) {
-          if (isOnDistantMission) {
-            ctx.log(isMaydayTarget ? "mayday" : "rescue", `On distant mission (${jumpsFromHome} jumps from home) with ${fuelPct}% fuel — proceeding without refuel`);
-          } else {
-            ctx.log(isMaydayTarget ? "mayday" : "rescue", "Insufficient fuel for transfer — refueling self first...");
+      
+      // Only refuel if below threshold - don't waste time refueling when already well-fueled
+      if (fuelPct < settings.refuelThreshold) {
+        // If we're on a distant mission (>2 jumps from home), we may need to skip refueling
+        const isOnDistantMission = jumpsFromHome > 2;
+        
+        if (isOnDistantMission) {
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", 
+            `On distant mission (${jumpsFromHome} jumps from home) with ${fuelPct}% fuel — proceeding without refuel (below threshold but urgent)`);
+        } else {
+          // Need extra fuel beyond our own threshold to have enough to transfer
+          const minFuelForTransfer = Math.round(bot.maxFuel * (settings.refuelThreshold / 100)) + 100;
+          if (bot.fuel < minFuelForTransfer) {
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", 
+              `Fuel at ${fuelPct}% (below threshold ${settings.refuelThreshold}%) — refueling before rescue...`);
             const fueled = await ensureFueled(ctx, settings.refuelThreshold);
             if (!fueled) {
               ctx.log("error", "Cannot refuel self — waiting before retry...");
               await sleep(settings.scanIntervalSec * 1000);
               continue;
             }
+          } else {
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", 
+              `Fuel at ${fuelPct}% — adequate for transfer, proceeding to target`);
           }
-        } else if (isOnDistantMission) {
-          ctx.log(isMaydayTarget ? "mayday" : "rescue", `On distant mission (${jumpsFromHome} jumps from home) with adequate fuel (${fuelPct}%) — proceeding to target`);
         }
+      } else {
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", 
+          `Fuel at ${fuelPct}% — above threshold (${settings.refuelThreshold}%), no need to refuel`);
       }
     } else {
       // Fallback: need fuel cells instead
@@ -388,7 +396,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       yield "navigate_to_target";
       await ensureUndocked(ctx);
 
-      if (target.system && target.system !== bot.system) {
+      if (target.system && target.system.toLowerCase() !== bot.system.toLowerCase()) {
         ctx.log(isMaydayTarget ? "mayday" : "rescue", `Navigating to ${target.system}...`);
         const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
         const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
@@ -585,6 +593,25 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       }
     }
 
+    // Send AI-generated "rescue complete" private message to target
+    const aiChatService = (globalThis as any).aiChatService;
+    if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+      try {
+        await aiChatService.sendPrivateMessage(bot, target.username, {
+          situation: isMaydayTarget
+            ? `You responded to their MAYDAY distress call and successfully refueled them. They are now safe to continue their journey.`
+            : `You completed a fuel transfer mission to help them with their low fuel situation.`,
+          currentSystem: bot.system,
+          targetSystem: target.system,
+          jumps: undefined,
+          fuelRefueled: undefined,
+          playerFuelPct: target.fuelPct,
+        });
+      } catch (e) {
+        ctx.log("warn", `AI completion message failed: ${e}`);
+      }
+    }
+
     // ── Skip to return home if recovering from returning_home state ──
     if (skipToReturnHome) {
       ctx.log("rescue", "Recovered session was returning home - skipping to return home logic...");
@@ -592,7 +619,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     }
 
     // ── Return to home system ──
-    if (homeSystem && bot.system !== homeSystem) {
+    if (homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
       yield "return_home";
       ctx.log(isMaydayTarget ? "mayday" : "rescue", `Returning to home system ${homeSystem}...`);
       await ensureUndocked(ctx);
@@ -615,7 +642,16 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
     // ── Refuel self ──
     yield "self_refuel";
-    await ensureFueled(ctx, settings.refuelThreshold);
+    await bot.refreshStatus();
+    const fuelAfterRescue = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelAfterRescue < settings.refuelThreshold) {
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", 
+        `Fuel at ${fuelAfterRescue}% after rescue — refueling to threshold (${settings.refuelThreshold}%)...`);
+      await ensureFueled(ctx, settings.refuelThreshold);
+    } else {
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", 
+        `Fuel at ${fuelAfterRescue}% — above threshold, no need to refuel`);
+    }
     await bot.refreshStatus();
     logStatus(ctx);
 
@@ -872,7 +908,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
   }
 
   // ── Return to home system ──
-  if (homeSystem && bot.system !== homeSystem) {
+  if (homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
     yield "return_home";
     ctx.log("rescue", `Returning to home system ${homeSystem}...`);
     await ensureUndocked(ctx);
@@ -883,27 +919,29 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
   // ── Dock and refuel self ──
   yield "self_refuel";
   await ensureDocked(ctx);
-  
-  // Always refuel to 100% after a rescue mission, regardless of current fuel level
-  ctx.log("rescue", "Refueling to full capacity after mission...");
+
+  // Refuel after mission - but only if below threshold
   await bot.refreshStatus();
-  
-  // Call refuel command directly since we're docked
-  const refuelResp = await bot.exec("refuel");
-  if (refuelResp.error) {
-    ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
-    // Try ensureFueled as fallback
-    await ensureFueled(ctx, settings.refuelThreshold);
+  const fuelAfterMission = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (fuelAfterMission < settings.refuelThreshold) {
+    ctx.log("rescue", `Fuel at ${fuelAfterMission}% — refueling to threshold (${settings.refuelThreshold}%)...`);
+    const refuelResp = await bot.exec("refuel");
+    if (refuelResp.error) {
+      ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
+      await ensureFueled(ctx, settings.refuelThreshold);
+    } else {
+      await bot.refreshStatus();
+      const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      ctx.log("rescue", `Fuel: ${fuelPct}% (${bot.fuel}/${bot.maxFuel})`);
+    }
   } else {
-    await bot.refreshStatus();
-    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-    ctx.log("rescue", `Fuel: ${fuelPct}% (${bot.fuel}/${bot.maxFuel})`);
+    ctx.log("rescue", `Fuel at ${fuelAfterMission}% — above threshold, no need to refuel`);
   }
-  
+
   await bot.refreshStatus();
   logStatus(ctx);
 
-  ctx.log("rescue", `✓ Bot is docked, refueled, and ready for next mission`);
+  ctx.log("rescue", `✓ Bot is docked and ready for next mission`);
 
   // Clear routine params after completion (also cleared in botmanager, but good to do here too)
   (bot as unknown as Record<string, unknown>).routineParams = undefined;
@@ -1261,7 +1299,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     ctx.log("mayday", `Current location: ${bot.system}, Home: ${homeSystem || "not set"}`);
 
     // ── Return home ──
-    if (homeSystem && bot.system !== homeSystem) {
+    if (homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
       yield "return_home";
       ctx.log("mayday", `Returning to home system ${homeSystem}...`);
       await ensureUndocked(ctx);
@@ -1291,21 +1329,26 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       completeRescueSession(bot.username);
     }
 
-    ctx.log("mayday", "Refueling to full capacity after mission...");
     await bot.refreshStatus();
-    const refuelResp = await bot.exec("refuel");
-    if (refuelResp.error) {
-      ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
-      await ensureFueled(ctx, settings.refuelThreshold);
+    const fuelAfterMission = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelAfterMission < settings.refuelThreshold) {
+      ctx.log("mayday", `Fuel at ${fuelAfterMission}% — refueling to threshold (${settings.refuelThreshold}%)...`);
+      const refuelResp = await bot.exec("refuel");
+      if (refuelResp.error) {
+        ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
+        await ensureFueled(ctx, settings.refuelThreshold);
+      } else {
+        await bot.refreshStatus();
+        const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        ctx.log("mayday", `Fuel: ${fuelPct}% (${bot.fuel}/${bot.maxFuel})`);
+      }
     } else {
-      await bot.refreshStatus();
-      const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      ctx.log("mayday", `Fuel: ${fuelPct}% (${bot.fuel}/${bot.maxFuel})`);
+      ctx.log("mayday", `Fuel at ${fuelAfterMission}% — above threshold, no need to refuel`);
     }
 
     await bot.refreshStatus();
     logStatus(ctx);
-    ctx.log("mayday", "✓ Bot is docked, refueled, and ready for next MAYDAY");
+    ctx.log("mayday", "✓ Bot is docked and ready for next MAYDAY");
 
     // Short cooldown before next scan
     await sleep(5000);
@@ -1610,13 +1653,18 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     await bot.refreshStatus();
     logStatus(ctx);
 
-    // Always refuel to 100% before heading out on a rescue mission
-    ctx.log("rescue", "Topping off fuel to 100% before rescue mission...");
-    const fueled = await ensureFueled(ctx, 100);
-    if (!fueled) {
-      ctx.log("error", "Cannot refuel self — waiting before retry...");
-      await sleep(settings.scanIntervalSec * 1000);
-      continue;
+    // Only refuel if below threshold - don't waste time refueling when already well-fueled
+    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelPct < settings.refuelThreshold) {
+      ctx.log("rescue", `Fuel at ${fuelPct}% (below threshold ${settings.refuelThreshold}%) — refueling before mission...`);
+      const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+      if (!fueled) {
+        ctx.log("error", "Cannot refuel self — waiting before retry...");
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
+      }
+    } else {
+      ctx.log("rescue", `Fuel at ${fuelPct}% — above threshold (${settings.refuelThreshold}%), no need to refuel`);
     }
 
     // ── Check for Refueling Pump ──
@@ -2008,7 +2056,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Return to home system ──
-    if (homeSystem && bot.system !== homeSystem) {
+    if (homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
       yield "return_home";
       ctx.log(isMaydayTarget ? "mayday" : "rescue", `Returning to home system ${homeSystem}...`);
       await ensureUndocked(ctx);
@@ -2031,7 +2079,16 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Refuel self ──
     yield "self_refuel";
-    await ensureFueled(ctx, settings.refuelThreshold);
+    await bot.refreshStatus();
+    const fuelAfterRescue2 = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelAfterRescue2 < settings.refuelThreshold) {
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", 
+        `Fuel at ${fuelAfterRescue2}% after rescue — refueling to threshold (${settings.refuelThreshold}%)...`);
+      await ensureFueled(ctx, settings.refuelThreshold);
+    } else {
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", 
+        `Fuel at ${fuelAfterRescue2}% — above threshold, no need to refuel`);
+    }
     await bot.refreshStatus();
     logStatus(ctx);
 

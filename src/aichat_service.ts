@@ -1156,6 +1156,14 @@ ${mapSummary}
   ): Promise<{ ok: boolean; message?: string; error?: string }> {
     const settings = getAiChatSettings();
 
+    // Check if AI Chat is enabled
+    if (!settings.enabled) {
+      this.logFn("ai_chat_debug", `Private message skipped: AI Chat is disabled (enabled=${settings.enabled})`);
+      return { ok: false, error: "AI Chat is disabled" };
+    }
+    
+    this.logFn("ai_chat_debug", `AI Chat enabled: ${settings.enabled}, sending private message...`);
+
     // Build system prompt for private message generation
     const systemPrompt = `${personality || "You are a helpful rescue pilot in SpaceMolt."}
 
@@ -1232,6 +1240,14 @@ Message:`;
     personality?: string
   ): Promise<{ ok: boolean; message?: string; error?: string }> {
     const settings = getAiChatSettings();
+
+    // Check if AI Chat is enabled
+    if (!settings.enabled) {
+      this.logFn("ai_chat_debug", `Faction message skipped: AI Chat is disabled (enabled=${settings.enabled})`);
+      return { ok: false, error: "AI Chat is disabled" };
+    }
+    
+    this.logFn("ai_chat_debug", `AI Chat enabled: ${settings.enabled}, sending faction message...`);
 
     const { messageType, targetName, isMayday = false, isBot = false, targetFuelPct, jumps } = context;
 

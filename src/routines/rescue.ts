@@ -17,6 +17,12 @@ import {
 import { getNextMayday, markMaydayHandled, clearExpiredMaydays, type MaydayRequest } from "../mayday.js";
 import { getNextManualRescue, markManualRescueHandled, type ManualRescueRequest } from "../manualrescue.js";
 import {
+  isRescueHandled,
+  parseRescueAnnouncement,
+  recordRescueAnnouncement,
+  cleanupExpiredAnnouncements,
+} from "../rescuecoordination.js";
+import {
   getActiveRescueSession,
   startRescueSession,
   updateRescueSession,
@@ -35,9 +41,13 @@ function getRescueSettings(): {
   scanIntervalSec: number;
   refuelThreshold: number;
   maydayMaxJumps: number;
+  homeSystem?: string;
 } {
   const all = readSettings();
   const r = all.rescue || {};
+  const ft = all.fuel_transfer || {};
+  // Also check global settings for homeSystem
+  const general = all.general || {};
   return {
     /** Fuel % below which a bot is considered in need of rescue. */
     fuelThreshold: (r.fuelThreshold as number) || 10,
@@ -51,6 +61,8 @@ function getRescueSettings(): {
     refuelThreshold: (r.refuelThreshold as number) || 60,
     /** Maximum jumps away to respond to MAYDAYs (0 = unlimited). */
     maydayMaxJumps: (r.maydayMaxJumps as number) || 12,
+    /** Home system from rescue settings, fuel_transfer settings, or global settings */
+    homeSystem: (r.homeSystem as string) || (ft.homeSystem as string) || (general.homeSystem as string),
   };
 }
 
@@ -144,9 +156,16 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
   const { bot } = ctx;
 
   await bot.refreshStatus();
-  const homeSystem = bot.system;
+  const settings = getRescueSettings();
+  const homeSystem = settings.homeSystem || bot.system;
 
   ctx.log("system", "FuelTransfer bot online — ready to refuel stranded ships...");
+  
+  if (settings.homeSystem) {
+    ctx.log("system", `Home base configured: ${homeSystem}`);
+  } else {
+    ctx.log("warn", "No home base configured — will use starting system as home");
+  }
 
   // Clear expired MAYDAYs on startup to avoid processing old requests
   clearExpiredMaydays();
@@ -160,19 +179,105 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
   // Track idle time when away from home (for auto-return feature)
   let idleTimeMs = 0;
-  const IDLE_RETURN_THRESHOLD_MS = 60000; // Return home after 60 seconds of idle time when away from home
+  const IDLE_RETURN_THRESHOLD_MS = 30000; // Return home after 30 seconds of idle time when away from home
   let isReturningIdle = false; // Track if we're returning home due to idle
 
   // Log if starting away from home
-  const startedAwayFromHome = homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase();
+  const startedAwayFromHome = homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem);
   if (startedAwayFromHome) {
     ctx.log("rescue", `⚠️ Bot started away from home (${bot.system} vs ${homeSystem}) — will return home after ${IDLE_RETURN_THRESHOLD_MS / 1000}s of idle time`);
+  } else if (homeSystem) {
+    ctx.log("rescue", `✓ Bot started at home base (${homeSystem})`);
   }
 
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Check if we should return home due to idle timeout (CHECKED EVERY ITERATION) ──
+    const isAwayFromHome = homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem);
+    if (isReturningIdle && isAwayFromHome) {
+      // Check for any new rescue requests before returning (abort return if found)
+      const urgentManualRescue = getNextManualRescue();
+      if (urgentManualRescue) {
+        ctx.log("rescue", `🎯 Aborting return home - manual rescue request for ${urgentManualRescue.targetPlayer}`);
+        isReturningIdle = false;
+        idleTimeMs = 0;
+        continue;
+      }
+
+      const urgentMayday = getNextMayday();
+      if (urgentMayday) {
+        const knownPlayer = isKnownPlayer(urgentMayday.sender);
+        if (knownPlayer) {
+          ctx.log("mayday", `🚨 Aborting return home - MAYDAY from ${urgentMayday.sender}`);
+          isReturningIdle = false;
+          idleTimeMs = 0;
+          continue;
+        }
+        markMaydayHandled(urgentMayday);
+      }
+
+      const fleet = ctx.getFleetStatus?.() || [];
+      const strandedBot = findStrandedBots(fleet, bot.username, settings.fuelThreshold)[0];
+      if (strandedBot) {
+        ctx.log("rescue", `🚑 Aborting return home - fleet rescue needed for ${strandedBot.username}`);
+        isReturningIdle = false;
+        idleTimeMs = 0;
+        continue;
+      }
+
+      // No urgent requests - proceed with return home
+      ctx.log("rescue", `🏠 Returning home after idle timeout...`);
+      yield "return_home";
+      await ensureUndocked(ctx);
+      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!arrived) {
+        ctx.log("error", `Failed to return to home system ${homeSystem}`);
+      } else {
+        ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+        isReturningIdle = false;
+        idleTimeMs = 0;
+      }
+      continue;
+    }
+
+    // ── Clean up expired rescue announcements ──
+    cleanupExpiredAnnouncements();
+
+    // ── Monitor faction chat for rescue announcements from other bots ──
+    // This helps coordinate with other rescue bots to avoid duplicate responses
+    try {
+      const chatResp = await bot.exec("get_chat_history", { channel: "faction", limit: 20 });
+      if (!chatResp.error && chatResp.result) {
+        const r = chatResp.result as Record<string, unknown>;
+        const msgs = (
+          Array.isArray(chatResp.result) ? chatResp.result :
+          Array.isArray(r.messages) ? r.messages :
+          Array.isArray(r.history) ? r.history :
+          []
+        ) as Array<Record<string, unknown>>;
+
+        for (const msg of msgs) {
+          const content = (msg.content as string) || (msg.message as string) || "";
+          const sender = (msg.sender as string) || (msg.username as string) || "";
+          const ts = (msg.timestamp as number) || (msg.created_at as number) || Date.now();
+          
+          // Skip messages from self
+          if (sender === bot.username) continue;
+          
+          const announcement = parseRescueAnnouncement(content, sender, ts * 1000);
+          if (announcement) {
+            recordRescueAnnouncement(announcement);
+            ctx.log("rescue", `📡 Detected rescue announcement from ${sender}: ${announcement.targetName} at ${announcement.targetSystem}`);
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore errors - faction chat monitoring is optional
+    }
 
     // ── Check for MANUAL RESCUE requests (HIGHEST PRIORITY) ──
     const manualRescue = getNextManualRescue();
@@ -303,6 +408,14 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
           ctx.log("mayday", `✓ Sender ${mayday.sender} is a KNOWN player — responding to MAYDAY`);
 
+          // ── RESCUE COORDINATION: Check if another bot is already handling this ──
+          const handledBy = isRescueHandled(mayday.sender, mayday.system, mayday.poi, bot.username);
+          if (handledBy) {
+            ctx.log("rescue", `🤝 MAYDAY already being handled by ${handledBy.rescuerUsername} - skipping to avoid duplicate rescue`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+
           // Check jump range
           let jumpsAway = 0;
           if (mayday.system && mayday.system !== bot.system && settings.maydayMaxJumps > 0) {
@@ -337,20 +450,20 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
       if (targets.length === 0 && !maydayTarget) {
         yield "idle";
-        
+
         // Track idle time when away from home
-        const isAwayFromHome = homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase();
+        const isAwayFromHome = homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem);
         if (isAwayFromHome && !isReturningIdle) {
           idleTimeMs += settings.scanIntervalSec * 1000;
-          
+
           if (idleTimeMs >= IDLE_RETURN_THRESHOLD_MS) {
             ctx.log("rescue", `⏱️ Idle for ${Math.round(idleTimeMs / 1000)}s — returning home...`);
             isReturningIdle = true;
           } else {
-            ctx.log("rescue", `⏱️ Idle for ${Math.round(idleTimeMs / 1000)}s (away from home: ${isAwayFromHome})`);
+            ctx.log("rescue", `⏱️ Idle for ${Math.round(idleTimeMs / 1000)}s (away from home)`);
           }
         }
-        
+
         await sleep(settings.scanIntervalSec * 1000);
         continue;
       }
@@ -359,56 +472,6 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       target = maydayTarget || targets[0];
       isMaydayTarget = !!maydayTarget;
       logCategory = isMaydayTarget ? "mayday" : "rescue";
-    }
-
-    // ── Check if we should return home due to idle timeout ──
-    const isAwayFromHome = homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase();
-    if (isReturningIdle && isAwayFromHome) {
-      // Check for any new rescue requests before returning (abort return if found)
-      const urgentManualRescue = getNextManualRescue();
-      const urgentMayday = getNextMayday();
-      
-      if (urgentManualRescue) {
-        ctx.log("rescue", `🎯 Aborting return home - manual rescue request for ${urgentManualRescue.targetPlayer}`);
-        isReturningIdle = false;
-        idleTimeMs = 0;
-        continue; // Restart loop to handle the rescue
-      }
-      
-      if (urgentMayday) {
-        const knownPlayer = isKnownPlayer(urgentMayday.sender);
-        if (knownPlayer) {
-          ctx.log("mayday", `🚨 Aborting return home - MAYDAY from ${urgentMayday.sender}`);
-          isReturningIdle = false;
-          idleTimeMs = 0;
-          continue; // Restart loop to handle the MAYDAY
-        }
-        markMaydayHandled(urgentMayday); // Ignore unknown player
-      }
-      
-      const fleet = ctx.getFleetStatus?.() || [];
-      const strandedBot = findStrandedBots(fleet, bot.username, settings.fuelThreshold)[0];
-      if (strandedBot) {
-        ctx.log("rescue", `🚑 Aborting return home - fleet rescue needed for ${strandedBot.username}`);
-        isReturningIdle = false;
-        idleTimeMs = 0;
-        continue; // Restart loop to handle the fleet rescue
-      }
-      
-      // No urgent requests - proceed with return home
-      ctx.log("rescue", `🏠 Returning home after idle timeout...`);
-      yield "return_home";
-      await ensureUndocked(ctx);
-      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
-      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-      if (!arrived) {
-        ctx.log("error", `Failed to return to home system ${homeSystem}`);
-      } else {
-        ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
-        isReturningIdle = false;
-        idleTimeMs = 0;
-      }
-      continue; // Restart loop after returning
     }
 
     if (!target) {
@@ -1130,14 +1193,20 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
   const { bot } = ctx;
 
   await bot.refreshStatus();
-  const homeSystem = bot.system;
+  const settings = getRescueSettings();
+  const homeSystem = settings.homeSystem || bot.system;
+  
+  if (settings.homeSystem) {
+    ctx.log("system", `Home base configured: ${homeSystem}`);
+  } else {
+    ctx.log("warn", "No home base configured — will use starting system as home");
+  }
 
   ctx.log("rescue", "🚨 MaydayRescue bot online — monitoring emergency channel for distress calls...");
 
   // Clear expired MAYDAYs on startup to avoid processing old requests
   clearExpiredMaydays();
 
-  const settings = getRescueSettings();
   const aiChatService = (globalThis as any).aiChatService;
 
   // Log category for this routine (always "mayday" since it's MAYDAY-specific)
@@ -1602,12 +1671,35 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
   await bot.refreshStatus();
-  const homeSystem = bot.system;
+  const settings = getRescueSettings();
+  const homeSystem = settings.homeSystem || bot.system;
+  
+  if (settings.homeSystem) {
+    ctx.log("system", `Home base configured: ${homeSystem}`);
+  } else {
+    ctx.log("warn", "No home base configured — will use starting system as home");
+  }
 
   ctx.log("system", "FuelRescue bot online — monitoring fleet and MAYDAY channel for stranded ships...");
 
   // Clear expired MAYDAYs on startup to avoid processing old requests
   clearExpiredMaydays();
+
+  // Normalize system names for comparison (handle underscore vs space)
+  const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+
+  // Track idle time when away from home (for auto-return feature)
+  let idleTimeMs = 0;
+  const IDLE_RETURN_THRESHOLD_MS = 30000; // Return home after 30 seconds of idle time when away from home
+  let isReturningIdle = false; // Track if we're returning home due to idle
+
+  // Log if starting away from home
+  const startedAwayFromHome = homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem);
+  if (startedAwayFromHome) {
+    ctx.log("rescue", `⚠️ Bot started away from home (${bot.system} vs ${homeSystem}) — will return home after ${IDLE_RETURN_THRESHOLD_MS / 1000}s of idle time`);
+  } else if (homeSystem) {
+    ctx.log("rescue", `✓ Bot started at home base (${homeSystem})`);
+  }
 
   // Log category - determined when target is selected
   let logCategory: string = "rescue";
@@ -1617,10 +1709,110 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Check if we should return home due to idle timeout (CHECKED EVERY ITERATION) ──
+    const isAwayFromHome = homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem);
+    if (isReturningIdle && isAwayFromHome) {
+      // Check for any new rescue requests before returning (abort return if found)
+      const urgentManualRescue = getNextManualRescue();
+      if (urgentManualRescue) {
+        ctx.log("rescue", `🎯 Aborting return home - manual rescue request for ${urgentManualRescue.targetPlayer}`);
+        isReturningIdle = false;
+        idleTimeMs = 0;
+        continue;
+      }
+
+      const urgentMayday = getNextMayday();
+      if (urgentMayday) {
+        const knownPlayer = isKnownPlayer(urgentMayday.sender);
+        if (knownPlayer) {
+          ctx.log("mayday", `🚨 Aborting return home - MAYDAY from ${urgentMayday.sender}`);
+          isReturningIdle = false;
+          idleTimeMs = 0;
+          continue;
+        }
+        markMaydayHandled(urgentMayday);
+      }
+
+      const fleet = ctx.getFleetStatus?.() || [];
+      const strandedBot = findStrandedBots(fleet, bot.username, settings.fuelThreshold)[0];
+      if (strandedBot) {
+        ctx.log("rescue", `🚑 Aborting return home - fleet rescue needed for ${strandedBot.username}`);
+        isReturningIdle = false;
+        idleTimeMs = 0;
+        continue;
+      }
+
+      // No urgent requests - proceed with return home
+      ctx.log("rescue", `🏠 Returning home after idle timeout...`);
+      yield "return_home";
+      await ensureUndocked(ctx);
+      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!arrived) {
+        ctx.log("error", `Failed to return to home system ${homeSystem}`);
+      } else {
+        ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+        isReturningIdle = false;
+        idleTimeMs = 0;
+      }
+      continue;
+    }
+
+    // ── Clean up expired rescue announcements ──
+    cleanupExpiredAnnouncements();
+
+    // ── Monitor faction chat for rescue announcements from other bots ──
+    // This helps coordinate with other rescue bots to avoid duplicate responses
+    try {
+      const chatResp = await bot.exec("get_chat_history", { channel: "faction", limit: 20 });
+      if (!chatResp.error && chatResp.result) {
+        const r = chatResp.result as Record<string, unknown>;
+        const msgs = (
+          Array.isArray(chatResp.result) ? chatResp.result :
+          Array.isArray(r.messages) ? r.messages :
+          Array.isArray(r.history) ? r.history :
+          []
+        ) as Array<Record<string, unknown>>;
+
+        for (const msg of msgs) {
+          const content = (msg.content as string) || (msg.message as string) || "";
+          const sender = (msg.sender as string) || (msg.username as string) || "";
+          const ts = (msg.timestamp as number) || (msg.created_at as number) || Date.now();
+          
+          // Skip messages from self
+          if (sender === bot.username) continue;
+          
+          const announcement = parseRescueAnnouncement(content, sender, ts * 1000);
+          if (announcement) {
+            recordRescueAnnouncement(announcement);
+            ctx.log("rescue", `📡 Detected rescue announcement from ${sender}: ${announcement.targetName} at ${announcement.targetSystem}`);
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore errors - faction chat monitoring is optional
+    }
+
+    // ── Check for MANUAL RESCUE requests (HIGHEST PRIORITY) ──
+    const manualRescue = getNextManualRescue();
+    let manualRescueTarget: RescueTarget | null = null;
+    if (manualRescue) {
+      ctx.log("rescue", `🎯 MANUAL RESCUE REQUEST: ${manualRescue.targetPlayer} at ${manualRescue.targetSystem}/${manualRescue.targetPOI}`);
+      manualRescueTarget = {
+        username: manualRescue.targetPlayer,
+        system: manualRescue.targetSystem,
+        poi: manualRescue.targetPOI,
+        fuelPct: 0, // Unknown fuel level for manual rescue
+        docked: false,
+      };
+      markManualRescueHandled(manualRescue);
+      ctx.log("rescue", `✓ Manual rescue request accepted - will rescue ${manualRescue.targetPlayer}`);
+    }
+
     // ── Rescue session recovery ──
     const activeSession = getActiveRescueSession(bot.username);
     let recoveredSession: RescueSession | null = null;
-    if (activeSession) {
+    if (activeSession && !manualRescueTarget) {
       ctx.log("rescue", `Found incomplete rescue session: ${activeSession.targetUsername} at ${activeSession.targetSystem}/${activeSession.targetPoi} (${activeSession.state})`);
       // Validate the session is still relevant
       const fleet = ctx.getFleetStatus?.() || [];
@@ -1646,11 +1838,21 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
     const settings = getRescueSettings();
 
-    // ── Handle recovered session ──
+    // ── Determine log category early (needed for skipToReturnHome case) ──
+    let logCategory: string = "rescue";
+
+    // ── Handle recovered session or manual rescue ──
     let target: RescueTarget | null = null;
     let isMaydayTarget = false;
+    let isManualRescueTarget = false;
+    let skipToReturnHome = false;
 
-    if (recoveredSession) {
+    if (manualRescueTarget) {
+      // Manual rescue has highest priority
+      target = manualRescueTarget;
+      isManualRescueTarget = true;
+      ctx.log("rescue", `🎯 PRIORITY: Manual rescue mission for ${target.username}`);
+    } else if (recoveredSession) {
       // Resume the rescued session - skip scanning and go directly to execution
       target = {
         username: recoveredSession.targetUsername,
@@ -1696,8 +1898,8 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       // Set up for immediate execution below
     }
 
-    // ── Check fleet status (only if not resuming) ──
-    if (!recoveredSession) {
+    // ── Check fleet status (only if not resuming and no manual rescue) ──
+    if (!recoveredSession && !manualRescueTarget) {
       yield "scan_fleet";
       const fleet = ctx.getFleetStatus?.() || [];
       if (fleet.length === 0) {
@@ -1717,15 +1919,23 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
           // Check if sender is a known player (from playerNames.json)
           const knownPlayer = isKnownPlayer(mayday.sender);
-          
+
           if (!knownPlayer) {
             // Unknown sender - skip this MAYDAY (possible ambush)
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - not a known player (possible ambush)`);
             markMaydayHandled(mayday);
             continue;
           }
-          
+
           ctx.log("mayday", `✓ Sender ${mayday.sender} is a KNOWN player — responding to MAYDAY`);
+
+          // ── RESCUE COORDINATION: Check if another bot is already handling this ──
+          const handledBy = isRescueHandled(mayday.sender, mayday.system, mayday.poi, bot.username);
+          if (handledBy) {
+            ctx.log("rescue", `🤝 MAYDAY already being handled by ${handledBy.rescuerUsername} - skipping to avoid duplicate rescue`);
+            markMaydayHandled(mayday);
+            continue;
+          }
 
           // Check jump range
           let jumpsAway = 0;
@@ -1760,6 +1970,19 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       if (targets.length === 0 && !maydayTarget) {
+        // Track idle time when away from home
+        const isAwayFromHome = homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem);
+        if (isAwayFromHome && !isReturningIdle) {
+          idleTimeMs += settings.scanIntervalSec * 1000;
+
+          if (idleTimeMs >= IDLE_RETURN_THRESHOLD_MS) {
+            ctx.log("rescue", `⏱️ Idle for ${Math.round(idleTimeMs / 1000)}s — returning home...`);
+            isReturningIdle = true;
+          } else {
+            ctx.log("rescue", `⏱️ Idle for ${Math.round(idleTimeMs / 1000)}s (away from home)`);
+          }
+        }
+
         // No one needs help — scavenge where we are and idle
         yield "idle_scavenge";
         if (!bot.docked) {
@@ -1803,25 +2026,39 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       const aiChatService = (globalThis as any).aiChatService;
       if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
         try {
-          await aiChatService.sendFactionMessage(bot, {
+          const result = await aiChatService.sendFactionMessage(bot, {
             messageType: "rescue_start",
             targetName: target.username,
             isMayday: isMaydayTarget,
-            isBot: !isMaydayTarget,
+            isBot: !isMaydayTarget && !isManualRescueTarget,
             currentSystem: bot.system,
             targetSystem: target.system,
             targetPoi: target.poi || undefined,
             targetFuelPct: target.fuelPct,
           });
+          // Only record announcement if message was actually sent
+          if (result.ok) {
+            recordRescueAnnouncement({
+              rescuerUsername: bot.username,
+              targetName: target.username,
+              targetSystem: target.system,
+              targetPoi: target.poi || undefined,
+              timestamp: Date.now(),
+              isMayday: isMaydayTarget,
+            });
+          } else {
+            ctx.log("ai_chat_debug", `Faction announcement skipped: ${result.error}`);
+          }
         } catch (e) {
           ctx.log("warn", `AI faction message (start) failed: ${e}`);
         }
       }
     }
 
-    const maydayTarget = target;
-
-    if (maydayTarget) {
+    // ── Log the rescue target ──
+    if (isManualRescueTarget) {
+      ctx.log("rescue", `🎯 MANUAL RESCUE: ${target.username} at ${target.system}/${target.poi || "unknown"}`);
+    } else if (isMaydayTarget) {
       ctx.log("mayday", `RESCUE NEEDED (MAYDAY): ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
     } else {
       ctx.log("rescue", `RESCUE NEEDED: ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
@@ -1945,7 +2182,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "navigate_to_target";
     await ensureUndocked(ctx);
 
-    if (target.system && target.system !== bot.system) {
+    if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
       ctx.log(logCategory, `Navigating to ${target.system}...`);
       const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
       const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
@@ -2016,7 +2253,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       const aiChatService = (globalThis as any).aiChatService;
       if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
         try {
-          await aiChatService.sendFactionMessage(bot, {
+          const result = await aiChatService.sendFactionMessage(bot, {
             messageType: "rescue_arrived",
             targetName: target.username,
             isMayday: isMaydayTarget,
@@ -2025,6 +2262,9 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             targetSystem: target.system,
             targetPoi: target.poi || undefined,
           });
+          if (!result.ok) {
+            ctx.log("ai_chat_debug", `Faction announcement (arrived) skipped: ${result.error}`);
+          }
         } catch (e) {
           ctx.log("warn", `AI faction message (arrived) failed: ${e}`);
         }
@@ -2063,7 +2303,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           const aiChatService = (globalThis as any).aiChatService;
           if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
             try {
-              await aiChatService.sendFactionMessage(bot, {
+              const result = await aiChatService.sendFactionMessage(bot, {
                 messageType: "rescue_no_show",
                 targetName: target.username,
                 isMayday: isMaydayTarget,
@@ -2072,16 +2312,30 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
                 targetSystem: target.system,
                 targetPoi: target.poi || undefined,
               });
+              if (!result.ok) {
+                ctx.log("ai_chat_debug", `Faction announcement (no_show) skipped: ${result.error}`);
+              }
             } catch (e) {
               ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
             }
           }
-          
+
           // Fail the session and return home
           if (recoveredSession || getActiveRescueSession(bot.username)) {
             failRescueSession(bot.username, "Target not found at location");
           }
           markMaydayHandled({ sender: target.username, system: target.system, poi: target.poi || "", fuelPct: target.fuelPct, timestamp: Date.now(), currentFuel: 0, maxFuel: 0, rawMessage: "" });
+          
+          // Return home after failed rescue (potential ambush)
+          if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
+            ctx.log("rescue", `🚨 Target not found - returning home to safety...`);
+            await ensureUndocked(ctx);
+            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+            const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+            if (arrived) {
+              ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+            }
+          }
           continue;
         }
       }
@@ -2119,7 +2373,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         const aiChatService = (globalThis as any).aiChatService;
         if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
           try {
-            await aiChatService.sendFactionMessage(bot, {
+            const result = await aiChatService.sendFactionMessage(bot, {
               messageType: "rescue_complete",
               targetName: target.username,
               isMayday: isMaydayTarget,
@@ -2128,6 +2382,9 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
               targetSystem: target.system,
               targetPoi: target.poi || undefined,
             });
+            if (!result.ok) {
+              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+            }
           } catch (e) {
             ctx.log("warn", `AI faction message (complete) failed: ${e}`);
           }
@@ -2173,7 +2430,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         const aiChatService = (globalThis as any).aiChatService;
         if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
           try {
-            await aiChatService.sendFactionMessage(bot, {
+            const result = await aiChatService.sendFactionMessage(bot, {
               messageType: "rescue_complete",
               targetName: target.username,
               isMayday: isMaydayTarget,
@@ -2182,6 +2439,9 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
               targetSystem: target.system,
               targetPoi: target.poi || undefined,
             });
+            if (!result.ok) {
+              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+            }
           } catch (e) {
             ctx.log("warn", `AI faction message (complete) failed: ${e}`);
           }
@@ -2266,7 +2526,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Return to home system ──
-    if (homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
+    if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
       yield "return_home";
       ctx.log(logCategory, `Returning to home system ${homeSystem}...`);
       await ensureUndocked(ctx);
@@ -2312,6 +2572,10 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     } else {
       ctx.log("rescue", `=== Rescue mission for ${target.username} complete ===`);
     }
+
+    // Reset idle timer after successful rescue
+    idleTimeMs = 0;
+    isReturningIdle = false;
 
     // Short cooldown before next scan
     await sleep(10000);

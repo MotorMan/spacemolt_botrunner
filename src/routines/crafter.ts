@@ -249,6 +249,37 @@ function hasMaterialsAnywhere(ctx: RoutineContext, recipe: Recipe, batchSize: nu
   return true;
 }
 
+/**
+ * Calculate the maximum number of times a recipe can be crafted based on available materials.
+ * Checks cargo + personal storage + faction storage.
+ * Returns 0 if any component is missing.
+ */
+function calculateMaxCraftable(ctx: RoutineContext, recipe: Recipe): number {
+  const { bot } = ctx;
+  let maxCrafts = Infinity;
+
+  for (const comp of recipe.components) {
+    // Count in cargo + personal storage + faction storage
+    let totalAvailable = 0;
+    for (const i of bot.inventory) {
+      if (i.itemId === comp.item_id) totalAvailable += i.quantity;
+    }
+    for (const i of bot.storage) {
+      if (i.itemId === comp.item_id) totalAvailable += i.quantity;
+    }
+    for (const i of bot.factionStorage) {
+      if (i.itemId === comp.item_id) totalAvailable += i.quantity;
+    }
+
+    const craftsPossible = Math.floor(totalAvailable / comp.quantity);
+    if (craftsPossible < maxCrafts) {
+      maxCrafts = craftsPossible;
+    }
+  }
+
+  return maxCrafts === Infinity ? 0 : maxCrafts;
+}
+
 /** Build a lookup: output_item_id → Recipe, so we can find what recipe produces a given item. */
 function buildRecipeIndex(recipes: Recipe[]): Map<string, Recipe> {
   const index = new Map<string, Recipe>();
@@ -670,191 +701,138 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
-      // Craft in batches - use adaptive batch sizes (100x → 10x → 1x fallback)
-      // Personal storage has 100k per item limit, so we can't withdraw millions at once
+      ctx.log("craft", `${recipe.name}: need ${needed} to reach quota (have ${currentStock}/${limit})`);
+
+      // Calculate how many we can actually craft based on available materials
+      const maxCraftable = calculateMaxCraftable(ctx, recipe);
+      ctx.log("craft", `${recipe.name}: can craft up to ${maxCraftable}x based on available materials`);
+
+      // Determine actual craft count: min of (needed, maxCraftable)
+      const toCraft = Math.min(needed, maxCraftable);
+
+      if (toCraft <= 0) {
+        missingSummary.push(`${recipe.name}: no materials available`);
+        continue;
+      }
+
+      ctx.log("craft", `${recipe.name}: will craft ${toCraft}x (quota: ${needed}, materials: ${maxCraftable})`);
+
       let crafted = 0;
+      let failedWithdrawals = 0;
+      const MAX_FAILED_WITHDRAWALS = 3;
 
-      while (crafted < needed && bot.state === "running") {
-        const remaining = needed - crafted;
-        // Start with 100x batch target, fall back to 10x, then 1x if withdrawal fails
-        let cycleTarget = Math.min(remaining, 100);
-
-        // Refresh inventories at start of each cycle
+      while (crafted < toCraft && bot.state === "running" && failedWithdrawals < MAX_FAILED_WITHDRAWALS) {
+        // Refresh inventories
         await bot.refreshCargo();
         if (bot.docked) {
           await bot.refreshStorage();
           await bot.refreshFactionStorage();
         }
 
-        // Try to get materials for the batch, with fallback to smaller sizes
-        let gotMaterials = false;
-        let missingForCycle: { name: string; need: number; have: number } | null = null;
+        // Calculate remaining to craft and how many we can craft with current materials
+        const remaining = toCraft - crafted;
+        const maxCraftableNow = calculateMaxCraftable(ctx, recipe);
 
-        while (!gotMaterials && cycleTarget >= 1) {
-          missingForCycle = getMissingMaterial(ctx, recipe, cycleTarget);
-
-          if (!missingForCycle) {
-            gotMaterials = true;
-            break;
-          }
-
-          // Check if materials are available somewhere (cargo + storage + faction) for THIS batch size
-          const materialsExistAnywhere = hasMaterialsAnywhere(ctx, recipe, cycleTarget);
-          
-          // DEBUG LOGGING - uncomment to debug batch size fallback issues
-          // ctx.log("craft", `${recipe.name}: missing ${missingForCycle.name} (need ${missingForCycle.need}, have ${missingForCycle.have}) for ${cycleTarget}x batch, materialsExistAnywhere=${materialsExistAnywhere}`);
-
-          if (materialsExistAnywhere) {
-            // Materials exist but not in cargo/storage - withdraw them
-            ctx.log("craft", `${recipe.name}: withdrawing materials for ${cycleTarget}x batch...`);
-            await withdrawFactionMaterials(ctx, recipe, cycleTarget);
-            await withdrawStorageMaterials(ctx, recipe, cycleTarget);
-            // Refresh storage after withdrawal to update cache
-            await bot.refreshStorage();
-            missingForCycle = getMissingMaterial(ctx, recipe, cycleTarget);
-
-            if (!missingForCycle) {
-              gotMaterials = true;
-              break;
-            }
-
-            // Still missing after withdrawal - try prerequisites
-            ctx.log("craft", `${recipe.name}: still missing ${missingForCycle.need}x ${missingForCycle.name} after withdrawal, trying prerequisites...`);
-            const preCrafted = await craftPrerequisites(ctx, recipe, recipeIndex);
-            if (preCrafted.length > 0) {
-              prereqSummary.push(...preCrafted);
-              await bot.refreshCargo();
-              if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
-              await withdrawFactionMaterials(ctx, recipe, cycleTarget);
-              await withdrawStorageMaterials(ctx, recipe, cycleTarget);
-              await bot.refreshStorage();
-              missingForCycle = getMissingMaterial(ctx, recipe, cycleTarget);
-              if (!missingForCycle) {
-                gotMaterials = true;
-                break;
-              }
-            }
-          }
-
-          // Materials don't exist for this batch size
-          // Try smaller batch first (100x → 10x → 1x) before crafting prerequisites
-          // DEBUG LOGGING - uncomment to debug batch size fallback issues
-          // ctx.log("craft", `${recipe.name}: cycleTarget=${cycleTarget}, checking fallback...`);
-          if (cycleTarget === 100) {
-            cycleTarget = 10;
-            ctx.log("craft", `${recipe.name}: materials not available for 100x batch, trying 10x...`);
-            continue; // Try 10x immediately
-          } else if (cycleTarget === 10) {
-            cycleTarget = 1;
-            ctx.log("craft", `${recipe.name}: materials not available for 10x batch, trying 1x...`);
-            continue; // Try 1x immediately
-          } else if (cycleTarget > 1) {
-            // Some other batch size (like 50x) - fall back to 10x
-            cycleTarget = 10;
-            ctx.log("craft", `${recipe.name}: materials not available for ${cycleTarget}x batch, trying 10x...`);
-            continue;
-          }
-
-          // At 1x and materials still don't exist anywhere - try prerequisites as last resort
-          ctx.log("craft", `${recipe.name}: materials not available anywhere, trying prerequisites...`);
+        if (maxCraftableNow <= 0) {
+          // Try prerequisites
+          ctx.log("craft", `${recipe.name}: no materials available, trying prerequisites...`);
           const preCrafted = await craftPrerequisites(ctx, recipe, recipeIndex);
           if (preCrafted.length > 0) {
             prereqSummary.push(...preCrafted);
             await bot.refreshCargo();
             if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
-            await withdrawFactionMaterials(ctx, recipe, 1);
-            await withdrawStorageMaterials(ctx, recipe, 1);
-            await bot.refreshStorage();
-            missingForCycle = getMissingMaterial(ctx, recipe, 1);
-            if (!missingForCycle) {
-              gotMaterials = true;
-              break;
-            }
+            continue; // Re-check materials after prerequisite crafting
           }
-
-          break; // Already at 1x and prerequisites didn't help, give up
-        }
-
-        // DEBUG LOGGING - uncomment to debug loop exit conditions
-        // ctx.log("craft", `${recipe.name}: after while loop - gotMaterials=${gotMaterials}, cycleTarget=${cycleTarget}, missingForCycle=${missingForCycle ? missingForCycle.name : 'null'}`);
-        if (!gotMaterials && missingForCycle) {
-          ctx.log("craft", `${recipe.name}: cannot get materials for even 1x batch, skipping`);
-          missingSummary.push(`${recipe.name} (${missingForCycle.need}x ${missingForCycle.name} for ${cycleTarget}x batch)`);
+          ctx.log("craft", `${recipe.name}: no materials and prerequisites couldn't help`);
           break;
         }
 
-        // Small delay after withdrawal to ensure server has processed everything
-        if (cycleTarget > 1) {
+        // Determine batch size: min of (remaining, maxCraftableNow, craftingSkillLevel)
+        const batchSize = Math.min(remaining, maxCraftableNow, craftingSkillLevel);
+        ctx.log("craft", `${recipe.name}: crafting ${batchSize}x batch (skill: ${craftingSkillLevel}, remaining: ${remaining}, canCraft: ${maxCraftableNow})`);
+
+        // Withdraw materials for this batch
+        await withdrawFactionMaterials(ctx, recipe, batchSize);
+        await withdrawStorageMaterials(ctx, recipe, batchSize);
+        await bot.refreshStorage();
+
+        // Check if we have materials in cargo/storage after withdrawal
+        const missingAfterWithdraw = getMissingMaterial(ctx, recipe, batchSize);
+        if (missingAfterWithdraw) {
+          ctx.log("warn", `${recipe.name}: missing ${missingAfterWithdraw.need}x ${missingAfterWithdraw.name} after withdrawal (batch: ${batchSize})`);
+          failedWithdrawals++;
+          // Try prerequisites
+          const preCrafted = await craftPrerequisites(ctx, recipe, recipeIndex);
+          if (preCrafted.length > 0) {
+            prereqSummary.push(...preCrafted);
+            await bot.refreshCargo();
+            if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
+            continue;
+          }
+          // If we can't get materials for even 1, give up
+          if (batchSize === 1) break;
+          // Otherwise try with batch size 1
+          continue;
+        }
+
+        // Small delay after withdrawal
+        if (batchSize > 1) {
           await sleep(300);
         }
 
-        // Now craft using the crafting skill level as the batch size
-        // Crafting skill level determines how many items can be crafted per command
-        let craftedInCycle = 0;
-        while (craftedInCycle < cycleTarget && bot.state === "running") {
-          const craftBatchSize = Math.max(1, craftingSkillLevel);
+        // Execute the craft command
+        yield `craft_${recipeId}`;
+        const craftResp = await bot.exec("craft", { recipe_id: recipeId, count: batchSize });
 
-          yield `craft_${recipeId}`;
-          const craftResp = await bot.exec("craft", { recipe_id: recipeId, count: craftBatchSize });
-
-          if (craftResp.error) {
-            const msg = craftResp.error.message.toLowerCase();
-            if (msg.includes("material") || msg.includes("component") || msg.includes("insufficient")) {
-              // Out of materials in cargo - stop crafting this cycle, will withdraw more next outer iteration
-              ctx.log("craft", `${recipe.name}: ran out of materials in cargo after ${craftedInCycle}x in this cycle`);
-              break;
-            } else {
-              ctx.log("error", `Craft ${recipe.name}: ${craftResp.error.message}`);
-              break;
-            }
-          }
-
-          const result = craftResp.result as Record<string, unknown> | undefined;
-
-          // Parse actual output quantity from craft response
-          // Response may have: { count, quantity, items: [{ quantity }], output: { quantity }, produced: [...] }
-          let actualOutputQty = 0;
-          if (result) {
-            // Try direct count/quantity fields first
-            actualOutputQty = (result.count as number) || (result.quantity as number) || 0;
-
-            // If no direct count, check for items/output arrays
-            if (actualOutputQty === 0) {
-              const items = (result.items as Array<Record<string, unknown>>) ||
-                           (result.output as Array<Record<string, unknown>>) ||
-                           (result.produced as Array<Record<string, unknown>>);
-              if (items && items.length > 0) {
-                // Sum up quantities from all output items
-                for (const item of items) {
-                  actualOutputQty += (item.quantity as number) || (item.count as number) || 0;
-                }
-              }
-            }
-
-            // Fallback: use recipe's output_quantity * craftBatchSize
-            if (actualOutputQty === 0) {
-              actualOutputQty = (recipe.output_quantity || 1) * craftBatchSize;
-            }
+        if (craftResp.error) {
+          const msg = craftResp.error.message.toLowerCase();
+          if (msg.includes("material") || msg.includes("component") || msg.includes("insufficient")) {
+            ctx.log("craft", `${recipe.name}: ran out of materials during craft`);
+            failedWithdrawals++;
+            continue; // Will try to withdraw more on next iteration
           } else {
-            actualOutputQty = (recipe.output_quantity || 1) * craftBatchSize;
+            ctx.log("error", `Craft ${recipe.name}: ${craftResp.error.message}`);
+            break;
           }
-
-          craftedInCycle += actualOutputQty;
-          crafted += actualOutputQty;
-          totalCrafted += actualOutputQty;
-          bot.stats.totalCrafted += actualOutputQty;
-
-          // Progress logging
-          const pct = Math.round((crafted / needed) * 100);
-          ctx.log("craft", `${recipe.name}: ${crafted}/${needed} (${pct}%) - crafted ${actualOutputQty}x`);
         }
 
-        // If we couldn't craft anything in this cycle, break out
-        if (craftedInCycle === 0) break;
+        // Parse actual output quantity from craft response
+        const result = craftResp.result as Record<string, unknown> | undefined;
+        let actualOutputQty = 0;
+        if (result) {
+          actualOutputQty = (result.count as number) || (result.quantity as number) || 0;
+          if (actualOutputQty === 0) {
+            const items = (result.items as Array<Record<string, unknown>>) ||
+                         (result.output as Array<Record<string, unknown>>) ||
+                         (result.produced as Array<Record<string, unknown>>);
+            if (items && items.length > 0) {
+              for (const item of items) {
+                actualOutputQty += (item.quantity as number) || (item.count as number) || 0;
+              }
+            }
+          }
+          if (actualOutputQty === 0) {
+            actualOutputQty = (recipe.output_quantity || 1) * batchSize;
+          }
+        } else {
+          actualOutputQty = (recipe.output_quantity || 1) * batchSize;
+        }
+
+        crafted += actualOutputQty;
+        totalCrafted += actualOutputQty;
+        bot.stats.totalCrafted += actualOutputQty;
+
+        // Progress logging
+        const pct = Math.round((crafted / toCraft) * 100);
+        ctx.log("craft", `${recipe.name}: ${crafted}/${toCraft} (${pct}%) - crafted ${actualOutputQty}x`);
       }
 
       if (crafted > 0) {
         craftedSummary.push(`${crafted}x ${recipe.name}`);
+      }
+
+      if (crafted < toCraft) {
+        ctx.log("craft", `${recipe.name}: only crafted ${crafted}/${toCraft} - materials exhausted or error occurred`);
       }
     }
 

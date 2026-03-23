@@ -14,7 +14,7 @@ import {
   sleep,
   logStatus,
 } from "./common.js";
-import { getNextMayday, markMaydayHandled, type MaydayRequest } from "../mayday.js";
+import { getNextMayday, markMaydayHandled, clearExpiredMaydays, type MaydayRequest } from "../mayday.js";
 import { getNextManualRescue, markManualRescueHandled, type ManualRescueRequest } from "../manualrescue.js";
 import {
   getActiveRescueSession,
@@ -147,6 +147,9 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
   const homeSystem = bot.system;
 
   ctx.log("system", "FuelTransfer bot online — ready to refuel stranded ships...");
+
+  // Clear expired MAYDAYs on startup to avoid processing old requests
+  clearExpiredMaydays();
 
   // Check for Refueling Pump module at startup
   const hasPump = await hasRefuelingPump(ctx);
@@ -1131,6 +1134,9 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
   ctx.log("rescue", "🚨 MaydayRescue bot online — monitoring emergency channel for distress calls...");
 
+  // Clear expired MAYDAYs on startup to avoid processing old requests
+  clearExpiredMaydays();
+
   const settings = getRescueSettings();
   const aiChatService = (globalThis as any).aiChatService;
 
@@ -1599,6 +1605,9 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   const homeSystem = bot.system;
 
   ctx.log("system", "FuelRescue bot online — monitoring fleet and MAYDAY channel for stranded ships...");
+
+  // Clear expired MAYDAYs on startup to avoid processing old requests
+  clearExpiredMaydays();
 
   // Log category - determined when target is selected
   let logCategory: string = "rescue";

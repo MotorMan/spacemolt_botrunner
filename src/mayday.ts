@@ -59,6 +59,9 @@ export function isLegitimateMayday(mayday: MaydayRequest, fuelThresholdPct: numb
 const maydayQueue: MaydayRequest[] = [];
 const processedMaydays = new Set<string>(); // Prevent duplicate processing
 
+// MAYDAYs expire after 5 minutes (300000 ms) - players should be rescued or logged off by then
+const MAYDAY_EXPIRY_MS = 300000;
+
 /**
  * Add a MAYDAY request to the queue.
  * Returns true if added, false if duplicate or invalid.
@@ -66,13 +69,13 @@ const processedMaydays = new Set<string>(); // Prevent duplicate processing
 export function addMaydayRequest(mayday: MaydayRequest): boolean {
   // Create unique ID to prevent duplicates
   const maydayId = `${mayday.sender}-${mayday.system}-${mayday.poi}-${Math.floor(mayday.timestamp / 60000)}`; // Unique per minute
-  
+
   if (processedMaydays.has(maydayId)) {
     return false; // Already processed
   }
 
   maydayQueue.push(mayday);
-  
+
   // Keep queue size reasonable
   if (maydayQueue.length > 50) {
     maydayQueue.shift();
@@ -83,13 +86,30 @@ export function addMaydayRequest(mayday: MaydayRequest): boolean {
 
 /**
  * Get the next pending MAYDAY request (oldest first).
+ * Filters out expired MAYDAYs automatically.
  * Returns null if no pending requests.
  */
 export function getNextMayday(): MaydayRequest | null {
-  if (maydayQueue.length === 0) {
-    return null;
+  const now = Date.now();
+  
+  // Filter out expired MAYDAYs
+  while (maydayQueue.length > 0) {
+    const mayday = maydayQueue[0];
+    const age = now - mayday.timestamp;
+    
+    if (age > MAYDAY_EXPIRY_MS) {
+      // This MAYDAY is expired - remove it
+      const ageMinutes = Math.round(age / 60000);
+      console.log(`[mayday] ⏰ Expiring MAYDAY from ${mayday.sender} at ${mayday.system}/${mayday.poi} (${ageMinutes} minutes old)`);
+      maydayQueue.shift();
+      continue;
+    }
+    
+    // Found a valid MAYDAY
+    return mayday;
   }
-  return maydayQueue[0];
+  
+  return null;
 }
 
 /**
@@ -117,4 +137,31 @@ export function markMaydayHandled(mayday: MaydayRequest): void {
  */
 export function clearMaydayQueue(): void {
   maydayQueue.length = 0;
+}
+
+/**
+ * Clear expired MAYDAYs from the queue.
+ * Call this periodically or when starting a rescue routine.
+ */
+export function clearExpiredMaydays(): void {
+  const now = Date.now();
+  const initialLength = maydayQueue.length;
+  
+  while (maydayQueue.length > 0) {
+    const mayday = maydayQueue[0];
+    const age = now - mayday.timestamp;
+    
+    if (age > MAYDAY_EXPIRY_MS) {
+      const ageMinutes = Math.round(age / 60000);
+      console.log(`[mayday] ⏰ Expiring MAYDAY from ${mayday.sender} at ${mayday.system}/${mayday.poi} (${ageMinutes} minutes old)`);
+      maydayQueue.shift();
+    } else {
+      break; // Queue is ordered by timestamp, so we can stop at first valid one
+    }
+  }
+  
+  const expired = initialLength - maydayQueue.length;
+  if (expired > 0) {
+    console.log(`[mayday] Cleared ${expired} expired MAYDAY(s)`);
+  }
 }

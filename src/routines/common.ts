@@ -991,11 +991,14 @@ export async function navigateToSystem(
   const MAX_JUMPS = 199;
   const MAX_RETRIES_PER_JUMP = 10;
 
+  // Normalize system names for comparison (replace underscores with spaces, lowercase)
+  const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+
   for (let attempt = 0; attempt < MAX_JUMPS; attempt++) {
     await bot.refreshStatus();
-    // Case-insensitive comparison for system names
-    if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) {
-      ctx.log("travel", `Already at ${targetSystemId} (case-insensitive match)`);
+    // Case-insensitive comparison for system names (handle underscore vs space)
+    if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+      ctx.log("travel", `Already at ${targetSystemId} (normalized: "${normalizeSystemName(bot.system)}" === "${normalizeSystemName(targetSystemId)}")`);
       return true;
     }
 
@@ -1009,7 +1012,20 @@ export async function navigateToSystem(
     } else {
       ctx.log("travel", `No mapped route — querying server for route to ${targetSystemId}`);
       const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
-      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number } | null;
+      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
+      
+      // Check if server says we're already at target (message field or 0 jumps)
+      const alreadyAtTarget = routeData?.found && (
+        routeData.total_jumps === 0 || 
+        (routeData.message && routeData.message.toLowerCase().includes('already')) ||
+        (routeData.route && routeData.route.length === 1)
+      );
+      
+      if (alreadyAtTarget) {
+        ctx.log("travel", `Server confirms we are already at ${targetSystemId}`);
+        return true;
+      }
+      
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
         nextSystem = routeData.route[1].system_id;
         ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
@@ -1018,15 +1034,15 @@ export async function navigateToSystem(
         // This can happen due to case mismatch or if we're already there
         ctx.log("warn", `Server returned no route to ${targetSystemId} — checking if already arrived...`);
         await bot.refreshStatus();
-        if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) {
-          ctx.log("travel", `Confirmed at ${targetSystemId} after failed route lookup`);
+        if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+          ctx.log("travel", `Confirmed at ${targetSystemId} after failed route lookup (normalized comparison)`);
           return true;
         }
         // Also check if we're in a neighboring system (1 jump away)
         const currentSystemData = mapStore.getSystem(bot.system);
         if (currentSystemData) {
           const isNeighbor = currentSystemData.connections.some(
-            c => c.system_id.toLowerCase() === targetSystemId.toLowerCase()
+            c => normalizeSystemName(c.system_id) === normalizeSystemName(targetSystemId)
           );
           if (isNeighbor) {
             ctx.log("travel", `Target ${targetSystemId} is adjacent - attempting direct jump`);
@@ -1065,7 +1081,7 @@ export async function navigateToSystem(
 
     // CRITICAL: Re-check position after ensureFueled — it may have moved us to a different system!
     await bot.refreshStatus();
-    if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
+    if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) return true;
 
     // Recalculate route from CURRENT position (ensureFueled may have moved us)
     const postFuelRoute = mapStore.findRoute(bot.system, targetSystemId);
@@ -1076,7 +1092,20 @@ export async function navigateToSystem(
       // No mapped route — query server
       ctx.log("travel", `No mapped route from ${bot.system} — querying server for route to ${targetSystemId}`);
       const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
-      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number } | null;
+      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
+      
+      // Check if server says we're already at target
+      const alreadyAtTarget = routeData?.found && (
+        routeData.total_jumps === 0 || 
+        (routeData.message && routeData.message.toLowerCase().includes('already')) ||
+        (routeData.route && routeData.route.length === 1)
+      );
+      
+      if (alreadyAtTarget) {
+        ctx.log("travel", `Server confirms we are already at ${targetSystemId} (post-fuel check)`);
+        return true;
+      }
+      
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
         nextSystem = routeData.route[1].system_id;
         ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);

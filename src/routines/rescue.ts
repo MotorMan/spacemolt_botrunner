@@ -422,12 +422,43 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       // ── Travel to stranded bot's POI ──
       if (target.poi) {
         yield "travel_to_target";
-        ctx.log(isMaydayTarget ? "mayday" : "rescue", `Traveling to ${target.username}'s location (${target.poi})...`);
-        const travelResp = await bot.exec("travel", { target_poi: target.poi });
+        
+        // Resolve POI name to POI ID by querying system info
+        let targetPoiId: string | null = null;
+        let targetPoiName: string = target.poi;
+        
+        try {
+          const { pois } = await getSystemInfo(ctx);
+          // Find POI by name (case-insensitive match)
+          const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
+          if (matchedPoi) {
+            targetPoiId = matchedPoi.id;
+            targetPoiName = matchedPoi.name;
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
+          } else {
+            // Try partial match as fallback
+            const partialMatch = pois.find(p => p.name.toLowerCase().includes(target.poi.toLowerCase()) || target.poi.toLowerCase().includes(p.name.toLowerCase()));
+            if (partialMatch) {
+              targetPoiId = partialMatch.id;
+              targetPoiName = partialMatch.name;
+              ctx.log(isMaydayTarget ? "mayday" : "rescue", `Partial POI match: "${target.poi}" -> ID: ${targetPoiId}`);
+            }
+          }
+        } catch (e) {
+          ctx.log("warn", `Could not query system POIs: ${e}`);
+        }
+        
+        // Use POI ID if resolved, otherwise fall back to name
+        const travelTarget = targetPoiId || target.poi;
+        
+        ctx.log(isMaydayTarget ? "mayday" : "rescue", `Traveling to ${target.username}'s location (${targetPoiName})...`);
+        const travelResp = await bot.exec("travel", { target_poi: travelTarget });
         if (travelResp.error && !travelResp.error.message.includes("already")) {
           ctx.log("error", `Travel failed: ${travelResp.error.message}`);
+        } else {
+          // Success - update bot.poi with the resolved name
+          bot.poi = targetPoiName;
         }
-        bot.poi = target.poi;
         // Update session state after traveling to POI
         if (recoveredSession || getActiveRescueSession(bot.username)) {
           updateRescueSession(bot.username, { state: "at_poi" });
@@ -562,8 +593,21 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
               // Return to target and jettison
               await ensureUndocked(ctx);
               if (target.poi) {
-                await bot.exec("travel", { target_poi: target.poi });
-                bot.poi = target.poi;
+                // Resolve POI name to ID
+                let targetPoiId: string | null = null;
+                try {
+                  const { pois } = await getSystemInfo(ctx);
+                  const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
+                  if (matchedPoi) {
+                    targetPoiId = matchedPoi.id;
+                    ctx.log(isMaydayTarget ? "mayday" : "rescue", `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
+                  }
+                } catch (e) {
+                  ctx.log("warn", `Could not query system POIs: ${e}`);
+                }
+                const travelTarget = targetPoiId || target.poi;
+                await bot.exec("travel", { target_poi: travelTarget });
+                bot.poi = targetPoiId ? target.poi : target.poi;
               }
 
               await bot.refreshCargo();
@@ -1790,13 +1834,44 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Travel to stranded bot's POI ──
     if (target.poi) {
       yield "travel_to_target";
-      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Traveling to ${target.username}'s location (${target.poi})...`);
-      const travelResp = await bot.exec("travel", { target_poi: target.poi });
+      
+      // Resolve POI name to POI ID by querying system info
+      let targetPoiId: string | null = null;
+      let targetPoiName: string = target.poi;
+      
+      try {
+        const { pois } = await getSystemInfo(ctx);
+        // Find POI by name (case-insensitive match)
+        const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
+        if (matchedPoi) {
+          targetPoiId = matchedPoi.id;
+          targetPoiName = matchedPoi.name;
+          ctx.log(isMaydayTarget ? "mayday" : "rescue", `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
+        } else {
+          // Try partial match as fallback
+          const partialMatch = pois.find(p => p.name.toLowerCase().includes(target.poi.toLowerCase()) || target.poi.toLowerCase().includes(p.name.toLowerCase()));
+          if (partialMatch) {
+            targetPoiId = partialMatch.id;
+            targetPoiName = partialMatch.name;
+            ctx.log(isMaydayTarget ? "mayday" : "rescue", `Partial POI match: "${target.poi}" -> ID: ${targetPoiId}`);
+          }
+        }
+      } catch (e) {
+        ctx.log("warn", `Could not query system POIs: ${e}`);
+      }
+      
+      // Use POI ID if resolved, otherwise fall back to name
+      const travelTarget = targetPoiId || target.poi;
+      
+      ctx.log(isMaydayTarget ? "mayday" : "rescue", `Traveling to ${target.username}'s location (${targetPoiName})...`);
+      const travelResp = await bot.exec("travel", { target_poi: travelTarget });
       if (travelResp.error && !travelResp.error.message.includes("already")) {
         ctx.log("error", `Travel failed: ${travelResp.error.message}`);
         // Try docking at station to send gift instead
+      } else {
+        // Success - update bot.poi with the resolved name
+        bot.poi = targetPoiName;
       }
-      bot.poi = target.poi;
       // Update session state after traveling to POI
       if (recoveredSession || getActiveRescueSession(bot.username)) {
         updateRescueSession(bot.username, { state: "at_poi" });

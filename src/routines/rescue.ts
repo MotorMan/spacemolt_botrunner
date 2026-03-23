@@ -155,6 +155,17 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     ctx.log("info", "Switching to fuel cell delivery fallback mode...");
   }
 
+  // Track idle time when away from home (for auto-return feature)
+  let idleTimeMs = 0;
+  const IDLE_RETURN_THRESHOLD_MS = 60000; // Return home after 60 seconds of idle time when away from home
+  let isReturningIdle = false; // Track if we're returning home due to idle
+
+  // Log if starting away from home
+  const startedAwayFromHome = homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase();
+  if (startedAwayFromHome) {
+    ctx.log("rescue", `⚠️ Bot started away from home (${bot.system} vs ${homeSystem}) — will return home after ${IDLE_RETURN_THRESHOLD_MS / 1000}s of idle time`);
+  }
+
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -174,6 +185,9 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       };
       markManualRescueHandled(manualRescue);
       ctx.log("rescue", `✓ Manual rescue request accepted - will rescue ${manualRescue.targetPlayer}`);
+      // Reset idle timer since we have a mission
+      idleTimeMs = 0;
+      isReturningIdle = false;
     }
 
     // ── Rescue session recovery ──
@@ -189,6 +203,9 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         if (fuelPct <= 25) {
           recoveredSession = activeSession;
           ctx.log("rescue", `Resuming rescue mission for ${activeSession.targetUsername} (state: ${activeSession.state})`);
+          // Reset idle timer since we have a mission
+          idleTimeMs = 0;
+          isReturningIdle = false;
         } else {
           ctx.log("rescue", `${activeSession.targetUsername} has been refueled (${fuelPct}%) - clearing session`);
           failRescueSession(bot.username, "Target no longer needs rescue");
@@ -313,6 +330,20 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
       if (targets.length === 0 && !maydayTarget) {
         yield "idle";
+        
+        // Track idle time when away from home
+        const isAwayFromHome = homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase();
+        if (isAwayFromHome && !isReturningIdle) {
+          idleTimeMs += settings.scanIntervalSec * 1000;
+          
+          if (idleTimeMs >= IDLE_RETURN_THRESHOLD_MS) {
+            ctx.log("rescue", `⏱️ Idle for ${Math.round(idleTimeMs / 1000)}s — returning home...`);
+            isReturningIdle = true;
+          } else {
+            ctx.log("rescue", `⏱️ Idle for ${Math.round(idleTimeMs / 1000)}s (away from home: ${isAwayFromHome})`);
+          }
+        }
+        
         await sleep(settings.scanIntervalSec * 1000);
         continue;
       }
@@ -320,6 +351,56 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       // ── Rescue the most critical bot ──
       target = maydayTarget || targets[0];
       isMaydayTarget = !!maydayTarget;
+    }
+
+    // ── Check if we should return home due to idle timeout ──
+    const isAwayFromHome = homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase();
+    if (isReturningIdle && isAwayFromHome) {
+      // Check for any new rescue requests before returning (abort return if found)
+      const urgentManualRescue = getNextManualRescue();
+      const urgentMayday = getNextMayday();
+      
+      if (urgentManualRescue) {
+        ctx.log("rescue", `🎯 Aborting return home - manual rescue request for ${urgentManualRescue.targetPlayer}`);
+        isReturningIdle = false;
+        idleTimeMs = 0;
+        continue; // Restart loop to handle the rescue
+      }
+      
+      if (urgentMayday) {
+        const knownPlayer = isKnownPlayer(urgentMayday.sender);
+        if (knownPlayer) {
+          ctx.log("mayday", `🚨 Aborting return home - MAYDAY from ${urgentMayday.sender}`);
+          isReturningIdle = false;
+          idleTimeMs = 0;
+          continue; // Restart loop to handle the MAYDAY
+        }
+        markMaydayHandled(urgentMayday); // Ignore unknown player
+      }
+      
+      const fleet = ctx.getFleetStatus?.() || [];
+      const strandedBot = findStrandedBots(fleet, bot.username, settings.fuelThreshold)[0];
+      if (strandedBot) {
+        ctx.log("rescue", `🚑 Aborting return home - fleet rescue needed for ${strandedBot.username}`);
+        isReturningIdle = false;
+        idleTimeMs = 0;
+        continue; // Restart loop to handle the fleet rescue
+      }
+      
+      // No urgent requests - proceed with return home
+      ctx.log("rescue", `🏠 Returning home after idle timeout...`);
+      yield "return_home";
+      await ensureUndocked(ctx);
+      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!arrived) {
+        ctx.log("error", `Failed to return to home system ${homeSystem}`);
+      } else {
+        ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+        isReturningIdle = false;
+        idleTimeMs = 0;
+      }
+      continue; // Restart loop after returning
     }
 
     if (!target) {
@@ -740,6 +821,10 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     } else {
       ctx.log("rescue", `=== Fuel transfer mission for ${target.username} complete ===`);
     }
+
+    // Reset idle timer after successful rescue
+    idleTimeMs = 0;
+    isReturningIdle = false;
 
     // Short cooldown before next scan
     await sleep(10000);

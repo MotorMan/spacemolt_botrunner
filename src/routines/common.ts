@@ -1996,9 +1996,13 @@ export async function checkCustomsInspection(
   // Use targetSystem if provided, otherwise fall back to bot.system
   const systemToCheck = targetSystem || bot.system;
 
-  // Only check if we're in an empire system (not Frontier, not pirate)
-  if (!isEmpireSystem(systemToCheck, bot.getEmpire())) {
-    ctx.log("customs", `System ${systemToCheck} is not an empire system (or bot is Frontier) - no customs check needed`);
+  // Get the system's security level from mapStore
+  const sysData = mapStore.getSystem(systemToCheck);
+  const securityLevel = sysData?.security_level;
+
+  // Only check if we're in an empire system (not Frontier, not pirate, not lawless)
+  if (!isEmpireSystem(systemToCheck, bot.getEmpire(), securityLevel)) {
+    ctx.log("customs", `System ${systemToCheck} is not an empire system (or bot is Frontier, or system is lawless) - no customs check needed`);
     return { wasStopped: false, outcome: "none", chatMessages: [] };
   }
 
@@ -2021,12 +2025,12 @@ export async function checkCustomsInspection(
       5000, // Poll every 5 seconds
       6     // Max 6 polls (30 seconds total)
     );
-    
+
     if (pollResult.customsShipFound && pollResult.shipName) {
       ctx.log("customs", `Customs ship ${pollResult.shipName} detected!`);
     }
   }
-  
+
   return result;
 }
 

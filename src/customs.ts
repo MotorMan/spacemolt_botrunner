@@ -501,21 +501,48 @@ function isPirateSystem(systemId: string): boolean {
 }
 
 /**
+ * Check if a system has lawless/null-sec security status (no customs in these systems).
+ */
+function isLawlessSystem(securityLevel: string | undefined): boolean {
+  if (!securityLevel) return false;
+  const level = securityLevel.toLowerCase().trim();
+
+  // Explicit lawless keywords
+  if (level.includes("lawless") || level === "null" || level.includes("unregulated")) {
+    return true;
+  }
+
+  // Numeric security <= 25 is considered lawless/no customs
+  const numeric = parseInt(level, 10);
+  if (!isNaN(numeric) && numeric <= 25) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * Check if the current system belongs to an empire that has customs/police.
- * 
+ *
  * Customs inspections ONLY occur in these empire systems:
  * - Voidborn, Nebula, Crimson, Solarian
- * 
+ *
  * Customs do NOT occur in:
  * - Outer Rim (lawless territory)
  * - Frontier (per developer confirmation)
  * - Pirate systems (hostile territory)
+ * - Lawless/null-sec systems (no law enforcement)
  * - Any other unknown/neutral systems
  *
  * @param systemId - The system ID to check
  * @param botEmpire - The bot's empire affiliation (used to determine customs jurisdiction)
+ * @param securityLevel - The system's security level (optional, for lawless system detection)
  */
-export function isEmpireSystem(systemId: string, botEmpire?: string): boolean {
+export function isEmpireSystem(
+  systemId: string,
+  botEmpire?: string,
+  securityLevel?: string
+): boolean {
   if (!botEmpire) {
     return false;
   }
@@ -529,6 +556,11 @@ export function isEmpireSystem(systemId: string, botEmpire?: string): boolean {
 
   // Pirate systems have no customs (hostile territory) - bots should NOT wait for inspections here
   if (isPirateSystem(systemId)) {
+    return false;
+  }
+
+  // Lawless/null-sec systems have no customs - skip the 2-second delay
+  if (isLawlessSystem(securityLevel)) {
     return false;
   }
 

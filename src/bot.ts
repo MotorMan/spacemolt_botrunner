@@ -5,7 +5,7 @@ import { debugLog } from "./debug.js";
 import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
-import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse } from "./customs.js";
+import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -246,10 +246,12 @@ export class Bot {
 
     // After jump/travel commands in empire space, wait for customs messages
     // This is the PROACTIVE check - wait 2 seconds minimum for customs to respond
+    // Only applies to customs empires (Voidborn, Nebula, Crimson, Solarian) in non-lawless systems
     if (!resp.error && (command === "jump" || command === "travel")) {
       await this.refreshStatus();
-      // Check if we're in empire space (not Frontier, not pirate)
-      if (this.getEmpire().toLowerCase() !== "frontier") {
+      // Check if we're in an empire system with customs (not Frontier, not Outer Rim, not pirate, not lawless)
+      const sysData = mapStore.getSystem(this.system);
+      if (isEmpireSystem(this.system, this.getEmpire(), sysData?.security_level)) {
         this.log("customs", `⏱️ Post-jump customs wait @ ${this.system} - 2 second delay...`);
         await sleep(2000);
       }

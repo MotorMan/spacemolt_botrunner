@@ -166,6 +166,7 @@ function getAiChatSettings(): {
   respondToQuestions: boolean;
   respondToAll: boolean;
   respondToSystem: boolean;
+  respondToMayday: boolean;
   personality: string;
   lockDurationSec: number;
   conversationCooldownSec: number;
@@ -198,6 +199,7 @@ function getAiChatSettings(): {
     respondToQuestions: (s.respondToQuestions as boolean) ?? false,
     respondToAll: (s.respondToAll as boolean) ?? false,
     respondToSystem: (s.respondToSystem as boolean) ?? false,
+    respondToMayday: (s.respondToMayday as boolean) ?? true,
     personality: (s.personality as string) || DEFAULT_PERSONALITY,
     lockDurationSec: (s.lockDurationSec as number) || 60,
     conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
@@ -524,7 +526,7 @@ export class AiChatService {
       this.logFn("ai_chat_debug", `Duplicate message ignored: ${msg.sender} - ${msg.content.slice(0, 50)}`);
       return;
     }
-    
+
     // Log incoming message
     this.logChat({
       timestamp: new Date().toISOString(),
@@ -534,7 +536,8 @@ export class AiChatService {
       content: msg.content,
       botName: msg.botUsername,
     });
-    
+
+    this.logFn("ai_chat_debug", `Message added to queue: channel=${msg.channel}, sender=${msg.sender}, botUsername=${msg.botUsername}, content=${msg.content.slice(0, 50)}`);
     this.chatMessageQueue.push(msg);
     if (this.chatMessageQueue.length > 100) {
       this.chatMessageQueue = this.chatMessageQueue.slice(-100);
@@ -622,6 +625,7 @@ export class AiChatService {
 
         // Process each message
         for (const msg of messages) {
+          this.logFn("ai_chat_debug", `About to process message: channel=${msg.channel}, sender=${msg.sender}, content=${msg.content.slice(0, 30)}`);
           await this.processMessage(msg, settings);
         }
       } catch (err) {
@@ -635,6 +639,9 @@ export class AiChatService {
     msg: ChatMessage,
     settings: ReturnType<typeof getAiChatSettings>
   ): Promise<void> {
+    // Log message details for debugging
+    this.logFn("ai_chat_debug", `Processing message: channel=${msg.channel}, sender=${msg.sender}, botUsername=${msg.botUsername}, botSystem=${msg.botSystem}, botPoi=${msg.botPoi}`);
+
     // Monitor local, faction, system, and private chat
     if (msg.channel !== "local" && msg.channel !== "faction" && msg.channel !== "system" && msg.channel !== "private") {
       return;
@@ -666,6 +673,12 @@ export class AiChatService {
     // For system chat, check if enabled
     if (msg.channel === "system" && !settings.respondToSystem) {
       this.logFn("ai_chat_debug", `System chat disabled, ignoring: ${msg.sender} - ${msg.content.slice(0, 50)}`);
+      return;
+    }
+
+    // Skip MAYDAY messages if disabled (player won't see responses anyway)
+    if (msg.content.includes("MAYDAY") && !settings.respondToMayday) {
+      this.logFn("ai_chat_debug", `MAYDAY response disabled, ignoring: ${msg.sender} - ${msg.content.slice(0, 50)}`);
       return;
     }
 
@@ -753,7 +766,8 @@ export class AiChatService {
     this.logFn("ai_chat", `Should respond to [${msg.channel}] ${msg.sender}: ${reason}`);
 
     // Select responder for non-mention messages
-    const responder = this.selectResponder(msg, "");
+    // For local chat, prefer the bot that received the message (guaranteed to be at correct location)
+    const responder = this.selectResponder(msg, msg.channel === "local" ? (msg.botUsername || "") : "");
     if (!responder) {
       this.logFn("ai_chat", "No available bot to respond");
       return;
@@ -791,11 +805,12 @@ export class AiChatService {
     }
 
     // For LOCAL chat: verify responder is at same location as receiving bot
-    if (msg.channel === "local") {
+    // Skip this check if the responder IS the receiving bot (it obviously can respond to messages it received)
+    if (msg.channel === "local" && responder.username !== msg.botUsername) {
       const locationMatch = this.checkLocationMatch(responder, msg);
       if (!locationMatch.matched) {
         this.logFn("ai_chat", `${responder.username} at wrong location (${responder.system}/${responder.poi}), message was from ${msg.botSystem}/${msg.botPoi}`);
-        
+
         // Try to find a bot at the correct location
         const locationBot = this.findBotAtLocation(msg, triedBots);
         if (locationBot) {
@@ -808,6 +823,9 @@ export class AiChatService {
           return;
         }
       }
+    } else if (msg.channel === "local" && responder.username === msg.botUsername) {
+      // Log that we're skipping location check for receiving bot
+      this.logFn("ai_chat_debug", `Skipping location check for ${responder.username} (is the receiving bot)`);
     }
 
     // Try to acquire lock

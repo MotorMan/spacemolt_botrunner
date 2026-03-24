@@ -121,10 +121,17 @@ async function recoverTradeSession(
 
     if (!destBuyer || destBuyer.quantity <= 0) {
       ctx.log("trade", `Destination buyer gone — finding alternative`);
-      // Find alternative buyer
+      // Find alternative buyer with a dockable station
       const alternativeBuyers = allBuys
         .filter(b => b.itemId === session.itemId && b.price > 0)
-        .sort((a, b) => b.price - a.price);
+        .map(b => {
+          const sys = mapStore.getSystem(b.systemId);
+          const poi = sys?.pois.find(p => p.id === b.poiId);
+          const hasStation = poi?.market && poi.market.length > 0;
+          return { buyer: b, hasStation };
+        })
+        .filter(({ hasStation }) => hasStation)
+        .sort((a, b) => b.buyer.price - a.buyer.price);
 
       if (alternativeBuyers.length === 0) {
         ctx.log("error", "No alternative buyers found — abandoning session");
@@ -132,7 +139,7 @@ async function recoverTradeSession(
         return null;
       }
 
-      const bestAlt = alternativeBuyers[0];
+      const bestAlt = alternativeBuyers[0].buyer;
       ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
       session = updateTradeSession(session.botUsername, {
         destSystem: bestAlt.systemId,
@@ -156,9 +163,17 @@ async function recoverTradeSession(
 
     if (!hasStation) {
       ctx.log("error", `Destination ${session.destPoiName} has no station — finding alternative buyer`);
+      // Find alternative buyer with a dockable station
       const alternativeBuyers = allBuys
         .filter(b => b.itemId === session.itemId && b.price > 0)
-        .sort((a, b) => b.price - a.price);
+        .map(b => {
+          const sys = mapStore.getSystem(b.systemId);
+          const poi = sys?.pois.find(p => p.id === b.poiId);
+          const poiHasStation = poi?.market && poi.market.length > 0;
+          return { buyer: b, hasStation: poiHasStation };
+        })
+        .filter(({ hasStation }) => hasStation)
+        .sort((a, b) => b.buyer.price - a.buyer.price);
 
       if (alternativeBuyers.length === 0) {
         ctx.log("error", "No alternative buyers found — abandoning session");
@@ -166,7 +181,7 @@ async function recoverTradeSession(
         return null;
       }
 
-      const bestAlt = alternativeBuyers[0];
+      const bestAlt = alternativeBuyers[0].buyer;
       ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
       session = updateTradeSession(session.botUsername, {
         destSystem: bestAlt.systemId,
@@ -599,11 +614,18 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       const dockResp = await bot.exec("dock");
       if (dockResp.error && !dockResp.error.message.includes("already")) {
         ctx.log("error", `Dock failed at destination: ${dockResp.error.message} — finding alternative buyer`);
-        // Destination has no station - find alternative buyer
+        // Destination has no station - find alternative buyer with a dockable station
         const allBuys = mapStore.getAllBuyDemand();
         const alternativeBuyers = allBuys
           .filter(b => b.itemId === recoveredSession.itemId && b.price > 0)
-          .sort((a, b) => b.price - a.price);
+          .map(b => {
+            const sys = mapStore.getSystem(b.systemId);
+            const poi = sys?.pois.find(p => p.id === b.poiId);
+            const hasStation = poi?.market && poi.market.length > 0;
+            return { buyer: b, hasStation };
+          })
+          .filter(({ hasStation }) => hasStation)
+          .sort((a, b) => b.buyer.price - a.buyer.price);
 
         if (alternativeBuyers.length === 0) {
           ctx.log("error", "No alternative buyers found — abandoning session");
@@ -614,7 +636,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
 
-        const bestAlt = alternativeBuyers[0];
+        const bestAlt = alternativeBuyers[0].buyer;
         ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
         updateTradeSession(bot.username, {
           destSystem: bestAlt.systemId,

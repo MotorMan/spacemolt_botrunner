@@ -1132,7 +1132,7 @@ ${mapSummary}
       if (!chatResp.error) {
         this.logFn("ai_chat", `→ ${bot.username} responded: ${cleanResponse}`);
 
-        // Log outgoing message
+        // Log outgoing message to chat log file
         this.logChat({
           timestamp: new Date().toISOString(),
           direction: "OUT",
@@ -1140,6 +1140,11 @@ ${mapSummary}
           sender: bot.username,
           content: cleanResponse,
         });
+
+        // Log to bot's activity log for private messages
+        if (msg.channel === "private") {
+          bot.log("chat", `📤 Private to ${msg.sender}: ${cleanResponse}`);
+        }
 
         mem.lastResponse = cleanResponse;
         mem.conversationHistory.push({
@@ -1249,7 +1254,7 @@ Message:`;
       if (!chatResp.error) {
         this.logFn("ai_chat", `→ Private message to ${targetPlayer}: ${cleanResponse}`);
 
-        // Log outgoing message
+        // Log outgoing message to chat log file
         this.logChat({
           timestamp: new Date().toISOString(),
           direction: "OUT",
@@ -1257,6 +1262,9 @@ Message:`;
           sender: bot.username,
           content: cleanResponse,
         });
+
+        // Log to bot's activity log
+        bot.log("chat", `📤 Private to ${targetPlayer}: ${cleanResponse}`);
 
         return { ok: true, message: cleanResponse };
       } else {

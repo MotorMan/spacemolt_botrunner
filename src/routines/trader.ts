@@ -127,7 +127,7 @@ async function recoverTradeSession(
         .map(b => {
           const sys = mapStore.getSystem(b.systemId);
           const poi = sys?.pois.find(p => p.id === b.poiId);
-          const hasStation = poi?.market && poi.market.length > 0;
+          const hasStation = poi?.has_base ?? false;
           return { buyer: b, hasStation };
         })
         .filter(({ hasStation }) => hasStation)
@@ -159,7 +159,7 @@ async function recoverTradeSession(
     // Validate that the destination POI actually has a station (can dock there)
     const destSystem = mapStore.getSystem(session.destSystem);
     const destPoiData = destSystem?.pois.find(p => p.id === session.destPoi);
-    const hasStation = destPoiData?.market && destPoiData.market.length > 0;
+    const hasStation = destPoiData?.has_base ?? false;
 
     if (!hasStation) {
       ctx.log("error", `Destination ${session.destPoiName} has no station — finding alternative buyer`);
@@ -169,7 +169,7 @@ async function recoverTradeSession(
         .map(b => {
           const sys = mapStore.getSystem(b.systemId);
           const poi = sys?.pois.find(p => p.id === b.poiId);
-          const poiHasStation = poi?.market && poi.market.length > 0;
+          const poiHasStation = poi?.has_base ?? false;
           return { buyer: b, hasStation: poiHasStation };
         })
         .filter(({ hasStation }) => hasStation)
@@ -621,7 +621,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           .map(b => {
             const sys = mapStore.getSystem(b.systemId);
             const poi = sys?.pois.find(p => p.id === b.poiId);
-            const hasStation = poi?.market && poi.market.length > 0;
+            const hasStation = poi?.has_base ?? false;
             return { buyer: b, hasStation };
           })
           .filter(({ hasStation }) => hasStation)

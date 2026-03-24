@@ -31,6 +31,13 @@ import {
   type RescueSession,
 } from "./rescueActivity.js";
 import { isKnownPlayer } from "../playernames.js";
+import {
+  shouldRescuePlayer,
+  recordRescueRequest,
+  recordGhost,
+  recordSuccessfulRescue,
+  getPlayerRecord,
+} from "../rescueBlackBook.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -424,6 +431,18 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           }
 
           ctx.log("mayday", `✓ Sender ${mayday.sender} is a KNOWN player — responding to MAYDAY`);
+
+          // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
+          const rescueDecision = shouldRescuePlayer(mayday.sender);
+          if (!rescueDecision.shouldRescue) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - ${rescueDecision.reason}`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+          ctx.log("mayday", `✓ BlackBook check passed: ${rescueDecision.reason}`);
+
+          // Record rescue request for blackbook tracking
+          recordRescueRequest(mayday.sender);
 
           // ── RESCUE COORDINATION: Check if another bot is already handling this ──
           const handledBy = isRescueHandled(mayday.sender, mayday.system, mayday.poi, bot.username);
@@ -977,6 +996,9 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           notes: `Billed ${bill.total}cr (${bill.jumpCost}cr jumps + ${bill.fuelCost}cr fuel)`,
         });
 
+        // Record successful rescue in BlackBook
+        recordSuccessfulRescue(activeSessionForBill.targetUsername, bill.total);
+
         // Delay faction chat announcement to avoid rate limiting
         const aiChatSettings = (globalThis as any).aiChatService?.getSettings?.();
         const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
@@ -1439,6 +1461,18 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       }
       
       ctx.log("mayday", `✓ Sender ${nextMayday.sender} is a KNOWN player — responding to MAYDAY`);
+
+      // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
+      const rescueDecision = shouldRescuePlayer(nextMayday.sender);
+      if (!rescueDecision.shouldRescue) {
+        ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - ${rescueDecision.reason}`);
+        markMaydayHandled(nextMayday);
+        continue;
+      }
+      ctx.log("mayday", `✓ BlackBook check passed: ${rescueDecision.reason}`);
+
+      // Record rescue request for blackbook tracking
+      recordRescueRequest(nextMayday.sender);
 
       mayday = nextMayday;
     }
@@ -2041,6 +2075,18 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
           ctx.log("mayday", `✓ Sender ${mayday.sender} is a KNOWN player — responding to MAYDAY`);
 
+          // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
+          const rescueDecision = shouldRescuePlayer(mayday.sender);
+          if (!rescueDecision.shouldRescue) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - ${rescueDecision.reason}`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+          ctx.log("mayday", `✓ BlackBook check passed: ${rescueDecision.reason}`);
+
+          // Record rescue request for blackbook tracking
+          recordRescueRequest(mayday.sender);
+
           // ── RESCUE COORDINATION: Check if another bot is already handling this ──
           const handledBy = isRescueHandled(mayday.sender, mayday.system, mayday.poi, bot.username);
           if (handledBy) {
@@ -2427,7 +2473,11 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         if (!targetHere) {
           targetFound = false;
           ctx.log("error", `Target ${target.username} not found at ${target.poi} - they may have left or it was a false alarm`);
-          
+
+          // Record ghost incident in BlackBook
+          recordGhost(target.username);
+          ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${getPlayerRecord(target.username).ghostCount})`);
+
           // Send grumpy faction chat message about being ghosted
           const aiChatService = (globalThis as any).aiChatService;
           if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
@@ -2454,7 +2504,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             failRescueSession(bot.username, "Target not found at location");
           }
           markMaydayHandled({ sender: target.username, system: target.system, poi: target.poi || "", fuelPct: target.fuelPct, timestamp: Date.now(), currentFuel: 0, maxFuel: 0, rawMessage: "" });
-          
+
           // Return home after failed rescue (potential ambush)
           if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
             ctx.log("rescue", `🚨 Target not found - returning home to safety...`);
@@ -2640,6 +2690,9 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           creditsSent: bill.total,
           notes: `Billed ${bill.total}cr (${bill.jumpCost}cr jumps + ${bill.fuelCost}cr fuel)`,
         });
+
+        // Record successful rescue in BlackBook
+        recordSuccessfulRescue(activeSessionForBill.targetUsername, bill.total);
 
         // Delay faction chat announcement to avoid rate limiting
         const aiChatSettings = aiChatService?.getSettings?.();

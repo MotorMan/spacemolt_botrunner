@@ -1315,22 +1315,22 @@ Message:`;
     switch (messageType) {
       case "rescue_start":
         situation = isMayday
-          ? `You received a MAYDAY distress call from ${targetName} and are launching a rescue mission.`
-          : `One of your faction bots (${targetName}) needs emergency fuel rescue.`;
+          ? "You received a MAYDAY distress call and are launching a rescue mission."
+          : "One of your faction bots needs emergency fuel rescue.";
         styleGuide = isMayday
           ? "Be heroic and reassuring. Let faction members know you're responding to an emergency."
           : "Be helpful and team-oriented. Let faction members know you're helping a fellow bot.";
         break;
       case "rescue_arrived":
-        situation = `You have arrived at ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""} to assist ${targetName}.`;
+        situation = `You have arrived at ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""} to assist.`;
         styleGuide = "Be confident and professional. Announce your arrival.";
         break;
       case "rescue_complete":
-        situation = `You have successfully refueled ${targetName} and they are now safe.`;
+        situation = "You have successfully refueled the target and they are now safe.";
         styleGuide = "Be triumphant and positive. Celebrate the successful rescue.";
         break;
       case "rescue_no_show":
-        situation = `You traveled all the way to ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""} to help ${targetName}, but they were not there.`;
+        situation = `You traveled all the way to ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""} to help, but they were not there.`;
         styleGuide = "Be grumpy and annoyed. Express frustration about the wasted trip. Maybe mutter about being ghosted.";
         break;
     }
@@ -1341,7 +1341,7 @@ Message:`;
 Context:
 - Your callsign: ${bot.username}
 - You are currently in: ${context.currentSystem}
-- Target is in: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}${jumps ? ` (${jumps} jumps from your previous location)` : ""}
+- Target location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}${jumps ? ` (${jumps} jumps from your previous location)` : ""}
 - ${situation}
 - This message goes to FACTION chat (all faction members can see it)
 
@@ -1352,13 +1352,14 @@ Style:
 - Keep it natural and in-character
 - Be concise (faction chat is public)
 - ${styleGuide}
-- ${messageType === "rescue_no_show" ? "Show genuine annoyance - you wasted fuel and time!" : "Include relevant details (who, where, status) if appropriate"}
-- Don't be overly verbose`;
+- ${messageType === "rescue_no_show" ? "Show genuine annoyance - you wasted fuel and time!" : "Include relevant details (location, status) if appropriate"}
+- Don't be overly verbose
+- Do NOT start the message with the target's name - we already know who they are`;
 
     const userMessage = `Generate a faction chat message:
 
 Message type: ${messageType}
-Target: ${targetName} (${isBot ? "faction bot" : "player"}${isMayday ? ", MAYDAY distress call" : ""})
+Target: ${isBot ? "Faction bot" : "Player"}${isMayday ? ", MAYDAY distress call" : ""}
 ${targetFuelPct ? `Their fuel level: ${targetFuelPct}%` : ""}
 Location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}
 ${jumps ? `Jumps to get there: ${jumps}` : ""}

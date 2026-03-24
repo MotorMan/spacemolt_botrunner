@@ -489,16 +489,11 @@ async function craftFromCategories(
     return a.complexity - b.complexity;
   });
 
-  // Craft from the highest priority category we have materials for
-  const target = candidates[0].recipe;
-  ctx.log("craft", `Crafting from ${target.category}: ${target.name} (${target.components.map(c => `${c.quantity}x ${c.name}`).join(", ")})...`);
-
-  // Deposit non-essential cargo to make space
+  // Deposit non-essential cargo to make space before crafting
   for (const item of [...bot.inventory]) {
     if (item.quantity <= 0) continue;
     const lower = item.itemId.toLowerCase();
     if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-    if (target.components.some(c => c.item_id === item.itemId)) continue;
     const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
     if (dResp.error) {
       await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
@@ -507,25 +502,77 @@ async function craftFromCategories(
   await bot.refreshCargo();
   await bot.refreshStatus();
 
-  // Craft up to 10 batches of the target recipe
+  // Craft up to 10 batches total, iterating through available recipes
   const MAX_CRAFTS = 10;
-  for (let i = 0; i < MAX_CRAFTS && bot.state === "running"; i++) {
+  let totalCrafted = 0;
+
+  while (totalCrafted < MAX_CRAFTS && bot.state === "running") {
+    // Refresh inventories at start of each iteration
     await bot.refreshCargo();
     if (bot.docked) {
       await bot.refreshStorage();
       await bot.refreshFactionStorage();
     }
 
-    if (!hasMaterialsAnywhere(ctx, target)) break;
+    // Find the first recipe we can craft
+    let target: Recipe | null = null;
+    for (const candidate of candidates) {
+      if (hasMaterialsAnywhere(ctx, candidate.recipe)) {
+        target = candidate.recipe;
+        break;
+      }
+    }
 
+    if (!target) {
+      ctx.log("info", `No materials available for any recipe in assigned categories. Waiting 60s...`);
+      break;
+    }
+
+    ctx.log("craft", `Crafting from ${target.category}: ${target.name} (${target.components.map(c => `${c.quantity}x ${c.name}`).join(", ")})...`);
+
+    // Withdraw materials for this recipe
     await withdrawFactionMaterials(ctx, target);
     await withdrawStorageMaterials(ctx, target);
 
-    if (getMissingMaterial(ctx, target)) break;
+    // Refresh after withdrawal to ensure cargo is updated
+    await bot.refreshCargo();
+    await bot.refreshStorage();
 
-    const craftBatchSize = Math.max(1, craftingSkillLevel);
+    // Check if we have materials after withdrawal
+    const missing = getMissingMaterial(ctx, target);
+    if (missing) {
+      ctx.log("warn", `Missing ${missing.need}x ${missing.name} after withdrawal for ${target.name}, skipping to next recipe`);
+      // Remove this recipe from candidates temporarily and try next
+      const idx = candidates.findIndex(c => c.recipe === target);
+      if (idx !== -1) candidates.splice(idx, 1);
+      if (candidates.length === 0) break;
+      continue;
+    }
+
+    // Calculate max craftable based on available materials (cargo + personal storage)
+    const maxCraftable = calculateMaxCraftable(ctx, target);
+    // Batch size is limited by: skill level, remaining crafts, and available materials
+    const craftBatchSize = Math.min(Math.max(1, craftingSkillLevel), MAX_CRAFTS - totalCrafted, maxCraftable);
+
+    if (craftBatchSize <= 0) {
+      ctx.log("warn", `No materials available for ${target.name} after withdrawal, skipping`);
+      const idx = candidates.findIndex(c => c.recipe === target);
+      if (idx !== -1) candidates.splice(idx, 1);
+      if (candidates.length === 0) break;
+      continue;
+    }
+
+    ctx.log("craft", `Crafting ${craftBatchSize}x ${target.name} (skill: ${craftingSkillLevel}, maxCraftable: ${maxCraftable})...`);
     const craftResp = await bot.exec("craft", { recipe_id: target.recipe_id, count: craftBatchSize });
-    if (craftResp.error) break;
+
+    if (craftResp.error) {
+      ctx.log("error", `craft: ${craftResp.error.message}`);
+      // Remove this recipe from candidates and try next
+      const idx = candidates.findIndex(c => c.recipe === target);
+      if (idx !== -1) candidates.splice(idx, 1);
+      if (candidates.length === 0) break;
+      continue;
+    }
 
     const result = craftResp.result as Record<string, unknown> | undefined;
     let qty = 0;
@@ -546,6 +593,7 @@ async function craftFromCategories(
 
     crafted.push(`${qty}x ${target.output_name || target.name}`);
     bot.stats.totalCrafted += qty;
+    totalCrafted++;
   }
 
   return crafted;

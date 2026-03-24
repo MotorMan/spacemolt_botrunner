@@ -269,7 +269,7 @@ export class SpaceMoltAPI {
 
   async execute(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
-    commandLog("api", `Executing command: ${this.credentials?.username}:${command}`, { command, payload });
+    commandLog("api", `Executing command: ${botName}:${command}`, { command, payload });
 
     // Log session state for debugging
     logSessionCheck(botName, !!this.session, this.session?.id || null, this.session?.expiresAt || null);

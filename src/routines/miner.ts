@@ -267,30 +267,6 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
   }
 
-  // ── Detect mining type from modules ──
-  let miningType: "ore" | "gas" | "ice" = "ore";
-  if (settings0.miningType === "auto") {
-    const detected = await detectMiningType(ctx);
-    if (!detected) {
-      ctx.log("error", "Cannot determine mining type — please check ship equipment");
-      await sleep(30000);
-      return;
-    }
-    miningType = detected;
-  } else {
-    miningType = settings0.miningType;
-  }
-
-  const targetResource = miningType === "ice" ? settings0.targetIce : (miningType === "ore" ? settings0.targetOre : settings0.targetGas);
-  const resourceLabel = miningType === "ice" ? "ice" : (miningType === "ore" ? "ore" : "gas");
-
-  // Log mining configuration
-  if (targetResource) {
-    ctx.log("mining", `Target ${resourceLabel}: ${targetResource} (mode: ${settings0.miningType})`);
-  } else {
-    ctx.log("mining", `Mining any ${resourceLabel} (no specific target configured)`);
-  }
-
   // ── Startup: return home and dump non-fuel cargo to storage ──
   await bot.refreshCargo();
   const nonFuelCargo = bot.inventory.filter(i => {
@@ -306,8 +282,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
     await ensureDocked(ctx);
+    const startupSettings = getMinerSettings(bot.username);
     for (const item of nonFuelCargo) {
-      if (settings0.depositMode === "faction") {
+      if (startupSettings.depositMode === "faction") {
         const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
         if (fResp.error) {
           await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
@@ -332,6 +309,30 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       hullThresholdPct: settings.repairThreshold,
     };
     const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
+
+    // ── Re-evaluate mining type and target from settings each cycle ──
+    let miningType: "ore" | "gas" | "ice" = "ore";
+    if (settings.miningType === "auto") {
+      const detected = await detectMiningType(ctx);
+      if (!detected) {
+        ctx.log("error", "Cannot determine mining type — please check ship equipment");
+        await sleep(30000);
+        continue;
+      }
+      miningType = detected;
+    } else {
+      miningType = settings.miningType;
+    }
+
+    const targetResource = miningType === "ice" ? settings.targetIce : (miningType === "ore" ? settings.targetOre : settings.targetGas);
+    const resourceLabel = miningType === "ice" ? "ice" : (miningType === "ore" ? "ore" : "gas");
+
+    // Log mining configuration (re-checked each cycle)
+    if (targetResource) {
+      ctx.log("mining", `Target ${resourceLabel}: ${targetResource} (mode: ${settings.miningType})`);
+    } else {
+      ctx.log("mining", `Mining any ${resourceLabel} (no specific target configured)`);
+    }
 
     // ── Recovered session handling ──
     // If we have a recovered session, use its target instead of recalculating

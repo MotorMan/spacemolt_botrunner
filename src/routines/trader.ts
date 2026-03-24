@@ -306,7 +306,7 @@ function getItemMarketCost(itemId: string): number {
 
 /**
  * Find alternative profitable buyers for an item, considering acquisition cost.
- * Returns buyers that would result in a profit after fuel costs.
+ * Returns buyers that would result in a profit after fuel costs at dockable stations.
  */
 function findProfitableAlternativeBuyers(
   itemId: string,
@@ -319,25 +319,31 @@ function findProfitableAlternativeBuyers(
   const allBuys = mapStore.getAllBuyDemand();
   const buyers = allBuys
     .filter(b => b.itemId === itemId && b.price > 0 && b.quantity > 0)
+    .filter(b => {
+      // Only include buyers at POIs with a dockable station
+      const sys = mapStore.getSystem(b.systemId);
+      const poi = sys?.pois.find(p => p.id === b.poiId);
+      return poi?.has_base ?? false;
+    })
     .map(buyer => {
       const { jumps, cost: fuelCost } = estimateFuelCost(currentSystem, buyer.systemId, settings.fuelCostPerJump);
       if (jumps >= 999) return null;
-      
+
       const sellQty = Math.min(quantity, buyer.quantity);
       if (sellQty <= 0) return null;
-      
+
       // Calculate total profit: revenue - acquisition cost - fuel
       const revenue = buyer.price * sellQty;
       const totalCost = acquisitionCost + fuelCost;
       const profit = revenue - totalCost;
-      
+
       if (profit <= 0) return null;
-      
+
       return { buyer, profit, jumps };
     })
     .filter((r): r is NonNullable<typeof r> => r !== null)
     .sort((a, b) => b.profit - a.profit);
-  
+
   return buyers;
 }
 
@@ -369,10 +375,16 @@ function findCargoSellRoutes(
   if (allBuys.length === 0) return routes;
 
   for (const item of cargoItems) {
-    // Find best buyer (not at current station — we already tried selling here)
+    // Find best buyer at a dockable station (not at current station — we already tried selling here)
     const buyers = allBuys
       .filter(b => b.itemId === item.itemId && b.price > 0)
       .filter(b => !(b.systemId === currentSystem && b.poiId === bot.poi))
+      .filter(b => {
+        // Only include buyers at POIs with a dockable station
+        const sys = mapStore.getSystem(b.systemId);
+        const poi = sys?.pois.find(p => p.id === b.poiId);
+        return poi?.has_base ?? false;
+      })
       .sort((a, b) => b.price - a.price);
 
     for (const buy of buyers) {
@@ -381,7 +393,7 @@ function findCargoSellRoutes(
 
       const sellQty = Math.min(item.quantity, buy.quantity);
       if (sellQty <= 0) continue;
-      
+
       // Calculate profit: if acquisition cost is known, include it in the calculation
       const costBasis = acquisitionCostPerUnit ?? 0;
       const profitPerUnit = buy.price - costBasis - (jumps > 0 ? fuelCost / sellQty : 0);
@@ -1708,6 +1720,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const buyers = allBuys
           .filter(b => b.itemId === route!.itemId && b.price > 0)
           .filter(b => !(b.systemId === bot.system && b.poiId === bot.poi)) // skip current station
+          .filter(b => {
+            // Only include buyers at POIs with a dockable station
+            const sys = mapStore.getSystem(b.systemId);
+            const poi = sys?.pois.find(p => p.id === b.poiId);
+            return poi?.has_base ?? false;
+          })
           .sort((a, b) => b.price - a.price);
 
         for (const buyer of buyers) {

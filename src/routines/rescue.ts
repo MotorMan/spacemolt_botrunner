@@ -2597,7 +2597,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // ── Send rescue complete message and bill IMMEDIATELY after fuel delivery ──
+    // ── Send rescue bill IMMEDIATELY after fuel delivery ──
     // Get the active session for billing
     const activeSessionForBill = getActiveRescueSession(bot.username);
     if (activeSessionForBill) {
@@ -2618,31 +2618,9 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("rescue", `   • Fuel: ${fuelDeliveredBill} units × ${settings.costPerFuel}cr = ${bill.fuelCost}cr`);
       ctx.log("rescue", `   • TOTAL: ${bill.total} credits`);
 
-      // Send "rescue complete" private message FIRST
-      const aiChatService = (globalThis as any).aiChatService;
-      if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-        try {
-          const result = await aiChatService.sendPrivateMessage(bot, activeSessionForBill.targetUsername, {
-            situation: activeSessionForBill.isMayday
-              ? `You responded to their MAYDAY distress call and successfully refueled them. They are now safe to continue their journey.`
-              : `You completed a fuel transfer mission to help them with their low fuel situation.`,
-            currentSystem: bot.system,
-            targetSystem: activeSessionForBill.targetSystem,
-            jumps: undefined,
-            fuelRefueled: fuelDeliveredBill > 0 ? fuelDeliveredBill : undefined,
-            playerFuelPct: target.fuelPct,
-          });
-          if (result.ok) {
-            ctx.log("rescue", `✓ Sent "rescue complete" private message to ${activeSessionForBill.targetUsername}`);
-          } else {
-            ctx.log("warn", `Private message to ${activeSessionForBill.targetUsername} failed: ${result.error}`);
-          }
-        } catch (e) {
-          ctx.log("warn", `AI completion message failed: ${e}`);
-        }
-      }
-
       // Send bill via private message (if total > 0)
+      // Note: The bill message includes rescue completion info, so no separate message is needed
+      const aiChatService = (globalThis as any).aiChatService;
       if (bill.total > 0) {
         await sendRescueBill(
           ctx,
@@ -2664,7 +2642,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         });
 
         // Delay faction chat announcement to avoid rate limiting
-        const aiChatSettings = (globalThis as any).aiChatService?.getSettings?.();
+        const aiChatSettings = aiChatService?.getSettings?.();
         const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
         ctx.log("rescue", `⏳ Delaying faction announcement by ${cooldownSec}s...`);
         await sleep(cooldownSec * 1000);

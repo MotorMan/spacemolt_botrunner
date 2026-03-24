@@ -474,31 +474,63 @@ export async function sendCustomsChatResponse(
 // ── Empire system detection ─────────────────────────────────
 
 /**
+ * Empires that have customs inspections.
+ * - Voidborn, Nebula, Crimson, and Solarian have customs
+ * - Outer Rim does NOT have customs (lawless territory)
+ * - Frontier does NOT have customs (per developer confirmation)
+ */
+const CUSTOMS_EMPIRES = ["voidborn", "nebula", "crimson", "solarian"];
+
+/** Pirate systems — hostile territory with no customs inspections. */
+const PIRATE_SYSTEMS = [
+  "alhena",
+  "xamidimura",
+  "algol",
+  "zaniah",
+  "sheratan",
+  "bellatrix",
+  "barnard_44",
+  "gsc_0008",
+  "gliese_581",
+];
+
+/** Check if a system is a pirate system (hostile territory). */
+function isPirateSystem(systemId: string): boolean {
+  const lower = systemId.toLowerCase();
+  return PIRATE_SYSTEMS.some(ps => lower === ps || lower.includes(ps));
+}
+
+/**
  * Check if the current system belongs to an empire that has customs/police.
- * Frontier empire does NOT have customs scans (per developer confirmation).
  * 
+ * Customs inspections ONLY occur in these empire systems:
+ * - Voidborn, Nebula, Crimson, Solarian
+ * 
+ * Customs do NOT occur in:
+ * - Outer Rim (lawless territory)
+ * - Frontier (per developer confirmation)
+ * - Pirate systems (hostile territory)
+ * - Any other unknown/neutral systems
+ *
  * @param systemId - The system ID to check
- * @param botEmpire - The bot's empire affiliation (optional, for extra filtering)
+ * @param botEmpire - The bot's empire affiliation (used to determine customs jurisdiction)
  */
 export function isEmpireSystem(systemId: string, botEmpire?: string): boolean {
-  // Frontier empire has NO customs or police scans
-  if (botEmpire && botEmpire.toLowerCase() === "frontier") {
+  if (!botEmpire) {
     return false;
   }
 
-  // Pirate systems have no customs (hostile territory)
-  const pirateSystems = [
-    "alhena",
-    "xamidimura",
-    "algol",
-    "zaniah",
-    "sheratan",
-    "bellatrix",
-    "barnard_44",
-    "gsc_0008",
-    "gliese_581",
-  ];
+  const empireLower = botEmpire.toLowerCase();
 
-  const lower = systemId.toLowerCase();
-  return !pirateSystems.some(ps => lower === ps || lower.includes(ps));
+  // Only these empires have customs inspections
+  if (!CUSTOMS_EMPIRES.includes(empireLower)) {
+    return false;
+  }
+
+  // Pirate systems have no customs (hostile territory) - bots should NOT wait for inspections here
+  if (isPirateSystem(systemId)) {
+    return false;
+  }
+
+  return true;
 }

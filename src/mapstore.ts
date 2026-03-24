@@ -803,6 +803,8 @@ class MapStore {
       // Skip pirate systems
       if (this.isPirateSystem(sysId)) continue;
       for (const poi of sys.pois) {
+        // Only include POIs with a dockable station
+        if (!poi.has_base) continue;
         for (const m of poi.market) {
           if (itemId && m.item_id !== itemId) continue;
           if (m.best_sell !== null && m.best_sell > 0 && m.sell_quantity > 0) {

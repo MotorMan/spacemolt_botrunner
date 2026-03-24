@@ -6,6 +6,7 @@ import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
+import { processPrivateMessage as processCooperationPrivateMessage } from "./cooperation/rescueCooperation.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -941,6 +942,22 @@ export class Bot {
             this.log("ai_chat", `Forwarded to AI Chat service: ${sender}`);
           } else {
             this.log("debug", `AI Chat service not available (service=${!!aiChatService}, addChatMessage=${typeof aiChatService?.addChatMessage === "function"})`);
+          }
+          
+          // ── RESCUE COOPERATION: Process private messages for cooperation claims ──
+          if (channel === "private") {
+            const senderId = data.sender_id as string | undefined;
+            const result = processCooperationPrivateMessage(sender, content, senderId);
+            
+            if (result.isClaim && result.claim) {
+              this.log("coop", `📧 Processed claim from ${sender}: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps by ${result.claim.botName})`);
+            } else if (result.skipReason) {
+              this.log("coop_debug", `Skipped private message from ${sender}: ${result.skipReason}`);
+            }
+            
+            if (senderId && result.isClaim) {
+              this.log("coop_debug", `Cached player ID for ${sender}: ${senderId}`);
+            }
           }
         } else {
           this.log("debug", `Chat message received but data is not object: ${typeof data}`);

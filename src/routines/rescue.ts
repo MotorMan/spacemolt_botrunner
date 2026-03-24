@@ -38,6 +38,16 @@ import {
   recordSuccessfulRescue,
   getPlayerRecord,
 } from "../rescueBlackBook.js";
+import {
+  getCooperationSettings,
+  isCooperationEnabled,
+  sendRescueClaim,
+  processPrivateMessage,
+  calculateJumpsToTarget,
+  shouldProceedOrYield,
+  isRescueClaimedByPartner,
+  type RescueClaim,
+} from "../cooperation/rescueCooperation.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -52,6 +62,9 @@ function getRescueSettings(): {
   homeStation?: string;
   costPerJump: number;
   costPerFuel: number;
+  cooperationEnabled: boolean;
+  partnerBotName: string;
+  cooperationMaxDelaySeconds: number;
 } {
   const all = readSettings();
   const r = all.rescue || {};
@@ -79,6 +92,12 @@ function getRescueSettings(): {
     costPerJump: (r.costPerJump as number) || 50,
     /** Credits charged per unit of fuel for rescue billing */
     costPerFuel: (r.costPerFuel as number) || 2,
+    /** Cooperation enabled for multi-bot coordination */
+    cooperationEnabled: (r.cooperationEnabled as boolean) || false,
+    /** Partner bot name for DM communication */
+    partnerBotName: (r.partnerBotName as string) || '',
+    /** Max acceptable delay for cooperation messages */
+    cooperationMaxDelaySeconds: (r.cooperationMaxDelaySeconds as number) || 30,
   };
 }
 
@@ -288,10 +307,10 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           const content = (msg.content as string) || (msg.message as string) || "";
           const sender = (msg.sender as string) || (msg.username as string) || "";
           const ts = (msg.timestamp as number) || (msg.created_at as number) || Date.now();
-          
+
           // Skip messages from self
           if (sender === bot.username) continue;
-          
+
           const announcement = parseRescueAnnouncement(content, sender, ts * 1000);
           if (announcement) {
             recordRescueAnnouncement(announcement);
@@ -301,6 +320,14 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       }
     } catch (e) {
       // Ignore errors - faction chat monitoring is optional
+    }
+
+    // ── RESCUE COOPERATION: Monitor private messages from partner bot ──
+    // This enables coordination between our two rescue bots
+    // Note: We can't poll private chat history (requires target_id), so we rely on real-time messages
+    const coopSettings = getCooperationSettings();
+    if (isCooperationEnabled() && coopSettings.enabled) {
+      ctx.log("coop_debug", `Cooperation monitoring enabled (partner: ${coopSettings.partnerBotName})`);
     }
 
     // ── Check for MANUAL RESCUE requests (HIGHEST PRIORITY) ──
@@ -452,6 +479,21 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             continue;
           }
 
+          // ── RESCUE COOPERATION: Check with partner bot if enabled ──
+          let partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
+          
+          if (isCooperationEnabled() && settings.cooperationEnabled) {
+            ctx.log("coop", `🤝 Cooperation enabled (partner: ${settings.partnerBotName})`);
+            ctx.log("coop", `🤝 MAYDAY: ${mayday.sender} at ${mayday.system}/${mayday.poi}`);
+            
+            if (partnerClaim) {
+              // Partner has claimed this rescue - will compare distances after calculating jumps
+              ctx.log("coop", `🤝 ✓ PARTNER CLAIM FOUND: ${partnerClaim.botName} claimed ${partnerClaim.player} at ${partnerClaim.system} (${partnerClaim.jumps} jumps, ts: ${partnerClaim.timestamp})`);
+            } else {
+              ctx.log("coop", `🤝 ✗ No partner claim found yet - will proceed and send claim (partner may respond with their claim)`);
+            }
+          }
+
           // Check jump range
           let jumpsAway = 0;
           if (mayday.system && mayday.system !== bot.system && settings.maydayMaxJumps > 0) {
@@ -481,6 +523,52 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           };
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
+          
+          // ── RESCUE COOPERATION: Send claim to partner bot ──
+          if (isCooperationEnabled() && settings.cooperationEnabled) {
+            const myClaim: RescueClaim = {
+              type: "RESCUE_CLAIM",
+              player: mayday.sender,
+              system: mayday.system,
+              poi: mayday.poi,
+              timestamp: new Date().toISOString(),
+              jumps: jumpsAway,
+              botName: bot.username,
+            };
+
+            // Send claim to partner bot and wait for it to complete
+            ctx.log("coop", `📧 Sending rescue claim to ${settings.partnerBotName}...`);
+            const sendResult = await sendRescueClaim(bot, myClaim);
+            if (sendResult.ok) {
+              ctx.log("coop", `📧 Sent rescue claim to ${settings.partnerBotName}: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
+            } else {
+              ctx.log("coop", `⚠️ Failed to send rescue claim: ${sendResult.error}`);
+            }
+
+            // Wait briefly for partner's claim to arrive (accounts for chat delays)
+            // Use configured delay, default 3 seconds
+            const cooperationDelay = Math.min(settings.cooperationMaxDelaySeconds * 1000, 5000);
+            ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for partner claim...`);
+            await sleep(cooperationDelay);
+
+            // Re-check for partner claims after delay
+            partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
+            
+            // Check if we should yield to partner
+            if (partnerClaim) {
+              const decision = shouldProceedOrYield(myClaim, partnerClaim);
+              if (decision === "yield") {
+                ctx.log("coop", `🤝 Yielding rescue to ${partnerClaim.botName} (they are closer: ${partnerClaim.jumps} vs ${jumpsAway} jumps)`);
+                maydayTarget = null; // Cancel this rescue
+                markMaydayHandled(mayday);
+                continue;
+              } else if (decision === "proceed") {
+                ctx.log("coop", `🤝 Proceeding with rescue (closer than partner: ${jumpsAway} vs ${partnerClaim.jumps} jumps)`);
+              }
+            } else {
+              ctx.log("coop", `🤝 No partner claim received - proceeding with rescue`);
+            }
+          }
         }
       }
 
@@ -1924,10 +2012,10 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           const content = (msg.content as string) || (msg.message as string) || "";
           const sender = (msg.sender as string) || (msg.username as string) || "";
           const ts = (msg.timestamp as number) || (msg.created_at as number) || Date.now();
-          
+
           // Skip messages from self
           if (sender === bot.username) continue;
-          
+
           const announcement = parseRescueAnnouncement(content, sender, ts * 1000);
           if (announcement) {
             recordRescueAnnouncement(announcement);
@@ -1937,6 +2025,14 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     } catch (e) {
       // Ignore errors - faction chat monitoring is optional
+    }
+
+    // ── RESCUE COOPERATION: Monitor private messages from partner bot ──
+    // This enables coordination between our two rescue bots
+    // Note: We can't poll private chat history (requires target_id), so we rely on real-time messages
+    const coopSettings = getCooperationSettings();
+    if (isCooperationEnabled() && coopSettings.enabled) {
+      ctx.log("coop_debug", `Cooperation monitoring enabled (partner: ${coopSettings.partnerBotName})`);
     }
 
     // ── Check for MANUAL RESCUE requests (HIGHEST PRIORITY) ──
@@ -2095,6 +2191,21 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             continue;
           }
 
+          // ── RESCUE COOPERATION: Check with partner bot if enabled ──
+          let partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
+          
+          if (isCooperationEnabled() && settings.cooperationEnabled) {
+            ctx.log("coop", `🤝 Cooperation enabled (partner: ${settings.partnerBotName})`);
+            ctx.log("coop", `🤝 MAYDAY: ${mayday.sender} at ${mayday.system}/${mayday.poi}`);
+            
+            if (partnerClaim) {
+              // Partner has claimed this rescue - will compare distances after calculating jumps
+              ctx.log("coop", `🤝 ✓ PARTNER CLAIM FOUND: ${partnerClaim.botName} claimed ${partnerClaim.player} at ${partnerClaim.system} (${partnerClaim.jumps} jumps, ts: ${partnerClaim.timestamp})`);
+            } else {
+              ctx.log("coop", `🤝 ✗ No partner claim found yet - will proceed and send claim (partner may respond with their claim)`);
+            }
+          }
+
           // Check jump range
           let jumpsAway = 0;
           if (mayday.system && mayday.system !== bot.system && settings.maydayMaxJumps > 0) {
@@ -2124,6 +2235,52 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           };
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
+          
+          // ── RESCUE COOPERATION: Send claim to partner bot ──
+          if (isCooperationEnabled() && settings.cooperationEnabled) {
+            const myClaim: RescueClaim = {
+              type: "RESCUE_CLAIM",
+              player: mayday.sender,
+              system: mayday.system,
+              poi: mayday.poi,
+              timestamp: new Date().toISOString(),
+              jumps: jumpsAway,
+              botName: bot.username,
+            };
+
+            // Send claim to partner bot and wait for it to complete
+            ctx.log("coop", `📧 Sending rescue claim to ${settings.partnerBotName}...`);
+            const sendResult = await sendRescueClaim(bot, myClaim);
+            if (sendResult.ok) {
+              ctx.log("coop", `📧 Sent rescue claim to ${settings.partnerBotName}: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
+            } else {
+              ctx.log("coop", `⚠️ Failed to send rescue claim: ${sendResult.error}`);
+            }
+
+            // Wait briefly for partner's claim to arrive (accounts for chat delays)
+            // Use configured delay, default 3 seconds
+            const cooperationDelay = Math.min(settings.cooperationMaxDelaySeconds * 1000, 5000);
+            ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for partner claim...`);
+            await sleep(cooperationDelay);
+
+            // Re-check for partner claims after delay
+            partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
+            
+            // Check if we should yield to partner
+            if (partnerClaim) {
+              const decision = shouldProceedOrYield(myClaim, partnerClaim);
+              if (decision === "yield") {
+                ctx.log("coop", `🤝 Yielding rescue to ${partnerClaim.botName} (they are closer: ${partnerClaim.jumps} vs ${jumpsAway} jumps)`);
+                maydayTarget = null; // Cancel this rescue
+                markMaydayHandled(mayday);
+                continue;
+              } else if (decision === "proceed") {
+                ctx.log("coop", `🤝 Proceeding with rescue (closer than partner: ${jumpsAway} vs ${partnerClaim.jumps} jumps)`);
+              }
+            } else {
+              ctx.log("coop", `🤝 No partner claim received - proceeding with rescue`);
+            }
+          }
         }
       }
 

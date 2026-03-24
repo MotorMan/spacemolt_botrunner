@@ -4471,6 +4471,9 @@ function renderRescueSettings(panel) {
   const homeStation = r.homeStation || '';
   const costPerJump = r.costPerJump ?? 50;
   const costPerFuel = r.costPerFuel ?? 2;
+  const cooperationEnabled = r.cooperationEnabled ?? false;
+  const partnerBotName = r.partnerBotName || '';
+  const cooperationMaxDelaySeconds = r.cooperationMaxDelaySeconds ?? 30;
 
   // Build system options from mapData
   const systems = Object.keys(mapData || {}).sort();
@@ -4562,6 +4565,37 @@ function renderRescueSettings(panel) {
       <small style="color:var(--dim)">Credits charged per unit of fuel delivered (sent as invoice via DM)</small>
     </div>
 
+    <hr style="border-color:var(--dim);opacity:0.3;margin:16px 0">
+
+    <div class="settings-group">
+      <label>🤝 Enable Cooperation Mode</label>
+      <label class="toggle" style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">
+        <input type="checkbox" id="set-rescue-cooperationEnabled" ${cooperationEnabled ? 'checked' : ''} style="width:auto">
+        <span>Enable multi-bot coordination</span>
+      </label>
+      <small style="color:var(--dim)">Coordinate with another rescue bot to avoid duplicate responses to MAYDAYs</small>
+    </div>
+
+    <div class="settings-group">
+      <label>Partner Bot Name</label>
+      <input type="text" id="set-rescue-partnerBotName" value="${partnerBotName}" placeholder="e.g., RescueBot_Alpha" style="width:100%;max-width:250px">
+      <small style="color:var(--dim)">Username of the other rescue bot to coordinate with (sends DMs for coordination)</small>
+    </div>
+
+    <div class="settings-group">
+      <label>Max Message Delay (seconds)</label>
+      <input type="number" id="set-rescue-cooperationMaxDelay" value="${cooperationMaxDelaySeconds}" min="10" max="120" style="width:80px">
+      <small style="color:var(--dim)">Maximum acceptable delay for cooperation messages (handles chat lag up to 30+ seconds)</small>
+    </div>
+
+    <div class="settings-group" style="background:rgba(59,130,246,0.1);border-left:3px solid var(--accent);padding:12px">
+      <small style="color:var(--dim)">
+        <strong>How it works:</strong> When both bots detect the same MAYDAY, they exchange distance info (jumps away). 
+        The closer bot takes priority. Messages include timestamps to handle chat delays.
+        Format: <code style="background:rgba(0,0,0,0.2);padding:2px 4px">RESCUE_CLAIM|player|system|timestamp|jumps|bot_name</code>
+      </small>
+    </div>
+
     <button class="btn" onclick="saveRescueSettings()">Save</button>
   `;
 }
@@ -4578,6 +4612,9 @@ function saveRescueSettings() {
     maydayMaxJumps: parseInt(document.getElementById('set-rescue-maydayMaxJumps').value) || 0,
     costPerJump: parseInt(document.getElementById('set-rescue-costPerJump').value) || 50,
     costPerFuel: parseInt(document.getElementById('set-rescue-costPerFuel').value) || 2,
+    cooperationEnabled: document.getElementById('set-rescue-cooperationEnabled').checked || false,
+    partnerBotName: document.getElementById('set-rescue-partnerBotName').value || '',
+    cooperationMaxDelaySeconds: parseInt(document.getElementById('set-rescue-cooperationMaxDelay').value) || 30,
   };
   send({ type: 'saveSettings', routine: 'rescue', settings: s });
   alert('FuelRescue settings saved!');

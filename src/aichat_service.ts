@@ -1141,9 +1141,15 @@ ${mapSummary}
           content: cleanResponse,
         });
 
-        // Log to bot's activity log for private messages
+        // Log to bot's activity log based on channel
         if (msg.channel === "private") {
           bot.log("chat", `📤 Private to ${msg.sender}: ${cleanResponse}`);
+        } else if (msg.channel === "faction") {
+          bot.log("chat", `📤 Faction: ${cleanResponse}`);
+        } else if (msg.channel === "local") {
+          bot.log("chat", `📤 Local: ${cleanResponse}`);
+        } else if (msg.channel === "system") {
+          bot.log("chat", `📤 System: ${cleanResponse}`);
         }
 
         mem.lastResponse = cleanResponse;
@@ -1383,6 +1389,10 @@ Message:`;
 
       if (!chatResp.error) {
         this.logFn("ai_chat", `→ Faction chat: ${cleanResponse}`);
+        
+        // Log to bot's activity log
+        bot.log("chat", `📤 Faction: ${cleanResponse}`);
+        
         return { ok: true, message: cleanResponse };
       } else {
         this.logFn("error", `Faction message failed: ${chatResp.error.message}`);

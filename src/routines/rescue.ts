@@ -115,7 +115,7 @@ async function sendRescueBill(
   const aiChatService = (globalThis as any).aiChatService;
   if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
     try {
-      await aiChatService.sendPrivateMessage(ctx.bot, targetUsername, {
+      const result = await aiChatService.sendPrivateMessage(ctx.bot, targetUsername, {
         situation: isMayday
           ? `You responded to their MAYDAY distress call and successfully refueled them. You are now sending them an invoice for the rescue service. Total bill: ${bill.total} credits (${bill.jumpCost} for ${jumpsToTarget + jumpsToHome} jumps, ${bill.fuelCost} for ${fuelDelivered} fuel units).`
           : `You completed a fuel transfer mission to help them with their low fuel situation. You are now sending them an invoice for the rescue service. Total bill: ${bill.total} credits (${bill.jumpCost} for ${jumpsToTarget + jumpsToHome} jumps, ${bill.fuelCost} for ${fuelDelivered} fuel units).`,
@@ -125,10 +125,16 @@ async function sendRescueBill(
         fuelRefueled: fuelDelivered,
         playerFuelPct: undefined,
       });
-      ctx.log("rescue", `📧 Sent rescue invoice to ${targetUsername}: ${bill.total} credits (${bill.jumpCost} jumps + ${bill.fuelCost} fuel)`);
+      if (result.ok) {
+        ctx.log("rescue", `📧 Sent rescue invoice to ${targetUsername}: ${bill.total} credits (${bill.jumpCost} jumps + ${bill.fuelCost} fuel)`);
+      } else {
+        ctx.log("warn", `Rescue invoice to ${targetUsername} failed: ${result.error}`);
+      }
     } catch (e) {
       ctx.log("warn", `Failed to send rescue bill: ${e}`);
     }
+  } else {
+    ctx.log("warn", "AI Chat service not available for rescue bill");
   }
 }
 
@@ -883,26 +889,8 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       }
     }
 
-    // Send AI-generated "rescue complete" private message to target
-    const aiChatService = (globalThis as any).aiChatService;
-    if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-      try {
-        await aiChatService.sendPrivateMessage(bot, target.username, {
-          situation: isManualRescueTarget
-            ? `You completed a manual rescue mission to help them. They have been refueled and can continue their journey.`
-            : isMaydayTarget
-              ? `You responded to their MAYDAY distress call and successfully refueled them. They are now safe to continue their journey.`
-              : `You completed a fuel transfer mission to help them with their low fuel situation.`,
-          currentSystem: bot.system,
-          targetSystem: target.system,
-          jumps: undefined,
-          fuelRefueled: undefined,
-          playerFuelPct: target.fuelPct,
-        });
-      } catch (e) {
-        ctx.log("warn", `AI completion message failed: ${e}`);
-      }
-    }
+    // Note: Rescue complete message and bill are sent immediately after fuel delivery
+    // (see the "Send rescue complete message and bill IMMEDIATELY" section below)
 
     // ── Skip to return home if recovering from returning_home state ──
     if (skipToReturnHome) {
@@ -1539,13 +1527,18 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     // Send AI-generated "on my way" message via private chat
     if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
       try {
-        await aiChatService.sendPrivateMessage(bot, mayday.sender, {
+        const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
           situation: `You are responding to their MAYDAY distress call. You are coming to rescue them with fuel.`,
           currentSystem: bot.system,
           targetSystem: mayday.system,
           jumps: jumpsToTarget > 0 ? jumpsToTarget : undefined,
           playerFuelPct: mayday.fuelPct,
         });
+        if (result.ok) {
+          ctx.log("mayday", `✓ Sent "on my way" private message to ${mayday.sender}`);
+        } else {
+          ctx.log("warn", `Private message to ${mayday.sender} failed: ${result.error}`);
+        }
       } catch (e) {
         ctx.log("warn", `AI message failed: ${e}`);
       }
@@ -1679,8 +1672,8 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     // Send AI-generated "rescue complete" message
     if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
       try {
-        await aiChatService.sendPrivateMessage(bot, mayday.sender, {
-          situation: fuelTransferred > 0 
+        const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
+          situation: fuelTransferred > 0
             ? `You have successfully refueled the stranded pilot. They are now safe and can continue their journey.`
             : `You arrived to help but couldn't provide fuel. You did your best to assist.`,
           currentSystem: mayday.system, // Now at same system
@@ -1688,9 +1681,16 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
           fuelRefueled: fuelTransferred > 0 ? fuelTransferred : undefined,
           playerFuelPct: targetFuelBefore,
         });
+        if (result.ok) {
+          ctx.log("mayday", `✓ Sent "rescue complete" private message to ${mayday.sender}`);
+        } else {
+          ctx.log("warn", `Private message to ${mayday.sender} failed: ${result.error}`);
+        }
       } catch (e) {
         ctx.log("warn", `AI completion message failed: ${e}`);
       }
+    } else {
+      ctx.log("warn", "AI Chat service not available for rescue complete message");
     }
 
     // Mark MAYDAY as handled
@@ -2597,8 +2597,119 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // Skip faction chat here - billing code will send it after delay
-    ctx.log("rescue", `Will send faction announcement after billing delay...`);
+    // ── Send rescue complete message and bill IMMEDIATELY after fuel delivery ──
+    // Get the active session for billing
+    const activeSessionForBill = getActiveRescueSession(bot.username);
+    if (activeSessionForBill) {
+      const jumpsToTarget = activeSessionForBill.jumpsCompleted || 0;
+      const fuelDeliveredBill = activeSessionForBill.fuelDelivered || 0;
+
+      // Calculate bill (we know jumps to target, estimate return jumps as same)
+      const bill = calculateRescueBill(
+        jumpsToTarget,
+        jumpsToTarget,
+        fuelDeliveredBill,
+        settings
+      );
+
+      // Log the bill
+      ctx.log("rescue", `💰 RESCUE BILL for ${activeSessionForBill.targetUsername}:`);
+      ctx.log("rescue", `   • Jumps: ${jumpsToTarget} there + ${jumpsToTarget} back = ${jumpsToTarget * 2} × ${settings.costPerJump}cr = ${bill.jumpCost}cr`);
+      ctx.log("rescue", `   • Fuel: ${fuelDeliveredBill} units × ${settings.costPerFuel}cr = ${bill.fuelCost}cr`);
+      ctx.log("rescue", `   • TOTAL: ${bill.total} credits`);
+
+      // Send "rescue complete" private message FIRST
+      const aiChatService = (globalThis as any).aiChatService;
+      if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+        try {
+          const result = await aiChatService.sendPrivateMessage(bot, activeSessionForBill.targetUsername, {
+            situation: activeSessionForBill.isMayday
+              ? `You responded to their MAYDAY distress call and successfully refueled them. They are now safe to continue their journey.`
+              : `You completed a fuel transfer mission to help them with their low fuel situation.`,
+            currentSystem: bot.system,
+            targetSystem: activeSessionForBill.targetSystem,
+            jumps: undefined,
+            fuelRefueled: fuelDeliveredBill > 0 ? fuelDeliveredBill : undefined,
+            playerFuelPct: target.fuelPct,
+          });
+          if (result.ok) {
+            ctx.log("rescue", `✓ Sent "rescue complete" private message to ${activeSessionForBill.targetUsername}`);
+          } else {
+            ctx.log("warn", `Private message to ${activeSessionForBill.targetUsername} failed: ${result.error}`);
+          }
+        } catch (e) {
+          ctx.log("warn", `AI completion message failed: ${e}`);
+        }
+      }
+
+      // Send bill via private message (if total > 0)
+      if (bill.total > 0) {
+        await sendRescueBill(
+          ctx,
+          activeSessionForBill.targetUsername,
+          bill,
+          jumpsToTarget,
+          jumpsToTarget,
+          fuelDeliveredBill,
+          activeSessionForBill.isMayday
+        );
+
+        // Update session with billing info
+        updateRescueSession(bot.username, {
+          jumpsCompleted: jumpsToTarget,
+          totalJumps: jumpsToTarget * 2,
+          fuelDelivered: fuelDeliveredBill,
+          creditsSent: bill.total,
+          notes: `Billed ${bill.total}cr (${bill.jumpCost}cr jumps + ${bill.fuelCost}cr fuel)`,
+        });
+
+        // Delay faction chat announcement to avoid rate limiting
+        const aiChatSettings = (globalThis as any).aiChatService?.getSettings?.();
+        const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
+        ctx.log("rescue", `⏳ Delaying faction announcement by ${cooldownSec}s...`);
+        await sleep(cooldownSec * 1000);
+
+        // Send faction chat announcement
+        if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+          try {
+            const result = await aiChatService.sendFactionMessage(bot, {
+              messageType: "rescue_complete",
+              targetName: activeSessionForBill.targetUsername,
+              isMayday: activeSessionForBill.isMayday,
+              isBot: !activeSessionForBill.isMayday,
+              currentSystem: bot.system,
+              targetSystem: activeSessionForBill.targetSystem,
+              targetPoi: activeSessionForBill.targetPoi || undefined,
+            });
+            if (!result.ok) {
+              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+            }
+          } catch (e) {
+            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
+          }
+        }
+      } else {
+        // No bill to send, but still send faction announcement
+        if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+          try {
+            const result = await aiChatService.sendFactionMessage(bot, {
+              messageType: "rescue_complete",
+              targetName: activeSessionForBill.targetUsername,
+              isMayday: activeSessionForBill.isMayday,
+              isBot: !activeSessionForBill.isMayday,
+              currentSystem: bot.system,
+              targetSystem: activeSessionForBill.targetSystem,
+              targetPoi: activeSessionForBill.targetPoi || undefined,
+            });
+            if (!result.ok) {
+              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+            }
+          } catch (e) {
+            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
+          }
+        }
+      }
+    }
 
     // ── Return to home system ──
     if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
@@ -2673,107 +2784,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     await bot.refreshStatus();
     const fuelAfterRescue2 = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelAfterRescue2 < settings.refuelThreshold) {
-      ctx.log(logCategory, 
+      ctx.log(logCategory,
         `Fuel at ${fuelAfterRescue2}% after rescue — refueling to threshold (${settings.refuelThreshold}%)...`);
       await ensureFueled(ctx, settings.refuelThreshold);
     } else {
-      ctx.log(logCategory, 
+      ctx.log(logCategory,
         `Fuel at ${fuelAfterRescue2}% — above threshold, no need to refuel`);
     }
     await bot.refreshStatus();
     logStatus(ctx);
-
-    // ── Calculate and send rescue bill (after refuel, before returning home) ──
-    const activeSessionForBill2 = getActiveRescueSession(bot.username);
-    if (activeSessionForBill2) {
-      const jumpsToTarget2 = activeSessionForBill2.jumpsCompleted || 0;
-      const fuelDelivered2 = activeSessionForBill2.fuelDelivered || 0;
-      
-      // Estimate round trip: jumps to target × 2 (there and back)
-      const estimatedTotalJumps2 = jumpsToTarget2 * 2;
-      const bill2 = calculateRescueBill(
-        jumpsToTarget2, // One-way jumps for display
-        jumpsToTarget2, // Return jumps (estimate)
-        fuelDelivered2,
-        settings
-      );
-      
-      // Log the bill clearly
-      ctx.log("rescue", `💰 RESCUE BILL for ${activeSessionForBill2.targetUsername}:`);
-      ctx.log("rescue", `   • Jumps: ${jumpsToTarget2} there + ${jumpsToTarget2} back = ${estimatedTotalJumps2} × ${settings.costPerJump}cr = ${bill2.jumpCost}cr`);
-      ctx.log("rescue", `   • Fuel: ${fuelDelivered2} units × ${settings.costPerFuel}cr = ${bill2.fuelCost}cr`);
-      ctx.log("rescue", `   • TOTAL: ${bill2.total} credits`);
-      
-      if (bill2.total > 0) {
-        // Send bill via private message FIRST
-        await sendRescueBill(
-          ctx,
-          activeSessionForBill2.targetUsername,
-          bill2,
-          jumpsToTarget2,
-          jumpsToTarget2, // Estimate for return
-          fuelDelivered2,
-          activeSessionForBill2.isMayday
-        );
-        
-        // Update session with billing info
-        updateRescueSession(bot.username, {
-          jumpsCompleted: jumpsToTarget2,
-          totalJumps: estimatedTotalJumps2,
-          fuelDelivered: fuelDelivered2,
-          creditsSent: bill2.total,
-          notes: `Billed ${bill2.total}cr (${bill2.jumpCost}cr jumps + ${bill2.fuelCost}cr fuel)`,
-        });
-
-        // Delay faction chat announcement to avoid rate limiting
-        const aiChatSettings2 = (globalThis as any).aiChatService?.getSettings?.();
-        const cooldownSec2 = aiChatSettings2?.conversationCooldownSec || 10;
-        ctx.log("rescue", `⏳ Delaying faction announcement by ${cooldownSec2}s...`);
-        await sleep(cooldownSec2 * 1000);
-
-        // Send faction chat announcement AFTER delay
-        const aiChatService2 = (globalThis as any).aiChatService;
-        if (aiChatService2 && typeof aiChatService2.sendFactionMessage === "function") {
-          try {
-            const result2 = await aiChatService2.sendFactionMessage(bot, {
-              messageType: "rescue_complete",
-              targetName: activeSessionForBill2.targetUsername,
-              isMayday: activeSessionForBill2.isMayday,
-              isBot: !activeSessionForBill2.isMayday,
-              currentSystem: bot.system,
-              targetSystem: activeSessionForBill2.targetSystem,
-              targetPoi: activeSessionForBill2.targetPoi || undefined,
-            });
-            if (!result2.ok) {
-              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result2.error}`);
-            }
-          } catch (e) {
-            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
-          }
-        }
-      } else {
-        // No bill to send, but still send faction announcement
-        const aiChatService2 = (globalThis as any).aiChatService;
-        if (aiChatService2 && typeof aiChatService2.sendFactionMessage === "function") {
-          try {
-            const result2 = await aiChatService2.sendFactionMessage(bot, {
-              messageType: "rescue_complete",
-              targetName: activeSessionForBill2.targetUsername,
-              isMayday: activeSessionForBill2.isMayday,
-              isBot: !activeSessionForBill2.isMayday,
-              currentSystem: bot.system,
-              targetSystem: activeSessionForBill2.targetSystem,
-              targetPoi: activeSessionForBill2.targetPoi || undefined,
-            });
-            if (!result2.ok) {
-              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result2.error}`);
-            }
-          } catch (e) {
-            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
-          }
-        }
-      }
-    }
 
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {

@@ -400,12 +400,18 @@ export class AiChatService {
 
   /**
    * Generate a hash for duplicate detection.
-   * Now includes botUsername to allow same message to different bots.
+   * For mentions, include botUsername so different bots can respond to their own mentions.
+   * For non-mention messages, exclude botUsername so only one bot responds.
    */
-  private getMessageHash(msg: ChatMessage): string {
+  private getMessageHash(msg: ChatMessage, isMention: boolean): string {
     const minute = Math.floor(msg.timestamp / 60000);
-    // Include botUsername in hash so same message to different bots isn't marked as duplicate
-    return `${msg.sender}|${msg.channel}|${msg.content}|${minute}|${msg.botUsername || "unknown"}`;
+    // For mentions, include botUsername so different bots can respond to their own mentions
+    // For non-mentions, exclude botUsername so only one bot responds to "respond to all"
+    if (isMention) {
+      return `${msg.sender}|${msg.channel}|${msg.content}|${minute}|${msg.botUsername || "unknown"}`;
+    } else {
+      return `${msg.sender}|${msg.channel}|${msg.content}|${minute}`;
+    }
   }
 
   /**
@@ -418,22 +424,22 @@ export class AiChatService {
   /**
    * Check if this is a duplicate message.
    */
-  private isDuplicate(msg: ChatMessage): boolean {
+  private isDuplicate(msg: ChatMessage, isMention: boolean = false): boolean {
     const now = Date.now();
-    const hash = this.getMessageHash(msg);
-    
+    const hash = this.getMessageHash(msg, isMention);
+
     // Clean up expired entries
     for (const [key, timestamp] of this.seenMessages.entries()) {
       if (now - timestamp > this.SEEN_EXPIRY_MS) {
         this.seenMessages.delete(key);
       }
     }
-    
+
     const prevTime = this.seenMessages.get(hash);
     if (prevTime !== undefined) {
       return true;
     }
-    
+
     this.seenMessages.set(hash, now);
     return false;
   }
@@ -521,8 +527,22 @@ export class AiChatService {
    * Add a chat message to the queue.
    */
   addChatMessage(msg: ChatMessage): void {
-    // Check for duplicates first
-    if (this.isDuplicate(msg)) {
+    // Check if message mentions any bot
+    const bots = AiChatService.getBots();
+    let isMention = false;
+    if (bots) {
+      for (const bot of bots) {
+        if (messageMentionsBot(msg.content, bot.username)) {
+          isMention = true;
+          break;
+        }
+      }
+    }
+
+    // Check for duplicates
+    // For mentions: allow same message to different bots (each mentioned bot can respond)
+    // For non-mentions: deduplicate across all bots (only one bot should respond to "respond to all")
+    if (this.isDuplicate(msg, isMention)) {
       this.logFn("ai_chat_debug", `Duplicate message ignored: ${msg.sender} - ${msg.content.slice(0, 50)}`);
       return;
     }
@@ -790,7 +810,8 @@ export class AiChatService {
     triedBots: Set<string> = new Set()
   ): Promise<void> {
     // Check conversation limits (cooldown, consecutive responses)
-    const participants = [humanSender, responder.username];
+    // Use channel + human sender as key (not responder) so only one bot responds per conversation
+    const participants = [humanSender]; // Don't include responder - conversation is per channel+sender
     const limits = this.checkConversationLimits(msg.channel, participants);
     if (!limits.allowed) {
       this.logFn("ai_chat", `Skipping: ${limits.reason}`);
@@ -1227,6 +1248,16 @@ Message:`;
 
       if (!chatResp.error) {
         this.logFn("ai_chat", `→ Private message to ${targetPlayer}: ${cleanResponse}`);
+
+        // Log outgoing message
+        this.logChat({
+          timestamp: new Date().toISOString(),
+          direction: "OUT",
+          channel: "private",
+          sender: bot.username,
+          content: cleanResponse,
+        });
+
         return { ok: true, message: cleanResponse };
       } else {
         this.logFn("error", `Private message to ${targetPlayer} failed: ${chatResp.error.message}`);
@@ -1359,6 +1390,13 @@ Message:`;
 
   static setGetBotsFn(fn: () => Bot[]): void {
     AiChatService.getBots = fn;
+  }
+
+  /**
+   * Get current AI Chat settings.
+   */
+  getSettings(): ReturnType<typeof getAiChatSettings> {
+    return getAiChatSettings();
   }
 
   /**

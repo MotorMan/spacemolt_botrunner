@@ -133,6 +133,12 @@ export class Bot {
   readonly actionLog: string[] = [];
   private maxLogEntries = 200;
 
+  /** Private message polling - track last poll time and seen message IDs */
+  private lastPrivateMessagePoll = 0;
+  private seenPrivateMessageIds = new Set<string>();
+  private readonly PRIVATE_MESSAGE_POLL_INTERVAL_MS = 5000; // Poll every 5 seconds
+  private readonly PRIVATE_MESSAGE_SEEN_EXPIRY_MS = 60000; // Clear seen IDs after 1 minute
+
   /** Customs inspection state - tracks if bot is being held for customs scan. */
   customsHold: {
     active: boolean;
@@ -587,6 +593,8 @@ export class Bot {
         }
         // Small gap between actions
         await sleep(2000);
+        // Poll for private messages periodically
+        await this.pollPrivateMessages();
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1203,6 +1211,75 @@ export class Bot {
 
     if (count > 0) {
       this.log("playernames", `Discovered ${count} new player(s) from battle/scan`);
+    }
+  }
+
+  /**
+   * Poll private chat messages and log them to the activity log.
+   * Called periodically to capture DM messages that don't come through notifications.
+   */
+  private async pollPrivateMessages(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastPrivateMessagePoll < this.PRIVATE_MESSAGE_POLL_INTERVAL_MS) {
+      return; // Not time to poll yet
+    }
+    this.lastPrivateMessagePoll = now;
+
+    // Clean up expired seen message IDs
+    if (this.seenPrivateMessageIds.size > 100) {
+      // Periodically clear old entries to prevent memory growth
+      this.seenPrivateMessageIds.clear();
+    }
+
+    try {
+      const chatResp = await this.exec("get_chat_history", { channel: "private", limit: 10 });
+      if (chatResp.error) {
+        return; // Ignore errors - polling is best-effort
+      }
+
+      const result = chatResp.result as Record<string, unknown> | Array<unknown> | undefined;
+      const messages = Array.isArray(result) ? result : 
+                       (result && typeof result === "object" ? ((result as Record<string, unknown>).messages as Array<unknown> || []) : []);
+
+      for (const msg of messages) {
+        if (!msg || typeof msg !== "object") continue;
+        const m = msg as Record<string, unknown>;
+        
+        const msgId = (m.id as string) || (m.message_id as string) || "";
+        const sender = (m.sender as string) || (m.username as string) || "";
+        const content = (m.content as string) || (m.message as string) || "";
+        const timestamp = (m.timestamp as number) || (m.created_at as number) || 0;
+
+        // Skip messages from self
+        if (sender === this.username) continue;
+
+        // Skip already seen messages
+        if (msgId && this.seenPrivateMessageIds.has(msgId)) continue;
+
+        // Mark as seen
+        if (msgId) this.seenPrivateMessageIds.add(msgId);
+
+        // Log the private message to activity log
+        const timeStr = new Date(timestamp || Date.now()).toLocaleTimeString("en-US", { hour12: false });
+        this.log("chat", `📩 Private [${timeStr}] ${sender}: ${content}`);
+
+        // Forward to AI chat service for response handling
+        const aiChatService = (globalThis as any).aiChatService;
+        if (aiChatService && typeof aiChatService.addChatMessage === "function") {
+          aiChatService.addChatMessage({
+            sender,
+            channel: "private",
+            content,
+            timestamp: timestamp || Date.now(),
+            botUsername: this.username,
+            botSystem: this.system,
+            botPoi: this.poi,
+            targetId: sender, // For private messages, target is the sender
+          });
+        }
+      }
+    } catch (err) {
+      // Ignore polling errors - best effort only
     }
   }
 

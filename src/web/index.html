@@ -2117,55 +2117,52 @@ function mcStartManualRescue() {
     logResponse('<span class="resp-err">No bot selected</span>');
     return;
   }
-  
+
   const systemSelect = document.getElementById('mc-rescue-system');
   const poiSelect = document.getElementById('mc-rescue-poi');
   const playerInput = document.getElementById('mc-rescue-player');
-  
+
   if (!systemSelect || !poiSelect || !playerInput) {
     logResponse('<span class="resp-err">UI elements not found</span>');
     return;
   }
-  
+
   const systemId = systemSelect.value;
   const poiId = poiSelect.value;
   const playerName = playerInput.value.trim();
-  
+
   // Validate inputs
   if (!systemId) {
     logResponse('<span class="resp-err">Please select a system</span>');
     return;
   }
-  
+
   if (!poiId) {
     logResponse('<span class="resp-err">Please select a POI</span>');
     return;
   }
-  
+
   if (!playerName) {
     logResponse('<span class="resp-err">Please enter a player name</span>');
     return;
   }
-  
-  // Start the manual rescue routine
+
+  // Send manual rescue request to the rescue routine
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-  logResponse(`<span class="resp-cmd">${ts} > starting manual rescue mission</span>`);
+  logResponse(`<span class="resp-cmd">${ts} > requesting manual rescue mission</span>`);
   logResponse(`<span class="resp-info">Target: ${esc(playerName)} at ${esc(systemId)} / ${esc(poiId)}</span>`);
 
-  // Send start action with parameters to botmanager
+  // Send manual rescue request action
   send({
-    type: 'start',
+    type: 'manual_rescue_request',
     bot: profileBot,
-    routine: 'manual_rescue',
-    params: {
-      targetSystem: systemId,
-      targetPOI: poiId,
-      targetPlayer: playerName
-    }
+    targetSystem: systemId,
+    targetPOI: poiId,
+    targetPlayer: playerName
   });
 
-  logResponse(`<span class="resp-ok">✓ Rescue mission started!</span>`);
-  logResponse(`<span class="resp-info">Bot will navigate to ${esc(systemId)}, locate ${esc(playerName)}, and refuel them</span>`);
+  logResponse(`<span class="resp-ok">✓ Rescue request queued!</span>`);
+  logResponse(`<span class="resp-info">The rescue bot will handle this as a priority mission</span>`);
 }
 
 // ── Deposit All Queue System ───────────────────────────────
@@ -2884,7 +2881,9 @@ let botLogBuffers = {};
 const LOG_CAT_CLASSES = {
   system: 'log-cat-system', error: 'log-cat-error', travel: 'log-cat-travel',
   mining: 'log-cat-mining', trade: 'log-cat-trade', rescue: 'log-cat-rescue',
-  combat: 'log-cat-combat', info: 'log-cat-info',
+  combat: 'log-cat-combat', info: 'log-cat-info', chat: 'log-cat-chat',
+  mayday: 'log-cat-mayday', local: 'log-cat-local', faction: 'log-cat-faction',
+  private: 'log-cat-private', customs: 'log-cat-customs', customs_debug: 'log-cat-customs',
 };
 
 function formatBotLogLine(line) {
@@ -4182,6 +4181,8 @@ function renderCrafterSettings(panel) {
   const enabledCategories = crafter.enabledCategories || ["Refining", "Components", "Consumables"];
   const refuelThreshold = crafter.refuelThreshold ?? 50;
   const repairThreshold = crafter.repairThreshold ?? 40;
+  const categoryAssignments = crafter.categoryAssignments || {};
+  const botQuotaOverrides = crafter.botQuotaOverrides || {};
 
   // Use catalog recipes if available, fall back to API fetch
   if (!cachedSettingsRecipes) {
@@ -4239,6 +4240,25 @@ function renderCrafterSettings(panel) {
     return `<label class="craft-cat-check"><input type="checkbox" data-category="${esc(cat)}" ${checked}> ${esc(cat)} (${count})</label>`;
   }).join('');
 
+  // Build bot category assignments UI
+  const botNames = bots.map(b => b.username).sort();
+  const botAssignmentRows = botNames.map(botName => {
+    const assignedCats = categoryAssignments[botName] || [];
+    const catCheckboxes = allCategories.map(cat => {
+      const checked = assignedCats.includes(cat) ? 'checked' : '';
+      return `<label class="craft-cat-check" style="font-size:11px"><input type="checkbox" class="bot-cat-assign" data-bot="${esc(botName)}" data-category="${esc(cat)}" ${checked}> ${esc(cat)}</label>`;
+    }).join('');
+    return `
+      <div class="bot-cat-assign-row" style="padding:8px;border:1px solid var(--border);border-radius:6px;margin-bottom:8px">
+        <div style="font-weight:600;color:var(--text);margin-bottom:6px">${esc(botName)}</div>
+        <div class="craft-cat-checks" style="display:flex;flex-wrap:wrap;gap:6px">
+          ${catCheckboxes}
+          ${assignedCats.length === 0 ? '<span style="color:var(--dim);font-size:11px">No categories assigned - bot will use global enabled categories</span>' : ''}
+        </div>
+      </div>
+    `;
+  }).join('');
+
   panel.innerHTML = `
     <h3>Crafter Settings</h3>
     <div class="settings-desc">Add recipes and set stock limits. The crafter bot will craft each item up to its limit, then stop.</div>
@@ -4268,6 +4288,16 @@ function renderCrafterSettings(panel) {
       <div class="craft-cat-checks">
         <label class="craft-cat-check"><input type="checkbox" id="craft-cat-toggle-all" onchange="toggleAllCategories(this)"> All</label>
         ${categoryChecks}
+      </div>
+    </div>
+
+    <div class="setting-row" style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
+        <div class="setting-label">Bot Category Assignments</div>
+        <div class="setting-hint">Assign specific categories to individual bots. Bots with assignments will ONLY craft from those categories. Leave unassigned to use global enabled categories.</div>
+      </div>
+      <div style="margin-top:10px">
+        ${botAssignmentRows || '<div style="color:var(--dim);padding:8px">No bots available</div>'}
       </div>
     </div>
 
@@ -4404,9 +4434,21 @@ function saveCrafterSettings() {
     if (el.checked) enabledCategories.push(el.getAttribute('data-category'));
   });
 
+  // Collect bot category assignments
+  const categoryAssignments = {};
+  document.querySelectorAll('.bot-cat-assign').forEach(el => {
+    const bot = el.getAttribute('data-bot');
+    const cat = el.getAttribute('data-category');
+    if (el.checked) {
+      if (!categoryAssignments[bot]) categoryAssignments[bot] = [];
+      categoryAssignments[bot].push(cat);
+    }
+  });
+
   const s = {
     craftLimits,
     enabledCategories,
+    categoryAssignments,
     refuelThreshold: parseInt(document.getElementById('set-crafter-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-crafter-repairThreshold').value) || 40,
   };
@@ -4425,6 +4467,31 @@ function renderRescueSettings(panel) {
   const scanIntervalSec = r.scanIntervalSec ?? 30;
   const refuelThreshold = r.refuelThreshold ?? 60;
   const maydayMaxJumps = r.maydayMaxJumps ?? 12;
+  const homeSystem = r.homeSystem || '';
+  const homeStation = r.homeStation || '';
+  const costPerJump = r.costPerJump ?? 50;
+  const costPerFuel = r.costPerFuel ?? 2;
+
+  // Build system options from mapData
+  const systems = Object.keys(mapData || {}).sort();
+  const sysOpts = ['<option value="">(none - use starting system)</option>'];
+  for (const sys of systems) {
+    const sel = sys === homeSystem ? ' selected' : '';
+    sysOpts.push(`<option value="${esc(sys)}"${sel}>${esc(sys)}</option>`);
+  }
+
+  // Build station options from selected system
+  let stationOpts = ['<option value="">(none - dock at any station)</option>'];
+  if (homeSystem && mapData && mapData[homeSystem]) {
+    const sysData = mapData[homeSystem];
+    const pois = sysData.pois || [];
+    const stations = pois.filter(p => p.type === 'station' || p.type === 'outpost' || (p.services && p.services.refuel));
+    for (const station of stations) {
+      const stationVal = `${homeSystem}|${station.id}`;
+      const sel = stationVal === homeStation ? ' selected' : '';
+      stationOpts.push(`<option value="${esc(stationVal)}"${sel}>${esc(station.name)}</option>`);
+    }
+  }
 
   panel.innerHTML = `
     <h3 style="margin:0 0 12px;color:var(--text)">FuelRescue Settings</h3>
@@ -4432,6 +4499,18 @@ function renderRescueSettings(panel) {
       Monitors fleet for stranded bots and delivers fuel cells or credits.
       Also responds to MAYDAY emergency calls within jump range.
     </p>
+
+    <div class="settings-group">
+      <label>Home System</label>
+      <select id="set-rescue-homeSystem" onchange="renderRescueSettings(document.getElementById('settings-content'))" style="width:100%;max-width:300px">${sysOpts.join('')}</select>
+      <small style="color:var(--dim)">Return to this system after completing rescues (defaults to starting system if not set)</small>
+    </div>
+
+    <div class="settings-group">
+      <label>Home Station (optional)</label>
+      <select id="set-rescue-homeStation" style="width:100%;max-width:300px">${stationOpts.join('')}</select>
+      <small style="color:var(--dim)">Dock at this specific station when returning home (for refueling). Select system first.</small>
+    </div>
 
     <div class="settings-group">
       <label>Fleet scan interval (seconds)</label>
@@ -4469,18 +4548,36 @@ function renderRescueSettings(panel) {
       <small style="color:var(--dim)">Keep rescue bot's own fuel above this level</small>
     </div>
 
+    <hr style="border-color:var(--dim);opacity:0.3;margin:16px 0">
+    
+    <div class="settings-group">
+      <label>💰 Cost per jump (credits)</label>
+      <input type="number" id="set-rescue-costPerJump" value="${costPerJump}" min="0" max="1000" style="width:80px">
+      <small style="color:var(--dim)">Credits charged per jump for rescue travel (sent as invoice via DM)</small>
+    </div>
+
+    <div class="settings-group">
+      <label>💰 Cost per fuel unit (credits)</label>
+      <input type="number" id="set-rescue-costPerFuel" value="${costPerFuel}" min="0" max="100" style="width:80px">
+      <small style="color:var(--dim)">Credits charged per unit of fuel delivered (sent as invoice via DM)</small>
+    </div>
+
     <button class="btn" onclick="saveRescueSettings()">Save</button>
   `;
 }
 
 function saveRescueSettings() {
   const s = {
+    homeSystem: document.getElementById('set-rescue-homeSystem').value || '',
+    homeStation: document.getElementById('set-rescue-homeStation').value || '',
     fuelThreshold: parseInt(document.getElementById('set-rescue-fuelThreshold').value) || 10,
     rescueFuelCells: parseInt(document.getElementById('set-rescue-fuelCells').value) || 10,
     rescueCredits: parseInt(document.getElementById('set-rescue-credits').value) || 500,
     scanIntervalSec: parseInt(document.getElementById('set-rescue-scanInterval').value) || 30,
     refuelThreshold: parseInt(document.getElementById('set-rescue-refuelThreshold').value) || 60,
     maydayMaxJumps: parseInt(document.getElementById('set-rescue-maydayMaxJumps').value) || 0,
+    costPerJump: parseInt(document.getElementById('set-rescue-costPerJump').value) || 50,
+    costPerFuel: parseInt(document.getElementById('set-rescue-costPerFuel').value) || 2,
   };
   send({ type: 'saveSettings', routine: 'rescue', settings: s });
   alert('FuelRescue settings saved!');
@@ -4535,6 +4632,15 @@ function saveMaydaySettings() {
 function renderFuelTransferSettings(panel) {
   const f = settings.fuel_transfer || {};
   const refuelThreshold = f.refuelThreshold ?? 60;
+  const homeSystem = f.homeSystem || '';
+
+  // Build system options from mapData
+  const systems = Object.keys(mapData || {}).sort();
+  const sysOpts = ['<option value="">(none - use starting system)</option>'];
+  for (const sys of systems) {
+    const sel = sys === homeSystem ? ' selected' : '';
+    sysOpts.push(`<option value="${esc(sys)}"${sel}>${esc(sys)}</option>`);
+  }
 
   panel.innerHTML = `
     <h3 style="margin:0 0 12px;color:var(--text)">FuelTransfer Settings</h3>
@@ -4542,6 +4648,12 @@ function renderFuelTransferSettings(panel) {
       Uses a dedicated fuel transfer ship with Refueling Pump module to directly refuel stranded ships.
       Requires the refueling_pump module to be installed on the ship.
     </p>
+
+    <div class="settings-group">
+      <label>Home System</label>
+      <select id="set-fueltransfer-homeSystem" style="width:100%;max-width:300px">${sysOpts.join('')}</select>
+      <small style="color:var(--dim)">Return to this system after completing rescues (defaults to starting system if not set)</small>
+    </div>
 
     <div class="settings-group">
       <label>Self refuel threshold (%)</label>
@@ -4555,6 +4667,7 @@ function renderFuelTransferSettings(panel) {
 
 function saveFuelTransferSettings() {
   const s = {
+    homeSystem: document.getElementById('set-fueltransfer-homeSystem').value || '',
     refuelThreshold: parseInt(document.getElementById('set-fueltransfer-refuelThreshold').value) || 60,
   };
   send({ type: 'saveSettings', routine: 'fuel_transfer', settings: s });
@@ -5137,6 +5250,7 @@ function renderAiChatSettings(panel) {
   const respondToQuestions = ac.respondToQuestions ?? false;
   const respondToAll = ac.respondToAll ?? false;
   const respondToSystem = ac.respondToSystem ?? false;
+  const respondToMayday = ac.respondToMayday ?? true;
   const personality = ac.personality || '';
   const lockDurationSec = ac.lockDurationSec ?? 60;
   const conversationCooldownSec = ac.conversationCooldownSec ?? 15;
@@ -5229,6 +5343,10 @@ function renderAiChatSettings(panel) {
           <input type="checkbox" id="set-aichat-respondToSystem" ${respondToSystem ? 'checked' : ''}>
           <span style="font-size:12px;color:var(--text)">Respond to SYSTEM chat</span>
         </label>
+        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+          <input type="checkbox" id="set-aichat-respondToMayday" ${respondToMayday ? 'checked' : ''}>
+          <span style="font-size:12px;color:var(--text)">Respond to MAYDAY messages (player won't see)</span>
+        </label>
       </div>
     </div>
 
@@ -5257,6 +5375,7 @@ function saveAiChatSettings() {
     respondToQuestions: document.getElementById('set-aichat-respondToQuestions').checked,
     respondToAll: document.getElementById('set-aichat-respondToAll').checked,
     respondToSystem: document.getElementById('set-aichat-respondToSystem').checked,
+    respondToMayday: document.getElementById('set-aichat-respondToMayday').checked,
     personality: document.getElementById('set-aichat-personality').value.trim(),
     lockDurationSec: parseInt(document.getElementById('set-aichat-lockDurationSec').value) || 60,
     conversationCooldownSec: parseInt(document.getElementById('set-aichat-conversationCooldownSec').value) || 15,
@@ -7726,6 +7845,14 @@ function renderMinerSettings(panel) {
     <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
       <div class="setting-row">
         <div>
+          <div class="setting-label">Depletion Timeout (Hours)</div>
+          <div class="setting-hint">How long to wait before re-checking depleted mining locations. Default is 3 hours.</div>
+        </div>
+        <input type="number" id="set-miner-depletionTimeoutHours" min="1" max="24" value="${settings.miner?.depletionTimeoutHours || 3}" style="width:80px" />
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Harvesting System</div>
           <div class="setting-hint">Override system to harvest in. Bot will jump there on start.</div>
         </div>
@@ -7852,6 +7979,7 @@ function saveMinerSettings() {
     cargoThreshold: parseInt(document.getElementById('set-miner-cargoThreshold').value) || 80,
     refuelThreshold: parseInt(document.getElementById('set-miner-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-miner-repairThreshold').value) || 40,
+    depletionTimeoutHours: parseInt(document.getElementById('set-miner-depletionTimeoutHours').value) || 3,
     oreQuotas: collectQuotas('ore-quota-table'),
     gasQuotas: collectQuotas('gas-quota-table'),
     iceQuotas: collectQuotas('ice-quota-table'),

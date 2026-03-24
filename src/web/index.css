@@ -703,6 +703,13 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .log-entry.log-cat-rescue, .log-entry.log-cat-rescue .log-msg { color: #bc8cff; }
 .log-entry.log-cat-combat, .log-entry.log-cat-combat .log-msg { color: #f85149; }
 .log-entry.log-cat-info, .log-entry.log-cat-info .log-msg { color: #8b949e; }
+/* Chat message categories */
+.log-entry.log-cat-chat, .log-entry.log-cat-chat .log-msg { color: #a5d6ff; }
+.log-entry.log-cat-mayday, .log-entry.log-cat-mayday .log-msg { color: #ff7b72; font-weight: 600; }
+.log-entry.log-cat-local, .log-entry.log-cat-local .log-msg { color: #79c0ff; }
+.log-entry.log-cat-faction, .log-entry.log-cat-faction .log-msg { color: #d2a8ff; }
+.log-entry.log-cat-private, .log-entry.log-cat-private .log-msg { color: #ffa657; font-style: italic; }
+.log-entry.log-cat-customs, .log-entry.log-cat-customs .log-msg { color: #ffab70; }
 .exec-cooldown { opacity: 0.5; pointer-events: none; }
 
 /* ── Settings page ──────────────────────────────── */

@@ -17,6 +17,8 @@ import { aiRoutine } from "./routines/ai.js";
 import { cargoMoverRoutine } from "./routines/cargo_mover.js";
 import { returnHomeRoutine } from "./routines/return_home.js";
 import { commandReceiverRoutine } from "./routines/command_receiver.js";
+import { fleetHunterCommanderRoutine } from "./routines/fleet_hunter_commander.js";
+import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordinate.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
@@ -56,6 +58,8 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   trader: { name: "Trader", fn: traderRoutine },
   salvager: { name: "Salvager", fn: salvagerRoutine },
   hunter: { name: "Hunter", fn: hunterRoutine },
+  fleet_hunter_commander: { name: "FleetHunterCmd", fn: fleetHunterCommanderRoutine },
+  fleet_hunter_subordinate: { name: "FleetHunterWing", fn: fleetHunterSubordinateRoutine },
   faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },
   trade_buyer: { name: "TradeBuyer", fn: tradeBuyerRoutine },
   cleanup: { name: "Cleanup", fn: cleanupRoutine },

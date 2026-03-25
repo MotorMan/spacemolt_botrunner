@@ -14,6 +14,7 @@
     <div class="top-tabs" id="topTabs">
       <div class="top-tab active" data-tab="dashboard" onclick="switchTab('dashboard')">Dashboard</div>
       <div class="top-tab" data-tab="commandall" onclick="switchTab('commandall')">Command All</div>
+      <div class="top-tab" data-tab="fleetcombat" onclick="switchTab('fleetcombat')">Fleet Combat</div>
       <div class="top-tab" data-tab="map" onclick="switchTab('map')">Map</div>
       <div class="top-tab" data-tab="market" onclick="switchTab('market')">Market</div>
       <div class="top-tab" data-tab="missions" onclick="switchTab('missions')">Missions</div>
@@ -141,6 +142,33 @@
     </div>
   </div>
 
+  <!-- ══ Fleet Combat Tab ══ -->
+  <div class="tab-page" id="page-fleetcombat">
+    <div class="commandall-layout">
+      <div class="commandall-header">
+        <h3>Fleet Combat Control</h3>
+        <p style="color:var(--text-dim);font-size:12px;margin:4px 0 0 0">
+          Control your fleet of hunter bots. Commands are sent via faction chat to bots running the Fleet Hunter routines.
+        </p>
+      </div>
+      <div class="commandall-body">
+        <div class="manual-panel" style="width:100%">
+          <div class="manual-header">Fleet Combat Commands</div>
+          <div class="manual-body" id="fleetCombatControls">
+            <!-- filled by JS -->
+          </div>
+        </div>
+        <div class="response-panel" style="width:100%">
+          <div class="response-header">
+            <span>Fleet Combat Log</span>
+            <button onclick="clearFleetCombatLog()">Clear</button>
+          </div>
+          <div class="response-log" id="fleetCombatLog"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- ══ Settings Tab ══ -->
   <div class="tab-page" id="page-settings">
     <div class="settings-layout">
@@ -161,6 +189,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('ai')">AI</div>
         <div class="sidebar-item" onclick="switchSettingsTab('ai_chat')">AI Chat Service</div>
         <div class="sidebar-item" onclick="switchSettingsTab('hunter')">Hunter</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('fleet_hunter')">Fleet Hunter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cargo_mover')">CargoMover</div>
         <div class="sidebar-item" onclick="switchSettingsTab('fuel_transfer')">FuelTransfer</div>
         <div class="sidebar-item" onclick="switchSettingsTab('manual_rescue')">ManualRescue</div>
@@ -492,6 +521,7 @@ function switchTab(name) {
   if (name === 'shipyard') renderShipyardPage();
   if (name === 'stats') { renderStatsTab(); refreshFactionFunds(); }
   if (name === 'commandall') renderCommandAllControls();
+  if (name === 'fleetcombat') renderFleetCombatControls();
 }
 
 // ── WebSocket ──────────────────────────────────────────────
@@ -3890,6 +3920,8 @@ function renderSettingsPanel() {
     renderAiChatSettings(panel);
   } else if (activeSettingsTab === 'hunter') {
     renderHunterSettings(panel);
+  } else if (activeSettingsTab === 'fleet_hunter') {
+    renderFleetHunterSettings(panel);
   } else if (activeSettingsTab === 'cargo_mover') {
     renderCargoMoverSettings(panel);
   } else if (activeSettingsTab === 'fuel_transfer') {
@@ -8369,6 +8401,178 @@ function saveHunterSettings() {
   settings.hunter = s;
 }
 
+// ── Fleet Hunter settings ─────────────────────────────────────
+function renderFleetHunterSettings(panel) {
+  const fh = settings.fleet_hunter || {};
+  const fleetId = fh.fleetId || 'default';
+  const patrolSystem = fh.patrolSystem || '';
+  const refuelThreshold = fh.refuelThreshold ?? 40;
+  const repairThreshold = fh.repairThreshold ?? 30;
+  const fleeThreshold = fh.fleeThreshold ?? 20;
+  const maxAttackTier = fh.maxAttackTier || 'large';
+  const fleeFromTier = fh.fleeFromTier || 'boss';
+  const minPiratesToFlee = fh.minPiratesToFlee ?? 3;
+  const fireMode = fh.fireMode || 'spread';
+  const fleetSize = fh.fleetSize ?? 6;
+  const autoCloak = fh.autoCloak ?? false;
+  const ammoThreshold = fh.ammoThreshold ?? 5;
+  const maxReloadAttempts = fh.maxReloadAttempts ?? 3;
+
+  const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
+  const tierOpts = tierOptions.map(t => `<option value="${t}"${t === maxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
+  const fleeTierOpts = tierOptions.map(t => `<option value="${t}"${t === fleeFromTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
+
+  const systemOpts = ['<option value="">(auto — nearest low-sec)</option>'];
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+    const sel = sys.id === patrolSystem ? ' selected' : '';
+    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+    systemOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+  }
+  if (patrolSystem && !knownSystems.find(s => s.id === patrolSystem)) {
+    systemOpts.push(`<option value="${esc(patrolSystem)}" selected>${esc(patrolSystem)}</option>`);
+  }
+
+  panel.innerHTML = `
+    <h3>Fleet Hunter Settings</h3>
+    <div class="settings-desc">Fleet hunting configuration for coordinated pirate hunting. One bot runs as Commander, others as Subordinates.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Fleet ID</div>
+        <div class="setting-hint">Unique identifier for this fleet. All bots in the same fleet must use the same ID.</div>
+      </div>
+      <input type="text" id="set-fleet-hunter-fleetId" value="${esc(fleetId)}" placeholder="default">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Fire Mode</div>
+        <div class="setting-hint">Focus: all bots attack same target. Spread: bots pick different targets.</div>
+      </div>
+      <select id="set-fleet-hunter-fireMode">
+        <option value="spread"${fireMode === 'spread' ? ' selected' : ''}>Spread Fire</option>
+        <option value="focus"${fireMode === 'focus' ? ' selected' : ''}>Focus Fire</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Patrol System</div>
+        <div class="setting-hint">Fixed system to patrol. Leave empty to auto-find nearest huntable system.</div>
+      </div>
+      <select id="set-fleet-hunter-patrolSystem">${systemOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Expected Fleet Size</div>
+        <div class="setting-hint">Number of bots expected in the fleet (for coordination logic).</div>
+      </div>
+      <input type="number" id="set-fleet-hunter-fleetSize" min="2" max="50" value="${fleetSize}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Return to station to refuel when fuel drops below this percentage.</div>
+      </div>
+      <input type="number" id="set-fleet-hunter-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold (%)</div>
+        <div class="setting-hint">Abort patrol and retreat when hull drops below this percentage.</div>
+      </div>
+      <input type="number" id="set-fleet-hunter-repairThreshold" min="20" max="80" value="${repairThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Flee Threshold (%)</div>
+        <div class="setting-hint">Emergency flee from active fight when hull drops below this percentage.</div>
+      </div>
+      <input type="number" id="set-fleet-hunter-fleeThreshold" min="5" max="50" value="${fleeThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Attack Tier</div>
+        <div class="setting-hint">Maximum pirate tier to engage. Pirates above this tier will be ignored.</div>
+      </div>
+      <select id="set-fleet-hunter-maxAttackTier">${tierOpts}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Flee From Tier</div>
+        <div class="setting-hint">Flee from combat if a pirate of this tier or higher is detected.</div>
+      </div>
+      <select id="set-fleet-hunter-fleeFromTier">${fleeTierOpts}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min Pirates to Flee</div>
+        <div class="setting-hint">Flee from combat if this many or more pirates are present.</div>
+      </div>
+      <input type="number" id="set-fleet-hunter-minPiratesToFlee" min="1" max="10" value="${minPiratesToFlee}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Auto-Cloak in Dangerous Systems</div>
+        <div class="setting-hint">Automatically activate cloak when entering systems with hostile players.</div>
+      </div>
+      <select id="set-fleet-hunter-autoCloak">
+        <option value="false"${!autoCloak ? ' selected' : ''}>Disabled</option>
+        <option value="true"${autoCloak ? ' selected' : ''}>Enabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ammo Threshold</div>
+        <div class="setting-hint">Reload ammo when it drops below this amount.</div>
+      </div>
+      <input type="number" id="set-fleet-hunter-ammoThreshold" min="1" max="20" value="${ammoThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Reload Attempts</div>
+        <div class="setting-hint">Maximum attempts to reload before giving up and returning to station.</div>
+      </div>
+      <input type="number" id="set-fleet-hunter-maxReloadAttempts" min="1" max="10" value="${maxReloadAttempts}">
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveFleetHunterSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function saveFleetHunterSettings() {
+  const s = {
+    fleetId: document.getElementById('set-fleet-hunter-fleetId').value.trim() || 'default',
+    patrolSystem: document.getElementById('set-fleet-hunter-patrolSystem').value,
+    refuelThreshold: parseInt(document.getElementById('set-fleet-hunter-refuelThreshold').value) || 40,
+    repairThreshold: parseInt(document.getElementById('set-fleet-hunter-repairThreshold').value) || 30,
+    fleeThreshold: parseInt(document.getElementById('set-fleet-hunter-fleeThreshold').value) || 20,
+    maxAttackTier: document.getElementById('set-fleet-hunter-maxAttackTier').value,
+    fleeFromTier: document.getElementById('set-fleet-hunter-fleeFromTier').value,
+    minPiratesToFlee: parseInt(document.getElementById('set-fleet-hunter-minPiratesToFlee').value) || 3,
+    fireMode: document.getElementById('set-fleet-hunter-fireMode').value,
+    fleetSize: parseInt(document.getElementById('set-fleet-hunter-fleetSize').value) || 6,
+    autoCloak: document.getElementById('set-fleet-hunter-autoCloak').value === 'true',
+    ammoThreshold: parseInt(document.getElementById('set-fleet-hunter-ammoThreshold').value) || 5,
+    maxReloadAttempts: parseInt(document.getElementById('set-fleet-hunter-maxReloadAttempts').value) || 3,
+  };
+  send({ type: 'saveSettings', routine: 'fleet_hunter', settings: s });
+  settings.fleet_hunter = s;
+  logToSystem('Fleet Hunter settings saved');
+}
+
 // ── Cargo Mover settings ────────────────────────────────────────
 let cmFactionItems = [];  // Cached faction storage items from source station
 let cmPersonalItems = []; // Cached personal storage items from selected bot
@@ -10354,8 +10558,316 @@ function caLog(html) {
   log.scrollTop = 0;
 }
 
-function clearCommandAllLog() {
-  const log = document.getElementById('commandAllLog');
+// ── Fleet Combat Controls ───────────────────────────────────
+
+let fleetCombatFleetId = 'default';
+let fleetCombatFireMode = 'spread';
+
+/** Render the Fleet Combat controls panel */
+function renderFleetCombatControls() {
+  const controls = document.getElementById('fleetCombatControls');
+  if (!controls) return;
+
+  // Get current settings
+  const settings = window.currentSettings || {};
+  const fleetHunterSettings = settings.fleet_hunter || {};
+  fleetCombatFleetId = fleetHunterSettings.fleetId || 'default';
+  fleetCombatFireMode = fleetHunterSettings.fireMode || 'spread';
+
+  // Build bot list for commander selection
+  const botOpts = bots.length > 0
+    ? bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)} (${esc(b.shipName || 'unknown ship')})</option>`).join('')
+    : '<option value="">No bots available</option>';
+
+  // Get POIs from first bot's system
+  const firstBotSystem = bots[0]?.system || '';
+  const sysData = firstBotSystem && mapData[firstBotSystem] ? mapData[firstBotSystem] : null;
+  const poiOpts = sysData && sysData.pois && sysData.pois.length > 0
+    ? [...sysData.pois].sort((a, b) => ((a.name || a.id) || '').localeCompare((b.name || b.id) || '')).map(p => `<option value="${esc(p.id)}">${esc(p.name || p.id)} (${esc(p.type || '')})</option>`).join('')
+    : '<option value="">No POIs known</option>';
+
+  // Get adjacent systems for jump options
+  const currentSys = bots[0]?.system || '';
+  const jumpOpts = knownSystems.length > 0
+    ? knownSystems.filter(s => s.id !== currentSys).map(s => {
+        const label = s.name ? `${s.name} (${s.id})` : s.id;
+        return `<option value="${esc(s.id)}">${esc(label)}</option>`;
+      }).join('')
+    : '<option value="">No systems mapped</option>';
+
+  controls.innerHTML = `
+    <div class="cmd-group">
+      <label style="color:var(--text-bright);font-weight:600">Fleet Configuration</label>
+    </div>
+
+    <div class="cmd-group">
+      <label>Fleet ID</label>
+      <input type="text" id="fc-fleet-id" value="${esc(fleetCombatFleetId)}" placeholder="default">
+      <button class="sm" onclick="fcSetFleetId()">Set</button>
+      <small style="color:var(--text-dim);display:block;margin-top:4px">All fleet bots must use the same Fleet ID</small>
+    </div>
+
+    <div class="cmd-group">
+      <label>Fire Mode</label>
+      <select id="fc-fire-mode">
+        <option value="spread"${fleetCombatFireMode === 'spread' ? ' selected' : ''}>Spread (bots pick different targets)</option>
+        <option value="focus"${fleetCombatFireMode === 'focus' ? ' selected' : ''}>Focus Fire (all bots attack same target)</option>
+      </select>
+      <button class="sm" onclick="fcSetFireMode()">Set</button>
+    </div>
+
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Fleet Movement</label>
+    </div>
+
+    <div class="cmd-group">
+      <label>Move Fleet To POI</label>
+      <select id="fc-move-poi">${poiOpts}</select>
+      <button class="primary sm" onclick="fcMove()">Move</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Jump Fleet To System</label>
+      <select id="fc-jump-sys">${jumpOpts}</select>
+      <button class="primary sm" onclick="fcJump()">Jump</button>
+    </div>
+
+    <div class="cmd-group">
+      <button class="sm" onclick="fcRegroup()">Regroup Fleet</button>
+      <button class="sm" onclick="fcHold()">Hold Position</button>
+      <button class="sm" onclick="fcPatrol()">Resume Patrol</button>
+    </div>
+
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Combat Commands</label>
+    </div>
+
+    <div class="cmd-group">
+      <label>Attack Target ID</label>
+      <input type="text" id="fc-attack-target" placeholder="entity_id or pirate_id">
+      <input type="text" id="fc-attack-name" placeholder="Target name (optional)" style="width:150px">
+      <button class="danger sm" onclick="fcAttack()">Attack</button>
+    </div>
+
+    <div class="cmd-group">
+      <button class="danger sm" onclick="fcFlee()">FLEE!</button>
+      <button class="sm" onclick="fcScan()">Scan Area</button>
+    </div>
+
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Quick Start</label>
+    </div>
+
+    <div class="cmd-group">
+      <label>Start Commander</label>
+      <select id="fc-commander-bot">${botOpts}</select>
+      <button class="primary sm" onclick="fcStartCommander()">Start Commander</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Start Subordinates (selected bots)</label>
+      <div id="fc-subordinate-list" style="max-height:150px;overflow-y:auto;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:8px;margin:8px 0">
+        ${bots.map(b => `
+          <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin:4px 0">
+            <input type="checkbox" class="fc-sub-check" value="${esc(b.username)}">
+            ${esc(b.username)}
+          </label>
+        `).join('')}
+      </div>
+      <button class="primary sm" onclick="fcStartSubordinates()">Start Subordinates</button>
+    </div>
+  `;
+}
+
+/** Send a fleet command via faction chat */
+function fcSendCommand(command, params = '') {
+  const msg = `[FLEET ${fleetCombatFleetId}] ${command} ${params}`.trim();
+  logFleetCombat(`Sending: ${msg}`);
+
+  // Send via API
+  fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      bot: bots[0]?.username || '',
+      channel: 'faction',
+      content: msg,
+    }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) {
+      logFleetCombat(`Error: ${data.error.message}`, 'error');
+    } else {
+      logFleetCombat(`Sent successfully`);
+    }
+  }).catch(err => {
+    logFleetCombat(`Error: ${err.message}`, 'error');
+  });
+}
+
+function fcSetFleetId() {
+  const fleetId = document.getElementById('fc-fleet-id').value.trim() || 'default';
+  fleetCombatFleetId = fleetId;
+  logFleetCombat(`Fleet ID set to: ${fleetId}`);
+
+  // Save to settings
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fleet_hunter: { fleetId },
+    }),
+  }).then(() => {
+    logFleetCombat('Fleet ID saved to settings');
+  }).catch(err => {
+    logFleetCombat(`Error saving: ${err.message}`, 'error');
+  });
+}
+
+function fcSetFireMode() {
+  const fireMode = document.getElementById('fc-fire-mode').value;
+  fleetCombatFireMode = fireMode;
+  logFleetCombat(`Fire mode set to: ${fireMode}`);
+
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fleet_hunter: { fireMode },
+    }),
+  }).then(() => {
+    logFleetCombat('Fire mode saved to settings');
+  }).catch(err => {
+    logFleetCombat(`Error saving: ${err.message}`, 'error');
+  });
+}
+
+function fcMove() {
+  const poiId = document.getElementById('fc-move-poi').value;
+  if (!poiId) {
+    logFleetCombat('Select a POI first', 'error');
+    return;
+  }
+  const firstBot = bots[0];
+  if (!firstBot) {
+    logFleetCombat('No bots available', 'error');
+    return;
+  }
+  fcSendCommand('MOVE', `${firstBot.system}/${poiId}`);
+}
+
+function fcJump() {
+  const systemId = document.getElementById('fc-jump-sys').value;
+  if (!systemId) {
+    logFleetCombat('Select a system first', 'error');
+    return;
+  }
+  fcSendCommand('MOVE', systemId);
+}
+
+function fcRegroup() {
+  const firstBot = bots[0];
+  if (!firstBot) {
+    logFleetCombat('No bots available', 'error');
+    return;
+  }
+  const poi = firstBot.poi || '';
+  fcSendCommand('REGROUP', poi ? `${firstBot.system}/${poi}` : firstBot.system);
+}
+
+function fcHold() {
+  fcSendCommand('HOLD');
+}
+
+function fcPatrol() {
+  fcSendCommand('PATROL');
+}
+
+function fcAttack() {
+  const targetId = document.getElementById('fc-attack-target').value.trim();
+  const targetName = document.getElementById('fc-attack-name').value.trim() || targetId;
+  if (!targetId) {
+    logFleetCombat('Enter a target ID', 'error');
+    return;
+  }
+  fcSendCommand('ATTACK', `${targetId}:${targetName}`);
+}
+
+function fcFlee() {
+  if (confirm('Order all fleet bots to FLEE? This will cause them to retreat immediately!')) {
+    fcSendCommand('FLEE');
+  }
+}
+
+function fcScan() {
+  fcSendCommand('SCAN', '');
+  logFleetCombat('Scan command sent (bots will report back via chat)');
+}
+
+function fcStartCommander() {
+  const botName = document.getElementById('fc-commander-bot').value;
+  if (!botName) {
+    logFleetCombat('Select a commander bot', 'error');
+    return;
+  }
+
+  fetch(`/api/bot/${encodeURIComponent(botName)}/start`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ routine: 'fleet_hunter_commander' }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) {
+      logFleetCombat(`Error starting commander: ${data.error.message}`, 'error');
+    } else {
+      logFleetCombat(`Commander started: ${botName}`);
+    }
+  }).catch(err => {
+    logFleetCombat(`Error: ${err.message}`, 'error');
+  });
+}
+
+function fcStartSubordinates() {
+  const checkboxes = document.querySelectorAll('.fc-sub-check:checked');
+  const botNames = [...checkboxes].map(cb => cb.value);
+
+  if (botNames.length === 0) {
+    logFleetCombat('Select at least one subordinate bot', 'error');
+    return;
+  }
+
+  logFleetCombat(`Starting ${botNames.length} subordinate(s)...`);
+
+  // Start each subordinate with a small delay
+  botNames.forEach((botName, index) => {
+    setTimeout(() => {
+      fetch(`/api/bot/${encodeURIComponent(botName)}/start`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ routine: 'fleet_hunter_subordinate' }),
+      }).then(r => r.json()).then(data => {
+        if (data.error) {
+          logFleetCombat(`Error starting ${botName}: ${data.error.message}`, 'error');
+        } else {
+          logFleetCombat(`Subordinate started: ${botName}`);
+        }
+      }).catch(err => {
+        logFleetCombat(`Error: ${err.message}`, 'error');
+      });
+    }, index * 500);
+  });
+}
+
+function logFleetCombat(message, type = 'info') {
+  const log = document.getElementById('fleetCombatLog');
+  if (!log) return;
+
+  const timestamp = new Date().toLocaleTimeString();
+  const color = type === 'error' ? '#ef4444' : type === 'success' ? '#22c55e' : '#94a3b8';
+  log.innerHTML += `<div style="color:${color}">[${timestamp}] ${esc(message)}</div>`;
+  log.scrollTop = log.scrollHeight;
+}
+
+function clearFleetCombatLog() {
+  const log = document.getElementById('fleetCombatLog');
   if (log) log.innerHTML = '';
 }
 

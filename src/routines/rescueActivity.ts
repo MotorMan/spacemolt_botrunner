@@ -140,3 +140,40 @@ export function clearActiveRescueSession(botUsername: string): void {
   activity.activeSession = undefined;
   saveBotActivity(botUsername, activity);
 }
+
+/**
+ * Check if a MAYDAY matches the last completed rescue for this bot.
+ * This prevents re-triggering the same rescue due to chat caching/duplicates.
+ */
+export function isMaydayDuplicate(
+  botUsername: string,
+  player: string,
+  system: string,
+  poi?: string
+): boolean {
+  const activity = getBotActivity(botUsername);
+  const lastCompleted = activity.lastCompletedSession;
+  
+  if (!lastCompleted) {
+    return false;
+  }
+  
+  // Check if completed within last 5 minutes (prevent stale matches)
+  const completedAt = new Date(lastCompleted.completedAt || lastCompleted.lastUpdatedAt).getTime();
+  const now = Date.now();
+  const fiveMinutes = 5 * 60 * 1000;
+  
+  if (now - completedAt > fiveMinutes) {
+    return false;
+  }
+  
+  // Normalize for comparison (case-insensitive, handle spaces/underscores)
+  const normalize = (s: string) => s.toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+  
+  const playerMatch = normalize(lastCompleted.targetUsername) === normalize(player);
+  const systemMatch = normalize(lastCompleted.targetSystem) === normalize(system);
+  const poiMatch = !poi || !lastCompleted.targetPoi || 
+                   normalize(lastCompleted.targetPoi) === normalize(poi);
+  
+  return playerMatch && systemMatch && poiMatch;
+}

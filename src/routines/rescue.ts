@@ -28,6 +28,7 @@ import {
   updateRescueSession,
   completeRescueSession,
   failRescueSession,
+  isMaydayDuplicate,
   type RescueSession,
 } from "./rescueActivity.js";
 import { isKnownPlayer } from "../playernames.js";
@@ -468,6 +469,15 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           }
           ctx.log("mayday", `✓ BlackBook check passed: ${rescueDecision.reason}`);
 
+          // ── RESCUE BLACKBOOK: Check if this is a duplicate MAYDAY (chat cache echo) ──
+          // Prevents re-triggering the same rescue we just completed
+          if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate of recently completed rescue (chat cache echo)`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+          ctx.log("mayday_debug", `✓ Not a duplicate MAYDAY`);
+
           // Record rescue request for blackbook tracking
           recordRescueRequest(mayday.sender);
 
@@ -738,12 +748,13 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
     // ── Navigate to stranded bot's system ──
     if (!skipToReturnHome) {
+      ctx.log("rescue", `🔍 Navigation debug: target.system=${target?.system}, bot.system=${bot.system}, isMayday=${isMaydayTarget}, isManual=${isManualRescueTarget}, skipToReturnHome=${skipToReturnHome}`);
       yield "navigate_to_target";
       await ensureUndocked(ctx);
 
       if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
         ctx.log(logCategory, `Navigating to ${target.system}...`);
-        
+
         // Track jumps for billing - get route before navigating
         let jumpsToTarget = 0;
         try {
@@ -756,7 +767,23 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         } catch (e) {
           ctx.log("warn", `Could not calculate route to ${target.system}: ${e}`);
         }
-        
+
+        // ── RESCUE COOPERATION: Send en-route notification to stranded player ──
+        ctx.log("rescue", `📧 En-route notification check: isMayday=${isMaydayTarget}, isManual=${isManualRescueTarget}`);
+        // Let them know we're on our way (only for MAYDAY rescues, not fleet rescues)
+        if (isMaydayTarget || isManualRescueTarget) {
+          const aiChatService = (globalThis as any).aiChatService;
+          if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
+            aiChatService.sendRescueEnRouteNotification(bot, target.username, jumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
+              if (!result.ok) {
+                ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
+              }
+            }).catch((err: Error) => {
+              ctx.log("warn", `Error sending en-route notification: ${err.message}`);
+            });
+          }
+        }
+
         const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
         const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
         if (!arrived) {
@@ -1016,6 +1043,29 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         ctx.log("error", `Failed to return to home system ${homeSystem}`);
       } else {
         ctx.log(logCategory, `✓ Arrived at home system ${homeSystem}`);
+
+        // If home station is configured, travel there and dock
+        if (settings.homeStation) {
+          const [expectedSystem, stationId] = settings.homeStation.split('|');
+          if (expectedSystem === homeSystem && stationId) {
+            ctx.log(logCategory, `🚀 Traveling to home station...`);
+            const travelResp = await bot.exec("travel", { target_poi: stationId });
+            if (!travelResp.error) {
+              ctx.log(logCategory, `⚓ Docking at home station...`);
+              const dockResp = await bot.exec("dock");
+              if (!dockResp.error) {
+                ctx.log(logCategory, `✓ Docked at home station`);
+                // Refuel after docking
+                ctx.log(logCategory, `⛽ Refueling at home station...`);
+                const refuelResp = await bot.exec("refuel");
+                if (!refuelResp.error) {
+                  await bot.refreshStatus();
+                  ctx.log(logCategory, `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                }
+              }
+            }
+          }
+        }
       }
       // Update session state for return home
       if (recoveredSession || getActiveRescueSession(bot.username)) {
@@ -1025,18 +1075,41 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       ctx.log("warn", "No home system set — skipping return home");
     } else {
       ctx.log(logCategory, `Already at home system ${homeSystem}`);
+      
+      // Already at home system - still travel to home station and dock if configured
+      if (settings.homeStation) {
+        const [expectedSystem, stationId] = settings.homeStation.split('|');
+        if (expectedSystem === homeSystem && stationId) {
+          ctx.log(logCategory, `🚀 Traveling to home station...`);
+          const travelResp = await bot.exec("travel", { target_poi: stationId });
+          if (!travelResp.error) {
+            ctx.log(logCategory, `⚓ Docking at home station...`);
+            const dockResp = await bot.exec("dock");
+            if (!dockResp.error) {
+              ctx.log(logCategory, `✓ Docked at home station`);
+              // Refuel after docking
+              ctx.log(logCategory, `⛽ Refueling at home station...`);
+              const refuelResp = await bot.exec("refuel");
+              if (!refuelResp.error) {
+                await bot.refreshStatus();
+                ctx.log(logCategory, `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+              }
+            }
+          }
+        }
+      }
     }
 
-    // ── Refuel self ──
+    // ── Refuel self (fallback if not already refueled at station) ──
     yield "self_refuel";
     await bot.refreshStatus();
     const fuelAfterRescue = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelAfterRescue < settings.refuelThreshold) {
-      ctx.log(logCategory, 
+      ctx.log(logCategory,
         `Fuel at ${fuelAfterRescue}% after rescue — refueling to threshold (${settings.refuelThreshold}%)...`);
       await ensureFueled(ctx, settings.refuelThreshold);
     } else {
-      ctx.log(logCategory, 
+      ctx.log(logCategory,
         `Fuel at ${fuelAfterRescue}% — above threshold, no need to refuel`);
     }
     await bot.refreshStatus();
@@ -1087,53 +1160,61 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         // Record successful rescue in BlackBook
         recordSuccessfulRescue(activeSessionForBill.targetUsername, bill.total);
 
-        // Delay faction chat announcement to avoid rate limiting
-        const aiChatSettings = (globalThis as any).aiChatService?.getSettings?.();
+        // ── Send faction announcement in background (non-blocking) ──
+        // This allows immediate return home instead of waiting for cooldown
+        const aiChatService = (globalThis as any).aiChatService;
+        const aiChatSettings = aiChatService?.getSettings?.();
         const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
-        ctx.log("rescue", `⏳ Delaying faction announcement by ${cooldownSec}s...`);
-        await sleep(cooldownSec * 1000);
+        ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
         
-        // Send faction chat announcement AFTER delay
-        const aiChatService = (globalThis as any).aiChatService;
-        if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-          try {
-            const result = await aiChatService.sendFactionMessage(bot, {
-              messageType: "rescue_complete",
-              targetName: activeSessionForBill.targetUsername,
-              isMayday: activeSessionForBill.isMayday,
-              isBot: !activeSessionForBill.isMayday,
-              currentSystem: bot.system,
-              targetSystem: activeSessionForBill.targetSystem,
-              targetPoi: activeSessionForBill.targetPoi || undefined,
-            });
-            if (!result.ok) {
-              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+        // Schedule faction announcement to run after cooldown, but don't block
+        setTimeout(async () => {
+          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+            try {
+              const result = await aiChatService.sendFactionMessage(bot, {
+                messageType: "rescue_complete",
+                targetName: activeSessionForBill.targetUsername,
+                isMayday: activeSessionForBill.isMayday,
+                isBot: !activeSessionForBill.isMayday,
+                currentSystem: bot.system,
+                targetSystem: activeSessionForBill.targetSystem,
+                targetPoi: activeSessionForBill.targetPoi || undefined,
+              });
+              if (!result.ok) {
+                ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+              }
+            } catch (e) {
+              ctx.log("warn", `AI faction message (complete) failed: ${e}`);
             }
-          } catch (e) {
-            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
           }
-        }
+        }, cooldownSec * 1000);
       } else {
-        // No bill to send, but still send faction announcement
+        // No bill to send, but still send faction announcement in background
         const aiChatService = (globalThis as any).aiChatService;
-        if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-          try {
-            const result = await aiChatService.sendFactionMessage(bot, {
-              messageType: "rescue_complete",
-              targetName: activeSessionForBill.targetUsername,
-              isMayday: activeSessionForBill.isMayday,
-              isBot: !activeSessionForBill.isMayday,
-              currentSystem: bot.system,
-              targetSystem: activeSessionForBill.targetSystem,
-              targetPoi: activeSessionForBill.targetPoi || undefined,
-            });
-            if (!result.ok) {
-              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+        const aiChatSettings = aiChatService?.getSettings?.();
+        const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
+        ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
+        
+        setTimeout(async () => {
+          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+            try {
+              const result = await aiChatService.sendFactionMessage(bot, {
+                messageType: "rescue_complete",
+                targetName: activeSessionForBill.targetUsername,
+                isMayday: activeSessionForBill.isMayday,
+                isBot: !activeSessionForBill.isMayday,
+                currentSystem: bot.system,
+                targetSystem: activeSessionForBill.targetSystem,
+                targetPoi: activeSessionForBill.targetPoi || undefined,
+              });
+              if (!result.ok) {
+                ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+              }
+            } catch (e) {
+              ctx.log("warn", `AI faction message (complete) failed: ${e}`);
             }
-          } catch (e) {
-            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
           }
-        }
+        }, cooldownSec * 1000);
       }
     }
 
@@ -1401,10 +1482,65 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     ctx.log("rescue", `Returning to home system ${homeSystem}...`);
     await ensureUndocked(ctx);
     const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
-    await navigateToSystem(ctx, homeSystem, safetyOpts);
+    const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+    if (!arrived) {
+      ctx.log("error", `Failed to return to home system ${homeSystem}`);
+    } else {
+      ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+
+      // If home station is configured, travel there and dock
+      if (settings.homeStation) {
+        const [expectedSystem, stationId] = settings.homeStation.split('|');
+        if (expectedSystem === homeSystem && stationId) {
+          ctx.log("rescue", `🚀 Traveling to home station...`);
+          const travelResp = await bot.exec("travel", { target_poi: stationId });
+          if (!travelResp.error) {
+            ctx.log("rescue", `⚓ Docking at home station...`);
+            const dockResp = await bot.exec("dock");
+            if (!dockResp.error) {
+              ctx.log("rescue", `✓ Docked at home station`);
+              // Refuel after docking
+              ctx.log("rescue", `⛽ Refueling at home station...`);
+              const refuelResp = await bot.exec("refuel");
+              if (!refuelResp.error) {
+                await bot.refreshStatus();
+                ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+              }
+            }
+          }
+        }
+      }
+    }
+  } else if (!homeSystem) {
+    ctx.log("warn", "No home system set — skipping return home");
+  } else {
+    ctx.log("rescue", `Already at home system ${homeSystem}`);
+    
+    // Already at home system - still travel to home station and dock if configured
+    if (settings.homeStation) {
+      const [expectedSystem, stationId] = settings.homeStation.split('|');
+      if (expectedSystem === homeSystem && stationId) {
+        ctx.log("rescue", `🚀 Traveling to home station...`);
+        const travelResp = await bot.exec("travel", { target_poi: stationId });
+        if (!travelResp.error) {
+          ctx.log("rescue", `⚓ Docking at home station...`);
+          const dockResp = await bot.exec("dock");
+          if (!dockResp.error) {
+            ctx.log("rescue", `✓ Docked at home station`);
+            // Refuel after docking
+            ctx.log("rescue", `⛽ Refueling at home station...`);
+            const refuelResp = await bot.exec("refuel");
+            if (!refuelResp.error) {
+              await bot.refreshStatus();
+              ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+            }
+          }
+        }
+      }
+    }
   }
 
-  // ── Dock and refuel self ──
+  // ── Dock and refuel self (fallback if not already docked at station) ──
   yield "self_refuel";
   await ensureDocked(ctx);
 
@@ -1834,6 +1970,29 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         ctx.log("error", `Failed to return to home system ${homeSystem}`);
       } else {
         ctx.log("mayday", `✓ Arrived at home system ${homeSystem}`);
+
+        // If home station is configured, travel there and dock
+        if (settings.homeStation) {
+          const [expectedSystem, stationId] = settings.homeStation.split('|');
+          if (expectedSystem === homeSystem && stationId) {
+            ctx.log("mayday", `🚀 Traveling to home station...`);
+            const travelResp = await bot.exec("travel", { target_poi: stationId });
+            if (!travelResp.error) {
+              ctx.log("mayday", `⚓ Docking at home station...`);
+              const dockResp = await bot.exec("dock");
+              if (!dockResp.error) {
+                ctx.log("mayday", `✓ Docked at home station`);
+                // Refuel after docking
+                ctx.log("mayday", `⛽ Refueling at home station...`);
+                const refuelResp = await bot.exec("refuel");
+                if (!refuelResp.error) {
+                  await bot.refreshStatus();
+                  ctx.log("mayday", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                }
+              }
+            }
+          }
+        }
       }
       // Update session state for return home
       if (recoveredSession || getActiveRescueSession(bot.username)) {
@@ -1843,9 +2002,32 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       ctx.log("warn", "No home system set — skipping return home");
     } else {
       ctx.log("mayday", `Already at home system ${homeSystem}`);
+      
+      // Already at home system - still travel to home station and dock if configured
+      if (settings.homeStation) {
+        const [expectedSystem, stationId] = settings.homeStation.split('|');
+        if (expectedSystem === homeSystem && stationId) {
+          ctx.log("mayday", `🚀 Traveling to home station...`);
+          const travelResp = await bot.exec("travel", { target_poi: stationId });
+          if (!travelResp.error) {
+            ctx.log("mayday", `⚓ Docking at home station...`);
+            const dockResp = await bot.exec("dock");
+            if (!dockResp.error) {
+              ctx.log("mayday", `✓ Docked at home station`);
+              // Refuel after docking
+              ctx.log("mayday", `⛽ Refueling at home station...`);
+              const refuelResp = await bot.exec("refuel");
+              if (!refuelResp.error) {
+                await bot.refreshStatus();
+                ctx.log("mayday", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+              }
+            }
+          }
+        }
+      }
     }
 
-    // ── Dock and refuel self ──
+    // ── Dock and refuel self (fallback if not already docked at station) ──
     yield "self_refuel";
     await ensureDocked(ctx);
 
@@ -2179,6 +2361,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             continue;
           }
           ctx.log("mayday", `✓ BlackBook check passed: ${rescueDecision.reason}`);
+
+          // ── RESCUE BLACKBOOK: Check if this is a duplicate MAYDAY (chat cache echo) ──
+          // Prevents re-triggering the same rescue we just completed
+          if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate of recently completed rescue (chat cache echo)`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+          ctx.log("mayday_debug", `✓ Not a duplicate MAYDAY`);
 
           // Record rescue request for blackbook tracking
           recordRescueRequest(mayday.sender);
@@ -2516,12 +2707,13 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Navigate to stranded bot's system ──
+    ctx.log("rescue", `🔍 Navigation debug (2nd path): target.system=${target?.system}, bot.system=${bot.system}, isMayday=${isMaydayTarget}, isManual=${isManualRescueTarget}`);
     yield "navigate_to_target";
     await ensureUndocked(ctx);
 
     if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
       ctx.log(logCategory, `Navigating to ${target.system}...`);
-      
+
       // Track jumps for billing - get route before navigating
       let jumpsToTarget = 0;
       try {
@@ -2534,7 +2726,22 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       } catch (e) {
         ctx.log("warn", `Could not calculate route to ${target.system}: ${e}`);
       }
-      
+
+      // ── RESCUE COOPERATION: Send en-route notification to stranded player ──
+      // Let them know we're on our way (only for MAYDAY rescues, not fleet rescues)
+      if (isMaydayTarget || isManualRescueTarget) {
+        const aiChatService = (globalThis as any).aiChatService;
+        if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
+          aiChatService.sendRescueEnRouteNotification(bot, target.username, jumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
+            if (!result.ok) {
+              ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
+            }
+          }).catch((err: Error) => {
+            ctx.log("warn", `Error sending en-route notification: ${err.message}`);
+          });
+        }
+      }
+
       const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
       const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
       if (!arrived) {
@@ -2851,51 +3058,58 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         // Record successful rescue in BlackBook
         recordSuccessfulRescue(activeSessionForBill.targetUsername, bill.total);
 
-        // Delay faction chat announcement to avoid rate limiting
+        // ── Send faction announcement in background (non-blocking) ──
+        // This allows immediate return home instead of waiting for cooldown
         const aiChatSettings = aiChatService?.getSettings?.();
         const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
-        ctx.log("rescue", `⏳ Delaying faction announcement by ${cooldownSec}s...`);
-        await sleep(cooldownSec * 1000);
-
-        // Send faction chat announcement
-        if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-          try {
-            const result = await aiChatService.sendFactionMessage(bot, {
-              messageType: "rescue_complete",
-              targetName: activeSessionForBill.targetUsername,
-              isMayday: activeSessionForBill.isMayday,
-              isBot: !activeSessionForBill.isMayday,
-              currentSystem: bot.system,
-              targetSystem: activeSessionForBill.targetSystem,
-              targetPoi: activeSessionForBill.targetPoi || undefined,
-            });
-            if (!result.ok) {
-              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+        ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
+        
+        setTimeout(async () => {
+          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+            try {
+              const result = await aiChatService.sendFactionMessage(bot, {
+                messageType: "rescue_complete",
+                targetName: activeSessionForBill.targetUsername,
+                isMayday: activeSessionForBill.isMayday,
+                isBot: !activeSessionForBill.isMayday,
+                currentSystem: bot.system,
+                targetSystem: activeSessionForBill.targetSystem,
+                targetPoi: activeSessionForBill.targetPoi || undefined,
+              });
+              if (!result.ok) {
+                ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+              }
+            } catch (e) {
+              ctx.log("warn", `AI faction message (complete) failed: ${e}`);
             }
-          } catch (e) {
-            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
           }
-        }
+        }, cooldownSec * 1000);
       } else {
-        // No bill to send, but still send faction announcement
-        if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-          try {
-            const result = await aiChatService.sendFactionMessage(bot, {
-              messageType: "rescue_complete",
-              targetName: activeSessionForBill.targetUsername,
-              isMayday: activeSessionForBill.isMayday,
-              isBot: !activeSessionForBill.isMayday,
-              currentSystem: bot.system,
-              targetSystem: activeSessionForBill.targetSystem,
-              targetPoi: activeSessionForBill.targetPoi || undefined,
-            });
-            if (!result.ok) {
-              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+        // No bill to send, but still send faction announcement in background
+        const aiChatSettings = aiChatService?.getSettings?.();
+        const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
+        ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
+        
+        setTimeout(async () => {
+          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+            try {
+              const result = await aiChatService.sendFactionMessage(bot, {
+                messageType: "rescue_complete",
+                targetName: activeSessionForBill.targetUsername,
+                isMayday: activeSessionForBill.isMayday,
+                isBot: !activeSessionForBill.isMayday,
+                currentSystem: bot.system,
+                targetSystem: activeSessionForBill.targetSystem,
+                targetPoi: activeSessionForBill.targetPoi || undefined,
+              });
+              if (!result.ok) {
+                ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+              }
+            } catch (e) {
+              ctx.log("warn", `AI faction message (complete) failed: ${e}`);
             }
-          } catch (e) {
-            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
           }
-        }
+        }, cooldownSec * 1000);
       }
     }
 

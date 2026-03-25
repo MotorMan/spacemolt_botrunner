@@ -33,11 +33,37 @@ import {
   createTradeSession,
   type TradeSession,
 } from "./traderActivity.js";
+import {
+  getItemLock,
+  getRouteLock,
+  acquireTradeLock,
+  updateTradeLock,
+  releaseTradeLock,
+  getBestUnlockedRoute,
+  canChallengeLock,
+  cleanupStaleLocks,
+} from "./traderCoordination.js";
 
 /** Free cargo weight (not item count — callers must divide by item size). */
 function getFreeSpace(bot: Bot): number {
   if (bot.cargoMax <= 0) return 999;
   return Math.max(0, bot.cargoMax - bot.cargo);
+}
+
+// ── Helpers ─────────────────────────────────────────────────
+
+/**
+ * Fail a trade session and release the fleet lock.
+ */
+async function failTradeSessionWithLockRelease(botUsername: string, reason: string): Promise<void> {
+  const session = getActiveSession(botUsername);
+  failTradeSession(botUsername, reason);
+  if (session) {
+    const lockReleased = releaseTradeLock(botUsername, session.itemId, `failed: ${reason}`);
+    if (lockReleased) {
+      console.log(`[Trader] Fleet lock released on ${session.itemName} (failure: ${reason})`);
+    }
+  }
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -95,7 +121,7 @@ async function recoverTradeSession(
     
     if (cargoQty <= 0) {
       ctx.log("error", `Recovery failed: ${session.itemName} no longer in cargo`);
-      await failTradeSession(session.botUsername, "Items not in cargo");
+      await failTradeSessionWithLockRelease(session.botUsername, "Items not in cargo");
       return null;
     }
     
@@ -135,7 +161,7 @@ async function recoverTradeSession(
 
       if (alternativeBuyers.length === 0) {
         ctx.log("error", "No alternative buyers found — abandoning session");
-        await failTradeSession(session.botUsername, "No buyers available");
+        await failTradeSessionWithLockRelease(session.botUsername, "No buyers available");
         return null;
       }
 
@@ -152,7 +178,7 @@ async function recoverTradeSession(
       })!;
     } else if (destBuyer.price < session.buyPricePerUnit) {
       ctx.log("error", `Price dropped to ${destBuyer.price}cr (below cost ${session.buyPricePerUnit}cr) — abandoning`);
-      await failTradeSession(session.botUsername, "Price below cost");
+      await failTradeSessionWithLockRelease(session.botUsername, "Price below cost");
       return null;
     }
 
@@ -527,6 +553,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Fleet coordination cleanup (periodic stale lock cleanup) ──
+    const cleanedLocks = cleanupStaleLocks();
+    if (cleanedLocks > 0) {
+      ctx.log("trade", `Fleet coordination: cleaned up ${cleanedLocks} stale lock(s)`);
+    }
+
     // ── Trade session recovery ──
     const activeSession = getActiveSession(bot.username);
     let recoveredSession: TradeSession | null = null;
@@ -641,7 +673,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
         if (alternativeBuyers.length === 0) {
           ctx.log("error", "No alternative buyers found — abandoning session");
-          await failTradeSession(recoveredSession.botUsername, "No station at destination");
+          await failTradeSessionWithLockRelease(recoveredSession.botUsername, "No station at destination");
           recoveredSessionHandled = true; // Mark as handled to prevent re-recovery
           await ensureDocked(ctx);
           await sleep(60000);
@@ -943,6 +975,24 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
       }
+
+      // Fleet coordination: filter out routes locked by other traders
+      const coordinationResult = getBestUnlockedRoute(routes, bot.username, cargoCapacity);
+      if (coordinationResult.lockedBy && coordinationResult.lockedBy !== bot.username) {
+        ctx.log("trade", `Route coordination: ${coordinationResult.reason} — ${coordinationResult.lockedBy} is trading ${routes[0].itemName}`);
+      } else if (coordinationResult.route) {
+        ctx.log("trade", `Route coordination: ${coordinationResult.reason}`);
+      }
+
+      // Filter routes based on coordination
+      if (coordinationResult.route) {
+        // Find the selected route in our list and prioritize it
+        const selectedRoute = coordinationResult.route;
+        routes = [selectedRoute, ...routes.filter(r => r !== selectedRoute)];
+      } else {
+        // No routes available due to locks - clear routes array
+        routes = [];
+      }
     }
 
     if (routes.length === 0 && !recoveredSessionHandled) {
@@ -955,6 +1005,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // If we have a recovered session that wasn't handled yet, convert it to a route and execute
     const failedSources = new Set<string>();
     let attempts = 0;
+    let pendingLockItemId: string | null = null; // Track lock acquired during route selection
+    let pendingLockReleased = false; // Track if pending lock was released
 
     if (recoveredSession && !recoveredSessionHandled) {
       ctx.log("trade", `Executing recovered session: ${recoveredSession.itemName} (${recoveredSession.quantityBought}x @ ${recoveredSession.buyPricePerUnit}cr → ${recoveredSession.destPoiName})`);
@@ -1023,6 +1075,32 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // ── Normal market route: travel to source and buy ──
+      // Acquire tentative lock BEFORE traveling to prevent other bots from taking same route
+      const tentativeLockId = `${candidate.sourceSystem}:${candidate.sourcePoi}:${candidate.itemId}`;
+      const lockAcquired = acquireTradeLock({
+        botUsername: bot.username,
+        itemId: candidate.itemId,
+        itemName: candidate.itemName,
+        sourceSystem: candidate.sourceSystem,
+        sourcePoi: candidate.sourcePoi,
+        destSystem: candidate.destSystem,
+        destPoi: candidate.destPoi,
+        quantityCommitted: candidate.buyQty,
+        sessionId: `${bot.username}_pending_${Date.now()}`,
+      });
+      
+      if (!lockAcquired) {
+        ctx.log("trade", `Route locked by another bot — skipping ${candidate.itemName}`);
+        failedSources.add(sourceKey);
+        continue;
+      }
+      
+      // Track the lock so we can release it if route fails
+      pendingLockItemId = candidate.itemId;
+      pendingLockReleased = false; // Reset for this route attempt
+      
+      ctx.log("trade", `Fleet lock acquired: ${candidate.itemName} (${candidate.sourceSystem} → ${candidate.destSystem})`);
+
       yield "travel_to_source";
 
       if (bot.system !== candidate.sourceSystem) {
@@ -1030,6 +1108,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!fueled) {
           ctx.log("error", "Cannot refuel for trade run — waiting 30s");
+          releaseTradeLock(bot.username, candidate.itemId, "aborted:cannot_refuel");
+          pendingLockItemId = null;
+          pendingLockReleased = true;
           await sleep(30000);
           break;
         }
@@ -1038,6 +1119,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const arrived = await navigateToSystem(ctx, candidate.sourceSystem, safetyOpts);
         if (!arrived) {
           ctx.log("error", "Failed to reach source system — trying next route");
+          releaseTradeLock(bot.username, candidate.itemId, "aborted:travel_failed");
+          pendingLockItemId = null;
+          pendingLockReleased = true;
           continue;
         }
       }
@@ -1049,6 +1133,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const tResp = await bot.exec("travel", { target_poi: candidate.sourcePoi });
         if (tResp.error && !tResp.error.message.includes("already")) {
           ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
+          releaseTradeLock(bot.username, candidate.itemId, "aborted:travel_failed");
+          pendingLockItemId = null;
+          pendingLockReleased = true;
           continue;
         }
         bot.poi = candidate.sourcePoi;
@@ -1082,6 +1169,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         failedSources.add(sourceKey);
         mapStore.removeMarketItem(candidate.sourceSystem, candidate.sourcePoi, candidate.itemId);
         ctx.log("trade", `${candidate.itemName} not available at ${candidate.sourcePoiName} (stale data) — trying next route`);
+        releaseTradeLock(bot.username, candidate.itemId, "aborted:item_not_available");
+        pendingLockItemId = null;
+        pendingLockReleased = true;
         continue;
       }
 
@@ -1181,6 +1271,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
       if (qty <= 0 && alreadyHave <= 0) {
         ctx.log("trade", "Cannot afford any items or cargo full — trying next route");
+        releaseTradeLock(bot.username, candidate.itemId, "aborted:cannot_afford");
+        pendingLockItemId = null;
+        pendingLockReleased = true;
         continue;
       }
 
@@ -1197,6 +1290,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           }
           if (alreadyHave <= 0) {
             ctx.log("error", `Buy failed: ${buyResp.error.message} — trying next route`);
+            releaseTradeLock(bot.username, candidate.itemId, "aborted:buy_failed");
+            pendingLockItemId = null;
+            pendingLockReleased = true;
             continue;
           }
           // Have some already — proceed with what we've got
@@ -1237,6 +1333,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         });
         startTradeSession(session);
         ctx.log("trade", `Trade session started: ${session.sessionId}`);
+
+        // Update the lock with the real session ID and actual quantity
+        updateTradeLock(bot.username, candidate.itemId, {
+          sessionId: session.sessionId,
+          quantityCommitted: buyQty,
+        });
       }
 
       // Reserve this trade in cached market data so other bots don't chase the same route
@@ -1245,9 +1347,20 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         candidate.destSystem, candidate.destPoi,
         candidate.itemId, buyQty,
       );
+      
+      // Clear pending lock - it's now tracked by the session
+      pendingLockItemId = null;
+      
       break;
     }
     } // End of route selection loop (skipped if recovered session)
+
+    // Clean up any pending lock that wasn't converted to a session
+    if (pendingLockItemId && !pendingLockReleased) {
+      ctx.log("trade", `Releasing pending lock on ${pendingLockItemId} (route selection failed)`);
+      releaseTradeLock(bot.username, pendingLockItemId, "aborted:route_failed");
+      pendingLockItemId = null;
+    }
 
     // Fill remaining cargo with station storage items sellable at destination
     if (route && buyQty > 0) {
@@ -1301,12 +1414,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // No route worked — deposit unsellable cargo and wait
     if (!route || buyQty <= 0) {
-      // Fail any active session
-      const activeSession = getActiveSession(bot.username);
-      if (activeSession) {
-        failTradeSession(bot.username, "No valid route found");
-      }
-      
+      // Fail any active session and release lock
+      await failTradeSessionWithLockRelease(bot.username, "No valid route found");
+
       if (bot.docked) {
         await bot.refreshCargo();
         for (const item of [...bot.inventory]) {
@@ -1869,6 +1979,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const completedSession = completeTradeSession(bot.username, actualRevenue, actualProfit);
     if (completedSession) {
       ctx.log("trade", `Session completed: ${completedSession.sessionId}`);
+      
+      // Release fleet lock on this item
+      const lockReleased = releaseTradeLock(bot.username, completedSession.itemId, "completed");
+      if (lockReleased) {
+        ctx.log("trade", `Fleet lock released on ${completedSession.itemName}`);
+      }
     }
 
     // ── Faction donation (10% of profit) ──

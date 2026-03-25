@@ -1511,4 +1511,61 @@ They're warning you for not staying still. Respond defensively or apologetically
       this.logFn("error", `Customs LLM error: ${llmErr instanceof Error ? llmErr.message : String(llmErr)}`);
     }
   }
+
+  /**
+   * Send a rescue en-route notification to a stranded player.
+   * This is a simple, non-AI message to let them know help is coming.
+   */
+  async sendRescueEnRouteNotification(
+    bot: Bot,
+    targetPlayer: string,
+    jumpsAway: number
+  ): Promise<{ ok: boolean; message?: string; error?: string }> {
+    this.logFn("ai_chat", `🚁 Preparing rescue en-route notification to ${targetPlayer} (${jumpsAway} jumps away)...`);
+
+    // Simple template-based message (no AI needed for this)
+    const message = jumpsAway > 0
+      ? `🚁 Rescue dispatched! I'm ${jumpsAway} jump${jumpsAway !== 1 ? 's' : ''} away. Hang tight - help is on the way!`
+      : `🚁 Rescue dispatched! I'm in the same system - arriving shortly!`;
+
+    this.logFn("ai_chat", `🚁 Message content: ${message}`);
+
+    try {
+      // Send as private message
+      this.logFn("ai_chat", `🚁 Sending private message to ${targetPlayer}...`);
+      const chatResp = await bot.exec("chat", {
+        channel: "private",
+        target_id: targetPlayer,
+        content: message,
+      });
+
+      if (!chatResp.error) {
+        this.logFn("ai_chat", `→ Rescue en-route notification to ${targetPlayer}: ${message}`);
+        
+        // Log to chat.log file (same as other private messages)
+        this.logChat({
+          timestamp: new Date().toISOString(),
+          direction: "OUT",
+          channel: "private",
+          sender: bot.username,
+          content: message,
+        });
+        
+        // Log to bot's activity log (shows in UI)
+        bot.log("chat", `📤 Private to ${targetPlayer}: ${message}`);
+        bot.log("rescue", `📧 Sent en-route notification to ${targetPlayer}`);
+        
+        return { ok: true, message };
+      } else {
+        this.logFn("error", `Rescue notification to ${targetPlayer} failed: ${chatResp.error.message}`);
+        bot.log("warn", `📧 Failed to send en-route notification: ${chatResp.error.message}`);
+        return { ok: false, error: chatResp.error.message };
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.logFn("error", `Rescue notification error: ${errMsg}`);
+      bot.log("warn", `📧 En-route notification error: ${errMsg}`);
+      return { ok: false, error: errMsg };
+    }
+  }
 }

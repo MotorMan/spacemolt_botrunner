@@ -1045,10 +1045,13 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         ctx.log(logCategory, `✓ Arrived at home system ${homeSystem}`);
 
         // If home station is configured, travel there and dock
+        ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", homeSystem: "${homeSystem}"`);
         if (settings.homeStation) {
           const [expectedSystem, stationId] = settings.homeStation.split('|');
+          ctx.log("rescue_debug", `Parsed homeStation: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
+          ctx.log("rescue_debug", `Comparison: expectedSystem===homeSystem? ${expectedSystem === homeSystem}, stationId truthy? ${!!stationId}`);
           if (expectedSystem === homeSystem && stationId) {
-            ctx.log(logCategory, `🚀 Traveling to home station...`);
+            ctx.log(logCategory, `🚀 Traveling to home station (${stationId})...`);
             const travelResp = await bot.exec("travel", { target_poi: stationId });
             if (!travelResp.error) {
               ctx.log(logCategory, `⚓ Docking at home station...`);
@@ -1061,10 +1064,20 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
                 if (!refuelResp.error) {
                   await bot.refreshStatus();
                   ctx.log(logCategory, `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                } else {
+                  ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
                 }
+              } else {
+                ctx.log("error", `Dock failed: ${dockResp.error.message}`);
               }
+            } else {
+              ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
             }
+          } else {
+            ctx.log("warn", `homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
           }
+        } else {
+          ctx.log("rescue", `⚠️ homeStation not configured - will use ensureFueled to refuel at ${homeSystem}`);
         }
       }
       // Update session state for return home
@@ -1075,12 +1088,14 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       ctx.log("warn", "No home system set — skipping return home");
     } else {
       ctx.log(logCategory, `Already at home system ${homeSystem}`);
-      
+
       // Already at home system - still travel to home station and dock if configured
+      ctx.log("rescue_debug", `Already at home: homeStation config="${settings.homeStation}", homeSystem="${homeSystem}"`);
       if (settings.homeStation) {
         const [expectedSystem, stationId] = settings.homeStation.split('|');
+        ctx.log("rescue_debug", `Parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
         if (expectedSystem === homeSystem && stationId) {
-          ctx.log(logCategory, `🚀 Traveling to home station...`);
+          ctx.log(logCategory, `🚀 Traveling to home station (${stationId})...`);
           const travelResp = await bot.exec("travel", { target_poi: stationId });
           if (!travelResp.error) {
             ctx.log(logCategory, `⚓ Docking at home station...`);
@@ -1093,24 +1108,36 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
               if (!refuelResp.error) {
                 await bot.refreshStatus();
                 ctx.log(logCategory, `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+              } else {
+                ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
               }
+            } else {
+              ctx.log("error", `Dock failed: ${dockResp.error.message}`);
             }
+          } else {
+            ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
           }
+        } else {
+          ctx.log("warn", `homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
         }
+      } else {
+        ctx.log("rescue", `⚠️ homeStation not configured - will use ensureFueled to refuel at ${homeSystem}`);
       }
     }
 
     // ── Refuel self (fallback if not already refueled at station) ──
+    ctx.log("rescue_debug", `=== Starting refuel self section ===`);
     yield "self_refuel";
     await bot.refreshStatus();
     const fuelAfterRescue = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("rescue_debug", `Fuel after rescue: ${fuelAfterRescue}%, threshold: ${settings.refuelThreshold}%`);
     if (fuelAfterRescue < settings.refuelThreshold) {
       ctx.log(logCategory,
         `Fuel at ${fuelAfterRescue}% after rescue — refueling to threshold (${settings.refuelThreshold}%)...`);
       await ensureFueled(ctx, settings.refuelThreshold);
     } else {
       ctx.log(logCategory,
-        `Fuel at ${fuelAfterRescue}% — above threshold, no need to refuel`);
+        `Fuel at ${fuelAfterRescue}% — above threshold (${settings.refuelThreshold}%), no need to refuel`);
     }
     await bot.refreshStatus();
     logStatus(ctx);
@@ -1230,6 +1257,8 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     } else {
       ctx.log("rescue", `=== Fuel transfer mission for ${target.username} complete ===`);
     }
+
+    ctx.log("rescue_debug", `=== Rescue loop iteration complete, sleeping before next scan ===`);
 
     // Reset idle timer after successful rescue
     idleStartTime = 0;

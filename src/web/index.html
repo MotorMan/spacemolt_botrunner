@@ -4509,6 +4509,7 @@ function renderRescueSettings(panel) {
   const scanIntervalSec = r.scanIntervalSec ?? 30;
   const refuelThreshold = r.refuelThreshold ?? 60;
   const maydayMaxJumps = r.maydayMaxJumps ?? 12;
+  const maydayFuelThreshold = r.maydayFuelThreshold ?? 15;
   const homeSystem = r.homeSystem || '';
   const homeStation = r.homeStation || '';
   const costPerJump = r.costPerJump ?? 50;
@@ -4573,6 +4574,12 @@ function renderRescueSettings(panel) {
       <label>MAYDAY max jumps (0 = unlimited)</label>
       <input type="number" id="set-rescue-maydayMaxJumps" value="${maydayMaxJumps}" min="0" max="50" style="width:80px">
       <small style="color:var(--dim)">Maximum jumps away to respond to MAYDAYs (fleet rescues always unlimited)</small>
+    </div>
+
+    <div class="settings-group">
+      <label>MAYDAY fuel threshold (%)</label>
+      <input type="number" id="set-rescue-maydayFuelThreshold" value="${maydayFuelThreshold}" min="5" max="50" style="width:80px">
+      <small style="color:var(--dim)">Only respond to MAYDAYs where pilot has less than this % fuel (avoids ambushes)</small>
     </div>
 
     <div class="settings-group">
@@ -4652,6 +4659,7 @@ function saveRescueSettings() {
     scanIntervalSec: parseInt(document.getElementById('set-rescue-scanInterval').value) || 30,
     refuelThreshold: parseInt(document.getElementById('set-rescue-refuelThreshold').value) || 60,
     maydayMaxJumps: parseInt(document.getElementById('set-rescue-maydayMaxJumps').value) || 0,
+    maydayFuelThreshold: parseInt(document.getElementById('set-rescue-maydayFuelThreshold').value) || 15,
     costPerJump: parseInt(document.getElementById('set-rescue-costPerJump').value) || 50,
     costPerFuel: parseInt(document.getElementById('set-rescue-costPerFuel').value) || 2,
     cooperationEnabled: document.getElementById('set-rescue-cooperationEnabled').checked || false,

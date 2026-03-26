@@ -59,6 +59,7 @@ function getRescueSettings(): {
   scanIntervalSec: number;
   refuelThreshold: number;
   maydayMaxJumps: number;
+  maydayFuelThreshold: number;
   homeSystem?: string;
   homeStation?: string;
   costPerJump: number;
@@ -85,6 +86,8 @@ function getRescueSettings(): {
     refuelThreshold: (r.refuelThreshold as number) || 60,
     /** Maximum jumps away to respond to MAYDAYs (0 = unlimited). */
     maydayMaxJumps: (r.maydayMaxJumps as number) || 12,
+    /** Max fuel % for MAYDAY sender to be considered a valid rescue (avoids ambushes). */
+    maydayFuelThreshold: (r.maydayFuelThreshold as number) || 15,
     /** Home system from rescue settings, fuel_transfer settings, or global settings */
     homeSystem: (r.homeSystem as string) || (ft.homeSystem as string) || (general.homeSystem as string),
     /** Home station ID (format: "systemId|stationId") */
@@ -459,6 +462,15 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           }
 
           ctx.log("mayday", `✓ Sender ${mayday.sender} is a KNOWN player — responding to MAYDAY`);
+
+          // ── MAYDAY FUEL CHECK: Verify sender's fuel is below threshold ──
+          // Prevents wasting fuel on players who aren't actually in distress (potential ambushes)
+          if (mayday.fuelPct > settings.maydayFuelThreshold) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - fuel too high (${mayday.fuelPct}% > ${settings.maydayFuelThreshold}% threshold)`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+          ctx.log("mayday", `✓ Fuel check passed: ${mayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
           const rescueDecision = shouldRescuePlayer(mayday.sender);
@@ -1377,7 +1389,15 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     if (!nearbyResp.error && nearbyResp.result) {
       // Track player names from nearby scan
       bot.trackNearbyPlayers(nearbyResp.result);
-      
+
+      // Check for pirates and flee if detected
+      const { checkAndFleeFromPirates } = await import("./common.js");
+      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+      if (fled) {
+        ctx.log("error", "Pirates detected - had to flee, rescue aborted");
+        return;
+      }
+
       const data = nearbyResp.result as Record<string, unknown>;
       const players = Array.isArray(data.players) ? data.players :
                       Array.isArray(data.nearby) ? data.nearby :
@@ -1715,6 +1735,15 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       
       ctx.log("mayday", `✓ Sender ${nextMayday.sender} is a KNOWN player — responding to MAYDAY`);
 
+      // ── MAYDAY FUEL CHECK: Verify sender's fuel is below threshold ──
+      // Prevents wasting fuel on players who aren't actually in distress (potential ambushes)
+      if (nextMayday.fuelPct > settings.maydayFuelThreshold) {
+        ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - fuel too high (${nextMayday.fuelPct}% > ${settings.maydayFuelThreshold}% threshold)`);
+        markMaydayHandled(nextMayday);
+        continue;
+      }
+      ctx.log("mayday", `✓ Fuel check passed: ${nextMayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
+
       // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
       const rescueDecision = shouldRescuePlayer(nextMayday.sender);
       if (!rescueDecision.shouldRescue) {
@@ -1890,7 +1919,15 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     if (!nearbyResp.error && nearbyResp.result) {
       // Track player names from nearby scan
       bot.trackNearbyPlayers(nearbyResp.result);
-      
+
+      // Check for pirates and flee if detected
+      const { checkAndFleeFromPirates } = await import("./common.js");
+      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+      if (fled) {
+        ctx.log("error", "Pirates detected - had to flee, rescue aborted");
+        return;
+      }
+
       const data = nearbyResp.result as Record<string, unknown>;
       const players = Array.isArray(data.players) ? data.players :
                       Array.isArray(data.nearby) ? data.nearby :
@@ -2114,6 +2151,14 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
   try {
     const resp = await bot.exec("get_nearby");
     if (!resp.error && resp.result) {
+      // Check for pirates and flee if detected
+      const { checkAndFleeFromPirates } = await import("./common.js");
+      const fled = await checkAndFleeFromPirates(ctx, resp.result);
+      if (fled) {
+        ctx.log("error", "Pirates detected - had to flee");
+        return null;
+      }
+
       const data = resp.result as Record<string, unknown>;
       const players = Array.isArray(data.players) ? data.players :
                       Array.isArray(data.nearby) ? data.nearby :
@@ -2123,7 +2168,7 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
       for (const p of players as Array<Record<string, unknown>>) {
         const playerId = (p.player_id as string) || (p.id as string);
         const pUsername = (p.username as string) || (p.name as string);
-        
+
         if (pUsername && pUsername.toLowerCase() === username.toLowerCase()) {
           ctx.log("rescue", `Found player ID for ${username}: ${playerId}`);
           return playerId;
@@ -2135,7 +2180,7 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
       for (const p of players as Array<Record<string, unknown>>) {
         const playerId = (p.player_id as string) || (p.id as string);
         const pUsername = ((p.username as string) || (p.name as string) || "").toLowerCase();
-        
+
         if (pUsername.includes(username.toLowerCase()) || username.toLowerCase().includes(pUsername)) {
           ctx.log("rescue", `Fuzzy match found: ${pUsername} -> ${playerId}`);
           return playerId;
@@ -2381,6 +2426,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           }
 
           ctx.log("mayday", `✓ Sender ${mayday.sender} is a KNOWN player — responding to MAYDAY`);
+
+          // ── MAYDAY FUEL CHECK: Verify sender's fuel is below threshold ──
+          // Prevents wasting fuel on players who aren't actually in distress (potential ambushes)
+          if (mayday.fuelPct > settings.maydayFuelThreshold) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - fuel too high (${mayday.fuelPct}% > ${settings.maydayFuelThreshold}% threshold)`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+          ctx.log("mayday", `✓ Fuel check passed: ${mayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
           const rescueDecision = shouldRescuePlayer(mayday.sender);
@@ -2853,11 +2907,19 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       // Use get_nearby to verify target is present
       const nearbyResp = await bot.exec("get_nearby");
       if (!nearbyResp.error && nearbyResp.result) {
+        // Check for pirates and flee if detected
+        const { checkAndFleeFromPirates } = await import("./common.js");
+        const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+        if (fled) {
+          ctx.log("error", "Pirates detected - had to flee, rescue aborted");
+          return;
+        }
+
         const data = nearbyResp.result as Record<string, unknown>;
         const players = Array.isArray(data.players) ? data.players :
                         Array.isArray(data.nearby) ? data.nearby :
                         Array.isArray(data.ships) ? data.ships : [];
-        
+
         const targetHere = players.some(p => {
           const username = ((p.username as string) || (p.name as string) || "").toLowerCase();
           return username === target.username.toLowerCase();

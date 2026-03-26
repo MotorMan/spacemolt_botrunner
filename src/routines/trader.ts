@@ -50,6 +50,11 @@ function getFreeSpace(bot: Bot): number {
   return Math.max(0, bot.cargoMax - bot.cargo);
 }
 
+/** Minimum credits to keep in personal wallet for trading operations. */
+const TRADER_WORKING_BALANCE = 200_000;
+/** Buffer above working balance before depositing excess to faction storage. */
+const TRADER_DEPOSIT_THRESHOLD = 210_000;
+
 // ── Helpers ─────────────────────────────────────────────────
 
 /**
@@ -1146,15 +1151,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       await ensureDocked(ctx);
       bot.docked = true;
 
-      // Withdraw credits from storage
+      // Withdraw credits from storage only if below working balance
       await bot.refreshStorage();
       const storageResp = await bot.exec("view_storage");
       if (storageResp.result && typeof storageResp.result === "object") {
         const sr = storageResp.result as Record<string, unknown>;
         const storedCredits = (sr.credits as number) || (sr.stored_credits as number) || 0;
-        if (storedCredits > 0) {
-          await bot.exec("withdraw_credits", { amount: storedCredits });
-          ctx.log("trade", `Withdrew ${storedCredits} credits from storage`);
+        if (storedCredits > 0 && bot.credits < TRADER_WORKING_BALANCE) {
+          // Only withdraw what's needed to reach working balance
+          const needed = Math.min(storedCredits, TRADER_WORKING_BALANCE - bot.credits);
+          if (needed > 0) {
+            await bot.exec("withdraw_credits", { amount: needed });
+            ctx.log("trade", `Withdrew ${needed} credits from storage (working balance: ${bot.credits + needed}cr)`);
+          }
         }
       }
 
@@ -1705,6 +1714,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       } else {
         bot.poi = route.destPoi;
+
+        // Check for pirates at destination
+        const nearbyResp = await bot.exec("get_nearby");
+        if (nearbyResp.result && typeof nearbyResp.result === "object") {
+          const { checkAndFleeFromPirates } = await import("./common.js");
+          const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+          if (fled) {
+            ctx.log("error", "Pirates detected at destination - fled, aborting trade");
+            await ensureDocked(ctx);
+            await sleep(30000);
+            continue;
+          }
+        }
       }
     }
 
@@ -1989,6 +2011,49 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Faction donation (10% of profit) ──
     await factionDonateProfit(ctx, actualProfit);
+
+    // ── Deposit excess credits to faction storage at home base ──
+    await bot.refreshStatus();
+    if (bot.credits > TRADER_DEPOSIT_THRESHOLD) {
+      const excessCredits = bot.credits - TRADER_WORKING_BALANCE;
+      const homeSystemForDeposit = settings.homeSystem || startSystem;
+      
+      if (homeSystemForDeposit && bot.system !== homeSystemForDeposit) {
+        ctx.log("trade", `Excess credits detected (${bot.credits}cr) — returning to home system ${homeSystemForDeposit} to deposit ${excessCredits}cr`);
+        await ensureUndocked(ctx);
+        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (fueled) {
+          const arrived = await navigateToSystem(ctx, homeSystemForDeposit, safetyOpts);
+          if (arrived) {
+            // Dock at home station
+            const { pois: homePois } = await getSystemInfo(ctx);
+            const homeStation = findStation(homePois);
+            if (homeStation) {
+              await bot.exec("travel", { target_poi: homeStation.id });
+              await ensureDocked(ctx, true);
+              
+              // Deposit excess credits to faction storage
+              const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+              if (!depositResp.error) {
+                ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
+                logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);
+              } else {
+                ctx.log("error", `Failed to deposit credits: ${depositResp.error.message}`);
+              }
+            }
+          }
+        }
+      } else if (bot.docked) {
+        // Already at home and docked - deposit immediately
+        const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+        if (!depositResp.error) {
+          ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
+          logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);
+        } else {
+          ctx.log("error", `Failed to deposit credits: ${depositResp.error.message}`);
+        }
+      }
+    }
 
     // ── Maintenance ──
     yield "post_trade_maintenance";

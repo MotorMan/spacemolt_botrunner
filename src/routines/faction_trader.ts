@@ -388,6 +388,18 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         ctx.log("travel", `Traveling to ${recoveredSession.destPoiName}...`);
         await bot.exec("travel", { target_poi: recoveredSession.destPoi });
         bot.poi = recoveredSession.destPoi;
+
+        // Check for pirates at destination
+        const nearbyResp = await bot.exec("get_nearby");
+        if (nearbyResp.result && typeof nearbyResp.result === "object") {
+          const { checkAndFleeFromPirates } = await import("./common.js");
+          const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+          if (fled) {
+            ctx.log("error", "Pirates detected at destination - fled, will retry");
+            await sleep(30000);
+            continue;
+          }
+        }
       }
 
       await ensureDocked(ctx);

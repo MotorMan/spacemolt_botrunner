@@ -588,6 +588,18 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
     bot.poi = miningPoi.id;
 
+    // Check for pirates at mining location
+    const nearbyResp = await bot.exec("get_nearby");
+    if (nearbyResp.result && typeof nearbyResp.result === "object") {
+      const { checkAndFleeFromPirates } = await import("./common.js");
+      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+      if (fled) {
+        ctx.log("error", "Pirates detected - fled mining location, will retry");
+        await sleep(30000);
+        continue;
+      }
+    }
+
     // Update session state to mining
     if (recoveredSession) {
       updateMiningSession(bot.username, {

@@ -909,14 +909,15 @@ export const coordinatorRoutine: Routine = async function* (ctx: RoutineContext)
       .join(", ");
     ctx.log("coord", `Top demand: ${demandSummary}`);
 
-    // ── Credit redistribution: top off bots below 1000cr from faction treasury ──
+    // ── Credit redistribution: top off bots below 10,000cr from faction treasury ──
     yield "redistribute_credits";
     const fleet = ctx.getFleetStatus?.() || [];
+    const BOT_WORKING_BALANCE = 10_000;
     for (const member of fleet) {
       if (member.username === bot.username) continue;
       if (member.state !== "running") continue;
-      if (member.credits >= 1000) continue;
-      const needed = 1000 - member.credits;
+      if (member.credits >= BOT_WORKING_BALANCE) continue;
+      const needed = BOT_WORKING_BALANCE - member.credits;
       // Withdraw from faction treasury
       const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
       if (withdrawResp.error) {
@@ -930,8 +931,8 @@ export const coordinatorRoutine: Routine = async function* (ctx: RoutineContext)
         // Re-deposit withdrawn credits back
         await bot.exec("faction_deposit_credits", { amount: needed });
       } else {
-        ctx.log("coord", `Sent ${needed}cr to ${member.username} (topped off to 1000cr)`);
-        logFactionActivity(ctx, "gift", `Sent ${needed}cr to ${member.username} (top-off to 1000cr)`);
+        ctx.log("coord", `Sent ${needed}cr to ${member.username} (topped off to ${BOT_WORKING_BALANCE}cr)`);
+        logFactionActivity(ctx, "gift", `Sent ${needed}cr to ${member.username} (top-off to ${BOT_WORKING_BALANCE}cr)`);
       }
     }
 

@@ -848,9 +848,17 @@ async function* visitOtherPoi(
     if (objects.length > 0) {
       ctx.log("info", `Visited ${poi.name}: ${objects.length} objects nearby`);
     }
-    
+
     // Track player names from nearby scan
     bot.trackNearbyPlayers(nearbyResp.result);
+
+    // Check for pirates and flee if detected
+    const { checkAndFleeFromPirates } = await import("./common.js");
+    const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+    if (fled) {
+      // We've fled - abort this POI scan and return to main loop
+      return;
+    }
   }
 
   mapStore.markExplored(systemId, poi.id);

@@ -688,6 +688,18 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
             continue;
           }
           bot.poi = candidate.sourcePoi;
+
+          // Check for pirates at source location
+          const nearbyResp = await bot.exec("get_nearby");
+          if (nearbyResp.result && typeof nearbyResp.result === "object") {
+            const { checkAndFleeFromPirates } = await import("./common.js");
+            const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+            if (fled) {
+              ctx.log("error", "Pirates detected at source - fled, will retry");
+              await sleep(30000);
+              continue;
+            }
+          }
         }
 
         yield "dock_source";

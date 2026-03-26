@@ -5,11 +5,12 @@
  * ore parsing, and safety checks.
  */
 import type { RoutineContext } from "../bot.js";
+import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
-import { 
-  waitForCustomsInspection, 
-  pollForCustomsShip, 
+import {
+  waitForCustomsInspection,
+  pollForCustomsShip,
   isEmpireSystem,
   getBotCustomsStats,
 } from "../customs.js";
@@ -323,8 +324,9 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
  *  or navigates to the nearest known station system if none is available.
  *  Returns true if successfully docked.
  *  @param skipStorageCollection If true, skips automatic storage collection (withdraw credits).
+ *  @param minBalance Minimum credits to keep on bot when collecting from storage (only withdraw if below this). If 0, withdraws all.
  */
-export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: boolean = true): Promise<boolean> {
+export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: boolean = true, minBalance: number = 0): Promise<boolean> {
   const { bot } = ctx;
   if (bot.docked) return true;
 
@@ -342,7 +344,7 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
     if (!dockResp.error || dockResp.error.message.includes("already")) {
       bot.docked = true;
       if (!skipStorageCollection) {
-        await collectFromStorage(ctx);
+        await collectFromStorage(ctx, minBalance);
       }
       await ensureInsured(ctx);
       return true;
@@ -392,7 +394,7 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
   if (!dResp.error || dResp.error.message.includes("already")) {
     bot.docked = true;
     if (!skipStorageCollection) {
-      await collectFromStorage(ctx);
+      await collectFromStorage(ctx, minBalance);
     }
     await ensureInsured(ctx);
     return true;
@@ -448,8 +450,9 @@ export async function analyzeMarket(ctx: RoutineContext): Promise<void> {
  * Check station storage for credits and withdraw them to the bot.
  * Does NOT transfer items - routines should handle storage items manually if needed.
  * Also records market prices at the station.
+ * @param minBalance - Minimum credits to keep on bot (only withdraw if below this). If 0, withdraws all.
  */
-export async function collectFromStorage(ctx: RoutineContext): Promise<void> {
+export async function collectFromStorage(ctx: RoutineContext, minBalance: number = 0): Promise<void> {
   const { bot } = ctx;
 
   const storageResp = await bot.exec("view_storage");
@@ -460,10 +463,22 @@ export async function collectFromStorage(ctx: RoutineContext): Promise<void> {
   // Withdraw credits to the bot
   const credits = (r.credits as number) || (r.stored_credits as number) || 0;
   if (credits > 0) {
-    const wResp = await bot.exec("withdraw_credits", { amount: credits });
-    if (!wResp.error) {
-      ctx.log("trade", `Collected ${credits} credits from storage`);
-      await bot.refreshStatus();
+    let amountToWithdraw = credits;
+    
+    // If minBalance is set, only withdraw if bot is below that threshold
+    if (minBalance > 0 && bot.credits < minBalance) {
+      amountToWithdraw = Math.min(credits, minBalance - bot.credits);
+    } else if (minBalance > 0) {
+      // Bot already has enough credits - don't withdraw
+      amountToWithdraw = 0;
+    }
+    
+    if (amountToWithdraw > 0) {
+      const wResp = await bot.exec("withdraw_credits", { amount: amountToWithdraw });
+      if (!wResp.error) {
+        ctx.log("trade", `Collected ${amountToWithdraw} credits from storage`);
+        await bot.refreshStatus();
+      }
     }
   }
 
@@ -1220,6 +1235,16 @@ export async function navigateToSystem(
 
     // Check for customs inspection after entering new system
     await checkCustomsInspection(ctx, nextSystem);
+
+    // Check for pirates in the new system and flee if detected
+    const nearbyResp = await bot.exec("get_nearby");
+    if (nearbyResp.result && typeof nearbyResp.result === "object") {
+      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result, true);
+      if (fled) {
+        // We fled - navigation is aborted, caller will need to handle new position
+        return false;
+      }
+    }
 
     // Update map data for the new system
     const sysResp = await bot.exec("get_system");
@@ -2010,6 +2035,315 @@ export async function factionDonateProfit(ctx: RoutineContext, profit: number): 
     ctx.log("trade", `Donated ${donation}cr to faction treasury (${pct}% of ${profit}cr profit)`);
     logFactionActivity(ctx, "donation", `Deposited ${donation}cr (${pct}% of ${profit}cr profit)`);
   }
+}
+
+// ── Combat Detection & Flee ─────────────────────────────────
+
+/** Result of pirate detection in nearby entities */
+export interface PirateDetectionResult {
+  hasPirates: boolean;
+  pirateCount: number;
+  highestTier: PirateTier | null;
+  pirates: NearbyEntity[];
+}
+
+/** Pirate tier type for threat assessment - matches API values */
+export type PirateTier = "small" | "medium" | "large" | "capitol" | "boss" | "raider" | "salvager" | "tanker" | "fighter" | "destroyer" | "cruiser" | "battleship";
+
+/** Map pirate ship types to threat levels for flee decisions */
+const PIRATE_THREAT_LEVELS: Record<string, number> = {
+  "salvager": 1,
+  "tanker": 1,
+  "fighter": 2,
+  "small": 2,
+  "raider": 3,
+  "medium": 3,
+  "destroyer": 4,
+  "large": 4,
+  "cruiser": 5,
+  "capitol": 6,
+  "battleship": 7,
+  "boss": 8,
+};
+
+/** Get threat level for a pirate tier (higher = more dangerous) */
+export function getPirateThreatLevel(tier: string | undefined | null): number {
+  if (!tier) return 0;
+  return PIRATE_THREAT_LEVELS[tier.toLowerCase()] || 2;
+}
+
+/** Pirate entity from get_nearby response */
+export interface NearbyEntity {
+  id: string;
+  name: string;
+  type: string;
+  faction: string;
+  isNPC: boolean;
+  isPirate: boolean;
+  tier?: PirateTier;
+  isBoss?: boolean;
+  hull?: number;
+  maxHull?: number;
+  shield?: number;
+  maxShield?: number;
+  status?: string;
+}
+
+/**
+ * Parse get_nearby response to detect pirates.
+ * @param result - The result from get_nearby API call
+ * @returns Detection result with pirate count and threat level
+ */
+export function parseNearbyForPirates(result: unknown): PirateDetectionResult {
+  if (!result || typeof result !== "object") {
+    return { hasPirates: false, pirateCount: 0, highestTier: null, pirates: [] };
+  }
+
+  const r = result as Record<string, unknown>;
+  const pirates: NearbyEntity[] = [];
+
+  // Handle different response formats
+  let rawEntities: Array<Record<string, unknown>> = [];
+
+  if (Array.isArray(r)) {
+    rawEntities = r;
+  } else if (Array.isArray(r.entities)) {
+    rawEntities = r.entities as Array<Record<string, unknown>>;
+  } else if (Array.isArray(r.players) && r.players.length > 0) {
+    rawEntities = r.players as Array<Record<string, unknown>>;
+  } else if (Array.isArray(r.nearby)) {
+    rawEntities = r.nearby as Array<Record<string, unknown>>;
+  }
+
+  // Parse entities looking for pirates
+  for (const e of rawEntities) {
+    const id = (e.id as string) || (e.player_id as string) || (e.entity_id as string) || (e.pirate_id as string) || "";
+    if (!id) continue;
+
+    let faction = "";
+    if (typeof e.faction === "string") faction = e.faction.toLowerCase();
+    else if (typeof e.faction_id === "string") faction = e.faction_id.toLowerCase();
+
+    let type = "";
+    if (typeof e.type === "string") type = e.type.toLowerCase();
+    else if (typeof e.entity_type === "string") type = e.entity_type.toLowerCase();
+
+    const isPirate = !!(e.pirate_id) || type.includes("pirate") || faction.includes("pirate");
+    if (!isPirate) continue;
+
+    const tier = (e.tier as PirateTier) || "small";
+    const isBoss = !!(e.is_boss as boolean);
+
+    pirates.push({
+      id,
+      name: (e.name as string) || (e.username as string) || (e.pirate_name as string) || id,
+      type: "pirate",
+      faction: "pirate",
+      isNPC: true,
+      isPirate: true,
+      tier,
+      isBoss,
+      hull: e.hull as number,
+      maxHull: e.max_hull as number,
+      shield: e.shield as number,
+      maxShield: e.max_shield as number,
+      status: e.status as string,
+    });
+  }
+
+  // Parse pirates array (special format from get_nearby at POIs)
+  if (Array.isArray(r.pirates)) {
+    const rawPirates = r.pirates as Array<Record<string, unknown>>;
+    for (const p of rawPirates) {
+      const id = (p.pirate_id as string) || "";
+      if (!id) continue;
+
+      const tier = (p.tier as PirateTier) || "small";
+      const isBoss = !!(p.is_boss as boolean);
+
+      pirates.push({
+        id,
+        name: (p.name as string) || (p.pirate_name as string) || id,
+        type: "pirate",
+        faction: "pirate",
+        isNPC: true,
+        isPirate: true,
+        tier,
+        isBoss,
+        hull: p.hull as number,
+        maxHull: p.max_hull as number,
+        shield: p.shield as number,
+        maxShield: p.max_shield as number,
+        status: p.status as string,
+      });
+    }
+  }
+
+  // Determine highest threat tier present
+  let highestTier: PirateTier | null = null;
+  let highestThreat = 0;
+  for (const pirate of pirates) {
+    if (pirate.tier) {
+      const threat = getPirateThreatLevel(pirate.tier);
+      if (threat > highestThreat) {
+        highestThreat = threat;
+        highestTier = pirate.tier;
+      }
+    }
+  }
+
+  return {
+    hasPirates: pirates.length > 0,
+    pirateCount: pirates.length,
+    highestTier,
+    pirates,
+  };
+}
+
+/**
+ * Get current battle status from the API.
+ * @param ctx - Routine context
+ * @returns Battle status or null if not in battle
+ */
+export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus | null> {
+  const { bot } = ctx;
+  const resp = await bot.exec("get_battle_status");
+  if (resp.error || !resp.result) {
+    return null;
+  }
+
+  const result = resp.result as Record<string, unknown>;
+  if (result.error && (result.error as Record<string, unknown>).code === "not_in_battle") {
+    return null;
+  }
+
+  // Parse battle status
+  const status: BattleStatus = {
+    battle_id: (result.battle_id as string) || "",
+    tick: (result.tick as number) || undefined,
+    system_id: (result.system_id as string) || undefined,
+    sides: (result.sides as BattleSide[]) || [],
+    participants: (result.participants as BattleParticipant[]) || [],
+    your_side_id: (result.your_side_id as number) || undefined,
+    your_zone: (result.your_zone as BattleZone) || undefined,
+    your_stance: (result.your_stance as BattleStance) || undefined,
+    your_target_id: (result.your_target_id as string) || undefined,
+    auto_pilot: (result.auto_pilot as boolean) || undefined,
+  };
+
+  return status;
+}
+
+/**
+ * Attempt to flee from an active battle.
+ * Uses "battle stance flee" command.
+ * @param ctx - Routine context
+ * @returns true if flee command was issued successfully, false otherwise
+ */
+export async function fleeFromBattle(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+
+  // Check if we're actually in a battle
+  const status = await getBattleStatus(ctx);
+  if (!status) {
+    ctx.log("combat", "Not in battle - cannot flee");
+    return false;
+  }
+
+  ctx.log("combat", "FLEEING BATTLE - issuing flee stance command!");
+  const resp = await bot.exec("battle", { action: "stance", stance: "flee" });
+
+  if (resp.error) {
+    ctx.log("error", `Flee command failed: ${resp.error.message}`);
+    return false;
+  }
+
+  ctx.log("combat", "Flee stance engaged - escaping battle!");
+  return true;
+}
+
+/**
+ * Emergency flee response when pirates are detected in get_nearby.
+ * If not in a battle, immediately jump to a random adjacent system.
+ * If already in battle, use flee stance.
+ * @param ctx - Routine context
+ * @param pirateResult - Result from parseNearbyForPirates
+ * @returns true if successfully escaped/fled, false if failed
+ */
+export async function emergencyFleeFromPirates(
+  ctx: RoutineContext,
+  pirateResult: PirateDetectionResult,
+): Promise<boolean> {
+  const { bot } = ctx;
+
+  ctx.log("error", `PIRATES DETECTED! ${pirateResult.pirateCount} pirate(s), highest tier: ${pirateResult.highestTier || "unknown"} - EMERGENCY FLEE!`);
+
+  // Check if we're already in a battle
+  const battleStatus = await getBattleStatus(ctx);
+  if (battleStatus) {
+    ctx.log("combat", "Already in battle - using flee stance");
+    return await fleeFromBattle(ctx);
+  }
+
+  // Not in battle - need to jump away immediately
+  // We have 20 seconds (2 ticks) to leave before they attack
+  ctx.log("combat", "Not in battle - attempting emergency jump!");
+
+  // Get system info to find jump targets
+  const { connections } = await getSystemInfo(ctx);
+  if (!connections || connections.length === 0) {
+    ctx.log("error", "No jump connections available - trapped!");
+    return false;
+  }
+
+  // Pick a random connection to jump to
+  const randomConnection = connections[Math.floor(Math.random() * connections.length)];
+  if (!randomConnection || !randomConnection.id) {
+    ctx.log("error", "Could not select jump target - trapped!");
+    return false;
+  }
+
+  ctx.log("travel", `Emergency jump to ${randomConnection.name || randomConnection.id}!`);
+  const jumpResp = await bot.exec("jump", { target_system: randomConnection.id });
+
+  if (jumpResp.error) {
+    ctx.log("error", `Emergency jump failed: ${jumpResp.error.message}`);
+    return false;
+  }
+
+  ctx.log("combat", `Successfully escaped to ${randomConnection.name || randomConnection.id}!`);
+  return true;
+}
+
+/**
+ * Check for pirates in nearby and flee if detected.
+ * Should be called after get_nearby in non-combat routines.
+ * @param ctx - Routine context
+ * @param nearbyResult - Result from get_nearby API call
+ * @param isJumpCommand - Whether the previous command was a jump (if true, we're already escaping)
+ * @returns true if pirates were detected and flee was attempted, false if no pirates
+ */
+export async function checkAndFleeFromPirates(
+  ctx: RoutineContext,
+  nearbyResult: unknown,
+  isJumpCommand: boolean = false,
+): Promise<boolean> {
+  const pirateResult = parseNearbyForPirates(nearbyResult);
+
+  if (!pirateResult.hasPirates) {
+    return false;
+  }
+
+  // Pirates detected!
+  if (isJumpCommand) {
+    // We just jumped - already fleeing, but log the threat
+    ctx.log("combat", `Pirates detected in system (${pirateResult.pirateCount}x, tier: ${pirateResult.highestTier}) - continuing escape`);
+    return true;
+  }
+
+  // Not a jump command - we need to flee NOW
+  await emergencyFleeFromPirates(ctx, pirateResult);
+  return true;
 }
 
 // ── Customs Inspection ───────────────────────────────────────

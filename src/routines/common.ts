@@ -130,7 +130,7 @@ export const SALVAGE_YARD_STATIONS = [
   "alpha_centauri_colonial_station", // Sol
   "node_alpha_processing_station",   // Node
   "the_anvil_arsenal",               // Anvil
-  "mobile_capital",                  // Mobile
+  "mobile_capital",                  // Mobile empire (dynamic - location tracked by mapStore)
   "cargo_lanes_freight_depot",       // Cargo Lanes
 ];
 
@@ -165,15 +165,54 @@ export function findSalvageYardStation(pois: SystemPOI[]): SystemPOI | null {
 
 /** Get the system ID for a known salvage yard station. */
 export function getSystemForSalvageYard(stationId: string): string | null {
-  // Map salvage yard stations to their systems (update as discovered)
+  // Mobile capitol is dynamic - use the tracked location
+  if (stationId === "mobile_capital") {
+    return getMobileCapitolSystem();
+  }
+  
+  // Map other salvage yard stations to their systems (update as discovered)
   const stationToSystem: Record<string, string> = {
     "alpha_centauri_colonial_station": "sol",            // Sol empire
     "node_alpha_processing_station": "node_alpha",       // Node empire (guess - update if different)
     "the_anvil_arsenal": "the_anvil",                    // Anvil empire (guess - update if different)
-    "mobile_capital": "mobile",                          // Mobile empire (guess - update if different)
     "cargo_lanes_freight_depot": "cargo_lanes",          // Cargo Lanes empire (guess - update if different)
   };
   return stationToSystem[stationId] || null;
+}
+
+/**
+ * Resolve the current system for the mobile_capitol station.
+ * This is a moving station that changes location periodically.
+ * Returns the last known system from mapStore, or null if not yet discovered.
+ */
+export function getMobileCapitolSystem(): string | null {
+  const location = mapStore.getMobileCapitolLocation();
+  return location?.systemId || null;
+}
+
+/**
+ * Resolve a station reference that may be the mobile_capitol.
+ * If stationId is "mobile_capital", returns the current known location from mapStore.
+ * Otherwise returns the stationId unchanged.
+ */
+export function resolveStationId(stationId: string): string | null {
+  if (stationId === "mobile_capital") {
+    const location = mapStore.getMobileCapitolLocation();
+    return location?.poiId || "mobile_capital";
+  }
+  return stationId;
+}
+
+/**
+ * Resolve a system reference that may be the mobile_capitol's system.
+ * If systemId is "mobile_capital" or refers to the mobile capitol, returns the current system.
+ * Otherwise returns the systemId unchanged.
+ */
+export function resolveSystemForMobileCapitol(systemIdOrStation: string): string | null {
+  if (systemIdOrStation === "mobile_capital") {
+    return getMobileCapitolSystem();
+  }
+  return systemIdOrStation;
 }
 
 // ── System data parsing ──────────────────────────────────────

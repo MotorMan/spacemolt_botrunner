@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
+import { log } from "./ui.js";
 
 // ── Data model ──────────────────────────────────────────────
 
@@ -114,6 +115,13 @@ export interface MapData {
   version: 1;
   last_saved: string;
   systems: Record<string, StoredSystem>;
+  /** Track the mobile_capitol station's current location. Updated when discovered by bots. */
+  mobile_capitol?: {
+    system_id: string;
+    system_name: string;
+    poi_id: string;
+    discovered_at: string;
+  };
 }
 
 // ── MapStore singleton ──────────────────────────────────────
@@ -258,6 +266,12 @@ class MapStore {
           last_updated: now(),
         };
       });
+
+      // Auto-detect mobile_capitol station and update its location
+      const mobileCapitolPoi = sys.pois.find((p) => p.id === "mobile_capital");
+      if (mobileCapitolPoi) {
+        this.updateMobileCapitolLocation(id, sys.name || id, mobileCapitolPoi.id);
+      }
     }
 
     // Merge wrecks from system data
@@ -919,6 +933,56 @@ class MapStore {
   /** Return the full systems map for the web dashboard. */
   getAllSystems(): Record<string, StoredSystem> {
     return this.data.systems;
+  }
+
+  // ── Mobile Capitol Tracking ───────────────────────────────
+
+  /**
+   * Update the mobile_capitol station's current location.
+   * Call this when a bot visits the mobile_capitol and discovers its new system.
+   */
+  updateMobileCapitolLocation(systemId: string, systemName: string, poiId: string): void {
+    const previous = this.data.mobile_capitol;
+    if (previous && previous.system_id === systemId && previous.poi_id === poiId) {
+      // Already at this location, just refresh timestamp
+      this.data.mobile_capitol = { ...previous, discovered_at: now() };
+    } else {
+      if (previous) {
+        log("map", `Mobile capitol moved: ${previous.system_name} → ${systemName}`);
+      }
+      this.data.mobile_capitol = {
+        system_id: systemId,
+        system_name: systemName,
+        poi_id: poiId,
+        discovered_at: now(),
+      };
+    }
+    this.scheduleSave();
+  }
+
+  /**
+   * Get the current known location of the mobile_capitol station.
+   * Returns null if the location has not been discovered yet.
+   */
+  getMobileCapitolLocation(): { systemId: string; systemName: string; poiId: string; discoveredAt: string } | null {
+    if (!this.data.mobile_capitol) return null;
+    const mc = this.data.mobile_capitol;
+    return {
+      systemId: mc.system_id,
+      systemName: mc.system_name,
+      poiId: mc.poi_id,
+      discoveredAt: mc.discovered_at,
+    };
+  }
+
+  /**
+   * Check if a POI is the mobile_capitol station.
+   * Returns true if the system_id and poi_id match the current known location.
+   */
+  isMobileCapitol(systemId: string, poiId: string): boolean {
+    if (!this.data.mobile_capitol) return false;
+    return this.data.mobile_capitol.system_id === systemId && 
+           this.data.mobile_capitol.poi_id === poiId;
   }
 
   /** Formatted summary string for menu display. */

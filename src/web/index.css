@@ -1791,6 +1791,23 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   flex-shrink: 0;
   align-items: center;
 }
+.ship-gift-bot-select {
+  font-size: 11px;
+  padding: 2px 6px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid #21262d;
+  border-radius: 4px;
+  cursor: pointer;
+}
+.ship-gift-custom-input {
+  font-size: 11px;
+  padding: 2px 6px;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid #21262d;
+  border-radius: 4px;
+}
 .shipyard-active-badge {
   font-size: 10px;
   padding: 2px 8px;

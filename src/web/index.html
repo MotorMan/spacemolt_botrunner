@@ -453,6 +453,7 @@ let routines = [];
 let settings = {};
 let knownSystems = [];
 let knownOres = [];
+let mobileCapitol = null;     // { systemId, systemName, poiId, discoveredAt }
 let reconnectDelay = 1000;
 let modalMode = 'add';
 let activeSettingsTab = 'general';
@@ -655,11 +656,13 @@ function connect() {
         settings = msg.settings || {};
         knownSystems = msg.knownSystems || [];
         knownOres = msg.knownOres || [];
+        mobileCapitol = msg.mobileCapitol || null;
         if (msg.catalog) catalog = msg.catalog;
         mapData = msg.mapData || {};
         statsDaily = msg.statsDaily || {};
         renderBots();
         renderStats();
+        renderMapStats();
         setTimeout(refreshFactionFunds, 2000);
         updateChatBotSelect();
         renderSettingsPanel();
@@ -677,7 +680,7 @@ function connect() {
         }
         // Load faction log
         factionLogLines = msg.logs?.faction || [];
-        
+
         // Re-initialize rescue systems dropdown if profile is open
         if (profileBot) mcInitRescueSystems();
         break;
@@ -3335,12 +3338,19 @@ function renderMapStats() {
   const totalStations = systems.reduce((s, sys) => s + (sys.pois || []).filter(p => p.has_base).length, 0);
   const totalOres = new Set();
   systems.forEach(sys => (sys.pois || []).forEach(p => (p.ores_found || []).forEach(o => totalOres.add(o.item_id))));
+  
+  // Mobile capitol location display
+  const mcDisplay = mobileCapitol 
+    ? `<span style="margin-left:auto;color:#4fc3f7">Mobile Capitol: <span class="stat-val">${esc(mobileCapitol.systemName || mobileCapitol.systemId)}</span></span>`
+    : `<span style="margin-left:auto;color:#666">Mobile Capitol: <span class="stat-val">not discovered</span></span>`;
+  
   bar.innerHTML = `
     <span>Systems: <span class="stat-val">${systems.length}</span></span>
     <span>POIs: <span class="stat-val">${totalPois}</span></span>
     <span>Belts: <span class="stat-val">${totalBelts}</span></span>
     <span>Stations: <span class="stat-val">${totalStations}</span></span>
     <span>Ores: <span class="stat-val">${totalOres.size}</span></span>
+    ${mcDisplay}
   `;
 }
 
@@ -8076,12 +8086,13 @@ function renderSalvagerSettings(panel) {
   const preferScrap = sv.preferScrap ?? false;
   const autoCloak = sv.autoCloak ?? false;
 
-  // Salvage yard stations list
+  // Salvage yard stations list - mobile_capital is dynamic
+  const mcLocation = mobileCapitol ? mobileCapitol.systemName || mobileCapitol.systemId : 'unknown (not discovered)';
   const salvageYardStations = [
-    { id: 'alpha_centauri_colonial_station', name: 'Alpha Centauri Colonial Station', system: 'alpha_centauri' },
+    { id: 'alpha_centauri_colonial_station', name: 'Alpha Centauri Colonial Station', system: 'sol' },
     { id: 'node_alpha_processing_station', name: 'Node Alpha Processing Station', system: 'node_alpha' },
     { id: 'the_anvil_arsenal', name: 'The Anvil Arsenal', system: 'the_anvil' },
-    { id: 'mobile_capital', name: 'Mobile Capital', system: 'frontier' },
+    { id: 'mobile_capital', name: 'Mobile Capital', system: mcLocation },
     { id: 'cargo_lanes_freight_depot', name: 'Cargo Lanes Freight Depot', system: 'cargo_lanes' },
     { id: 'starfall_salvage_station', name: 'Starfall Salvage Station', system: 'starfall' }
   ];
@@ -9405,6 +9416,20 @@ function renderFleetPanel(ships, username, error) {
         : '';
       const etaHtml = buildEta ? `<span style="font-size:10px;color:var(--text-dim);margin-left:4px">${esc(String(buildEta))}</span>` : '';
 
+      // Build bot dropdown for gifting
+      const botOptions = bots.filter(b => b.username !== username).map(b => 
+        `<option value="${esc(b.username)}">${esc(b.username)}</option>`
+      ).join('');
+      const giftDropdown = !isActive && !isBuilding ? `
+        <select class="ship-gift-bot-select" id="gift-select-${id}" onchange="handleGiftBotSelect('${esc(username)}','${esc(id)}',this)">
+          <option value="">Gift to...</option>
+          ${botOptions}
+          <option value="__custom__">Enter name...</option>
+        </select>
+        <input type="text" class="ship-gift-custom-input" id="gift-input-${id}" placeholder="Bot name..." style="display:none;width:120px;font-size:11px;padding:2px 6px;">
+        <button class="sm" style="color:var(--cyan)" onclick="shipGift('${esc(username)}','${esc(id)}','${esc(name)}')">Gift</button>
+      ` : '';
+
       html += `<div class="shipyard-ship-card">
         <div style="flex:1">
           <div class="ssc-name">${esc(name)} ${cls && name !== cls ? `<span style="font-weight:400;color:var(--text-dim);font-size:11px">${esc(cls)}</span>` : ''} ${isActive ? '<span class="shipyard-active-badge">Active</span>' : ''}${buildBadge}${etaHtml}</div>
@@ -9415,6 +9440,7 @@ function renderFleetPanel(ships, username, error) {
           ${!isActive && !isBuilding ? `<button class="sm" onclick="shipGoTo('${esc(username)}','${esc(id)}','${esc(rawLoc)}')">Go</button>` : ''}
           ${!isActive && !isBuilding ? `<button class="sm" onclick="shipSwitch('${esc(username)}','${esc(id)}')">Switch</button>` : ''}
           ${!isActive && !isBuilding ? `<button class="sm" style="color:var(--red)" onclick="shipSell('${esc(username)}','${esc(id)}','${esc(name)}')">Sell</button>` : ''}
+          ${giftDropdown}
         </div>
       </div>`;
     }
@@ -9961,6 +9987,59 @@ function shipSwitch(username, shipId) {
       if (shipyardActivePanel === 'fleet') fetchFleetList(username);
     } else {
       appendLine('system', `Switch ship failed: ${result.error || 'unknown'}`);
+    }
+  });
+}
+
+/** Handle gift bot dropdown selection - show/hide custom name input */
+function handleGiftBotSelect(username, shipId, selectEl) {
+  const inputEl = document.getElementById(`gift-input-${shipId}`);
+  if (!inputEl) return;
+  if (selectEl.value === '__custom__') {
+    inputEl.style.display = 'inline-block';
+    inputEl.focus();
+  } else {
+    inputEl.style.display = 'none';
+    inputEl.value = '';
+  }
+}
+
+/** Gift a ship to another bot or player */
+function shipGift(username, shipId, name) {
+  if (!shipId) return;
+  
+  // Get the selected bot from dropdown or custom input
+  const selectEl = document.getElementById(`gift-select-${shipId}`);
+  const inputEl = document.getElementById(`gift-input-${shipId}`);
+  
+  let recipient = selectEl ? selectEl.value : '';
+  
+  // If custom input is visible, use that value
+  if (inputEl && inputEl.style.display !== 'none') {
+    recipient = inputEl.value.trim();
+  }
+  
+  if (!recipient) {
+    appendLine('system', 'Please select a recipient for the gift');
+    return;
+  }
+  
+  if (recipient === '__custom__' && inputEl && inputEl.style.display !== 'none') {
+    recipient = inputEl.value.trim();
+    if (!recipient) {
+      appendLine('system', 'Please enter a recipient name');
+      return;
+    }
+  }
+  
+  if (!confirm(`Gift ${name || 'this ship'} to ${recipient}? This cannot be undone.`)) return;
+  
+  sendExec(username, 'send_gift', { recipient: recipient, ship_id: shipId }, (result) => {
+    if (result.ok) {
+      appendLine('system', `${username} gifted ${name || 'a ship'} to ${recipient}`);
+      if (shipyardActivePanel === 'fleet') fetchFleetList(username);
+    } else {
+      appendLine('system', `Gift ship failed: ${result.error || 'unknown'}`);
     }
   });
 }

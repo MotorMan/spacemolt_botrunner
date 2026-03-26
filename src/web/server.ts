@@ -366,6 +366,7 @@ export class WebServer {
             settings: this.settings,
             knownSystems,
             knownOres,
+            mobileCapitol: this.getMobileCapitolLocation(),
             catalog: catalogStore.getAll(),
             mapData: mapStore.getAllSystems(),
             statsDaily: this.statsData.daily,
@@ -537,6 +538,10 @@ export class WebServer {
       const sys = mapStore.getSystem(id);
       return { id, name: sys?.name || id };
     });
+  }
+
+  private getMobileCapitolLocation(): { systemId: string; systemName: string; poiId: string; discoveredAt: string } | null {
+    return mapStore.getMobileCapitolLocation();
   }
 
   private pushLog(buffer: string[], line: string): void {

@@ -1109,7 +1109,7 @@ export class Bot {
 
   /**
    * Extract and track player names from a get_nearby response.
-   * Handles players, pirates, ships, and other entity arrays.
+   * Only tracks actual players, not pirates or empire NPCs.
    */
   trackNearbyPlayers(nearbyResult: unknown): void {
     if (!nearbyResult || typeof nearbyResult !== "object") {
@@ -1118,17 +1118,16 @@ export class Bot {
     }
 
     const data = nearbyResult as Record<string, unknown>;
-    
+
     // Debug: log what keys we have
     debugLog("playernames:track", `${this.username}`, `get_nearby result keys: ${Object.keys(data).join(", ")}`);
 
-    // Extract from various possible array formats (objects, nearby, ships, players, pirates)
+    // Only track actual players (exclude pirates and empire_npcs)
     const arraysToCheck = [
       Array.isArray(data.objects) ? data.objects : [],
       Array.isArray(data.nearby) ? data.nearby : [],
       Array.isArray(data.ships) ? data.ships : [],
       Array.isArray(data.players) ? data.players : [],
-      Array.isArray(data.pirates) ? data.pirates : [],
       Array.isArray(data.nearby_players) ? data.nearby_players : [],
     ];
 

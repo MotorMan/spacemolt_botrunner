@@ -1108,8 +1108,8 @@ export class Bot {
   }
 
   /**
-   * Extract and track player names from a get_nearby response.
-   * Only tracks actual players, not pirates or empire NPCs.
+   * Extract and track player names, pirates, and empire NPCs from a get_nearby response.
+   * Players, pirates, and empire NPCs are tracked in separate categories.
    */
   trackNearbyPlayers(nearbyResult: unknown): void {
     if (!nearbyResult || typeof nearbyResult !== "object") {
@@ -1122,8 +1122,8 @@ export class Bot {
     // Debug: log what keys we have
     debugLog("playernames:track", `${this.username}`, `get_nearby result keys: ${Object.keys(data).join(", ")}`);
 
-    // Only track actual players (exclude pirates and empire_npcs)
-    const arraysToCheck = [
+    // Track actual players (exclude pirates and empire_npcs)
+    const playerArraysToCheck = [
       Array.isArray(data.objects) ? data.objects : [],
       Array.isArray(data.nearby) ? data.nearby : [],
       Array.isArray(data.ships) ? data.ships : [],
@@ -1131,10 +1131,10 @@ export class Bot {
       Array.isArray(data.nearby_players) ? data.nearby_players : [],
     ];
 
-    let count = 0;
-    let totalFound = 0;
-    for (const arr of arraysToCheck) {
-      totalFound += arr.length;
+    let playerCount = 0;
+    let totalPlayersFound = 0;
+    for (const arr of playerArraysToCheck) {
+      totalPlayersFound += arr.length;
       for (const entity of arr as Array<Record<string, unknown>>) {
         // Try various field names for player/ship names
         const name = (entity.username as string) ||
@@ -1144,16 +1144,41 @@ export class Bot {
 
         if (name && name.trim()) {
           if (playerNameStore.add(name)) {
-            count++;
+            playerCount++;
           }
         }
       }
     }
 
-    debugLog("playernames:track", `${this.username}`, `Found ${totalFound} entities, ${count} new names`);
+    // Track pirates separately
+    let pirateCount = 0;
+    const piratesArray = Array.isArray(data.pirates) ? data.pirates : [];
+    for (const pirate of piratesArray as Array<Record<string, unknown>>) {
+      const name = pirate.name as string;
+      if (name && name.trim()) {
+        if (playerNameStore.addPirate(name)) {
+          pirateCount++;
+        }
+      }
+    }
 
-    if (count > 0) {
-      this.log("playernames", `Discovered ${count} new player(s) from nearby scan`);
+    // Track empire NPCs separately
+    let empireNpcCount = 0;
+    const empireNpcsArray = Array.isArray(data.empire_npcs) ? data.empire_npcs : [];
+    for (const npc of empireNpcsArray as Array<Record<string, unknown>>) {
+      const name = npc.name as string;
+      if (name && name.trim()) {
+        if (playerNameStore.addEmpireNpc(name)) {
+          empireNpcCount++;
+        }
+      }
+    }
+
+    const totalFound = totalPlayersFound + piratesArray.length + empireNpcsArray.length;
+    debugLog("playernames:track", `${this.username}`, `Found ${totalFound} entities: ${totalPlayersFound} players, ${piratesArray.length} pirates, ${empireNpcsArray.length} empire NPCs. Added ${playerCount} new players, ${pirateCount} new pirates, ${empireNpcCount} new empire NPCs`);
+
+    if (playerCount > 0 || pirateCount > 0 || empireNpcCount > 0) {
+      this.log("playernames", `Discovered ${playerCount} new player(s), ${pirateCount} new pirate(s), ${empireNpcCount} new empire NPC(s) from nearby scan`);
     }
   }
 

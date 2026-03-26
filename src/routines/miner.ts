@@ -156,6 +156,14 @@ async function detectMiningType(ctx: RoutineContext): Promise<"ore" | "gas" | "i
   return null;
 }
 
+/** Get expected mining type for a resource ID. */
+function getMiningTypeForResource(resourceId: string): "ore" | "gas" | "ice" {
+  const lower = resourceId.toLowerCase();
+  if (lower.includes("gas")) return "gas";
+  if (lower.includes("ice")) return "ice";
+  return "ore";
+}
+
 /** Pick target resource based on quota deficits. Returns the resource ID with biggest deficit. */
 function pickTargetFromQuotas(
   quotas: Record<string, number>,
@@ -337,16 +345,24 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Recovered session handling ──
     // If we have a recovered session, use its target instead of recalculating
     if (recoveredSession) {
-      ctx.log("mining", `Using recovered session target: ${recoveredSession.targetResourceName} @ ${recoveredSession.targetPoiName}`);
-      // Update session state based on current position
-      if (bot.system === recoveredSession.homeSystem && bot.docked) {
-        recoveredSession.state = "depositing";
-      } else if (bot.system === recoveredSession.targetSystemId) {
-        recoveredSession.state = "mining";
+      // Validate that the recovered session's target is compatible with currently detected mining type
+      const sessionMiningType = getMiningTypeForResource(recoveredSession.targetResourceId);
+      if (sessionMiningType !== miningType) {
+        ctx.log("warn", `Recovered session target (${recoveredSession.targetResourceName}) incompatible with detected equipment (${miningType}) — discarding session`);
+        failMiningSession(bot.username, "Equipment mismatch");
+        recoveredSession = null;
       } else {
-        recoveredSession.state = "traveling_to_ore";
+        ctx.log("mining", `Using recovered session target: ${recoveredSession.targetResourceName} @ ${recoveredSession.targetPoiName}`);
+        // Update session state based on current position
+        if (bot.system === recoveredSession.homeSystem && bot.docked) {
+          recoveredSession.state = "depositing";
+        } else if (bot.system === recoveredSession.targetSystemId) {
+          recoveredSession.state = "mining";
+        } else {
+          recoveredSession.state = "traveling_to_ore";
+        }
+        updateMiningSession(bot.username, { state: recoveredSession.state });
       }
-      updateMiningSession(bot.username, { state: recoveredSession.state });
     }
 
     // ── Quota-based target selection ──

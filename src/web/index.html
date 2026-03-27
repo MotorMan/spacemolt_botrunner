@@ -48,7 +48,34 @@
       <div class="stat-item"><span class="stat-value" id="statCrafted">0</span><span class="stat-label">Items Crafted</span></div>
       <div class="stat-item"><span class="stat-value" id="statSystems">0</span><span class="stat-label">Explored</span></div>
     </div>
-    <div class="bot-table-wrap">
+    <!-- Filter Bar for Routine Groups -->
+    <div class="filter-bar" id="routineGroupsFilterBar" style="display:none;">
+      <input type="text" class="filter-input" placeholder="🔍 Search bots..." id="botSearch" oninput="filterBots()">
+      <select class="filter-select" id="routineFilter" onchange="filterBots()">
+        <option value="">All Routines</option>
+        <option value="miner">Miner</option>
+        <option value="crafter">Crafter</option>
+        <option value="trader">Trader</option>
+        <option value="explorer">Explorer</option>
+        <option value="hunter">Hunter</option>
+        <option value="hauler">Hauler</option>
+        <option value="salvager">Salvager</option>
+        <option value="scout">Scout</option>
+      </select>
+      <select class="filter-select" id="statusFilter" onchange="filterBots()">
+        <option value="">All Status</option>
+        <option value="running">Running</option>
+        <option value="idle">Idle</option>
+        <option value="error">Error</option>
+        <option value="stopping">Stopping</option>
+      </select>
+      <div style="margin-left:auto;display:flex;gap:6px;">
+        <span class="filter-chip active" onclick="toggleShowDetails()">📄 Details: <span id="detailsToggleText">Off</span></span>
+        <span class="filter-chip" onclick="toggleCollapseAll()">📌 Collapse All</span>
+        <button class="sm" onclick="toggleRoutineGroupsLayout()" title="Switch back to Table view">📊 Table View</button>
+      </div>
+    </div>
+    <div class="bot-table-wrap" id="originalTableWrap">
       <div class="bot-table-header">
         <span>Bots</span>
         <div style="display:flex;gap:8px;align-items:center;">
@@ -57,6 +84,7 @@
           </button>
           <button class="sm danger" onclick="emergencyReturnHome()">⚠ Emergency Return Home</button>
           <button class="sm" onclick="showAddModal()">+ Add Bot</button>
+          <button class="sm" onclick="toggleRoutineGroupsLayout()" title="Switch to Routine Groups layout">📊 Groups View</button>
           <div style="display:flex;gap:6px;align-items:center;border-left:1px solid var(--border);padding-left:8px;margin-left:4px;">
             <select id="bulkStartRoutine" style="font-size:12px;padding:4px 8px;">
               <!-- populated by JS -->
@@ -87,6 +115,21 @@
         </table>
       </div>
     </div>
+
+    <!-- Routine Groups Container (Alternative Layout) -->
+    <div class="routine-groups-container" id="routineGroupsContainer" style="display:none;">
+      <!-- Populated by JS -->
+    </div>
+
+    <!-- Empty State -->
+    <div class="empty-state" id="emptyState" style="display:none;">
+      <div class="empty-state-icon">🤖</div>
+      <div class="empty-state-title">No bots found</div>
+      <div class="empty-state-desc">Try adjusting your filters or add a new bot</div>
+    </div>
+
+    <!-- Tooltip -->
+    <div class="bot-tooltip" id="botTooltip"></div>
 
     <div class="log-area">
       <div class="log-panel">
@@ -810,6 +853,222 @@ function renderBots() {
     </tr>`;
   }).join('');
 }
+
+// ═══════════════════════════════════════════════════════════
+// ROUTINE GROUPS LAYOUT
+// ═══════════════════════════════════════════════════════════
+
+let routineGroupsState = {
+  showDetails: false,
+  allCollapsed: false,
+  currentFilter: { search: '', routine: '', status: '' },
+  expandedBots: new Set()
+};
+
+const routineIcons = {
+  miner: '⛏', crafter: '🔨', trader: '💰', explorer: '🚀',
+  hunter: '⚔️', hauler: '📦', salvager: '♻️', scout: '📡',
+  idle: '⏸', unknown: '🤖'
+};
+
+function getRoutineIcon(routine) {
+  return routineIcons[routine] || routineIcons.unknown;
+}
+
+function enableRoutineGroups() {
+  document.body.classList.add('routine-groups-active');
+  document.getElementById('originalTableWrap').style.display = 'none';
+  document.getElementById('routineGroupsContainer').style.display = 'grid';
+  document.getElementById('routineGroupsFilterBar').style.display = 'flex';
+  renderRoutineGroups();
+}
+
+function disableRoutineGroups() {
+  document.body.classList.remove('routine-groups-active');
+  document.getElementById('originalTableWrap').style.display = 'block';
+  document.getElementById('routineGroupsContainer').style.display = 'none';
+  document.getElementById('routineGroupsFilterBar').style.display = 'none';
+  renderBots();
+}
+
+function toggleRoutineGroupsLayout() {
+  if (document.body.classList.contains('routine-groups-active')) {
+    disableRoutineGroups();
+  } else {
+    enableRoutineGroups();
+  }
+}
+
+function renderRoutineGroups() {
+  const container = document.getElementById('routineGroupsContainer');
+  const emptyState = document.getElementById('emptyState');
+  if (!container) return;
+  
+  const filteredBots = bots.filter(bot => {
+    const matchesSearch = !routineGroupsState.currentFilter.search || bot.username.toLowerCase().includes(routineGroupsState.currentFilter.search);
+    const matchesRoutine = !routineGroupsState.currentFilter.routine || bot.routine === routineGroupsState.currentFilter.routine;
+    const matchesStatus = !routineGroupsState.currentFilter.status || bot.state === routineGroupsState.currentFilter.status;
+    return matchesSearch && matchesRoutine && matchesStatus;
+  });
+  
+  if (filteredBots.length === 0) {
+    emptyState.style.display = 'block';
+    container.style.display = 'none';
+    return;
+  } else {
+    emptyState.style.display = 'none';
+    container.style.display = 'grid';
+  }
+  
+  const grouped = {};
+  filteredBots.forEach(bot => {
+    if (!grouped[bot.routine]) grouped[bot.routine] = [];
+    grouped[bot.routine].push(bot);
+  });
+  
+  const allRoutines = [...new Set([...Object.keys(grouped), ...routines])];
+  
+  container.innerHTML = allRoutines.map(routine => {
+    const routineBots = grouped[routine] || [];
+    const runningCount = routineBots.filter(b => b.state === 'running').length;
+    const isHidden = routineBots.length === 0 && routineGroupsState.currentFilter.routine === '';
+    
+    return `
+      <div class="routine-group routine-${routine} ${isHidden ? 'hidden' : ''} ${routineGroupsState.allCollapsed ? 'collapsed' : ''}" data-routine="${routine}">
+        <div class="routine-group-header" onclick="toggleRoutineGroup('${routine}')">
+          <div class="routine-group-title">
+            <span class="routine-group-chevron">▶</span>
+            <span class="routine-group-icon">${getRoutineIcon(routine)}</span>
+            <span class="routine-group-name">${esc(routine)}</span>
+            <span class="routine-group-count">${routineBots.length}</span>
+          </div>
+          <div class="routine-group-status">
+            <span class="routine-group-status-dot ${runningCount > 0 ? 'running' : ''}"></span>
+            <span>${runningCount}/${routineBots.length} running</span>
+          </div>
+        </div>
+        <div class="routine-group-body">
+          ${routineBots.map(bot => renderBotCard(bot)).join('')}
+        </div>
+      </div>
+    `;
+  }).join('');
+}
+
+function toggleRoutineGroup(routine) {
+  const group = document.querySelector(`.routine-group[data-routine="${routine}"]`);
+  if (group) group.classList.toggle('collapsed');
+}
+
+function renderBotCard(bot) {
+  const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
+  const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 0;
+  const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 0;
+  const cargoPct = bot.cargoMax > 0 ? Math.round((bot.cargo / bot.cargoMax) * 100) : 0;
+  const isExpanded = routineGroupsState.expandedBots.has(bot.username);
+  const isLowFuel = fuelPct < 20;
+
+  return `
+    <div class="bot-card routine-${bot.routine} ${isExpanded ? 'expanded' : ''}"
+         data-bot="${esc(bot.username)}"
+         onclick="handleBotCardClick(event, '${esc(bot.username)}')">
+      <div class="bot-card-header">
+        <div class="bot-card-name">
+          <span class="bot-card-name-icon"></span>
+          <span class="bot-card-name-text" title="${esc(bot.username)}">${esc(bot.username)}</span>
+          <span class="bot-card-ship" title="${esc(bot.shipName || '')}">${esc(bot.shipName || '-')}</span>
+        </div>
+        <div class="bot-card-status">
+          <span class="status-dot ${bot.state}"></span>
+          <span class="status-label">${bot.state}</span>
+        </div>
+      </div>
+      <div class="bot-card-bars">
+        <div class="bar-row">
+          <span class="bar-label">Shield</span>
+          <div class="bar-container bar-shield-hull">
+            <div class="bar-shield" style="width:${shieldPct}%"></div>
+            <div class="bar-hull" style="width:${hullPct}%"></div>
+          </div>
+          <span class="bar-value">${shieldPct}%</span>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">Hull</span>
+          <div class="bar-container">
+            <div class="bar-fuel ${isLowFuel ? 'low' : ''}" style="width:${fuelPct}%"></div>
+          </div>
+          <span class="bar-value">${fuelPct}%</span>
+        </div>
+        <div class="bar-row">
+          <span class="bar-label">Cargo</span>
+          <div class="bar-container">
+            <div class="bar-cargo" style="width:${cargoPct}%"></div>
+          </div>
+          <span class="bar-value">${cargoPct}%</span>
+        </div>
+      </div>
+      ${routineGroupsState.showDetails ? `
+      <div class="bot-card-info">
+        <div class="info-row"><span class="info-label">Credits</span><span class="info-value">${num(bot.credits)}cr</span></div>
+        <div class="info-row"><span class="info-label">Location</span><span class="info-value" title="${esc(bot.system)}">${esc(bot.system)}</span></div>
+        <div class="info-row"><span class="info-label">Shield</span><span class="info-value">${bot.shield}/${bot.maxShield}</span></div>
+        <div class="info-row"><span class="info-label">Hull</span><span class="info-value">${bot.hull}/${bot.maxHull}</span></div>
+        <div class="info-row"><span class="info-label">Fuel</span><span class="info-value">${bot.fuel}/${bot.maxFuel}</span></div>
+        <div class="info-row"><span class="info-label">Cargo</span><span class="info-value">${bot.cargo}/${bot.cargoMax}</span></div>
+      </div>
+      ` : ''}
+      <div class="bot-card-actions">
+        ${bot.state !== 'running'
+          ? `<button class="sm primary" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>`
+          : `<button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+        }
+        <button class="sm" onclick="event.stopPropagation();openProfile('${esc(bot.username)}')">Details</button>
+      </div>
+    </div>
+  `;
+}
+
+function handleBotCardClick(event, botName) {
+  if (routineGroupsState.expandedBots.has(botName)) {
+    routineGroupsState.expandedBots.delete(botName);
+  } else {
+    routineGroupsState.expandedBots.add(botName);
+  }
+  renderRoutineGroups();
+  showBotTooltip(event, botName);
+}
+
+function showBotTooltip(event, botName) {
+  const tooltip = document.getElementById('botTooltip');
+  const bot = bots.find(b => b.username === botName);
+  if (!bot) return;
+  
+  tooltip.innerHTML = `
+    <div class="tooltip-row"><span class="tooltip-label">Credits:</span><span class="tooltip-value">${num(bot.credits)}cr</span></div>
+    <div class="tooltip-row"><span class="tooltip-label">Location:</span><span class="tooltip-value">${esc(bot.system)}</span></div>
+    <div class="tooltip-row"><span class="tooltip-label">Shield:</span><span class="tooltip-value">${bot.shield}/${bot.maxShield}</span></div>
+    <div class="tooltip-row"><span class="tooltip-label">Hull:</span><span class="tooltip-value">${bot.hull}/${bot.maxHull}</span></div>
+    <div class="tooltip-row"><span class="tooltip-label">Fuel:</span><span class="tooltip-value">${bot.fuel}/${bot.maxFuel}</span></div>
+    <div class="tooltip-row"><span class="tooltip-label">Cargo:</span><span class="tooltip-value">${bot.cargo}/${bot.cargoMax}</span></div>
+    <div class="tooltip-row"><span class="tooltip-label">Routine:</span><span class="tooltip-value">${esc(bot.routine)}</span></div>
+  `;
+  
+  tooltip.classList.add('visible');
+  tooltip.style.left = event.pageX + 10 + 'px';
+  tooltip.style.top = event.pageY + 10 + 'px';
+  
+  setTimeout(() => tooltip.classList.remove('visible'), 2000);
+}
+
+// Override renderBots to use routine groups when active
+const originalRenderBots = window.renderBots;
+window.renderBots = function() {
+  if (document.body.classList.contains('routine-groups-active')) {
+    renderRoutineGroups();
+  } else if (originalRenderBots) {
+    originalRenderBots();
+  }
+};
 
 // ── Bulk Start Idle Bots ────────────────────────────────────
 const BULK_START_DELAY_MS = 1000; // 1 second delay between bots
@@ -7733,6 +7992,9 @@ function renderMinerSettings(panel) {
   const oreQuotas = m.oreQuotas || {};
   const gasQuotas = m.gasQuotas || {};
   const iceQuotas = m.iceQuotas || {};
+  const depletionTimeoutHours = m.depletionTimeoutHours ?? 3;
+  const ignoreDepletion = m.ignoreDepletion ?? false;
+  const maxJumps = m.maxJumps ?? 10;
   const orePrimary = depositBot ? `bot:${depositBot}` : depositMode;
   const oreSecondary = depositFallback;
 
@@ -7946,6 +8208,25 @@ function renderMinerSettings(panel) {
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Ignore Depletion Markings</div>
+          <div class="setting-hint">When enabled, miners will ignore depletion markings and continue mining at target POIs. Useful when multiple ores exist at a POI and one gets marked depleted prematurely.</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="set-miner-ignoreDepletion"${settings.miner?.ignoreDepletion ? ' checked' : ''} />
+          <span>Ignore depletion</span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Max Jump Distance</div>
+          <div class="setting-hint">Maximum number of jumps the miner will travel to reach a mining location. Prevents miners from traveling across the galaxy. Default is 10 jumps.</div>
+        </div>
+        <input type="number" id="set-miner-maxJumps" min="1" max="50" value="${settings.miner?.maxJumps ?? 10}" style="width:80px" />
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Harvesting System</div>
           <div class="setting-hint">Override system to harvest in. Bot will jump there on start.</div>
         </div>
@@ -8073,6 +8354,8 @@ function saveMinerSettings() {
     refuelThreshold: parseInt(document.getElementById('set-miner-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-miner-repairThreshold').value) || 40,
     depletionTimeoutHours: parseInt(document.getElementById('set-miner-depletionTimeoutHours').value) || 3,
+    ignoreDepletion: document.getElementById('set-miner-ignoreDepletion').checked,
+    maxJumps: parseInt(document.getElementById('set-miner-maxJumps').value) || 10,
     oreQuotas: collectQuotas('ore-quota-table'),
     gasQuotas: collectQuotas('gas-quota-table'),
     iceQuotas: collectQuotas('ice-quota-table'),

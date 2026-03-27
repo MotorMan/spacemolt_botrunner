@@ -335,6 +335,17 @@ export class WebServer {
           });
         }
 
+        // Serve dashboard variants page
+        if (url.pathname === "/dashboard-variants" || url.pathname === "/variants") {
+          const variantsPath = join(import.meta.dir, "dashboard-variants.html");
+          return new Response(readFileSync(variantsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve index.html for all other routes (read fresh for dev, no cache)
         return new Response(readFileSync(indexPath, "utf-8"), {
           headers: {

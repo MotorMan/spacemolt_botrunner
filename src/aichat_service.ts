@@ -167,6 +167,7 @@ function getAiChatSettings(): {
   respondToAll: boolean;
   respondToSystem: boolean;
   respondToMayday: boolean;
+  respondToCustoms: boolean;
   personality: string;
   lockDurationSec: number;
   conversationCooldownSec: number;
@@ -200,6 +201,7 @@ function getAiChatSettings(): {
     respondToAll: (s.respondToAll as boolean) ?? false,
     respondToSystem: (s.respondToSystem as boolean) ?? false,
     respondToMayday: (s.respondToMayday as boolean) ?? true,
+    respondToCustoms: (s.respondToCustoms as boolean) ?? true,
     personality: (s.personality as string) || DEFAULT_PERSONALITY,
     lockDurationSec: (s.lockDurationSec as number) || 60,
     conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
@@ -1435,6 +1437,12 @@ Message:`;
     // Check if AI Chat is enabled
     if (!settings.enabled) {
       this.logFn("ai_chat_debug", "Customs response skipped: AI Chat is disabled");
+      return;
+    }
+
+    // Check if customs response is enabled
+    if (!settings.respondToCustoms) {
+      this.logFn("ai_chat_debug", "Customs response skipped: respondToCustoms is disabled");
       return;
     }
 

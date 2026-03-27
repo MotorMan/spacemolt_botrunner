@@ -17,6 +17,7 @@ import {
   navigateToSystem,
   recordMarketData,
   factionDonateProfit,
+  logFactionActivity,
   detectAndRecoverFromDeath,
   maxItemsForCargo,
   readSettings,
@@ -777,5 +778,17 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     await ensureDocked(ctx);
     await tryRefuel(ctx);
     await repairShip(ctx);
+
+    // ── Deposit excess credits: keep only 10k, deposit rest to faction ──
+    yield "deposit_credits";
+    const BOT_WORKING_BALANCE = 10_000;
+    if (bot.credits > BOT_WORKING_BALANCE) {
+      const excessCredits = bot.credits - BOT_WORKING_BALANCE;
+      const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+      if (!depositResp.error) {
+        ctx.log("trade", `Deposited ${excessCredits}cr to faction treasury (retained ${BOT_WORKING_BALANCE}cr)`);
+        logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr (excess credits above ${BOT_WORKING_BALANCE}cr)`);
+      }
+    }
   }
 };

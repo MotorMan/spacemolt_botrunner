@@ -1038,6 +1038,33 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "repair";
     await repairShip(ctx);
 
+    // ── Credit top-up: ensure all running bots have at least 10k credits ──
+    yield "topup_credits";
+    const fleet = ctx.getFleetStatus?.() || [];
+    const BOT_WORKING_BALANCE = 10_000;
+    for (const member of fleet) {
+      if (member.username === bot.username) continue;
+      if (member.state !== "running") continue;
+      if (member.credits >= BOT_WORKING_BALANCE) continue;
+      const needed = BOT_WORKING_BALANCE - member.credits;
+      // Withdraw from faction treasury
+      const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+      if (withdrawResp.error) {
+        ctx.log("coord", `Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
+        break; // treasury likely empty
+      }
+      logFactionActivity(ctx, "withdraw", `Withdrew ${needed}cr from treasury for ${member.username}`);
+      const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
+      if (giftResp.error) {
+        ctx.log("coord", `Gift to ${member.username} failed: ${giftResp.error.message}`);
+        // Re-deposit withdrawn credits back
+        await bot.exec("faction_deposit_credits", { amount: needed });
+      } else {
+        ctx.log("coord", `Sent ${needed}cr to ${member.username} (topped off to ${BOT_WORKING_BALANCE}cr)`);
+        logFactionActivity(ctx, "gift", `Sent ${needed}cr to ${member.username} (top-off to ${BOT_WORKING_BALANCE}cr)`);
+      }
+    }
+
     // ── Check for skill level-ups ──
     yield "check_skills";
     await bot.checkSkills();

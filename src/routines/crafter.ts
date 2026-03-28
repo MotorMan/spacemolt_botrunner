@@ -596,11 +596,10 @@ async function craftFromCategories(
     }
     if (maxCraftable === Infinity) maxCraftable = 0;
 
-    // Determine batch size: limited by skill level, remaining craft slots, and available materials
+    // Determine batch size: limited by skill level and available materials
     // Note: craftingSkillLevel of 0 still allows crafting 1 at a time
     const maxBatchFromSkill = Math.max(1, craftingSkillLevel);
-    const desiredBatchSize = Math.min(maxBatchFromSkill, MAX_CRAFTS - totalCrafted);
-    const actualBatchSize = Math.min(desiredBatchSize, maxCraftable);
+    const actualBatchSize = Math.min(maxBatchFromSkill, maxCraftable);
 
     if (actualBatchSize <= 0) {
       ctx.log("warn", `No materials available for ${target.name}, skipping`);

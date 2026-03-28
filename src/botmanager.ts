@@ -1,46 +1,72 @@
-import { existsSync, readdirSync, appendFileSync, mkdirSync, rmSync } from "fs";
+import { existsSync, readdirSync, appendFileSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { join } from "path";
 import { Bot, type Routine } from "./bot.js";
 import { SessionManager } from "./session.js";
 import { minerRoutine } from "./routines/miner.js";
 import { explorerRoutine } from "./routines/explorer.js";
 import { crafterRoutine } from "./routines/crafter.js";
-import { rescueRoutine } from "./routines/rescue.js";
+import { rescueRoutine, fuelTransferRoutine, manualPlayerRescueRoutine, maydayRescueRoutine } from "./routines/rescue.js";
 import { coordinatorRoutine } from "./routines/coordinator.js";
 import { traderRoutine } from "./routines/trader.js";
-import { gasHarvesterRoutine } from "./routines/gas_harvester.js";
-import { iceHarvesterRoutine } from "./routines/ice_harvester.js";
 import { salvagerRoutine } from "./routines/salvager.js";
 import { hunterRoutine } from "./routines/hunter.js";
 import { factionTraderRoutine } from "./routines/faction_trader.js";
+import { tradeBuyerRoutine } from "./routines/trade_buyer.js";
 import { cleanupRoutine } from "./routines/cleanup.js";
 import { aiRoutine } from "./routines/ai.js";
+import { cargoMoverRoutine } from "./routines/cargo_mover.js";
+import { returnHomeRoutine } from "./routines/return_home.js";
+import { commandReceiverRoutine } from "./routines/command_receiver.js";
+import { fleetHunterCommanderRoutine } from "./routines/fleet_hunter_commander.js";
+import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordinate.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
-import { WebServer, type WebAction, type WebActionResult } from "./web/server.js";
+import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
 import { setLogSink } from "./ui.js";
 import { debugLog } from "./debug.js";
+import { reconnectQueue } from "./reconnectqueue.js";
+import { AiChatService } from "./aichat_service.js";
+import { massDisconnectDetector } from "./massdisconnect.js";
+import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
+
+interface BotState {
+  wasRunning: boolean;
+  routine: string | null;
+}
 
 const BASE_DIR = process.cwd();
 const SESSIONS_DIR = join(BASE_DIR, "sessions");
 
 const bots: Map<string, Bot> = new Map();
 let server: WebServer;
+let aiChatService: AiChatService | null = null;
+
+/** Get list of discovered bot usernames (for API use). */
+export function getDiscoveredBots(): string[] {
+  return [...bots.keys()];
+}
 
 const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   miner: { name: "Miner", fn: minerRoutine },
   explorer: { name: "Explorer", fn: explorerRoutine },
   crafter: { name: "Crafter", fn: crafterRoutine },
   rescue: { name: "FuelRescue", fn: rescueRoutine },
+  fuel_transfer: { name: "FuelTransfer", fn: fuelTransferRoutine },
+  manual_rescue: { name: "ManualRescue", fn: manualPlayerRescueRoutine },
+  mayday: { name: "MaydayRescue", fn: maydayRescueRoutine },
   coordinator: { name: "Coordinator", fn: coordinatorRoutine },
   trader: { name: "Trader", fn: traderRoutine },
-  gas_harvester: { name: "GasHarvester", fn: gasHarvesterRoutine },
-  ice_harvester: { name: "IceHarvester", fn: iceHarvesterRoutine },
   salvager: { name: "Salvager", fn: salvagerRoutine },
   hunter: { name: "Hunter", fn: hunterRoutine },
+  fleet_hunter_commander: { name: "FleetHunterCmd", fn: fleetHunterCommanderRoutine },
+  fleet_hunter_subordinate: { name: "FleetHunterWing", fn: fleetHunterSubordinateRoutine },
   faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },
+  trade_buyer: { name: "TradeBuyer", fn: tradeBuyerRoutine },
   cleanup: { name: "Cleanup", fn: cleanupRoutine },
   ai: { name: "AI", fn: aiRoutine },
+  cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },
+  return_home: { name: "ReturnHome", fn: returnHomeRoutine },
+  command_receiver: { name: "CommandReceiver", fn: commandReceiverRoutine },
 };
 
 // ── Auto-discover existing sessions ─────────────────────────
@@ -120,9 +146,25 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleExec(action);
     case "remove":
       return handleRemove(action);
+    case "emergencyReturn":
+      return handleEmergencyReturn();
+    case "shutdown":
+      return handleShutdown();
+    case "manual_rescue_request":
+      return handleManualRescueRequest(action);
     default:
       return { ok: false, error: `Unknown action: ${(action as any).type}` };
   }
+}
+
+async function handleShutdown(): Promise<WebActionResult> {
+  server.logSystem("Shutdown requested from web UI");
+  // Use globalThis shutdown function if available, otherwise trigger manually
+  const shutdownFn = (globalThis as any).shutdownServer;
+  if (shutdownFn) {
+    shutdownFn("web-ui");
+  }
+  return { ok: true, message: "Server shutting down..." };
 }
 
 async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
@@ -133,6 +175,45 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
   server.saveRoutineSettings(routine, s);
   server.logSystem(`Settings saved for ${routine}`);
   return { ok: true, message: `${routine} settings saved`, settings: server.settings };
+}
+
+async function handleManualRescueRequest(action: WebAction): Promise<WebActionResult> {
+  const botName = action.bot;
+  if (!botName) return { ok: false, error: "No bot specified" };
+
+  const bot = bots.get(botName);
+  if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
+
+  const targetSystem = (action as any).targetSystem as string;
+  const targetPOI = (action as any).targetPOI as string;
+  const targetPlayer = (action as any).targetPlayer as string;
+
+  if (!targetSystem) return { ok: false, error: "No target system specified" };
+  if (!targetPOI) return { ok: false, error: "No target POI specified" };
+  if (!targetPlayer) return { ok: false, error: "No target player specified" };
+
+  // Check if the bot is running the rescue routine
+  const botStatus = bot.status();
+  if (botStatus.routine !== "rescue") {
+    return { ok: false, error: `Bot is not running the rescue routine (current: ${botStatus.routine || "idle"})` };
+  }
+
+  // Add the manual rescue request to the queue
+  const request: ManualRescueRequest = {
+    targetPlayer,
+    targetSystem,
+    targetPOI,
+    timestamp: Date.now(),
+    botUsername: botName,
+  };
+
+  const added = addManualRescueRequest(request);
+  if (!added) {
+    return { ok: false, error: "Duplicate rescue request - already queued" };
+  }
+
+  server.logSystem(`Manual rescue request queued: ${targetPlayer} at ${targetSystem}/${targetPOI} (for bot ${botName})`);
+  return { ok: true, message: `Rescue request queued for ${targetPlayer}` };
 }
 
 async function handleStart(action: WebAction): Promise<WebActionResult> {
@@ -149,6 +230,11 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
 
   server.logSystem(`Starting ${bot.username} with ${routine.name} routine...`);
 
+  // Store routine parameters on bot object if provided (for manual_rescue etc.)
+  if (action.params) {
+    (bot as unknown as Record<string, unknown>).routineParams = action.params;
+  }
+
   const startOpts = (routineKey === "rescue" || routineKey === "coordinator")
     ? { getFleetStatus: () => [...bots.values()].map(b => b.status()) }
     : undefined;
@@ -156,10 +242,14 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   bot.start(routineKey, routine.fn, startOpts).then(() => {
     server.logSystem(`Bot ${bot.username} routine finished.`);
     server.clearBotAssignment(botName);
+    // Clear params after routine completes
+    (bot as unknown as Record<string, unknown>).routineParams = undefined;
   }).catch((err: unknown) => {
     const msg = err instanceof Error ? err.message : String(err);
     server.logSystem(`Bot ${bot.username} stopped with error: ${msg}`);
     server.clearBotAssignment(botName);
+    // Clear params after error
+    (bot as unknown as Record<string, unknown>).routineParams = undefined;
   });
 
   server.saveBotAssignment(botName, routineKey);
@@ -179,6 +269,68 @@ async function handleStop(action: WebAction): Promise<WebActionResult> {
   server.clearBotAssignment(botName);
   server.logSystem(`Stop signal sent to ${bot.username}`);
   return { ok: true, message: `Stop signal sent to ${botName}` };
+}
+
+async function handleEmergencyReturn(): Promise<WebActionResult> {
+  server.logSystem("EMERGENCY RETURN HOME: Stopping all bots and setting to return_home routine...");
+  
+  const runningBots = [...bots.values()].filter(b => b.state === "running");
+  if (runningBots.length === 0) {
+    server.logSystem("EMERGENCY RETURN HOME: No running bots to stop");
+    return { ok: true, message: "No running bots to stop" };
+  }
+
+  // Stop all running bots
+  for (const bot of runningBots) {
+    bot.stop();
+    server.clearBotAssignment(bot.username);
+    server.logSystem(`Stop requested for ${bot.username}`);
+  }
+
+  // Wait for all bots to fully stop (state changes from "stopping" to "idle")
+  server.logSystem("Waiting for bots to stop current actions...");
+  const STOP_TIMEOUT = 15000; // 15 seconds max wait
+  const CHECK_INTERVAL = 500; // Check every 500ms
+  
+  const startTime = Date.now();
+  for (const bot of runningBots) {
+    while (bot.state === "stopping" && (Date.now() - startTime) < STOP_TIMEOUT) {
+      await new Promise(r => setTimeout(r, CHECK_INTERVAL));
+    }
+    if (bot.state === "stopping") {
+      server.logSystem(`${bot.username} did not stop gracefully — forcing restart`);
+      // Force reset the state
+      (bot as any)._state = "idle";
+      (bot as any)._routine = null;
+    } else {
+      server.logSystem(`${bot.username} stopped successfully`);
+    }
+  }
+
+  // Additional delay to ensure any in-progress API calls complete
+  await new Promise(r => setTimeout(r, 2000));
+
+  // Start all bots with return_home routine
+  for (const bot of runningBots) {
+    const routineKey = "return_home";
+    const routine = ROUTINES[routineKey];
+    
+    server.logSystem(`Starting ${bot.username} with ${routine.name} routine...`);
+    
+    bot.start(routineKey, routine.fn, undefined).then(() => {
+      server.logSystem(`Bot ${bot.username} return_home routine finished.`);
+      server.clearBotAssignment(bot.username);
+    }).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      server.logSystem(`Bot ${bot.username} stopped with error: ${msg}`);
+      server.clearBotAssignment(bot.username);
+    });
+
+    server.saveBotAssignment(bot.username, routineKey);
+  }
+
+  server.logSystem(`EMERGENCY RETURN HOME: ${runningBots.length} bot(s) set to return_home`);
+  return { ok: true, message: `Emergency Return Home initiated for ${runningBots.length} bot(s)` };
 }
 
 async function handleRemove(action: WebAction): Promise<WebActionResult> {
@@ -300,6 +452,7 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   const bot = bots.get(botName);
   if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
 
+  // Ensure session exists before executing command
   if (!bot.api.getSession()) {
     await bot.login();
   }
@@ -307,16 +460,9 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   debugLog("exec:handler", `${botName} > ${command}`, params);
   let resp = await bot.exec(command, params);
 
-  // If still getting auth errors after API's internal recovery, do a full re-login and retry once
-  if (resp.error) {
-    const code = resp.error.code;
-    if (code === "session_invalid" || code === "session_expired" || code === "not_authenticated") {
-      server.logSystem(`Session lost for ${botName}, re-logging in...`);
-      const ok = await bot.login();
-      if (ok) {
-        resp = await bot.exec(command, params);
-      }
-    }
+  // Track player names from get_nearby responses
+  if (!resp.error && resp.result && command === "get_nearby") {
+    bot.trackNearbyPlayers(resp.result);
   }
 
   // Refresh cached state after mutating commands
@@ -392,10 +538,15 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
 // ── Main ────────────────────────────────────────────────────
 
 async function main(): Promise<void> {
-  const port = parseInt(process.env.PORT || "3000", 10);
+  // Load port from settings.json (general.port), env var, or default to 3000
+  const settings = loadSettings();
+  const port = parseInt(process.env.PORT || String(settings.general?.port || 3000), 10);
   server = new WebServer(port);
   server.routines = Object.keys(ROUTINES);
   server.onAction = handleAction;
+  server.onShutdown = async () => {
+    (globalThis as any).shutdownServer("web-ui");
+  };
 
   // Route global ui.log() calls through the web server
   setLogSink((category, message) => {
@@ -423,6 +574,27 @@ async function main(): Promise<void> {
     server.logActivity(line);
   });
 
+  // Initialize and start AI Chat service
+  aiChatService = new AiChatService((category, message) => {
+    const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+    const line = `${timestamp} [AI_CHAT] [${category}] ${message}`;
+    server.logSystem(line);
+  });
+  AiChatService.setGetBotsFn(() => [...bots.values()]);
+  aiChatService.start();
+  // Expose on globalThis for bot.ts to access
+  (globalThis as any).aiChatService = aiChatService;
+  server.logSystem("AI Chat service initialized");
+
+  // Set up mass disconnect detector callback
+  massDisconnectDetector.setTriggerCallback((affectedBots) => {
+    server.logSystem(`⚠️ MASS SESSION INVALIDATION DETECTED: ${affectedBots.length} unique bots lost sessions within 5s`);
+    server.logSystem(`Affected bots: ${affectedBots.join(", ")}`);
+    server.logSystem(`Initiating graceful shutdown for restart...`);
+    (globalThis as any).shutdownServer("mass_session_loss", true);
+  });
+  server.logSystem("Mass disconnect detector initialized");
+
   server.logSystem("SpaceMolt Bot Manager v0.2");
   server.logSystem("Loading saved sessions...");
 
@@ -443,32 +615,72 @@ async function main(): Promise<void> {
   if (bots.size > 0) {
     const assignments = server.getBotAssignments();
     server.logSystem(`Found ${bots.size} saved bot(s): ${[...bots.keys()].join(", ")}`);
+    server.logSystem(`Bot assignments: ${JSON.stringify(assignments)}`);
+    // Push initial bot list to UI immediately (shows as "idle" with default values)
+    refreshStatusTable();
 
-    // Stagger logins to avoid spamming the API
-    const LOGIN_DELAY_MS = 5000;
-    let loginIndex = 0;
+    // Session resume is fast (5s delay to match renewal queue), full login requires rate limiting (25s delay)
+    const SESSION_RESUME_DELAY_MS = 5000;
+    const FULL_LOGIN_DELAY_MS = 25000;
+    let botIndex = 0;
+
     for (const [name, bot] of bots) {
-      const delay = loginIndex * LOGIN_DELAY_MS;
-      loginIndex++;
+      const delay = botIndex * SESSION_RESUME_DELAY_MS;
+      const loginIndex = botIndex; // Capture for closure
+      botIndex++;
       setTimeout(() => {
-        bot.login().then(async (ok) => {
+        // Try session resume first (fast, no rate limit)
+        bot.resumeSession().then(async (ok) => {
           refreshStatusTable();
-          if (!ok) return;
-          // Fetch catalog data if stale (first logged-in bot triggers it)
-          if (catalogStore.isStale()) {
-            try {
-              await catalogStore.fetchAll(bot.api);
-              server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
-            } catch (err) {
-              server.logSystem(`Catalog fetch failed: ${err}`);
+          if (ok) {
+            server.logSystem(`${name} session resumed (no login delay)`);
+            // Session resumed, start routine if assigned
+            const routineKey = assignments[name];
+            if (routineKey && ROUTINES[routineKey]) {
+              server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+              await handleStart({ type: "start", bot: name, routine: routineKey });
             }
+            return;
           }
-          const routineKey = assignments[name];
-          if (!routineKey || !ROUTINES[routineKey]) return;
-          server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-          await handleStart({ type: "start", bot: name, routine: routineKey });
+
+          // Session resume failed, need full login with rate-limited delay
+          const loginDelay = loginIndex * FULL_LOGIN_DELAY_MS;
+          server.logSystem(`${name} session expired, scheduling full login in ${loginDelay / 1000}s...`);
+          server.logSystem(`DEBUG: ${name} login scheduled with delay ${loginDelay}ms (index=${loginIndex})`);
+          setTimeout(() => {
+            server.logSystem(`DEBUG: ${name} login timeout fired, calling bot.login()`);
+            bot.login().then(async (loginOk) => {
+              server.logSystem(`DEBUG: ${name} login completed, ok=${loginOk}`);
+              refreshStatusTable();
+              if (!loginOk) {
+                server.logSystem(`${name} login failed`);
+                return;
+              }
+              // Fetch catalog data if stale (first logged-in bot triggers it)
+              if (catalogStore.isStale()) {
+                try {
+                  await catalogStore.fetchAll(bot.api);
+                  server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                } catch (err) {
+                  server.logSystem(`Catalog fetch failed: ${err}`);
+                }
+              }
+              const routineKey = assignments[name];
+              server.logSystem(`DEBUG: ${name} routine assignment: ${routineKey || 'none'}`);
+              if (!routineKey || !ROUTINES[routineKey]) {
+                server.logSystem(`${name} logged in but no routine assigned`);
+                return;
+              }
+              server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+              await handleStart({ type: "start", bot: name, routine: routineKey });
+            }).catch((err) => {
+              server.logSystem(`Login failed for ${name}: ${err}`);
+              refreshStatusTable();
+            });
+          }, loginDelay);
         }).catch((err) => {
-          server.logSystem(`Login failed for ${name}: ${err}`);
+          server.logSystem(`Session resume failed for ${name}: ${err}`);
+          refreshStatusTable();
         });
       }, delay);
     }
@@ -532,25 +744,72 @@ async function main(): Promise<void> {
   // Start HTTP + WebSocket server
   server.start();
 
-  // Graceful shutdown
-  process.on("SIGINT", () => {
-    console.log("\nShutting down...");
+  // Graceful shutdown handler
+  function gracefulShutdown(signal: string, restart: boolean = false): void {
+    console.log(`\nShutting down (${signal})...`);
+    server.logSystem(`Server shutdown requested (${signal}${restart ? ", restart requested" : ""})`);
     // Clear intervals
     for (const id of intervals) clearInterval(id);
     // Flush stats before stopping bots
     const statuses = [...bots.values()].map(b => b.status());
     server.flushBotStats(statuses);
+    // Stop all running bots
     for (const [, bot] of bots) {
       if (bot.state === "running") bot.stop();
     }
+    // Stop AI Chat service
+    if (aiChatService) {
+      aiChatService.stop();
+      aiChatService = null;
+    }
+    // Clear reconnection queue to release any pending reconnection attempts
+    reconnectQueue.clear();
+    // Flush persistent data
     mapStore.flush();
     catalogStore.flush();
     server.stop();
-    process.exit(0);
-  });
+    
+    // If restarting due to mass session loss, clear all session files
+    // This forces fresh logins on restart, avoiding the invalid session loop
+    if (restart && signal === "mass_session_loss") {
+      server.logSystem(`Clearing session files for all bots...`);
+      const sessionsDir = join(BASE_DIR, "sessions");
+      if (existsSync(sessionsDir)) {
+        const botDirs = readdirSync(sessionsDir, { withFileTypes: true })
+          .filter(d => d.isDirectory())
+          .map(d => d.name);
+        
+        for (const botName of botDirs) {
+          const sessionFile = join(sessionsDir, botName, "session.json");
+          if (existsSync(sessionFile)) {
+            try {
+              rmSync(sessionFile);
+              debugLog("shutdown", `Deleted session file for ${botName}`);
+            } catch (err) {
+              server.logSystem(`Warning: Failed to delete session file for ${botName}: ${err}`);
+            }
+          }
+        }
+        server.logSystem(`Session files cleared for ${botDirs.length} bot(s)`);
+      }
+    }
+
+    // Exit with special code to signal watchdog to restart
+    // Code 100 = restart requested, code 0 = normal shutdown
+    process.exit(restart ? 100 : 0);
+  }
+
+  // Graceful shutdown on SIGINT (Ctrl+C) and SIGTERM (Windows/taskkill)
+  process.on("SIGINT", () => gracefulShutdown("SIGINT"));
+  process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
+
+  // Expose shutdown function for web UI
+  (globalThis as any).shutdownServer = gracefulShutdown;
 }
 
 main().catch((err) => {
   console.error("Fatal error:", err);
   process.exit(1);
 });
+
+

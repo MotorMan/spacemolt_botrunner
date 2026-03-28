@@ -49,6 +49,26 @@ import {
 
 // ── Settings ─────────────────────────────────────────────────
 
+type PirateTier = "small" | "medium" | "large" | "capitol" | "boss";
+
+const TIER_ORDER: Record<PirateTier, number> = {
+  "small": 1,
+  "medium": 2,
+  "large": 3,
+  "capitol": 4,
+  "boss": 5,
+};
+
+function getTierLevel(tier: PirateTier | undefined | null): number {
+  if (!tier) return 1; // default to small if unknown
+  return TIER_ORDER[tier] ?? 1;
+}
+
+function isTierTooHigh(pirateTier: PirateTier | undefined, maxTier: PirateTier): boolean {
+  if (!pirateTier) return false; // unknown tier, allow attack
+  return getTierLevel(pirateTier) > getTierLevel(maxTier);
+}
+
 function getHunterSettings(username?: string): {
   system: string;
   refuelThreshold: number;
@@ -59,6 +79,9 @@ function getHunterSettings(username?: string): {
   ammoThreshold: number;
   maxReloadAttempts: number;
   responseRange: number;
+  maxAttackTier: PirateTier;
+  fleeFromTier: PirateTier;
+  minPiratesToFlee: number;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -74,6 +97,9 @@ function getHunterSettings(username?: string): {
     ammoThreshold: (h.ammoThreshold as number) || 5,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
     responseRange: (h.responseRange as number) ?? 3,
+    maxAttackTier: ((h.maxAttackTier as PirateTier) || "large") as PirateTier,
+    fleeFromTier: ((h.fleeFromTier as PirateTier) || "boss") as PirateTier,
+    minPiratesToFlee: (h.minPiratesToFlee as number) || 3,
   };
 }
 
@@ -170,53 +196,122 @@ interface NearbyEntity {
   faction: string;
   isNPC: boolean;
   isPirate: boolean;
+  tier?: "small" | "medium" | "large" | "capitol" | "boss";
+  isBoss?: boolean;
+  hull?: number;
+  maxHull?: number;
+  shield?: number;
+  maxShield?: number;
+  status?: string;
 }
 
 function parseNearby(result: unknown): NearbyEntity[] {
   if (!result || typeof result !== "object") return [];
   const r = result as Record<string, unknown>;
-  const raw = (
-    Array.isArray(r) ? r :
-    Array.isArray(r.entities) ? r.entities :
-    Array.isArray(r.players) ? r.players :
-    Array.isArray(r.nearby) ? r.nearby :
-    []
-  ) as Array<Record<string, unknown>>;
+  const entities: NearbyEntity[] = [];
 
-  return raw
-    .map(e => {
-      const isPirate = !!(e.pirate_id);
-      const id = (e.id as string) || (e.player_id as string) || (e.entity_id as string) || (e.pirate_id as string) || "";
-      const faction = ((e.faction as string) || (e.faction_id as string) || "").toLowerCase();
-      const type = ((e.type as string) || (e.entity_type as string) || "").toLowerCase();
-      const isNPC = isPirate || !!(e.is_npc) || type === "npc" || type === "pirate" || type === "enemy";
-      return {
+  // Handle different possible response formats from get_nearby API call
+  let rawEntities: Array<Record<string, unknown>> = [];
+
+  if (Array.isArray(r)) {
+    // Direct array of entities
+    rawEntities = r;
+  } else if (Array.isArray(r.entities)) {
+    // Entities are under .entities key
+    rawEntities = r.entities as Array<Record<string, unknown>>;
+  } else if (Array.isArray(r.players) && r.players.length > 0) {
+    // Players array is present
+    rawEntities = r.players as Array<Record<string, unknown>>;
+  } else if (Array.isArray(r.nearby)) {
+    // Nearby array is present
+    rawEntities = r.nearby as Array<Record<string, unknown>>;
+  }
+
+  // Parse regular entities
+  for (const e of rawEntities) {
+    const id = (e.id as string) || (e.player_id as string) || (e.entity_id as string) || (e.pirate_id as string) || "";
+    // Safely extract faction - handling different possible field names
+    let faction = "";
+    if (typeof e.faction === "string") {
+      faction = e.faction.toLowerCase();
+    } else if (typeof e.faction_id === "string") {
+      faction = e.faction_id.toLowerCase();
+    }
+
+    // Safely extract type - handling different possible field names
+    let type = "";
+    if (typeof e.type === "string") {
+      type = e.type.toLowerCase();
+    } else if (typeof e.entity_type === "string") {
+      type = e.entity_type.toLowerCase();
+    }
+
+    const isPirate = !!(e.pirate_id) || type.includes("pirate") || faction.includes("pirate");
+    const isNPC = isPirate || !!(e.is_npc) || type === "npc" || type === "enemy" || (typeof e.name === "string" && e.name.toLowerCase().includes("drifter"));
+
+    entities.push({
+      id,
+      name: (e.name as string) || (e.username as string) || (e.pirate_name as string) || (e.pirate_id as string) || id,
+      type,
+      faction,
+      isNPC,
+      isPirate,
+    });
+  }
+
+  // Parse pirates array (special format from get_nearby at POIs)
+  if (Array.isArray(r.pirates)) {
+    const rawPirates = r.pirates as Array<Record<string, unknown>>;
+    for (const p of rawPirates) {
+      const id = (p.pirate_id as string) || "";
+      if (!id) continue;
+
+      const tier = (p.tier as string) || "small";
+      const isBoss = !!(p.is_boss as boolean);
+
+      entities.push({
         id,
-        name: (e.name as string) || (e.username as string) || (e.pirate_name as string) || id,
-        type,
-        faction,
-        isNPC,
-        isPirate,
-      };
-    })
-    .filter(e => e.id);
+        name: (p.name as string) || (p.pirate_name as string) || id,
+        type: "pirate",
+        faction: "pirate",
+        isNPC: true,
+        isPirate: true,
+        tier: tier as "small" | "medium" | "large" | "capitol" | "boss",
+        isBoss,
+        hull: p.hull as number,
+        maxHull: p.max_hull as number,
+        shield: p.shield as number,
+        maxShield: p.max_shield as number,
+        status: p.status as string,
+      });
+    }
+  }
+
+  return entities.filter(e => e.id);
 }
 
-const PIRATE_KEYWORDS = ["pirate", "raider", "outlaw", "bandit", "corsair", "marauder", "hostile"];
+const PIRATE_KEYWORDS = ["drifter", "pirate", "raider", "outlaw", "bandit", "corsair", "marauder", "hostile"];
 
-function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean): boolean {
-  if (entity.isPirate) return true;
+function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean, maxAttackTier: PirateTier = "large"): boolean {
+  if (entity.isPirate) {
+    // Check tier restriction for pirates
+    if (isTierTooHigh(entity.tier, maxAttackTier)) return false;
+    return true;
+  }
   if (onlyNPCs && !entity.isNPC) return false;
-  const factionMatch = PIRATE_KEYWORDS.some(kw => entity.faction.includes(kw));
-  const typeMatch = PIRATE_KEYWORDS.some(kw => entity.type.includes(kw));
-  const nameMatch = PIRATE_KEYWORDS.some(kw => entity.name.toLowerCase().includes(kw));
+
+  // Fixed potential undefined checks
+  const factionMatch = entity.faction ? PIRATE_KEYWORDS.some(kw => entity.faction.includes(kw)) : false;
+  const typeMatch = entity.type ? PIRATE_KEYWORDS.some(kw => entity.type.includes(kw)) : false;
+  const nameMatch = entity.name ? PIRATE_KEYWORDS.some(kw => entity.name.toLowerCase().includes(kw)) : false;
+
   return factionMatch || typeMatch || (entity.isNPC && nameMatch);
 }
 
 // ── Mission helpers ───────────────────────────────────────────
 
 const COMBAT_MISSION_KEYWORDS = [
-  "bounty", "pirate", "hunt", "kill", "eliminate", "destroy",
+  "bounty", "pirate", "hunt", "kill", "eliminate", "destroy", "drifter",
   "combat", "hostile", "contract", "patrol", "neutralize",
 ];
 
@@ -336,29 +431,41 @@ async function engageTarget(
   ctx: RoutineContext,
   target: NearbyEntity,
   fleeThreshold: number,
+  fleeFromTier: PirateTier,
+  minPiratesToFlee: number,
 ): Promise<boolean> {
   const { bot } = ctx;
 
-  // Scan before engaging
+  // If we have a valid entity to target, try to attack it regardless of scan result
+  if (!target.id) return false;
+
+  // Scan before engaging - this can be skipped for now if the target is already known
   const scanResp = await bot.exec("scan", { target_id: target.id });
-  if (!scanResp.error && scanResp.result) {
+  if (scanResp.error) {
+    ctx.log("combat", `Scan failed for ${target.name}: ${scanResp.error.message}`);
+  } else if (scanResp.result) {
     const s = scanResp.result as Record<string, unknown>;
     const shipType = (s.ship_type as string) || (s.ship as string) || "unknown";
     const faction = (s.faction as string) || target.faction || "unknown";
     ctx.log("combat", `Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
   }
 
-  // Initiate combat
+  // Initiate combat - even if we can't scan them, try to attack
   ctx.log("combat", `Engaging ${target.name}...`);
+
   const attackResp = await bot.exec("attack", { target_id: target.id });
   if (attackResp.error) {
     const msg = attackResp.error.message.toLowerCase();
-    if (msg.includes("not found") || msg.includes("invalid") || msg.includes("no target")) {
-      ctx.log("combat", `${target.name} is no longer available`);
+
+    // If this is an obvious error about not being able to engage
+    if (msg.includes("not found") || msg.includes("invalid") ||
+        msg.includes("no target") || msg.includes("already in battle")) {
+      ctx.log("combat", `${target.name} is no longer available or already fighting`);
       return false;
     }
-    ctx.log("error", `Attack failed: ${attackResp.error.message}`);
-    return false;
+
+    // If attack failed but not because they're gone, just log and continue
+    ctx.log("error", `Attack attempt on ${target.name}: ${attackResp.error.message}`);
   }
 
   ctx.log("combat", "Combat initiated — advancing to close range...");
@@ -379,7 +486,7 @@ async function engageTarget(
     if (advResp.error) break;
   }
 
-  // Main combat loop
+  // Main combat loop with better logic
   const MAX_COMBAT_TICKS = 30;
   for (let tick = 0; tick < MAX_COMBAT_TICKS; tick++) {
     if (bot.state !== "running") return false;
@@ -396,6 +503,35 @@ async function engageTarget(
       return false;
     }
 
+    // Check for pirate-based flee conditions
+    const nearbyResp = await bot.exec("get_nearby");
+    if (!nearbyResp.error && nearbyResp.result) {
+      // Track player names from nearby scan
+      bot.trackNearbyPlayers(nearbyResp.result);
+      
+      const entities = parseNearby(nearbyResp.result);
+      const pirateCount = entities.filter(e => e.isPirate).length;
+      const highestPirateTier = entities
+        .filter(e => e.isPirate && e.tier)
+        .reduce((max, e) => getTierLevel(e.tier) > getTierLevel(max) ? e.tier! : max, "small" as PirateTier);
+
+      // Flee if too many pirates
+      if (pirateCount >= minPiratesToFlee) {
+        ctx.log("combat", `Too many pirates (${pirateCount}) — fleeing!`);
+        await bot.exec("stance", { stance: "flee" });
+        await bot.exec("retreat");
+        return false;
+      }
+
+      // Flee if pirate tier is too high
+      if (isTierTooHigh(highestPirateTier, fleeFromTier)) {
+        ctx.log("combat", `Pirate tier too high (${highestPirateTier}) — fleeing!`);
+        await bot.exec("stance", { stance: "flee" });
+        await bot.exec("retreat");
+        return false;
+      }
+    }
+
     // Brace when shields are critical and hull is hurting
     const shieldsCritical = shieldPct < 15 && hullPct < 70;
     if (shieldsCritical) {
@@ -406,28 +542,75 @@ async function engageTarget(
     }
 
     ctx.log("combat", `Tick ${tick + 1}: hull ${hullPct}% | shields ${shieldPct}% — attacking ${target.name}`);
-    const atkResp = await bot.exec("attack", { target_id: target.id });
 
-    if (atkResp.error) {
-      const msg = atkResp.error.message.toLowerCase();
-      if (
-        msg.includes("not in battle") || msg.includes("no battle") ||
-        msg.includes("battle_over") || msg.includes("destroyed") ||
-        msg.includes("dead") || msg.includes("not found") ||
-        msg.includes("already") || msg.includes("ended")
-      ) {
-        ctx.log("combat", `${target.name} eliminated`);
+    // Check if we're still in combat with this target
+    const nearbyCheck = await bot.exec("get_nearby");
+    let entities = [];
+
+    if (!nearbyCheck.error && nearbyCheck.result) {
+      // Track player names from nearby scan
+      bot.trackNearbyPlayers(nearbyCheck.result);
+      
+      entities = parseNearby(nearbyCheck.result);
+
+
+      // If the entity is present, perform attack
+      if (entities.some(e => e.id === target.id)) {
+        const atkResp = await bot.exec("attack", { target_id: target.id });
+
+        if (atkResp.error) {
+          const msg = atkResp.error.message.toLowerCase();
+
+          // If combat has ended with this entity, return true
+          if (
+            msg.includes("not in battle") || msg.includes("no battle") ||
+            msg.includes("battle_over") || msg.includes("destroyed") ||
+            msg.includes("dead") || msg.includes("not found") ||
+            msg.includes("already") || msg.includes("ended")
+          ) {
+            ctx.log("combat", `${target.name} eliminated`);
+            return true;
+          }
+
+          // If we get other errors, continue combat (maybe they're just busy)
+        }
+      } else {
+        // Target no longer in nearby - assume defeated
+        ctx.log("combat", `${target.name} is gone — eliminated or fled`);
         return true;
       }
-      ctx.log("combat", `Attack error: ${atkResp.error.message} — assuming combat over`);
-      return true;
+    } else {
+      // When we can't get nearby scan data, but have a target that exists,
+      // just continue attacking it with fallback logic
+
+      const atkResp = await bot.exec("attack", { target_id: target.id });
+
+      if (atkResp.error) {
+        const msg = atkResp.error.message.toLowerCase();
+
+        // If the error indicates combat is over, return true
+        if (
+          msg.includes("not in battle") || msg.includes("no battle") ||
+          msg.includes("battle_over") || msg.includes("destroyed") ||
+          msg.includes("dead") || msg.includes("not found") ||
+          msg.includes("already") || msg.includes("ended")
+        ) {
+          ctx.log("combat", `${target.name} eliminated`);
+          return true;
+        }
+
+        // If error is something else, just continue - this might be due to API limitations
+      }
     }
 
-    // If target has disappeared from nearby scan, combat is done
-    const nearbyResp = await bot.exec("get_nearby");
-    if (!nearbyResp.error) {
-      const entities = parseNearby(nearbyResp.result);
-      if (!entities.some(e => e.id === target.id)) {
+    // Additional check for the target's presence in case of API inconsistency
+    const finalCheck = await bot.exec("get_nearby");
+    if (!finalCheck.error && finalCheck.result) {
+      // Track player names from nearby scan
+      bot.trackNearbyPlayers(finalCheck.result);
+      
+      const entitiesFinal = parseNearby(finalCheck.result);
+      if (!entitiesFinal.some(e => e.id === target.id)) {
         ctx.log("combat", `${target.name} is gone — eliminated or fled`);
         return true;
       }
@@ -761,13 +944,18 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       // Scan for targets
       yield "scan_for_targets";
       const nearbyResp = await bot.exec("get_nearby");
+      //ctx.log("info", `get_nearby: ${nearbyResp}.`);
       if (nearbyResp.error) {
         ctx.log("error", `get_nearby at ${poi.name}: ${nearbyResp.error.message}`);
         continue;
       }
 
+      // Track player names from nearby scan
+      bot.trackNearbyPlayers(nearbyResp.result);
+
       const entities = parseNearby(nearbyResp.result);
-      const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs));
+      ctx.log("info", `entities: ${entities}`);
+      const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
 
       if (targets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
@@ -797,7 +985,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
         }
 
         yield "engage";
-        const won = await engageTarget(ctx, target, settings.fleeThreshold);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee);
 
         if (won) {
           totalKills++;
@@ -854,7 +1042,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       await bot.refreshCargo();
       let unsold = false;
       for (const item of bot.inventory) {
-        if (item.itemId.toLowerCase().includes("fuel") || item.itemId.toLowerCase().includes("energy_cell")) continue;
+        if (item.itemId.toLowerCase().includes("fuel") || item.itemId.toLowerCase().includes("energy_cell") || item.itemId.toLowerCase().includes("repair")) continue;
         ctx.log("trade", `Selling ${item.quantity}x ${item.name}...`);
         const sellResp = await bot.exec("sell", { item_id: item.itemId, quantity: item.quantity });
         if (sellResp.error) unsold = true;
@@ -905,3 +1093,9 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
     }
   }
 };
+
+
+
+
+
+

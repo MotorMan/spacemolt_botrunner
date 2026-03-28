@@ -18,10 +18,19 @@ interface CraftLimit {
   limit: number;
 }
 
+/** Ship Passive recipe IDs that run automatically and cannot be crafted manually. */
+const SHIP_PASSIVE_RECIPE_IDS = new Set([
+  "onboard_alloy_synthesis",
+  "onboard_munitions_fabrication",
+]);
+
 function getCrafterSettings(): {
   craftLimits: CraftLimit[];
+  enabledCategories: string[];
   refuelThreshold: number;
   repairThreshold: number;
+  categoryAssignments: Record<string, string[]>;
+  botQuotaOverrides: Record<string, Record<string, number>>;
 } {
   const all = readSettings();
   const c = all.crafter || {};
@@ -29,23 +38,31 @@ function getCrafterSettings(): {
   const craftLimits: CraftLimit[] = [];
   for (const [recipeId, limit] of Object.entries(rawLimits)) {
     if (limit > 0) {
+      // Filter out Ship Passive recipes - they can't be crafted manually
+      if (SHIP_PASSIVE_RECIPE_IDS.has(recipeId)) {
+        continue; // Skip silently
+      }
       craftLimits.push({ recipeId, limit });
     }
   }
+  // Default enabled categories for when no specific recipes are configured
+  const defaultCategories = ["Refining", "Components", "Consumables"];
+  const enabledCategories = (c.enabledCategories as string[]) || defaultCategories;
+  // Per-bot category assignments: { botName: ["Refining", "Components"] }
+  const categoryAssignments = (c.categoryAssignments as Record<string, string[]>) || {};
+  // Per-bot quota overrides: { botName: { recipeId: limit } }
+  const botQuotaOverrides = (c.botQuotaOverrides as Record<string, Record<string, number>>) || {};
   return {
     craftLimits,
+    enabledCategories,
     refuelThreshold: (c.refuelThreshold as number) || 50,
     repairThreshold: (c.repairThreshold as number) || 40,
+    categoryAssignments,
+    botQuotaOverrides,
   };
 }
 
 // ── Recipe/inventory helpers ─────────────────────────────────
-
-interface RecipeSkillReq {
-  skillId: string;
-  skillName: string;
-  level: number;
-}
 
 interface Recipe {
   recipe_id: string;
@@ -54,7 +71,7 @@ interface Recipe {
   output_item_id: string;
   output_name: string;
   output_quantity: number;
-  requiredSkill: RecipeSkillReq | null;
+  category?: string;
 }
 
 function parseRecipes(data: unknown): Recipe[] {
@@ -87,26 +104,6 @@ function parseRecipes(data: unknown): Recipe[] {
       ? (rawOutputs[0] as Record<string, unknown>) || {}
       : (rawOutputs as Record<string, unknown>) || {};
 
-    // Parse skill requirement from various API shapes
-    let requiredSkill: RecipeSkillReq | null = null;
-    const skillObj = (r.required_skill || r.skill) as Record<string, unknown> | undefined;
-    if (skillObj && typeof skillObj === "object") {
-      const sId = (skillObj.skill_id as string) || (skillObj.id as string) || (skillObj.name as string) || "";
-      const sName = (skillObj.name as string) || sId;
-      const sLevel = (skillObj.level as number) || (skillObj.min_level as number) || 0;
-      if (sId && sLevel > 0) requiredSkill = { skillId: sId, skillName: sName, level: sLevel };
-    }
-    // Also check required_skills: Record<string, number>
-    if (!requiredSkill && r.required_skills && typeof r.required_skills === "object") {
-      const skills = r.required_skills as Record<string, number>;
-      for (const [sId, sLevel] of Object.entries(skills)) {
-        if (sLevel > 0) {
-          requiredSkill = { skillId: sId, skillName: sId, level: sLevel };
-          break; // use the first skill requirement
-        }
-      }
-    }
-
     return {
       recipe_id: (r.recipe_id as string) || (r.id as string) || "",
       name: (r.name as string) || (r.recipe_id as string) || "",
@@ -118,7 +115,7 @@ function parseRecipes(data: unknown): Recipe[] {
       output_item_id: (output.item_id as string) || (output.id as string) || (output.item as string) || (r.output_item_id as string) || "",
       output_name: (output.name as string) || (output.item_name as string) || (r.name as string) || "",
       output_quantity: (output.quantity as number) || (output.amount as number) || (output.count as number) || 1,
-      requiredSkill,
+      category: (r.category as string) || "",
     };
   }).filter(r => r.recipe_id);
 }
@@ -157,7 +154,7 @@ async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
 }
 
 /** Count how many of an item exist in cargo + storage + faction storage. */
-function countItem(ctx: RoutineContext, itemId: string): number {
+function countItem(ctx: RoutineContext, itemId: string, personalMode: boolean = false): number {
   const { bot } = ctx;
   let total = 0;
   for (const i of bot.inventory) {
@@ -166,8 +163,10 @@ function countItem(ctx: RoutineContext, itemId: string): number {
   for (const i of bot.storage) {
     if (i.itemId === itemId) total += i.quantity;
   }
-  for (const i of bot.factionStorage) {
-    if (i.itemId === itemId) total += i.quantity;
+  if (!personalMode) {
+    for (const i of bot.factionStorage) {
+      if (i.itemId === itemId) total += i.quantity;
+    }
   }
   return total;
 }
@@ -182,73 +181,134 @@ function countInCargo(ctx: RoutineContext, itemId: string): number {
 }
 
 /** Withdraw materials from station storage into cargo for a recipe. */
-async function withdrawStorageMaterials(ctx: RoutineContext, recipe: Recipe): Promise<void> {
-  const { bot } = ctx;
-  for (const comp of recipe.components) {
-    const inCargo = countInCargo(ctx, comp.item_id);
-    if (inCargo >= comp.quantity) continue;
-
-    // Check cargo space before withdrawing
-    const freeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
-    if (freeSpace <= 0) break;
-
-    const needed = comp.quantity - inCargo;
-    const inStorage = bot.storage.find(i => i.itemId === comp.item_id);
-    if (!inStorage || inStorage.quantity <= 0) continue;
-
-    const withdrawQty = Math.min(needed, inStorage.quantity, freeSpace);
-    const resp = await bot.exec("withdraw_items", { item_id: comp.item_id, quantity: withdrawQty });
-    if (!resp.error) {
-      ctx.log("craft", `Withdrew ${withdrawQty}x ${comp.name || comp.item_id} from station storage`);
-      await bot.refreshStatus(); // update cargo count
-    }
-  }
-  await bot.refreshCargo();
+async function withdrawStorageMaterials(ctx: RoutineContext, recipe: Recipe, batchSize: number = 1): Promise<void> {
+  // No-op: crafting automatically pulls from personal storage.
+  // Materials in personal storage are already accessible, no need to move to cargo.
+  // This function is kept for backward compatibility in call sites.
 }
 
-/** Withdraw materials from faction storage into cargo for a recipe. */
-async function withdrawFactionMaterials(ctx: RoutineContext, recipe: Recipe): Promise<void> {
+/** Withdraw materials from faction storage into personal storage for a recipe. */
+async function withdrawFactionMaterials(ctx: RoutineContext, recipe: Recipe, batchSize: number = 1, personalMode: boolean = false): Promise<void> {
+  if (personalMode) return; // No faction access in personal mode
+  
   const { bot } = ctx;
   for (const comp of recipe.components) {
-    const inCargo = countInCargo(ctx, comp.item_id);
-    if (inCargo >= comp.quantity) continue;
+    // Check cargo + personal storage (crafting uses both)
+    let have = 0;
+    for (const i of bot.inventory) {
+      if (i.itemId === comp.item_id) have += i.quantity;
+    }
+    for (const i of bot.storage) {
+      if (i.itemId === comp.item_id) have += i.quantity;
+    }
+    const totalNeeded = comp.quantity * batchSize;
+    if (have >= totalNeeded) continue;
 
-    // Check cargo space before withdrawing
-    const freeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
-    if (freeSpace <= 0) break;
-
-    const needed = comp.quantity - inCargo;
+    const needed = totalNeeded - have;
     const inFaction = bot.factionStorage.find(i => i.itemId === comp.item_id);
     if (!inFaction || inFaction.quantity <= 0) continue;
 
-    const withdrawQty = Math.min(needed, inFaction.quantity, freeSpace);
-    const resp = await bot.exec("faction_withdraw_items", { item_id: comp.item_id, quantity: withdrawQty });
+    const withdrawQty = Math.min(needed, inFaction.quantity);
+    const resp = await bot.exec("storage", { action: "deposit", target: "self", item_id: comp.item_id, quantity: withdrawQty, source: "faction" });
     if (!resp.error) {
       ctx.log("craft", `Withdrew ${withdrawQty}x ${comp.name || comp.item_id} from faction storage`);
       logFactionActivity(ctx, "withdraw", `Withdrew ${withdrawQty}x ${comp.name || comp.item_id} from faction storage`);
-      await bot.refreshStatus(); // update cargo count
+      await bot.refreshStorage();
+    } else {
+      ctx.log("error", `Failed to withdraw ${comp.name || comp.item_id}: ${resp.error?.message}`);
     }
   }
-  await bot.refreshCargo();
 }
 
 /** Check if we have materials in cargo for a recipe. Returns missing item info or null if all present. */
-function getMissingMaterial(ctx: RoutineContext, recipe: Recipe): { name: string; need: number; have: number } | null {
+function getMissingMaterial(ctx: RoutineContext, recipe: Recipe, batchSize: number = 1, personalMode: boolean = false): { name: string; need: number; have: number } | null {
+  const { bot } = ctx;
   for (const comp of recipe.components) {
-    const have = countInCargo(ctx, comp.item_id);
-    if (have < comp.quantity) {
-      return { name: comp.name || comp.item_id, need: comp.quantity, have };
+    // Crafting pulls from both cargo and personal storage
+    let have = 0;
+    for (const i of bot.inventory) {
+      if (i.itemId === comp.item_id) have += i.quantity;
+    }
+    for (const i of bot.storage) {
+      if (i.itemId === comp.item_id) have += i.quantity;
+    }
+    if (!personalMode) {
+      for (const i of bot.factionStorage) {
+        if (i.itemId === comp.item_id) have += i.quantity;
+      }
+    }
+    const totalNeeded = comp.quantity * batchSize;
+    if (have < totalNeeded) {
+      return { name: comp.name || comp.item_id, need: totalNeeded, have };
     }
   }
   return null;
 }
 
-/** Check if materials exist anywhere (cargo + storage + faction). */
-function hasMaterialsAnywhere(ctx: RoutineContext, recipe: Recipe): boolean {
+/** Check if materials exist in cargo + personal storage (accessible by craft command). */
+function hasMaterialsAccessible(ctx: RoutineContext, recipe: Recipe, batchSize: number = 1, personalMode: boolean = false): boolean {
+  const { bot } = ctx;
   for (const comp of recipe.components) {
-    if (countItem(ctx, comp.item_id) < comp.quantity) return false;
+    let total = 0;
+    for (const i of bot.inventory) {
+      if (i.itemId === comp.item_id) total += i.quantity;
+    }
+    for (const i of bot.storage) {
+      if (i.itemId === comp.item_id) total += i.quantity;
+    }
+    if (!personalMode) {
+      for (const i of bot.factionStorage) {
+        if (i.itemId === comp.item_id) total += i.quantity;
+      }
+    }
+    const needed = comp.quantity * batchSize;
+    if (total < needed) return false;
   }
   return true;
+}
+
+/** Check if materials exist anywhere (cargo + storage + faction). */
+function hasMaterialsAnywhere(ctx: RoutineContext, recipe: Recipe, batchSize: number = 1, personalMode: boolean = false): boolean {
+  for (const comp of recipe.components) {
+    const total = countItem(ctx, comp.item_id, personalMode);
+    const needed = comp.quantity * batchSize;
+    if (total < needed) return false;
+  }
+  return true;
+}
+
+/**
+ * Calculate the maximum number of times a recipe can be crafted based on available materials.
+ * Checks cargo + personal storage (what the craft command can actually access).
+ * Returns 0 if any component is missing.
+ */
+function calculateMaxCraftable(ctx: RoutineContext, recipe: Recipe, personalMode: boolean = false): number {
+  const { bot } = ctx;
+  let maxCrafts = Infinity;
+
+  for (const comp of recipe.components) {
+    // Count in cargo + personal storage only (faction storage not directly accessible by craft command)
+    let totalAvailable = 0;
+    for (const i of bot.inventory) {
+      if (i.itemId === comp.item_id) totalAvailable += i.quantity;
+    }
+    for (const i of bot.storage) {
+      if (i.itemId === comp.item_id) totalAvailable += i.quantity;
+    }
+    if (!personalMode) {
+      // Include faction storage for material availability check
+      for (const i of bot.factionStorage) {
+        if (i.itemId === comp.item_id) totalAvailable += i.quantity;
+      }
+    }
+
+    const craftsPossible = Math.floor(totalAvailable / comp.quantity);
+    if (craftsPossible < maxCrafts) {
+      maxCrafts = craftsPossible;
+    }
+  }
+
+  return maxCrafts === Infinity ? 0 : maxCrafts;
 }
 
 /** Build a lookup: output_item_id → Recipe, so we can find what recipe produces a given item. */
@@ -273,24 +333,29 @@ async function craftPrerequisites(
   recipe: Recipe,
   recipeIndex: Map<string, Recipe>,
   depth: number = 0,
+  personalMode: boolean = false,
 ): Promise<string[]> {
   if (depth > 2) return []; // prevent infinite recursion
   const { bot } = ctx;
   const crafted: string[] = [];
 
   for (const comp of recipe.components) {
-    const totalAvailable = countItem(ctx, comp.item_id);
+    const totalAvailable = countItem(ctx, comp.item_id, personalMode);
     if (totalAvailable >= comp.quantity) continue; // have enough
 
     const deficit = comp.quantity - totalAvailable;
     const prereqRecipe = recipeIndex.get(comp.item_id);
-    if (!prereqRecipe) continue; // no recipe to craft this item
+    if (!prereqRecipe) {
+      // DEBUG: No recipe found to craft this component
+      // ctx.log("craft", `  No recipe found to craft ${comp.name || comp.item_id}`);
+      continue; // no recipe to craft this item
+    }
 
     // How many batches do we need? (each batch produces output_quantity)
     const batchesNeeded = Math.ceil(deficit / (prereqRecipe.output_quantity || 1));
 
     // Recursively craft sub-prerequisites first
-    const subCrafted = await craftPrerequisites(ctx, prereqRecipe, recipeIndex, depth + 1);
+    const subCrafted = await craftPrerequisites(ctx, prereqRecipe, recipeIndex, depth + 1, personalMode);
     crafted.push(...subCrafted);
 
     // Refresh inventories after sub-crafting
@@ -301,7 +366,12 @@ async function craftPrerequisites(
     }
 
     // Check if we can craft the prerequisite now
-    if (!hasMaterialsAnywhere(ctx, prereqRecipe)) continue;
+    const prereqMaterialsExist = hasMaterialsAnywhere(ctx, prereqRecipe, 1, personalMode);
+    if (!prereqMaterialsExist) {
+      // DEBUG: Raw materials not available
+      // ctx.log("craft", `  Cannot craft ${prereqRecipe.name}: raw materials not available anywhere`);
+      continue;
+    }
 
     // Withdraw materials for the prerequisite
     // First deposit any crafted items in cargo to make space
@@ -311,27 +381,52 @@ async function craftPrerequisites(
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
       // Don't deposit items we need as components for this prereq
       if (prereqRecipe.components.some(c => c.item_id === item.itemId)) continue;
-      const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+      // Use unified storage command: deposit from cargo to faction storage
+      const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
       if (dResp.error) {
-        await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+        // Fallback: deposit to personal storage
+        await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
       }
     }
     await bot.refreshCargo();
     await bot.refreshStatus();
 
-    await withdrawFactionMaterials(ctx, prereqRecipe);
+    await withdrawFactionMaterials(ctx, prereqRecipe, 1, personalMode);
     await withdrawStorageMaterials(ctx, prereqRecipe);
 
-    const stillMissing = getMissingMaterial(ctx, prereqRecipe);
-    if (stillMissing) continue; // can't get all materials into cargo
+    const stillMissing = getMissingMaterial(ctx, prereqRecipe, 1, personalMode);
+    if (stillMissing) {
+      // DEBUG: Still missing materials after withdrawal
+      // ctx.log("craft", `  Cannot craft ${prereqRecipe.name}: still missing ${stillMissing.need}x ${stillMissing.name} after withdrawal`);
+      continue; // can't get all materials into cargo
+    }
 
     // Craft the prerequisite
     for (let batch = 0; batch < batchesNeeded && bot.state === "running"; batch++) {
       const craftResp = await bot.exec("craft", { recipe_id: prereqRecipe.recipe_id, count: 1 });
-      if (craftResp.error) break;
+      if (craftResp.error) {
+        // DEBUG: Craft failed
+        // ctx.log("craft", `  Failed to craft ${prereqRecipe.name}: ${craftResp.error?.message}`);
+        break;
+      }
 
       const result = craftResp.result as Record<string, unknown> | undefined;
-      const qty = (result?.count as number) || (result?.quantity as number) || (prereqRecipe.output_quantity || 1);
+      let qty = 0;
+      if (result) {
+        qty = (result.count as number) || (result.quantity as number) || 0;
+        if (qty === 0) {
+          const items = (result.items as Array<Record<string, unknown>>) ||
+                       (result.output as Array<Record<string, unknown>>) ||
+                       (result.produced as Array<Record<string, unknown>>);
+          if (items && items.length > 0) {
+            for (const item of items) {
+              qty += (item.quantity as number) || (item.count as number) || 0;
+            }
+          }
+        }
+      }
+      if (qty === 0) qty = prereqRecipe.output_quantity || 1;
+
       crafted.push(`${qty}x ${prereqRecipe.output_name || prereqRecipe.name}`);
       bot.stats.totalCrafted += qty;
 
@@ -343,16 +438,16 @@ async function craftPrerequisites(
       }
 
       // Re-check if we still need more
-      const newTotal = countItem(ctx, comp.item_id);
+      const newTotal = countItem(ctx, comp.item_id, personalMode);
       if (newTotal >= comp.quantity) break;
 
       // Check if we still have materials for another batch
-      const prereqMissing = getMissingMaterial(ctx, prereqRecipe);
+      const prereqMissing = getMissingMaterial(ctx, prereqRecipe, 1, personalMode);
       if (prereqMissing) {
         // Try to withdraw more materials
-        await withdrawFactionMaterials(ctx, prereqRecipe);
+        await withdrawFactionMaterials(ctx, prereqRecipe, 1, personalMode);
         await withdrawStorageMaterials(ctx, prereqRecipe);
-        if (getMissingMaterial(ctx, prereqRecipe)) break;
+        if (getMissingMaterial(ctx, prereqRecipe, 1, personalMode)) break;
       }
     }
   }
@@ -361,103 +456,238 @@ async function craftPrerequisites(
 }
 
 /**
- * Grind crafting XP by crafting the simplest recipes we have materials for.
- * Tries up to 5 crafts of the cheapest available recipe to level up skill.
+ * Craft useful items from enabled categories when no specific recipes are configured.
+ * Prioritizes valuable outputs (refining, components) over simple XP-grinding recipes.
  * Returns list of items crafted for logging.
  */
-async function grindCraftingXP(
+async function craftFromCategories(
   ctx: RoutineContext,
   recipes: Recipe[],
   recipeIndex: Map<string, Recipe>,
-  allowedRecipeIds?: Set<string>,
+  enabledCategories: string[],
+  craftingSkillLevel: number,
+  personalMode: boolean = false,
 ): Promise<string[]> {
   const { bot } = ctx;
   const crafted: string[] = [];
 
-  // Find recipes we can actually craft right now (have materials, not skill-blocked)
-  // Only consider recipes from settings (or their prerequisites) — not random items
-  const candidates: Array<{ recipe: Recipe; complexity: number }> = [];
+  // Priority order for categories - most useful first
+  const categoryPriority: Record<string, number> = {
+    "Refining": 1,
+    "Components": 2,
+    "Consumables": 3,
+    "Modules": 4,
+    "Equipment": 5,
+    "Weapons": 6,
+    "Defense": 7,
+    "Ice Refining": 8,
+    "Gas Processing": 9,
+    "Electronic Warfare": 10,
+    "Stealth": 11,
+  };
+
+  // Find recipes we can craft, sorted by category priority then complexity
+  const candidates: Array<{ recipe: Recipe; priority: number; complexity: number }> = [];
+
+  // Refresh storage before checking materials to ensure we have fresh data
+  if (bot.docked) {
+    await bot.refreshStorage();
+    if (!personalMode) {
+      await bot.refreshFactionStorage();
+    }
+  }
+
+  // Debug: log storage counts
+  ctx.log("craft", `PERSONAL MODE ${personalMode}: Storage has ${bot.storage.length} items, Cargo has ${bot.inventory.length} items`);
+  if (bot.storage.length > 0) {
+    const sampleItems = bot.storage.slice(0, 5).map(i => `${i.name} (${i.itemId}) [${i.quantity}]`).join(", ");
+    ctx.log("craft", `Storage sample: ${sampleItems}${bot.storage.length > 5 ? "..." : ""}`);
+  }
 
   for (const recipe of recipes) {
-    // If settings specify allowed recipes, only grind those (or their components)
-    if (allowedRecipeIds && allowedRecipeIds.size > 0) {
-      const isAllowed = allowedRecipeIds.has(recipe.recipe_id) ||
-        allowedRecipeIds.has(recipe.name) ||
-        allowedRecipeIds.has(recipe.name.toLowerCase());
-      // Also allow recipes whose output is a component of an allowed recipe
-      const isPrereq = [...allowedRecipeIds].some(id => {
-        const parent = recipeIndex.get(id);
-        return parent?.components.some(c => c.item_id === recipe.output_item_id);
-      });
-      if (!isAllowed && !isPrereq) continue;
-    }
-    // Skip recipes with no ingredients — they grant no skill XP
+    // Only allow recipes from enabled categories
+    const recipeCategory = recipe.category || "";
+    if (!enabledCategories.includes(recipeCategory)) continue;
+
+    // Skip recipes with no ingredients
     if (recipe.components.length === 0) continue;
-    if (!hasMaterialsAnywhere(ctx, recipe)) continue;
-    // Only grind recipes we have the skill for
-    if (!canCraftSkillwise(ctx, recipe).ok) continue;
-    // Complexity = total number of component items needed
+    // Skip recipes that cannot be crafted manually
+    if (!isRecipeCraftable(recipe).ok) continue;
+    // Skip if we don't have materials
+    const hasMats = hasMaterialsAnywhere(ctx, recipe, 1, personalMode);
+    if (!hasMats) continue;
+
+    const priority = categoryPriority[recipeCategory] || 99;
     const complexity = recipe.components.reduce((sum, c) => sum + c.quantity, 0);
-    candidates.push({ recipe, complexity });
+    candidates.push({ recipe, priority, complexity });
   }
 
   if (candidates.length === 0) return crafted;
 
-  // Sort by complexity (simplest first — basic refining recipes)
-  candidates.sort((a, b) => a.complexity - b.complexity);
+  // Sort by category priority first, then by complexity (prefer simpler within same category)
+  candidates.sort((a, b) => {
+    if (a.priority !== b.priority) return a.priority - b.priority;
+    return a.complexity - b.complexity;
+  });
 
-  // Try the simplest recipe
-  const target = candidates[0].recipe;
-  ctx.log("craft", `Grinding XP: crafting ${target.name} (${target.components.map(c => `${c.quantity}x ${c.name}`).join(", ")})...`);
-
-  // Deposit non-essential cargo to make space
-  for (const item of [...bot.inventory]) {
-    if (item.quantity <= 0) continue;
-    const lower = item.itemId.toLowerCase();
-    if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-    if (target.components.some(c => c.item_id === item.itemId)) continue;
-    const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
-    if (dResp.error) {
-      await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+  // Deposit non-essential cargo to make space before crafting (only in faction mode)
+  if (!personalMode) {
+    for (const item of [...bot.inventory]) {
+      if (item.quantity <= 0) continue;
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+      const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+      if (dResp.error) {
+        await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+      }
     }
   }
   await bot.refreshCargo();
   await bot.refreshStatus();
 
-  const MAX_XP_CRAFTS = 5;
-  for (let i = 0; i < MAX_XP_CRAFTS && bot.state === "running"; i++) {
+  // Craft up to 10 batches total, iterating through available recipes
+  const MAX_CRAFTS = 10;
+  let totalCrafted = 0;
+
+  while (totalCrafted < MAX_CRAFTS && bot.state === "running") {
+    // Refresh cargo only - storage was already loaded and should persist
+    // (refreshStorage would re-query and might lose items from other stations)
     await bot.refreshCargo();
-    if (bot.docked) {
-      await bot.refreshStorage();
+    if (bot.docked && !personalMode) {
+      // Only refresh faction storage in faction mode
       await bot.refreshFactionStorage();
     }
 
-    if (!hasMaterialsAnywhere(ctx, target)) break;
+    // Find the first recipe we can craft
+    let target: Recipe | null = null;
+    for (const candidate of candidates) {
+      if (hasMaterialsAnywhere(ctx, candidate.recipe, 1, personalMode)) {
+        target = candidate.recipe;
+        break;
+      }
+    }
 
-    await withdrawFactionMaterials(ctx, target);
-    await withdrawStorageMaterials(ctx, target);
+    if (!target) {
+      ctx.log("info", `No materials available for any recipe in assigned categories. Waiting 60s...`);
+      break;
+    }
 
-    if (getMissingMaterial(ctx, target)) break;
+    ctx.log("craft", `Crafting from ${target.category}: ${target.name} (${target.components.map(c => `${c.quantity}x ${c.name}`).join(", ")})...`);
 
-    const craftResp = await bot.exec("craft", { recipe_id: target.recipe_id, count: 1 });
-    if (craftResp.error) break;
+    // Calculate max craftable including faction storage (total available across all locations)
+    let maxCraftable = Infinity;
+    for (const comp of target.components) {
+      let totalAvailable = 0;
+      for (const i of bot.inventory) {
+        if (i.itemId === comp.item_id) totalAvailable += i.quantity;
+      }
+      for (const i of bot.storage) {
+        if (i.itemId === comp.item_id) totalAvailable += i.quantity;
+      }
+      if (!personalMode) {
+        const inFaction = bot.factionStorage.find(i => i.itemId === comp.item_id);
+        if (inFaction) totalAvailable += inFaction.quantity;
+      }
+
+      const maxFromThisComp = Math.floor(totalAvailable / comp.quantity);
+      if (maxFromThisComp < maxCraftable) {
+        maxCraftable = maxFromThisComp;
+      }
+    }
+    if (maxCraftable === Infinity) maxCraftable = 0;
+
+    // Determine batch size: limited by skill level, remaining craft slots, and available materials
+    // Note: craftingSkillLevel of 0 still allows crafting 1 at a time
+    const maxBatchFromSkill = Math.max(1, craftingSkillLevel);
+    const desiredBatchSize = Math.min(maxBatchFromSkill, MAX_CRAFTS - totalCrafted);
+    const actualBatchSize = Math.min(desiredBatchSize, maxCraftable);
+
+    if (actualBatchSize <= 0) {
+      ctx.log("warn", `No materials available for ${target.name}, skipping`);
+      const idx = candidates.findIndex(c => c.recipe === target);
+      if (idx !== -1) candidates.splice(idx, 1);
+      if (candidates.length === 0) break;
+      continue;
+    }
+
+    ctx.log("craft", `Crafting ${actualBatchSize}x ${target.name} (skill: ${craftingSkillLevel}, maxCraftable: ${maxCraftable})...`);
+
+    // Withdraw ALL materials needed for the full batch upfront
+    await withdrawFactionMaterials(ctx, target, actualBatchSize, personalMode);
+    await bot.refreshStorage();
+    await bot.refreshFactionStorage();
+
+    // Verify we have materials after withdrawal
+    const missing = getMissingMaterial(ctx, target, actualBatchSize, personalMode);
+    if (missing) {
+      ctx.log("warn", `Missing ${missing.need}x ${missing.name} after withdrawal for ${target.name} (batch: ${actualBatchSize}), skipping`);
+      const idx = candidates.findIndex(c => c.recipe === target);
+      if (idx !== -1) candidates.splice(idx, 1);
+      if (candidates.length === 0) break;
+      continue;
+    }
+
+    // Craft the full batch
+    const craftResp = await bot.exec("craft", { recipe_id: target.recipe_id, count: actualBatchSize });
+
+    if (craftResp.error) {
+      ctx.log("error", `craft: ${craftResp.error.message}`);
+      // Remove this recipe from candidates and try next
+      const idx = candidates.findIndex(c => c.recipe === target);
+      if (idx !== -1) candidates.splice(idx, 1);
+      if (candidates.length === 0) break;
+      continue;
+    }
 
     const result = craftResp.result as Record<string, unknown> | undefined;
-    const qty = (result?.count as number) || (result?.quantity as number) || (target.output_quantity || 1);
+    let qty = 0;
+    if (result) {
+      qty = (result.count as number) || (result.quantity as number) || 0;
+      if (qty === 0) {
+        const items = (result.items as Array<Record<string, unknown>>) ||
+                     (result.output as Array<Record<string, unknown>>) ||
+                     (result.produced as Array<Record<string, unknown>>);
+        if (items && items.length > 0) {
+          for (const item of items) {
+            qty += (item.quantity as number) || (item.count as number) || 0;
+          }
+        }
+      }
+    }
+    if (qty === 0) qty = target.output_quantity || 1;
+
     crafted.push(`${qty}x ${target.output_name || target.name}`);
     bot.stats.totalCrafted += qty;
+    totalCrafted++;
+
+    // Refresh inventories after craft to update material counts
+    await bot.refreshStorage();
+    await bot.refreshFactionStorage();
   }
 
   return crafted;
 }
 
-/** Check if the bot has the required skill level to craft a recipe. */
-function canCraftSkillwise(ctx: RoutineContext, recipe: Recipe): { ok: boolean; reason: string } {
-  if (!recipe.requiredSkill) return { ok: true, reason: "" };
-  const { skillId, skillName, level } = recipe.requiredSkill;
-  const myLevel = ctx.bot.getSkillLevel(skillId);
-  if (myLevel >= level) return { ok: true, reason: "" };
-  return { ok: false, reason: `${skillName} Lv${level} required (have Lv${myLevel})` };
+/** Check if a recipe can be crafted manually (not ship-only or facility-only). */
+function isRecipeCraftable(recipe: Recipe): { ok: boolean; reason: string } {
+  const category = (recipe.category || "").toLowerCase();
+
+  // Ship Passive recipes run automatically and cannot be crafted manually
+  if (category.includes("ship passive")) {
+    return { ok: false, reason: "Recipe runs automatically on ships, cannot be crafted manually" };
+  }
+
+  // Also check by recipe ID as a fallback (in case category field is missing from API)
+  if (SHIP_PASSIVE_RECIPE_IDS.has(recipe.recipe_id)) {
+    return { ok: false, reason: "Recipe runs automatically on ships, cannot be crafted manually" };
+  }
+
+  // Facility Only recipes can only be crafted at facilities
+  if (category.includes("facility only")) {
+    return { ok: false, reason: "Recipe can only be crafted at facilities" };
+  }
+
+  return { ok: true, reason: "" };
 }
 
 // ── Crafter routine ──────────────────────────────────────────
@@ -485,12 +715,6 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     const settings = getCrafterSettings();
 
-    if (settings.craftLimits.length === 0) {
-      ctx.log("info", "No craft limits configured — check Crafter settings. Waiting 30s...");
-      await sleep(30000);
-      continue;
-    }
-
     // ── Scavenge wrecks before docking ──
     yield "scavenge";
     await scavengeWrecks(ctx);
@@ -505,13 +729,26 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     const recipes = await fetchAllRecipes(ctx);
     if (recipes.length === 0) {
       ctx.log("error", "No recipes available — waiting 60s");
-      await sleep(60000);
+      await sleep(10000);
       continue;
     }
 
-    // ── Refresh skills for pre-craft skill checks ──
+    // ── Refresh skills (for crafting skill level tracking) ──
     yield "check_skills";
     await bot.checkSkills();
+
+    // ── Get crafting skill level (determines max craft quantity per command) ──
+    const craftingSkillLevel = bot.getSkillLevel("crafting");
+
+    // ── Detect faction membership early ──
+    // Check if bot is in a faction by attempting to view faction storage
+    let personalMode = false;
+    if (bot.docked) {
+      const factionResp = await bot.exec("view_faction_storage");
+      personalMode = !!factionResp.error;
+    } else {
+      personalMode = true;
+    }
 
     // ── Clear cargo space for material withdrawal ──
     await bot.refreshCargo();
@@ -520,9 +757,14 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         if (item.quantity <= 0) continue;
         const lower = item.itemId.toLowerCase();
         if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-        const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
-        if (dResp.error) {
-          await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+        // In faction mode, try faction storage first; in personal mode, use personal storage directly
+        if (!personalMode) {
+          const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+          if (dResp.error) {
+            await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+          }
+        } else {
+          await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
         }
       }
       await bot.refreshCargo();
@@ -532,28 +774,59 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Refresh inventory (cargo + personal storage + faction storage) ──
     if (bot.docked) {
       await bot.refreshStorage();
-      await bot.refreshFactionStorage();
+      if (!personalMode) {
+        // Successfully accessed faction storage - bot is in a faction
+        await bot.refreshFactionStorage();
+        ctx.log("craft", `FACTION MODE: Bot is in a faction, using faction storage`);
+      } else {
+        // Failed to access faction storage - bot is not in a faction
+        bot.factionStorage = [];
+        ctx.log("craft", `PERSONAL MODE: Bot is not in a faction, using only personal storage`);
+      }
+    } else {
+      ctx.log("craft", `PERSONAL MODE: Bot is not docked, using only personal storage`);
     }
 
     // ── Build recipe index for prerequisite lookup ──
     const recipeIndex = buildRecipeIndex(recipes);
 
-    // ── Process each configured limit ──
-    let totalCrafted = 0;
-    const craftedSummary: string[] = [];   // "5x Fuel Cells"
-    const prereqSummary: string[] = [];    // "3x Refined Alloy (prereq)"
-    const missingSummary: string[] = [];   // "Armor Plate (2x refined_titanium)"
-    const skillSummary: string[] = [];     // "Solarian Composite (skill too low, crafted 5x Refined Iron for XP)"
-    const atLimitCount = { count: 0 };
+    // ── Determine which categories this bot should craft from ──
+    const botName = bot.username;
+    const assignedCategories = settings.categoryAssignments[botName];
+    const isSpecializedBot = assignedCategories && assignedCategories.length > 0;
+    
+    if (isSpecializedBot) {
+      ctx.log("craft", `Bot is assigned to categories: ${assignedCategories.join(", ")}`);
+    }
 
+    // ── Determine effective quotas for this bot (global + bot-specific overrides) ──
+    const effectiveQuotas = new Map<string, number>();
+    // First, add global quotas
     for (const { recipeId, limit } of settings.craftLimits) {
-      if (bot.state !== "running") break;
+      effectiveQuotas.set(recipeId, limit);
+    }
+    // Then apply bot-specific overrides
+    const botOverrides = settings.botQuotaOverrides[botName] || {};
+    for (const [recipeId, limit] of Object.entries(botOverrides)) {
+      if (limit > 0) {
+        effectiveQuotas.set(recipeId, limit);
+      } else {
+        effectiveQuotas.delete(recipeId);
+      }
+    }
 
+    // ── Build list of recipes to craft based on category assignments ──
+    const recipesToCraft: Array<{ recipeId: string; limit: number; recipe: Recipe }> = [];
+
+    for (const [recipeId, limit] of Array.from(effectiveQuotas.entries())) {
+      if (bot.state !== "running") break;
+      
       const recipe = recipes.find(r =>
         r.recipe_id === recipeId ||
         r.name === recipeId ||
         r.name.toLowerCase() === recipeId.toLowerCase()
       );
+      
       if (!recipe) {
         const similar = recipes
           .filter(r => r.recipe_id.toLowerCase().includes(recipeId.toLowerCase()) || r.name.toLowerCase().includes(recipeId.toLowerCase()))
@@ -563,8 +836,65 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
+      // Skip recipes that cannot be crafted manually (ship-only or facility-only)
+      const craftableCheck = isRecipeCraftable(recipe);
+      if (!craftableCheck.ok) {
+        if (craftableCheck.reason.includes("automatically on ships")) {
+          ctx.log("warn", `Skipping "${recipeId}" (${recipe.name}): ${craftableCheck.reason}`);
+        } else {
+          ctx.log("error", `Recipe "${recipeId}" (${recipe.name}) is not craftable: ${craftableCheck.reason}`);
+        }
+        continue;
+      }
+
+      // Check if recipe matches bot's assigned categories
+      const recipeCategory = recipe.category || "";
+      if (isSpecializedBot && !assignedCategories.includes(recipeCategory)) {
+        ctx.log("craft", `Skipping "${recipeId}" (${recipe.name}): category "${recipeCategory}" not assigned to this bot`);
+        continue;
+      }
+
+      recipesToCraft.push({ recipeId, limit, recipe });
+    }
+
+    // ── If no quota recipes match assigned categories, craft from assigned categories ──
+    if (recipesToCraft.length === 0 && isSpecializedBot) {
+      ctx.log("craft", `No quota recipes match assigned categories — crafting from assigned categories: ${assignedCategories.join(", ")}`);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, recipeIndex, assignedCategories, craftingSkillLevel, personalMode);
+      if (categoryCrafted.length > 0) {
+        ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
+      } else {
+        ctx.log("info", `No materials available for assigned categories. Waiting 60s...`);
+        await sleep(60000);
+      }
+      continue;
+    }
+
+    // ── If no specific recipes configured (or none match), use enabled categories ──
+    if (recipesToCraft.length === 0 && !isSpecializedBot) {
+      ctx.log("craft", `No specific recipes configured — crafting from enabled categories: ${settings.enabledCategories.join(", ")}`);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, recipeIndex, settings.enabledCategories, craftingSkillLevel, personalMode);
+      if (categoryCrafted.length > 0) {
+        ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
+      } else {
+        ctx.log("info", `No materials available for enabled categories. Waiting 60s...`);
+        await sleep(60000);
+      }
+      continue;
+    }
+
+    // ── Process each recipe to craft ──
+    let totalCrafted = 0;
+    const craftedSummary: string[] = [];   // "5x Fuel Cells"
+    const prereqSummary: string[] = [];    // "3x Refined Alloy (prereq)"
+    const missingSummary: string[] = [];   // "Armor Plate (2x refined_titanium)"
+    const atLimitCount = { count: 0 };
+
+    for (const { recipeId, limit, recipe } of recipesToCraft) {
+      if (bot.state !== "running") break;
+
       const outputId = recipe.output_item_id || recipeId;
-      const currentStock = countItem(ctx, outputId);
+      const currentStock = countItem(ctx, outputId, personalMode);
       const needed = limit - currentStock;
 
       if (needed <= 0) {
@@ -572,150 +902,193 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
-      // ── Skill check: don't withdraw materials if we can't craft this yet ──
-      const skillCheck = canCraftSkillwise(ctx, recipe);
-      if (!skillCheck.ok) {
-        // Skill too low — grind XP on simpler recipes instead of pulling materials
-        const allowedIds = new Set(settings.craftLimits.map(cl => cl.recipeId));
-        let xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex, allowedIds);
-        if (xpCrafted.length === 0) {
-          // Fallback: search all recipes for anything we have ingredients for right now
-          xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex);
-        }
-        if (xpCrafted.length > 0) {
-          skillSummary.push(`${recipe.name} (${skillCheck.reason}, ground ${xpCrafted.join(", ")} for XP)`);
-        } else {
-          skillSummary.push(`${recipe.name} (${skillCheck.reason})`);
-        }
+      ctx.log("craft", `${recipe.name}: need ${needed} to reach quota (have ${currentStock}/${limit})`);
+
+      // Calculate how many we can actually craft based on available materials
+      const maxCraftable = calculateMaxCraftable(ctx, recipe, personalMode);
+      ctx.log("craft", `${recipe.name}: can craft up to ${maxCraftable}x based on available materials`);
+
+      // Determine actual craft count: min of (needed, maxCraftable)
+      const toCraft = Math.min(needed, maxCraftable);
+
+      if (toCraft <= 0) {
+        missingSummary.push(`${recipe.name}: no materials available`);
         continue;
       }
 
-      // Craft in batches
+      ctx.log("craft", `${recipe.name}: will craft ${toCraft}x (quota: ${needed}, materials: ${maxCraftable})`);
+
       let crafted = 0;
-      let hitSkillBlock = false;
-      while (crafted < needed && bot.state === "running") {
+      let failedWithdrawals = 0;
+      const MAX_FAILED_WITHDRAWALS = 3;
+
+      while (crafted < toCraft && bot.state === "running" && failedWithdrawals < MAX_FAILED_WITHDRAWALS) {
+        // Refresh inventories
         await bot.refreshCargo();
         if (bot.docked) {
           await bot.refreshStorage();
           await bot.refreshFactionStorage();
         }
 
-        const missing = getMissingMaterial(ctx, recipe);
-        if (missing) {
-          // Materials not in cargo — try pulling from storage sources
-          if (hasMaterialsAnywhere(ctx, recipe)) {
-            await withdrawFactionMaterials(ctx, recipe);
-            await withdrawStorageMaterials(ctx, recipe);
-            const stillMissing = getMissingMaterial(ctx, recipe);
-            if (stillMissing) {
-              // Try crafting the missing prerequisites
-              const preCrafted = await craftPrerequisites(ctx, recipe, recipeIndex);
-              if (preCrafted.length > 0) {
-                prereqSummary.push(...preCrafted);
-                // Refresh and re-withdraw after crafting prereqs
-                await bot.refreshCargo();
-                if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
-                await withdrawFactionMaterials(ctx, recipe);
-                await withdrawStorageMaterials(ctx, recipe);
-              }
-              const finalMissing = getMissingMaterial(ctx, recipe);
-              if (finalMissing) {
-                missingSummary.push(`${recipe.name} (${finalMissing.need}x ${finalMissing.name})`);
-                break;
-              }
-            }
-          } else {
-            // Materials don't exist anywhere — try crafting prerequisites
-            const preCrafted = await craftPrerequisites(ctx, recipe, recipeIndex);
-            if (preCrafted.length > 0) {
-              prereqSummary.push(...preCrafted);
-              await bot.refreshCargo();
-              if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
-              await withdrawFactionMaterials(ctx, recipe);
-              await withdrawStorageMaterials(ctx, recipe);
-              const finalMissing = getMissingMaterial(ctx, recipe);
-              if (finalMissing) {
-                missingSummary.push(`${recipe.name} (${finalMissing.need}x ${finalMissing.name})`);
-                break;
-              }
-            } else {
-              missingSummary.push(`${recipe.name} (${missing.need}x ${missing.name})`);
-              break;
-            }
+        // Calculate remaining to craft and how many we can craft with current materials
+        const remaining = toCraft - crafted;
+        const maxCraftableNow = calculateMaxCraftable(ctx, recipe, personalMode);
+
+        if (maxCraftableNow <= 0) {
+          // Try prerequisites
+          ctx.log("craft", `${recipe.name}: no materials available, trying prerequisites...`);
+          const preCrafted = await craftPrerequisites(ctx, recipe, recipeIndex, 0, personalMode);
+          if (preCrafted.length > 0) {
+            prereqSummary.push(...preCrafted);
+            await bot.refreshCargo();
+            if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
+            continue; // Re-check materials after prerequisite crafting
           }
+          ctx.log("craft", `${recipe.name}: no materials and prerequisites couldn't help`);
+          break;
         }
 
-        const remaining = needed - crafted;
-        const batchSize = Math.min(remaining, 10);
+        // Determine batch size: min of (remaining, maxCraftableNow, craftingSkillLevel)
+        const batchSize = Math.min(remaining, maxCraftableNow, craftingSkillLevel);
+        ctx.log("craft", `${recipe.name}: crafting ${batchSize}x batch (skill: ${craftingSkillLevel}, remaining: ${remaining}, canCraft: ${maxCraftableNow})`);
 
+        // Withdraw materials for this batch
+        await withdrawFactionMaterials(ctx, recipe, batchSize, personalMode);
+        await withdrawStorageMaterials(ctx, recipe, batchSize);
+        await bot.refreshStorage();
+
+        // Check if we have materials in cargo/storage after withdrawal
+        const missingAfterWithdraw = getMissingMaterial(ctx, recipe, batchSize, personalMode);
+        if (missingAfterWithdraw) {
+          ctx.log("warn", `${recipe.name}: missing ${missingAfterWithdraw.need}x ${missingAfterWithdraw.name} after withdrawal (batch: ${batchSize})`);
+          failedWithdrawals++;
+          // Try prerequisites
+          const preCrafted = await craftPrerequisites(ctx, recipe, recipeIndex, 0, personalMode);
+          if (preCrafted.length > 0) {
+            prereqSummary.push(...preCrafted);
+            await bot.refreshCargo();
+            if (bot.docked) { await bot.refreshStorage(); await bot.refreshFactionStorage(); }
+            continue;
+          }
+          // If we can't get materials for even 1, give up
+          if (batchSize === 1) break;
+          // Otherwise try with batch size 1
+          continue;
+        }
+
+        // Small delay after withdrawal
+        if (batchSize > 1) {
+          await sleep(300);
+        }
+
+        // Execute the craft command
         yield `craft_${recipeId}`;
         const craftResp = await bot.exec("craft", { recipe_id: recipeId, count: batchSize });
 
         if (craftResp.error) {
           const msg = craftResp.error.message.toLowerCase();
-          if (msg.includes("skill")) {
-            hitSkillBlock = true;
-          } else if (msg.includes("material") || msg.includes("component") || msg.includes("insufficient")) {
-            missingSummary.push(`${recipe.name} (no materials)`);
-            // Diagnostic: log what the local recipe expects vs what's actually in cargo
-            const componentList = recipe.components.map(c => {
-              const inCargo = countInCargo(ctx, c.item_id);
-              return `${c.item_id}(need ${c.quantity}, have ${inCargo})`;
-            }).join(", ");
-            ctx.log("error", `${recipe.name} components mismatch — local recipe: [${componentList}]`);
+          if (msg.includes("material") || msg.includes("component") || msg.includes("insufficient")) {
+            ctx.log("craft", `${recipe.name}: ran out of materials during craft`);
+            failedWithdrawals++;
+            continue; // Will try to withdraw more on next iteration
           } else {
             ctx.log("error", `Craft ${recipe.name}: ${craftResp.error.message}`);
+            break;
           }
-          break;
         }
 
+        // Parse actual output quantity from craft response
         const result = craftResp.result as Record<string, unknown> | undefined;
-        const actualCount = (result?.count as number) || (result?.quantity as number) || batchSize;
-        crafted += actualCount;
-        totalCrafted += actualCount;
-        bot.stats.totalCrafted += actualCount;
+        let actualOutputQty = 0;
+        if (result) {
+          actualOutputQty = (result.count as number) || (result.quantity as number) || 0;
+          if (actualOutputQty === 0) {
+            const items = (result.items as Array<Record<string, unknown>>) ||
+                         (result.output as Array<Record<string, unknown>>) ||
+                         (result.produced as Array<Record<string, unknown>>);
+            if (items && items.length > 0) {
+              for (const item of items) {
+                actualOutputQty += (item.quantity as number) || (item.count as number) || 0;
+              }
+            }
+          }
+          if (actualOutputQty === 0) {
+            actualOutputQty = (recipe.output_quantity || 1) * batchSize;
+          }
+        } else {
+          actualOutputQty = (recipe.output_quantity || 1) * batchSize;
+        }
+
+        crafted += actualOutputQty;
+        totalCrafted += actualOutputQty;
+        bot.stats.totalCrafted += actualOutputQty;
+
+        // Progress logging
+        const pct = Math.round((crafted / toCraft) * 100);
+        ctx.log("craft", `${recipe.name}: ${crafted}/${toCraft} (${pct}%) - crafted ${actualOutputQty}x`);
       }
 
       if (crafted > 0) {
         craftedSummary.push(`${crafted}x ${recipe.name}`);
       }
 
-      // ── Skill too low: try grinding XP on configured recipes only ──
-      if (hitSkillBlock && bot.state === "running") {
-        const allowedIds = new Set(settings.craftLimits.map(cl => cl.recipeId));
-        let xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex, allowedIds);
-        if (xpCrafted.length === 0) {
-          // Fallback: search all recipes for anything we have ingredients for right now
-          xpCrafted = await grindCraftingXP(ctx, recipes, recipeIndex);
-        }
-        if (xpCrafted.length > 0) {
-          skillSummary.push(`${recipe.name} (skill too low, ground ${xpCrafted.join(", ")} for XP)`);
-        } else {
-          skillSummary.push(`${recipe.name} (skill too low, no XP recipes available)`);
-        }
+      if (crafted < toCraft) {
+        ctx.log("craft", `${recipe.name}: only crafted ${crafted}/${toCraft} - materials exhausted or error occurred`);
       }
     }
 
-    // ── Deposit crafted goods back to faction storage ──
-    if (totalCrafted > 0 && bot.docked) {
+    // ── If all configured recipes are at their limits, fall back to enabled categories crafting ──
+    if (atLimitCount.count === settings.craftLimits.length && settings.craftLimits.length > 0) {
+      ctx.log("craft", `All ${atLimitCount.count} configured recipes at limit — crafting from enabled categories: ${settings.enabledCategories.join(", ")}`);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, recipeIndex, settings.enabledCategories, craftingSkillLevel, personalMode);
+      if (categoryCrafted.length > 0) {
+        craftedSummary.push(...categoryCrafted);
+      } else {
+        ctx.log("info", `No materials available for enabled categories. Waiting 60s...`);
+        await sleep(60000);
+      }
+    }
+
+    // ── Deposit crafted goods to faction storage (only if in faction mode) ──
+    if (bot.docked && !personalMode) {
       await bot.refreshCargo();
+      await bot.refreshStorage();
       const depositedItems: string[] = [];
+
+      // First, deposit all crafted items from cargo to faction storage
       for (const item of [...bot.inventory]) {
         if (item.quantity <= 0) continue;
-        const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-        const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+        // Use unified storage command: deposit from cargo to faction storage
+        const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
         if (!dResp.error) {
           depositedItems.push(`${item.quantity}x ${item.name}`);
           logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (crafted)`);
         } else {
-          await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+          // Fallback: deposit to personal storage
+          await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
         }
       }
+
+      // Transfer ALL items from personal storage to faction storage (including fuel/energy cells)
+      // This ensures the dedicated crafter bot's personal storage stays empty
+      await bot.refreshStorage();
+      for (const item of [...bot.storage]) {
+        if (item.quantity <= 0) continue;
+        // Use unified storage command: transfer from personal storage to faction storage
+        const transferResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "storage" });
+        if (!transferResp.error) {
+          depositedItems.push(`${item.quantity}x ${item.name} (from storage)`);
+          logFactionActivity(ctx, "deposit", `Transferred ${item.quantity}x ${item.name} from personal storage to faction storage`);
+        }
+      }
+
       if (depositedItems.length > 0) {
         ctx.log("trade", `Deposited to faction: ${depositedItems.join(", ")}`);
       }
       await bot.refreshCargo();
+      await bot.refreshStorage();
+    } else if (bot.docked && personalMode) {
+      ctx.log("craft", `PERSONAL MODE: Skipping faction deposit (bot not in faction)`);
     }
 
     // ── Single summary line ──
@@ -723,7 +1096,6 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     if (craftedSummary.length > 0) parts.push(`Crafted ${craftedSummary.join(", ")}`);
     if (prereqSummary.length > 0) parts.push(`Prereqs: ${prereqSummary.join(", ")}`);
     if (atLimitCount.count > 0) parts.push(`${atLimitCount.count} at limit`);
-    if (skillSummary.length > 0) parts.push(`Skill: ${skillSummary.join(", ")}`);
     if (missingSummary.length > 0) parts.push(`Missing: ${missingSummary.join(", ")}`);
     if (parts.length > 0) {
       ctx.log("craft", parts.join(". "));
@@ -737,12 +1109,39 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "repair";
     await repairShip(ctx);
 
+    // ── Credit top-up: ensure all running bots have at least 10k credits ──
+    yield "topup_credits";
+    const fleet = ctx.getFleetStatus?.() || [];
+    const BOT_WORKING_BALANCE = 10_000;
+    for (const member of fleet) {
+      if (member.username === bot.username) continue;
+      if (member.state !== "running") continue;
+      if (member.credits >= BOT_WORKING_BALANCE) continue;
+      const needed = BOT_WORKING_BALANCE - member.credits;
+      // Withdraw from faction treasury
+      const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+      if (withdrawResp.error) {
+        ctx.log("coord", `Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
+        break; // treasury likely empty
+      }
+      logFactionActivity(ctx, "withdraw", `Withdrew ${needed}cr from treasury for ${member.username}`);
+      const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
+      if (giftResp.error) {
+        ctx.log("coord", `Gift to ${member.username} failed: ${giftResp.error.message}`);
+        // Re-deposit withdrawn credits back
+        await bot.exec("faction_deposit_credits", { amount: needed });
+      } else {
+        ctx.log("coord", `Sent ${needed}cr to ${member.username} (topped off to ${BOT_WORKING_BALANCE}cr)`);
+        logFactionActivity(ctx, "gift", `Sent ${needed}cr to ${member.username} (top-off to ${BOT_WORKING_BALANCE}cr)`);
+      }
+    }
+
     // ── Check for skill level-ups ──
     yield "check_skills";
     await bot.checkSkills();
 
     // ── Wait before next cycle ──
     ctx.log("info", "Waiting 60s before next crafting cycle...");
-    await sleep(60000);
+    await sleep(10000);
   }
 };

@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
+import { log } from "./ui.js";
 
 // ── Data model ──────────────────────────────────────────────
 
@@ -18,6 +19,19 @@ export interface OreRecord {
   total_mined: number;
   times_seen: number;
   last_seen: string;
+  depleted?: boolean;
+  depleted_at?: string;
+}
+
+/** Depletion timeout in milliseconds - POIs can be re-checked after this long. */
+export const DEPLETION_TIMEOUT_MS = 3 * 60 * 60 * 1000; // 3 hours
+
+/** Check if an ore depletion has expired (can be re-mined). */
+export function isDepletionExpired(depletedAt: string | undefined, timeoutMs: number = DEPLETION_TIMEOUT_MS): boolean {
+  if (!depletedAt) return true;
+  const depletedTime = new Date(depletedAt).getTime();
+  const now = Date.now();
+  return (now - depletedTime) > timeoutMs;
 }
 
 export interface MarketRecord {
@@ -101,6 +115,13 @@ export interface MapData {
   version: 1;
   last_saved: string;
   systems: Record<string, StoredSystem>;
+  /** Track the mobile_capitol station's current location. Updated when discovered by bots. */
+  mobile_capitol?: {
+    system_id: string;
+    system_name: string;
+    poi_id: string;
+    discovered_at: string;
+  };
 }
 
 // ── MapStore singleton ──────────────────────────────────────
@@ -116,6 +137,25 @@ class MapStore {
 
   constructor() {
     this.data = this.load();
+  }
+
+  // ── Pirate System Check ─────────────────────────────────
+
+  /** Check if a system is a pirate system (hostile). */
+  private isPirateSystem(systemId: string): boolean {
+    const lower = systemId.toLowerCase();
+    const pirateSystems = [
+      "alhena",
+      "xamidimura",
+      "algol",
+      "zaniah",
+      "sheratan",
+      "bellatrix",
+      "barnard_44",
+      "gsc_0008",
+      "gliese_581",
+    ];
+    return pirateSystems.some(ps => lower === ps || lower.includes(ps));
   }
 
   // ── Persistence ─────────────────────────────────────────
@@ -226,6 +266,12 @@ class MapStore {
           last_updated: now(),
         };
       });
+
+      // Auto-detect mobile_capitol station and update its location
+      const mobileCapitolPoi = sys.pois.find((p) => p.id === "mobile_capital");
+      if (mobileCapitolPoi) {
+        this.updateMobileCapitolLocation(id, sys.name || id, mobileCapitolPoi.id);
+      }
     }
 
     // Merge wrecks from system data
@@ -462,6 +508,7 @@ class MapStore {
       existing.total_mined++;
       existing.times_seen++;
       existing.last_seen = now();
+      existing.depleted = false; // Reset depleted flag on successful mining
     } else {
       poi.ores_found.push({
         item_id: oreItem.item_id,
@@ -473,6 +520,22 @@ class MapStore {
     }
 
     this.scheduleSave();
+  }
+
+  /** Mark an ore as depleted at a POI. */
+  markOreDepleted(systemId: string, poiId: string, oreId: string): void {
+    const sys = this.data.systems[systemId];
+    if (!sys) return;
+
+    const poi = sys.pois.find((p) => p.id === poiId);
+    if (!poi) return;
+
+    const existing = poi.ores_found.find((o) => o.item_id === oreId);
+    if (existing) {
+      existing.depleted = true;
+      existing.depleted_at = now();
+      this.scheduleSave();
+    }
   }
 
   /** Record a pirate sighting in a system. */
@@ -542,11 +605,13 @@ class MapStore {
     return sys.pois.find((p) => p.has_base) ?? null;
   }
 
-  /** BFS to find the nearest known system that has a station. Returns { systemId, poiId, hops } or null. */
+  /** BFS to find the nearest known system that has a station (excluding pirate systems). Returns { systemId, poiId, poiName, hops } or null. */
   findNearestStationSystem(fromSystemId: string): { systemId: string; poiId: string; poiName: string; hops: number } | null {
-    // Check current system first
-    const localStation = this.findNearestStation(fromSystemId);
-    if (localStation) return { systemId: fromSystemId, poiId: localStation.id, poiName: localStation.name, hops: 0 };
+    // Check current system first (but skip if it's a pirate system)
+    if (!this.isPirateSystem(fromSystemId)) {
+      const localStation = this.findNearestStation(fromSystemId);
+      if (localStation) return { systemId: fromSystemId, poiId: localStation.id, poiName: localStation.name, hops: 0 };
+    }
 
     const visited = new Set<string>([fromSystemId]);
     const queue: Array<{ id: string; hops: number }> = [{ id: fromSystemId, hops: 0 }];
@@ -558,6 +623,8 @@ class MapStore {
       for (const conn of conns) {
         const nextId = conn.system_id;
         if (!nextId || visited.has(nextId)) continue;
+        // Skip pirate systems
+        if (this.isPirateSystem(nextId)) continue;
         visited.add(nextId);
 
         const station = this.findNearestStation(nextId);
@@ -571,11 +638,12 @@ class MapStore {
     return null;
   }
 
-  /** Find the best sell price for an item across all known markets. */
+  /** Find the best sell price for an item across all known markets (excluding pirate systems). */
   findBestSellPrice(itemId: string): { systemId: string; poiId: string; poiName: string; price: number } | null {
     let best: { systemId: string; poiId: string; poiName: string; price: number } | null = null;
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      if (this.isPirateSystem(sysId)) continue;
       for (const poi of sys.pois) {
         for (const m of poi.market) {
           if (m.item_id === itemId && m.best_sell !== null) {
@@ -600,7 +668,7 @@ class MapStore {
     return this.data.systems[systemId]?.connections ?? [];
   }
 
-  /** Find all locations where a specific ore has been mined, sorted by total_mined descending. */
+  /** Find all locations where a specific ore has been mined, sorted by total_mined descending (excluding pirate systems). */
   findOreLocations(oreId: string): Array<{
     systemId: string;
     systemName: string;
@@ -619,6 +687,7 @@ class MapStore {
     }> = [];
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      if (this.isPirateSystem(sysId)) continue;
       const hasStation = sys.pois.some((p) => p.has_base);
       for (const poi of sys.pois) {
         const ore = poi.ores_found.find((o) => o.item_id === oreId);
@@ -684,11 +753,12 @@ class MapStore {
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  /** Find the best buy price (highest buyer) for an item across all known markets. */
+  /** Find the best buy price (highest buyer) for an item across all known markets (excluding pirate systems). */
   findBestBuyPrice(itemId: string): { systemId: string; poiId: string; poiName: string; price: number; quantity: number } | null {
     let best: { systemId: string; poiId: string; poiName: string; price: number; quantity: number } | null = null;
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      if (this.isPirateSystem(sysId)) continue;
       for (const poi of sys.pois) {
         for (const m of poi.market) {
           if (m.item_id === itemId && m.best_buy !== null && m.buy_quantity > 0) {
@@ -703,11 +773,13 @@ class MapStore {
     return best;
   }
 
-  /** Find all items with buy orders across all known stations. */
+  /** Find all items with buy orders across all known stations (excluding pirate systems). */
   getAllBuyDemand(): Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> {
     const results: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      // Skip pirate systems
+      if (this.isPirateSystem(sysId)) continue;
       for (const poi of sys.pois) {
         for (const m of poi.market) {
           if (m.best_buy !== null && m.buy_quantity > 0) {
@@ -728,7 +800,7 @@ class MapStore {
     return results;
   }
 
-  /** Find price spreads for an item or all items between stations.
+  /** Find price spreads for an item or all items between stations (excluding pirate systems).
    *  Returns opportunities where an item can be bought cheaply and sold at a higher price. */
   findPriceSpreads(itemId?: string): Array<{
     itemId: string; itemName: string;
@@ -742,7 +814,11 @@ class MapStore {
     const buyListings: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      // Skip pirate systems
+      if (this.isPirateSystem(sysId)) continue;
       for (const poi of sys.pois) {
+        // Only include POIs with a dockable station
+        if (!poi.has_base) continue;
         for (const m of poi.market) {
           if (itemId && m.item_id !== itemId) continue;
           if (m.best_sell !== null && m.best_sell > 0 && m.sell_quantity > 0) {
@@ -857,6 +933,56 @@ class MapStore {
   /** Return the full systems map for the web dashboard. */
   getAllSystems(): Record<string, StoredSystem> {
     return this.data.systems;
+  }
+
+  // ── Mobile Capitol Tracking ───────────────────────────────
+
+  /**
+   * Update the mobile_capitol station's current location.
+   * Call this when a bot visits the mobile_capitol and discovers its new system.
+   */
+  updateMobileCapitolLocation(systemId: string, systemName: string, poiId: string): void {
+    const previous = this.data.mobile_capitol;
+    if (previous && previous.system_id === systemId && previous.poi_id === poiId) {
+      // Already at this location, just refresh timestamp
+      this.data.mobile_capitol = { ...previous, discovered_at: now() };
+    } else {
+      if (previous) {
+        log("map", `Mobile capitol moved: ${previous.system_name} → ${systemName}`);
+      }
+      this.data.mobile_capitol = {
+        system_id: systemId,
+        system_name: systemName,
+        poi_id: poiId,
+        discovered_at: now(),
+      };
+    }
+    this.scheduleSave();
+  }
+
+  /**
+   * Get the current known location of the mobile_capitol station.
+   * Returns null if the location has not been discovered yet.
+   */
+  getMobileCapitolLocation(): { systemId: string; systemName: string; poiId: string; discoveredAt: string } | null {
+    if (!this.data.mobile_capitol) return null;
+    const mc = this.data.mobile_capitol;
+    return {
+      systemId: mc.system_id,
+      systemName: mc.system_name,
+      poiId: mc.poi_id,
+      discoveredAt: mc.discovered_at,
+    };
+  }
+
+  /**
+   * Check if a POI is the mobile_capitol station.
+   * Returns true if the system_id and poi_id match the current known location.
+   */
+  isMobileCapitol(systemId: string, poiId: string): boolean {
+    if (!this.data.mobile_capitol) return false;
+    return this.data.mobile_capitol.system_id === systemId && 
+           this.data.mobile_capitol.poi_id === poiId;
   }
 
   /** Formatted summary string for menu display. */

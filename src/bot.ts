@@ -3,8 +3,17 @@ import { SessionManager, type Credentials } from "./session.js";
 import { log, logError, logNotifications } from "./ui.js";
 import { debugLog } from "./debug.js";
 import { mapStore } from "./mapstore.js";
+import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
+import { playerNameStore } from "./playernamestore.js";
+import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
+import { processPrivateMessage as processCooperationPrivateMessage } from "./cooperation/rescueCooperation.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
+
+// Simple sleep helper to avoid circular dependency with common.ts
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 export interface CargoItem {
   itemId: string;
@@ -112,6 +121,9 @@ export class Bot {
   /** Whether the bot's ship is dead (hull <= 0). */
   isDead = false;
 
+  /** Whether the bot is currently towing a wreck. */
+  towingWreck = false;
+
   /** Cached installed mod IDs from last refreshShipMods(). */
   installedMods: string[] = [];
 
@@ -121,6 +133,26 @@ export class Bot {
   // Action log (last N entries)
   readonly actionLog: string[] = [];
   private maxLogEntries = 200;
+
+  /** Customs inspection state - tracks if bot is being held for customs scan. */
+  customsHold: {
+    active: boolean;
+    since: number;
+    system: string;
+    poi: string;
+    outcome: "pending" | "cleared" | "contraband" | "evasion" | null;
+    aiResponseSent: boolean; // Track if AI response was already sent
+  } = { active: false, since: 0, system: "", poi: "", outcome: null, aiResponseSent: false };
+
+  /** Timestamp when customs hold was last cleared (prevents rapid re-triggering). */
+  private customsClearedAt: number = 0;
+
+  /** Track last customs message content to prevent duplicate processing. */
+  private lastCustomsMessage: string = "";
+  private lastCustomsMessageTime: number = 0;
+
+  /** Cooldown after customs clears before new hold can start (prevents rapid re-triggering). */
+  private static readonly CUSTOMS_COOLDOWN_MS = 30000; // 30 seconds
 
   /** Optional callback for routing log output (e.g. to TUI). */
   onLog?: (username: string, category: string, message: string) => void;
@@ -139,12 +171,21 @@ export class Bot {
   private lastWarningAlertMs = 0;
   private static readonly WARNING_ALERT_COOLDOWN_MS = 60_000;
 
+  /** Track ongoing login to prevent duplicate concurrent logins */
+  private _loginPromise: Promise<boolean> | null = null;
+
   constructor(username: string, baseDir: string) {
     this.username = username;
     this.api = new SpaceMoltAPI();
+    this.api.setBotName(username);
     this.session = new SessionManager(username, baseDir);
+    // Connect API to session manager for persistence
+    this.api.setSessionManager(this.session);
     this.color = BOT_COLORS[colorIndex % BOT_COLORS.length];
     colorIndex++;
+    
+    // Initialize player name tracking
+    playerNameStore.setBotName(username);
   }
 
   get state(): BotState {
@@ -153,6 +194,12 @@ export class Bot {
 
   get routineName(): string | null {
     return this._routine;
+  }
+
+  /** Get the bot's empire affiliation from session credentials. */
+  getEmpire(): string {
+    const creds = this.session.loadCredentials();
+    return creds?.empire || "";
   }
 
   log(category: string, message: string): void {
@@ -174,9 +221,42 @@ export class Bot {
 
   /** Execute an API command, log the result, handle notifications. */
   async exec(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
+    // Block travel/jump commands while customs hold is active (allow chat and get_nearby for interaction)
+    const blockedCommands = new Set(["jump", "travel", "dock", "undock", "mine", "salvage", "buy", "sell"]);
+    if (this.isCustomsHold() && blockedCommands.has(command)) {
+      this.log("customs", `⏳ Customs hold ACTIVE - blocking ${command} until clearance...`);
+      const outcome = await this.waitForCustomsClear();
+      this.log("customs", `✅ Customs clearance received (outcome: ${outcome}), resuming ${command}`);
+    }
+
     this._lastAction = command;
     debugLog("bot:exec", `${this.username} > ${command}`, payload);
     let resp = await this.api.execute(command, payload);
+
+    // Handle full login required (after too many session recovery failures)
+    if (resp.error && resp.error.code === "full_login_required") {
+      this.log("system", "Full login required due to session recovery failures, performing login...");
+      const loggedIn = await this.login();
+      if (loggedIn) {
+        this.log("system", "Full login successful, retrying command...");
+        resp = await this.api.execute(command, payload);
+      } else {
+        this.log("error", "Full login failed");
+      }
+    }
+
+    // After jump/travel commands in empire space, wait for customs messages
+    // This is the PROACTIVE check - wait 2 seconds minimum for customs to respond
+    // Only applies to customs empires (Voidborn, Nebula, Crimson, Solarian) in non-lawless systems
+    if (!resp.error && (command === "jump" || command === "travel")) {
+      await this.refreshStatus();
+      // Check if we're in an empire system with customs (not Frontier, not Outer Rim, not pirate, not lawless)
+      const sysData = mapStore.getSystem(this.system);
+      if (isEmpireSystem(this.system, this.getEmpire(), sysData?.security_level)) {
+        this.log("customs", `⏱️ Post-jump customs wait @ ${this.system} - 2 second delay...`);
+        await sleep(2000);
+      }
+    }
 
     // Action pending — a previous game action is still resolving (10s tick).
     // Wait for the tick to complete then retry once.
@@ -213,11 +293,41 @@ export class Bot {
       }
     }
 
+    // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
+    // This helps collect player names faster as we move through the galaxy
+    if (!resp.error) {
+      const navigationCommands = ["travel", "jump", "dock", "undock"];
+      if (navigationCommands.includes(command)) {
+        // Small delay to let the navigation complete
+        await sleep(500);
+        const nearbyResp = await this.api.execute("get_nearby");
+        if (!nearbyResp.error && nearbyResp.result) {
+          this.trackNearbyPlayers(nearbyResp.result);
+        }
+      }
+    }
+
     return resp;
   }
 
-  /** Login using stored credentials. Returns true on success. */
+  /** Login using stored credentials. Returns true on success. Prevents duplicate concurrent logins. */
   async login(): Promise<boolean> {
+    // If login already in progress, wait for it instead of starting a new one
+    if (this._loginPromise) {
+      this.log("system", "Login already in progress, waiting...");
+      return this._loginPromise;
+    }
+
+    // Start new login
+    this._loginPromise = this.doLogin().finally(() => {
+      this._loginPromise = null;
+    });
+
+    return this._loginPromise;
+  }
+
+  /** Internal login implementation */
+  private async doLogin(): Promise<boolean> {
     const creds = this.session.loadCredentials();
     if (!creds) {
       this._error = "No credentials found";
@@ -239,6 +349,28 @@ export class Bot {
     }
 
     this.log("system", "Login successful");
+    this.api.resetFullLoginFlag();
+    await this.refreshStatus();
+    return true;
+  }
+
+  /** Resume session from disk without full login. Returns true if session was restored and is valid. */
+  async resumeSession(): Promise<boolean> {
+    const restored = this.api.restoreSessionToken();
+    if (!restored) {
+      this.log("system", "No saved session token found, will require full login");
+      return false;
+    }
+
+    // Test the session with a lightweight API call
+    this.log("system", "Testing restored session...");
+    const resp = await this.exec("get_status");
+    if (resp.error) {
+      this.log("system", `Restored session invalid: ${resp.error.message}, will require full login`);
+      return false;
+    }
+
+    this.log("system", "Session resumed successfully");
     await this.refreshStatus();
     return true;
   }
@@ -287,6 +419,25 @@ export class Bot {
 
       // Cloak detection
       this.isCloaked = !!(p.is_cloaked || p.cloaked);
+
+      // Tow detection - check for towing_wreck flag or tow_attached status
+      const towingField = (p.towing_wreck as boolean) ?? (p.towing as boolean) ?? (p.has_tow as boolean);
+      if (towingField != null) {
+        this.towingWreck = towingField;
+      }
+      // Also check ship-level tow status
+      if (ship) {
+        const shipTowing = (ship.towing_wreck as boolean) ?? (ship.towing as boolean) ?? (ship.has_tow as boolean);
+        if (shipTowing != null) {
+          this.towingWreck = shipTowing;
+        }
+      }
+      
+      // Debug: log tow-related fields from status
+      if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
+          (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
+        this.log("debug", `Tow fields in status: p.towing_wreck=${p.towing_wreck}, p.towing=${p.towing}, p.has_tow=${p.has_tow}, ship.towing_wreck=${ship?.towing_wreck}, ship.towing=${ship?.towing}, ship.has_tow=${ship?.has_tow}, this.towingWreck=${this.towingWreck}`);
+      }
 
       // Death detection
       if (this.hull <= 0 && this.maxHull > 0) {
@@ -388,12 +539,34 @@ export class Bot {
     this._error = null;
     this._abortController = new AbortController();
 
-    // Only login if we don't already have an active session
-    if (!this.api.getSession()) {
+    const creds = this.session.loadCredentials();
+    if (!creds) {
+      this._error = "No credentials found";
+      this._state = "error";
+      throw new Error(this._error);
+    }
+
+    // Try to resume session from disk first (fast, no login delay)
+    // If resume fails, fall back to full login
+    if (this.api.needsFullLogin()) {
+      // Full login required due to too many session recovery failures
+      this.log("system", "Full login required (session recovery failed too many times)...");
       const loggedIn = await this.login();
       if (!loggedIn) {
-        // login() already set _state = "error" and _error; throw so the caller's
-        // .catch() handler fires instead of .then() (which would log "routine finished").
+        this._state = "error";
+        throw new Error(this._error || "Login failed");
+      }
+      this.api.resetFullLoginFlag();
+    } else if (this.api.getSession()) {
+      this.log("system", "Using existing in-memory session");
+    } else if (await this.resumeSession()) {
+      // Session resumed successfully from disk
+    } else {
+      // No valid session, need full login
+      this.log("system", "No valid session, performing full login...");
+      const loggedIn = await this.login();
+      if (!loggedIn) {
+        this._state = "error";
         throw new Error(this._error || "Login failed");
       }
     }
@@ -507,10 +680,95 @@ export class Bot {
   }
 
   /**
+   * Start a customs hold - blocks travel/jump actions until cleared.
+   */
+  startCustomsHold(): void {
+    // Don't restart if already active - prevents timer reset and AI response spam
+    if (this.customsHold.active) {
+      this.log("customs", "📋 Customs hold already active - ignoring duplicate stop request");
+      return;
+    }
+    
+    this.customsHold = {
+      active: true,
+      since: Date.now(),
+      system: this.system,
+      poi: this.poi,
+      outcome: "pending",
+      aiResponseSent: false, // Fresh hold = allow AI response
+    };
+    this.log("customs", `🛑 CUSTOMS HOLD: Awaiting inspection at ${this.system}/${this.poi}...`);
+  }
+
+  /**
+   * Clear the customs hold after scan completes.
+   */
+  clearCustomsHold(outcome: "cleared" | "contraband" | "evasion"): void {
+    if (!this.customsHold.active && this.customsHold.outcome === null) {
+      this.log("customs_debug", `Clear received but no active hold (outcome: ${outcome})`);
+      return;
+    }
+
+    this.customsHold.outcome = outcome;
+    this.customsHold.active = false;
+    this.customsHold.aiResponseSent = false; // Reset for next customs stop
+    this.customsClearedAt = Date.now(); // Set cooldown timestamp
+    this.log("customs", `✅ CUSTOMS CLEARED: ${outcome} (30s cooldown)`);
+  }
+
+  /**
+   * Check if bot is currently held by customs.
+   */
+  isCustomsHold(): boolean {
+    if (!this.customsHold.active) return false;
+    
+    // Auto-timeout after 30 seconds (customs ship should have arrived by then)
+    const elapsed = Date.now() - this.customsHold.since;
+    if (elapsed > 30000) {
+      this.log("customs", "⏰ CUSTOMS TIMEOUT: Proceeding after 30s wait");
+      this.customsHold.active = false;
+      this.customsHold.outcome = "cleared";
+      return false;
+    }
+    
+    return true;
+  }
+
+  /**
+   * Wait for customs hold to clear (blocks until cleared or timeout).
+   */
+  async waitForCustomsClear(maxWaitMs: number = 30000): Promise<"cleared" | "contraband" | "evasion" | "timeout"> {
+    const startTime = Date.now();
+    
+    while (this.customsHold.active && Date.now() - startTime < maxWaitMs) {
+      await sleep(500);
+      
+      // Check if outcome was set by chat handler
+      if (this.customsHold.outcome && this.customsHold.outcome !== "pending") {
+        this.customsHold.active = false;
+        return this.customsHold.outcome;
+      }
+    }
+    
+    // Timeout
+    if (this.customsHold.active) {
+      this.customsHold.active = false;
+      this.customsHold.outcome = "cleared";
+      this.log("customs", "⏰ Customs scan timeout - proceeding");
+      return "timeout";
+    }
+    
+    return this.customsHold.outcome || "cleared";
+  }
+
+  /**
    * Route notifications to the bot's own activity log and detect hull damage.
    * Uses this.api.execute() directly (not this.exec()) to avoid recursion.
    */
   private async handleNotifications(notifications: unknown[]): Promise<void> {
+    // Get AI Chat service from global scope (initialized by botmanager)
+    const aiChatService = (globalThis as any).aiChatService;
+
     for (const n of notifications) {
       if (typeof n !== "object" || !n) {
         if (typeof n === "string") this.log("info", `[NOTIFY] ${n}`);
@@ -521,8 +779,191 @@ export class Bot {
       const type = notif.type as string | undefined;
       const msgType = notif.msg_type as string | undefined;
 
-      // Chat messages are already displayed by logNotifications — skip
-      if (msgType === "chat_message") continue;
+      // Chat messages - route to AI chat handler and display
+      if (msgType === "chat_message") {
+        const data = notif.data as Record<string, unknown> | undefined;
+        if (data && typeof data === "object") {
+          const channel = (data.channel as string) || "local";
+          const sender = (data.sender as string) || "Unknown";
+          const content = (data.content as string) || "";
+
+          // Skip messages from self (prevent processing our own AI responses)
+          if (sender === this.username) {
+            continue;
+          }
+
+          this.log("chat", `Received [${channel}] ${sender}: ${content}`);
+          
+          // Track player name from chat (but NOT from MAYDAY messages - those can be fake/pirate names)
+          if (sender && sender !== "Unknown" && sender !== this.username) {
+            const contentLower = content.toLowerCase();
+            if (!contentLower.includes("mayday")) {
+              playerNameStore.add(sender);
+            } else {
+              debugLog("playernames:skip", `${this.username}`, `Ignored MAYDAY sender: "${sender}"`);
+            }
+          }
+
+          // Check for MAYDAY emergency rescue requests
+          if (channel === "emergency" || content.includes("MAYDAY")) {
+            const mayday = parseMaydayMessage(content, sender, Date.now(), this.username, this.system, this.poi);
+            if (mayday) {
+              const added = addMaydayRequest(mayday);
+              if (added) {
+                this.log("mayday", `🚨 MAYDAY received from ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
+              }
+            } else {
+              this.log("warn", `MAYDAY parse failed - message format may have changed. Content: "${content}"`);
+            }
+          }
+
+          // Check for CUSTOMS inspection messages addressed to THIS BOT
+          // Only process customs messages if sender is actually a customs agent
+          if (channel === "system" || channel === "local") {
+            const senderLower = sender.toLowerCase();
+            const isFromCustoms =
+              senderLower.startsWith("[customs]") ||
+              senderLower.startsWith("confederacy customs") ||
+              senderLower.includes("customs i -") ||
+              senderLower.includes("customs ii -") ||
+              senderLower.includes("customs iii -");
+
+            if (isFromCustoms) {
+              // This is a customs message - process it
+              const customsDetection = detectCustomsMessage(content);
+              if (customsDetection.type !== "none") {
+                // Check if message is addressed to THIS bot (by player name or ship name)
+                const lowerContent = content.toLowerCase();
+                const lowerUsername = this.username.toLowerCase();
+                const lowerShipName = (this.shipName || "").toLowerCase();
+
+                // Check if username appears in message (customs messages use player name)
+                const mentionsUsername = lowerContent.includes(lowerUsername);
+
+                // Also check ship name as fallback
+                const mentionsShip = lowerShipName && (
+                  lowerContent.includes(lowerShipName) ||
+                  lowerContent.includes(lowerShipName.replace(/\s+/g, ""))
+                );
+
+                const isAddressedToBot = mentionsUsername || mentionsShip;
+
+                this.log("customs_debug", `Customs check: user="${this.username}", ship="${this.shipName}", mentionsUser=${mentionsUsername}, mentionsShip=${mentionsShip}, addressed=${isAddressedToBot}`);
+
+                if (!isAddressedToBot) {
+                  // Skip customs messages for other players/ships
+                  this.log("customs_debug", `Skipping customs message - not addressed to this bot`);
+                  continue;
+                }
+
+                // CRITICAL: Skip if we just cleared customs (cooldown period)
+                const now = Date.now();
+                if (this.customsClearedAt && now - this.customsClearedAt < Bot.CUSTOMS_COOLDOWN_MS) {
+                  const remaining = Math.round((Bot.CUSTOMS_COOLDOWN_MS - (now - this.customsClearedAt)) / 1000);
+                  this.log("customs_debug", `Skipping customs message - in ${remaining}s cooldown period`);
+                  continue;
+                }
+
+                // Deduplicate: ignore if same message content within 10 seconds
+                if (content === this.lastCustomsMessage && now - this.lastCustomsMessageTime < 10000) {
+                  this.log("customs_debug", "Skipping duplicate customs message");
+                  continue;
+                }
+                this.lastCustomsMessage = content;
+                this.lastCustomsMessageTime = now;
+
+                this.log("customs_debug", `Detection result: ${customsDetection.type}, keywords: ${customsDetection.matchedKeywords.join(", ")}`);
+
+                this.log("customs", `CUSTOMS detected [${customsDetection.type}]: ${sender} - ${content.slice(0, 100)}`);
+
+                // Get bot's customs statistics for AI response
+                const customsStats = getBotCustomsStats(this.username);
+
+                // Handle customs hold state
+                if (customsDetection.type === "stop_request") {
+                  // Start customs hold - this will block travel/jump actions
+                  this.startCustomsHold();
+                  this.log("customs", "📋 Scan in progress - waiting for clearance...");
+                  logCustomsStop(this.username, this.system, this.poi, "pending");
+
+                  // Send AI chat response to customs (only once per entire customs encounter)
+                  // Check both aiResponseSent flag AND if we're still in the same hold session
+                  if (!this.customsHold.aiResponseSent) {
+                    sendCustomsChatResponse(this, (cat, msg) => this.log(cat, msg), {
+                      messageType: "stop_request",
+                      customsMessage: content,
+                      botStops: customsStats.totalStops,
+                    });
+                    this.customsHold.aiResponseSent = true;
+                    this.log("customs_debug", "AI customs response sent");
+                  } else {
+                    this.log("customs_debug", "AI response already sent for this customs encounter - skipping");
+                  }
+                } else if (customsDetection.type === "cleared") {
+                  // Clear the hold - scan complete, all good
+                  this.clearCustomsHold("cleared");
+                  logCustomsStop(this.username, this.system, this.poi, "cleared");
+                  // No AI response for clearance - just log and continue
+                } else if (customsDetection.type === "contraband") {
+                  // Clear hold - contraband found, penalty process complete
+                  this.clearCustomsHold("contraband");
+                  this.log("customs", "⚠️ Contraband detected - penalty process complete");
+                  logCustomsStop(this.username, this.system, this.poi, "contraband");
+                  // No AI response for contraband - just log and continue
+                } else if (customsDetection.type === "evasion_warning") {
+                  // Clear hold - evasion noted, process complete
+                  this.clearCustomsHold("evasion");
+                  this.log("customs", "⚠️ Evasion warning - process complete");
+                  logCustomsStop(this.username, this.system, this.poi, "evasion");
+                  // No AI response for evasion - just log and continue
+                }
+              }
+
+              // Don't forward customs messages to general AI Chat service
+              // (we handle them separately with sendCustomsChatResponse)
+              this.log("customs_debug", "Customs message - skipping general AI Chat forwarding");
+              continue; // Skip the addChatMessage() call below
+            }
+            // End of isFromCustoms block - non-customs messages fall through
+          }
+
+          // Route NON-customs messages to AI chat handler
+          if (aiChatService && typeof aiChatService.addChatMessage === "function") {
+            aiChatService.addChatMessage({
+              sender,
+              channel: channel as "local" | "faction" | "system" | "private",
+              content,
+              timestamp: Date.now(),
+              botUsername: this.username,
+              botSystem: this.system,
+              botPoi: this.poi,
+              targetId: channel === "private" ? (data.sender_id as string) : undefined,
+            });
+            this.log("ai_chat", `Forwarded to AI Chat service: ${sender}`);
+          } else {
+            this.log("debug", `AI Chat service not available (service=${!!aiChatService}, addChatMessage=${typeof aiChatService?.addChatMessage === "function"})`);
+          }
+          
+          // ── RESCUE COOPERATION: Process private messages for cooperation claims ──
+          if (channel === "private") {
+            const senderId = data.sender_id as string | undefined;
+            const result = processCooperationPrivateMessage(sender, content, senderId);
+            
+            if (result.isClaim && result.claim) {
+              this.log("coop", `📧 Processed claim from ${sender}: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps by ${result.claim.botName})`);
+            } else if (result.skipReason) {
+              this.log("coop_debug", `Skipped private message from ${sender}: ${result.skipReason}`);
+            }
+            
+            if (senderId && result.isClaim) {
+              this.log("coop_debug", `Cached player ID for ${sender}: ${senderId}`);
+            }
+          }
+        } else {
+          this.log("debug", `Chat message received but data is not object: ${typeof data}`);
+        }
+        continue;
+      }
 
       let data = notif.data as Record<string, unknown> | string | undefined;
       if (typeof data === "string") {
@@ -549,6 +990,11 @@ export class Bot {
           this.log("combat",
             `UNDER ATTACK! ${pirateName}${pirateT ? ` (${pirateT})` : ""} dealt ${damage} ${damageType} dmg${hullStr}${shieldStr}`
           );
+
+          // Track pirate name
+          if (pirateName && pirateName !== "Unknown") {
+            playerNameStore.add(pirateName);
+          }
 
           // Combat chat alerts disabled — was spamming faction chat
           // const now = Date.now();
@@ -609,6 +1055,12 @@ export class Bot {
     try {
       let nearbyInfo = "";
       const nearbyResp = await this.api.execute("get_nearby");
+      
+      // Track players from nearby response
+      if (nearbyResp.result) {
+        this.trackNearbyPlayers(nearbyResp.result);
+      }
+      
       if (nearbyResp.result && typeof nearbyResp.result === "object") {
         const nearby = nearbyResp.result as Record<string, unknown>;
 
@@ -652,6 +1104,146 @@ export class Bot {
       this.log("combat", `Faction warning sent`);
     } catch (err) {
       this.log("error", `Warning alert failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  /**
+   * Extract and track player names, pirates, and empire NPCs from a get_nearby response.
+   * Players, pirates, and empire NPCs are tracked in separate categories.
+   */
+  trackNearbyPlayers(nearbyResult: unknown): void {
+    if (!nearbyResult || typeof nearbyResult !== "object") {
+      this.log("debug", "trackNearbyPlayers: no result or not object");
+      return;
+    }
+
+    const data = nearbyResult as Record<string, unknown>;
+
+    // Debug: log what keys we have
+    debugLog("playernames:track", `${this.username}`, `get_nearby result keys: ${Object.keys(data).join(", ")}`);
+
+    // Track actual players (exclude pirates and empire_npcs)
+    const playerArraysToCheck = [
+      Array.isArray(data.objects) ? data.objects : [],
+      Array.isArray(data.nearby) ? data.nearby : [],
+      Array.isArray(data.ships) ? data.ships : [],
+      Array.isArray(data.players) ? data.players : [],
+      Array.isArray(data.nearby_players) ? data.nearby_players : [],
+    ];
+
+    let playerCount = 0;
+    let totalPlayersFound = 0;
+    for (const arr of playerArraysToCheck) {
+      totalPlayersFound += arr.length;
+      for (const entity of arr as Array<Record<string, unknown>>) {
+        // Try various field names for player/ship names
+        const name = (entity.username as string) ||
+                     (entity.name as string) ||
+                     (entity.player_name as string) ||
+                     (entity.ship_name as string);
+
+        if (name && name.trim()) {
+          if (playerNameStore.add(name)) {
+            playerCount++;
+          }
+        }
+      }
+    }
+
+    // Track pirates separately
+    let pirateCount = 0;
+    const piratesArray = Array.isArray(data.pirates) ? data.pirates : [];
+    for (const pirate of piratesArray as Array<Record<string, unknown>>) {
+      const name = pirate.name as string;
+      if (name && name.trim()) {
+        if (playerNameStore.addPirate(name)) {
+          pirateCount++;
+        }
+      }
+    }
+
+    // Track empire NPCs separately
+    let empireNpcCount = 0;
+    const empireNpcsArray = Array.isArray(data.empire_npcs) ? data.empire_npcs : [];
+    for (const npc of empireNpcsArray as Array<Record<string, unknown>>) {
+      const name = npc.name as string;
+      if (name && name.trim()) {
+        if (playerNameStore.addEmpireNpc(name)) {
+          empireNpcCount++;
+        }
+      }
+    }
+
+    const totalFound = totalPlayersFound + piratesArray.length + empireNpcsArray.length;
+    debugLog("playernames:track", `${this.username}`, `Found ${totalFound} entities: ${totalPlayersFound} players, ${piratesArray.length} pirates, ${empireNpcsArray.length} empire NPCs. Added ${playerCount} new players, ${pirateCount} new pirates, ${empireNpcCount} new empire NPCs`);
+
+    if (playerCount > 0 || pirateCount > 0 || empireNpcCount > 0) {
+      this.log("playernames", `Discovered ${playerCount} new player(s), ${pirateCount} new pirate(s), ${empireNpcCount} new empire NPC(s) from nearby scan`);
+    }
+  }
+
+  /**
+   * Track faction member names from faction data.
+   * Call this after loading faction info to record all members.
+   */
+  trackFactionMembers(factionData: unknown): void {
+    if (!factionData || typeof factionData !== "object") {
+      return;
+    }
+
+    const data = factionData as Record<string, unknown>;
+    const members = Array.isArray(data.members) ? data.members : [];
+    
+    let count = 0;
+    for (const member of members as Array<Record<string, unknown>>) {
+      const name = (member.username as string) || (member.player_name as string) || (member.name as string);
+      if (name && name.trim()) {
+        if (playerNameStore.add(name)) {
+          count++;
+        }
+      }
+    }
+
+    if (count > 0) {
+      this.log("playernames", `Discovered ${count} new faction member(s)`);
+    }
+  }
+
+  /**
+   * Track player names from battle/scan results.
+   * Handles battle participants, scan targets, and similar arrays.
+   */
+  trackBattleParticipants(resultData: unknown): void {
+    if (!resultData || typeof resultData !== "object") {
+      return;
+    }
+
+    const data = resultData as Record<string, unknown>;
+    
+    // Extract from various possible array formats
+    const arraysToCheck = [
+      Array.isArray(data.participants) ? data.participants : [],
+      Array.isArray(data.targets) ? data.targets : [],
+      Array.isArray(data.sides) ? data.sides : [],
+    ];
+
+    let count = 0;
+    for (const arr of arraysToCheck) {
+      for (const entity of arr as Array<Record<string, unknown>>) {
+        const name = (entity.username as string) || 
+                     (entity.player_name as string) || 
+                     (entity.name as string);
+        
+        if (name && name.trim()) {
+          if (playerNameStore.add(name)) {
+            count++;
+          }
+        }
+      }
+    }
+
+    if (count > 0) {
+      this.log("playernames", `Discovered ${count} new player(s) from battle/scan`);
     }
   }
 

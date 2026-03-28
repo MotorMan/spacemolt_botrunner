@@ -8,17 +8,27 @@ export interface Credentials {
   playerId: string;
 }
 
+export interface SessionToken {
+  sessionId: string;
+  expiresAt?: string; // Kept for debugging, not used for validation
+  playerId?: string;
+  v2SessionId?: string;
+  v2ExpiresAt?: string; // Kept for debugging, not used for validation
+}
+
 export class SessionManager {
   readonly dir: string;
   private credentialsPath: string;
   private legacyCredentialsPath: string;
   private todoPath: string;
+  private sessionTokenPath: string;
 
   constructor(sessionName: string, baseDir: string) {
     this.dir = join(baseDir, "sessions", sessionName);
     this.credentialsPath = join(this.dir, "credentials.json");
     this.legacyCredentialsPath = join(this.dir, "CREDENTIALS.md");
     this.todoPath = join(this.dir, "TODO.md");
+    this.sessionTokenPath = join(this.dir, "session.json");
     if (!existsSync(this.dir)) {
       mkdirSync(this.dir, { recursive: true });
     }
@@ -72,6 +82,31 @@ export class SessionManager {
       JSON.stringify(creds, null, 2) + "\n",
       "utf-8"
     );
+  }
+
+  saveSessionToken(token: SessionToken): void {
+    writeFileSync(
+      this.sessionTokenPath,
+      JSON.stringify(token, null, 2) + "\n",
+      "utf-8"
+    );
+  }
+
+  loadSessionToken(): SessionToken | null {
+    if (!existsSync(this.sessionTokenPath)) return null;
+    try {
+      const data = JSON.parse(readFileSync(this.sessionTokenPath, "utf-8"));
+      if (data.sessionId && data.expiresAt) {
+        return data as SessionToken;
+      }
+    } catch {}
+    return null;
+  }
+
+  clearSessionToken(): void {
+    if (existsSync(this.sessionTokenPath)) {
+      writeFileSync(this.sessionTokenPath, "{}\n", "utf-8");
+    }
   }
 
   loadTodo(): string {

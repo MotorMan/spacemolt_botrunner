@@ -6,6 +6,9 @@ import {
   isMinablePoi,
   isScenicPoi,
   isStationPoi,
+  isOreBeltPoi,
+  isGasCloudPoi,
+  isIceFieldPoi,
   findStation,
   getSystemInfo,
   parseOreFromMineResult,
@@ -21,15 +24,100 @@ import {
   scavengeWrecks,
   detectAndRecoverFromDeath,
   readSettings,
+  writeSettings,
   sleep,
+  isPirateSystem,
+  checkCustomsInspection,
 } from "./common.js";
 
 /** Number of mine attempts per resource POI to sample ores. */
 const SAMPLE_MINES = 5;
 /** Minimum fuel % before heading back to refuel. */
 const FUEL_SAFETY_PCT = 40;
-/** Minimum fuel % required before attempting a system jump. */
-const JUMP_FUEL_PCT = 70;
+/** Default minimum fuel % required before attempting a system jump. */
+const DEFAULT_JUMP_FUEL_PCT = 50;
+
+// ── Ship module detection ───────────────────────────────────
+
+interface ShipModules {
+  hasMiningLaser: boolean;
+  hasGasHarvester: boolean;
+  hasIceHarvester: boolean;
+  hasRadHarvester: boolean;
+}
+
+/** Detect ship mining/harvesting modules. */
+async function detectShipModules(ctx: RoutineContext): Promise<ShipModules> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error) {
+    ctx.log("error", `Failed to get ship info: ${shipResp.error.message}`);
+    return { hasMiningLaser: false, hasGasHarvester: false, hasIceHarvester: false, hasRadHarvester: false };
+  }
+
+  const shipData = shipResp.result as Record<string, unknown>;
+  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+
+  const result: ShipModules = {
+    hasMiningLaser: false,
+    hasGasHarvester: false,
+    hasIceHarvester: false,
+    hasRadHarvester: false,
+  };
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = (modObj?.id as string) || (modObj?.type_id as string) || "";
+    const modName = (modObj?.name as string) || "";
+    const modType = (modObj?.type as string) || "";
+
+    const checkStr = `${modId} ${modName} ${modType}`.toLowerCase();
+
+    if (checkStr.includes("mining_laser") || checkStr.includes("mining laser")) {
+      result.hasMiningLaser = true;
+    }
+    if (checkStr.includes("gas_harvester") || checkStr.includes("gas harvester")) {
+      result.hasGasHarvester = true;
+    }
+    if (checkStr.includes("ice_harvester") || checkStr.includes("ice harvester")) {
+      result.hasIceHarvester = true;
+    }
+    if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester") || checkStr.includes("radiation harvester")) {
+      result.hasRadHarvester = true;
+    }
+  }
+
+  return result;
+}
+
+/** Check if a POI type requires a specific module. */
+function poiRequiresModule(poiType: string, modules: ShipModules): { canAccess: boolean; missingModule?: string } {
+  const type = poiType.toLowerCase();
+  
+  // Gas clouds need gas harvester
+  if (isGasCloudPoi(poiType) && !modules.hasGasHarvester) {
+    return { canAccess: false, missingModule: "Gas Harvester" };
+  }
+  
+  // Ice fields need ice harvester
+  if (isIceFieldPoi(poiType) && !modules.hasIceHarvester) {
+    return { canAccess: false, missingModule: "Ice Harvester" };
+  }
+  
+  // Radiation nebulae need rad harvester
+  if (type.includes("radiation") || type.includes("rad_") || type.includes("radioactive")) {
+    if (!modules.hasRadHarvester) {
+      return { canAccess: false, missingModule: "Rad Harvester" };
+    }
+  }
+  
+  // Ore belts need mining laser
+  if (isOreBeltPoi(poiType) && !modules.hasMiningLaser) {
+    return { canAccess: false, missingModule: "Mining Laser" };
+  }
+  
+  return { canAccess: true };
+}
 
 // ── Mission helpers ───────────────────────────────────────────
 
@@ -117,6 +205,11 @@ export type ExplorerMode = "explore" | "trade_update";
 function getExplorerSettings(username?: string): {
   mode: ExplorerMode;
   acceptMissions: boolean;
+  focusAreaSystem: string | null;
+  maxJumps: number;
+  refuelThreshold: number;
+  surveyMode: "quick" | "thorough";
+  scanPois: boolean;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -130,10 +223,53 @@ function getExplorerSettings(username?: string): {
       ? Boolean(e.acceptMissions)
       : true;
 
+  // Focus area settings: per-bot only (no global defaults)
+  const focusAreaSystem = (botOverrides.focusAreaSystem as string) || null;
+  const maxJumps = (botOverrides.maxJumps as number) || 5;
+
+  // Refuel threshold: per-bot > global explorer > default 50%
+  const refuelThreshold = (botOverrides.refuelThreshold as number) ?? e.refuelThreshold ?? DEFAULT_JUMP_FUEL_PCT;
+
+  // Survey mode: per-bot > global explorer > default "thorough"
+  const surveyMode = (botOverrides.surveyMode as "quick" | "thorough") ?? e.surveyMode ?? "thorough";
+
+  // Scan POIs: per-bot > global explorer > default true
+  const scanPois = botOverrides.scanPois !== undefined
+    ? Boolean(botOverrides.scanPois)
+    : e.scanPois !== undefined
+      ? Boolean(e.scanPois)
+      : true;
+
   return {
     mode: (mode === "trade_update" ? "trade_update" : "explore") as ExplorerMode,
     acceptMissions,
+    focusAreaSystem,
+    maxJumps,
+    refuelThreshold: Number(refuelThreshold) || DEFAULT_JUMP_FUEL_PCT,
+    surveyMode: (surveyMode === "quick" ? "quick" : "thorough") as "quick" | "thorough",
+    scanPois,
   };
+}
+
+/** Persist explorer mode setting for a specific bot. */
+export function setExplorerMode(username: string, mode: ExplorerMode): void {
+  writeSettings({
+    [username]: { explorerMode: mode },
+  });
+}
+
+/** Persist focus area settings for a specific bot. */
+export function setExplorerFocusArea(username: string, focusAreaSystem: string | null, maxJumps: number): void {
+  writeSettings({
+    [username]: { focusAreaSystem, maxJumps },
+  });
+}
+
+/** Persist jump fuel threshold setting for a specific bot. */
+export function setExplorerJumpFuelThreshold(username: string, refuelThreshold: number): void {
+  writeSettings({
+    [username]: { refuelThreshold },
+  });
 }
 
 /**
@@ -158,6 +294,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   const visitedSystems = new Set<string>();
+  let lastSystem: string | null = null;
 
   // ── Startup: dock at local station to clear cargo & refuel ──
   yield "startup_prep";
@@ -230,6 +367,14 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Re-check mode after recovery — user might have changed it, or session was restarted ──
+    const modeCheck = getExplorerSettings(bot.username);
+    if (modeCheck.mode === "trade_update") {
+      ctx.log("system", "Mode changed to trade_update — switching routines...");
+      yield* tradeUpdateRoutine(ctx);
+      return;
+    }
+
     // ── Get current system data ──
     yield "scan_system";
     await bot.refreshStatus();
@@ -248,28 +393,47 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     await fetchSecurityLevel(ctx, systemId);
 
     // ── Survey the system to reveal hidden POIs ──
-    yield "survey_system";
-    const surveyResp = await bot.exec("survey_system");
-    if (!surveyResp.error) {
-      ctx.log("info", `Surveyed ${bot.system} — checking for newly revealed POIs...`);
-      // Re-fetch system info to pick up any hidden POIs that were revealed
-      const refreshed = await getSystemInfo(ctx);
-      if (refreshed.pois.length > pois.length) {
-        ctx.log("info", `Survey revealed ${refreshed.pois.length - pois.length} new POI(s)!`);
+    // Only survey if scanPois is enabled
+    const explorerSettings = getExplorerSettings(bot.username);
+    
+    if (explorerSettings.scanPois) {
+      yield "survey_system";
+      const surveyResp = await bot.exec("survey_system");
+      if (!surveyResp.error) {
+        ctx.log("info", `Surveyed ${bot.system} — checking for newly revealed POIs...`);
+        // Re-fetch system info to pick up any hidden POIs that were revealed
+        const refreshed = await getSystemInfo(ctx);
+        if (refreshed.pois.length > pois.length) {
+          ctx.log("info", `Survey revealed ${refreshed.pois.length - pois.length} new POI(s)!`);
+        }
+        pois = refreshed.pois;
+        connections = refreshed.connections;
+      } else {
+        const msg = surveyResp.error.message.toLowerCase();
+        // Don't log for expected errors like "already surveyed" or skill-related
+        if (!msg.includes("already") && !msg.includes("cooldown")) {
+          ctx.log("info", `Survey: ${surveyResp.error.message}`);
+        }
       }
-      pois = refreshed.pois;
-      connections = refreshed.connections;
+    }
+
+    // ── Detect ship modules for mining/harvesting ──
+    const shipModules = await detectShipModules(ctx);
+    const moduleInfo = [];
+    if (shipModules.hasMiningLaser) moduleInfo.push("Mining Laser");
+    if (shipModules.hasGasHarvester) moduleInfo.push("Gas Harvester");
+    if (shipModules.hasIceHarvester) moduleInfo.push("Ice Harvester");
+    if (shipModules.hasRadHarvester) moduleInfo.push("Rad Harvester");
+    if (moduleInfo.length > 0) {
+      ctx.log("info", `Ship equipped: ${moduleInfo.join(", ")}`);
     } else {
-      const msg = surveyResp.error.message.toLowerCase();
-      // Don't log for expected errors like "already surveyed" or skill-related
-      if (!msg.includes("already") && !msg.includes("cooldown")) {
-        ctx.log("info", `Survey: ${surveyResp.error.message}`);
-      }
+      ctx.log("warn", "No mining/harvesting modules detected — will skip resource POIs");
     }
 
     // ── Classify POIs and determine what needs visiting ──
     const toVisit: Array<{ poi: SystemPOI; reason: string }> = [];
     let skippedCount = 0;
+    let skippedNoModule = 0;
 
     for (const poi of pois) {
       const isStation = isStationPoi(poi);
@@ -277,28 +441,53 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       const isScenic = isScenicPoi(poi.type);
       const minutesAgo = mapStore.minutesSinceExplored(systemId, poi.id);
 
+      // Check if we have the required module for this POI type
+      if (isMinable) {
+        const moduleCheck = poiRequiresModule(poi.type, shipModules);
+        if (!moduleCheck.canAccess) {
+          skippedNoModule++;
+          // Mark as explored to avoid revisiting
+          mapStore.markExplored(systemId, poi.id);
+          ctx.log("info", `Skipping ${poi.name}: requires ${moduleCheck.missingModule} (not equipped)`);
+          continue;
+        }
+      }
+
       if (isStation) {
         if (minutesAgo < STATION_REFRESH_MINS) { skippedCount++; continue; }
         toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : "refresh" });
       } else if (isMinable) {
+        // In quick survey mode, skip resource POIs that have already been sampled
+        if (explorerSettings.surveyMode === "quick") {
+          const storedPoi = mapStore.getSystem(systemId)?.pois.find(p => p.id === poi.id);
+          const hasOreData = (storedPoi?.ores_found?.length ?? 0) > 0;
+          if (hasOreData) { skippedCount++; continue; }
+        }
+        
         // Always re-visit if explored but no ores were recorded
         const storedPoi = mapStore.getSystem(systemId)?.pois.find(p => p.id === poi.id);
         const hasOreData = (storedPoi?.ores_found?.length ?? 0) > 0;
         if (minutesAgo < RESOURCE_REFRESH_MINS && hasOreData) { skippedCount++; continue; }
         toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : (hasOreData ? "re-sample" : "no-data") });
       } else if (isScenic) {
+        // In quick survey mode, skip scenic POIs entirely
+        if (explorerSettings.surveyMode === "quick") { skippedCount++; continue; }
         if (minutesAgo < Infinity) { skippedCount++; continue; }
         toVisit.push({ poi, reason: "new" });
       } else {
+        // In quick survey mode, skip other POIs
+        if (explorerSettings.surveyMode === "quick") { skippedCount++; continue; }
         if (minutesAgo < RESOURCE_REFRESH_MINS) { skippedCount++; continue; }
         toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : "refresh" });
       }
     }
 
     if (toVisit.length === 0) {
-      ctx.log("info", `${bot.system}: all ${skippedCount} POIs up to date — moving on`);
+      const moduleSkipMsg = skippedNoModule > 0 ? `, ${skippedNoModule} skipped (no module)` : "";
+      ctx.log("info", `${bot.system}: all ${skippedCount} POIs up to date${moduleSkipMsg} — moving on`);
     } else {
-      ctx.log("info", `${bot.system}: ${toVisit.length} to visit, ${skippedCount} already explored`);
+      const moduleSkipMsg = skippedNoModule > 0 ? `, ${skippedNoModule} skipped (no module)` : "";
+      ctx.log("info", `${bot.system}: ${toVisit.length} to visit, ${skippedCount} already explored${moduleSkipMsg}`);
     }
 
     // ── Hull check — repair if <= 40% ──
@@ -396,12 +585,15 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "check_skills";
     await bot.checkSkills();
 
+    // ── Re-get settings in case they changed ──
+    const currentSettings = getExplorerSettings(bot.username);
+
     // ── Pick next system to explore ──
     yield "pick_next_system";
 
     // ALWAYS ensure fueled before jumping — will navigate to nearest station if needed
     yield "pre_jump_fuel";
-    const jumpFueled = await ensureFueled(ctx, JUMP_FUEL_PCT);
+    const jumpFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
     if (!jumpFueled) {
       ctx.log("error", "Could not refuel before jump — waiting 30s...");
       await sleep(30000);
@@ -409,18 +601,19 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     const validConns = connections.filter(c => c.id);
-    const nextSystem = pickNextSystem(validConns, visitedSystems);
+    const nextSystem = pickNextSystem(validConns, visitedSystems, lastSystem);
     if (!nextSystem) {
       ctx.log("info", "All connected systems explored! Picking a random connection...");
       if (validConns.length > 0) {
         // Ensure fuel before random jump
-        const rndFueled = await ensureFueled(ctx, JUMP_FUEL_PCT);
+        const rndFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
         if (!rndFueled) {
           ctx.log("error", "Cannot refuel for random jump — waiting 30s...");
           await sleep(30000);
           continue;
         }
-        const random = validConns[Math.floor(Math.random() * validConns.length)];
+        // Smart selection: avoid dead-ends and pirate systems
+        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems);
         await ensureUndocked(ctx);
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
         const jumpResp = await bot.exec("jump", { target_system: random.id });
@@ -440,7 +633,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const preJumpFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (preJumpFuel < 25) {
       ctx.log("system", `Fuel too low for jump (${preJumpFuel}%) — refueling first...`);
-      const jf = await ensureFueled(ctx, JUMP_FUEL_PCT);
+      const jf = await ensureFueled(ctx, currentSettings.refuelThreshold);
       if (!jf) {
         ctx.log("error", "Cannot refuel — waiting 30s...");
         await sleep(30000);
@@ -464,6 +657,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     ctx.log("travel", `Jumped to ${nextSystem.name || nextSystem.id}`);
     bot.stats.totalSystems++;
+    
+    // Check for customs inspection after jump
+    await checkCustomsInspection(ctx, systemId);
+    
+    lastSystem = systemId;
   }
 };
 
@@ -650,6 +848,17 @@ async function* visitOtherPoi(
     if (objects.length > 0) {
       ctx.log("info", `Visited ${poi.name}: ${objects.length} objects nearby`);
     }
+
+    // Track player names from nearby scan
+    bot.trackNearbyPlayers(nearbyResp.result);
+
+    // Check for pirates and flee if detected
+    const { checkAndFleeFromPirates } = await import("./common.js");
+    const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+    if (fled) {
+      // We've fled - abort this POI scan and return to main loop
+      return;
+    }
   }
 
   mapStore.markExplored(systemId, poi.id);
@@ -689,7 +898,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const alive2 = await detectAndRecoverFromDeath(ctx);
     if (!alive2) { await sleep(30000); continue; }
 
-    // Re-read settings each cycle — user might switch mode mid-run
+    // ── Re-check mode after recovery — user might have changed it, or session was restarted ──
     const modeCheck = getExplorerSettings(bot.username);
     if (modeCheck.mode !== "trade_update") {
       ctx.log("system", "Mode changed to explore — restarting as explorer...");
@@ -701,7 +910,23 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const allSystems = mapStore.getAllSystems();
     const stationSystems: Array<{ systemId: string; systemName: string; stationPoi: string; stationName: string; staleMins: number }> = [];
 
+    // Get focus area settings
+    const focusSettings = getExplorerSettings(bot.username);
+    const focusAreaSystem = focusSettings.focusAreaSystem;
+    const maxJumps = focusSettings.maxJumps;
+
     for (const [sysId, sys] of Object.entries(allSystems)) {
+      // Skip pirate systems — they are hostile!
+      if (isPirateSystem(sysId)) continue;
+
+      // If focus area is set, check if this system is within range
+      if (focusAreaSystem) {
+        const route = mapStore.findRoute(focusAreaSystem, sysId);
+        if (!route) continue; // No route = not reachable
+        const jumpsNeeded = route.length - 1; // Number of jumps = route length - 1
+        if (jumpsNeeded > maxJumps) continue; // Too far from focus area
+      }
+
       for (const poi of sys.pois) {
         if (!poi.has_base) continue;
         // Find the stalest market entry, or Infinity if no market data
@@ -728,12 +953,14 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     stationSystems.sort((a, b) => b.staleMins - a.staleMins);
 
     if (stationSystems.length === 0) {
-      ctx.log("info", "No known stations on map — run an explorer in 'explore' mode first. Waiting 60s...");
+      const focusMsg = focusAreaSystem ? ` within ${maxJumps} jumps of ${focusAreaSystem}` : '';
+      ctx.log("info", `No known stations${focusMsg} — run an explorer in 'explore' mode first. Waiting 60s...`);
       await sleep(60000);
       continue;
     }
 
-    ctx.log("info", `Found ${stationSystems.length} known stations to update`);
+    const focusLog = focusAreaSystem ? ` (focus: ${focusAreaSystem}, max ${maxJumps} jumps)` : '';
+    ctx.log("info", `Found ${stationSystems.length} known stations to update${focusLog}`);
 
     // ── Visit each station ──
     for (const target of stationSystems) {
@@ -848,13 +1075,37 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
 // ── Helpers ──────────────────────────────────────────────────
 
-/** Pick the best next system: prefer unvisited, then least-explored in mapStore. */
-function pickNextSystem(connections: Connection[], visited: Set<string>): Connection | null {
-  const unvisited = connections.filter(c => !visited.has(c.id));
-  if (unvisited.length > 0) {
-    const unmapped = unvisited.filter(c => !mapStore.getSystem(c.id));
-    if (unmapped.length > 0) return unmapped[0];
+/**
+ * Pick the best next system: prioritize unexplored systems not in map.json.
+ * Priority:
+ * 1. Systems not in map.json at all (completely unexplored)
+ * 2. Systems in map.json but not yet visited this session
+ * 3. Among unvisited, prefer systems with fewer POIs (less explored)
+ * Always avoids pirate systems unless no other option exists.
+ */
+function pickNextSystem(connections: Connection[], visited: Set<string>, lastSystem: string | null): Connection | null {
+  // Separate connections into pirate and non-pirate
+  const nonPirateConns = connections.filter(c => !isPirateSystem(c.id));
+  const pirateConns = connections.filter(c => isPirateSystem(c.id));
+  
+  // Work with non-pirate connections first
+  let candidates = nonPirateConns.length > 0 ? nonPirateConns : pirateConns;
+  
+  // Priority 1: Systems not in map.json at all (completely unexplored)
+  const unmapped = candidates.filter(c => !mapStore.getSystem(c.id));
+  if (unmapped.length > 0) {
+    // If multiple unmapped, prefer non-pirate
+    const unmappedNonPirate = unmapped.filter(c => !isPirateSystem(c.id));
+    if (unmappedNonPirate.length > 0) {
+      return unmappedNonPirate[Math.floor(Math.random() * unmappedNonPirate.length)];
+    }
+    return unmapped[Math.floor(Math.random() * unmapped.length)];
+  }
 
+  // Priority 2: Systems in map.json but not visited this session
+  const unvisited = candidates.filter(c => !visited.has(c.id));
+  if (unvisited.length > 0) {
+    // Sort by POI count (prefer less explored systems)
     unvisited.sort((a, b) => {
       const aPois = mapStore.getSystem(a.id)?.pois?.length ?? 0;
       const bPois = mapStore.getSystem(b.id)?.pois?.length ?? 0;
@@ -863,5 +1114,67 @@ function pickNextSystem(connections: Connection[], visited: Set<string>): Connec
     return unvisited[0];
   }
 
+  // All connected systems have been visited this session
   return null;
+}
+
+/**
+ * Smart connection picker that avoids dead-ends and pirate traps.
+ * Used when all connected systems have been visited.
+ * Priority:
+ * 1. Not the system we just came from
+ * 2. Not a pirate system
+ * 3. Systems with more connections (not a dead-end)
+ * 4. Unexplored systems (not in map.json) over explored ones
+ */
+function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>): Connection {
+  // First, filter out the system we came from (if possible)
+  let candidates = lastSystem ? connections.filter(c => c.id !== lastSystem) : connections;
+  if (candidates.length === 0) candidates = connections;
+
+  // Separate into pirate and non-pirate
+  const nonPirate = candidates.filter(c => !isPirateSystem(c.id));
+  const pirate = candidates.filter(c => isPirateSystem(c.id));
+
+  // Prefer non-pirate systems
+  const pool = nonPirate.length > 0 ? nonPirate : pirate;
+
+  // Score each connection by multiple factors
+  const scored = pool.map(conn => {
+    const sys = mapStore.getSystem(conn.id);
+    const connectionCount = sys?.connections?.length ?? 1;
+    const isInMap = conn.id ? mapStore.getSystem(conn.id) != null : false;
+    const isExploredThisSession = conn.id ? visited.has(conn.id) : false;
+    
+    // Higher score = better
+    let score = 0;
+    
+    // Big bonus for systems not in map.json (completely unexplored)
+    if (!isInMap) {
+      score += 1000;
+    }
+    
+    // Bonus for systems with more connections (hubs, not dead-ends)
+    score += connectionCount * 10;
+    
+    // Small penalty for already explored this session
+    if (isExploredThisSession) {
+      score -= 50;
+    }
+    
+    return { conn, score };
+  });
+
+  // Sort by score (highest first)
+  scored.sort((a, b) => b.score - a.score);
+
+  // Pick from top scored (add some randomness among top candidates)
+  const topScore = scored[0].score;
+  const topCandidates = scored.filter(s => s.score === topScore);
+  const chosen = topCandidates[Math.floor(Math.random() * topCandidates.length)];
+
+  const connInfo = scored.map(s => `${s.conn.name || s.conn.id}: ${s.score}`).join(", ");
+  ctx.log("info", `Connection scores: ${connInfo} — picking ${chosen.conn.name || chosen.conn.id}`);
+
+  return chosen.conn;
 }

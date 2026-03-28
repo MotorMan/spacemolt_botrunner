@@ -20,6 +20,11 @@ import {
   readSettings,
   sleep,
   logFactionActivity,
+  isPirateSystem,
+  getSystemInfo,
+  findStation,
+  isStationPoi,
+  type SystemPOI,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -29,6 +34,7 @@ function getCleanupSettings(username?: string): {
   homeStation: string;
   refuelThreshold: number;
   repairThreshold: number;
+  focusStationId: string;  // If set, only clean up this specific station
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -42,6 +48,7 @@ function getCleanupSettings(username?: string): {
       || (t.homeStation as string) || (general.factionStorageStation as string) || "",
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
+    focusStationId: (botOverrides.focusStationId as string) || (t.focusStationId as string) || "",
   };
 }
 
@@ -111,28 +118,65 @@ function resolveStation(stationId: string): { systemId: string; poiId: string; p
   const allSystems = mapStore.getAllSystems();
   for (const [sysId, sys] of Object.entries(allSystems)) {
     for (const poi of sys.pois) {
+      // Match on id, base_id, or base_name (case-insensitive for names)
       if (poi.id === stationId || poi.base_id === stationId) {
         return { systemId: sysId, poiId: poi.id, poiName: poi.base_name || poi.name || poi.id };
+      }
+      // Also match on base_name for convenience (e.g. "sol_central" -> base_name)
+      if (poi.base_name && poi.base_name.toLowerCase() === stationId.toLowerCase()) {
+        return { systemId: sysId, poiId: poi.id, poiName: poi.base_name };
       }
     }
   }
   return null;
 }
 
-/** Get all known stations with bases from mapStore. */
-function getAllKnownStations(homeSystem: string, homeStation: string): StationTarget[] {
+/** Get all known stations with bases from mapStore (excluding pirate systems). */
+function getAllKnownStations(homeSystem: string, homeStation: string, focusStationId?: string): StationTarget[] {
   const stations: StationTarget[] = [];
   const allSystems = mapStore.getAllSystems();
 
+  // If focus station is set, only return that station
+  if (focusStationId) {
+    for (const [sysId, sys] of Object.entries(allSystems)) {
+      if (isPirateSystem(sysId)) continue;
+      for (const poi of sys.pois) {
+        if (!poi.has_base) continue;
+        if (poi.base_id === focusStationId || poi.id === focusStationId) {
+          // Skip the home/faction storage station
+          if (sysId === homeSystem && (poi.id === homeStation || poi.base_id === homeStation)) continue;
+          // For stations with bases, use base_id for travel; otherwise use poi.id
+          const travelId = poi.base_id || poi.id;
+          stations.push({
+            stationId: travelId,
+            systemId: sysId,
+            poiId: travelId,
+            poiName: poi.base_name || poi.name || poi.id,
+            hasItems: false,
+            hasCredits: false,
+            hasOrders: false,
+          });
+          return stations;  // Return early - only one station in focus mode
+        }
+      }
+    }
+    return stations;  // Focus station not found
+  }
+
+  // Default: return all stations (except home)
   for (const [sysId, sys] of Object.entries(allSystems)) {
+    // Skip pirate systems
+    if (isPirateSystem(sysId)) continue;
     for (const poi of sys.pois) {
       if (!poi.has_base) continue;
       // Skip the home/faction storage station
       if (sysId === homeSystem && (poi.id === homeStation || poi.base_id === homeStation)) continue;
+      // For stations with bases, use base_id for travel; otherwise use poi.id
+      const travelId = poi.base_id || poi.id;
       stations.push({
-        stationId: poi.base_id || poi.id,
+        stationId: travelId,
         systemId: sysId,
-        poiId: poi.id,
+        poiId: travelId,
         poiName: poi.base_name || poi.name || poi.id,
         hasItems: false,
         hasCredits: false,
@@ -168,28 +212,91 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     }
   }
 
-  // Travel to home station POI
+  // Travel to home station POI using fresh API data (like return_home.ts)
   await ensureUndocked(ctx);
-  // Resolve home station to POI id (might be a base_id)
-  let homePoiId = settings.homeStation;
-  if (homePoiId) {
-    const resolved = resolveStation(homePoiId);
-    if (resolved) homePoiId = resolved.poiId;
-  } else {
-    // Find any station in the home system
-    const sys = mapStore.getSystem(settings.homeSystem);
-    const station = sys?.pois.find(p => p.has_base);
-    if (station) homePoiId = station.id;
+  
+  // Get fresh system data from API
+  const { pois } = await getSystemInfo(ctx);
+  
+  let targetStation = null;
+
+  // First, try to find by configured homeStation name/id
+  if (settings.homeStation) {
+    targetStation = pois.find(p => 
+      isStationPoi(p) && 
+      (p.id === settings.homeStation || p.base_id === settings.homeStation)
+    );
+    if (!targetStation) {
+      // Also try matching by base_id (case-insensitive)
+      targetStation = pois.find(p => 
+        isStationPoi(p) && 
+        p.base_id && 
+        p.base_id.toLowerCase() === settings.homeStation.toLowerCase()
+      );
+    }
   }
 
-  if (homePoiId && bot.poi !== homePoiId) {
+  // If not found, search for any station with a base in the home system
+  // Skip the focus station (we're collecting FROM there, not depositing TO there)
+  if (!targetStation) {
+    targetStation = pois.find(p =>
+      isStationPoi(p) &&
+      p.has_base &&
+      p.base_id !== settings.focusStationId &&
+      p.id !== settings.focusStationId &&
+      p.id !== bot.poi
+    );
+    if (targetStation) {
+      ctx.log("info", `Using default station in ${settings.homeSystem}: ${targetStation.base_id || targetStation.name || targetStation.id}`);
+    }
+  }
+
+  // If still not found, fall back to "sol" system (the default)
+  if (!targetStation && settings.homeSystem !== "sol") {
+    ctx.log("warn", `No valid home station in ${settings.homeSystem} — falling back to sol system`);
+    // Navigate to sol first
+    const solSystem = "sol";
+    if (bot.system !== solSystem) {
+      const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+      if (fueled) {
+        const arrived = await navigateToSystem(ctx, solSystem, safetyOpts);
+        if (!arrived) {
+          ctx.log("error", "Failed to reach sol system for fallback");
+          return;
+        }
+      } else {
+        ctx.log("error", "Cannot refuel to reach sol system");
+        return;
+      }
+    }
+    // Get fresh system data for sol
+    const { pois: solPois } = await getSystemInfo(ctx);
+    targetStation = solPois.find(p =>
+      isStationPoi(p) &&
+      p.has_base &&
+      p.id !== bot.poi
+    );
+    if (targetStation) {
+      ctx.log("info", `Using fallback station in sol: ${targetStation.base_id || targetStation.name || targetStation.id}`);
+    }
+  }
+
+  if (!targetStation) {
+    ctx.log("error", `Could not find home station (focus: ${settings.focusStationId || 'none'}, current: ${bot.poi}). Configure factionStorageStation in settings.`);
+    return;
+  }
+
+  // For stations with bases, use base_id for travel (game API expects base_id for faction stations)
+  const targetPoiId = targetStation.base_id && targetStation.has_base ? targetStation.base_id : targetStation.id;
+  
+  if (bot.poi !== targetPoiId) {
     ctx.log("travel", `Traveling to home station...`);
-    const tResp = await bot.exec("travel", { target_poi: homePoiId });
+    const tResp = await bot.exec("travel", { target_poi: targetPoiId });
     if (tResp.error && !tResp.error.message.includes("already")) {
       ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
       return;
     }
-    bot.poi = homePoiId;
+    bot.poi = targetPoiId;
   }
 
   // Dock
@@ -230,7 +337,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await sleep(10000); continue; }
 
     const settings = getCleanupSettings(bot.username);
     const safetyOpts = {
@@ -240,7 +347,8 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Phase 1: Remote scan — discover which stations have our stuff ──
     yield "remote_scan";
-    ctx.log("info", "Scanning all stations for stored items (remote)...");
+    const focusMode = settings.focusStationId ? ` (focus: ${settings.focusStationId})` : "";
+    ctx.log("info", `Scanning${focusMode} for stored items (remote)...`);
 
     // Call view_storage to get the hint field
     const storageData = await bot.viewStorage();
@@ -248,13 +356,13 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     const hintEntries = parseStorageHints(hint);
 
     // Get all known stations for comparison
-    const allStations = getAllKnownStations(settings.homeSystem, settings.homeStation);
+    const allStations = getAllKnownStations(settings.homeSystem, settings.homeStation, settings.focusStationId);
 
     // If we got hints, mark stations that have items
     const stationsWithStorage: StationTarget[] = [];
 
     if (hintEntries.length > 0) {
-      ctx.log("info", `Hint lists ${hintEntries.length} station(s) with storage`);
+      ctx.log("info", `Hint lists ${hintEntries.length} station(s) with storage — verifying each remotely...`);
       for (const entry of hintEntries) {
         const sid = entry.station_id || entry.base_id || entry.poi_id || "";
         if (!sid) continue;
@@ -274,7 +382,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
             systemId: resolved.systemId,
             poiId: resolved.poiId,
             poiName: resolved.poiName,
-            hasItems: true,
+            hasItems: false,
             hasCredits: false,
             hasOrders: false,
           };
@@ -284,15 +392,32 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
             systemId: entry.system_id,
             poiId: sid,
             poiName: entry.name || sid,
-            hasItems: true,
+            hasItems: false,
             hasCredits: false,
             hasOrders: false,
           };
         }
 
-        if (target) {
-          target.hasItems = true;
+        if (!target) continue;
+
+        // Remotely verify this station actually has items/credits
+        const remote = await bot.viewStorage(target.stationId);
+        const credits = (remote.credits as number) || (remote.stored_credits as number) || 0;
+        const itemArray = (
+          Array.isArray(remote) ? remote :
+          Array.isArray(remote.items) ? remote.items :
+          Array.isArray(remote.storage) ? remote.storage :
+          []
+        ) as Array<Record<string, unknown>>;
+        const hasItems = itemArray.some(
+          (i: Record<string, unknown>) => ((i.quantity as number) || 0) > 0
+        );
+
+        if (credits > 0 || hasItems) {
+          target.hasCredits = credits > 0;
+          target.hasItems = hasItems;
           stationsWithStorage.push(target);
+          ctx.log("info", `  ${target.poiName}: ${credits > 0 ? credits + "cr" : ""}${hasItems ? " + items" : ""}`);
         }
       }
     } else {
@@ -303,7 +428,6 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
         const remote = await bot.viewStorage(station.stationId);
         const credits = (remote.credits as number) || (remote.stored_credits as number) || 0;
-        const items = bot.parseItemList ? [] : []; // parseItemList is private, check items array
         const itemArray = (
           Array.isArray(remote) ? remote :
           Array.isArray(remote.items) ? remote.items :
@@ -352,12 +476,18 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     if (stationsWithStorage.length === 0) {
-      ctx.log("info", "No stations with stored items — waiting 5 minutes");
-      await sleep(300000);
+      const waitMsg = settings.focusStationId 
+        ? `No items at focus station — waiting 30 seconds`
+        : "No stations with stored items — waiting 30 seconds";
+      ctx.log("info", waitMsg);
+      await sleep(30000);
       continue;
     }
 
-    ctx.log("info", `Found ${stationsWithStorage.length} station(s) with items/credits to collect`);
+    const stationCountMsg = settings.focusStationId
+      ? `Found ${stationsWithStorage.length} station(s) in focus mode with items/credits to collect`
+      : `Found ${stationsWithStorage.length} station(s) with items/credits to collect`;
+    ctx.log("info", stationCountMsg);
 
     // ── Phase 2: Travel to each station and collect ──
     let totalCredits = 0;
@@ -508,7 +638,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     await repairShip(ctx);
 
     // Wait before next run
-    ctx.log("info", "Next cleanup run in 5 minutes");
-    await sleep(300000);
+    ctx.log("info", "Next cleanup run in 30 seconds");
+    await sleep(30000);
   }
 };

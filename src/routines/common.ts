@@ -5,8 +5,15 @@
  * ore parsing, and safety checks.
  */
 import type { RoutineContext } from "../bot.js";
+import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
+import {
+  waitForCustomsInspection,
+  pollForCustomsShip,
+  isEmpireSystem,
+  getBotCustomsStats,
+} from "../customs.js";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -20,6 +27,7 @@ export interface BaseServices {
   missions?: boolean;
   cloning?: boolean;
   insurance?: boolean;
+  salvage_yard?: boolean;
 }
 
 export interface SystemPOI {
@@ -55,12 +63,12 @@ export function isMinablePoi(type: string): boolean {
     || t.includes("belt") || t.includes("resource");
 }
 
-/** Check if a POI is an ore belt (asteroid belt/field/ring — NOT gas clouds or ice fields). */
+/** Check if a POI is an ore belt (asteroid belt/field/ring/nebula — NOT gas clouds or ice fields). */
 export function isOreBeltPoi(type: string): boolean {
   const t = type.toLowerCase();
-  if (t.includes("gas") || t.includes("cloud") || t.includes("nebula") || t.includes("ice")) return false;
+  if (t.includes("gas") || t.includes("cloud") || t.includes("ice")) return false;
   return t.includes("asteroid") || t.includes("belt") || t.includes("ring")
-    || t.includes("field") || t.includes("resource");
+    || t.includes("field") ||  t.includes("nebula") || t.includes("resource");
 }
 
 /** Check if a POI is a gas cloud. */
@@ -102,13 +110,13 @@ export function isStationPoi(poi: SystemPOI): boolean {
 }
 
 /** Find the first station POI in a list. Optionally filter by required service. */
-export function findStation(pois: SystemPOI[], requiredService?: keyof BaseServices): SystemPOI | null {
+export function findStation(pois: SystemPOI[], requiredService?: keyof BaseServices, excludePirates: boolean = true): SystemPOI | null {
   if (requiredService) {
     // Prefer station with the required service
-    const withService = pois.find(p => isStationPoi(p) && p.services?.[requiredService] !== false);
+    const withService = pois.find(p => isStationPoi(p) && p.services?.[requiredService] !== false && !(excludePirates && isPirateSystem(p.id)));
     if (withService) return withService;
   }
-  return pois.find(p => isStationPoi(p)) || null;
+  return pois.find(p => isStationPoi(p) && !(excludePirates && isPirateSystem(p.id))) || null;
 }
 
 /** Check if a station POI is known to lack a specific service. */
@@ -116,6 +124,96 @@ export function stationHasService(poi: SystemPOI, service: keyof BaseServices): 
   // If services are unknown, assume the station has the service (optimistic)
   if (!poi.services) return true;
   return poi.services[service] !== false;
+}
+
+/** Known salvage yard station IDs (one per empire). */
+export const SALVAGE_YARD_STATIONS = [
+  "alpha_centauri_colonial_station", // Sol
+  "node_alpha_processing_station",   // Node
+  "the_anvil_arsenal",               // Anvil
+  "mobile_capital",                  // Mobile empire (dynamic - location tracked by mapStore)
+  "cargo_lanes_freight_depot",       // Cargo Lanes
+];
+
+/** Pirate station systems — these are hostile and should be avoided. */
+export const PIRATE_SYSTEMS = [
+  "alhena",
+  "xamidimura",
+  "algol",
+  "zaniah",
+  "sheratan",
+  "bellatrix",
+  "barnard_44",
+  "gsc_0008",
+  "gliese_581",
+];
+
+/** Check if a system ID is a pirate system. */
+export function isPirateSystem(systemId: string): boolean {
+  const lower = systemId.toLowerCase();
+  return PIRATE_SYSTEMS.some(ps => lower === ps || lower.includes(ps));
+}
+
+/** Find a station with a salvage yard service. Returns null if none found. */
+export function findSalvageYardStation(pois: SystemPOI[]): SystemPOI | null {
+  // First try: check services flag
+  const byService = pois.find(p => isStationPoi(p) && p.services?.salvage_yard !== false);
+  if (byService) return byService;
+  
+  // Second try: match known salvage yard station IDs
+  return pois.find(p => isStationPoi(p) && SALVAGE_YARD_STATIONS.includes(p.id)) || null;
+}
+
+/** Get the system ID for a known salvage yard station. */
+export function getSystemForSalvageYard(stationId: string): string | null {
+  // Mobile capitol is dynamic - use the tracked location
+  if (stationId === "mobile_capital") {
+    return getMobileCapitolSystem();
+  }
+  
+  // Map other salvage yard stations to their systems (update as discovered)
+  const stationToSystem: Record<string, string> = {
+    "alpha_centauri_colonial_station": "sol",            // Sol empire
+    "node_alpha_processing_station": "node_alpha",       // Node empire (guess - update if different)
+    "the_anvil_arsenal": "the_anvil",                    // Anvil empire (guess - update if different)
+    "cargo_lanes_freight_depot": "cargo_lanes",          // Cargo Lanes empire (guess - update if different)
+  };
+  return stationToSystem[stationId] || null;
+}
+
+/**
+ * Resolve the current system for the mobile_capitol station.
+ * This is a moving station that changes location periodically.
+ * Returns the last known system from mapStore, or null if not yet discovered.
+ */
+export function getMobileCapitolSystem(): string | null {
+  const location = mapStore.getMobileCapitolLocation();
+  return location?.systemId || null;
+}
+
+/**
+ * Resolve a station reference that may be the mobile_capitol.
+ * If stationId is "mobile_capital", returns the current known location from mapStore.
+ * Otherwise returns the stationId unchanged.
+ */
+export function resolveStationId(stationId: string): string | null {
+  if (stationId === "mobile_capital") {
+    const location = mapStore.getMobileCapitolLocation();
+    return location?.poiId || "mobile_capital";
+  }
+  return stationId;
+}
+
+/**
+ * Resolve a system reference that may be the mobile_capitol's system.
+ * If systemId is "mobile_capital" or refers to the mobile capitol, returns the current system.
+ * Otherwise returns the systemId unchanged.
+ */
+export function resolveSystemForMobileCapitol(systemIdOrStation: string): string | null {
+  if (systemIdOrStation === "mobile_capital") {
+    return getMobileCapitolSystem();
+  }
+  return systemIdOrStation;
 }
 
 // ── System data parsing ──────────────────────────────────────
@@ -224,8 +322,11 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
 
 /** Ensure the bot is docked at a station. Finds one in current system,
  *  or navigates to the nearest known station system if none is available.
- *  Returns true if successfully docked. */
-export async function ensureDocked(ctx: RoutineContext): Promise<boolean> {
+ *  Returns true if successfully docked.
+ *  @param skipStorageCollection If true, skips automatic storage collection (withdraw credits).
+ *  @param minBalance Minimum credits to keep on bot when collecting from storage (only withdraw if below this). If 0, withdraws all.
+ */
+export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: boolean = true, minBalance: number = 0): Promise<boolean> {
   const { bot } = ctx;
   if (bot.docked) return true;
 
@@ -242,9 +343,9 @@ export async function ensureDocked(ctx: RoutineContext): Promise<boolean> {
     const dockResp = await bot.exec("dock");
     if (!dockResp.error || dockResp.error.message.includes("already")) {
       bot.docked = true;
-      await collectFromStorage(ctx);
-      await recordMarketData(ctx);
-      await analyzeMarket(ctx);
+      if (!skipStorageCollection) {
+        await collectFromStorage(ctx, minBalance);
+      }
       await ensureInsured(ctx);
       return true;
     }
@@ -292,9 +393,9 @@ export async function ensureDocked(ctx: RoutineContext): Promise<boolean> {
   const dResp = await bot.exec("dock");
   if (!dResp.error || dResp.error.message.includes("already")) {
     bot.docked = true;
-    await collectFromStorage(ctx);
-    await recordMarketData(ctx);
-    await analyzeMarket(ctx);
+    if (!skipStorageCollection) {
+      await collectFromStorage(ctx, minBalance);
+    }
     await ensureInsured(ctx);
     return true;
   }
@@ -346,12 +447,12 @@ export async function analyzeMarket(ctx: RoutineContext): Promise<void> {
 // ── Storage collection ───────────────────────────────────────
 
 /**
- * Check station storage for credits and items, withdraw everything useful.
- * Withdraws credits first, then fuel cells / other items if cargo space allows.
+ * Check station storage for credits and withdraw them to the bot.
+ * Does NOT transfer items - routines should handle storage items manually if needed.
  * Also records market prices at the station.
- * Should be called every time a bot successfully docks.
+ * @param minBalance - Minimum credits to keep on bot (only withdraw if below this). If 0, withdraws all.
  */
-export async function collectFromStorage(ctx: RoutineContext): Promise<void> {
+export async function collectFromStorage(ctx: RoutineContext, minBalance: number = 0): Promise<void> {
   const { bot } = ctx;
 
   const storageResp = await bot.exec("view_storage");
@@ -362,71 +463,40 @@ export async function collectFromStorage(ctx: RoutineContext): Promise<void> {
   // Withdraw credits to the bot
   const credits = (r.credits as number) || (r.stored_credits as number) || 0;
   if (credits > 0) {
-    const wResp = await bot.exec("withdraw_credits", { amount: credits });
-    if (!wResp.error) {
-      ctx.log("trade", `Collected ${credits} credits from storage`);
-      await bot.refreshStatus();
+    let amountToWithdraw = credits;
+    
+    // If minBalance is set, only withdraw if bot is below that threshold
+    if (minBalance > 0 && bot.credits < minBalance) {
+      amountToWithdraw = Math.min(credits, minBalance - bot.credits);
+    } else if (minBalance > 0) {
+      // Bot already has enough credits - don't withdraw
+      amountToWithdraw = 0;
+    }
+    
+    if (amountToWithdraw > 0) {
+      const wResp = await bot.exec("withdraw_credits", { amount: amountToWithdraw });
+      if (!wResp.error) {
+        ctx.log("trade", `Collected ${amountToWithdraw} credits from storage`);
+        await bot.refreshStatus();
+      }
     }
   }
-
-  // Transfer all station storage items → faction storage (shared pool)
-  await transferStationToFaction(ctx);
-
-  await bot.refreshStatus();
 
   // Record market prices at this station
   await recordMarketData(ctx);
 }
 
 /**
+ * @deprecated This function is deprecated and no longer performs any action.
+ * Routines should handle storage transfers explicitly if needed.
  * Transfer all items from personal station storage into faction storage.
  * This centralises materials so any bot (crafters, traders, etc.) can access them.
  * Credits are kept on the bot (not transferred).
  * Assumes docked at a station with both storage and faction storage access.
  */
 export async function transferStationToFaction(ctx: RoutineContext): Promise<void> {
-  const { bot } = ctx;
-  if (!bot.docked) return;
-
-  await bot.refreshStorage();
-  if (bot.storage.length === 0) return;
-
-  await bot.refreshStatus();
-  const transferred: string[] = [];
-
-  for (const item of bot.storage) {
-    if (item.quantity <= 0) continue;
-
-    // Check available cargo space — items pass through cargo as intermediary
-    const freeSpace = bot.cargoMax > 0 ? bot.cargoMax - bot.cargo : 0;
-    if (freeSpace <= 0) break; // cargo full, can't transfer any more
-
-    const qty = Math.min(item.quantity, maxItemsForCargo(freeSpace, item.itemId));
-    if (qty <= 0) continue;
-
-    // Withdraw from station storage into cargo
-    const wResp = await bot.exec("withdraw_items", { item_id: item.itemId, quantity: qty });
-    if (wResp.error) continue;
-
-    // Deposit into faction storage
-    const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: qty });
-    if (!dResp.error) {
-      transferred.push(`${qty}x ${item.name}`);
-      logFactionActivity(ctx, "deposit", `Transferred ${qty}x ${item.name} from station → faction storage`);
-    } else {
-      // Failed to deposit to faction — put back in station storage
-      await bot.exec("deposit_items", { item_id: item.itemId, quantity: qty });
-    }
-
-    await bot.refreshStatus(); // update cargo count for next iteration
-  }
-
-  if (transferred.length > 0) {
-    ctx.log("trade", `Transferred to faction storage: ${transferred.join(", ")}`);
-    await bot.refreshCargo();
-    await bot.refreshStorage();
-    await bot.refreshFactionStorage();
-  }
+  // Deprecated - no longer performs any action
+  // Routines should handle storage transfers explicitly if needed
 }
 
 // ── Refueling ────────────────────────────────────────────────
@@ -972,11 +1042,19 @@ export async function navigateToSystem(
   opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean> },
 ): Promise<boolean> {
   const { bot } = ctx;
-  const MAX_JUMPS = 20;
+  const MAX_JUMPS = 199;
+  const MAX_RETRIES_PER_JUMP = 10;
+
+  // Normalize system names for comparison (replace underscores with spaces, lowercase)
+  const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
 
   for (let attempt = 0; attempt < MAX_JUMPS; attempt++) {
     await bot.refreshStatus();
-    if (bot.system === targetSystemId) return true;
+    // Case-insensitive comparison for system names (handle underscore vs space)
+    if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+      ctx.log("travel", `Already at ${targetSystemId} (normalized: "${normalizeSystemName(bot.system)}" === "${normalizeSystemName(targetSystemId)}")`);
+      return true;
+    }
 
     // Plan route from current position
     const route = mapStore.findRoute(bot.system, targetSystemId);
@@ -988,13 +1066,49 @@ export async function navigateToSystem(
     } else {
       ctx.log("travel", `No mapped route — querying server for route to ${targetSystemId}`);
       const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
-      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number } | null;
+      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
+      
+      // Check if server says we're already at target (message field or 0 jumps)
+      const alreadyAtTarget = routeData?.found && (
+        routeData.total_jumps === 0 || 
+        (routeData.message && routeData.message.toLowerCase().includes('already')) ||
+        (routeData.route && routeData.route.length === 1)
+      );
+      
+      if (alreadyAtTarget) {
+        ctx.log("travel", `Server confirms we are already at ${targetSystemId}`);
+        return true;
+      }
+      
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
         nextSystem = routeData.route[1].system_id;
         ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
       } else {
-        ctx.log("error", `No route to ${targetSystemId} — cannot navigate`);
-        return false;
+        // Server returned no route - check if we might already be at the target
+        // This can happen due to case mismatch or if we're already there
+        ctx.log("warn", `Server returned no route to ${targetSystemId} — checking if already arrived...`);
+        await bot.refreshStatus();
+        if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+          ctx.log("travel", `Confirmed at ${targetSystemId} after failed route lookup (normalized comparison)`);
+          return true;
+        }
+        // Also check if we're in a neighboring system (1 jump away)
+        const currentSystemData = mapStore.getSystem(bot.system);
+        if (currentSystemData) {
+          const isNeighbor = currentSystemData.connections.some(
+            c => normalizeSystemName(c.system_id) === normalizeSystemName(targetSystemId)
+          );
+          if (isNeighbor) {
+            ctx.log("travel", `Target ${targetSystemId} is adjacent - attempting direct jump`);
+            nextSystem = targetSystemId;
+          } else {
+            ctx.log("error", `No route to ${targetSystemId} from ${bot.system} — cannot navigate`);
+            return false;
+          }
+        } else {
+          ctx.log("error", `No route to ${targetSystemId} — cannot navigate`);
+          return false;
+        }
       }
     }
 
@@ -1019,21 +1133,118 @@ export async function navigateToSystem(
       return false;
     }
 
-    // Re-check in case ensureFueled moved us
+    // CRITICAL: Re-check position after ensureFueled — it may have moved us to a different system!
     await bot.refreshStatus();
-    if (bot.system === targetSystemId) return true;
+    if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) return true;
+
+    // Recalculate route from CURRENT position (ensureFueled may have moved us)
+    const postFuelRoute = mapStore.findRoute(bot.system, targetSystemId);
+    if (postFuelRoute && postFuelRoute.length > 1) {
+      nextSystem = postFuelRoute[1];
+      ctx.log("travel", `Route recalculated from ${bot.system}: ${postFuelRoute.length - 1} jump${postFuelRoute.length - 1 !== 1 ? "s" : ""} remaining`);
+    } else {
+      // No mapped route — query server
+      ctx.log("travel", `No mapped route from ${bot.system} — querying server for route to ${targetSystemId}`);
+      const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
+      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
+      
+      // Check if server says we're already at target
+      const alreadyAtTarget = routeData?.found && (
+        routeData.total_jumps === 0 || 
+        (routeData.message && routeData.message.toLowerCase().includes('already')) ||
+        (routeData.route && routeData.route.length === 1)
+      );
+      
+      if (alreadyAtTarget) {
+        ctx.log("travel", `Server confirms we are already at ${targetSystemId} (post-fuel check)`);
+        return true;
+      }
+      
+      if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
+        nextSystem = routeData.route[1].system_id;
+        ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
+      } else {
+        ctx.log("error", `No route from ${bot.system} to ${targetSystemId} — cannot navigate`);
+        return false;
+      }
+    }
 
     await ensureUndocked(ctx);
 
-    // Jump
-    ctx.log("travel", `Jumping to ${nextSystem}...`);
-    const jumpResp = await bot.exec("jump", { target_system: nextSystem });
-    if (jumpResp.error) {
-      ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+    // Jump with retry logic for transient errors
+    let jumpSuccess = false;
+    let retries = 0;
+    while (!jumpSuccess && retries < MAX_RETRIES_PER_JUMP && bot.state === "running") {
+      retries++;
+      ctx.log("travel", `Jumping to ${nextSystem} from ${bot.system}... (attempt ${retries}/${MAX_RETRIES_PER_JUMP})`);
+      const jumpResp = await bot.exec("jump", { target_system: nextSystem });
+      
+      if (!jumpResp.error) {
+        jumpSuccess = true;
+        break;
+      }
+      
+      const errorMsg = jumpResp.error.message.toLowerCase();
+
+      // Check if error is transient (network timeout, connection issue, etc.)
+      const isTransient =
+        errorMsg.includes("timeout") ||
+        errorMsg.includes("524") || // HTTP 524 Request Timeout
+        errorMsg.includes("connection") ||
+        errorMsg.includes("network") ||
+        errorMsg.includes("hiccup") ||
+        errorMsg.includes("temporarily") ||
+        errorMsg.includes("try again") ||
+        errorMsg.includes("pending") ||
+        errorMsg.includes("busy") ||
+        errorMsg.includes("systems are not connected"); // Sometimes a temporary state
+      
+      if (!isTransient) {
+        // Permanent error - don't retry
+        ctx.log("error", `Jump failed (permanent error): ${jumpResp.error.message}`);
+        return false;
+      }
+      
+      ctx.log("error", `Jump failed (transient): ${jumpResp.error.message}`);
+      
+      if (retries < MAX_RETRIES_PER_JUMP) {
+        // Wait before retrying - exponential backoff
+        const waitTime = 5000 * retries; // 5s, 10s, 15s
+        ctx.log("travel", `Waiting ${waitTime/1000}s before retry...`);
+        await sleep(waitTime);
+
+        // CRITICAL: Refresh status and recalculate route after wait
+        await bot.refreshStatus();
+        if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
+
+        // Recalculate route from CURRENT position (may have changed during wait)
+        const retryRoute = mapStore.findRoute(bot.system, targetSystemId);
+        if (retryRoute && retryRoute.length > 1) {
+          nextSystem = retryRoute[1];
+          ctx.log("travel", `Route recalculated after wait: ${retryRoute.length - 1} jump${retryRoute.length - 1 !== 1 ? "s" : ""} remaining`);
+        }
+      }
+    }
+    
+    if (!jumpSuccess) {
+      ctx.log("error", `Jump to ${nextSystem} failed after ${MAX_RETRIES_PER_JUMP} retries`);
       return false;
     }
 
     await bot.refreshStatus();
+
+    // Check for customs inspection after entering new system
+    await checkCustomsInspection(ctx, nextSystem);
+
+    // Check for pirates in the new system and flee if detected
+    const nearbyResp = await bot.exec("get_nearby");
+    if (nearbyResp.result && typeof nearbyResp.result === "object") {
+      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result, true);
+      if (fled) {
+        // We fled - navigation is aborted, caller will need to handle new position
+        return false;
+      }
+    }
 
     // Update map data for the new system
     const sysResp = await bot.exec("get_system");
@@ -1053,7 +1264,7 @@ export async function navigateToSystem(
     }
 
     ctx.log("travel", `Arrived in ${bot.system}`);
-    if (bot.system === targetSystemId) return true;
+    if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
     if (bot.state !== "running") return false;
   }
 
@@ -1295,15 +1506,20 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
 }
 
 /**
- * Full wreck salvage chain: loot → salvage → scrap for each wreck.
- * Optionally tow high-value wrecks. Returns total items extracted.
+ * Full wreck salvage chain using the new tow-based system:
+ * 1. Loot cargo from wrecks in the field (loot_wreck)
+ * 2. Tow the wreck (tow_wreck) - attaches to ship, 50% speed penalty
+ * 3. Travel to salvage yard station with the towed wreck
+ * 4. Sell wreck (sell_wreck) for credits + salvaging XP, or scrap (scrap_wreck) for materials at lvl 2+
+ *
+ * Returns { itemsLooted, isTowing }. Towed wrecks are processed at salvage yard.
  */
 export async function fullSalvageWrecks(
   ctx: RoutineContext,
   opts?: { fuelOnly?: boolean; enableTow?: boolean; minTowValue?: number },
-): Promise<number> {
+): Promise<{ itemsLooted: number; isTowing: boolean }> {
   const { bot } = ctx;
-  if (bot.docked) return 0;
+  if (bot.docked) return { itemsLooted: 0, isTowing: false };
 
   const enableTow = opts?.enableTow ?? false;
   const minTowValue = opts?.minTowValue ?? 500;
@@ -1311,10 +1527,11 @@ export async function fullSalvageWrecks(
 
   const wrecksResp = await bot.exec("get_wrecks");
   const wrecks = parseWrecks(wrecksResp.result);
-  if (wrecks.length === 0) return 0;
+  if (wrecks.length === 0) return { itemsLooted: 0, isTowing: bot.towingWreck };
 
-  let totalExtracted = 0;
-  const extractedItems: string[] = [];
+  let totalLooted = 0;
+  const lootedItems: string[] = [];
+  const towedWrecks: { wreck_id: string; name: string; salvage_value: number }[] = [];
 
   for (const wreck of wrecks) {
     if (bot.state !== "running") break;
@@ -1325,7 +1542,7 @@ export async function fullSalvageWrecks(
       break;
     }
 
-    // Step 1: Loot all items from the wreck
+    // Step 1: Loot cargo from the wreck
     if (wreck.items.length > 0) {
       let candidates = [...wreck.items];
       if (fuelOnly) {
@@ -1357,58 +1574,170 @@ export async function fullSalvageWrecks(
           continue;
         }
 
-        totalExtracted++;
-        extractedItems.push(`${item.quantity}x ${item.name}`);
+        totalLooted++;
+        lootedItems.push(`${item.quantity}x ${item.name}`);
       }
     }
 
-    // Step 2: Salvage the wreck for components
-    await bot.refreshStatus();
-    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) continue;
+    // Step 2: Optionally tow high-value wrecks
+    if (enableTow) {
+      // Check if we already have a tow attached
+      await bot.refreshStatus();
+      if (bot.towingWreck) {
+        ctx.log("scavenge", "Already towing a wreck — stopping salvage and heading to salvage yard");
+        break; // Exit the wrecks loop entirely
+      }
 
-    const salvageResp = await bot.exec("salvage_wreck", { wreck_id: wreck.wreck_id });
-    if (!salvageResp.error && salvageResp.result) {
-      const sr = salvageResp.result as Record<string, unknown>;
-      const items = (sr.items as Array<Record<string, unknown>>) || [];
-      if (items.length > 0) {
-        const names = items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || (i.item_id as string) || "component"}`).join(", ");
-        extractedItems.push(names);
-        totalExtracted += items.length;
-        ctx.log("scavenge", `Salvaged components: ${names}`);
+      const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
+      if (!towResp.error && towResp.result) {
+        const tr = towResp.result as Record<string, unknown>;
+        ctx.log("debug", `tow_wreck response: ${JSON.stringify(tr)}`);
+        const salvageValue = (tr.salvage_value as number) || 0;
+        const shipClass = (tr.ship_class as string) || "unknown";
+
+        if (salvageValue >= minTowValue) {
+          towedWrecks.push({
+            wreck_id: wreck.wreck_id,
+            name: wreck.name,
+            salvage_value: salvageValue,
+          });
+          ctx.log("scavenge", `Towed ${shipClass} wreck (${wreck.name}) - value: ${salvageValue}cr, speed penalty: 50%`);
+          // Set towing flag immediately - server confirms tow in the response
+          bot.towingWreck = true;
+          ctx.log("scavenge", `Set bot.towingWreck=true after successful tow`);
+          break;
+        } else {
+          ctx.log("scavenge", `Skipped towing ${wreck.name} - value ${salvageValue}cr below threshold ${minTowValue}cr`);
+        }
+      } else if (towResp.error) {
+        const msg = towResp.error.message.toLowerCase();
+        if (msg.includes("already")) {
+          // Check if it's "already_towing" (we're towing) vs "already_towed" (someone else has it)
+          if (msg.includes("already_towing") || msg.includes("already towing")) {
+            // We are already towing - this is a signal to head to salvage yard
+            ctx.log("warn", `Already towing a wreck — should head to salvage yard (${towResp.error.message})`);
+            bot.towingWreck = true;
+            break; // Stop scanning and go to salvage yard
+          } else {
+            // Someone else is towing this wreck - skip it and try another
+            ctx.log("scavenge", `Wreck already being towed by another player — skipping (${towResp.error.message})`);
+            continue; // Try the next wreck
+          }
+        } else {
+          ctx.log("error", `Failed to tow ${wreck.name}: ${towResp.error.message}`);
+        }
       }
     }
+  }
 
-    // Step 3: Scrap the wreck for raw materials
-    await bot.refreshStatus();
-    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) continue;
+  if (totalLooted > 0) {
+    await bot.refreshCargo();
+    ctx.log("scavenge", `Looted ${lootedItems.join(", ")} from ${wrecks.length} wreck(s)`);
+  }
 
-    const scrapResp = await bot.exec("scrap_wreck", { wreck_id: wreck.wreck_id });
+  if (towedWrecks.length > 0) {
+    ctx.log("scavenge", `Towing ${towedWrecks.length} wreck(s) to salvage yard: ${towedWrecks.map(w => w.name).join(", ")}`);
+  }
+
+  // Refresh status to get latest towing state
+  await bot.refreshStatus();
+  ctx.log("debug", `fullSalvageWrecks returning: itemsLooted=${totalLooted}, towedWrecks=${towedWrecks.length}, bot.towingWreck=${bot.towingWreck}`);
+  return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
+}
+
+/**
+ * Process towed wrecks at a salvage yard station.
+ * - If salvaging skill < 2: sell_wreck for credits + XP
+ * - If salvaging skill >= 2: scrap_wreck for materials (or sell if preferred)
+ * 
+ * Must be docked at a station with salvage_yard service.
+ * Returns number of wrecks processed.
+ */
+export async function processTowedWrecks(
+  ctx: RoutineContext,
+  opts?: { preferScrap: boolean },
+): Promise<number> {
+  const { bot } = ctx;
+  if (!bot.docked) {
+    ctx.log("error", "Must be docked to process towed wrecks");
+    return 0;
+  }
+
+  const preferScrap = opts?.preferScrap ?? false;
+
+  // Check if we're towing a wreck
+  await bot.refreshStatus();
+  if (!bot.towingWreck) {
+    return 0; // No towed wreck to process
+  }
+
+  // Check station has salvage yard
+  const { pois } = await getSystemInfo(ctx);
+  const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+  if (currentStation?.services && currentStation.services.salvage_yard === false) {
+    ctx.log("error", "This station does not have a salvage yard - cannot process wrecks");
+    return 0;
+  }
+
+  // Check salvaging skill level
+  await bot.checkSkills();
+  const salvagingLevel = bot.getSkillLevel("salvaging");
+  const canScrap = salvagingLevel >= 2;
+
+  let processed = 0;
+
+  // Try to scrap if preferred and skill allows, otherwise sell
+  if (preferScrap && canScrap) {
+    const scrapResp = await bot.exec("scrap_wreck");
     if (!scrapResp.error && scrapResp.result) {
       const sr = scrapResp.result as Record<string, unknown>;
       const items = (sr.items as Array<Record<string, unknown>>) || [];
       if (items.length > 0) {
-        const names = items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || (i.item_id as string) || "material"}`).join(", ");
-        extractedItems.push(names);
-        totalExtracted += items.length;
-        ctx.log("scavenge", `Scrapped materials: ${names}`);
+        const names = items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || "material"}`).join(", ");
+        ctx.log("scavenge", `Scrapped wreck for: ${names}`);
+        processed++;
       }
+    } else if (scrapResp.error) {
+      const errMsg = scrapResp.error.message.toLowerCase();
+      if (errMsg.includes("not_towing")) {
+        ctx.log("warn", "Server says not towing during scrap — clearing tow flag");
+        bot.towingWreck = false;
+      } else {
+        ctx.log("error", `Scrap failed: ${scrapResp.error.message} - falling back to sell`);
+      }
+      // Fall through to sell
     }
+  }
 
-    // Step 4: Optionally tow high-value wrecks
-    if (enableTow) {
-      const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
-      if (!towResp.error) {
-        ctx.log("scavenge", `Towing wreck: ${wreck.name}`);
+  if (processed === 0) {
+    // Sell the wreck for credits + XP
+    const sellResp = await bot.exec("sell_wreck");
+    if (!sellResp.error && sellResp.result) {
+      const sr = sellResp.result as Record<string, unknown>;
+      const credits = (sr.credits as number) || (sr.earned as number) || 0;
+      const xp = (sr.xp as number) || (sr.experience as number) || 0;
+      if (credits > 0 || xp > 0) {
+        ctx.log("scavenge", `Sold wreck for ${credits}cr + ${xp} XP`);
+        processed++;
+      }
+    } else if (sellResp.error) {
+      const errMsg = sellResp.error.message.toLowerCase();
+      if (errMsg.includes("not_towing")) {
+        ctx.log("warn", "Server says not towing during sell — clearing tow flag");
+        bot.towingWreck = false;
+      } else {
+        ctx.log("error", `Sell wreck failed: ${sellResp.error.message}`);
       }
     }
   }
 
-  if (totalExtracted > 0) {
-    await bot.refreshCargo();
-    ctx.log("scavenge", `Full salvage: ${totalExtracted} items from ${wrecks.length} wreck(s)`);
+  // Reset towing flag after successful processing
+  if (processed > 0) {
+    bot.towingWreck = false;
   }
 
-  return totalExtracted;
+  await bot.refreshStatus();
+  return processed;
 }
 
 // ── Role-Based Mods ──────────────────────────────────────────
@@ -1707,3 +2036,378 @@ export async function factionDonateProfit(ctx: RoutineContext, profit: number): 
     logFactionActivity(ctx, "donation", `Deposited ${donation}cr (${pct}% of ${profit}cr profit)`);
   }
 }
+
+// ── Combat Detection & Flee ─────────────────────────────────
+
+/** Result of pirate detection in nearby entities */
+export interface PirateDetectionResult {
+  hasPirates: boolean;
+  pirateCount: number;
+  highestTier: PirateTier | null;
+  pirates: NearbyEntity[];
+}
+
+/** Pirate tier type for threat assessment - matches API values */
+export type PirateTier = "small" | "medium" | "large" | "capitol" | "boss" | "raider" | "salvager" | "tanker" | "fighter" | "destroyer" | "cruiser" | "battleship";
+
+/** Map pirate ship types to threat levels for flee decisions */
+const PIRATE_THREAT_LEVELS: Record<string, number> = {
+  "salvager": 1,
+  "tanker": 1,
+  "fighter": 2,
+  "small": 2,
+  "raider": 3,
+  "medium": 3,
+  "destroyer": 4,
+  "large": 4,
+  "cruiser": 5,
+  "capitol": 6,
+  "battleship": 7,
+  "boss": 8,
+};
+
+/** Get threat level for a pirate tier (higher = more dangerous) */
+export function getPirateThreatLevel(tier: string | undefined | null): number {
+  if (!tier) return 0;
+  return PIRATE_THREAT_LEVELS[tier.toLowerCase()] || 2;
+}
+
+/** Pirate entity from get_nearby response */
+export interface NearbyEntity {
+  id: string;
+  name: string;
+  type: string;
+  faction: string;
+  isNPC: boolean;
+  isPirate: boolean;
+  tier?: PirateTier;
+  isBoss?: boolean;
+  hull?: number;
+  maxHull?: number;
+  shield?: number;
+  maxShield?: number;
+  status?: string;
+}
+
+/**
+ * Parse get_nearby response to detect pirates.
+ * @param result - The result from get_nearby API call
+ * @returns Detection result with pirate count and threat level
+ */
+export function parseNearbyForPirates(result: unknown): PirateDetectionResult {
+  if (!result || typeof result !== "object") {
+    return { hasPirates: false, pirateCount: 0, highestTier: null, pirates: [] };
+  }
+
+  const r = result as Record<string, unknown>;
+  const pirates: NearbyEntity[] = [];
+
+  // Handle different response formats
+  let rawEntities: Array<Record<string, unknown>> = [];
+
+  if (Array.isArray(r)) {
+    rawEntities = r;
+  } else if (Array.isArray(r.entities)) {
+    rawEntities = r.entities as Array<Record<string, unknown>>;
+  } else if (Array.isArray(r.players) && r.players.length > 0) {
+    rawEntities = r.players as Array<Record<string, unknown>>;
+  } else if (Array.isArray(r.nearby)) {
+    rawEntities = r.nearby as Array<Record<string, unknown>>;
+  }
+
+  // Parse entities looking for pirates
+  for (const e of rawEntities) {
+    const id = (e.id as string) || (e.player_id as string) || (e.entity_id as string) || (e.pirate_id as string) || "";
+    if (!id) continue;
+
+    let faction = "";
+    if (typeof e.faction === "string") faction = e.faction.toLowerCase();
+    else if (typeof e.faction_id === "string") faction = e.faction_id.toLowerCase();
+
+    let type = "";
+    if (typeof e.type === "string") type = e.type.toLowerCase();
+    else if (typeof e.entity_type === "string") type = e.entity_type.toLowerCase();
+
+    const isPirate = !!(e.pirate_id) || type.includes("pirate") || faction.includes("pirate");
+    if (!isPirate) continue;
+
+    const tier = (e.tier as PirateTier) || "small";
+    const isBoss = !!(e.is_boss as boolean);
+
+    pirates.push({
+      id,
+      name: (e.name as string) || (e.username as string) || (e.pirate_name as string) || id,
+      type: "pirate",
+      faction: "pirate",
+      isNPC: true,
+      isPirate: true,
+      tier,
+      isBoss,
+      hull: e.hull as number,
+      maxHull: e.max_hull as number,
+      shield: e.shield as number,
+      maxShield: e.max_shield as number,
+      status: e.status as string,
+    });
+  }
+
+  // Parse pirates array (special format from get_nearby at POIs)
+  if (Array.isArray(r.pirates)) {
+    const rawPirates = r.pirates as Array<Record<string, unknown>>;
+    for (const p of rawPirates) {
+      const id = (p.pirate_id as string) || "";
+      if (!id) continue;
+
+      const tier = (p.tier as PirateTier) || "small";
+      const isBoss = !!(p.is_boss as boolean);
+
+      pirates.push({
+        id,
+        name: (p.name as string) || (p.pirate_name as string) || id,
+        type: "pirate",
+        faction: "pirate",
+        isNPC: true,
+        isPirate: true,
+        tier,
+        isBoss,
+        hull: p.hull as number,
+        maxHull: p.max_hull as number,
+        shield: p.shield as number,
+        maxShield: p.max_shield as number,
+        status: p.status as string,
+      });
+    }
+  }
+
+  // Determine highest threat tier present
+  let highestTier: PirateTier | null = null;
+  let highestThreat = 0;
+  for (const pirate of pirates) {
+    if (pirate.tier) {
+      const threat = getPirateThreatLevel(pirate.tier);
+      if (threat > highestThreat) {
+        highestThreat = threat;
+        highestTier = pirate.tier;
+      }
+    }
+  }
+
+  return {
+    hasPirates: pirates.length > 0,
+    pirateCount: pirates.length,
+    highestTier,
+    pirates,
+  };
+}
+
+/**
+ * Get current battle status from the API.
+ * @param ctx - Routine context
+ * @returns Battle status or null if not in battle
+ */
+export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus | null> {
+  const { bot } = ctx;
+  const resp = await bot.exec("get_battle_status");
+  if (resp.error || !resp.result) {
+    return null;
+  }
+
+  const result = resp.result as Record<string, unknown>;
+  if (result.error && (result.error as Record<string, unknown>).code === "not_in_battle") {
+    return null;
+  }
+
+  // Parse battle status
+  const status: BattleStatus = {
+    battle_id: (result.battle_id as string) || "",
+    tick: (result.tick as number) || undefined,
+    system_id: (result.system_id as string) || undefined,
+    sides: (result.sides as BattleSide[]) || [],
+    participants: (result.participants as BattleParticipant[]) || [],
+    your_side_id: (result.your_side_id as number) || undefined,
+    your_zone: (result.your_zone as BattleZone) || undefined,
+    your_stance: (result.your_stance as BattleStance) || undefined,
+    your_target_id: (result.your_target_id as string) || undefined,
+    auto_pilot: (result.auto_pilot as boolean) || undefined,
+  };
+
+  return status;
+}
+
+/**
+ * Attempt to flee from an active battle.
+ * Uses "battle stance flee" command.
+ * @param ctx - Routine context
+ * @returns true if flee command was issued successfully, false otherwise
+ */
+export async function fleeFromBattle(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+
+  // Check if we're actually in a battle
+  const status = await getBattleStatus(ctx);
+  if (!status) {
+    ctx.log("combat", "Not in battle - cannot flee");
+    return false;
+  }
+
+  ctx.log("combat", "FLEEING BATTLE - issuing flee stance command!");
+  const resp = await bot.exec("battle", { action: "stance", stance: "flee" });
+
+  if (resp.error) {
+    ctx.log("error", `Flee command failed: ${resp.error.message}`);
+    return false;
+  }
+
+  ctx.log("combat", "Flee stance engaged - escaping battle!");
+  return true;
+}
+
+/**
+ * Emergency flee response when pirates are detected in get_nearby.
+ * If not in a battle, immediately jump to a random adjacent system.
+ * If already in battle, use flee stance.
+ * @param ctx - Routine context
+ * @param pirateResult - Result from parseNearbyForPirates
+ * @returns true if successfully escaped/fled, false if failed
+ */
+export async function emergencyFleeFromPirates(
+  ctx: RoutineContext,
+  pirateResult: PirateDetectionResult,
+): Promise<boolean> {
+  const { bot } = ctx;
+
+  ctx.log("error", `PIRATES DETECTED! ${pirateResult.pirateCount} pirate(s), highest tier: ${pirateResult.highestTier || "unknown"} - EMERGENCY FLEE!`);
+
+  // Check if we're already in a battle
+  const battleStatus = await getBattleStatus(ctx);
+  if (battleStatus) {
+    ctx.log("combat", "Already in battle - using flee stance");
+    return await fleeFromBattle(ctx);
+  }
+
+  // Not in battle - need to jump away immediately
+  // We have 20 seconds (2 ticks) to leave before they attack
+  ctx.log("combat", "Not in battle - attempting emergency jump!");
+
+  // Get system info to find jump targets
+  const { connections } = await getSystemInfo(ctx);
+  if (!connections || connections.length === 0) {
+    ctx.log("error", "No jump connections available - trapped!");
+    return false;
+  }
+
+  // Pick a random connection to jump to
+  const randomConnection = connections[Math.floor(Math.random() * connections.length)];
+  if (!randomConnection || !randomConnection.id) {
+    ctx.log("error", "Could not select jump target - trapped!");
+    return false;
+  }
+
+  ctx.log("travel", `Emergency jump to ${randomConnection.name || randomConnection.id}!`);
+  const jumpResp = await bot.exec("jump", { target_system: randomConnection.id });
+
+  if (jumpResp.error) {
+    ctx.log("error", `Emergency jump failed: ${jumpResp.error.message}`);
+    return false;
+  }
+
+  ctx.log("combat", `Successfully escaped to ${randomConnection.name || randomConnection.id}!`);
+  return true;
+}
+
+/**
+ * Check for pirates in nearby and flee if detected.
+ * Should be called after get_nearby in non-combat routines.
+ * @param ctx - Routine context
+ * @param nearbyResult - Result from get_nearby API call
+ * @param isJumpCommand - Whether the previous command was a jump (if true, we're already escaping)
+ * @returns true if pirates were detected and flee was attempted, false if no pirates
+ */
+export async function checkAndFleeFromPirates(
+  ctx: RoutineContext,
+  nearbyResult: unknown,
+  isJumpCommand: boolean = false,
+): Promise<boolean> {
+  const pirateResult = parseNearbyForPirates(nearbyResult);
+
+  if (!pirateResult.hasPirates) {
+    return false;
+  }
+
+  // Pirates detected!
+  if (isJumpCommand) {
+    // We just jumped - already fleeing, but log the threat
+    ctx.log("combat", `Pirates detected in system (${pirateResult.pirateCount}x, tier: ${pirateResult.highestTier}) - continuing escape`);
+    return true;
+  }
+
+  // Not a jump command - we need to flee NOW
+  await emergencyFleeFromPirates(ctx, pirateResult);
+  return true;
+}
+
+// ── Customs Inspection ───────────────────────────────────────
+
+/**
+ * Check for customs inspection when entering a new system.
+ * Should be called after travel/jump commands when entering empire space.
+ *
+ * @param ctx - Routine context
+ * @param targetSystem - The system we jumped to (for accurate logging since bot.system may be unstable during jumps)
+ * @returns Object with inspection result
+ */
+export async function checkCustomsInspection(
+  ctx: RoutineContext,
+  targetSystem?: string
+): Promise<{
+  wasStopped: boolean;
+  outcome: "cleared" | "contraband" | "evasion" | "timeout" | "none";
+  chatMessages: string[];
+}> {
+  const { bot } = ctx;
+
+  // Use targetSystem if provided, otherwise fall back to bot.system
+  const systemToCheck = targetSystem || bot.system;
+
+  // Get the system's security level from mapStore
+  const sysData = mapStore.getSystem(systemToCheck);
+  const securityLevel = sysData?.security_level;
+
+  // Only check if we're in an empire system (not Frontier, not pirate, not lawless)
+  if (!isEmpireSystem(systemToCheck, bot.getEmpire(), securityLevel)) {
+    ctx.log("customs", `System ${systemToCheck} is not an empire system (or bot is Frontier, or system is lawless) - no customs check needed`);
+    return { wasStopped: false, outcome: "none", chatMessages: [] };
+  }
+
+  ctx.log("customs", `Entering empire system ${systemToCheck} - checking for customs...`);
+
+  // PROACTIVE: Always wait at least 2 seconds for customs message to arrive
+  // This is mandatory for all empire jumps, even if no message has arrived yet
+  ctx.log("customs", "⏱️ Mandatory customs wait - 2 second delay...");
+  await sleep(2000);
+
+  // Wait for customs inspection (up to 5 seconds total)
+  const result = await waitForCustomsInspection(bot, (cat, msg) => bot.log(cat, msg), systemToCheck, 5000);
+
+  // If customs ship is expected but not yet visible, poll for it
+  if (result.wasStopped && result.outcome === "timeout") {
+    ctx.log("customs", "Customs scan in progress - polling for customs ship...");
+    const pollResult = await pollForCustomsShip(
+      bot,
+      (cat, msg) => bot.log(cat, msg),
+      5000, // Poll every 5 seconds
+      6     // Max 6 polls (30 seconds total)
+    );
+
+    if (pollResult.customsShipFound && pollResult.shipName) {
+      ctx.log("customs", `Customs ship ${pollResult.shipName} detected!`);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Get customs statistics for AI chat context.
+ */
+export { getBotCustomsStats };

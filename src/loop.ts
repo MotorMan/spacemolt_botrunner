@@ -1,5 +1,5 @@
 import { complete } from "@mariozechner/pi-ai";
-import type { Model, Context, AssistantMessage, ToolCall, Message } from "@mariozechner/pi-ai";
+import type { Model, Context, AssistantMessage, ToolCall, Message, TextContent } from "@mariozechner/pi-ai";
 import type { SpaceMoltAPI } from "./api.js";
 import type { SessionManager } from "./session.js";
 import { executeTool } from "./tools.js";
@@ -307,8 +307,8 @@ async function summarizeViaLLM(
     clearTimeout(timeout);
 
     const text = resp.content
-      .filter((b): b is { type: "text"; text: string } => "text" in b)
-      .map((b) => b.text)
+      .filter((b): b is TextContent => b.type === "text" && "text" in b)
+      .map((b: TextContent) => b.text)
       .join("");
 
     if (!text.trim()) throw new Error("Empty summary response");
@@ -440,8 +440,8 @@ export async function generateSessionHandoff(
     clearTimeout(timeout);
 
     const text = resp.content
-      .filter((b): b is { type: "text"; text: string } => "text" in b)
-      .map((b) => b.text)
+      .filter((b): b is TextContent => b.type === "text" && "text" in b)
+      .map((b: TextContent) => b.text)
       .join("");
 
     return text.trim() || null;

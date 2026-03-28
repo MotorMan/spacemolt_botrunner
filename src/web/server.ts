@@ -80,6 +80,13 @@ function loadSettings(): RoutineSettings {
 
 export { loadSettings };
 
+/** Get the global system blacklist from settings. */
+export function getSystemBlacklist(): string[] {
+  const settings = loadSettings();
+  const blacklist = (settings.systemBlacklist as string[] | undefined) || [];
+  return blacklist;
+}
+
 function saveSettings(s: RoutineSettings): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
   writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2) + "\n", "utf-8");

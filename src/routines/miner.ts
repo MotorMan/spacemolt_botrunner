@@ -1,5 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore, isDepletionExpired } from "../mapstore.js";
+import { getSystemBlacklist } from "../web/server.js";
 import {
   isOreBeltPoi,
   isGasCloudPoi,
@@ -532,10 +533,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           recoveredSession = null;
         }
       } else {
-        // Calculate jump distances and filter by maxJumps
+        // Calculate jump distances and filter by maxJumps (use blacklist to avoid pirate systems)
+        const blacklist = getSystemBlacklist();
         const locationsWithDistance = locations
           .map(loc => {
-            const route = mapStore.findRoute(bot.system, loc.systemId);
+            const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
             const jumps = route ? route.length - 1 : 999;
             return { ...loc, jumps };
           })
@@ -804,10 +806,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             
             if (newLocs.length > 0) {
               newTarget = newQuotaTarget;
-              // Prefer current system, then closest by jumps
+              // Prefer current system, then closest by jumps (use blacklist)
+              const blacklist = getSystemBlacklist();
               const locsWithDist = newLocs
                 .map(loc => {
-                  const route = mapStore.findRoute(bot.system, loc.systemId);
+                  const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
                   return { ...loc, jumps: route ? route.length - 1 : 999 };
                 })
                 .filter(loc => loc.jumps <= maxJumps)

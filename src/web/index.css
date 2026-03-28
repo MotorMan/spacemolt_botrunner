@@ -1513,6 +1513,82 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   margin: 0; cursor: pointer;
 }
 
+/* ── System Blacklist Settings ───────────────────────── */
+.blacklist-section {
+  background: var(--card-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+}
+.blacklist-header {
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+  font-size: 0.9em;
+}
+.blacklist-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.blacklist-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  gap: 8px;
+}
+.blacklist-name {
+  font-weight: 500;
+  color: var(--text);
+  font-size: 0.9em;
+}
+.blacklist-id {
+  font-weight: 400;
+  color: var(--dim);
+  font-size: 0.85em;
+}
+.blacklist-empty {
+  color: var(--dim);
+  font-size: 0.9em;
+  padding: 16px;
+  text-align: center;
+}
+.blacklist-add {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.blacklist-add-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.blacklist-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--dim);
+  font-size: 0.85em;
+}
+.blacklist-divider::before,
+.blacklist-divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border);
+}
+.blacklist-hint {
+  font-size: 0.8em;
+  color: var(--dim);
+  margin-top: 4px;
+}
+
 /* ── Faction page ───────────────────────────────────── */
 .faction-layout {
   display: flex;

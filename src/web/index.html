@@ -218,6 +218,7 @@
       <div class="settings-sidebar">
         <div class="sidebar-header">Bot Types</div>
         <div class="sidebar-item active" onclick="switchSettingsTab('general')">General</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('system_blacklist')">System Blacklist</div>
         <div class="sidebar-item" onclick="switchSettingsTab('crafter')">Crafter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('rescue')">FuelRescue</div>
         <div class="sidebar-item" onclick="switchSettingsTab('explorer')">Explorer</div>
@@ -4161,6 +4162,8 @@ function renderSettingsPanel() {
   const panel = document.getElementById('settingsContent');
   if (activeSettingsTab === 'general') {
     renderGeneralSettings(panel);
+  } else if (activeSettingsTab === 'system_blacklist') {
+    renderSystemBlacklistSettings(panel);
   } else if (activeSettingsTab === 'miner') {
     renderMinerSettings(panel);
   } else if (activeSettingsTab === 'crafter') {
@@ -4270,6 +4273,147 @@ function saveGeneralSettings() {
     factionStorageStation,
   };
   send({ type: 'saveSettings', routine: 'general', settings: s });
+}
+
+// ── System Blacklist Settings ───────────────────────────────
+
+function renderSystemBlacklistSettings(panel) {
+  const blacklist = settings.systemBlacklist || [];
+  const blacklistSet = new Set(blacklist.map(s => s.toLowerCase()));
+  
+  // Build list of all known systems from mapData
+  const allSystems = Object.entries(mapData)
+    .map(([sysId, sys]) => ({
+      id: sysId,
+      name: sys.name || sysId,
+      isBlacklisted: blacklistSet.has(sysId.toLowerCase()),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  
+  const blacklistedSystems = allSystems.filter(s => s.isBlacklisted);
+  const availableSystems = allSystems.filter(s => !s.isBlacklisted);
+  
+  // Build blacklisted items list
+  const blacklistedRows = blacklistedSystems.length > 0
+    ? blacklistedSystems.map(s => `
+        <div class="blacklist-item">
+          <span class="blacklist-name">${esc(s.name)} <span class="blacklist-id">(${esc(s.id)})</span></span>
+          <button class="sm danger" onclick="removeFromBlacklist('${esc(s.id)}')">Remove</button>
+        </div>
+      `).join('')
+    : '<div class="blacklist-empty">No systems blacklisted. Add systems below to avoid them during travel.</div>';
+  
+  // Build available systems dropdown
+  const systemOptions = availableSystems.length > 0
+    ? availableSystems.map(s => `<option value="${esc(s.id)}">${esc(s.name)} (${esc(s.id)})</option>`).join('')
+    : '<option value="">All known systems are blacklisted</option>';
+  
+  // Manual text entry (comma-separated)
+  const manualEntryHelp = availableSystems.length > 0
+    ? 'Enter system names or IDs, separated by commas. Systems must match exactly (case-insensitive).'
+    : 'All known systems are already blacklisted. Remove systems above to add new ones.';
+  
+  panel.innerHTML = `
+    <h3>System Blacklist</h3>
+    <div class="settings-desc">
+      Prevent bots from traveling through dangerous systems (e.g., pirate-infested space). 
+      Bots will automatically route around blacklisted systems when navigating.
+    </div>
+    
+    <div class="blacklist-section">
+      <div class="blacklist-header">
+        <span>Blacklisted Systems (${blacklistedSystems.length})</span>
+      </div>
+      <div class="blacklist-list">
+        ${blacklistedRows}
+      </div>
+    </div>
+    
+    <div class="blacklist-section" style="margin-top:16px">
+      <div class="blacklist-header">
+        <span>Add Systems</span>
+      </div>
+      <div class="blacklist-add">
+        <div class="blacklist-add-row">
+          <select id="blacklist-system-select" style="flex:1;min-width:200px">
+            <option value="">(select a system)</option>
+            ${systemOptions}
+          </select>
+          <button class="primary sm" onclick="addToBlacklistFromSelect()">Add to Blacklist</button>
+        </div>
+        
+        <div class="blacklist-divider">
+          <span>OR</span>
+        </div>
+        
+        <div class="blacklist-add-row">
+          <input 
+            type="text" 
+            id="blacklist-manual-entry" 
+            placeholder="e.g., algol, bellatrix, zaniah" 
+            style="flex:1;min-width:200px"
+            ${availableSystems.length === 0 ? 'disabled' : ''}
+          />
+          <button class="primary sm" onclick="addToBlacklistFromText()" ${availableSystems.length === 0 ? 'disabled' : ''}>Add to Blacklist</button>
+        </div>
+        <div class="blacklist-hint">${manualEntryHelp}</div>
+      </div>
+    </div>
+    
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveBlacklistSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function addToBlacklistFromSelect() {
+  const select = document.getElementById('blacklist-system-select');
+  const systemId = select.value;
+  if (!systemId) return;
+  
+  if (!settings.systemBlacklist) settings.systemBlacklist = [];
+  if (!settings.systemBlacklist.includes(systemId)) {
+    settings.systemBlacklist.push(systemId);
+  }
+  renderSystemBlacklistSettings(document.getElementById('settingsContent'));
+}
+
+function addToBlacklistFromText() {
+  const input = document.getElementById('blacklist-manual-entry');
+  const text = input.value.trim();
+  if (!text) return;
+  
+  if (!settings.systemBlacklist) settings.systemBlacklist = [];
+  
+  const systems = text.split(',').map(s => s.trim()).filter(s => s.length > 0);
+  let added = 0;
+  for (const system of systems) {
+    // Check if it matches a known system ID or name
+    const match = Object.entries(mapData).find(
+      ([id, data]) => id.toLowerCase() === system.toLowerCase() || 
+                      (data.name || '').toLowerCase() === system.toLowerCase()
+    );
+    const systemId = match ? match[0] : system;
+    
+    if (!settings.systemBlacklist.includes(systemId)) {
+      settings.systemBlacklist.push(systemId);
+      added++;
+    }
+  }
+  
+  input.value = '';
+  renderSystemBlacklistSettings(document.getElementById('settingsContent'));
+}
+
+function removeFromBlacklist(systemId) {
+  if (!settings.systemBlacklist) return;
+  settings.systemBlacklist = settings.systemBlacklist.filter(s => s.toLowerCase() !== systemId.toLowerCase());
+  renderSystemBlacklistSettings(document.getElementById('settingsContent'));
+}
+
+function saveBlacklistSettings() {
+  const s = { systemBlacklist: settings.systemBlacklist || [] };
+  send({ type: 'saveSettings', routine: 'system_blacklist', settings: s });
 }
 
 function renderCleanupSettings(panel) {

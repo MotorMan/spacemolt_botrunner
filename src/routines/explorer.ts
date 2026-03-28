@@ -1,5 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { getSystemBlacklist } from "../web/server.js";
 import {
   type SystemPOI,
   type Connection,
@@ -914,14 +915,17 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const focusSettings = getExplorerSettings(bot.username);
     const focusAreaSystem = focusSettings.focusAreaSystem;
     const maxJumps = focusSettings.maxJumps;
+    const blacklist = getSystemBlacklist();
 
     for (const [sysId, sys] of Object.entries(allSystems)) {
       // Skip pirate systems — they are hostile!
       if (isPirateSystem(sysId)) continue;
+      // Skip blacklisted systems
+      if (blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())) continue;
 
       // If focus area is set, check if this system is within range
       if (focusAreaSystem) {
-        const route = mapStore.findRoute(focusAreaSystem, sysId);
+        const route = mapStore.findRoute(focusAreaSystem, sysId, blacklist);
         if (!route) continue; // No route = not reachable
         const jumpsNeeded = route.length - 1; // Number of jumps = route length - 1
         if (jumpsNeeded > maxJumps) continue; // Too far from focus area

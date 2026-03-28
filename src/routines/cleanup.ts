@@ -8,6 +8,7 @@
  */
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { getSystemBlacklist } from "../web/server.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -493,13 +494,14 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     let totalCredits = 0;
     let totalItems = 0;
 
-    // Sort by distance (same-system first, then by jump count)
+    // Sort by distance (same-system first, then by jump count, avoiding blacklisted systems)
+    const blacklist = getSystemBlacklist();
     stationsWithStorage.sort((a, b) => {
       const aLocal = a.systemId === bot.system ? 0 : 1;
       const bLocal = b.systemId === bot.system ? 0 : 1;
       if (aLocal !== bLocal) return aLocal - bLocal;
-      const aRoute = mapStore.findRoute(bot.system, a.systemId);
-      const bRoute = mapStore.findRoute(bot.system, b.systemId);
+      const aRoute = mapStore.findRoute(bot.system, a.systemId, blacklist);
+      const bRoute = mapStore.findRoute(bot.system, b.systemId, blacklist);
       const aJumps = aRoute ? aRoute.length - 1 : 999;
       const bJumps = bRoute ? bRoute.length - 1 : 999;
       return aJumps - bJumps;

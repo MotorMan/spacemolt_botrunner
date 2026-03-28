@@ -24,6 +24,7 @@
 
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { getSystemBlacklist } from "../web/server.js";
 import {
   findStation,
   isStationPoi,
@@ -141,11 +142,14 @@ function findNearestHuntableSystem(fromSystemId: string): string | null {
   }
 
   // Phase 2: scan all known systems
+  const blacklist = getSystemBlacklist();
   for (const systemId of mapStore.getAllSystemIds()) {
     if (visited.has(systemId)) continue;
+    // Skip blacklisted systems
+    if (blacklist.some(b => b.toLowerCase() === systemId.toLowerCase())) continue;
     const sys = mapStore.getSystem(systemId);
     if (!sys || !isHuntableSystem(sys.security_level)) continue;
-    if (mapStore.findRoute(fromSystemId, systemId)) return systemId;
+    if (mapStore.findRoute(fromSystemId, systemId, blacklist)) return systemId;
   }
 
   return null;
@@ -753,8 +757,9 @@ async function checkFactionAlerts(
     const lastMs = respondedAlerts.get(alertSystem) ?? 0;
     if (nowMs - lastMs < ALERT_RESPONSE_COOLDOWN_MS) continue;
 
-    // Check proximity via known map routes
-    const route = mapStore.findRoute(bot.system, alertSystem);
+    // Check proximity via known map routes (use blacklist)
+    const blacklist = getSystemBlacklist();
+    const route = mapStore.findRoute(bot.system, alertSystem, blacklist);
     if (!route || route.length > responseRange) continue;
 
     return alertSystem;
@@ -822,7 +827,8 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
     const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
     if (alertTarget) {
       const sys = mapStore.getSystem(alertTarget);
-      const route = mapStore.findRoute(bot.system, alertTarget);
+      const blacklist = getSystemBlacklist();
+      const route = mapStore.findRoute(bot.system, alertTarget, blacklist);
       const jumps = route ? route.length : "?";
       ctx.log("combat", `Faction alert! ${sys?.name || alertTarget} is under attack (${jumps} jump(s)) — diverting to assist`);
       respondedAlerts.set(alertTarget, Date.now());

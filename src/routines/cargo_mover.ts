@@ -9,6 +9,7 @@
  */
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { getSystemBlacklist } from "../web/server.js";
 import {
   ensureUndocked,
   ensureFueled,
@@ -319,7 +320,8 @@ function findMoveJobs(
     ctx.log("cargo", `  ${configItem.itemName}: inStorage=${inStorage}, inCargo=${inCargo}, available=${availableQty} (storageType=${storageType})`);
 
     if (targetQty > 0 && availableQty > 0) {
-      const route = mapStore.findRoute(sourceSystem, destSystem);
+      const blacklist = getSystemBlacklist();
+      const route = mapStore.findRoute(sourceSystem, destSystem, blacklist);
       const jumps = route ? route.length - 1 : 999;
 
       jobs.push({

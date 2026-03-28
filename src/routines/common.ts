@@ -8,6 +8,7 @@ import type { RoutineContext } from "../bot.js";
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
+import { getSystemBlacklist } from "../web/server.js";
 import {
   waitForCustomsInspection,
   pollForCustomsShip,
@@ -353,7 +354,8 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
 
   // No station in current system — find nearest known station
   ctx.log("system", "No station in current system — searching for nearest station...");
-  const nearest = mapStore.findNearestStationSystem(bot.system);
+  const blacklist = getSystemBlacklist();
+  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
   if (!nearest) {
     ctx.log("error", "No known station in mapped systems — cannot dock");
     return false;
@@ -364,7 +366,7 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
   // Navigate there
   if (nearest.systemId !== bot.system) {
     await ensureUndocked(ctx);
-    const route = mapStore.findRoute(bot.system, nearest.systemId);
+    const route = mapStore.findRoute(bot.system, nearest.systemId, blacklist);
     if (route && route.length > 1) {
       for (let i = 1; i < route.length; i++) {
         if (bot.state !== "running") return false;
@@ -823,7 +825,8 @@ export async function ensureFueled(
 
   // Step 4: No local station — find nearest known system with one
   ctx.log("system", "No station in current system — searching known map for nearest station...");
-  const nearest = mapStore.findNearestStationSystem(bot.system);
+  const blacklist = getSystemBlacklist();
+  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
   if (!nearest) {
     ctx.log("error", "No known station in mapped systems — emergency recovery...");
     return await emergencyFuelRecovery(ctx);
@@ -844,7 +847,7 @@ export async function ensureFueled(
     await ensureUndocked(ctx);
 
     // Jump system by system toward the station
-    const route = mapStore.findRoute(bot.system, nearest.systemId);
+    const route = mapStore.findRoute(bot.system, nearest.systemId, blacklist);
     if (route && route.length > 1) {
       for (let i = 1; i < route.length; i++) {
         if (bot.state !== "running") return false;
@@ -1044,6 +1047,7 @@ export async function navigateToSystem(
   const { bot } = ctx;
   const MAX_JUMPS = 199;
   const MAX_RETRIES_PER_JUMP = 10;
+  const blacklist = getSystemBlacklist();
 
   // Normalize system names for comparison (replace underscores with spaces, lowercase)
   const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
@@ -1056,8 +1060,8 @@ export async function navigateToSystem(
       return true;
     }
 
-    // Plan route from current position
-    const route = mapStore.findRoute(bot.system, targetSystemId);
+    // Plan route from current position (use blacklist to avoid pirate systems)
+    const route = mapStore.findRoute(bot.system, targetSystemId, blacklist);
     let nextSystem: string | null = null;
 
     if (route && route.length > 1) {
@@ -1137,8 +1141,8 @@ export async function navigateToSystem(
     await bot.refreshStatus();
     if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) return true;
 
-    // Recalculate route from CURRENT position (ensureFueled may have moved us)
-    const postFuelRoute = mapStore.findRoute(bot.system, targetSystemId);
+    // Recalculate route from CURRENT position (ensureFueled may have moved us, use blacklist)
+    const postFuelRoute = mapStore.findRoute(bot.system, targetSystemId, blacklist);
     if (postFuelRoute && postFuelRoute.length > 1) {
       nextSystem = postFuelRoute[1];
       ctx.log("travel", `Route recalculated from ${bot.system}: ${postFuelRoute.length - 1} jump${postFuelRoute.length - 1 !== 1 ? "s" : ""} remaining`);
@@ -1217,8 +1221,8 @@ export async function navigateToSystem(
         await bot.refreshStatus();
         if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
 
-        // Recalculate route from CURRENT position (may have changed during wait)
-        const retryRoute = mapStore.findRoute(bot.system, targetSystemId);
+        // Recalculate route from CURRENT position (may have changed during wait, use blacklist)
+        const retryRoute = mapStore.findRoute(bot.system, targetSystemId, blacklist);
         if (retryRoute && retryRoute.length > 1) {
           nextSystem = retryRoute[1];
           ctx.log("travel", `Route recalculated after wait: ${retryRoute.length - 1} jump${retryRoute.length - 1 !== 1 ? "s" : ""} remaining`);

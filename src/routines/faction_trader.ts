@@ -211,10 +211,14 @@ function findFactionSellRoutes(
   settings: ReturnType<typeof getFactionTraderSettings>,
   currentSystem: string,
   cargoCapacity: number,
+  personalMode: boolean = false,
 ): FactionSellRoute[] {
   const { bot } = ctx;
   const routes: FactionSellRoute[] = [];
-  if (bot.factionStorage.length === 0) return routes;
+  
+  // Use personal storage in personal mode, faction storage otherwise
+  const storage = personalMode ? bot.storage : bot.factionStorage;
+  if (storage.length === 0) return routes;
 
   const allBuys = mapStore.getAllBuyDemand();
   if (allBuys.length === 0) return routes;
@@ -222,7 +226,7 @@ function findFactionSellRoutes(
   const homeSystem = settings.homeSystem || currentSystem;
   const costPerJump = settings.fuelCostPerJump;
 
-  for (const item of bot.factionStorage) {
+  for (const item of storage) {
     const lower = item.itemId.toLowerCase();
     if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
     // Never trade raw ores, ice, or gas — those are crafting inputs
@@ -301,6 +305,16 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Detect faction membership early ──
+    // Check if bot is in a faction by attempting to view faction storage
+    let personalMode = false;
+    if (bot.docked) {
+      const factionResp = await bot.exec("view_faction_storage");
+      personalMode = !!factionResp.error;
+    } else {
+      personalMode = true;
+    }
 
     // ── Trade session recovery ──
     const activeSession = getActiveSession(bot.username);
@@ -424,10 +438,19 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
     // ── Find sell routes from faction storage ──
     yield "find_sales";
-    await bot.refreshFactionStorage();
+    
+    // Refresh storage based on mode
+    if (personalMode) {
+      await bot.refreshStorage();
+      ctx.log("trade", `PERSONAL MODE: Bot is not in a faction, using personal storage`);
+    } else {
+      await bot.refreshFactionStorage();
+      ctx.log("trade", `FACTION MODE: Bot is in a faction, using faction storage`);
+    }
+    
     await bot.refreshStatus();
     const cargoCapacity = bot.cargoMax > 0 ? bot.cargoMax : 50;
-    const foundRoutes = findFactionSellRoutes(ctx, settings, bot.system, cargoCapacity);
+    const foundRoutes = findFactionSellRoutes(ctx, settings, bot.system, cargoCapacity, personalMode);
 
     // Station priority: put routes whose destination is the home station first
     if (settings.stationPriority && settings.homeSystem) {
@@ -444,12 +467,13 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     }
 
     if (foundRoutes.length === 0) {
-      // If not at home, go there — faction storage is only visible at the home station
+      // If not at home, go there — storage is only visible at the home station
+      const storageType = personalMode ? "personal" : "faction";
       const homeSystem = settings.homeSystem || startSystem;
       const homeStationPoi = settings.homeStation || null;
       const atHome = (!homeSystem || bot.system === homeSystem) && (!homeStationPoi || bot.poi === homeStationPoi);
       if (!atHome) {
-        ctx.log("trade", "No faction storage items to sell — returning home to check faction storage");
+        ctx.log("trade", `No ${storageType} storage items to sell — returning home to check ${storageType} storage`);
         yield "return_home";
         if (homeSystem && bot.system !== homeSystem) {
           await ensureUndocked(ctx);
@@ -470,7 +494,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         }
         continue;
       }
-      ctx.log("trade", "No faction storage items to sell — waiting 60s");
+      ctx.log("trade", `No ${storageType} storage items to sell — waiting 60s`);
       await sleep(60000);
       continue;
     }
@@ -504,15 +528,24 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             totalSold += inCargo.quantity;
             continue;
           }
-          // Cargo full of other items (including fuel) — dump all to faction storage
+          // Cargo full of other items (including fuel) — dump all to storage
           let freed = false;
           for (const item of [...bot.inventory]) {
             if (item.quantity <= 0) continue;
-            const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
-            if (fResp.error) {
-              await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+            let dResp;
+            if (personalMode) {
+              // Personal storage - use deposit_items command
+              dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+            } else {
+              // Faction storage
+              dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+              if (dResp.error) {
+                dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+              }
             }
-            freed = true;
+            if (!dResp.error) {
+              freed = true;
+            }
           }
           if (!freed) break;
           continue;
@@ -520,11 +553,21 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
         let wQty = Math.min(remaining, maxItemsForCargo(freeSpace, route!.itemId));
         if (wQty <= 0) break;
-        let wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: wQty });
-        if (wResp.error && wResp.error.message.includes("cargo_full")) {
-          wQty = Math.max(1, Math.floor(wQty / 2));
+        
+        // Withdraw from storage based on mode
+        let wResp;
+        if (personalMode) {
+          // Personal storage - use withdraw_items command
+          wResp = await bot.exec("withdraw_items", { item_id: route!.itemId, quantity: wQty });
+        } else {
+          // Faction storage
           wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: wQty });
+          if (wResp.error && wResp.error.message.includes("cargo_full")) {
+            wQty = Math.max(1, Math.floor(wQty / 2));
+            wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: wQty });
+          }
         }
+        
         if (wResp.error) {
           if (totalSold > 0) break;
           ctx.log("error", `Withdraw failed: ${wResp.error.message}`);
@@ -599,21 +642,34 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             fuelKept += keep;
             const excess = item.quantity - keep;
             if (excess <= 0) continue;
-            const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: excess });
-            if (fResp.error) {
-              await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
+            // Deposit to storage based on mode
+            let dResp;
+            if (personalMode) {
+              dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
+            } else {
+              dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: excess });
+              if (dResp.error) {
+                dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
+              }
             }
             deposited.push(`${excess}x ${item.name}`);
           } else {
-            const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
-            if (fResp.error) {
-              await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+            // Deposit to storage based on mode
+            let dResp;
+            if (personalMode) {
+              dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+            } else {
+              dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+              if (dResp.error) {
+                dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+              }
             }
             deposited.push(`${item.quantity}x ${item.name}`);
           }
         }
         if (deposited.length > 0) {
-          ctx.log("trade", `Cleared cargo: ${deposited.join(", ")} → storage (kept ${fuelKept} fuel cells)`);
+          const storageType = personalMode ? "personal storage" : "storage";
+          ctx.log("trade", `Cleared cargo: ${deposited.join(", ")} → ${storageType} (kept ${fuelKept} fuel cells)`);
         }
       }
       await bot.refreshCargo();
@@ -622,22 +678,33 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       const freeSpace = getFreeSpace(bot);
       let qty = Math.min(route!.sellQty, route!.availableQty, maxItemsForCargo(freeSpace, route!.itemId));
       if (qty <= 0) {
-        ctx.log("trade", "No cargo space for faction withdrawal — skipping");
+        ctx.log("trade", "No cargo space for withdrawal — skipping");
         await sleep(30000);
         continue;
       }
 
-      let wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: qty });
-      if (wResp.error && wResp.error.message.includes("cargo_full")) {
-        qty = Math.max(1, Math.floor(qty / 2));
+      // Withdraw from storage based on mode
+      let wResp;
+      if (personalMode) {
+        // Personal storage - use withdraw_items command
+        wResp = await bot.exec("withdraw_items", { item_id: route!.itemId, quantity: qty });
+      } else {
+        // Faction storage
         wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: qty });
+        if (wResp.error && wResp.error.message.includes("cargo_full")) {
+          qty = Math.max(1, Math.floor(qty / 2));
+          wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: qty });
+        }
       }
+      
       if (wResp.error) {
         ctx.log("error", `Withdraw failed: ${wResp.error.message}`);
         await sleep(30000);
         continue;
       }
-      ctx.log("trade", `Withdrew ${qty}x ${route!.itemName} from faction storage`);
+      
+      const storageType = personalMode ? "personal storage" : "faction storage";
+      ctx.log("trade", `Withdrew ${qty}x ${route!.itemName} from ${storageType}`);
 
       // Create trade session for crash recovery
       const session = createTradeSession({

@@ -29,6 +29,9 @@ import {
   sleep,
   isPirateSystem,
   checkCustomsInspection,
+  checkAndFleeFromPirates,
+  fleeFromBattle,
+  getBattleStatus,
 } from "./common.js";
 
 /** Number of mine attempts per resource POI to sample ores. */
@@ -400,6 +403,18 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Battle check — if in battle, flee immediately ──
+    const battleStatus = await getBattleStatus(ctx);
+    if (battleStatus) {
+      ctx.log("combat", "In battle at start of loop - fleeing immediately!");
+      const fled = await fleeFromBattle(ctx);
+      if (!fled) {
+        ctx.log("error", "Flee failed - waiting before retry");
+      }
+      await sleep(5000);
+      continue;
+    }
+
     // ── Re-check mode after recovery — user might have changed it, or session was restarted ──
     const modeCheck = getExplorerSettings(bot.username);
     if (modeCheck.mode === "trade_update") {
@@ -675,6 +690,17 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         const jumpResp = await bot.exec("jump", { target_system: target.id });
         if (jumpResp.error) {
           const msg = jumpResp.error.message.toLowerCase();
+          // Check if we're in battle - need to flee immediately
+          if (msg.includes("battle") || msg.includes("in battle")) {
+            ctx.log("combat", "Cannot jump - in battle! Attempting to flee...");
+            const fled = await fleeFromBattle(ctx);
+            if (!fled) {
+              // Flee failed, but try anyway
+              ctx.log("error", "Flee command failed - battle engagement active");
+            }
+            await sleep(5000);
+            continue;
+          }
           if (msg.includes("fuel")) {
             ctx.log("error", "Insufficient fuel for direct jump — will refuel next loop");
           } else {
@@ -687,6 +713,16 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("travel", `Jumped to unknown system: ${target.name || target.id}`);
         bot.stats.totalSystems++;
         await checkCustomsInspection(ctx, systemId);
+        // Check for pirates
+        const nearbyResp = await bot.exec("get_nearby");
+        if (nearbyResp.result && typeof nearbyResp.result === "object") {
+          const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+          if (fled) {
+            ctx.log("error", "Pirates detected - fled, will retry");
+            await sleep(30000);
+            continue;
+          }
+        }
         lastSystem = systemId;
         continue;
       } else {
@@ -721,9 +757,36 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
         const jumpResp = await bot.exec("jump", { target_system: random.id });
         if (jumpResp.error) {
+          const msg = jumpResp.error.message.toLowerCase();
+          // Check if we're in battle - need to flee immediately
+          if (msg.includes("battle") || msg.includes("in battle")) {
+            ctx.log("combat", "Cannot jump - in battle! Attempting to flee...");
+            const fled = await fleeFromBattle(ctx);
+            if (!fled) {
+              ctx.log("error", "Flee command failed - battle engagement active");
+            }
+            await sleep(5000);
+            continue;
+          }
           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
           await sleep(10000);
+          continue;
         }
+        ctx.log("travel", `Jumped to ${random.name || random.id}`);
+        bot.stats.totalSystems++;
+        await checkCustomsInspection(ctx, systemId);
+        // Check for pirates
+        const nearbyResp = await bot.exec("get_nearby");
+        if (nearbyResp.result && typeof nearbyResp.result === "object") {
+          const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+          if (fled) {
+            ctx.log("error", "Pirates detected - fled, will retry");
+            await sleep(30000);
+            continue;
+          }
+        }
+        lastSystem = systemId;
+        continue;
       } else {
         ctx.log("error", "No connections from this system — stuck! Waiting 60s...");
         await sleep(60000);
@@ -749,6 +812,16 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const jumpResp = await bot.exec("jump", { target_system: nextSystem.id });
     if (jumpResp.error) {
       const msg = jumpResp.error.message.toLowerCase();
+      // Check if we're in battle - need to flee immediately
+      if (msg.includes("battle") || msg.includes("in battle")) {
+        ctx.log("combat", "Cannot jump - in battle! Attempting to flee...");
+        const fled = await fleeFromBattle(ctx);
+        if (!fled) {
+          ctx.log("error", "Flee command failed - battle engagement active");
+        }
+        await sleep(5000);
+        continue;
+      }
       if (msg.includes("fuel")) {
         ctx.log("error", "Insufficient fuel for jump — will refuel next loop");
       } else {
@@ -760,10 +833,20 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     ctx.log("travel", `Jumped to ${nextSystem.name || nextSystem.id}`);
     bot.stats.totalSystems++;
-    
+
     // Check for customs inspection after jump
     await checkCustomsInspection(ctx, systemId);
-    
+    // Check for pirates
+    const nearbyResp = await bot.exec("get_nearby");
+    if (nearbyResp.result && typeof nearbyResp.result === "object") {
+      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+      if (fled) {
+        ctx.log("error", "Pirates detected - fled, will retry");
+        await sleep(30000);
+        continue;
+      }
+    }
+
     lastSystem = systemId;
   }
 };

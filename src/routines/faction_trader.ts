@@ -310,11 +310,16 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
     // ── Detect faction membership early ──
     // Check if bot is in a faction by attempting to view faction storage
-    // If not docked, assume personal mode temporarily and dock first
+    // Distinguish between "not in faction" and "no faction storage at this station"
     let personalMode = false;
+    let factionError: string | null = null;
     if (bot.docked) {
       const factionResp = await bot.exec("view_faction_storage");
-      personalMode = !!factionResp.error;
+      if (factionResp.error) {
+        factionError = factionResp.error.message || "";
+        // Only use personal mode if bot is truly not in a faction
+        personalMode = factionError.includes("not_in_faction") || factionError.includes("not in a faction");
+      }
     } else {
       // Not docked - can't check faction storage yet, assume personal mode
       // Will re-check after docking
@@ -519,8 +524,13 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       } else if (personalMode) {
         // We assumed personal mode because we were undocked - now re-check
         const factionResp = await bot.exec("view_faction_storage");
-        personalMode = !!factionResp.error;
-        ctx.log("trade", personalMode 
+        if (factionResp.error) {
+          factionError = factionResp.error.message || "";
+          personalMode = factionError.includes("not_in_faction") || factionError.includes("not in a faction");
+        } else {
+          factionError = null;
+        }
+        ctx.log("trade", personalMode
           ? `PERSONAL MODE: Bot is not in a faction, using personal storage`
           : `FACTION MODE: Bot is in a faction, using faction storage`);
       }
@@ -546,7 +556,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       ctx.log("trade", `PERSONAL MODE: Bot is not in a faction, using personal storage`);
     } else {
       await bot.refreshFactionStorage();
-      ctx.log("trade", `FACTION MODE: Bot is in a faction, using faction storage`);
+      // Show helpful message if faction storage is empty at this station
+      if (factionError && (factionError.includes("no_faction_storage") || factionError.includes("no storage"))) {
+        ctx.log("trade", `FACTION MODE: Bot is in a faction, but no faction storage at this station — travel to home station`);
+      } else {
+        ctx.log("trade", `FACTION MODE: Bot is in a faction, using faction storage`);
+      }
     }
     
     await bot.refreshStatus();
@@ -696,9 +711,19 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             ctx.log("error", `Cargo recovery sell failed: ${sResp.error.message}`);
             break;
           }
-          totalSold += sellQty;
-          remaining -= sellQty;
-          ctx.log("trade", `Cargo recovery: Sold ${sellQty}x ${route!.itemName} (${totalSold} total, ${remaining} remaining)`);
+          // Verify sale by checking cargo after sell
+          await bot.refreshCargo();
+          const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+          const actuallySold = inCargo.quantity - afterSell;
+          
+          if (actuallySold <= 0) {
+            ctx.log("error", `Cargo recovery: Sell command succeeded but no items were sold!`);
+            break;
+          }
+          
+          totalSold += actuallySold;
+          remaining -= actuallySold;
+          ctx.log("trade", `Cargo recovery: Sold ${actuallySold}x ${route!.itemName} (${totalSold} total, ${remaining} remaining)`);
           continue;
         }
         
@@ -708,8 +733,17 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           // First try to sell the trade item we already have
           const inCargo = bot.inventory.find(i => i.itemId === route!.itemId);
           if (inCargo && inCargo.quantity > 0) {
-            await bot.exec("sell", { item_id: route!.itemId, quantity: inCargo.quantity });
-            totalSold += inCargo.quantity;
+            const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: inCargo.quantity });
+            if (!sResp.error) {
+              // Verify sale
+              await bot.refreshCargo();
+              const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+              const actuallySold = inCargo.quantity - afterSell;
+              if (actuallySold > 0) {
+                totalSold += actuallySold;
+                ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} from full cargo`);
+              }
+            }
             continue;
           }
           // Cargo full of other items (including fuel) — dump all to storage
@@ -758,15 +792,46 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           break;
         }
 
+        // Verify item was actually withdrawn to cargo
+        await bot.refreshCargo();
+        const afterWithdraw = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+        if (afterWithdraw <= 0) {
+          ctx.log("error", `Withdraw returned no items - item may not exist in storage`);
+          break;
+        }
+
         remaining -= wQty;
 
         const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: wQty });
         if (sResp.error) {
           ctx.log("error", `Sell failed: ${sResp.error.message}`);
+          // Fail the session if we have no successful sales yet
+          if (totalSold <= 0) {
+            const session = getActiveSession(bot.username);
+            if (session) {
+              failTradeSession(bot.username, `Sell failed: ${sResp.error.message}`);
+            }
+          }
           break;
         }
-        totalSold += wQty;
-        ctx.log("trade", `Sold ${wQty}x ${route!.itemName} (${totalSold} total, ${remaining} remaining)`);
+
+        // Verify sale by checking cargo after sell
+        await bot.refreshCargo();
+        const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+        const actuallySold = afterWithdraw - afterSell;
+        
+        if (actuallySold <= 0) {
+          ctx.log("error", `Sell command succeeded but no items were sold - item still in cargo (${afterWithdraw}x)`);
+          // Fail the session
+          const session = getActiveSession(bot.username);
+          if (session) {
+            failTradeSession(bot.username, "Sell command did not remove items from cargo");
+          }
+          break;
+        }
+
+        totalSold += actuallySold;
+        ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} (${totalSold} total, ${remaining} remaining)`);
       }
 
       if (totalSold > 0) {
@@ -805,6 +870,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         session.completedAt = new Date().toISOString();
         startTradeSession(session);
         ctx.log("trade", `In-station trade session completed: ${totalSold}x ${route!.itemName}`);
+      } else if (route) {
+        // No items sold - fail any existing session
+        const session = getActiveSession(bot.username);
+        if (session) {
+          failTradeSession(bot.username, "No items were actually sold");
+        }
       }
     } else {
       // ── Cross-system: withdraw, travel, sell ──
@@ -1031,23 +1102,33 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       const inCargo = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
       if (inCargo > 0) {
         const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: inCargo });
-        if (!sResp.error) {
-          const revenue = inCargo * route!.sellPrice;
-          bot.stats.totalTrades++;
-          bot.stats.totalProfit += revenue;
-          ctx.log("trade", `Sold ${inCargo}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue`);
-          await factionDonateProfit(ctx, revenue);
-          // Complete trade session
-          const actualProfit = revenue; // No acquisition cost for faction items
-          completeTradeSession(bot.username, revenue, actualProfit);
-          ctx.log("trade", "Trade session completed successfully");
-          
-          // Always refuel after selling before heading home (especially important for long return trips)
-          ctx.log("system", "Topping off fuel before return journey...");
-          await tryRefuel(ctx);
-        } else {
+        if (sResp.error) {
           ctx.log("error", `Sell failed: ${sResp.error.message}`);
           failTradeSession(bot.username, `Sell failed: ${sResp.error.message}`);
+        } else {
+          // Verify sale by checking cargo after sell
+          await bot.refreshCargo();
+          const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+          const actuallySold = inCargo - afterSell;
+          
+          if (actuallySold <= 0) {
+            ctx.log("error", `Sell command succeeded but no items were sold - item still in cargo (${inCargo}x)`);
+            failTradeSession(bot.username, "Sell command did not remove items from cargo");
+          } else {
+            const revenue = actuallySold * route!.sellPrice;
+            bot.stats.totalTrades++;
+            bot.stats.totalProfit += revenue;
+            ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue`);
+            await factionDonateProfit(ctx, revenue);
+            // Complete trade session
+            const actualProfit = revenue; // No acquisition cost for faction items
+            completeTradeSession(bot.username, revenue, actualProfit);
+            ctx.log("trade", "Trade session completed successfully");
+
+            // Always refuel after selling before heading home (especially important for long return trips)
+            ctx.log("system", "Topping off fuel before return journey...");
+            await tryRefuel(ctx);
+          }
         }
       } else {
         // No cargo - session recovery needed

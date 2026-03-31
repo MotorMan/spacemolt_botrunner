@@ -15,6 +15,8 @@
 
 import type { Bot } from "../bot.js";
 import { readSettings } from "../routines/common.js";
+import { getSystemBlacklist } from "../web/server.js";
+import { mapStore } from "../mapstore.js";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -370,8 +372,8 @@ export function processPrivateMessage(
 }
 
 /**
- * Calculate jumps to a target system.
- * Returns -1 if route cannot be calculated.
+ * Calculate jumps to a target system, respecting the system blacklist.
+ * Returns -1 if no valid route exists.
  */
 export async function calculateJumpsToTarget(
   bot: Bot,
@@ -381,14 +383,34 @@ export async function calculateJumpsToTarget(
     return 0;
   }
 
+  // First try mapStore with blacklist validation
+  const blacklist = getSystemBlacklist();
+  const mappedRoute = mapStore.findRoute(bot.system, targetSystem, blacklist);
+  if (mappedRoute && mappedRoute.length > 1) {
+    return mappedRoute.length - 1;
+  }
+
+  // No mapped route — try server route, but validate against blacklist
   try {
-    const routeResp = await bot.exec("find_route", { 
-      target_system: targetSystem 
+    const routeResp = await bot.exec("find_route", {
+      target_system: targetSystem
     });
-    
+
     if (!routeResp.error && routeResp.result) {
       const route = routeResp.result as Record<string, unknown>;
-      return (route.total_jumps as number) || -1;
+      const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+
+      if (routeData) {
+        // Validate server route against blacklist
+        const blacklistedOnRoute = routeData.find(
+          (sys: { system_id: string; name: string }) => blacklist.some((b: string) => b.toLowerCase() === sys.system_id.toLowerCase())
+        );
+        if (blacklistedOnRoute) {
+          // Server route passes through blacklisted system — reject it
+          return -1;
+        }
+        return (route.total_jumps as number) || -1;
+      }
     }
   } catch (e) {
     // Route calculation failed

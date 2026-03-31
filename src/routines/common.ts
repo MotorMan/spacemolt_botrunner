@@ -1085,23 +1085,35 @@ export async function navigateToSystem(
       ctx.log("travel", `No mapped route — querying server for route to ${targetSystemId}`);
       const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
       const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
-      
+
       // Check if server says we're already at target (message field or 0 jumps)
       const alreadyAtTarget = routeData?.found && (
-        routeData.total_jumps === 0 || 
+        routeData.total_jumps === 0 ||
         (routeData.message && routeData.message.toLowerCase().includes('already')) ||
         (routeData.route && routeData.route.length === 1)
       );
-      
+
       if (alreadyAtTarget) {
         ctx.log("travel", `Server confirms we are already at ${targetSystemId}`);
         return true;
       }
-      
+
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
-        nextSystem = routeData.route[1].system_id;
-        ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
-      } else {
+        // Validate server route against blacklist — reject if it passes through blacklisted systems
+        const serverRouteSystemIds = routeData.route.map(r => r.system_id);
+        const blacklistedOnRoute = serverRouteSystemIds.find(
+          sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
+        );
+        if (blacklistedOnRoute) {
+          ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route`);
+        } else {
+          nextSystem = routeData.route[1].system_id;
+          ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
+        }
+      }
+
+      // If server route was rejected or unavailable, try fallback options
+      if (!nextSystem) {
         // Server returned no route - check if we might already be at the target
         // This can happen due to case mismatch or if we're already there
         ctx.log("warn", `Server returned no route to ${targetSystemId} — checking if already arrived...`);
@@ -1165,23 +1177,34 @@ export async function navigateToSystem(
       ctx.log("travel", `No mapped route from ${bot.system} — querying server for route to ${targetSystemId}`);
       const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
       const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
-      
+
       // Check if server says we're already at target
       const alreadyAtTarget = routeData?.found && (
-        routeData.total_jumps === 0 || 
+        routeData.total_jumps === 0 ||
         (routeData.message && routeData.message.toLowerCase().includes('already')) ||
         (routeData.route && routeData.route.length === 1)
       );
-      
+
       if (alreadyAtTarget) {
         ctx.log("travel", `Server confirms we are already at ${targetSystemId} (post-fuel check)`);
         return true;
       }
-      
+
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
-        nextSystem = routeData.route[1].system_id;
-        ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
-      } else {
+        // Validate server route against blacklist — reject if it passes through blacklisted systems
+        const serverRouteSystemIds = routeData.route.map(r => r.system_id);
+        const blacklistedOnRoute = serverRouteSystemIds.find(
+          sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
+        );
+        if (blacklistedOnRoute) {
+          ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route (post-fuel)`);
+        } else {
+          nextSystem = routeData.route[1].system_id;
+          ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
+        }
+      }
+
+      if (!nextSystem) {
         ctx.log("error", `No route from ${bot.system} to ${targetSystemId} — cannot navigate`);
         return false;
       }

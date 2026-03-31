@@ -56,6 +56,137 @@ const TRADER_WORKING_BALANCE = 200_000;
 /** Buffer above working balance before depositing excess to faction storage. */
 const TRADER_DEPOSIT_THRESHOLD = 210_000;
 
+/**
+ * Check if the bot can afford a trade route, including potential withdrawal from storage.
+ * Returns an object with affordability info and withdrawal recommendation.
+ */
+async function canAffordRoute(
+  ctx: RoutineContext,
+  route: TradeRoute,
+  settings: ReturnType<typeof getTraderSettings>,
+): Promise<{
+  canAfford: boolean;
+  canAffordWithWithdrawal: boolean;
+  withdrawalNeeded: number;
+  maxAffordableQty: number;
+}> {
+  const { bot } = ctx;
+  const totalCost = route.buyPrice * route.buyQty;
+  const canAffordDirectly = bot.credits >= totalCost;
+  
+  if (canAffordDirectly) {
+    return {
+      canAfford: true,
+      canAffordWithWithdrawal: true,
+      withdrawalNeeded: 0,
+      maxAffordableQty: route.buyQty,
+    };
+  }
+
+  // Check station storage (personal) and faction storage (if in a faction)
+  let storedCredits = 0;
+  
+  // Check personal station storage
+  const storageResp = await bot.exec("view_storage");
+  if (storageResp.result && typeof storageResp.result === "object") {
+    const sr = storageResp.result as Record<string, unknown>;
+    storedCredits = (sr.credits as number) || (sr.stored_credits as number) || 0;
+  }
+  
+  // Also check faction storage if bot is in a faction
+  let factionStoredCredits = 0;
+  if (bot.faction) {
+    const factionStorageResp = await bot.exec("view_faction_storage");
+    if (factionStorageResp.result && typeof factionStorageResp.result === "object") {
+      const fsr = factionStorageResp.result as Record<string, unknown>;
+      factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
+    }
+  }
+  
+  const totalStored = storedCredits + factionStoredCredits;
+  const shortfall = totalCost - bot.credits;
+  const canWithdraw = totalStored >= shortfall;
+  
+  // Calculate max affordable quantity with current credits + all storage
+  const totalAvailable = bot.credits + totalStored;
+  const maxAffordableQty = Math.floor(totalAvailable / route.buyPrice);
+
+  return {
+    canAfford: false,
+    canAffordWithWithdrawal: canWithdraw && maxAffordableQty > 0,
+    withdrawalNeeded: canWithdraw ? shortfall : totalStored,
+    maxAffordableQty,
+  };
+}
+
+/**
+ * Withdraw credits from storage to fund a trade route.
+ * Tries station storage first, then faction storage if needed.
+ * Returns true if withdrawal was successful or not needed.
+ */
+async function withdrawCreditsForTrade(
+  ctx: RoutineContext,
+  route: TradeRoute,
+): Promise<boolean> {
+  const { bot } = ctx;
+  const totalCost = route.buyPrice * route.buyQty;
+  
+  // Already have enough credits
+  if (bot.credits >= totalCost) {
+    return true;
+  }
+
+  const needed = totalCost - bot.credits;
+  
+  // Try personal station storage first
+  let storedCredits = 0;
+  const storageResp = await bot.exec("view_storage");
+  if (storageResp.result && typeof storageResp.result === "object") {
+    const sr = storageResp.result as Record<string, unknown>;
+    storedCredits = (sr.credits as number) || (sr.stored_credits as number) || 0;
+  }
+  
+  if (storedCredits > 0) {
+    const withdrawAmount = Math.min(needed, storedCredits);
+    if (withdrawAmount > 0) {
+      const wResp = await bot.exec("withdraw_credits", { amount: withdrawAmount });
+      if (!wResp.error) {
+        await bot.refreshStatus();
+        ctx.log("trade", `Withdrew ${withdrawAmount}cr from station storage for trade (now ${bot.credits}cr)`);
+        return true;
+      }
+    }
+  }
+  
+  // Try faction storage if bot is in a faction
+  if (bot.faction) {
+    let factionStoredCredits = 0;
+    const factionStorageResp = await bot.exec("view_faction_storage");
+    if (factionStorageResp.result && typeof factionStorageResp.result === "object") {
+      const fsr = factionStorageResp.result as Record<string, unknown>;
+      factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
+    }
+    
+    if (factionStoredCredits > 0) {
+      const remainingNeeded = needed - (storedCredits > 0 ? Math.min(needed, storedCredits) : 0);
+      const withdrawAmount = Math.min(remainingNeeded, factionStoredCredits);
+      if (withdrawAmount > 0) {
+        const wResp = await bot.exec("faction_withdraw_credits", { amount: withdrawAmount });
+        if (!wResp.error) {
+          await bot.refreshStatus();
+          ctx.log("trade", `Withdrew ${withdrawAmount}cr from faction storage for trade (now ${bot.credits}cr)`);
+          return true;
+        } else {
+          ctx.log("error", `Failed to withdraw from faction storage: ${wResp.error.message}`);
+        }
+      }
+    }
+  }
+  
+  ctx.log("trade", `No storage credits available (need ${needed}cr)`);
+  return false;
+}
+
 // ── Helpers ─────────────────────────────────────────────────
 
 /**
@@ -835,14 +966,17 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Deposit items with no good price to faction storage
       if (itemsToDeposit.length > 0) {
-        // Check if we're at home - if not, navigate there first
-        if (bot.system !== homeSystem) {
+        // Check if bot is in a faction
+        if (!bot.faction) {
+          ctx.log("trade", `Not in a faction — keeping ${itemsToDeposit.length} item(s) in cargo for later sale`);
+          // Keep items in cargo - they'll be sold when a profitable route is found
+        } else if (bot.system !== homeSystem) {
           ctx.log("trade", `Depositing ${itemsToDeposit.length} item(s) to faction storage — traveling to home system ${homeSystem}...`);
           await ensureUndocked(ctx);
           const fueled = await ensureFueled(ctx, settings.refuelThreshold);
           if (fueled) {
-            const arrived = await navigateToSystem(ctx, homeSystem, { 
-              fuelThresholdPct: settings.refuelThreshold, 
+            const arrived = await navigateToSystem(ctx, homeSystem, {
+              fuelThresholdPct: settings.refuelThreshold,
               hullThresholdPct: settings.repairThreshold,
               autoCloak: settings.autoCloak,
             });
@@ -858,8 +992,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
 
-        // Deposit items to faction storage
-        if (bot.docked) {
+        // Deposit items to faction storage (only if in a faction and docked)
+        if (bot.faction && bot.docked) {
           const deposited: string[] = [];
           for (const item of itemsToDeposit) {
             const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
@@ -932,7 +1066,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // Skip route finding if we've already handled a recovered session (route is already set)
     yield "find_trades";
     let routes: TradeRoute[] = [];
-    
+    let allRoutesCount = 0;
+    let affordableRoutesCount = 0;
+
     if (!recoveredSessionHandled) {
       await bot.refreshStatus();
       await bot.refreshCargo();
@@ -949,10 +1085,21 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       const marketRoutes = findTradeOpportunities(settings, bot.system, cargoCapacity);
       // Filter out routes that sell items we just sold at the current station (demand already filled)
       const currentPoi = bot.poi;
-      const allRoutes = [...cargoRoutes, ...marketRoutes].filter(r => {
+      let allRoutes = [...cargoRoutes, ...marketRoutes].filter(r => {
         if (soldLocallyIds.has(r.itemId) && r.destSystem === bot.system && r.destPoi === currentPoi) return false;
         return true;
       });
+      allRoutesCount = allRoutes.length;
+
+      // Filter out routes where bot can't afford even 1 unit (will try again with cheaper items next scan)
+      const affordableRoutes = allRoutes.filter(r => bot.credits >= r.buyPrice);
+      affordableRoutesCount = affordableRoutes.length;
+      if (affordableRoutes.length < allRoutes.length) {
+        const skipped = allRoutes.length - affordableRoutes.length;
+        ctx.log("trade", `Skipping ${skipped} route(s) — item(s) too expensive for current budget (${bot.credits}cr)`);
+      }
+      allRoutes = affordableRoutes;
+      
       // Cargo routes first (already have the goods), then by profit
       routes = allRoutes.sort((a, b) => {
         // Cargo routes get priority — sort them first, then by profit
@@ -1004,7 +1151,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (routes.length === 0 && !recoveredSessionHandled) {
       // No routes found and no recovered session to handle
-      ctx.log("trade", "No profitable trade routes found — waiting 60s before re-scanning");
+      if (allRoutesCount > 0 && affordableRoutesCount === 0) {
+        ctx.log("trade", `No affordable routes found (budget: ${bot.credits}cr) — waiting 60s for more market data or consider earning credits via missions`);
+      } else {
+        ctx.log("trade", "No profitable trade routes found — waiting 60s before re-scanning");
+      }
       await sleep(60000);
       continue;
     }
@@ -1105,8 +1256,80 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       // Track the lock so we can release it if route fails
       pendingLockItemId = candidate.itemId;
       pendingLockReleased = false; // Reset for this route attempt
-      
+
       ctx.log("trade", `Fleet lock acquired: ${candidate.itemName} (${candidate.sourceSystem} → ${candidate.destSystem})`);
+
+      // Check affordability BEFORE traveling — include faction withdrawal fallback
+      const affordability = await canAffordRoute(ctx, candidate, settings);
+
+      const totalCost = candidate.buyPrice * candidate.buyQty;
+      const maxAffordableWithStorage = affordability.maxAffordableQty;
+      const maxAffordableOwnCredits = Math.floor(bot.credits / candidate.buyPrice);
+
+      // Can't afford even a single unit with all available credits — skip
+      if (maxAffordableWithStorage <= 0) {
+        ctx.log("trade", `Cannot afford route: need ${totalCost}cr for ${candidate.buyQty}x, have ${bot.credits}cr (storage: ${affordability.withdrawalNeeded > 0 ? 'insufficient' : 'empty'}) — skipping`);
+        releaseTradeLock(bot.username, candidate.itemId, "skipped:cannot_afford");
+        pendingLockItemId = null;
+        pendingLockReleased = true;
+        failedSources.add(sourceKey);
+        continue;
+      }
+
+      // Determine the actual quantity we can afford and should buy
+      let targetQty = candidate.buyQty;
+      let needsWithdrawal = false;
+
+      if (maxAffordableOwnCredits <= 0) {
+        // Can't afford any with own credits — need withdrawal
+        if (!affordability.canAffordWithWithdrawal) {
+          // Storage also can't help — skip
+          ctx.log("trade", `Cannot afford route: need ${totalCost}cr for ${candidate.buyQty}x, have ${bot.credits}cr (storage empty) — skipping`);
+          releaseTradeLock(bot.username, candidate.itemId, "skipped:cannot_afford");
+          pendingLockItemId = null;
+          pendingLockReleased = true;
+          failedSources.add(sourceKey);
+          continue;
+        }
+        // Use storage to fund the route
+        targetQty = Math.min(maxAffordableWithStorage, candidate.buyQty);
+        needsWithdrawal = true;
+      } else if (maxAffordableOwnCredits < candidate.buyQty) {
+        // Can afford some with own credits — adjust quantity (no withdrawal needed)
+        targetQty = maxAffordableOwnCredits;
+        ctx.log("trade", `Can only afford ${targetQty}/${candidate.buyQty}x with current credits — adjusting route`);
+      } else if (!affordability.canAfford && affordability.canAffordWithWithdrawal) {
+        // Can afford with storage help — use storage to get full quantity
+        targetQty = Math.min(maxAffordableWithStorage, candidate.buyQty);
+        needsWithdrawal = true;
+      }
+
+      // Adjust the route quantity if needed
+      if (targetQty < candidate.buyQty) {
+        ctx.log("trade", `Adjusted route: ${targetQty}/${candidate.buyQty}x ${candidate.itemName} (affordable quantity)`);
+        const adjustedProfitPerUnit = candidate.profitPerUnit;
+        candidate.buyQty = targetQty;
+        candidate.sellQty = targetQty;
+        candidate.totalProfit = adjustedProfitPerUnit * targetQty;
+      }
+
+      // Withdraw from storage if needed
+      if (needsWithdrawal) {
+        const adjustedCost = candidate.buyPrice * candidate.buyQty;
+        const withdrawalNeeded = Math.max(0, adjustedCost - bot.credits);
+        if (withdrawalNeeded > 0) {
+          ctx.log("trade", `Need ${withdrawalNeeded}cr from faction storage`);
+          const withdrew = await withdrawCreditsForTrade(ctx, candidate);
+          if (!withdrew) {
+            ctx.log("error", "Failed to withdraw credits from faction storage — skipping route");
+            releaseTradeLock(bot.username, candidate.itemId, "aborted:withdraw_failed");
+            pendingLockItemId = null;
+            pendingLockReleased = true;
+            failedSources.add(sourceKey);
+            continue;
+          }
+        }
+      }
 
       yield "travel_to_source";
 

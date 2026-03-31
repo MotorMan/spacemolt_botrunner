@@ -211,6 +211,8 @@ function getExplorerSettings(username?: string): {
   refuelThreshold: number;
   surveyMode: "quick" | "thorough";
   scanPois: boolean;
+  directToUnknown: boolean;
+  groupUnknowns: boolean;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -241,6 +243,20 @@ function getExplorerSettings(username?: string): {
       ? Boolean(e.scanPois)
       : true;
 
+  // Direct to unknown: per-bot > global explorer > default false
+  const directToUnknown = botOverrides.directToUnknown !== undefined
+    ? Boolean(botOverrides.directToUnknown)
+    : e.directToUnknown !== undefined
+      ? Boolean(e.directToUnknown)
+      : false;
+
+  // Group unknowns: per-bot > global explorer > default true
+  const groupUnknowns = botOverrides.groupUnknowns !== undefined
+    ? Boolean(botOverrides.groupUnknowns)
+    : e.groupUnknowns !== undefined
+      ? Boolean(e.groupUnknowns)
+      : true;
+
   return {
     mode: (mode === "trade_update" ? "trade_update" : "explore") as ExplorerMode,
     acceptMissions,
@@ -249,6 +265,8 @@ function getExplorerSettings(username?: string): {
     refuelThreshold: Number(refuelThreshold) || DEFAULT_JUMP_FUEL_PCT,
     surveyMode: (surveyMode === "quick" ? "quick" : "thorough") as "quick" | "thorough",
     scanPois,
+    directToUnknown,
+    groupUnknowns,
   };
 }
 
@@ -270,6 +288,20 @@ export function setExplorerFocusArea(username: string, focusAreaSystem: string |
 export function setExplorerJumpFuelThreshold(username: string, refuelThreshold: number): void {
   writeSettings({
     [username]: { refuelThreshold },
+  });
+}
+
+/** Persist direct to unknown setting for a specific bot. */
+export function setExplorerDirectToUnknown(username: string, directToUnknown: boolean): void {
+  writeSettings({
+    [username]: { directToUnknown },
+  });
+}
+
+/** Persist group unknowns setting for a specific bot. */
+export function setExplorerGroupUnknowns(username: string, groupUnknowns: boolean): void {
+  writeSettings({
+    [username]: { groupUnknowns },
   });
 }
 
@@ -591,6 +623,76 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Pick next system to explore ──
     yield "pick_next_system";
+
+    // ── Direct to Unknown mode: jump directly to farthest unknown system ──
+    if (currentSettings.directToUnknown) {
+      const blacklist = getSystemBlacklist();
+      const unknowns = findUnknownSystems(ctx, systemId, blacklist);
+      
+      if (unknowns.length > 0) {
+        // Pick the farthest unknown system
+        const target = unknowns[0];
+        ctx.log("exploration", `Direct-to-Unknown: Found ${unknowns.length} unknown system(s), targeting farthest: ${target.name} (${target.distance} jumps)`);
+        
+        // Load fuel cells if cargo space available
+        if (bot.cargoMax > 0 && bot.cargo < bot.cargoMax) {
+          yield "load_fuel_cells";
+          const stationForFuel = findStation(pois);
+          if (stationForFuel) {
+            // Travel to station if not already there
+            if (bot.poi !== stationForFuel.id) {
+              await ensureUndocked(ctx);
+              const tResp = await bot.exec("travel", { target_poi: stationForFuel.id });
+              if (!tResp.error || tResp.error.message.includes("already")) {
+                bot.poi = stationForFuel.id;
+              }
+            }
+            await loadFuelCells(ctx);
+          }
+        }
+        
+        // Ensure fuel before jumping
+        yield "pre_jump_fuel";
+        const directFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
+        if (!directFueled) {
+          ctx.log("error", "Could not refuel for direct jump — waiting 30s...");
+          await sleep(30000);
+          continue;
+        }
+        
+        // If grouping is enabled, find nearby unknowns to visit after the target
+        let nearbyUnknowns: string[] = [];
+        if (currentSettings.groupUnknowns) {
+          nearbyUnknowns = findNearbyUnknowns(ctx, target.id, 2, blacklist);
+          if (nearbyUnknowns.length > 0) {
+            ctx.log("exploration", `Grouping enabled: ${nearbyUnknowns.length} additional unknown(s) near ${target.name}`);
+          }
+        }
+        
+        // Jump to target system
+        await ensureUndocked(ctx);
+        ctx.log("travel", `Jumping directly to unknown system: ${target.name || target.id}...`);
+        const jumpResp = await bot.exec("jump", { target_system: target.id });
+        if (jumpResp.error) {
+          const msg = jumpResp.error.message.toLowerCase();
+          if (msg.includes("fuel")) {
+            ctx.log("error", "Insufficient fuel for direct jump — will refuel next loop");
+          } else {
+            ctx.log("error", `Direct jump failed: ${jumpResp.error.message}`);
+          }
+          await sleep(10000);
+          continue;
+        }
+        
+        ctx.log("travel", `Jumped to unknown system: ${target.name || target.id}`);
+        bot.stats.totalSystems++;
+        await checkCustomsInspection(ctx, systemId);
+        lastSystem = systemId;
+        continue;
+      } else {
+        ctx.log("info", "Direct-to-Unknown: No unknown systems found — using normal exploration");
+      }
+    }
 
     // ALWAYS ensure fueled before jumping — will navigate to nearest station if needed
     yield "pre_jump_fuel";
@@ -1078,6 +1180,195 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 }
 
 // ── Helpers ──────────────────────────────────────────────────
+
+/**
+ * Find all unknown systems (systems with 0 POIs mapped) reachable from current system.
+ * Returns systems sorted by distance (farthest first).
+ */
+function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklist: string[]): Array<{ id: string; name: string; distance: number; route: string[] }> {
+  const { log } = ctx;
+  const allSystems = mapStore.getAllSystems();
+  const unknowns: Array<{ id: string; name: string; distance: number; route: string[] }> = [];
+
+  // BFS to find all reachable systems and their distances
+  const visited = new Set<string>();
+  const queue: Array<{ systemId: string; distance: number; route: string[] }> = [
+    { systemId: currentSystem, distance: 0, route: [currentSystem] }
+  ];
+  visited.add(currentSystem);
+
+  while (queue.length > 0) {
+    const { systemId, distance, route } = queue.shift()!;
+    const sys = mapStore.getSystem(systemId);
+    if (!sys) continue;
+
+    for (const conn of sys.connections) {
+      const connId = conn.system_id;
+      if (!connId) continue;
+      if (visited.has(connId)) continue;
+      // Skip blacklisted systems
+      if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
+
+      visited.add(connId);
+      const newRoute = [...route, connId];
+      const newDistance = distance + 1;
+
+      // Check if this system is "unknown" (has 0 POIs mapped - never explored)
+      const targetSys = mapStore.getSystem(connId);
+      if (targetSys) {
+        // System is in map.json - check if it has 0 POIs (unexplored)
+        const poiCount = targetSys.pois?.length ?? 0;
+        if (poiCount === 0) {
+          unknowns.push({
+            id: connId,
+            name: conn.system_name || connId,
+            distance: newDistance,
+            route: newRoute,
+          });
+        }
+        // Continue BFS through known systems (whether explored or not)
+        queue.push({ systemId: connId, distance: newDistance, route: newRoute });
+      } else {
+        // System not in map.json at all - also consider it unknown
+        unknowns.push({
+          id: connId,
+          name: conn.system_name || connId,
+          distance: newDistance,
+          route: newRoute,
+        });
+      }
+    }
+  }
+
+  // Sort by distance (farthest first)
+  unknowns.sort((a, b) => b.distance - a.distance);
+  return unknowns;
+}
+
+/**
+ * Find unknown systems near a target system (for grouping).
+ * Returns systems within maxJumps of the target that have 0 POIs.
+ */
+function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps: number, blacklist: string[]): string[] {
+  const allSystems = mapStore.getAllSystems();
+  const nearby: string[] = [];
+
+  // BFS from target system
+  const visited = new Set<string>();
+  const queue: Array<{ systemId: string; distance: number }> = [
+    { systemId: targetSystem, distance: 0 }
+  ];
+  visited.add(targetSystem);
+
+  while (queue.length > 0) {
+    const { systemId, distance } = queue.shift()!;
+    if (distance >= maxJumps) continue;
+
+    const sys = mapStore.getSystem(systemId);
+    if (!sys) continue;
+
+    for (const conn of sys.connections) {
+      const connId = conn.system_id;
+      if (!connId) continue;
+      if (visited.has(connId)) continue;
+      if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
+
+      visited.add(connId);
+      
+      // Check if this system is "unknown" (has 0 POIs or not in map)
+      const targetSys = mapStore.getSystem(connId);
+      if (targetSys) {
+        // System is in map.json - check if it has 0 POIs (unexplored)
+        const poiCount = targetSys.pois?.length ?? 0;
+        if (poiCount === 0) {
+          nearby.push(connId);
+        }
+        // Continue BFS through known systems
+        queue.push({ systemId: connId, distance: distance + 1 });
+      } else {
+        // System not in map.json at all - also consider it unknown
+        nearby.push(connId);
+      }
+    }
+  }
+
+  return nearby;
+}
+
+/**
+ * Load cargo hold with fuel cells for long journeys.
+ * Fills cargo to max capacity with fuel cells.
+ */
+async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
+  const { bot, log } = ctx;
+  
+  // Find a station with fuel cells
+  const { pois } = await getSystemInfo(ctx);
+  const station = findStation(pois);
+  
+  if (!station) {
+    log("error", "No station in current system to load fuel cells");
+    return false;
+  }
+
+  // Dock at station
+  if (!bot.docked) {
+    const travelResp = await bot.exec("travel", { target_poi: station.id });
+    if (travelResp.error && !travelResp.error.message.includes("already")) {
+      log("error", `Could not reach station: ${travelResp.error.message}`);
+      return false;
+    }
+    
+    const dockResp = await bot.exec("dock");
+    if (dockResp.error && !dockResp.error.message.includes("already")) {
+      log("error", `Could not dock: ${dockResp.error.message}`);
+      return false;
+    }
+    bot.docked = true;
+  }
+
+  // Check current cargo
+  const cargoResp = await bot.exec("get_cargo");
+  if (!cargoResp.result || typeof cargoResp.result !== "object") {
+    log("error", "Could not get cargo status");
+    return false;
+  }
+
+  const cResult = cargoResp.result as Record<string, unknown>;
+  const cargoItems = (
+    Array.isArray(cResult) ? cResult :
+    Array.isArray(cResult.items) ? cResult.items :
+    Array.isArray(cResult.cargo) ? cResult.cargo :
+    []
+  ) as Array<Record<string, unknown>>;
+
+  let currentCargo = 0;
+  for (const item of cargoItems) {
+    const quantity = (item.quantity as number) || 0;
+    currentCargo += quantity;
+  }
+
+  const availableSpace = bot.cargoMax - currentCargo;
+  if (availableSpace <= 0) {
+    log("info", "Cargo hold is full");
+    return true;
+  }
+
+  // Buy fuel cells
+  log("trade", `Loading ${availableSpace} fuel cells for long journey...`);
+  const buyResp = await bot.exec("buy_item", {
+    item_id: "fuel_cell",
+    quantity: availableSpace
+  });
+
+  if (buyResp.error) {
+    log("error", `Could not buy fuel cells: ${buyResp.error.message}`);
+    return false;
+  }
+
+  log("trade", `Loaded ${availableSpace} fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
+  return true;
+}
 
 /**
  * Pick the best next system: prioritize unexplored systems not in map.json.

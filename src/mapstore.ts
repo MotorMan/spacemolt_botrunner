@@ -605,10 +605,13 @@ class MapStore {
     return sys.pois.find((p) => p.has_base) ?? null;
   }
 
-  /** BFS to find the nearest known system that has a station (excluding pirate systems). Returns { systemId, poiId, poiName, hops } or null. */
-  findNearestStationSystem(fromSystemId: string): { systemId: string; poiId: string; poiName: string; hops: number } | null {
-    // Check current system first (but skip if it's a pirate system)
-    if (!this.isPirateSystem(fromSystemId)) {
+  /** BFS to find the nearest known system that has a station (excluding pirate and blacklisted systems). Returns { systemId, poiId, poiName, hops } or null. */
+  findNearestStationSystem(fromSystemId: string, blacklist?: string[]): { systemId: string; poiId: string; poiName: string; hops: number } | null {
+    const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
+    const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+    
+    // Check current system first (but skip if it's a pirate or blacklisted system)
+    if (!this.isPirateSystem(fromSystemId) && !blacklistSet.has(fromSystemId.toLowerCase())) {
       const localStation = this.findNearestStation(fromSystemId);
       if (localStation) return { systemId: fromSystemId, poiId: localStation.id, poiName: localStation.name, hops: 0 };
     }
@@ -625,6 +628,8 @@ class MapStore {
         if (!nextId || visited.has(nextId)) continue;
         // Skip pirate systems
         if (this.isPirateSystem(nextId)) continue;
+        // Skip blacklisted systems
+        if (blacklistSet.has(nextId.toLowerCase())) continue;
         visited.add(nextId);
 
         const station = this.findNearestStation(nextId);
@@ -709,9 +714,11 @@ class MapStore {
   }
 
   /** BFS pathfinding between two systems using known connections. Returns system IDs in order, or null if no path. */
-  findRoute(fromSystemId: string, toSystemId: string): string[] | null {
+  findRoute(fromSystemId: string, toSystemId: string, blacklist?: string[]): string[] | null {
     if (fromSystemId === toSystemId) return [fromSystemId];
 
+    const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
+    const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
     const visited = new Set<string>([fromSystemId]);
     const queue: Array<{ id: string; path: string[] }> = [
       { id: fromSystemId, path: [fromSystemId] },
@@ -724,6 +731,8 @@ class MapStore {
       for (const conn of conns) {
         const nextId = conn.system_id;
         if (!nextId || visited.has(nextId)) continue;
+        // Skip blacklisted systems
+        if (blacklistSet.has(nextId.toLowerCase())) continue;
 
         const newPath = [...current.path, nextId];
         if (nextId === toSystemId) return newPath;

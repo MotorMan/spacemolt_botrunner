@@ -29,7 +29,6 @@
 
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
-import { getSystemBlacklist } from "../web/server.js";
 import {
   findStation,
   isStationPoi,
@@ -112,12 +111,9 @@ function findNearestHuntableSystem(fromSystemId: string): string | null {
 
   for (const systemId of mapStore.getAllSystemIds()) {
     if (visited.has(systemId)) continue;
-    const blacklist = getSystemBlacklist();
-    // Skip blacklisted systems
-    if (blacklist.some(b => b.toLowerCase() === systemId.toLowerCase())) continue;
     const sys = mapStore.getSystem(systemId);
     if (!sys || !isHuntableSystem(sys.security_level)) continue;
-    if (mapStore.findRoute(fromSystemId, systemId, blacklist)) return systemId;
+    return systemId;
   }
 
   return null;

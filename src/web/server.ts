@@ -83,8 +83,19 @@ export { loadSettings };
 /** Get the global system blacklist from settings. */
 export function getSystemBlacklist(): string[] {
   const settings = loadSettings();
-  const blacklist = (settings.systemBlacklist as string[] | undefined) || [];
-  return blacklist;
+  // Support multiple storage formats for backward compatibility
+  const raw = (settings.system_blacklist as any) 
+           || (settings.systemBlacklist as any) 
+           || [];
+  // Handle both direct array storage and nested object storage
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object' && Array.isArray(raw.system_blacklist)) {
+    return raw.system_blacklist;
+  }
+  if (raw && typeof raw === 'object' && Array.isArray(raw.systemBlacklist)) {
+    return raw.systemBlacklist;
+  }
+  return [];
 }
 
 function saveSettings(s: RoutineSettings): void {

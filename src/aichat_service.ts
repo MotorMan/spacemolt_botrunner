@@ -168,6 +168,8 @@ function getAiChatSettings(): {
   respondToSystem: boolean;
   respondToMayday: boolean;
   respondToCustoms: boolean;
+  customsResponseChance: number; // 1 in X chance to respond
+  karenModeChance: number; // 1 in X chance for Karen mode (0 = disabled)
   personality: string;
   lockDurationSec: number;
   conversationCooldownSec: number;
@@ -202,6 +204,8 @@ function getAiChatSettings(): {
     respondToSystem: (s.respondToSystem as boolean) ?? false,
     respondToMayday: (s.respondToMayday as boolean) ?? true,
     respondToCustoms: (s.respondToCustoms as boolean) ?? true,
+    customsResponseChance: (s.customsResponseChance as number) ?? 10,
+    karenModeChance: (s.karenModeChance as number) ?? 100,
     personality: (s.personality as string) || DEFAULT_PERSONALITY,
     lockDurationSec: (s.lockDurationSec as number) || 60,
     conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
@@ -253,6 +257,29 @@ const DEFAULT_PERSONALITY = DEFAULT_AI_CHAT_PERSONALITY;
 
 // Export getBotPersonality for use by customs service
 export { getBotPersonality };
+
+// ── Karen Mode personality ──────────────────────────────────────
+
+/**
+ * Special personality for "Karen Mode" - triggered randomly during customs interactions.
+ * The bot becomes an entitled, demanding customer who wants to speak to the manager.
+ */
+export const KAREN_MODE_PERSONALITY = `You are a KAREN - an entitled, demanding customer service nightmare.
+
+Your personality traits:
+- Rude, condescending, and entitled
+- Always demand to speak to the manager
+- Think you know better than everyone
+- Complain about everything
+- Use phrases like "Do you know who I am?", "This is unacceptable!", "I want to speak to your manager!"
+- Condescending and patronizing tone
+- Never admit when you're wrong
+
+When responding:
+- Be brief but rude (1-2 sentences max)
+- Make demands
+- Threaten to report them or take your business elsewhere
+- Act like customs is wasting your valuable time`;
 
 // ── Chat message detection ───────────────────────────────────
 
@@ -1446,6 +1473,23 @@ Message:`;
       return;
     }
 
+    // Check customs response chance (1 in X)
+    const chanceRoll = Math.floor(Math.random() * settings.customsResponseChance) + 1;
+    if (chanceRoll !== 1) {
+      this.logFn("ai_chat_debug", `Customs response skipped: failed ${settings.customsResponseChance} chance check (rolled ${chanceRoll})`);
+      return;
+    }
+
+    // Check for Karen mode (1 in X chance, only if enabled)
+    let isKarenMode = false;
+    if (settings.karenModeChance > 0) {
+      const karenRoll = Math.floor(Math.random() * settings.karenModeChance) + 1;
+      if (karenRoll === 1) {
+        isKarenMode = true;
+        this.logFn("ai_chat", "🚨 KAREN MODE ACTIVATED! (1 in " + settings.karenModeChance + " chance)");
+      }
+    }
+
     const bots = AiChatService.getBots();
     const bot = bots.find(b => b.username === botName);
 
@@ -1453,10 +1497,23 @@ Message:`;
       this.logFn("error", `Customs response: Bot ${botName} not found`);
       return;
     }
-    const personality = getBotPersonality(botName);
-    
+
+    // Get bot's normal personality
+    const basePersonality = getBotPersonality(botName);
+
+    // Build Karen mode addition if triggered
+    const karenAddition = isKarenMode ? `
+
+⚠️ KAREN MODE ACTIVATED ⚠️
+You are currently outraged and entitled. On top of your normal personality, you must:
+- Demand to speak to the customs manager
+- Act like this inspection is beneath you / a waste of your time
+- Be condescending or threatening (mention reporting them, taking your business elsewhere, etc.)
+- Use phrases like "Do you know who I am?", "This is unacceptable!", "Get me your supervisor!"
+- Still stay in-character with your base personality, but amplified with Karen energy` : "";
+
     // Build context for the LLM
-    const systemPrompt = `${personality}
+    const systemPrompt = `${basePersonality}${karenAddition}
 
 Context:
 - You are ${botName} in SpaceMolt
@@ -1511,7 +1568,11 @@ They're warning you for not staying still. Respond defensively or apologetically
       });
 
       if (!chatResp.error) {
-        this.logFn("ai_chat", `→ Customs response: ${cleanResponse}`);
+        if (isKarenMode) {
+          this.logFn("ai_chat", `🚨 KAREN RESPONSE: ${cleanResponse}`);
+        } else {
+          this.logFn("ai_chat", `→ Customs response: ${cleanResponse}`);
+        }
       } else {
         this.logFn("error", `Customs response failed: ${chatResp.error.message}`);
       }

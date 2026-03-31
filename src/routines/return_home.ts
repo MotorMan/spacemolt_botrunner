@@ -222,7 +222,9 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   }
 
   // Dock at station (skip storage collection - return home doesn't need to manage items)
+  // Refresh status first to ensure bot.docked is current before calling ensureDocked
   yield "dock";
+  await bot.refreshStatus();
   const docked = await ensureDocked(ctx, true);
   if (!docked) {
     ctx.log("error", "Failed to dock at home station — routine cancelled");

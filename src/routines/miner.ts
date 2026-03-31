@@ -355,18 +355,26 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   // ── Startup: return home and dump non-fuel cargo to storage ──
+  await bot.refreshStatus();
   await bot.refreshCargo();
   const nonFuelCargo = bot.inventory.filter(i => {
     const lower = i.itemId.toLowerCase();
     return !lower.includes("fuel") && !lower.includes("energy_cell") && i.quantity > 0;
   });
   if (nonFuelCargo.length > 0) {
-    if (bot.system !== homeSystem) {
+    // Validate bot.system before navigation
+    if (!bot.system) {
+      ctx.log("error", "Bot system not initialized — refreshing status...");
+      await bot.refreshStatus();
+    }
+    if (bot.system && bot.system !== homeSystem) {
       ctx.log("harvesting", `Startup: returning to home system ${homeSystem} to deposit cargo...`);
       const fueled = await ensureFueled(ctx, 50);
       if (fueled) {
         await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 50, hullThresholdPct: 30 });
       }
+    } else if (!bot.system) {
+      ctx.log("error", "Cannot return home — bot system unknown");
     }
     await ensureDocked(ctx);
     const startupSettings = getMinerSettings(bot.username);
@@ -425,8 +433,30 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("mining", `Mining any ${resourceLabel} (no specific target configured)`);
     }
 
+    // ── Select quotas based on mining type ──
+    const quotas = miningType === "ice" ? settings.iceQuotas : (miningType === "ore" ? settings.oreQuotas : settings.gasQuotas);
+
+    // ── Determine priority target (global target or quota pick) ──
+    const hasGlobalTarget = !!targetResource;
+    if (hasGlobalTarget) {
+      ctx.log("mining", `Global ${resourceLabel} target configured: ${targetResource} — overriding quotas`);
+    }
+
+    let quotaTargetResource = "";
+    if (!hasGlobalTarget && Object.keys(quotas).length > 0) {
+      await bot.refreshFactionStorage();
+      quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
+      if (quotaTargetResource) {
+        ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
+      } else {
+        ctx.log("mining", "All quotas met — mining locally");
+      }
+    }
+
+    const priorityTarget = hasGlobalTarget ? targetResource : quotaTargetResource;
+
     // ── Recovered session handling ──
-    // If we have a recovered session, use its target instead of recalculating
+    // Validate recovered session against current priorities (global target and quotas)
     if (recoveredSession) {
       // Validate that the recovered session's target is compatible with currently detected mining type
       const sessionMiningType = getMiningTypeForResource(recoveredSession.targetResourceId);
@@ -435,39 +465,38 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         failMiningSession(bot.username, "Equipment mismatch");
         recoveredSession = null;
       } else {
-        ctx.log("mining", `Using recovered session target: ${recoveredSession.targetResourceName} @ ${recoveredSession.targetPoiName}`);
-        // Update session state based on current position
-        if (bot.system === recoveredSession.homeSystem && bot.docked) {
-          recoveredSession.state = "depositing";
-        } else if (bot.system === recoveredSession.targetSystemId) {
-          recoveredSession.state = "mining";
-        } else {
-          recoveredSession.state = "traveling_to_ore";
+        // Check if recovered session target matches current priorities
+        const sessionTarget = recoveredSession.targetResourceId;
+        let shouldAbandon = false;
+        let reason = "";
+
+        // If there's a priority target (global or quota) that differs from session target, abandon session
+        if (priorityTarget && sessionTarget !== priorityTarget) {
+          shouldAbandon = true;
+          reason = hasGlobalTarget ? `global target override (${targetResource})` : `quota priority (${quotaTargetResource})`;
         }
-        updateMiningSession(bot.username, { state: recoveredSession.state });
+
+        if (shouldAbandon) {
+          ctx.log("mining", `Abandoning recovered session: ${reason}`);
+          failMiningSession(bot.username, reason);
+          recoveredSession = null;
+        } else {
+          ctx.log("mining", `Resuming recovered session: ${recoveredSession.targetResourceName} @ ${recoveredSession.targetPoiName}`);
+          // Update session state based on current position
+          if (bot.system === recoveredSession.homeSystem && bot.docked) {
+            recoveredSession.state = "depositing";
+          } else if (bot.system === recoveredSession.targetSystemId) {
+            recoveredSession.state = "mining";
+          } else {
+            recoveredSession.state = "traveling_to_ore";
+          }
+          updateMiningSession(bot.username, { state: recoveredSession.state });
+        }
       }
     }
 
-    // ── Quota-based target selection ──
-    let quotaTargetResource = "";
-    let quotaTargetType: "ore" | "gas" | "ice" = miningType;
-
-    // Select quotas based on mining type
-    const quotas = miningType === "ice" ? settings.iceQuotas : (miningType === "ore" ? settings.oreQuotas : settings.gasQuotas);
-
-    if (Object.keys(quotas).length > 0 && !recoveredSession) {
-      await bot.refreshFactionStorage();
-      quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
-      if (quotaTargetResource) {
-        ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
-      } else {
-        ctx.log("mining", "All quotas met — using configured target or mining locally");
-      }
-    }
-
-    // Use quota target if found, otherwise use configured target
-    // If we have a recovered session, use its target
-    const effectiveTarget = recoveredSession ? recoveredSession.targetResourceId : (quotaTargetResource || targetResource);
+    // ── Determine effective target ──
+    const effectiveTarget = recoveredSession ? recoveredSession.targetResourceId : priorityTarget;
     const isQuotaDriven = recoveredSession ? recoveredSession.isQuotaDriven : !!quotaTargetResource;
 
     // ── Status + fuel/hull checks ──

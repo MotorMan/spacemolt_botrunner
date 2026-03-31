@@ -331,24 +331,38 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
   const { bot } = ctx;
   if (bot.docked) return true;
 
+  // Refresh status first to ensure we have the latest docked state
+  await bot.refreshStatus();
+  if (bot.docked) return true;
+
   const { pois } = await getSystemInfo(ctx);
   const station = findStation(pois);
 
   if (station) {
     if (bot.poi !== station.id) {
       ctx.log("travel", `Traveling to ${station.name}...`);
-      await bot.exec("travel", { target_poi: station.id });
-      bot.poi = station.id;
-    }
-    ctx.log("system", "Docking...");
-    const dockResp = await bot.exec("dock");
-    if (!dockResp.error || dockResp.error.message.includes("already")) {
-      bot.docked = true;
-      if (!skipStorageCollection) {
-        await collectFromStorage(ctx, minBalance);
+      const travelResp = await bot.exec("travel", { target_poi: station.id });
+      if (travelResp.error && !travelResp.error.message.includes("already")) {
+        ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
+        // Fall through to search for nearest station
+      } else {
+        bot.poi = station.id;
+        // Refresh status after travel to update position
+        await bot.refreshStatus();
       }
-      await ensureInsured(ctx);
-      return true;
+    }
+    // Only attempt dock if we're at a station POI
+    if (bot.poi && pois.find(p => p.id === bot.poi)) {
+      ctx.log("system", "Docking...");
+      const dockResp = await bot.exec("dock");
+      if (!dockResp.error || dockResp.error.message.includes("already")) {
+        bot.docked = true;
+        if (!skipStorageCollection) {
+          await collectFromStorage(ctx, minBalance);
+        }
+        await ensureInsured(ctx);
+        return true;
+      }
     }
   }
 

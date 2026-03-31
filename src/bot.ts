@@ -115,6 +115,9 @@ export class Bot {
   /** Cached faction storage items from last view_faction_storage. */
   factionStorage: CargoItem[] = [];
 
+  /** Cached faction ID from last get_status (null if not in a faction). */
+  faction: string | null = null;
+
   /** Whether the bot's ship is currently cloaked. */
   isCloaked = false;
 
@@ -262,10 +265,21 @@ export class Bot {
     // Wait for the tick to complete then retry once.
     if (resp.error) {
       const msg = resp.error.message || "";
-      if (resp.error.code === "action_pending" || msg.includes("action is already pending")) {
+      if (resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress")) {
         debugLog("bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
+        this.log("system", "Action pending — waiting for server to process...");
         await sleep(10_000);
+        // Refresh status before retry to ensure we're in a valid state
+        await this.refreshStatus();
         resp = await this.api.execute(command, payload);
+        
+        // If still pending, wait a bit longer and try one more time
+        if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
+          this.log("system", "Action still pending — waiting additional 5s...");
+          await sleep(5_000);
+          await this.refreshStatus();
+          resp = await this.api.execute(command, payload);
+        }
       }
     }
 
@@ -398,6 +412,9 @@ export class Bot {
         (p.current_system as string) ||
         (p.location as string) ||
         this.location;
+
+      // Faction membership
+      this.faction = (p.faction_id as string) ?? (p.faction as string) ?? null;
 
       // Ship fields
       const ship = r.ship as Record<string, unknown> | undefined;

@@ -598,6 +598,11 @@ class MapStore {
     return Object.keys(this.data.systems);
   }
 
+  /** Return all stored systems with their data. */
+  getSystems(): StoredSystem[] {
+    return Object.values(this.data.systems);
+  }
+
   /** Find nearest station POI within a known system. */
   findNearestStation(systemId: string): StoredPOI | null {
     const sys = this.data.systems[systemId];

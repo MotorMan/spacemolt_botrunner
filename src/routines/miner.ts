@@ -129,6 +129,7 @@ function getMinerSettings(username?: string): {
   iceQuotas: Record<string, number>;
   depletionTimeoutHours: number;
   ignoreDepletion: boolean;
+  stayOutUntilFull: boolean;
   maxJumps: number;
 } {
   const all = readSettings();
@@ -169,6 +170,7 @@ function getMinerSettings(username?: string): {
     iceQuotas: (m.iceQuotas as Record<string, number>) || {},
     depletionTimeoutHours: (m.depletionTimeoutHours as number) || 3,
     ignoreDepletion: (m.ignoreDepletion as boolean) ?? false,
+    stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
     maxJumps: (m.maxJumps as number) ?? 10,
   };
 }
@@ -667,9 +669,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Find mining POI and station in current system ──
     yield miningType === "ice" ? "find_ice_field" : (miningType === "ore" ? "find_ore_belt" : "find_gas_cloud");
-    const { pois, systemId } = await getSystemInfo(ctx);
+    const { pois: initialPois, systemId } = await getSystemInfo(ctx);
     if (systemId) bot.system = systemId;
 
+    let pois = initialPois;
     let miningPoi: { id: string; name: string } | null = null;
     let stationPoi: { id: string; name: string } | null = null;
 
@@ -788,7 +791,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Periodically check POI to see if resource is depleted (remaining: 0)
       const now = Date.now();
-      if (effectiveTarget && bot.poi && !settings.ignoreDepletion && 
+      if (effectiveTarget && bot.poi && !settings.ignoreDepletion &&
           (now - lastPoiCheck) > POI_CHECK_INTERVAL_MS) {
         lastPoiCheck = now;
         const poiResp = await bot.exec("get_poi", { poi_id: bot.poi });
@@ -799,7 +802,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             : Array.isArray((result.poi as Record<string, unknown>)?.resources)
             ? ((result.poi as Record<string, unknown>).resources as Array<Record<string, unknown>>)
             : [];
-          
+
           for (const res of resources) {
             const resId = (res.resource_id as string) || (res.id as string) || "";
             if (resId === effectiveTarget) {
@@ -807,6 +810,74 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               if (remaining !== null && remaining <= 0) {
                 ctx.log("mining", `POI check: ${effectiveTarget} is depleted (remaining: ${remaining})`);
                 mapStore.markOreDepleted(bot.system, bot.poi, effectiveTarget);
+                
+                // If stayOutUntilFull is enabled and cargo is not full, search for new POI
+                if (settings.stayOutUntilFull) {
+                  const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+                  if (fillRatio < cargoThresholdRatio) {
+                    ctx.log("mining", "stayOutUntilFull enabled and cargo not full — searching for next POI...");
+                    // Search for next available POI with same target
+                    const newLocs = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+                      if (loc.poiId === bot.poi && loc.systemId === bot.system) return false; // Skip current POI
+                      const sys = mapStore.getSystem(loc.systemId);
+                      const poi = sys?.pois.find(p => p.id === loc.poiId);
+                      if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+                      if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
+                      if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
+                      return true;
+                    }).filter(loc => {
+                      const sys = mapStore.getSystem(loc.systemId);
+                      const poi = sys?.pois.find(p => p.id === loc.poiId);
+                      const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+                      if (!oreEntry?.depleted) return true;
+                      return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+                    });
+
+                    if (newLocs.length > 0) {
+                      const blacklist = getSystemBlacklist();
+                      const locsWithDist = newLocs
+                        .map(loc => {
+                          const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                          return { ...loc, jumps: route ? route.length - 1 : 999 };
+                        })
+                        .filter(loc => loc.jumps <= maxJumps)
+                        .sort((a, b) => {
+                          if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+                          if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+                          return a.jumps - b.jumps;
+                        });
+
+                      if (locsWithDist.length > 0) {
+                        const chosen = locsWithDist[0];
+                        ctx.log("mining", `Found next target: ${effectiveTarget} @ ${chosen.poiName} in ${chosen.systemId} (${chosen.jumps} jumps)`);
+                        
+                        // Travel to new system if needed
+                        if (chosen.systemId !== bot.system) {
+                          const arrived = await navigateToSystem(ctx, chosen.systemId, safetyOpts);
+                          if (arrived) {
+                            const { pois: newPois } = await getSystemInfo(ctx);
+                            pois = newPois;
+                            bot.system = chosen.systemId;
+                          } else {
+                            ctx.log("error", "Failed to reach new system");
+                          }
+                        }
+                        
+                        // Travel to new POI
+                        const travelResp = await bot.exec("travel", { target_poi: chosen.poiId });
+                        if (!travelResp.error || travelResp.error.message.includes("already")) {
+                          bot.poi = chosen.poiId;
+                          miningPoi = { id: chosen.poiId, name: chosen.poiName };
+                          ctx.log("mining", `Continuing at new POI: ${chosen.poiName}`);
+                          lastPoiCheck = 0; // Reset POI check timer
+                          continue; // Continue mining
+                        }
+                      }
+                    }
+                    ctx.log("mining", "No alternative POI found within range");
+                  }
+                }
+                
                 stopReason = `${effectiveTarget} depleted at this POI`;
                 if (recoveredSession) {
                   failMiningSession(bot.username, "Resource depleted");
@@ -834,15 +905,16 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
           // Re-pick a new target from quotas, or find any nearby ore if no quotas remain
           ctx.log("mining", `${resourceLabel} field depleted — searching for new target...`);
-          
+
           // Try to find a new target from quotas
           await bot.refreshFactionStorage();
           const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
-          
+
           let newTarget: string | null = null;
           let newPoiId: string | null = null;
           let newPoiName: string | null = null;
-          
+          let newSystemId: string | null = null;
+
           if (newQuotaTarget) {
             // Find locations for the new quota target
             const newLocs = mapStore.findOreLocations(newQuotaTarget).filter(loc => {
@@ -860,7 +932,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               if (!oreEntry?.depleted) return true;
               return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
             });
-            
+
             if (newLocs.length > 0) {
               newTarget = newQuotaTarget;
               // Prefer current system, then closest by jumps (use blacklist)
@@ -876,22 +948,24 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                   if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
                   return a.jumps - b.jumps;
                 });
-              
+
               if (locsWithDist.length > 0) {
                 const chosen = locsWithDist[0];
                 newPoiId = chosen.poiId;
                 newPoiName = chosen.poiName;
-                ctx.log("mining", `Quota pick: ${newQuotaTarget} @ ${chosen.poiName} (${chosen.jumps} jumps)`);
+                newSystemId = chosen.systemId;
+                ctx.log("mining", `Quota pick: ${newQuotaTarget} @ ${chosen.poiName} (${chosen.jumps} jumps${chosen.systemId !== bot.system ? ` in ${chosen.systemId}` : ''})`);
               }
             }
           }
-          
+
           // If no quota target found and we're set for "any", find any nearby ore
           if (!newTarget && !targetResource) {
+            // First try current system
             const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                            miningType === "ore" ? pois.filter(p => isOreBeltPoi(p.type)) :
                            pois.filter(p => isGasCloudPoi(p.type));
-            
+
             for (const poi of allPois) {
               const sysData = mapStore.getSystem(bot.system);
               const storedPoi = sysData?.pois.find(p => p.id === poi.id);
@@ -902,22 +976,68 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 if (!o.depleted) return true;
                 return isDepletionExpired(o.depleted_at, depletionTimeoutMs);
               }) || [];
-              
+
               if (availableOres.length > 0) {
                 newTarget = availableOres[0].item_id;
                 newPoiId = poi.id;
                 newPoiName = poi.name;
+                newSystemId = bot.system;
                 ctx.log("mining", `Found ${newTarget} @ ${poi.name} (no quota, mining any)`);
                 break;
               }
             }
+
+            // If stayOutUntilFull is enabled and cargo is not full, search other systems
+            if (!newTarget && settings.stayOutUntilFull) {
+              const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+              if (fillRatio < cargoThresholdRatio) {
+                ctx.log("mining", "stayOutUntilFull enabled and cargo not full — searching other systems...");
+                // Search all known systems for available POIs
+                const allSystems = mapStore.getSystems();
+                for (const sys of allSystems) {
+                  if (sys.id === bot.system) continue; // Skip current system (already checked)
+                  const sysPois = sys.pois.filter(p => {
+                    if (miningType === "ice") return isIceFieldPoi(p.type);
+                    if (miningType === "ore") return isOreBeltPoi(p.type);
+                    if (miningType === "gas") return isGasCloudPoi(p.type);
+                    return true;
+                  });
+
+                  for (const poi of sysPois) {
+                    const availableOres = poi.ores_found.filter(o => {
+                      if (miningType === "ice" && !o.item_id.toLowerCase().includes("ice")) return false;
+                      if (miningType === "gas" && !o.item_id.toLowerCase().includes("gas")) return false;
+                      if (miningType === "ore" && (o.item_id.toLowerCase().includes("gas") || o.item_id.toLowerCase().includes("ice"))) return false;
+                      if (!o.depleted) return true;
+                      return isDepletionExpired(o.depleted_at, depletionTimeoutMs);
+                    });
+
+                    if (availableOres.length > 0) {
+                      // Check jump distance
+                      const blacklist = getSystemBlacklist();
+                      const route = mapStore.findRoute(bot.system, sys.id, blacklist);
+                      const jumps = route ? route.length - 1 : 999;
+                      if (jumps <= maxJumps) {
+                        newTarget = availableOres[0].item_id;
+                        newPoiId = poi.id;
+                        newPoiName = poi.name;
+                        newSystemId = sys.id;
+                        ctx.log("mining", `Found ${newTarget} @ ${poi.name} in ${sys.id} (${jumps} jumps) - stayOutUntilFull`);
+                        break;
+                      }
+                    }
+                  }
+                  if (newTarget) break;
+                }
+              }
+            }
           }
-          
+
           if (newTarget && newPoiId && newPoiName) {
             // Update target and continue mining
             const oldTarget = effectiveTarget;
             const oldPoi = miningPoi;
-            
+
             // Update session if active
             if (recoveredSession) {
               updateMiningSession(bot.username, {
@@ -927,8 +1047,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 targetPoiName: newPoiName,
               });
             }
-            
-            // Travel to new POI if different
+
+            // Travel to new POI (may be in different system)
+            if (newSystemId && newSystemId !== bot.system) {
+              // Need to jump to new system first
+              ctx.log("mining", `Traveling to ${newTarget} in ${newSystemId} (${newPoiName}) - stayOutUntilFull`);
+              const arrived = await navigateToSystem(ctx, newSystemId, safetyOpts);
+              if (!arrived) {
+                ctx.log("error", "Failed to reach new system — returning home");
+                stopReason = `${resourceLabel} field depleted (travel failed)`;
+                break;
+              }
+              // Update pois list for new system
+              const { pois: newPois } = await getSystemInfo(ctx);
+              pois = newPois;
+              bot.system = newSystemId;
+            }
+
             if (newPoiId !== bot.poi) {
               ctx.log("mining", `Traveling to new target: ${newTarget} @ ${newPoiName}`);
               const travelResp = await bot.exec("travel", { target_poi: newPoiId });
@@ -939,7 +1074,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               }
               bot.poi = newPoiId;
             }
-            
+
             miningPoi = { id: newPoiId, name: newPoiName };
             ctx.log("mining", `Continuing mining session with new target: ${newTarget}`);
             continue; // Continue the harvest loop with new target
@@ -999,7 +1134,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (bot.state !== "running") break;
 
     // ── Return to home system if we traveled away ──
-    if (bot.system !== homeSystem && homeSystem) {
+    // When stayOutUntilFull is enabled, only return home if cargo is full
+    const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+    const shouldReturnHome = settings.stayOutUntilFull 
+      ? (fillRatio >= cargoThresholdRatio && bot.system !== homeSystem && homeSystem)
+      : (bot.system !== homeSystem && homeSystem);
+
+    if (shouldReturnHome) {
       yield "return_home";
       yield "pre_return_fuel";
       // Update session state

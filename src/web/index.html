@@ -8523,6 +8523,7 @@ function renderMinerSettings(panel) {
   const depletionTimeoutHours = m.depletionTimeoutHours ?? 3;
   const ignoreDepletion = m.ignoreDepletion ?? false;
   const maxJumps = m.maxJumps ?? 10;
+  const stayOutUntilFull = m.stayOutUntilFull ?? false;
   const orePrimary = depositBot ? `bot:${depositBot}` : depositMode;
   const oreSecondary = depositFallback;
 
@@ -8747,6 +8748,17 @@ function renderMinerSettings(panel) {
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Stay Out Until Full</div>
+          <div class="setting-hint">When enabled, miners will continue to the next POI with target ore instead of returning home when a POI is depleted. Saves time and fuel by staying out until cargo is full.</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="set-miner-stayOutUntilFull"${settings.miner?.stayOutUntilFull ? ' checked' : ''} />
+          <span>Stay out until cargo full</span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Max Jump Distance</div>
           <div class="setting-hint">Maximum number of jumps the miner will travel to reach a mining location. Prevents miners from traveling across the galaxy. Default is 10 jumps.</div>
         </div>
@@ -8883,6 +8895,7 @@ function saveMinerSettings() {
     repairThreshold: parseInt(document.getElementById('set-miner-repairThreshold').value) || 40,
     depletionTimeoutHours: parseInt(document.getElementById('set-miner-depletionTimeoutHours').value) || 3,
     ignoreDepletion: document.getElementById('set-miner-ignoreDepletion').checked,
+    stayOutUntilFull: document.getElementById('set-miner-stayOutUntilFull').checked,
     maxJumps: parseInt(document.getElementById('set-miner-maxJumps').value) || 10,
     oreQuotas: collectQuotas('ore-quota-table'),
     gasQuotas: collectQuotas('gas-quota-table'),

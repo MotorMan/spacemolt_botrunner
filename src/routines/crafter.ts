@@ -1,4 +1,5 @@
 import type { Routine, RoutineContext } from "../bot.js";
+import { catalogStore } from "../catalogstore.js";
 import {
   ensureDocked,
   tryRefuel,
@@ -24,6 +25,13 @@ interface CraftLimit {
   limit: number;
 }
 
+interface AutoBuySettings {
+  enabled: boolean;
+  maxPricePercentOverBase: number;  // e.g., 150 = 150% of base price (50% markup)
+  maxCreditsPerCycle: number;
+  excludeCategories: string[];      // Never buy these categories (e.g., ["ammo"])
+}
+
 /** Ship Passive recipe IDs that run automatically and cannot be crafted manually. */
 const SHIP_PASSIVE_RECIPE_IDS = new Set([
   "onboard_alloy_synthesis",
@@ -41,6 +49,7 @@ function getCrafterSettings(): {
   categoryAssignments: Record<string, string[]>;
   botQuotaOverrides: Record<string, Record<string, number>>;
   goalProcessingMode: GoalProcessingMode;
+  autoBuy: AutoBuySettings;
 } {
   const all = readSettings();
   const c = all.crafter || {};
@@ -64,6 +73,14 @@ function getCrafterSettings(): {
   const botQuotaOverrides = (c.botQuotaOverrides as Record<string, Record<string, number>>) || {};
   // Goal processing mode: "batch" (complete one goal before moving to next) or "round-robin" (craft 1 of each in rotation)
   const goalProcessingMode = (c.goalProcessingMode as GoalProcessingMode) || "batch";
+  // Auto-buy settings for missing materials
+  const autoBuyConfig = (c.autoBuy as Partial<AutoBuySettings>) || {};
+  const autoBuy: AutoBuySettings = {
+    enabled: autoBuyConfig.enabled ?? false,
+    maxPricePercentOverBase: autoBuyConfig.maxPricePercentOverBase ?? 150,  // 150% = 50% markup allowed
+    maxCreditsPerCycle: autoBuyConfig.maxCreditsPerCycle ?? 50000,
+    excludeCategories: autoBuyConfig.excludeCategories ?? ["ammo"],
+  };
   return {
     craftLimits,
     enabledCategories,
@@ -72,6 +89,7 @@ function getCrafterSettings(): {
     categoryAssignments,
     botQuotaOverrides,
     goalProcessingMode,
+    autoBuy,
   };
 }
 
@@ -333,6 +351,169 @@ function buildRecipeIndex(recipes: Recipe[]): Map<string, Recipe> {
     }
   }
   return index;
+}
+
+// ── Auto-buy helpers ────────────────────────────────────────
+
+/**
+ * Get the base price of an item from the catalog.
+ */
+function getItemBasePrice(itemId: string): number {
+  const item = catalogStore.getItem(itemId);
+  return (item?.base_value as number) || 0;
+}
+
+/**
+ * Get the category of an item from the catalog.
+ */
+function getItemCategory(itemId: string): string {
+  const item = catalogStore.getItem(itemId);
+  return (item?.category as string) || "";
+}
+
+/**
+ * Calculate the maximum price we're willing to pay for an item.
+ * Based on base_value * (maxPricePercentOverBase / 100).
+ */
+function calculateMaxBuyPrice(itemId: string, maxPricePercentOverBase: number): number {
+  const basePrice = getItemBasePrice(itemId);
+  if (basePrice <= 0) return 0;
+  return Math.floor(basePrice * (maxPricePercentOverBase / 100));
+}
+
+/**
+ * Attempt to buy a missing item from the local station market.
+ * Returns the quantity purchased, or 0 if purchase failed.
+ */
+async function buyMissingItem(
+  ctx: RoutineContext,
+  itemId: string,
+  quantityNeeded: number,
+  maxPricePerUnit: number,
+  maxTotalSpend: number,
+): Promise<number> {
+  const { bot } = ctx;
+
+  if (!bot.docked) {
+    ctx.log("trade", "Cannot buy items - not docked at station");
+    return 0;
+  }
+
+  // Check item category exclusions
+  const category = getItemCategory(itemId);
+  const item = catalogStore.getItem(itemId);
+  const itemName = item?.name || itemId;
+
+  // Estimate purchase to get actual market price
+  const estResp = await bot.exec("estimate_purchase", { item_id: itemId, quantity: 1 });
+  if (estResp.error) {
+    ctx.log("trade", `${itemName} not available at this station`);
+    return 0;
+  }
+
+  const est = estResp.result as Record<string, unknown> | undefined;
+  const marketPrice = (est?.unit_price as number) || (est?.price_per_unit as number) || 0;
+  const availableQty = (est?.available_quantity as number) || (est?.available as number) || 0;
+
+  if (marketPrice <= 0 || availableQty <= 0) {
+    ctx.log("trade", `${itemName} not available or invalid price (${marketPrice}cr)`);
+    return 0;
+  }
+
+  // Check if price is within our limit
+  if (marketPrice > maxPricePerUnit) {
+    ctx.log("trade", `${itemName} too expensive: ${marketPrice}cr > max ${maxPricePerUnit}cr (base: ${getItemBasePrice(itemId)}cr)`);
+    return 0;
+  }
+
+  // Calculate how many we can afford
+  const affordableQty = Math.min(
+    quantityNeeded,
+    availableQty,
+    Math.floor(maxTotalSpend / marketPrice),
+  );
+
+  if (affordableQty <= 0) {
+    ctx.log("trade", `Cannot afford ${itemName} at ${marketPrice}cr each`);
+    return 0;
+  }
+
+  // Execute purchase
+  ctx.log("trade", `Buying ${affordableQty}x ${itemName} @ ${marketPrice}cr = ${affordableQty * marketPrice}cr (max: ${maxPricePerUnit}cr)`);
+  const buyResp = await bot.exec("buy", { item_id: itemId, quantity: affordableQty });
+
+  if (buyResp.error) {
+    ctx.log("error", `Buy failed: ${buyResp.error.message}`);
+    return 0;
+  }
+
+  await bot.refreshCargo();
+  await bot.refreshStorage();
+
+  const purchased = bot.inventory.find(i => i.itemId === itemId)?.quantity || 0;
+  ctx.log("trade", `Purchased ${purchased}x ${itemName}`);
+
+  return purchased;
+}
+
+/**
+ * Attempt to buy missing materials for a recipe.
+ * Returns total credits spent, or 0 if nothing was bought.
+ */
+async function tryBuyMissingMaterials(
+  ctx: RoutineContext,
+  recipe: Recipe,
+  autoBuySettings: AutoBuySettings,
+): Promise<number> {
+  const { bot } = ctx;
+  let totalSpent = 0;
+
+  if (!bot.docked || !autoBuySettings.enabled) {
+    return 0;
+  }
+
+  // Check each component
+  for (const comp of recipe.components) {
+    const have = countItem(ctx, comp.item_id, false);
+    if (have >= comp.quantity) continue;
+
+    const needed = comp.quantity - have;
+    
+    // Skip excluded categories
+    const category = getItemCategory(comp.item_id);
+    if (autoBuySettings.excludeCategories.includes(category)) {
+      ctx.log("trade", `Skipping buy of ${comp.name}: category "${category}" is excluded`);
+      continue;
+    }
+
+    // Calculate max price
+    const maxPrice = calculateMaxBuyPrice(comp.item_id, autoBuySettings.maxPricePercentOverBase);
+    if (maxPrice <= 0) {
+      ctx.log("trade", `${comp.name}: no base price in catalog, cannot determine max buy price`);
+      continue;
+    }
+
+    const remainingBudget = autoBuySettings.maxCreditsPerCycle - totalSpent;
+    if (remainingBudget <= 0) {
+      ctx.log("trade", "Auto-buy budget exhausted for this cycle");
+      break;
+    }
+
+    // Try to buy
+    const purchased = await buyMissingItem(
+      ctx,
+      comp.item_id,
+      needed,
+      maxPrice,
+      remainingBudget,
+    );
+
+    if (purchased > 0) {
+      totalSpent += purchased * maxPrice; // Approximate
+    }
+  }
+
+  return totalSpent;
 }
 
 /**
@@ -714,6 +895,7 @@ async function executeCraftingPlan(
   craftingSkillLevel: number,
   processingMode: "batch" | "round-robin",
   personalMode: boolean,
+  autoBuySettings?: AutoBuySettings,
 ): Promise<{ crafted: string[]; prereqs: string[] }> {
   const { bot } = ctx;
   const crafted: string[] = [];
@@ -738,6 +920,7 @@ async function executeCraftingPlan(
         planItem.quantityToCraft,
         craftingSkillLevel,
         personalMode,
+        autoBuySettings,
       );
 
       if (result.crafted > 0) {
@@ -763,8 +946,8 @@ async function executeCraftingPlan(
         if (bot.state !== "running") break;
         if (planItem.quantityToCraft <= 0) continue;
 
-        // Craft one batch at a time
-        const batchSize = Math.min(planItem.quantityToCraft, craftingSkillLevel || 1);
+        // Craft one batch at a time - ALWAYS use integer >= 1
+        const batchSize = Math.max(1, Math.min(Math.floor(planItem.quantityToCraft), Math.floor(craftingSkillLevel || 1)));
 
         const result = await craftRecipeWithPrereqs(
           ctx,
@@ -772,11 +955,13 @@ async function executeCraftingPlan(
           batchSize,
           craftingSkillLevel,
           personalMode,
+          autoBuySettings,
         );
 
         if (result.crafted > 0) {
-          planItem.quantityToCraft -= result.crafted / (planItem.recipe.output_quantity || 1);
-          if (planItem.quantityToCraft <= 0) planItem.quantityToCraft = 0;
+          // Subtract whole batches crafted (integer math)
+          const batchesCompleted = Math.floor(result.crafted / (planItem.recipe.output_quantity || 1));
+          planItem.quantityToCraft = Math.max(0, planItem.quantityToCraft - batchesCompleted);
           crafted.push(`${result.crafted}x ${planItem.recipe.output_name}`);
         }
         if (result.prereqsCrafted.length > 0) {
@@ -796,6 +981,7 @@ async function executeCraftingPlan(
 
 /**
  * Craft a specific quantity of a recipe, handling prerequisites and material withdrawal.
+ * Optionally tries to buy missing materials if auto-buy is enabled.
  */
 async function craftRecipeWithPrereqs(
   ctx: RoutineContext,
@@ -803,6 +989,7 @@ async function craftRecipeWithPrereqs(
   quantityToCraft: number,
   craftingSkillLevel: number,
   personalMode: boolean,
+  autoBuySettings?: AutoBuySettings,
 ): Promise<{ crafted: number; prereqsCrafted: string[] }> {
   const { bot } = ctx;
   const prereqsCrafted: string[] = [];
@@ -816,6 +1003,7 @@ async function craftRecipeWithPrereqs(
   let totalCrafted = 0;
   let failedWithdrawals = 0;
   const MAX_FAILED_WITHDRAWALS = 3;
+  let totalSpentOnBuys = 0;
 
   while (totalCrafted < quantityToCraft && bot.state === "running" && failedWithdrawals < MAX_FAILED_WITHDRAWALS) {
     // Refresh inventories
@@ -830,14 +1018,29 @@ async function craftRecipeWithPrereqs(
     const maxCraftableNow = calculateMaxCraftable(ctx, recipe, personalMode);
 
     if (maxCraftableNow <= 0) {
-      ctx.log("craft", `${recipe.name}: no materials, checking prerequisites...`);
+      ctx.log("craft", `${recipe.name}: no materials available`);
+      
+      // Try auto-buy if enabled and we're docked
+      if (autoBuySettings?.enabled && bot.docked && totalSpentOnBuys < autoBuySettings.maxCreditsPerCycle) {
+        ctx.log("trade", `${recipe.name}: attempting to buy missing materials...`);
+        const boughtSomething = await tryBuyMissingMaterials(ctx, recipe, autoBuySettings);
+        if (boughtSomething) {
+          ctx.log("trade", `${recipe.name}: successfully bought materials, retrying craft`);
+          totalSpentOnBuys += boughtSomething;
+          await bot.refreshCargo();
+          await bot.refreshStorage();
+          continue; // Try crafting again with newly bought materials
+        }
+      }
+      
       // Note: With goal-based crafting, prerequisites should already be in the plan
       // This is a fallback for edge cases
       break;
     }
 
     // Determine batch size: min of (remaining, maxCraftableNow, craftingSkillLevel)
-    const batchSize = Math.min(remaining, maxCraftableNow, craftingSkillLevel || 1);
+    // ALWAYS use integer >= 1
+    const batchSize = Math.max(1, Math.min(Math.floor(remaining), Math.floor(maxCraftableNow), Math.floor(craftingSkillLevel || 1)));
     if (batchSize <= 0) break;
 
     ctx.log("craft", `  Batch: ${batchSize}x (skill: ${craftingSkillLevel}, remaining: ${remaining}, canCraft: ${maxCraftableNow})`);
@@ -851,6 +1054,29 @@ async function craftRecipeWithPrereqs(
     const missingAfterWithdraw = getMissingMaterial(ctx, recipe, batchSize, personalMode);
     if (missingAfterWithdraw) {
       ctx.log("warn", `${recipe.name}: missing ${missingAfterWithdraw.need}x ${missingAfterWithdraw.name} after withdrawal`);
+      
+      // Try auto-buy for the missing component if enabled
+      if (autoBuySettings?.enabled && bot.docked && totalSpentOnBuys < autoBuySettings.maxCreditsPerCycle) {
+        const maxPrice = calculateMaxBuyPrice(missingAfterWithdraw.name, autoBuySettings.maxPricePercentOverBase);
+        if (maxPrice > 0) {
+          const remainingBudget = autoBuySettings.maxCreditsPerCycle - totalSpentOnBuys;
+          const purchased = await buyMissingItem(
+            ctx,
+            missingAfterWithdraw.name,
+            missingAfterWithdraw.need,
+            maxPrice,
+            remainingBudget,
+          );
+          if (purchased > 0) {
+            totalSpentOnBuys += purchased * maxPrice; // Approximate
+            ctx.log("trade", `Bought ${purchased}x ${missingAfterWithdraw.name}, retrying craft`);
+            await bot.refreshCargo();
+            await bot.refreshStorage();
+            continue;
+          }
+        }
+      }
+      
       failedWithdrawals++;
       if (batchSize === 1) break;
       continue;
@@ -1142,9 +1368,11 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("craft", formatCraftingPlan(plan));
       
       for (const item of plan.flatOrder) {
+        // Ensure quantityToCraft is always an integer >= 1
+        const qty = Math.max(1, Math.floor(item.quantityToCraft));
         allPlanItems.push({
           recipe: item.recipe,
-          quantityToCraft: item.quantityToCraft,
+          quantityToCraft: qty,
           reason: item.reason,
           depth: item.depth,
         });
@@ -1167,6 +1395,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       craftingSkillLevel,
       settings.goalProcessingMode,
       personalMode,
+      settings.autoBuy,
     );
 
     // ── Summary logging ──

@@ -4671,7 +4671,6 @@ function renderCrafterSettings(panel) {
   const enabledCategories = crafter.enabledCategories || ["Refining", "Components", "Consumables"];
   const refuelThreshold = crafter.refuelThreshold ?? 50;
   const repairThreshold = crafter.repairThreshold ?? 40;
-  const categoryAssignments = crafter.categoryAssignments || {};
   const botQuotaOverrides = crafter.botQuotaOverrides || {};
 
   // Use catalog recipes if available, fall back to API fetch
@@ -4730,25 +4729,6 @@ function renderCrafterSettings(panel) {
     return `<label class="craft-cat-check"><input type="checkbox" data-category="${esc(cat)}" ${checked}> ${esc(cat)} (${count})</label>`;
   }).join('');
 
-  // Build bot category assignments UI
-  const botNames = bots.map(b => b.username).sort();
-  const botAssignmentRows = botNames.map(botName => {
-    const assignedCats = categoryAssignments[botName] || [];
-    const catCheckboxes = allCategories.map(cat => {
-      const checked = assignedCats.includes(cat) ? 'checked' : '';
-      return `<label class="craft-cat-check" style="font-size:11px"><input type="checkbox" class="bot-cat-assign" data-bot="${esc(botName)}" data-category="${esc(cat)}" ${checked}> ${esc(cat)}</label>`;
-    }).join('');
-    return `
-      <div class="bot-cat-assign-row" style="padding:8px;border:1px solid var(--border);border-radius:6px;margin-bottom:8px">
-        <div style="font-weight:600;color:var(--text);margin-bottom:6px">${esc(botName)}</div>
-        <div class="craft-cat-checks" style="display:flex;flex-wrap:wrap;gap:6px">
-          ${catCheckboxes}
-          ${assignedCats.length === 0 ? '<span style="color:var(--dim);font-size:11px">No categories assigned - bot will use global enabled categories</span>' : ''}
-        </div>
-      </div>
-    `;
-  }).join('');
-
   panel.innerHTML = `
     <h3>Crafter Settings</h3>
     <div class="settings-desc">Add recipes and set stock limits. The crafter bot will craft each item up to its limit, then stop.</div>
@@ -4781,16 +4761,6 @@ function renderCrafterSettings(panel) {
       </div>
     </div>
 
-    <div class="setting-row" style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
-      <div>
-        <div class="setting-label">Bot Category Assignments</div>
-        <div class="setting-hint">Assign specific categories to individual bots. Bots with assignments will ONLY craft from those categories. Leave unassigned to use global enabled categories.</div>
-      </div>
-      <div style="margin-top:10px">
-        ${botAssignmentRows || '<div style="color:var(--dim);padding:8px">No bots available</div>'}
-      </div>
-    </div>
-
     <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
       <div>
         <div class="setting-label">Goal Processing Mode</div>
@@ -4800,6 +4770,52 @@ function renderCrafterSettings(panel) {
         <option value="batch" ${((crafter.goalProcessingMode || 'batch') === 'batch') ? 'selected' : ''}>Batch (complete one goal at a time)</option>
         <option value="round-robin" ${((crafter.goalProcessingMode || 'batch') === 'round-robin') ? 'selected' : ''}>Round-Robin (craft 1 of each in rotation)</option>
       </select>
+    </div>
+
+    <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
+        <div class="setting-label">Auto-Buy Missing Materials</div>
+        <div class="setting-hint">Automatically purchase missing crafting materials from the local station market when crafting fails due to missing ingredients.</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px;min-width:200px">
+        <label style="display:flex;align-items:center;gap:8px;font-size:12px">
+          <input type="checkbox" id="set-crafter-autoBuy-enabled" ${crafter.autoBuy?.enabled ? 'checked' : ''}>
+          Enable Auto-Buy
+        </label>
+        <div style="display:flex;gap:12px;align-items:center">
+          <label style="font-size:11px;color:var(--text-dim)">Max Price:
+            <input type="number" id="set-crafter-autoBuy-maxPricePercent" min="100" max="500" value="${crafter.autoBuy?.maxPricePercentOverBase || 150}" style="width:70px;margin-left:4px"> % of base
+          </label>
+          <label style="font-size:11px;color:var(--text-dim)">Max Spend/Cycle:
+            <input type="number" id="set-crafter-autoBuy-maxCredits" min="1000" max="1000000" value="${crafter.autoBuy?.maxCreditsPerCycle || 50000}" style="width:90px;margin-left:4px"> cr
+          </label>
+        </div>
+        <div style="font-size:11px;color:var(--dim)">Exclude categories: <input type="text" id="set-crafter-autoBuy-excludeCategories" value="${(crafter.autoBuy?.excludeCategories || ['ammo']).join(',')}" style="min-width:150px" placeholder="ammo,weapons"> (comma-separated)</div>
+      </div>
+    </div>
+
+    <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
+        <div class="setting-label">Request Items from Trade_Buyer</div>
+        <div class="setting-hint">Items added here will be purchased by the trade_buyer bot and deposited to faction storage for crafting use. The trade_buyer must have a home system configured.</div>
+      </div>
+      
+      <div class="craft-limits-list" id="crafterRequestItemsList" style="margin-top:10px">
+        ${renderRequestItemsRows(crafter.requestItems || [])}
+      </div>
+
+      <div style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+          <input type="text" id="crafter-request-search" placeholder="Search items..." oninput="updateCrafterRequestSelect()" style="flex:1;min-width:120px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+          <select id="crafter-request-add-cat" onchange="updateCrafterRequestSelect()" style="min-width:100px">${renderRequestCategories(crafter.requestItems || [])}</select>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="crafter-request-add-select" onchange="updateCrafterRequestDetail()" style="flex:1;min-width:0"></select>
+          <input type="number" id="crafter-request-qty" min="1" value="100" placeholder="Qty" style="width:80px">
+          <button class="primary sm" onclick="addCrafterRequestItem()">+ Add Request</button>
+        </div>
+        <div id="crafter-request-add-detail" style="font-size:0.75em;color:var(--dim);margin-top:4px"></div>
+      </div>
     </div>
 
     <div class="setting-row" style="margin-top:16px">
@@ -4935,32 +4951,189 @@ function saveCrafterSettings() {
     if (el.checked) enabledCategories.push(el.getAttribute('data-category'));
   });
 
-  // Collect bot category assignments
-  const categoryAssignments = {};
-  document.querySelectorAll('.bot-cat-assign').forEach(el => {
-    const bot = el.getAttribute('data-bot');
-    const cat = el.getAttribute('data-category');
-    if (el.checked) {
-      if (!categoryAssignments[bot]) categoryAssignments[bot] = [];
-      categoryAssignments[bot].push(cat);
-    }
-  });
-
   // Collect goal processing mode
   const goalProcessingMode = document.getElementById('set-crafter-goalProcessingMode')?.value || 'batch';
+
+  // Collect auto-buy settings
+  const autoBuyEnabled = document.getElementById('set-crafter-autoBuy-enabled')?.checked || false;
+  const autoBuyMaxPricePercent = parseInt(document.getElementById('set-crafter-autoBuy-maxPricePercent')?.value) || 150;
+  const autoBuyMaxCredits = parseInt(document.getElementById('set-crafter-autoBuy-maxCredits')?.value) || 50000;
+  const autoBuyExcludeCatsRaw = document.getElementById('set-crafter-autoBuy-excludeCategories')?.value || 'ammo';
+  const autoBuyExcludeCategories = autoBuyExcludeCatsRaw.split(',').map(s => s.trim()).filter(s => s.length > 0);
+
+  // Collect request items
+  const requestItems = [];
+  document.querySelectorAll('#crafterRequestItemsList .craft-limit-row').forEach(row => {
+    const removeBtn = row.querySelector('button[onclick^="removeCrafterRequestItem"]');
+    if (removeBtn) {
+      const match = removeBtn.getAttribute('onclick').match(/'([^']+)'/);
+      if (match && match[1]) {
+        const qtyInput = row.querySelector('.request-item-qty');
+        requestItems.push({
+          itemId: match[1],
+          quantity: parseInt(qtyInput?.value) || 100,
+        });
+      }
+    }
+  });
 
   const s = {
     craftLimits,
     enabledCategories,
-    categoryAssignments,
     refuelThreshold: parseInt(document.getElementById('set-crafter-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-crafter-repairThreshold').value) || 40,
     goalProcessingMode,
+    autoBuy: {
+      enabled: autoBuyEnabled,
+      maxPricePercentOverBase: autoBuyMaxPricePercent,
+      maxCreditsPerCycle: autoBuyMaxCredits,
+      excludeCategories: autoBuyExcludeCategories,
+    },
+    requestItems,
   };
   send({ type: 'saveSettings', routine: 'crafter', settings: s });
 
   // Update local settings
   settings.crafter = s;
+
+  // Re-render to show updated values
+  renderCrafterSettings(document.getElementById('settingsContent'));
+}
+
+// ── Crafter Request Items helpers ───────────────────────────
+
+function renderRequestItemsRows(requestItems) {
+  const items = Array.isArray(requestItems) ? requestItems : [];
+  if (items.length === 0) {
+    return '<div style="color:var(--dim);padding:8px">No items requested. Add items that the trade_buyer should purchase for crafting.</div>';
+  }
+  
+  return items.map(req => {
+    const item = catalog.items?.[req.itemId];
+    const itemName = item?.name || req.itemId;
+    const itemSize = item?.size ?? 1;
+    const category = item?.category || '';
+    const baseValue = item?.base_value || 0;
+    const catBadge = category ? `<span class="craft-cat" style="font-size:10px;margin-left:6px">${esc(category)}</span>` : '';
+    return `
+      <div class="craft-limit-row" style="display:grid;grid-template-columns:1fr 80px 100px;gap:8px;align-items:center">
+        <div class="craft-limit-info">
+          <div class="craft-limit-name">${esc(itemName)} ${catBadge}</div>
+          <div class="craft-limit-detail">Size: ${itemSize} | Base: ${baseValue}cr | Requested: ${req.quantity || 100}</div>
+        </div>
+        <input type="number" class="request-item-qty" data-item-id="${esc(req.itemId)}" placeholder="Qty" min="1" value="${req.quantity || 100}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+        <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeCrafterRequestItem('${esc(req.itemId)}')">✕ Remove</button>
+      </div>`;
+  }).join('');
+}
+
+function renderRequestCategories(requestItems) {
+  const usedIds = new Set((Array.isArray(requestItems) ? requestItems : []).map(r => r.itemId));
+  const catalogItems = Object.values(catalog.items || {}).filter(i => i.tradeable !== false);
+  const availableItems = catalogItems.filter(i => !usedIds.has(i.id || i.item_id));
+  
+  const categories = new Map();
+  for (const item of availableItems) {
+    const cat = item.category || 'Other';
+    if (!categories.has(cat)) categories.set(cat, []);
+    categories.get(cat).push(item);
+  }
+  
+  return categories.size > 0
+    ? `<option value="__all__">All (${availableItems.length})</option>` + [...categories.keys()].sort().map(c => `<option value="${esc(c)}">${esc(c)} (${categories.get(c).length})</option>`).join('')
+    : '<option value="">All items added</option>';
+}
+
+function updateCrafterRequestSelect() {
+  const catSel = document.getElementById('crafter-request-add-cat');
+  const itemSel = document.getElementById('crafter-request-add-select');
+  const searchEl = document.getElementById('crafter-request-search');
+  if (!catSel || !itemSel) return;
+
+  const cat = catSel.value;
+  const searchText = (searchEl?.value || '').trim().toLowerCase();
+  const crafter = settings.crafter || {};
+  const requestItems = Array.isArray(crafter.requestItems) ? crafter.requestItems : [];
+  const usedIds = new Set(requestItems.map(r => r.itemId));
+  const catalogItems = Object.values(catalog.items || {}).filter(i => i.tradeable !== false);
+
+  const filtered = catalogItems.filter(item => {
+    const id = item.id || item.item_id || '';
+    if (usedIds.has(id)) return false;
+    const name = (item.name || '').toLowerCase();
+    const desc = (item.description || '').toLowerCase();
+    const itemCat = item.category || 'Other';
+    if (searchText) {
+      return name.includes(searchText) || id.toLowerCase().includes(searchText) || desc.includes(searchText) || itemCat.toLowerCase().includes(searchText);
+    }
+    return cat === '__all__' || itemCat === cat;
+  });
+
+  if (searchText) filtered.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+  itemSel.innerHTML = filtered.length > 0
+    ? filtered.map(item => {
+        const id = item.id || item.item_id || '';
+        const name = item.name || id || '?';
+        const itemCat = item.category || '';
+        const baseValue = item.base_value || 0;
+        const label = (searchText || cat === '__all__') && itemCat ? `${name} [${itemCat}]` : name;
+        return `<option value="${esc(id)}" data-base="${baseValue}">${esc(label)} - Base: ${baseValue}cr</option>`;
+      }).join('')
+    : '<option value="">No items available</option>';
+
+  updateCrafterRequestDetail();
+}
+
+function updateCrafterRequestDetail() {
+  const itemSel = document.getElementById('crafter-request-add-select');
+  const detailEl = document.getElementById('crafter-request-add-detail');
+  if (!itemSel || !detailEl) return;
+
+  const selectedOption = itemSel.selectedOptions[0];
+  if (!selectedOption) {
+    detailEl.innerHTML = '';
+    return;
+  }
+
+  const itemId = selectedOption.value;
+  const item = catalog.items?.[itemId];
+  if (!item) {
+    detailEl.innerHTML = '';
+    return;
+  }
+
+  const baseValue = item.base_value || 0;
+  const size = item.size ?? 1;
+  const category = item.category || 'Unknown';
+  detailEl.innerHTML = `<strong>${esc(item.name || itemId)}</strong> — Category: ${esc(category)} | Size: ${size} | Base Value: ${baseValue}cr`;
+}
+
+function addCrafterRequestItem() {
+  const sel = document.getElementById('crafter-request-add-select');
+  const qtyEl = document.getElementById('crafter-request-qty');
+  const itemId = sel?.value;
+  const quantity = parseInt(qtyEl?.value) || 100;
+  if (!itemId) return;
+
+  if (!settings.crafter) settings.crafter = {};
+  if (!settings.crafter.requestItems) settings.crafter.requestItems = [];
+  
+  // Check if already in list
+  const existing = settings.crafter.requestItems.find(r => r.itemId === itemId);
+  if (existing) {
+    existing.quantity = quantity;
+  } else {
+    settings.crafter.requestItems.push({ itemId, quantity });
+  }
+  
+  renderCrafterSettings(document.getElementById('settingsContent'));
+}
+
+function removeCrafterRequestItem(itemId) {
+  if (!settings.crafter?.requestItems) return;
+  settings.crafter.requestItems = settings.crafter.requestItems.filter(r => r.itemId !== itemId);
+  renderCrafterSettings(document.getElementById('settingsContent'));
 }
 
 // ── Rescue settings ────────────────────────────────────────
@@ -5512,33 +5685,45 @@ function renderTradeBuyerSettings(panel) {
   const minQuantityToBuy = t.minQuantityToBuy ?? 10;
   const autoInsure = t.autoInsure !== false;
   const autoCloak = t.autoCloak ?? false;
+  const buyItems = Array.isArray(t.buyItems) ? t.buyItems : [];
+  const maxPrices = t.maxPrices || {};
 
-  // Build item list from catalog
+  // Use catalog items
   const catalogItems = Object.values(catalog.items || {}).filter(i => i.tradeable !== false);
   catalogItems.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
 
-  // Get currently selected items
-  const buyItems = Array.isArray(t.buyItems) ? t.buyItems : [];
+  // Build rows only for configured items
+  const configuredRows = buyItems.map(itemId => {
+    const item = catalog.items?.[itemId] || catalogItems.find(i => (i.id || i.item_id) === itemId);
+    const itemName = item?.name || itemId;
+    const itemSize = item?.size ?? 1;
+    const category = item?.category || '';
+    const baseValue = item?.base_value || 0;
+    const maxPrice = maxPrices?.[itemId] ?? '';
+    const catBadge = category ? `<span class="craft-cat" style="font-size:10px;margin-left:6px">${esc(category)}</span>` : '';
+    return `
+      <div class="craft-limit-row" style="display:grid;grid-template-columns:1fr 140px 100px;gap:8px;align-items:center">
+        <div class="craft-limit-info">
+          <div class="craft-limit-name">${esc(itemName)} ${catBadge}</div>
+          <div class="craft-limit-detail">Size: ${itemSize} | Base: ${baseValue}cr ${maxPrice ? `| Max: ${maxPrice}cr` : ''}</div>
+        </div>
+        <input type="number" class="trade-buyer-max-price" data-item-id="${esc(itemId)}" placeholder="Max price (cr)" min="0" value="${maxPrice}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+        <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeTradeBuyerItem('${esc(itemId)}')">✕ Remove</button>
+      </div>`;
+  }).join('');
 
-  let itemsHtml = '';
-  for (const item of catalogItems) {
-    const itemId = item.id || item.item_id;
-    const itemName = item.name || itemId;
-    const itemSize = item.size ?? 1;
-    const isSelected = buyItems.includes(itemId);
-    const maxPrice = t.maxPrices?.[itemId] ?? '';
-    itemsHtml += `
-      <div class="trade-buyer-item-row" style="display:grid;grid-template-columns:1fr 120px 100px;gap:8px;align-items:center;padding:6px 0;border-bottom:1px solid var(--border-light)">
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer">
-          <input type="checkbox" class="trade-buyer-item-checkbox" data-item-id="${esc(itemId)}" ${isSelected ? 'checked' : ''}>
-          <span>${esc(itemName)}</span>
-          <span style="color:var(--text-dim);font-size:11px">(size: ${itemSize})</span>
-        </label>
-        <input type="number" class="trade-buyer-max-price" data-item-id="${esc(itemId)}" placeholder="Max price" min="0" value="${maxPrice}" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:4px 8px;font-size:12px">
-        <button class="sm danger" onclick="removeTradeBuyerItem('${esc(itemId)}')" style="padding:4px 8px">Remove</button>
-      </div>
-    `;
+  // Build category → item picker for available (not yet added) items
+  const usedIds = new Set(buyItems);
+  const availableItems = catalogItems.filter(i => !usedIds.has(i.id || i.item_id));
+  const categories = new Map();
+  for (const item of availableItems) {
+    const cat = item.category || 'Other';
+    if (!categories.has(cat)) categories.set(cat, []);
+    categories.get(cat).push(item);
   }
+  const catOpts = categories.size > 0
+    ? `<option value="__all__">All (${availableItems.length})</option>` + [...categories.keys()].sort().map(c => `<option value="${esc(c)}">${esc(c)} (${categories.get(c).length})</option>`).join('')
+    : '<option value="">All items added</option>';
 
   panel.innerHTML = `
     <h3>Trade Buyer Settings</h3>
@@ -5622,23 +5807,27 @@ function renderTradeBuyerSettings(panel) {
       </select>
     </div>
 
-    <div class="setting-row" style="display:block">
+    <div class="setting-row" style="display:block;margin-top:16px">
       <div style="margin-bottom:8px">
         <div class="setting-label">Items to Buy</div>
-        <div class="setting-hint" style="margin-top:4px">Select items from the catalog and optionally set a maximum price for each. The bot will only buy items that are checked below. Leave all unchecked to buy nothing (bot will idle).</div>
+        <div class="setting-hint" style="margin-top:4px">Add items to buy. Set optional max prices (leave empty to use market price). The bot will only buy items in this list.</div>
       </div>
-      <div style="max-height:400px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;padding:8px;background:var(--bg-tertiary)">
-        <div style="display:grid;grid-template-columns:1fr 120px 100px;gap:8px;padding:6px 0;border-bottom:1px solid var(--border);font-weight:600;font-size:12px;color:var(--text-dim)">
-          <span>Item</span>
-          <span>Max Price (cr)</span>
-          <span>Action</span>
+
+      <div class="craft-limits-list" id="tradeBuyerItemsList">
+        ${configuredRows || '<div style="color:var(--dim);padding:8px">No items configured. Add one below.</div>'}
+      </div>
+
+      <div style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+        <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+          <input type="text" id="trade-buyer-search" placeholder="Search items..." oninput="updateTradeBuyerItemSelect()" style="flex:1;min-width:120px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;font-size:12px">
+          <select id="trade-buyer-add-cat" onchange="updateTradeBuyerItemSelect()" style="min-width:100px">${catOpts}</select>
         </div>
-        ${itemsHtml}
-      </div>
-      <div style="margin-top:8px;display:flex;gap:8px">
-        <button class="sm" onclick="selectAllTradeBuyerItems()">Select All</button>
-        <button class="sm" onclick="deselectAllTradeBuyerItems()">Deselect All</button>
-        <button class="sm" onclick="clearRemovedTradeBuyerItems()">Clear Removed Items</button>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="trade-buyer-add-select" onchange="updateTradeBuyerAddDetail()" style="flex:1;min-width:0"></select>
+          <input type="number" id="trade-buyer-max-price" min="0" placeholder="Max price" style="width:100px">
+          <button class="primary sm" onclick="addTradeBuyerItem()">+ Add</button>
+        </div>
+        <div id="trade-buyer-add-detail" style="font-size:0.75em;color:var(--dim);margin-top:4px"></div>
       </div>
     </div>
 
@@ -5646,20 +5835,132 @@ function renderTradeBuyerSettings(panel) {
       <button class="primary" onclick="saveTradeBuyerSettings()">Save Settings</button>
     </div>
   `;
+
+  // Populate item dropdown for initially selected category
+  updateTradeBuyerItemSelect();
+}
+
+function updateTradeBuyerItemSelect() {
+  const catSel = document.getElementById('trade-buyer-add-cat');
+  const itemSel = document.getElementById('trade-buyer-add-select');
+  const searchEl = document.getElementById('trade-buyer-search');
+  if (!catSel || !itemSel) return;
+
+  const cat = catSel.value;
+  const searchText = (searchEl?.value || '').trim().toLowerCase();
+  const catalogItems = Object.values(catalog.items || {}).filter(i => i.tradeable !== false);
+  const t = settings.trade_buyer || {};
+  const buyItems = Array.isArray(t.buyItems) ? t.buyItems : [];
+  const usedIds = new Set(buyItems);
+
+  const filtered = catalogItems.filter(item => {
+    const id = item.id || item.item_id || '';
+    if (usedIds.has(id)) return false;
+    const name = (item.name || '').toLowerCase();
+    const desc = (item.description || '').toLowerCase();
+    const itemCat = item.category || 'Other';
+    if (searchText) {
+      return name.includes(searchText) || id.toLowerCase().includes(searchText) || desc.includes(searchText) || itemCat.toLowerCase().includes(searchText);
+    }
+    return cat === '__all__' || itemCat === cat;
+  });
+
+  // Sort by name for search results
+  if (searchText) filtered.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+  itemSel.innerHTML = filtered.length > 0
+    ? filtered.map(item => {
+        const id = item.id || item.item_id || '';
+        const name = item.name || id || '?';
+        const itemCat = item.category || '';
+        const baseValue = item.base_value || 0;
+        const label = (searchText || cat === '__all__') && itemCat ? `${name} [${itemCat}]` : name;
+        return `<option value="${esc(id)}" data-base="${baseValue}">${esc(label)} - Base: ${baseValue}cr</option>`;
+      }).join('')
+    : '<option value="">No items available</option>';
+
+  updateTradeBuyerAddDetail();
+}
+
+function updateTradeBuyerAddDetail() {
+  const itemSel = document.getElementById('trade-buyer-add-select');
+  const detailEl = document.getElementById('trade-buyer-add-detail');
+  if (!itemSel || !detailEl) return;
+
+  const selectedOption = itemSel.selectedOptions[0];
+  if (!selectedOption) {
+    detailEl.innerHTML = '';
+    return;
+  }
+
+  const itemId = selectedOption.value;
+  const item = catalog.items?.[itemId];
+  if (!item) {
+    detailEl.innerHTML = '';
+    return;
+  }
+
+  const baseValue = item.base_value || 0;
+  const size = item.size ?? 1;
+  const category = item.category || 'Unknown';
+  detailEl.innerHTML = `<strong>${esc(item.name || itemId)}</strong> — Category: ${esc(category)} | Size: ${size} | Base Value: ${baseValue}cr`;
+  
+  // Auto-fill max price input with base value
+  const maxPriceInput = document.getElementById('trade-buyer-max-price');
+  if (maxPriceInput && !maxPriceInput.value) {
+    maxPriceInput.value = baseValue || '';
+  }
+}
+
+function addTradeBuyerItem() {
+  const sel = document.getElementById('trade-buyer-add-select');
+  const maxPriceEl = document.getElementById('trade-buyer-max-price');
+  const itemId = sel?.value;
+  const maxPrice = maxPriceEl?.value ? parseInt(maxPriceEl.value) : null;
+  if (!itemId) return;
+
+  if (!settings.trade_buyer) settings.trade_buyer = {};
+  if (!settings.trade_buyer.buyItems) settings.trade_buyer.buyItems = [];
+  if (!settings.trade_buyer.buyItems.includes(itemId)) {
+    settings.trade_buyer.buyItems.push(itemId);
+  }
+  if (maxPrice !== null && maxPrice > 0) {
+    if (!settings.trade_buyer.maxPrices) settings.trade_buyer.maxPrices = {};
+    settings.trade_buyer.maxPrices[itemId] = maxPrice;
+  }
+  renderTradeBuyerSettings(document.getElementById('settingsContent'));
+}
+
+function removeTradeBuyerItem(itemId) {
+  if (!settings.trade_buyer?.buyItems) return;
+  const idx = settings.trade_buyer.buyItems.indexOf(itemId);
+  if (idx > -1) {
+    settings.trade_buyer.buyItems.splice(idx, 1);
+  }
+  if (settings.trade_buyer.maxPrices) {
+    delete settings.trade_buyer.maxPrices[itemId];
+  }
+  renderTradeBuyerSettings(document.getElementById('settingsContent'));
 }
 
 function saveTradeBuyerSettings() {
-  // Collect selected items and their max prices
-  const checkboxes = document.querySelectorAll('.trade-buyer-item-checkbox:checked');
+  // Collect selected items and their max prices from rendered inputs
   const buyItems = [];
   const maxPrices = {};
-
-  checkboxes.forEach(cb => {
-    const itemId = cb.getAttribute('data-item-id');
-    buyItems.push(itemId);
-    const maxPriceInput = document.querySelector(`.trade-buyer-max-price[data-item-id="${itemId}"]`);
-    if (maxPriceInput && maxPriceInput.value) {
-      maxPrices[itemId] = parseInt(maxPriceInput.value) || 0;
+  
+  document.querySelectorAll('#tradeBuyerItemsList .craft-limit-row').forEach(row => {
+    const itemId = row.querySelector('.craft-limit-name')?.textContent?.trim() || '';
+    // Get item ID from the remove button's onclick
+    const removeBtn = row.querySelector('button[onclick^="removeTradeBuyerItem"]');
+    if (removeBtn) {
+      const match = removeBtn.getAttribute('onclick').match(/'([^']+)'/);
+      if (match && match[1]) {
+        buyItems.push(match[1]);
+        const maxPriceInput = row.querySelector('.trade-buyer-max-price');
+        if (maxPriceInput && maxPriceInput.value) {
+          maxPrices[match[1]] = parseInt(maxPriceInput.value) || 0;
+        }
+      }
     }
   });
 
@@ -5678,40 +5979,7 @@ function saveTradeBuyerSettings() {
   };
   send({ type: 'saveSettings', routine: 'trade_buyer', settings: s });
   settings.trade_buyer = s;
-}
-
-function selectAllTradeBuyerItems() {
-  document.querySelectorAll('.trade-buyer-item-checkbox').forEach(cb => cb.checked = true);
-}
-
-function deselectAllTradeBuyerItems() {
-  document.querySelectorAll('.trade-buyer-item-checkbox').forEach(cb => cb.checked = false);
-}
-
-function removeTradeBuyerItem(itemId) {
-  const checkbox = document.querySelector(`.trade-buyer-item-checkbox[data-item-id="${itemId}"]`);
-  if (checkbox) {
-    checkbox.checked = false;
-  }
-}
-
-function clearRemovedTradeBuyerItems() {
-  // Remove any max price entries for items no longer in catalog
-  const catalogItemIds = new Set(Object.values(catalog.items || {}).map(i => i.id || i.item_id));
-  const t = settings.trade_buyer || {};
-  const maxPrices = t.maxPrices || {};
-  let changed = false;
-  for (const itemId of Object.keys(maxPrices)) {
-    if (!catalogItemIds.has(itemId)) {
-      delete maxPrices[itemId];
-      changed = true;
-    }
-  }
-  if (changed) {
-    settings.trade_buyer = { ...t, maxPrices };
-    send({ type: 'saveSettings', routine: 'trade_buyer', settings: { maxPrices } });
-    renderTradeBuyerSettings(document.getElementById('settingsContent'));
-  }
+  alert('Trade Buyer settings saved!');
 }
 
 // ── AI Settings ────────────────────────────────────────────

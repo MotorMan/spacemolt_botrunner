@@ -687,40 +687,30 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Fallback: find POI with target resource (skip depleted unless expired)
     if (!miningPoi && effectiveTarget) {
       for (const poi of pois) {
-        if (miningType === "ice" && isIceFieldPoi(poi.type)) {
-          const sysData = mapStore.getSystem(bot.system);
-          const storedPoi = sysData?.pois.find(p => p.id === poi.id);
-          const oreEntry = storedPoi?.ores_found.find(o => o.item_id === effectiveTarget);
-          if (oreEntry && (!oreEntry.depleted || isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs))) {
-            if (oreEntry.depleted) {
-              ctx.log("mining", `Re-checking depleted ${effectiveTarget} at ${poi.name} (depletion expired)`);
-            }
-            miningPoi = { id: poi.id, name: poi.name };
-            break;
-          }
-        } else if (miningType === "ore" && isOreBeltPoi(poi.type)) {
-          const sysData = mapStore.getSystem(bot.system);
-          const storedPoi = sysData?.pois.find(p => p.id === poi.id);
-          const oreEntry = storedPoi?.ores_found.find(o => o.item_id === effectiveTarget);
-          if (oreEntry && (!oreEntry.depleted || isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs))) {
-            if (oreEntry.depleted) {
-              ctx.log("mining", `Re-checking depleted ${effectiveTarget} at ${poi.name} (depletion expired)`);
-            }
-            miningPoi = { id: poi.id, name: poi.name };
-            break;
-          }
-        } else if (miningType === "gas" && isGasCloudPoi(poi.type)) {
-          const sysData = mapStore.getSystem(bot.system);
-          const storedPoi = sysData?.pois.find(p => p.id === poi.id);
-          const oreEntry = storedPoi?.ores_found.find(o => o.item_id === effectiveTarget);
-          if (oreEntry && (!oreEntry.depleted || isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs))) {
-            if (oreEntry.depleted) {
-              ctx.log("mining", `Re-checking depleted ${effectiveTarget} at ${poi.name} (depletion expired)`);
-            }
-            miningPoi = { id: poi.id, name: poi.name };
-            break;
+        const isMatchingType =
+          (miningType === "ice" && isIceFieldPoi(poi.type)) ||
+          (miningType === "ore" && isOreBeltPoi(poi.type)) ||
+          (miningType === "gas" && isGasCloudPoi(poi.type));
+
+        if (!isMatchingType) continue;
+
+        // Check stored depletion status - skip if depleted and not expired
+        const sysData = mapStore.getSystem(bot.system);
+        const storedPoi = sysData?.pois.find(p => p.id === poi.id);
+        const oreEntry = storedPoi?.ores_found.find(o => o.item_id === effectiveTarget);
+
+        if (oreEntry && oreEntry.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+          if (settings.ignoreDepletion) {
+            ctx.log("mining", `Mining depleted ${effectiveTarget} at ${poi.name} (ignoreDepletion enabled)`);
+          } else {
+            ctx.log("mining", `Skipping ${poi.name}: ${effectiveTarget} is depleted (waiting for timeout)`);
+            continue;
           }
         }
+
+        // Found a viable POI (not marked depleted in cache)
+        miningPoi = { id: poi.id, name: poi.name };
+        break;
       }
     }
 
@@ -784,6 +774,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let harvestCycles = 0;
     let stopReason = "";
     const resourcesMinedMap = new Map<string, number>();
+    let lastPoiCheck = 0;
+    const POI_CHECK_INTERVAL_MS = 60_000; // Check POI remaining every 60 seconds
 
     while (bot.state === "running") {
       await bot.refreshStatus();
@@ -793,6 +785,42 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (midFuel < safetyOpts.fuelThresholdPct) { stopReason = `fuel low (${midFuel}%)`; break; }
+
+      // Periodically check POI to see if resource is depleted (remaining: 0)
+      const now = Date.now();
+      if (effectiveTarget && bot.poi && !settings.ignoreDepletion && 
+          (now - lastPoiCheck) > POI_CHECK_INTERVAL_MS) {
+        lastPoiCheck = now;
+        const poiResp = await bot.exec("get_poi", { poi_id: bot.poi });
+        if (!poiResp.error && poiResp.result) {
+          const result = poiResp.result as Record<string, unknown>;
+          const resources = Array.isArray(result.resources)
+            ? (result.resources as Array<Record<string, unknown>>)
+            : Array.isArray((result.poi as Record<string, unknown>)?.resources)
+            ? ((result.poi as Record<string, unknown>).resources as Array<Record<string, unknown>>)
+            : [];
+          
+          for (const res of resources) {
+            const resId = (res.resource_id as string) || (res.id as string) || "";
+            if (resId === effectiveTarget) {
+              const remaining = (res.remaining as number) ?? (res.quantity as number) ?? null;
+              if (remaining !== null && remaining <= 0) {
+                ctx.log("mining", `POI check: ${effectiveTarget} is depleted (remaining: ${remaining})`);
+                mapStore.markOreDepleted(bot.system, bot.poi, effectiveTarget);
+                stopReason = `${effectiveTarget} depleted at this POI`;
+                if (recoveredSession) {
+                  failMiningSession(bot.username, "Resource depleted");
+                  recoveredSession = null;
+                }
+                break;
+              } else if (remaining !== null) {
+                ctx.log("mining", `POI check: ${effectiveTarget} remaining: ${remaining}`);
+              }
+            }
+          }
+        }
+        if (stopReason) break;
+      }
 
       const mineResp = await bot.exec("mine");
 

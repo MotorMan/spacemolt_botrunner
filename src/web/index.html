@@ -5316,6 +5316,7 @@ function renderTraderSettings(panel) {
   const refuelThreshold = t.refuelThreshold ?? 50;
   const repairThreshold = t.repairThreshold ?? 40;
   const homeSystem = t.homeSystem ?? '';
+  const maxFactionCreditsToUse = t.maxFactionCreditsToUse ?? 0;
 
   panel.innerHTML = `
     <h3>Trader Settings</h3>
@@ -5335,6 +5336,14 @@ function renderTraderSettings(panel) {
         <div class="setting-hint">Cap on total investment per trade run. 0 = unlimited.</div>
       </div>
       <input type="number" id="set-trader-maxCargoValue" min="0" max="1000000" value="${maxCargoValue}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Faction Credits to Use</div>
+        <div class="setting-hint">Maximum credits to withdraw from faction storage for trading. 0 = unlimited (use all available faction credits).</div>
+      </div>
+      <input type="number" id="set-trader-maxFactionCreditsToUse" min="0" max="100000000" value="${maxFactionCreditsToUse}">
     </div>
 
     <div class="setting-row">
@@ -5379,6 +5388,7 @@ function saveTraderSettings() {
   const s = {
     minProfitPerUnit: parseInt(document.getElementById('set-trader-minProfitPerUnit').value) || 10,
     maxCargoValue: parseInt(document.getElementById('set-trader-maxCargoValue').value) || 0,
+    maxFactionCreditsToUse: parseInt(document.getElementById('set-trader-maxFactionCreditsToUse').value) || 0,
     fuelCostPerJump: parseInt(document.getElementById('set-trader-fuelCostPerJump').value) || 50,
     refuelThreshold: parseInt(document.getElementById('set-trader-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-trader-repairThreshold').value) || 40,

@@ -2968,6 +2968,29 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
             if (arrived) {
               ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+
+              // If home station is configured, travel there and dock
+              if (settings.homeStation) {
+                const [expectedSystem, stationId] = settings.homeStation.split('|');
+                if (expectedSystem === homeSystem && stationId) {
+                  ctx.log("rescue", `🚀 Traveling to home station...`);
+                  const travelResp = await bot.exec("travel", { target_poi: stationId });
+                  if (!travelResp.error) {
+                    ctx.log("rescue", `⚓ Docking at home station...`);
+                    const dockResp = await bot.exec("dock");
+                    if (!dockResp.error) {
+                      ctx.log("rescue", `✓ Docked at home station`);
+                      // Refuel after docking
+                      ctx.log("rescue", `⛽ Refueling at home station...`);
+                      const refuelResp = await bot.exec("refuel");
+                      if (!refuelResp.error) {
+                        await bot.refreshStatus();
+                        ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
           continue;

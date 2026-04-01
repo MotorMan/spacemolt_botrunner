@@ -4791,6 +4791,17 @@ function renderCrafterSettings(panel) {
       </div>
     </div>
 
+    <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
+        <div class="setting-label">Goal Processing Mode</div>
+        <div class="setting-hint">How to process multiple goal items: <b>Batch</b> completes each goal fully before moving to the next, <b>Round-Robin</b> crafts one batch of each goal in rotation.</div>
+      </div>
+      <select id="set-crafter-goalProcessingMode" style="min-width:150px">
+        <option value="batch" ${((crafter.goalProcessingMode || 'batch') === 'batch') ? 'selected' : ''}>Batch (complete one goal at a time)</option>
+        <option value="round-robin" ${((crafter.goalProcessingMode || 'batch') === 'round-robin') ? 'selected' : ''}>Round-Robin (craft 1 of each in rotation)</option>
+      </select>
+    </div>
+
     <div class="setting-row" style="margin-top:16px">
       <div>
         <div class="setting-label">Refuel Threshold</div>
@@ -4935,12 +4946,16 @@ function saveCrafterSettings() {
     }
   });
 
+  // Collect goal processing mode
+  const goalProcessingMode = document.getElementById('set-crafter-goalProcessingMode')?.value || 'batch';
+
   const s = {
     craftLimits,
     enabledCategories,
     categoryAssignments,
     refuelThreshold: parseInt(document.getElementById('set-crafter-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-crafter-repairThreshold').value) || 40,
+    goalProcessingMode,
   };
   send({ type: 'saveSettings', routine: 'crafter', settings: s });
 

@@ -330,6 +330,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   const visitedSystems = new Set<string>();
+  const fledFromSystems = new Set<string>(); // Track systems we've fled from due to pirates
   let lastSystem: string | null = null;
 
   // ── Startup: dock at local station to clear cargo & refuel ──
@@ -610,7 +611,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       } else if (isStation) {
         yield* scanStation(ctx, systemId, poi);
       } else {
-        yield* visitOtherPoi(ctx, systemId, poi);
+        yield* visitOtherPoi(ctx, systemId, poi, fledFromSystems);
       }
 
       // ── Check cargo — if full, return to Sol Central to deposit ──
@@ -719,6 +720,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
           if (fled) {
             ctx.log("error", "Pirates detected - fled, will retry");
+            fledFromSystems.add(systemId); // Mark this system as hostile
             await sleep(30000);
             continue;
           }
@@ -740,7 +742,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     const validConns = connections.filter(c => c.id);
-    const nextSystem = pickNextSystem(validConns, visitedSystems, lastSystem);
+    const nextSystem = pickNextSystem(validConns, visitedSystems, lastSystem, fledFromSystems);
     if (!nextSystem) {
       ctx.log("info", "All connected systems explored! Picking a random connection...");
       if (validConns.length > 0) {
@@ -752,7 +754,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
         // Smart selection: avoid dead-ends and pirate systems
-        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems);
+        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, fledFromSystems);
         await ensureUndocked(ctx);
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
         const jumpResp = await bot.exec("jump", { target_system: random.id });
@@ -781,6 +783,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
           if (fled) {
             ctx.log("error", "Pirates detected - fled, will retry");
+            fledFromSystems.add(systemId); // Mark this system as hostile
             await sleep(30000);
             continue;
           }
@@ -842,6 +845,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
       if (fled) {
         ctx.log("error", "Pirates detected - fled, will retry");
+        fledFromSystems.add(systemId); // Mark this system as hostile
         await sleep(30000);
         continue;
       }
@@ -1023,6 +1027,7 @@ async function* visitOtherPoi(
   ctx: RoutineContext,
   systemId: string,
   poi: SystemPOI,
+  fledFromSystems: Set<string>,
 ): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
@@ -1042,7 +1047,9 @@ async function* visitOtherPoi(
     const { checkAndFleeFromPirates } = await import("./common.js");
     const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
     if (fled) {
-      // We've fled - abort this POI scan and return to main loop
+      // We've fled - mark this system as hostile and abort this POI scan
+      fledFromSystems.add(systemId);
+      mapStore.markExplored(systemId, poi.id);
       return;
     }
   }
@@ -1459,16 +1466,24 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  * 1. Systems not in map.json at all (completely unexplored)
  * 2. Systems in map.json but not yet visited this session
  * 3. Among unvisited, prefer systems with fewer POIs (less explored)
- * Always avoids pirate systems unless no other option exists.
+ * Always avoids pirate systems, blacklisted systems, and systems we've fled from.
  */
-function pickNextSystem(connections: Connection[], visited: Set<string>, lastSystem: string | null): Connection | null {
-  // Separate connections into pirate and non-pirate
-  const nonPirateConns = connections.filter(c => !isPirateSystem(c.id));
-  const pirateConns = connections.filter(c => isPirateSystem(c.id));
+function pickNextSystem(connections: Connection[], visited: Set<string>, lastSystem: string | null, fledFromSystems: Set<string>): Connection | null {
+  const blacklist = getSystemBlacklist();
   
+  // Filter out blacklisted systems and systems we've fled from
+  const nonBlacklistedConns = connections.filter(c => 
+    !blacklist.some(b => b.toLowerCase() === c.id.toLowerCase()) &&
+    !fledFromSystems.has(c.id)
+  );
+  
+  // Separate connections into pirate and non-pirate
+  const nonPirateConns = nonBlacklistedConns.filter(c => !isPirateSystem(c.id));
+  const pirateConns = nonBlacklistedConns.filter(c => isPirateSystem(c.id));
+
   // Work with non-pirate connections first
   let candidates = nonPirateConns.length > 0 ? nonPirateConns : pirateConns;
-  
+
   // Priority 1: Systems not in map.json at all (completely unexplored)
   const unmapped = candidates.filter(c => !mapStore.getSystem(c.id));
   if (unmapped.length > 0) {
@@ -1493,22 +1508,39 @@ function pickNextSystem(connections: Connection[], visited: Set<string>, lastSys
   }
 
   // All connected systems have been visited this session
+  // If no valid candidates, fall back to any non-blacklisted connection
+  if (candidates.length === 0 && nonBlacklistedConns.length > 0) {
+    return nonBlacklistedConns[0];
+  }
+  
   return null;
 }
 
 /**
- * Smart connection picker that avoids dead-ends and pirate traps.
+ * Smart connection picker that avoids dead-ends, pirate traps, blacklisted systems, and systems we've fled from.
  * Used when all connected systems have been visited.
  * Priority:
  * 1. Not the system we just came from
- * 2. Not a pirate system
- * 3. Systems with more connections (not a dead-end)
- * 4. Unexplored systems (not in map.json) over explored ones
+ * 2. Not a blacklisted system
+ * 3. Not a system we've fled from
+ * 4. Not a pirate system
+ * 5. Systems with more connections (not a dead-end)
+ * 6. Unexplored systems (not in map.json) over explored ones
  */
-function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>): Connection {
+function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, fledFromSystems: Set<string>): Connection {
+  const blacklist = getSystemBlacklist();
+  
   // First, filter out the system we came from (if possible)
   let candidates = lastSystem ? connections.filter(c => c.id !== lastSystem) : connections;
   if (candidates.length === 0) candidates = connections;
+
+  // Filter out blacklisted systems and systems we've fled from
+  const nonBlacklisted = candidates.filter(c => 
+    !blacklist.some(b => b.toLowerCase() === c.id.toLowerCase()) &&
+    !fledFromSystems.has(c.id)
+  );
+  // If all are blacklisted, use original candidates (trapped situation)
+  candidates = nonBlacklisted.length > 0 ? nonBlacklisted : candidates;
 
   // Separate into pirate and non-pirate
   const nonPirate = candidates.filter(c => !isPirateSystem(c.id));
@@ -1523,23 +1555,23 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     const connectionCount = sys?.connections?.length ?? 1;
     const isInMap = conn.id ? mapStore.getSystem(conn.id) != null : false;
     const isExploredThisSession = conn.id ? visited.has(conn.id) : false;
-    
+
     // Higher score = better
     let score = 0;
-    
+
     // Big bonus for systems not in map.json (completely unexplored)
     if (!isInMap) {
       score += 1000;
     }
-    
+
     // Bonus for systems with more connections (hubs, not dead-ends)
     score += connectionCount * 10;
-    
+
     // Small penalty for already explored this session
     if (isExploredThisSession) {
       score -= 50;
     }
-    
+
     return { conn, score };
   });
 

@@ -2337,8 +2337,21 @@ export async function emergencyFleeFromPirates(
     return false;
   }
 
-  // Pick a random connection to jump to
-  const randomConnection = connections[Math.floor(Math.random() * connections.length)];
+  // Get blacklist and filter out blacklisted systems
+  const blacklist = getSystemBlacklist();
+  const safeConnections = connections.filter(c => 
+    c.id && !blacklist.some(b => b.toLowerCase() === c.id!.toLowerCase())
+  );
+
+  // If all connections are blacklisted, we have no choice but to use any connection
+  const candidates = safeConnections.length > 0 ? safeConnections : connections;
+  if (candidates.length === 0) {
+    ctx.log("error", "No valid jump targets available - trapped!");
+    return false;
+  }
+
+  // Pick a random connection from valid candidates
+  const randomConnection = candidates[Math.floor(Math.random() * candidates.length)];
   if (!randomConnection || !randomConnection.id) {
     ctx.log("error", "Could not select jump target - trapped!");
     return false;

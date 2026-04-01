@@ -73,7 +73,7 @@ async function canAffordRoute(
   const { bot } = ctx;
   const totalCost = route.buyPrice * route.buyQty;
   const canAffordDirectly = bot.credits >= totalCost;
-  
+
   if (canAffordDirectly) {
     return {
       canAfford: true,
@@ -85,14 +85,14 @@ async function canAffordRoute(
 
   // Check station storage (personal) and faction storage (if in a faction)
   let storedCredits = 0;
-  
+
   // Check personal station storage
   const storageResp = await bot.exec("view_storage");
   if (storageResp.result && typeof storageResp.result === "object") {
     const sr = storageResp.result as Record<string, unknown>;
     storedCredits = (sr.credits as number) || (sr.stored_credits as number) || 0;
   }
-  
+
   // Also check faction storage if bot is in a faction
   let factionStoredCredits = 0;
   if (bot.faction) {
@@ -102,11 +102,17 @@ async function canAffordRoute(
       factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
     }
   }
-  
-  const totalStored = storedCredits + factionStoredCredits;
+
+  // Apply maxFactionCreditsToUse limit (0 = unlimited)
+  let usableFactionCredits = factionStoredCredits;
+  if (settings.maxFactionCreditsToUse > 0) {
+    usableFactionCredits = Math.min(factionStoredCredits, settings.maxFactionCreditsToUse);
+  }
+
+  const totalStored = storedCredits + usableFactionCredits;
   const shortfall = totalCost - bot.credits;
   const canWithdraw = totalStored >= shortfall;
-  
+
   // Calculate max affordable quantity with current credits + all storage
   const totalAvailable = bot.credits + totalStored;
   const maxAffordableQty = Math.floor(totalAvailable / route.buyPrice);
@@ -127,17 +133,18 @@ async function canAffordRoute(
 async function withdrawCreditsForTrade(
   ctx: RoutineContext,
   route: TradeRoute,
+  settings: ReturnType<typeof getTraderSettings>,
 ): Promise<boolean> {
   const { bot } = ctx;
   const totalCost = route.buyPrice * route.buyQty;
-  
+
   // Already have enough credits
   if (bot.credits >= totalCost) {
     return true;
   }
 
   const needed = totalCost - bot.credits;
-  
+
   // Try personal station storage first
   let storedCredits = 0;
   const storageResp = await bot.exec("view_storage");
@@ -145,7 +152,7 @@ async function withdrawCreditsForTrade(
     const sr = storageResp.result as Record<string, unknown>;
     storedCredits = (sr.credits as number) || (sr.stored_credits as number) || 0;
   }
-  
+
   if (storedCredits > 0) {
     const withdrawAmount = Math.min(needed, storedCredits);
     if (withdrawAmount > 0) {
@@ -157,7 +164,7 @@ async function withdrawCreditsForTrade(
       }
     }
   }
-  
+
   // Try faction storage if bot is in a faction
   if (bot.faction) {
     let factionStoredCredits = 0;
@@ -166,10 +173,16 @@ async function withdrawCreditsForTrade(
       const fsr = factionStorageResp.result as Record<string, unknown>;
       factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
     }
-    
+
     if (factionStoredCredits > 0) {
+      // Apply maxFactionCreditsToUse limit (0 = unlimited)
+      let usableFactionCredits = factionStoredCredits;
+      if (settings.maxFactionCreditsToUse > 0) {
+        usableFactionCredits = Math.min(factionStoredCredits, settings.maxFactionCreditsToUse);
+      }
+
       const remainingNeeded = needed - (storedCredits > 0 ? Math.min(needed, storedCredits) : 0);
-      const withdrawAmount = Math.min(remainingNeeded, factionStoredCredits);
+      const withdrawAmount = Math.min(remainingNeeded, usableFactionCredits);
       if (withdrawAmount > 0) {
         const wResp = await bot.exec("faction_withdraw_credits", { amount: withdrawAmount });
         if (!wResp.error) {
@@ -182,7 +195,7 @@ async function withdrawCreditsForTrade(
       }
     }
   }
-  
+
   ctx.log("trade", `No storage credits available (need ${needed}cr)`);
   return false;
 }
@@ -216,6 +229,7 @@ function getTraderSettings(username?: string): {
   autoInsure: boolean;
   stationPriority: boolean;
   autoCloak: boolean;
+  maxFactionCreditsToUse: number;
 } {
   const all = readSettings();
   const t = all.trader || {};
@@ -231,6 +245,7 @@ function getTraderSettings(username?: string): {
     autoInsure: (t.autoInsure as boolean) !== false,
     stationPriority: (botOverrides.stationPriority as boolean) || false,
     autoCloak: (t.autoCloak as boolean) ?? false,
+    maxFactionCreditsToUse: (t.maxFactionCreditsToUse as number) ?? 0, // 0 = unlimited
   };
 }
 
@@ -1319,7 +1334,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const withdrawalNeeded = Math.max(0, adjustedCost - bot.credits);
         if (withdrawalNeeded > 0) {
           ctx.log("trade", `Need ${withdrawalNeeded}cr from faction storage`);
-          const withdrew = await withdrawCreditsForTrade(ctx, candidate);
+          const withdrew = await withdrawCreditsForTrade(ctx, candidate, settings);
           if (!withdrew) {
             ctx.log("error", "Failed to withdraw credits from faction storage — skipping route");
             releaseTradeLock(bot.username, candidate.itemId, "aborted:withdraw_failed");

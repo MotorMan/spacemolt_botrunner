@@ -770,26 +770,15 @@ export class AiChatService {
     // If a specific bot is mentioned, ONLY that bot can respond
     // This prevents other bots from responding even with "respond to all" enabled
     if (mentionedBotName) {
-      this.logFn("ai_chat_debug", `Message mentions ${mentionedBotName}, checking if it should respond...`);
-      
-      // Check if the receiving bot is the mentioned bot
-      const receivingBot = msg.botUsername || "";
-      this.logFn("ai_chat_debug", `Receiving bot: ${receivingBot}, mentioned bot: ${mentionedBotName}`);
-      
-      if (receivingBot !== mentionedBotName) {
-        // This bot received the message but wasn't the one mentioned - skip silently
-        this.logFn("ai_chat_debug", `Received by ${receivingBot} but mentions ${mentionedBotName} - skipping`);
-        return;
-      }
-      
-      // The receiving bot IS the mentioned bot - proceed with mention response
-      this.logFn("ai_chat", `Processing mention: ${mentionedBotName} received message mentioning them`);
+      this.logFn("ai_chat_debug", `Message mentions ${mentionedBotName}, finding that bot to respond...`);
+
+      // Select the mentioned bot directly (regardless of which bot received the message)
       const responder = this.selectResponderByMention(mentionedBotName);
       if (!responder) {
         this.logFn("ai_chat", `Mentioned bot ${mentionedBotName} not available to respond`);
         return;
       }
-      
+
       this.logFn("ai_chat", `Responding to mention: ${mentionedBotName}`);
       await this.handleResponse(responder, msg, settings, msg.sender, true);
       return;
@@ -814,21 +803,31 @@ export class AiChatService {
 
     this.logFn("ai_chat", `Should respond to [${msg.channel}] ${msg.sender}: ${reason}`);
 
-    // Select responder for non-mention messages
+    // Select responder(s) for non-mention messages
     // For local chat, prefer the bot that received the message (guaranteed to be at correct location)
-    const responder = this.selectResponder(msg, msg.channel === "local" ? (msg.botUsername || "") : "");
-    if (!responder) {
+    const candidates = this.selectResponderCandidates(msg, msg.channel === "local" ? (msg.botUsername || "") : "");
+    if (candidates.length === 0) {
       this.logFn("ai_chat", "No available bot to respond");
       return;
     }
 
-    this.logFn("ai_chat", `Selected responder: ${responder.username}`);
-    await this.handleResponse(responder, msg, settings, msg.sender, true);
+    this.logFn("ai_chat", `Selected ${candidates.length} candidate bot(s): ${candidates.map(b => b.username).join(", ")}`);
+    
+    // Try each candidate until one succeeds
+    const triedBots = new Set<string>();
+    for (const candidate of candidates) {
+      triedBots.add(candidate.username);
+      const result = await this.handleResponse(candidate, msg, settings, msg.sender, true, triedBots);
+      if (result === "sent") {
+        break; // Success, stop trying
+      }
+    }
   }
 
   /**
    * Handle response logic (lock, limits, send).
    * For local chat, verifies bot is at same location as receiving bot.
+   * Returns: "sent" if response was sent, "failed" if not
    */
   private async handleResponse(
     responder: Bot,
@@ -837,21 +836,21 @@ export class AiChatService {
     humanSender: string,
     isHumanSender: boolean,
     triedBots: Set<string> = new Set()
-  ): Promise<void> {
+  ): Promise<"sent" | "failed"> {
     // Check conversation limits (cooldown, consecutive responses)
     // Use channel + human sender as key (not responder) so only one bot responds per conversation
     const participants = [humanSender]; // Don't include responder - conversation is per channel+sender
     const limits = this.checkConversationLimits(msg.channel, participants);
     if (!limits.allowed) {
       this.logFn("ai_chat", `Skipping: ${limits.reason}`);
-      return;
+      return "failed";
     }
 
     // Check global lock
     const channelId = `${msg.channel}:${responder.system || "unknown"}`;
     if (!this.canRespond(responder.username, humanSender, channelId, settings.lockDurationSec)) {
       this.logFn("ai_chat", `Lock held, skipping`);
-      return;
+      return "failed";
     }
 
     // For LOCAL chat: verify responder is at same location as receiving bot
@@ -860,52 +859,46 @@ export class AiChatService {
       const locationMatch = this.checkLocationMatch(responder, msg);
       if (!locationMatch.matched) {
         this.logFn("ai_chat", `${responder.username} at wrong location (${responder.system}/${responder.poi}), message was from ${msg.botSystem}/${msg.botPoi}`);
-
-        // Try to find a bot at the correct location
-        const locationBot = this.findBotAtLocation(msg, triedBots);
-        if (locationBot) {
-          this.logFn("ai_chat", `Found bot at correct location: ${locationBot.username}`);
-          triedBots.add(responder.username);
-          await this.handleResponse(locationBot, msg, settings, humanSender, isHumanSender, triedBots);
-          return;
-        } else {
-          this.logFn("ai_chat", "No bot at correct location, skipping response");
-          return;
-        }
+        return "failed"; // Caller will try next candidate
       }
     } else if (msg.channel === "local" && responder.username === msg.botUsername) {
       // Log that we're skipping location check for receiving bot
       this.logFn("ai_chat_debug", `Skipping location check for ${responder.username} (is the receiving bot)`);
     }
 
+    // For SYSTEM chat: verify responder is in the same system where the chat originated
+    // Skip this check if the responder IS the receiving bot (it obviously can respond to messages it received)
+    if (msg.channel === "system" && responder.username !== msg.botUsername && msg.botSystem) {
+      if (responder.system !== msg.botSystem) {
+        this.logFn("ai_chat", `${responder.username} not in system where chat originated (${responder.system} vs ${msg.botSystem})`);
+        return "failed"; // Caller will try next candidate
+      }
+    } else if (msg.channel === "system" && responder.username === msg.botUsername) {
+      // Log that we're skipping system check for receiving bot
+      this.logFn("ai_chat_debug", `Skipping system check for ${responder.username} (is the receiving bot)`);
+    }
+
     // Try to acquire lock
     if (!this.tryAcquireLock(responder.username, humanSender, channelId, settings.lockDurationSec)) {
       this.logFn("ai_chat", `Failed to acquire lock`);
-      return;
+      return "failed";
     }
 
     // Generate and send response (may fail if traveling for local chat)
     const result = await this.sendResponse(responder, msg, settings, humanSender, triedBots);
-    
+
     if (result === "traveling" && msg.channel === "local") {
-      // Bot was traveling, try to find another bot that received this message
-      this.logFn("ai_chat", `${responder.username} is traveling, trying to find alternative bot...`);
-      
-      const alternativeBot = this.findAlternativeBot(msg, responder.username, triedBots);
-      if (alternativeBot) {
-        this.logFn("ai_chat", `Found alternative: ${alternativeBot.username}`);
-        triedBots.add(responder.username);
-        await this.handleResponse(alternativeBot, msg, settings, humanSender, isHumanSender, triedBots);
-        return;
-      } else {
-        this.logFn("ai_chat", "No alternative bot available, skipping response");
-      }
+      // Bot was traveling, return failed so caller tries next candidate
+      this.logFn("ai_chat", `${responder.username} is traveling, will try next candidate...`);
+      return "failed";
     }
-    
+
     // Record this response for conversation tracking (only if not traveling)
     if (result !== "traveling") {
       this.recordResponse(msg.channel, participants, isHumanSender);
     }
+
+    return result === "sent" ? "sent" : "failed";
   }
 
   /**
@@ -925,67 +918,8 @@ export class AiChatService {
     if (responder.poi !== msg.botPoi) {
       return { matched: false, reason: `different POI: ${responder.poi} vs ${msg.botPoi}` };
     }
-    
+
     return { matched: true, reason: "location matches" };
-  }
-
-  /**
-   * Find a bot at the same location as the original message receiver.
-   */
-  private findBotAtLocation(msg: ChatMessage, triedBots: Set<string>): Bot | null {
-    const bots = AiChatService.getBots();
-    if (!bots || bots.length === 0) return null;
-    if (!msg.botSystem || !msg.botPoi) return null;
-
-    for (const bot of bots) {
-      if (triedBots.has(bot.username)) continue;
-      if (bot.state !== "running" && bot.state !== "idle") continue;
-      if (!bot.api.getSession()) continue;
-      
-      // Check if bot is at same location
-      if (bot.system === msg.botSystem && bot.poi === msg.botPoi) {
-        return bot;
-      }
-    }
-    
-    return null;
-  }
-
-  /**
-   * Find an alternative bot that also received the message and isn't traveling.
-   * For local chat, also verifies location match.
-   */
-  private findAlternativeBot(msg: ChatMessage, excludeBot: string, triedBots: Set<string>): Bot | null {
-    const bots = AiChatService.getBots();
-    if (!bots || bots.length === 0) return null;
-
-    // Find bots that aren't traveling and haven't been tried
-    for (const bot of bots) {
-      if (bot.username === excludeBot) continue;
-      if (triedBots.has(bot.username)) continue;
-      if (bot.state !== "running" && bot.state !== "idle") continue;
-      if (!bot.api.getSession()) continue;
-      
-      // Check if bot is traveling
-      if (!bot.poi || bot.poi === "") {
-        this.logFn("ai_chat_debug", `${bot.username} is traveling (no POI), skipping`);
-        continue;
-      }
-      
-      // For local chat, also check location match
-      if (msg.channel === "local") {
-        if (msg.botSystem && msg.botPoi) {
-          if (bot.system !== msg.botSystem || bot.poi !== msg.botPoi) {
-            this.logFn("ai_chat_debug", `${bot.username} at wrong location (${bot.system}/${bot.poi}), skipping`);
-            continue;
-          }
-        }
-      }
-      
-      return bot;
-    }
-    
-    return null;
   }
 
   /**
@@ -1003,46 +937,96 @@ export class AiChatService {
   }
 
   /**
-   * Select which bot should respond to a message.
-   * Priority: mentioned bot > receiving bot > any available bot
-   * Bots can be idle or running (AI Chat is a background service).
+   * Select candidate bots for responding to a message.
+   * Returns an array of bots in priority order (receiving bot first, then others by availability).
+   * For local/system chat, this helps ensure we try bots at the correct location first.
    */
-  private selectResponder(msg: ChatMessage, receivingBot: string): Bot | null {
+  private selectResponderCandidates(msg: ChatMessage, receivingBot: string): Bot[] {
     const bots = AiChatService.getBots();
-    this.logFn("ai_chat_debug", `selectResponder: receivingBot=${receivingBot}, total bots=${bots?.length || 0}`);
+    this.logFn("ai_chat_debug", `selectResponderCandidates: receivingBot=${receivingBot}, total bots=${bots?.length || 0}`);
     if (!bots || bots.length === 0) {
       this.logFn("ai_chat_debug", "No bots available");
-      return null;
+      return [];
     }
 
     // Log all bots and their states
     for (const b of bots) {
-      this.logFn("ai_chat_debug", `  Bot: ${b.username}, state=${b.state}, hasSession=${!!b.api.getSession()}`);
+      this.logFn("ai_chat_debug", `  Bot: ${b.username}, state=${b.state}, hasSession=${!!b.api.getSession()}, system=${b.system}, poi=${b.poi}`);
     }
 
-    // Find the receiving bot if specified
+    const candidates: Bot[] = [];
+    const addedBots = new Set<string>();
+
+    // Priority 1: The receiving bot (if specified) - it's guaranteed to be at the correct location for local chat
     if (receivingBot) {
       const target = bots.find(b => b.username === receivingBot);
-      this.logFn("ai_chat_debug", `Looking for ${receivingBot}: found=${!!target}, state=${target?.state}, session=${!!target?.api.getSession()}`);
+      this.logFn("ai_chat_debug", `Looking for receiving bot ${receivingBot}: found=${!!target}, state=${target?.state}, session=${!!target?.api.getSession()}`);
       if (target && (target.state === "running" || target.state === "idle") && target.api.getSession()) {
-        return target;
+        candidates.push(target);
+        addedBots.add(target.username);
       }
     }
 
-    // Find any available bot (idle or running with active session)
-    // Prefer bots that aren't currently locked
-    for (const bot of bots) {
-      this.logFn("ai_chat_debug", `Checking bot ${bot.username}: state=${bot.state}, locked=${this.globalChatLock?.botName === bot.username}`);
-      if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
-      if (this.globalChatLock && this.globalChatLock.botName === bot.username) continue;
-      this.logFn("ai_chat_debug", `Selected ${bot.username} as responder`);
-      return bot;
+    // Priority 2: For local/system chat, bots at the correct location/system
+    if (msg.channel === "local" && msg.botSystem && msg.botPoi) {
+      for (const bot of bots) {
+        if (addedBots.has(bot.username)) continue;
+        if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+        if (bot.system === msg.botSystem && bot.poi === msg.botPoi) {
+          this.logFn("ai_chat_debug", `Adding location-matched bot: ${bot.username}`);
+          candidates.push(bot);
+          addedBots.add(bot.username);
+        }
+      }
     }
 
-    // Fallback to first bot with session
-    const fallback = bots.find(b => (b.state === "running" || b.state === "idle") && b.api.getSession());
-    this.logFn("ai_chat_debug", `Fallback: ${fallback?.username || "none"}`);
-    return fallback || null;
+    // Priority 3: For system chat, bots in the correct system
+    if (msg.channel === "system" && msg.botSystem) {
+      for (const bot of bots) {
+        if (addedBots.has(bot.username)) continue;
+        if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+        if (bot.system === msg.botSystem) {
+          this.logFn("ai_chat_debug", `Adding system-matched bot: ${bot.username}`);
+          candidates.push(bot);
+          addedBots.add(bot.username);
+        }
+      }
+    }
+
+    // Priority 4: Any available bot (idle or running with active session)
+    // Prefer bots that aren't currently locked
+    for (const bot of bots) {
+      if (addedBots.has(bot.username)) continue;
+      if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+      if (this.globalChatLock && this.globalChatLock.botName === bot.username) {
+        this.logFn("ai_chat_debug", `Skipping locked bot: ${bot.username}`);
+        continue;
+      }
+      candidates.push(bot);
+      addedBots.add(bot.username);
+    }
+
+    // Fallback: Any bot with session (even if state is unusual)
+    for (const bot of bots) {
+      if (addedBots.has(bot.username)) continue;
+      if (bot.api.getSession()) {
+        candidates.push(bot);
+        addedBots.add(bot.username);
+      }
+    }
+
+    this.logFn("ai_chat_debug", `Returning ${candidates.length} candidate(s): ${candidates.map(b => b.username).join(", ")}`);
+    return candidates;
+  }
+
+  /**
+   * Select which bot should respond to a message (legacy single-bot version).
+   * Priority: receiving bot > any available bot
+   * Bots can be idle or running (AI Chat is a background service).
+   */
+  private selectResponder(msg: ChatMessage, receivingBot: string): Bot | null {
+    const candidates = this.selectResponderCandidates(msg, receivingBot);
+    return candidates.length > 0 ? candidates[0] : null;
   }
 
   private canRespond(botName: string, sender: string, channel: string, lockDurationSec: number): boolean {

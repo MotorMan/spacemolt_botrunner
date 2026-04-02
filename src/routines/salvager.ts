@@ -24,6 +24,8 @@ import {
   processTowedWrecks,
   getSystemInfo,
   sleep,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -130,6 +132,12 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "salvager")) {
+      await sleep(5000);
+      continue;
+    }
 
     // ── Verify tow status — clear stale flag if server says we're not towing ──
     await bot.refreshStatus();

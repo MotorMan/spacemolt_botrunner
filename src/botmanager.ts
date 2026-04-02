@@ -46,6 +46,11 @@ export function getDiscoveredBots(): string[] {
   return [...bots.keys()];
 }
 
+/** Get a bot by name (for API use). */
+export function getBot(name: string): Bot | undefined {
+  return bots.get(name);
+}
+
 const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   miner: { name: "Miner", fn: minerRoutine },
   explorer: { name: "Explorer", fn: explorerRoutine },

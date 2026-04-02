@@ -26,6 +26,8 @@ import {
   findStation,
   isStationPoi,
   type SystemPOI,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -339,6 +341,12 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(10000); continue; }
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "cleanup")) {
+      await sleep(5000);
+      continue;
+    }
 
     const settings = getCleanupSettings(bot.username);
     const safetyOpts = {

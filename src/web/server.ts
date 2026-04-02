@@ -1,6 +1,7 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
 import { join } from "path";
 import type { BotStatus } from "../bot.js";
+import { getBot } from "../botmanager.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import type { ServerWebSocket } from "bun";
@@ -340,6 +341,97 @@ export class WebServer {
             return Response.json(result);
           }
           return Response.json({ ok: false, error: "No action handler" });
+        }
+
+        // Per-bot battle status endpoint
+        if (url.pathname.startsWith("/api/bot/") && url.pathname.endsWith("/battle-status") && req.method === "GET") {
+          const botName = decodeURIComponent(url.pathname.slice("/api/bot/".length, -"/battle-status".length));
+          const bot = getBot(botName);
+          if (!bot) {
+            return Response.json({ error: { code: "not_found", message: `Bot ${botName} not found` } });
+          }
+          try {
+            const result = await bot.exec("get_battle_status");
+            if (result.error) {
+              // Not in battle is OK - return null battle
+              if ((result.error as Record<string, unknown>).code === "not_in_battle") {
+                return Response.json({ battle: null });
+              }
+              return Response.json({ error: result.error });
+            }
+            return Response.json({ battle: result.result });
+          } catch (err) {
+            return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
+          }
+        }
+
+        // Per-bot reload endpoint
+        if (url.pathname.startsWith("/api/bot/") && url.pathname.endsWith("/reload") && req.method === "POST") {
+          const botName = decodeURIComponent(url.pathname.slice("/api/bot/".length, -"/reload".length));
+          const body = await req.json();
+          const bot = getBot(botName);
+          if (!bot) {
+            return Response.json({ error: { code: "not_found", message: `Bot ${botName} not found` } });
+          }
+          try {
+            const result = await bot.exec("reload", {
+              weapon_instance_id: body.weapon_instance_id,
+              ammo_item_id: body.ammo_item_id
+            });
+            return Response.json(result);
+          } catch (err) {
+            return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
+          }
+        }
+
+        // Per-bot action endpoint (for battle commands)
+        if (url.pathname.startsWith("/api/bot/") && url.pathname.endsWith("/action") && req.method === "POST") {
+          const botName = decodeURIComponent(url.pathname.slice("/api/bot/".length, -"/action".length));
+          const body = await req.json();
+          const bot = getBot(botName);
+          if (!bot) {
+            return Response.json({ error: { code: "not_found", message: `Bot ${botName} not found` } });
+          }
+          try {
+            // Map battle actions to game commands
+            const { type, action, ...params } = body;
+            let command: string;
+            let cmdParams: Record<string, unknown> = {};
+            
+            if (type === "battle") {
+              switch (action) {
+                case "advance":
+                  command = "battle";
+                  cmdParams = { action: "advance" };
+                  break;
+                case "retreat":
+                  command = "battle";
+                  cmdParams = { action: "retreat" };
+                  break;
+                case "stance":
+                  command = "battle";
+                  cmdParams = { action: "stance", stance: params.stance };
+                  break;
+                case "target":
+                  command = "battle";
+                  cmdParams = { action: "target", target_id: params.target_id };
+                  break;
+                case "engage":
+                  command = "battle";
+                  cmdParams = { action: "engage", ...(params.side_id ? { side_id: params.side_id } : {}) };
+                  break;
+                default:
+                  return Response.json({ error: { code: "invalid_action", message: `Unknown battle action: ${action}` } });
+              }
+            } else {
+              return Response.json({ error: { code: "invalid_type", message: `Unknown action type: ${type}` } });
+            }
+            
+            const result = await bot.exec(command, cmdParams);
+            return Response.json(result);
+          } catch (err) {
+            return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
+          }
         }
 
         // Serve index.css

@@ -13,6 +13,8 @@ import {
   readSettings,
   sleep,
   logStatus,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
 } from "./common.js";
 import { getNextMayday, markMaydayHandled, clearMaydayQueue, type MaydayRequest } from "../mayday.js";
 import { getNextManualRescue, markManualRescueHandled, type ManualRescueRequest } from "../manualrescue.js";
@@ -290,6 +292,12 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "rescue")) {
+      await sleep(5000);
+      continue;
+    }
 
     // ── Clean up expired rescue announcements ──
     cleanupExpiredAnnouncements();

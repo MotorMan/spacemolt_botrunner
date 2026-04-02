@@ -24,6 +24,8 @@ import {
   logFactionActivity,
   isPirateSystem,
   type BaseServices,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
 } from "./common.js";
 import {
   getActiveSession,
@@ -437,6 +439,12 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "trade_buyer")) {
+      await sleep(5000);
+      continue;
+    }
 
     // ── Trade session recovery ──
     const activeSession = getActiveSession(bot.username);

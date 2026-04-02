@@ -24,6 +24,8 @@ import {
   readSettings,
   sleep,
   isPirateSystem,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
 } from "./common.js";
 import {
   getActiveSession,
@@ -307,6 +309,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "faction_trader")) {
+      await sleep(5000);
+      continue;
+    }
 
     // ── Detect faction membership early ──
     // Check if bot is in a faction by attempting to view faction storage

@@ -24,6 +24,8 @@ import {
   sleep,
   logFactionActivity,
   isPirateSystem,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
 } from "./common.js";
 import {
   getActiveSession,
@@ -705,6 +707,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "trader")) {
+      await sleep(5000);
+      continue;
+    }
 
     // ── Fleet coordination cleanup (periodic stale lock cleanup) ──
     const cleanedLocks = cleanupStaleLocks();

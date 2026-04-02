@@ -21,6 +21,8 @@ import {
   writeSettings,
   sleep,
   logFactionActivity,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
 } from "./common.js";
 
 /** Simple dock function that does NOT call collectFromStorage. */
@@ -375,6 +377,12 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) {
       await sleep(30000);
+      continue;
+    }
+
+    // Battle check
+    if (await checkAndFleeFromBattle(ctx, "cargo_mover")) {
+      await sleep(5000);
       continue;
     }
 

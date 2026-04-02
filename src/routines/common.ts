@@ -2613,6 +2613,75 @@ export async function handleBattleNotifications(
 }
 
 /**
+ * Quick battle status check with automatic flee.
+ * Use this in routines that don't need full battle state tracking.
+ * Returns true if battle was detected and flee was initiated.
+ * 
+ * @param ctx - Routine context
+ * @param logPrefix - Optional prefix for log messages (e.g., routine name)
+ * @returns true if battle detected and flee initiated, false otherwise
+ */
+export async function checkAndFleeFromBattle(
+  ctx: RoutineContext,
+  logPrefix?: string,
+): Promise<boolean> {
+  const battleStatus = await getBattleStatus(ctx);
+  if (battleStatus && battleStatus.is_participant) {
+    const prefix = logPrefix ? `[${logPrefix}] ` : "";
+    ctx.log("combat", `${prefix}BATTLE DETECTED! Battle ID: ${battleStatus.battle_id} - fleeing!`);
+    await fleeFromBattle(ctx, true, 35000);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Check battle status and handle notifications after a command.
+ * Use this wrapper pattern in routines: 
+ *   const resp = await bot.exec("command");
+ *   if (await checkBattleAfterCommand(ctx, resp.notifications, "command_name")) {
+ *     // Handle battle - command was interrupted
+ *     return; // or continue/break depending on loop
+ *   }
+ * 
+ * @param ctx - Routine context  
+ * @param notifications - Notifications from the command response
+ * @param commandName - Name of the command (for logging)
+ * @param battleState - Optional battle state for tracking
+ * @returns true if battle detected and flee initiated, false otherwise
+ */
+export async function checkBattleAfterCommand(
+  ctx: RoutineContext,
+  notifications: unknown[] | undefined,
+  commandName: string,
+  battleState?: BattleState,
+): Promise<boolean> {
+  if (!notifications || !Array.isArray(notifications)) {
+    return false;
+  }
+
+  // Check notifications first
+  if (battleState) {
+    const battleDetected = await handleBattleNotifications(ctx, notifications, battleState);
+    if (battleDetected) {
+      return true;
+    }
+  } else {
+    // Simple mode - just check for battle start events
+    const battleNotifs = parseBattleNotifications(notifications);
+    const hasBattleStart = battleNotifs.some(n => n.type === "battle_start" || n.type === "battle_hit");
+    if (hasBattleStart) {
+      ctx.log("combat", `Battle detected during ${commandName} - fleeing!`);
+      await fleeFromBattle(ctx, true, 35000);
+      return true;
+    }
+  }
+
+  // Fallback: check battle status directly
+  return await checkAndFleeFromBattle(ctx, commandName);
+}
+
+/**
  * Emergency flee response when pirates are detected in get_nearby.
  * If not in a battle, immediately jump to a random adjacent system.
  * If already in battle, use flee stance.

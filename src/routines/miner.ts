@@ -31,6 +31,12 @@ import {
   createMiningSession,
   type MiningSession,
 } from "./minerActivity.js";
+import {
+  type BattleState,
+  handleBattleNotifications,
+  getBattleStatus,
+  fleeFromBattle,
+} from "./common.js";
 
 // ── Mission helpers ───────────────────────────────────────────
 
@@ -403,6 +409,15 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Battle state tracking (per-cycle initialization) ──
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
+
     const settings = getMinerSettings(bot.username);
     const cargoThresholdRatio = settings.cargoThreshold / 100;
     const safetyOpts = {
@@ -740,6 +755,17 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Travel to mining location ──
     yield miningType === "ice" ? "travel_to_ice_field" : (miningType === "ore" ? "travel_to_belt" : "travel_to_cloud");
     const travelResp = await bot.exec("travel", { target_poi: miningPoi.id });
+    
+    // Check for battle notifications during travel
+    if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
+      const battleDetected = await handleBattleNotifications(ctx, travelResp.notifications, battleState);
+      if (battleDetected) {
+        ctx.log("error", "Battle detected during travel - fleeing!");
+        await sleep(5000);
+        continue;
+      }
+    }
+    
     if (travelResp.error && !travelResp.error.message.includes("already")) {
       ctx.log("error", `Travel failed: ${travelResp.error.message}`);
       await sleep(5000);
@@ -749,6 +775,27 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Check for pirates at mining location
     const nearbyResp = await bot.exec("get_nearby");
+
+    // Check for battle notifications in get_nearby response
+    if (nearbyResp.notifications && Array.isArray(nearbyResp.notifications)) {
+      const battleDetected = await handleBattleNotifications(ctx, nearbyResp.notifications, battleState);
+      if (battleDetected) {
+        ctx.log("error", "Battle detected at mining location - fleeing!");
+        await sleep(30000);
+        continue;
+      }
+    }
+
+    // Also check battle status directly (in case we missed notifications)
+    const directBattleStatus = await getBattleStatus(ctx);
+    if (directBattleStatus && directBattleStatus.is_participant) {
+      ctx.log("combat", `Direct battle status check: IN BATTLE (ID: ${directBattleStatus.battle_id}) - fleeing!`);
+      await fleeFromBattle(ctx, true, 35000);
+      ctx.log("error", "Battle detected via status check - fled, will retry mining");
+      await sleep(30000);
+      continue;
+    }
+
     if (nearbyResp.result && typeof nearbyResp.result === "object") {
       const { checkAndFleeFromPirates } = await import("./common.js");
       const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
@@ -778,7 +825,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let stopReason = "";
     const resourcesMinedMap = new Map<string, number>();
     let lastPoiCheck = 0;
+    let lastBattleCheck = 0;
     const POI_CHECK_INTERVAL_MS = 60_000; // Check POI remaining every 60 seconds
+    const BATTLE_CHECK_INTERVAL_MS = 8_000; // Check battle status every 8 seconds (< 1 game tick)
 
     while (bot.state === "running") {
       await bot.refreshStatus();
@@ -789,8 +838,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (midFuel < safetyOpts.fuelThresholdPct) { stopReason = `fuel low (${midFuel}%)`; break; }
 
-      // Periodically check POI to see if resource is depleted (remaining: 0)
+      // Periodic battle status check (backup detection in case notifications fail)
       const now = Date.now();
+      if ((now - lastBattleCheck) > BATTLE_CHECK_INTERVAL_MS) {
+        lastBattleCheck = now;
+        const battleStatusCheck = await getBattleStatus(ctx);
+        if (battleStatusCheck && battleStatusCheck.is_participant) {
+          ctx.log("combat", `PERIODIC CHECK: IN BATTLE! Battle ID: ${battleStatusCheck.battle_id} - fleeing!`);
+          battleState.inBattle = true;
+          battleState.battleId = battleStatusCheck.battle_id;
+          await fleeFromBattle(ctx, true, 35000);
+          stopReason = "battle detected (status check)";
+          break;
+        }
+      }
+
+      // Periodically check POI to see if resource is depleted (remaining: 0)
       if (effectiveTarget && bot.poi && !settings.ignoreDepletion &&
           (now - lastPoiCheck) > POI_CHECK_INTERVAL_MS) {
         lastPoiCheck = now;
@@ -865,6 +928,17 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                         
                         // Travel to new POI
                         const travelResp = await bot.exec("travel", { target_poi: chosen.poiId });
+                        
+                        // Check for battle notifications
+                        if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
+                          const battleDetected = await handleBattleNotifications(ctx, travelResp.notifications, battleState);
+                          if (battleDetected) {
+                            ctx.log("error", "Battle detected while changing POI - fleeing!");
+                            stopReason = "battle detected";
+                            break;
+                          }
+                        }
+                        
                         if (!travelResp.error || travelResp.error.message.includes("already")) {
                           bot.poi = chosen.poiId;
                           miningPoi = { id: chosen.poiId, name: chosen.poiName };
@@ -893,7 +967,28 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (stopReason) break;
       }
 
+      // Pre-mine battle check - prevents mine command from freezing if battle starts
+      const preMineBattleCheck = await getBattleStatus(ctx);
+      if (preMineBattleCheck && preMineBattleCheck.is_participant) {
+        ctx.log("combat", `PRE-MINE CHECK: IN BATTLE! Battle ID: ${preMineBattleCheck.battle_id} - fleeing!`);
+        battleState.inBattle = true;
+        battleState.battleId = preMineBattleCheck.battle_id;
+        await fleeFromBattle(ctx, true, 35000);
+        stopReason = "battle detected (pre-mine)";
+        break;
+      }
+
       const mineResp = await bot.exec("mine");
+
+      // Check for battle notifications after mining
+      if (mineResp.notifications && Array.isArray(mineResp.notifications)) {
+        const battleDetected = await handleBattleNotifications(ctx, mineResp.notifications, battleState);
+        if (battleDetected) {
+          ctx.log("error", "Battle detected while mining - fleeing!");
+          stopReason = "battle detected";
+          break;
+        }
+      }
 
       if (mineResp.error) {
         const msg = mineResp.error.message.toLowerCase();
@@ -1067,6 +1162,17 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             if (newPoiId !== bot.poi) {
               ctx.log("mining", `Traveling to new target: ${newTarget} @ ${newPoiName}`);
               const travelResp = await bot.exec("travel", { target_poi: newPoiId });
+              
+              // Check for battle notifications
+              if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
+                const battleDetected = await handleBattleNotifications(ctx, travelResp.notifications, battleState);
+                if (battleDetected) {
+                  ctx.log("error", "Battle detected while traveling to new target - fleeing!");
+                  stopReason = "battle detected";
+                  break;
+                }
+              }
+              
               if (travelResp.error && !travelResp.error.message.includes("already")) {
                 ctx.log("error", `Travel to new target failed: ${travelResp.error.message}`);
                 stopReason = `${resourceLabel} field depleted (travel failed)`;

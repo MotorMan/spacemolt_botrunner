@@ -3,32 +3,36 @@
  *
  * Responsibilities:
  * - Decide patrol systems and POIs
- * - Broadcast movement commands via faction chat
+ * - Send movement commands via local fleet communication
  * - Call targets for fleet to engage
  * - Coordinate fleet positioning during combat
  * - Order retreats when danger is detected
  * - Manage post-patrol logistics (dock, repair, resupply)
  *
  * Communication:
- * - Uses faction chat to broadcast commands to subordinates
- * - Format: [FLEET CMD] <COMMAND> <params>
+ * - Uses local fleet comm service (no faction chat spam)
  * - Commands: MOVE, ATTACK, FLEE, REGROUP, HOLD, PATROL
+ * - Optional: Also broadcast to faction chat if enableFactionBroadcast is true
  *
  * Settings (data/settings.json under "fleet_hunter"):
- *   fleetId           — unique identifier for this fleet (for chat filtering)
- *   patrolSystem      — system ID to patrol (default: current system)
- *   refuelThreshold   — fuel % to trigger refuel stop (default: 40)
- *   repairThreshold   — hull % to abort patrol and dock (default: 30)
- *   fleeThreshold     — hull % to flee an active fight (default: 20)
- *   maxAttackTier     — highest pirate tier to engage (default: "large")
- *   fleeFromTier      — pirate tier that triggers fleet flee (default: "boss")
- *   minPiratesToFlee  — number of pirates that triggers fleet flee (default: 3)
- *   fireMode          — "focus" (all fire same target) or "spread" (split targets)
- *   fleetSize         — expected number of subordinates (for coordination)
+ *   fleetId              — unique identifier for this fleet
+ *   patrolSystem         — system ID to patrol (default: current system)
+ *   refuelThreshold      — fuel % to trigger refuel stop (default: 40)
+ *   repairThreshold      — hull % to abort patrol and dock (default: 30)
+ *   fleeThreshold        — hull % to flee an active fight (default: 20)
+ *   maxAttackTier        — highest pirate tier to engage (default: "large")
+ *   fleeFromTier         — pirate tier that triggers fleet flee (default: "boss")
+ *   minPiratesToFlee     — number of pirates that triggers fleet flee (default: 3)
+ *   fireMode             — "focus" (all fire same target) or "spread" (split targets)
+ *   fleetSize            — expected number of subordinates (for coordination)
+ *   huntingEnabled       — enable/disable hunting (default: true)
+ *   manualMode           — manual control mode (default: false)
+ *   enableFactionBroadcast — also send commands to faction chat (default: false)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { fleetCommService } from "../fleet_comm.js";
 import {
   findStation,
   isStationPoi,
@@ -170,6 +174,9 @@ function getFleetHunterSettings(): {
   ammoThreshold: number;
   maxReloadAttempts: number;
   responseRange: number;
+  huntingEnabled: boolean;
+  manualMode: boolean;
+  enableFactionBroadcast: boolean;
 } {
   const all = readSettings();
   const h = all.fleet_hunter || {};
@@ -189,24 +196,34 @@ function getFleetHunterSettings(): {
     ammoThreshold: (h.ammoThreshold as number) || 5,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
     responseRange: (h.responseRange as number) ?? 3,
+    huntingEnabled: (h.huntingEnabled as boolean) ?? true,
+    manualMode: (h.manualMode as boolean) ?? false,
+    enableFactionBroadcast: (h.enableFactionBroadcast as boolean) ?? false,
   };
 }
 
 // ── Fleet command broadcasting ───────────────────────────────
 
-/** Broadcast a command to the fleet via faction chat. */
+/** Broadcast a command to the fleet via local comm (and optionally faction chat). */
 async function broadcastFleetCommand(ctx: RoutineContext, command: string, params: string): Promise<void> {
   const settings = getFleetHunterSettings();
   const msg = `[FLEET ${settings.fleetId}] ${command} ${params}`;
-  
-  try {
-    await ctx.bot.exec("chat", {
-      channel: "faction",
-      content: msg,
-    });
-    ctx.log("fleet", `Broadcast: ${msg}`);
-  } catch (e) {
-    ctx.log("error", `Failed to broadcast fleet command: ${e}`);
+
+  // Always send via local fleet comm service
+  await fleetCommService.broadcast(settings.fleetId, command as any, params || undefined, ctx.bot.username);
+  ctx.log("fleet", `Broadcast (local): ${command} ${params || ""}`);
+
+  // Optionally also send via faction chat (for compatibility with old subordinates or debugging)
+  if (settings.enableFactionBroadcast) {
+    try {
+      await ctx.bot.exec("chat", {
+        channel: "faction",
+        content: msg,
+      });
+      ctx.log("fleet", `Broadcast (faction): ${msg}`);
+    } catch (e) {
+      ctx.log("error", `Failed to broadcast fleet command to faction: ${e}`);
+    }
   }
 }
 
@@ -480,25 +497,45 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
   await bot.refreshStatus();
   let totalKills = 0;
 
+  // Register as commander with fleet comm service
+  const settings = getFleetHunterSettings();
+  fleetCommService.setCommander(settings.fleetId, bot.username);
+  ctx.log("fleet", `Registered as commander for fleet ${settings.fleetId}`);
+
   ctx.log("fleet", "Fleet Hunter Commander online — waiting for subordinates...");
   await sleep(3000); // Give subordinates time to join
 
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { 
+    if (!alive) {
       await orderFleetRegroup(ctx, bot.system, bot.poi || undefined);
-      await sleep(30000); 
-      continue; 
+      await sleep(30000);
+      continue;
     }
 
-    const settings = getFleetHunterSettings();
+    const currentSettings = getFleetHunterSettings();
+    
+    // Check if hunting is disabled
+    if (!currentSettings.huntingEnabled) {
+      ctx.log("fleet", "Hunting is disabled — waiting...");
+      await sleep(5000);
+      continue;
+    }
+
+    // In manual mode, wait for commands
+    if (currentSettings.manualMode) {
+      ctx.log("fleet", "Manual mode active — awaiting commands");
+      await sleep(2000);
+      continue;
+    }
+
     const safetyOpts = {
-      fuelThresholdPct: settings.refuelThreshold,
-      hullThresholdPct: settings.repairThreshold,
-      autoCloak: settings.autoCloak,
+      fuelThresholdPct: currentSettings.refuelThreshold,
+      hullThresholdPct: currentSettings.repairThreshold,
+      autoCloak: currentSettings.autoCloak,
     };
-    const patrolSystem = settings.patrolSystem || "";
+    const patrolSystem = currentSettings.patrolSystem || "";
 
     // ── Status ──
     yield "get_status";
@@ -507,7 +544,7 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
 
     // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    const fueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await sleep(30000);
@@ -517,18 +554,18 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
     // ── Hull check ──
     await bot.refreshStatus();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-    if (hullPct <= settings.repairThreshold) {
+    if (hullPct <= currentSettings.repairThreshold) {
       ctx.log("system", `Hull at ${hullPct}% — ordering fleet to retreat for repairs`);
       yield "emergency_repair";
       await orderFleetRegroup(ctx, bot.system); // Order regroup before docking
-      
+
       const docked = await ensureDocked(ctx);
       if (docked) {
         await repairShip(ctx);
         await tryRefuel(ctx);
         await ensureInsured(ctx);
         await ensureUndocked(ctx);
-        
+
         // Order fleet to regroup at current position
         await orderFleetRegroup(ctx, bot.system, bot.poi || undefined);
       }

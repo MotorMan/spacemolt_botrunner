@@ -191,7 +191,8 @@
       <div class="commandall-header">
         <h3>Fleet Combat Control</h3>
         <p style="color:var(--text-dim);font-size:12px;margin:4px 0 0 0">
-          Control your fleet of hunter bots. Commands are sent via faction chat to bots running the Fleet Hunter routines.
+          Control your fleet of hunter bots. Commands are sent locally (no faction chat spam).
+          Enable/Disable hunting or switch to manual mode for full control.
         </p>
       </div>
       <div class="commandall-body">
@@ -9266,6 +9267,9 @@ function renderFleetHunterSettings(panel) {
   const autoCloak = fh.autoCloak ?? false;
   const ammoThreshold = fh.ammoThreshold ?? 5;
   const maxReloadAttempts = fh.maxReloadAttempts ?? 3;
+  const huntingEnabled = fh.huntingEnabled ?? true;
+  const manualMode = fh.manualMode ?? false;
+  const enableFactionBroadcast = fh.enableFactionBroadcast ?? false;
 
   const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
   const tierOpts = tierOptions.map(t => `<option value="${t}"${t === maxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
@@ -9301,6 +9305,39 @@ function renderFleetHunterSettings(panel) {
       <select id="set-fleet-hunter-fireMode">
         <option value="spread"${fireMode === 'spread' ? ' selected' : ''}>Spread Fire</option>
         <option value="focus"${fireMode === 'focus' ? ' selected' : ''}>Focus Fire</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Hunting Enabled</div>
+        <div class="setting-hint">Enable or disable autonomous hunting. When disabled, fleet will wait in manual mode.</div>
+      </div>
+      <select id="set-fleet-hunter-huntingEnabled">
+        <option value="true"${huntingEnabled ? ' selected' : ''}>Enabled (Autonomous)</option>
+        <option value="false"${!huntingEnabled ? ' selected' : ''}>Disabled (Paused)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Manual Mode</div>
+        <div class="setting-hint">When enabled, fleet waits for your commands. When disabled, fleet hunts autonomously.</div>
+      </div>
+      <select id="set-fleet-hunter-manualMode">
+        <option value="false"${!manualMode ? ' selected' : ''}>Auto (Autonomous)</option>
+        <option value="true"${manualMode ? ' selected' : ''}>Manual (Wait for Commands)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Broadcast to Faction Chat</div>
+        <div class="setting-hint">Also send fleet commands to faction chat (for compatibility or debugging). Adds chat spam.</div>
+      </div>
+      <select id="set-fleet-hunter-enableFactionBroadcast">
+        <option value="false"${!enableFactionBroadcast ? ' selected' : ''}>Disabled (Local Only)</option>
+        <option value="true"${enableFactionBroadcast ? ' selected' : ''}>Enabled (Broadcast)</option>
       </select>
     </div>
 
@@ -9416,6 +9453,9 @@ function saveFleetHunterSettings() {
     autoCloak: document.getElementById('set-fleet-hunter-autoCloak').value === 'true',
     ammoThreshold: parseInt(document.getElementById('set-fleet-hunter-ammoThreshold').value) || 5,
     maxReloadAttempts: parseInt(document.getElementById('set-fleet-hunter-maxReloadAttempts').value) || 3,
+    huntingEnabled: document.getElementById('set-fleet-hunter-huntingEnabled').value === 'true',
+    manualMode: document.getElementById('set-fleet-hunter-manualMode').value === 'true',
+    enableFactionBroadcast: document.getElementById('set-fleet-hunter-enableFactionBroadcast').value === 'true',
   };
   send({ type: 'saveSettings', routine: 'fleet_hunter', settings: s });
   settings.fleet_hunter = s;
@@ -11479,6 +11519,8 @@ function caLog(html) {
 
 let fleetCombatFleetId = 'default';
 let fleetCombatFireMode = 'spread';
+let fleetCombatHuntingEnabled = true;
+let fleetCombatManualMode = false;
 
 /** Render the Fleet Combat controls panel */
 function renderFleetCombatControls() {
@@ -11490,6 +11532,8 @@ function renderFleetCombatControls() {
   const fleetHunterSettings = settings.fleet_hunter || {};
   fleetCombatFleetId = fleetHunterSettings.fleetId || 'default';
   fleetCombatFireMode = fleetHunterSettings.fireMode || 'spread';
+  fleetCombatHuntingEnabled = fleetHunterSettings.huntingEnabled ?? true;
+  fleetCombatManualMode = fleetHunterSettings.manualMode ?? false;
 
   // Build bot list for commander selection
   const botOpts = bots.length > 0
@@ -11531,6 +11575,28 @@ function renderFleetCombatControls() {
         <option value="focus"${fleetCombatFireMode === 'focus' ? ' selected' : ''}>Focus Fire (all bots attack same target)</option>
       </select>
       <button class="sm" onclick="fcSetFireMode()">Set</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Hunting Status</label>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+        <button class="${fleetCombatHuntingEnabled ? 'primary' : 'sm'}" onclick="fcSetHuntingEnabled(true)" ${fleetCombatHuntingEnabled ? 'disabled' : ''}>▶ Enable Hunting</button>
+        <button class="${!fleetCombatHuntingEnabled ? 'danger' : 'sm'}" onclick="fcSetHuntingEnabled(false)" ${!fleetCombatHuntingEnabled ? 'disabled' : ''}>⏸ Disable Hunting</button>
+        <span style="margin-left:auto;font-size:12px;color:${fleetCombatHuntingEnabled ? 'var(--green)' : 'var(--red)'};font-weight:600">
+          ${fleetCombatHuntingEnabled ? '🟢 ACTIVE' : '🔴 PAUSED'}
+        </span>
+      </div>
+    </div>
+
+    <div class="cmd-group">
+      <label>Control Mode</label>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+        <button class="${!fleetCombatManualMode ? 'primary' : 'sm'}" onclick="fcSetManualMode(false)" ${!fleetCombatManualMode ? 'disabled' : ''}>🤖 Auto</button>
+        <button class="${fleetCombatManualMode ? 'primary' : 'sm'}" onclick="fcSetManualMode(true)" ${fleetCombatManualMode ? 'disabled' : ''}>🎮 Manual</button>
+        <span style="margin-left:auto;font-size:12px;color:var(--text-dim)">
+          ${fleetCombatManualMode ? 'Manual: Awaiting your commands' : 'Auto: Autonomous hunting'}
+        </span>
+      </div>
     </div>
 
     <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
@@ -11653,6 +11719,42 @@ function fcSetFireMode() {
     }),
   }).then(() => {
     logFleetCombat('Fire mode saved to settings');
+  }).catch(err => {
+    logFleetCombat(`Error saving: ${err.message}`, 'error');
+  });
+}
+
+function fcSetHuntingEnabled(enabled) {
+  fleetCombatHuntingEnabled = enabled;
+  logFleetCombat(`Hunting ${enabled ? 'enabled' : 'disabled'}`);
+
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fleet_hunter: { huntingEnabled: enabled },
+    }),
+  }).then(() => {
+    logFleetCombat(`Hunting ${enabled ? 'enabled' : 'disabled'} in settings`);
+    renderFleetCombatControls(); // Re-render to update button states
+  }).catch(err => {
+    logFleetCombat(`Error saving: ${err.message}`, 'error');
+  });
+}
+
+function fcSetManualMode(manual) {
+  fleetCombatManualMode = manual;
+  logFleetCombat(`${manual ? 'Entered manual mode' : 'Returned to auto mode'}`);
+
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fleet_hunter: { manualMode: manual },
+    }),
+  }).then(() => {
+    logFleetCombat(`${manual ? 'Manual mode enabled' : 'Auto mode enabled'} in settings`);
+    renderFleetCombatControls(); // Re-render to update button states
   }).catch(err => {
     logFleetCombat(`Error saving: ${err.message}`, 'error');
   });

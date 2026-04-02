@@ -293,6 +293,7 @@ export class Bot {
       const code = resp.error.code || "";
       const quiet =
         code === "mission_incomplete" ||
+        code === "not_in_battle" ||
         (command === "view_faction_storage" && code !== "session_invalid") ||
         (command === "get_missions" && code !== "session_invalid") ||
         (command === "complete_mission" && code === "mission_incomplete") ||

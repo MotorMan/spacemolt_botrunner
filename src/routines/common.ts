@@ -1277,6 +1277,14 @@ export async function navigateToSystem(
     // Check for customs inspection after entering new system
     await checkCustomsInspection(ctx, nextSystem);
 
+    // Check for battle status after jump (in case we jumped into an active battle)
+    const battleStatus = await getBattleStatus(ctx);
+    if (battleStatus && battleStatus.is_participant) {
+      ctx.log("combat", `JUMPED INTO BATTLE! Battle ID: ${battleStatus.battle_id} - initiating emergency flee!`);
+      await fleeFromBattle(ctx, true, 35000);
+      return false; // Aborted navigation due to battle
+    }
+
     // Check for pirates in the new system and flee if detected
     const nearbyResp = await bot.exec("get_nearby");
     if (nearbyResp.result && typeof nearbyResp.result === "object") {
@@ -2080,6 +2088,177 @@ export async function factionDonateProfit(ctx: RoutineContext, profit: number): 
 
 // ── Combat Detection & Flee ─────────────────────────────────
 
+/** Battle notification types detected from notification parsing */
+export interface BattleNotification {
+  type: "battle_start" | "battle_tick" | "battle_hit" | "battle_end" | "battle_disengage" | "battle_flee_success" | "battle_flee_failed";
+  battleId?: string;
+  tick?: number;
+  message?: string;
+}
+
+/**
+ * Parse a notification to detect battle-related events.
+ * Based on actual game notification formats.
+ * 
+ * Raw notification structure:
+ * - type: "combat" | "system"
+ * - msg_type: "battle_started" | "battle_joined" | "battle_tick" | etc.
+ * - data: { message: "..." } or structured battle data
+ * 
+ * Message formats (without UI prefixes):
+ * - "Battle started! ID: {battle_id}"
+ * - "Battle tick {tick} - combat continues"
+ * - "{attacker} hit {defender} for {damage} damage"
+ * - "{player} left the battle"
+ * - "Battle ended!"
+ * - "You have disengaged from battle."
+ * 
+ * @param notification - Raw notification object
+ * @returns BattleNotification if battle-related, null otherwise
+ */
+export function parseBattleNotification(notification: unknown): BattleNotification | null {
+  if (!notification || typeof notification !== "object") {
+    return null;
+  }
+
+  const notif = notification as Record<string, unknown>;
+  const type = notif.type as string | undefined;
+  const msgType = notif.msg_type as string | undefined;
+  let data = notif.data as Record<string, unknown> | string | undefined;
+
+  // Parse data if it's a string (json.RawMessage)
+  if (typeof data === "string") {
+    try { data = JSON.parse(data) as Record<string, unknown>; } catch { /* leave as string */ }
+  }
+
+  // Get message text from notification
+  let message = "";
+  if (data && typeof data === "object") {
+    message = (data.message as string) || formatNotificationData(data);
+  } else if (typeof data === "string") {
+    message = data;
+  }
+
+  if (!message) return null;
+
+  const lowerMsg = message.toLowerCase();
+
+  // Check for battle_started msg_type (system notification with structured data)
+  if (msgType === "battle_started" && data && typeof data === "object") {
+    const battleData = data as Record<string, unknown>;
+    const battleId = (battleData.battle_id as string) || "";
+    if (battleId) {
+      return {
+        type: "battle_start",
+        battleId,
+        message: `Battle started! ID: ${battleId}`,
+      };
+    }
+  }
+
+  // Check for battle_joined msg_type (we were pulled into a battle)
+  if (msgType === "battle_joined" && data && typeof data === "object") {
+    const joinData = data as Record<string, unknown>;
+    const battleId = (joinData.battle_id as string) || "";
+    // This notification doesn't include battle_id directly, but indicates we joined a battle
+    return {
+      type: "battle_start",
+      battleId: undefined, // Will be populated by get_battle_status
+      message: "Joined battle",
+    };
+  }
+
+  // Battle started notification (type: combat)
+  // Format: "Battle started! ID: {battle_id}"
+  if (type === "combat") {
+    const battleStartMatch = message.match(/Battle started!\s*ID:\s*([a-f0-9]+)/i);
+    if (battleStartMatch) {
+      return {
+        type: "battle_start",
+        battleId: battleStartMatch[1],
+        message,
+      };
+    }
+
+    // Battle tick notification
+    // Format: "Battle tick {tick} - combat continues"
+    const battleTickMatch = message.match(/Battle tick\s+(\d+)\s*-\s*combat continues/i);
+    if (battleTickMatch) {
+      return {
+        type: "battle_tick",
+        tick: parseInt(battleTickMatch[1], 10),
+        message,
+      };
+    }
+
+    // Battle hit notification
+    // Format: "{attacker} hit {defender} for {damage} damage"
+    const battleHitMatch = message.match(/(.+?)\s+hit\s+(.+?)\s+for\s+(\d+)\s+damage/i);
+    if (battleHitMatch) {
+      return {
+        type: "battle_hit",
+        message,
+      };
+    }
+
+    // Player left battle notification
+    // Format: "{player} left the battle"
+    const leftBattleMatch = message.match(/(.+?)\s+left the battle/i);
+    if (leftBattleMatch) {
+      return {
+        type: "battle_end",
+        message,
+      };
+    }
+
+    // Battle ended notification
+    if (lowerMsg.includes("battle ended")) {
+      return {
+        type: "battle_end",
+        message,
+      };
+    }
+  }
+
+  // Disengage notification (type: system)
+  // Format: "You have disengaged from battle."
+  if (type === "system" && lowerMsg.includes("disengaged from battle")) {
+    return {
+      type: "battle_disengage",
+      message,
+    };
+  }
+
+  return null;
+}
+
+/** Helper to format notification data object */
+function formatNotificationData(data: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const [key, val] of Object.entries(data)) {
+    if (val === null || val === undefined || val === "") continue;
+    if (typeof val === "object") continue;
+    parts.push(`${key}: ${val}`);
+  }
+  return parts.length > 0 ? parts.join(", ") : JSON.stringify(data);
+}
+
+/**
+ * Parse array of notifications to detect battle events.
+ * @param notifications - Array of raw notifications
+ * @returns Array of parsed battle notifications
+ */
+export function parseBattleNotifications(notifications: unknown[]): BattleNotification[] {
+  const results: BattleNotification[] = [];
+  for (const n of notifications) {
+    const battle = parseBattleNotification(n);
+    if (battle) {
+      results.push(battle);
+    }
+  }
+  return results;
+}
+
 /** Result of pirate detection in nearby entities */
 export interface PirateDetectionResult {
   hasPirates: boolean;
@@ -2270,6 +2449,7 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
     your_stance: (result.your_stance as BattleStance) || undefined,
     your_target_id: (result.your_target_id as string) || undefined,
     auto_pilot: (result.auto_pilot as boolean) || undefined,
+    is_participant: (result.is_participant as boolean) || false,
   };
 
   return status;
@@ -2277,11 +2457,19 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
 
 /**
  * Attempt to flee from an active battle.
- * Uses "battle stance flee" command.
+ * Uses "battle stance flee" command which takes 3 ticks to complete.
+ * Optionally waits for disengage confirmation notification.
+ * 
  * @param ctx - Routine context
- * @returns true if flee command was issued successfully, false otherwise
+ * @param waitForDisengage - If true, waits for "You have disengaged from battle" notification (default: true)
+ * @param maxWaitMs - Maximum time to wait for disengage confirmation in ms (default: 35000ms = 3.5 ticks)
+ * @returns true if successfully fled and disengaged, false otherwise
  */
-export async function fleeFromBattle(ctx: RoutineContext): Promise<boolean> {
+export async function fleeFromBattle(
+  ctx: RoutineContext,
+  waitForDisengage: boolean = true,
+  maxWaitMs: number = 35000,
+): Promise<boolean> {
   const { bot } = ctx;
 
   // Check if we're actually in a battle
@@ -2299,8 +2487,129 @@ export async function fleeFromBattle(ctx: RoutineContext): Promise<boolean> {
     return false;
   }
 
-  ctx.log("combat", "Flee stance engaged - escaping battle!");
+  ctx.log("combat", "Flee stance engaged - escaping battle! (takes 3 ticks)");
+
+  // Wait for disengage confirmation if requested
+  if (waitForDisengage) {
+    ctx.log("combat", "Waiting for disengage confirmation...");
+    const startTime = Date.now();
+    let disengaged = false;
+
+    // Poll for disengage notification or battle status change
+    while (!disengaged && Date.now() - startTime < maxWaitMs) {
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Check every 5 seconds
+
+      // Check battle status - if not in battle anymore, we're clear
+      const newStatus = await getBattleStatus(ctx);
+      if (!newStatus) {
+        ctx.log("combat", "Battle status cleared - successfully disengaged!");
+        disengaged = true;
+        break;
+      }
+
+      // Also check if we're still in the battle by ID
+      if (newStatus.battle_id !== status.battle_id) {
+        ctx.log("combat", "Battle ID changed - successfully disengaged!");
+        disengaged = true;
+        break;
+      }
+    }
+
+    if (!disengaged) {
+      ctx.log("warn", "Flee timeout - battle may still be active");
+      return false;
+    }
+  }
+
   return true;
+}
+
+/**
+ * Handle battle detection from notifications and initiate flee.
+ * Call this after any command execution that may return battle notifications.
+ * 
+ * @param ctx - Routine context
+ * @param notifications - Array of notifications to check
+ * @param battleState - Current battle state object to track battle status
+ * @returns true if battle was detected and flee was initiated, false otherwise
+ */
+export interface BattleState {
+  inBattle: boolean;
+  battleId: string | null;
+  battleStartTick: number | null;
+  lastHitTick: number | null;
+  isFleeing: boolean;
+}
+
+export async function handleBattleNotifications(
+  ctx: RoutineContext,
+  notifications: unknown[],
+  battleState: BattleState,
+): Promise<boolean> {
+  const battleNotifications = parseBattleNotifications(notifications);
+
+  if (battleNotifications.length === 0) {
+    return false;
+  }
+
+  ctx.log("combat", `Processing ${battleNotifications.length} battle notification(s)...`);
+
+  for (const battleNotif of battleNotifications) {
+    ctx.log("combat", `Event: ${battleNotif.type} - ${battleNotif.message?.substring(0, 100) || ''}`);
+    
+    switch (battleNotif.type) {
+      case "battle_start":
+        ctx.log("combat", `BATTLE DETECTED! Battle ID: ${battleNotif.battleId}`);
+        battleState.inBattle = true;
+        battleState.battleId = battleNotif.battleId || null;
+        battleState.battleStartTick = Date.now();
+        battleState.isFleeing = false;
+        // Immediately initiate flee
+        ctx.log("combat", "Initiating emergency flee!");
+        await fleeFromBattle(ctx, true, 35000);
+        return true;
+
+      case "battle_tick":
+        if (battleState.inBattle && !battleState.isFleeing) {
+          ctx.log("combat", `Battle tick ${battleNotif.tick} - combat continues (we're still in battle!)`);
+          // If we somehow missed the battle start, flee now
+          ctx.log("combat", "Initiating late flee!");
+          await fleeFromBattle(ctx, true, 35000);
+          return true;
+        }
+        break;
+
+      case "battle_hit":
+        ctx.log("combat", `Battle hit detected: ${battleNotif.message}`);
+        battleState.lastHitTick = Date.now();
+        // If we're not already fleeing, start fleeing
+        if (battleState.inBattle && !battleState.isFleeing) {
+          ctx.log("combat", "Hit detected - ensuring flee is active!");
+          await fleeFromBattle(ctx, true, 35000);
+          return true;
+        }
+        break;
+
+      case "battle_disengage":
+        ctx.log("combat", "Disengage confirmation received - battle escaped!");
+        battleState.inBattle = false;
+        battleState.battleId = null;
+        battleState.isFleeing = false;
+        break;
+
+      case "battle_end":
+        ctx.log("combat", `Battle ended: ${battleNotif.message}`);
+        // If we were in this battle, clear state
+        if (battleState.inBattle) {
+          battleState.inBattle = false;
+          battleState.battleId = null;
+          battleState.isFleeing = false;
+        }
+        break;
+    }
+  }
+
+  return battleNotifications.some(n => n.type === "battle_start" || n.type === "battle_hit");
 }
 
 /**

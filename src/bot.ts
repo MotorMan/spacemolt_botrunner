@@ -811,12 +811,32 @@ export class Bot {
           }
 
           this.log("chat", `Received [${channel}] ${sender}: ${content}`);
-          
+
           // Track player name from chat (but NOT from MAYDAY messages - those can be fake/pirate names)
+          // Also skip empire NPCs like customs agents and police
           if (sender && sender !== "Unknown" && sender !== this.username) {
             const contentLower = content.toLowerCase();
-            if (!contentLower.includes("mayday")) {
+            const senderLower = sender.toLowerCase();
+            
+            // Check if sender is an empire NPC (customs, police, etc.)
+            const isEmpireNpc = 
+              senderLower.startsWith("[customs]") ||
+              senderLower.startsWith("[police]") ||
+              senderLower.startsWith("confederacy customs") ||
+              senderLower.includes("customs i -") ||
+              senderLower.includes("customs ii -") ||
+              senderLower.includes("customs iii -") ||
+              senderLower.includes("confederacy customs i -") ||
+              senderLower.includes("confederacy customs ii -") ||
+              senderLower.includes("pact border") ||
+              senderLower.includes("pact enforcer") ||
+              senderLower.includes("federation patrol") ||
+              senderLower.includes("rim ranger");
+            
+            if (!contentLower.includes("mayday") && !isEmpireNpc) {
               playerNameStore.add(sender);
+            } else if (isEmpireNpc) {
+              debugLog("playernames:skip", `${this.username}`, `Ignored empire NPC sender: "${sender}"`);
             } else {
               debugLog("playernames:skip", `${this.username}`, `Ignored MAYDAY sender: "${sender}"`);
             }
@@ -1128,6 +1148,7 @@ export class Bot {
   /**
    * Extract and track player names, pirates, and empire NPCs from a get_nearby response.
    * Players, pirates, and empire NPCs are tracked in separate categories.
+   * Empire NPCs are excluded from player tracking even if they appear in player arrays.
    */
   trackNearbyPlayers(nearbyResult: unknown): void {
     if (!nearbyResult || typeof nearbyResult !== "object") {
@@ -1139,6 +1160,16 @@ export class Bot {
 
     // Debug: log what keys we have
     debugLog("playernames:track", `${this.username}`, `get_nearby result keys: ${Object.keys(data).join(", ")}`);
+
+    // First, collect all empire NPC names to exclude them from player tracking
+    const empireNpcNames = new Set<string>();
+    const empireNpcsArray = Array.isArray(data.empire_npcs) ? data.empire_npcs : [];
+    for (const npc of empireNpcsArray as Array<Record<string, unknown>>) {
+      const name = npc.name as string;
+      if (name && name.trim()) {
+        empireNpcNames.add(name.trim());
+      }
+    }
 
     // Track actual players (exclude pirates and empire_npcs)
     const playerArraysToCheck = [
@@ -1161,7 +1192,12 @@ export class Bot {
                      (entity.ship_name as string);
 
         if (name && name.trim()) {
-          if (playerNameStore.add(name)) {
+          const trimmedName = name.trim();
+          // Skip if this is an empire NPC (even if it appeared in player arrays)
+          if (empireNpcNames.has(trimmedName)) {
+            continue;
+          }
+          if (playerNameStore.add(trimmedName)) {
             playerCount++;
           }
         }
@@ -1182,7 +1218,6 @@ export class Bot {
 
     // Track empire NPCs separately
     let empireNpcCount = 0;
-    const empireNpcsArray = Array.isArray(data.empire_npcs) ? data.empire_npcs : [];
     for (const npc of empireNpcsArray as Array<Record<string, unknown>>) {
       const name = npc.name as string;
       if (name && name.trim()) {
@@ -1230,6 +1265,7 @@ export class Bot {
   /**
    * Track player names from battle/scan results.
    * Handles battle participants, scan targets, and similar arrays.
+   * Empire NPCs are excluded from tracking.
    */
   trackBattleParticipants(resultData: unknown): void {
     if (!resultData || typeof resultData !== "object") {
@@ -1237,7 +1273,7 @@ export class Bot {
     }
 
     const data = resultData as Record<string, unknown>;
-    
+
     // Extract from various possible array formats
     const arraysToCheck = [
       Array.isArray(data.participants) ? data.participants : [],
@@ -1248,12 +1284,20 @@ export class Bot {
     let count = 0;
     for (const arr of arraysToCheck) {
       for (const entity of arr as Array<Record<string, unknown>>) {
-        const name = (entity.username as string) || 
-                     (entity.player_name as string) || 
+        const name = (entity.username as string) ||
+                     (entity.player_name as string) ||
                      (entity.name as string);
-        
+
         if (name && name.trim()) {
-          if (playerNameStore.add(name)) {
+          const trimmedName = name.trim();
+          const nameLower = trimmedName.toLowerCase();
+          
+          // Skip empire NPCs (customs, police, etc.)
+          const isEmpireNpc = 
+            nameLower.startsWith("[customs]") ||
+            nameLower.startsWith("[police]");
+          
+          if (!isEmpireNpc && playerNameStore.add(trimmedName)) {
             count++;
           }
         }

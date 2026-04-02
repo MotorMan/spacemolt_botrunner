@@ -40,6 +40,8 @@ import {
   recordGhost,
   recordSuccessfulRescue,
   getPlayerRecord,
+  markAsOwnBot,
+  isOwnBot,
 } from "../rescueBlackBook.js";
 import {
   getCooperationSettings,
@@ -287,6 +289,16 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
   } else if (homeSystem) {
     ctx.log("rescue", `✓ Bot started at home base (${homeSystem})`);
   }
+
+  // ── Mark all our bots in the blackbook to prevent them from being blacklisted ──
+  // Get fleet status and mark all bots with our username pattern as "own bots"
+  const fleet = ctx.getFleetStatus?.() || [];
+  const ourBotNames = fleet.map(b => b.username).filter(name => name !== bot.username);
+  for (const botName of ourBotNames) {
+    markAsOwnBot(botName);
+    ctx.log("rescue", `🤝 Marked ${botName} as our bot (will not blacklist)`);
+  }
+  ctx.log("rescue", `✓ Marked ${ourBotNames.length} bots as our own (excluded from ghost tracking)`);
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -2937,9 +2949,14 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           targetFound = false;
           ctx.log("error", `Target ${target.username} not found at ${target.poi} - they may have left or it was a false alarm`);
 
-          // Record ghost incident in BlackBook
+          // Record ghost incident in BlackBook (skipped for our own bots)
           recordGhost(target.username);
-          ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${getPlayerRecord(target.username).ghostCount})`);
+          const currentGhosts = getPlayerRecord(target.username).ghostCount;
+          if (currentGhosts < 0) {
+            ctx.log("rescue", `👻 Skipped ghost recording for ${target.username} (our own bot)`);
+          } else {
+            ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
+          }
 
           // Send grumpy faction chat message about being ghosted
           const aiChatService = (globalThis as any).aiChatService;

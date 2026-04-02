@@ -34,6 +34,8 @@ import {
   getBattleStatus,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
+  type BattleState,
+  handleBattleNotifications,
 } from "./common.js";
 
 /** Number of mine attempts per resource POI to sample ores. */
@@ -444,6 +446,14 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (explorerSettings.scanPois) {
       yield "survey_system";
       const surveyResp = await bot.exec("survey_system");
+
+      // Check for battle after survey
+      if (await checkBattleAfterCommand(ctx, surveyResp.notifications, "survey_system")) {
+        ctx.log("combat", "Battle detected during survey - fleeing!");
+        await sleep(5000);
+        continue;
+      }
+
       if (!surveyResp.error) {
         ctx.log("info", `Surveyed ${bot.system} — checking for newly revealed POIs...`);
         // Re-fetch system info to pick up any hidden POIs that were revealed
@@ -592,6 +602,14 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       yield `visit_${poi.id}`;
       const travelResp = await bot.exec("travel", { target_poi: poi.id });
+
+      // Check for battle after travel
+      if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+        ctx.log("combat", "Battle detected during travel - fleeing!");
+        await sleep(5000);
+        continue;
+      }
+
       if (travelResp.error && !travelResp.error.message.includes("already")) {
         ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
         continue;
@@ -600,7 +618,13 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Scavenge wrecks/containers at each POI
       yield "scavenge";
-      await scavengeWrecks(ctx);
+      const scavengeResult = await scavengeWrecks(ctx);
+
+      // Check battle status after scavenge (it makes multiple commands)
+      if (await checkAndFleeFromBattle(ctx, "scavenge")) {
+        await sleep(5000);
+        continue;
+      }
 
       if (isMinable) {
         yield* sampleResourcePoi(ctx, systemId, poi);
@@ -868,8 +892,25 @@ async function* sampleResourcePoi(
   let mined = 0;
   let cantMine = false;
 
+  // Battle state tracking for sampling loop
+  const battleState: BattleState = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+  };
+
   for (let i = 0; i < SAMPLE_MINES && bot.state === "running"; i++) {
     const mineResp = await bot.exec("mine");
+
+    // Check for battle notifications after mining
+    const battleDetected = await handleBattleNotifications(ctx, mineResp.notifications || [], battleState);
+    if (battleDetected) {
+      ctx.log("combat", "Battle detected while sampling - fleeing!");
+      await fleeFromBattle(ctx, true, 35000);
+      return;
+    }
 
     if (mineResp.error) {
       const msg = mineResp.error.message.toLowerCase();
@@ -914,6 +955,14 @@ async function* scanStation(
 
   yield `dock_${poi.id}`;
   const dockResp = await bot.exec("dock");
+
+  // Check for battle after dock (unlikely at station, but possible if interrupted)
+  if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
+    ctx.log("combat", "Battle detected during docking - fleeing!");
+    await sleep(3000);
+    return;
+  }
+
   if (dockResp.error && !dockResp.error.message.includes("already")) {
     ctx.log("error", `Dock failed at ${poi.name}: ${dockResp.error.message}`);
     return;
@@ -1032,6 +1081,14 @@ async function* visitOtherPoi(
 
   yield `scan_${poi.id}`;
   const nearbyResp = await bot.exec("get_nearby");
+
+  // Check for battle notifications first
+  if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
+    ctx.log("combat", "Battle detected at POI - fleeing!");
+    await sleep(5000);
+    return;
+  }
+
   if (nearbyResp.result && typeof nearbyResp.result === "object") {
     const nr = nearbyResp.result as Record<string, unknown>;
     const objects = (nr.objects || nr.results || nr.ships || nr.players || []) as unknown[];
@@ -1089,6 +1146,12 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     // ── Death recovery ──
     const alive2 = await detectAndRecoverFromDeath(ctx);
     if (!alive2) { await sleep(30000); continue; }
+
+    // ── Battle check — if in battle, flee immediately ──
+    if (await checkAndFleeFromBattle(ctx, "trade_update")) {
+      await sleep(5000);
+      continue;
+    }
 
     // ── Re-check mode after recovery — user might have changed it, or session was restarted ──
     const modeCheck = getExplorerSettings(bot.username);
@@ -1199,6 +1262,14 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       yield "travel_to_station";
       await ensureUndocked(ctx);
       const tResp = await bot.exec("travel", { target_poi: target.stationPoi });
+
+      // Check for battle after travel
+      if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+        ctx.log("combat", "Battle detected during travel - fleeing!");
+        await sleep(5000);
+        continue;
+      }
+
       if (tResp.error && !tResp.error.message.includes("already")) {
         ctx.log("error", `Travel failed: ${tResp.error.message}`);
         continue;
@@ -1207,7 +1278,13 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
       // ── Scavenge wrecks en route ──
       yield "scavenge";
-      await scavengeWrecks(ctx);
+      const scavengeResult = await scavengeWrecks(ctx);
+
+      // Check battle status after scavenge
+      if (await checkAndFleeFromBattle(ctx, "scavenge")) {
+        await sleep(5000);
+        continue;
+      }
 
       // ── Dock and scan ──
       yield "scan_station";

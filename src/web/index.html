@@ -2600,11 +2600,11 @@ function mcInitRescueSystems() {
   }
 
   // Use knownSystems from map data (same source as Jump To dropdown)
+  // Note: Unlike Jump To, we allow selecting the current system for rescue missions
+  // since the player may be in a different POI within the same system
   if (knownSystems && knownSystems.length > 0) {
-    const currentSys = profileBot ? (bots.find(b => b.username === profileBot)?.system || '') : '';
     systemSelect.innerHTML = '<option value="">Select a system...</option>' +
       knownSystems
-        .filter(s => s.id !== currentSys)  // Exclude current system like Jump To does
         .sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id))
         .map(s => {
           const label = s.name ? `${s.name} (${s.id})` : s.id;

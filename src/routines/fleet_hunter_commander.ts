@@ -277,6 +277,14 @@ interface NearbyEntity {
   status?: string;
 }
 
+interface BattleParticipant {
+  id: string;
+  name: string;
+  sideId: number;
+  isPirate: boolean;
+  isFriendly: boolean;
+}
+
 function parseNearby(result: unknown): NearbyEntity[] {
   if (!result || typeof result !== "object") return [];
   const r = result as Record<string, unknown>;
@@ -369,6 +377,78 @@ function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean, maxAttackTier: 
   return factionMatch || typeMatch || (entity.isNPC && nameMatch);
 }
 
+// ── Battle participant tracking ──────────────────────────────
+
+/** Parse battle status to extract participants and their sides */
+function parseBattleParticipants(result: unknown, friendlyFaction: string): BattleParticipant[] {
+  if (!result || typeof result !== "object") return [];
+  const r = result as Record<string, unknown>;
+  const participants: BattleParticipant[] = [];
+
+  // Battle status may have 'sides' array or 'participants' array
+  let rawParticipants: Array<Record<string, unknown>> = [];
+
+  if (Array.isArray(r.participants)) {
+    rawParticipants = r.participants as Array<Record<string, unknown>>;
+  } else if (Array.isArray(r.sides)) {
+    const sides = r.sides as Array<Record<string, unknown>>;
+    for (const side of sides) {
+      const sideId = side.side_id as number ?? 0;
+      const sideParticipants = Array.isArray(side.participants)
+        ? side.participants as Array<Record<string, unknown>>
+        : [];
+      for (const p of sideParticipants) {
+        rawParticipants.push({ ...p, side_id: sideId });
+      }
+    }
+  }
+
+  for (const p of rawParticipants) {
+    const id = (p.id as string) || (p.player_id as string) || "";
+    if (!id) continue;
+
+    const name = (p.name as string) || (p.username as string) || (p.pirate_name as string) || id;
+    const sideId = (p.side_id as number) ?? 0;
+    const faction = ((p.faction as string) || (p.faction_id as string) || "").toLowerCase();
+    const isPirate = !!(p.pirate_id) || faction.includes("pirate") || name.toLowerCase().includes("pirate");
+    const isFriendly = !isPirate && (faction === friendlyFaction || faction.includes(friendlyFaction));
+
+    participants.push({
+      id,
+      name,
+      sideId,
+      isPirate,
+      isFriendly,
+    });
+  }
+
+  return participants;
+}
+
+/**
+ * Check if there's a third-party collision risk in the battle.
+ * Returns true if there are multiple non-pirate sides fighting, which means
+ * our bots might accidentally target friendly players on competing sides.
+ */
+function hasThirdPartyCollision(participants: BattleParticipant[], ourSideId: number): boolean {
+  const nonPirateSides = new Set<number>();
+
+  for (const p of participants) {
+    if (!p.isPirate) {
+      nonPirateSides.add(p.sideId);
+    }
+  }
+
+  // If there are multiple non-pirate sides, we have a collision risk
+  // (our side + at least one other competing player side)
+  return nonPirateSides.size > 1;
+}
+
+/** Get the count of active pirates in the battle */
+function getActivePirateCount(participants: BattleParticipant[]): number {
+  return participants.filter(p => p.isPirate).length;
+}
+
 // ── Combat engagement ─────────────────────────────────────────
 
 async function engageTarget(
@@ -385,7 +465,7 @@ async function engageTarget(
 
   // Order fleet to attack
   await orderFleetAttack(ctx, target.id, target.name);
-  
+
   // Small delay to let subordinates receive the command
   await sleep(1000);
 
@@ -413,6 +493,10 @@ async function engageTarget(
     const advResp = await bot.exec("advance");
     if (advResp.error) break;
   }
+
+  // Track our side ID for collision detection
+  let ourSideId: number | null = null;
+  let thirdPartyWarning = false;
 
   // Combat loop
   const MAX_COMBAT_TICKS = 30;
@@ -455,6 +539,40 @@ async function engageTarget(
         await bot.exec("stance", { stance: "flee" });
         await bot.exec("retreat");
         return false;
+      }
+    }
+
+    // Check battle status for third-party collision risk
+    const battleResp = await bot.exec("get_battle_status");
+    if (!battleResp.error && battleResp.result) {
+      const participants = parseBattleParticipants(battleResp.result, bot.faction || "");
+
+      // Record our side ID on first check
+      if (ourSideId === null) {
+        const ourParticipant = participants.find(p => p.name === bot.username);
+        if (ourParticipant) {
+          ourSideId = ourParticipant.sideId;
+          ctx.log("combat", `We are on side ${ourSideId}`);
+        }
+      }
+
+      // Check for third-party collision risk
+      if (ourSideId !== null && hasThirdPartyCollision(participants, ourSideId)) {
+        const pirateCount = getActivePirateCount(participants);
+
+        if (pirateCount === 0) {
+          // Pirates are defeated but third-party players remain on competing sides
+          // Flee immediately to avoid friendly fire
+          ctx.log("combat", "PIRATES DEFEATED — Third-party players detected on competing sides! Ordering fleet flee to avoid friendly fire!");
+          await orderFleetFlee(ctx);
+          await bot.exec("stance", { stance: "flee" });
+          await bot.exec("retreat");
+          return false;
+        } else if (!thirdPartyWarning) {
+          // Warn that we're monitoring the situation
+          ctx.log("combat", `WARNING: Third-party players detected in battle. Monitoring for collision risk. ${pirateCount} pirate(s) remaining.`);
+          thirdPartyWarning = true;
+        }
       }
     }
 

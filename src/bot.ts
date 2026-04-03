@@ -268,6 +268,22 @@ export class Bot {
     debugLog("bot:exec", `${this.username} > ${command}`, payload);
     let resp = await this.api.execute(command, payload);
 
+    // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
+    // This prevents 502 errors from breaking routines mid-operation
+    if (resp.error && resp.error.message && resp.error.message.includes("502")) {
+      const MAX_502_RETRIES = 3;
+      for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
+        const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
+        this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1}/${MAX_502_RETRIES} after ${waitTime/1000}s...`);
+        await sleep(waitTime);
+        resp = await this.api.execute(command, payload);
+        if (!resp.error || !resp.error.message?.includes("502")) break;
+      }
+      if (resp.error && resp.error.message?.includes("502")) {
+        this.log("error", `HTTP 502: Bad Gateway (after ${MAX_502_RETRIES} retries)`);
+      }
+    }
+
     // Handle full login required (after too many session recovery failures)
     if (resp.error && resp.error.code === "full_login_required") {
       this.log("system", "Full login required due to session recovery failures, performing login...");

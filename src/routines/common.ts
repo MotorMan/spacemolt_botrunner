@@ -378,6 +378,15 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
         await ensureInsured(ctx);
         return true;
       }
+      // Dock failed at current POI - check if it's "No base at this location"
+      if (dockResp.error?.message?.includes("No base at this location")) {
+        ctx.log("error", `No dockable base at current POI (${bot.poi}) — searching for nearest station...`);
+        // Don't fall through to "No station in current system" - we know we need a different station
+        // Jump directly to the nearest station system
+      } else {
+        ctx.log("error", `Dock failed: ${dockResp.error.message}`);
+        // Fall through to search for nearest station
+      }
     }
   }
 
@@ -403,21 +412,37 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
         const jumpResp = await bot.exec("jump", { target_system: route[i] });
         if (jumpResp.error) {
           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-          return false;
+          // Check if we actually made the jump despite the error
+          await bot.refreshStatus();
+          if (bot.system.toLowerCase() !== route[i].toLowerCase()) {
+            return false; // Jump truly failed
+          }
+          ctx.log("travel", `Jump succeeded despite error (server confirmed position)`);
         }
       }
     } else {
       const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
       if (jumpResp.error) {
         ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-        return false;
+        // Check if we actually made the jump despite the error
+        await bot.refreshStatus();
+        if (bot.system.toLowerCase() !== nearest.systemId.toLowerCase()) {
+          return false; // Jump truly failed
+        }
+        ctx.log("travel", `Jump succeeded despite error (server confirmed position)`);
       }
     }
+    // Refresh status after navigation
+    await bot.refreshStatus();
   }
 
   // Travel to station POI and dock
   ctx.log("travel", `Traveling to ${nearest.poiName}...`);
-  await bot.exec("travel", { target_poi: nearest.poiId });
+  const travelResp = await bot.exec("travel", { target_poi: nearest.poiId });
+  if (travelResp.error && !travelResp.error.message.includes("already")) {
+    ctx.log("error", `Travel to station POI failed: ${travelResp.error.message}`);
+    return false;
+  }
   bot.poi = nearest.poiId;
 
   ctx.log("system", "Docking...");
@@ -1246,6 +1271,8 @@ export async function navigateToSystem(
       const isTransient =
         errorMsg.includes("timeout") ||
         errorMsg.includes("524") || // HTTP 524 Request Timeout
+        errorMsg.includes("502") || // HTTP 502 Bad Gateway (server-side issue)
+        errorMsg.includes("bad gateway") ||
         errorMsg.includes("connection") ||
         errorMsg.includes("network") ||
         errorMsg.includes("hiccup") ||
@@ -1253,14 +1280,28 @@ export async function navigateToSystem(
         errorMsg.includes("try again") ||
         errorMsg.includes("pending") ||
         errorMsg.includes("busy") ||
-        errorMsg.includes("systems are not connected"); // Sometimes a temporary state
-      
+        errorMsg.includes("systems are not connected") || // Sometimes a temporary state
+        errorMsg.includes("you are already in"); // Already at destination - treat as success
+
       if (!isTransient) {
         // Permanent error - don't retry
         ctx.log("error", `Jump failed (permanent error): ${jumpResp.error.message}`);
         return false;
       }
-      
+
+      // Special case: "already in" means we're already at the target system
+      if (errorMsg.includes("you are already in")) {
+        ctx.log("travel", `Server says already in system — refreshing status to verify position...`);
+        await bot.refreshStatus();
+        // Check if we're actually at the target system
+        if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+          ctx.log("travel", `Confirmed: already at target ${targetSystemId}`);
+          return true;
+        }
+        // Not at target - the "already in" error was for a different system
+        // Fall through to retry logic
+      }
+
       ctx.log("error", `Jump failed (transient): ${jumpResp.error.message}`);
       
       if (retries < MAX_RETRIES_PER_JUMP) {

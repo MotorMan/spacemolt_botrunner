@@ -116,6 +116,18 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
 
 type DepositMode = "storage" | "faction" | "sell";
 type MiningType = "auto" | "ore" | "gas" | "ice";
+type FlockRole = "leader" | "follower";
+
+interface FlockGroupConfig {
+  name: string;
+  targetOre: string;
+  targetGas: string;
+  targetIce: string;
+  miningType: MiningType;
+  rallySystem?: string;
+  maxMembers?: number;
+  [key: string]: unknown; // Add index signature for compatibility
+}
 
 function getMinerSettings(username?: string): {
   miningType: MiningType;
@@ -139,6 +151,11 @@ function getMinerSettings(username?: string): {
   maxJumps: number;
   escortName: string;
   escortSignalChannel: "faction" | "local" | "file";
+  // Flock mining settings
+  flockEnabled: boolean;
+  flockName: string;
+  flockRole: FlockRole;
+  flockGroups: FlockGroupConfig[];
 } {
   const all = readSettings();
   const m = all.miner || {};
@@ -158,6 +175,23 @@ function getMinerSettings(username?: string): {
     if (val === "faction" || val === "local" || val === "file") return val;
     return null;
   }
+
+  function parseFlockRole(val: unknown): FlockRole | null {
+    if (val === "leader" || val === "follower") return val;
+    return null;
+  }
+
+  // Parse flock groups from settings
+  const rawFlockGroups = (botOverrides.flockGroups as FlockGroupConfig[]) ?? (m.flockGroups as FlockGroupConfig[]) ?? [];
+  const flockGroups: FlockGroupConfig[] = rawFlockGroups.map((g: Record<string, unknown>) => ({
+    name: (g.name as string) || "unnamed_flock",
+    targetOre: (g.targetOre as string) || (g.target_ore as string) || "",
+    targetGas: (g.targetGas as string) || (g.target_gas as string) || "",
+    targetIce: (g.targetIce as string) || (g.target_ice as string) || "",
+    miningType: parseMiningType(g.miningType) ?? parseMiningType(g.mining_type) ?? "auto",
+    rallySystem: (g.rallySystem as string) ?? (g.rally_system as string) ?? undefined,
+    maxMembers: (g.maxMembers as number) ?? (g.max_members as number) ?? undefined,
+  }));
 
   return {
     miningType:
@@ -189,6 +223,13 @@ function getMinerSettings(username?: string): {
     escortSignalChannel:
       parseSignalChannel(botOverrides.escortSignalChannel) ??
       parseSignalChannel(m.escortSignalChannel) ?? "faction",
+    // Flock mining settings
+    flockEnabled: (botOverrides.flockEnabled as boolean) ?? (m.flockEnabled as boolean) ?? false,
+    flockName: (botOverrides.flockName as string) || (m.flockName as string) || "",
+    flockRole:
+      parseFlockRole(botOverrides.flockRole) ??
+      parseFlockRole(m.flockRole) ?? "follower",
+    flockGroups,
   };
 }
 
@@ -343,6 +384,202 @@ function findMiningPoi(
   }
 }
 
+// ── Flock coordination ─────────────────────────────────────────
+
+/**
+ * Flock coordination state shared via file system.
+ * Leader writes decisions, followers read and follow.
+ */
+interface FlockState {
+  leader: string;
+  targetSystemId: string;
+  targetPoiId: string;
+  targetPoiName: string;
+  targetResourceId: string;
+  miningType: "ore" | "gas" | "ice";
+  phase: "gathering" | "traveling" | "mining" | "returning" | "docked";
+  members: string[];
+  lastUpdate: number;
+  rallySystem?: string;
+}
+
+/**
+ * Get the flock state file path for a given flock name.
+ */
+async function getFlockStatePath(flockName: string): Promise<string> {
+  const { join } = await import("path");
+  return join(process.cwd(), "data", "flock_signals", `${flockName}.json`);
+}
+
+/**
+ * Read the current flock state. Returns null if no state exists or it's stale (>60s).
+ */
+async function readFlockState(flockName: string): Promise<FlockState | null> {
+  const { readFileSync, existsSync } = await import("fs");
+  const flockPath = await getFlockStatePath(flockName);
+  
+  if (!existsSync(flockPath)) return null;
+  
+  try {
+    const raw = readFileSync(flockPath, "utf-8");
+    const state = JSON.parse(raw) as FlockState;
+    
+    // Check if state is stale (older than 60 seconds)
+    if (Date.now() - state.lastUpdate > 60_000) {
+      return null;
+    }
+    
+    return state;
+  } catch (e) {
+    return null;
+  }
+}
+
+/**
+ * Write flock state to the shared file.
+ */
+async function writeFlockState(flockName: string, state: FlockState): Promise<void> {
+  const { writeFileSync, existsSync, mkdirSync } = await import("fs");
+  const { join } = await import("path");
+  const flockDir = join(process.cwd(), "data", "flock_signals");
+  
+  if (!existsSync(flockDir)) {
+    mkdirSync(flockDir, { recursive: true });
+  }
+  
+  const flockPath = await getFlockStatePath(flockName);
+  state.lastUpdate = Date.now();
+  writeFileSync(flockPath, JSON.stringify(state, null, 2));
+}
+
+/**
+ * Clear flock state file (used when leaving flock or session ends).
+ */
+async function clearFlockState(flockName: string): Promise<void> {
+  const { existsSync, unlinkSync } = await import("fs");
+  const flockPath = await getFlockStatePath(flockName);
+  
+  if (existsSync(flockPath)) {
+    try {
+      unlinkSync(flockPath);
+    } catch (e) {
+      // Ignore errors
+    }
+  }
+}
+
+/**
+ * Register this bot as a member of the flock.
+ * Leader adds itself to the members list.
+ */
+async function registerFlockMember(
+  flockName: string,
+  username: string,
+  isLeader: boolean,
+): Promise<FlockState | null> {
+  const existingState = await readFlockState(flockName);
+  
+  if (isLeader) {
+    // Leader creates or updates the flock state
+    const newState: FlockState = {
+      leader: username,
+      targetSystemId: "",
+      targetPoiId: "",
+      targetPoiName: "",
+      targetResourceId: "",
+      miningType: "ore",
+      phase: "gathering",
+      members: existingState?.members ? [...new Set([...existingState.members, username])] : [username],
+      lastUpdate: Date.now(),
+    };
+    await writeFlockState(flockName, newState);
+    return newState;
+  } else {
+    // Follower joins existing flock
+    if (!existingState) return null;
+    
+    // Check if flock has room (if maxMembers is set)
+    // Note: maxMembers check happens at higher level
+    if (!existingState.members.includes(username)) {
+      existingState.members.push(username);
+    }
+    await writeFlockState(flockName, existingState);
+    return existingState;
+  }
+}
+
+/**
+ * Remove this bot from the flock members list.
+ */
+async function unregisterFlockMember(
+  flockName: string,
+  username: string,
+): Promise<void> {
+  const existingState = await readFlockState(flockName);
+  
+  if (existingState) {
+    existingState.members = existingState.members.filter(m => m !== username);
+    
+    // If leader is leaving, elect new leader or clear state
+    if (existingState.leader === username) {
+      if (existingState.members.length > 0) {
+        existingState.leader = existingState.members[0];
+      } else {
+        await clearFlockState(flockName);
+        return;
+      }
+    }
+    
+    await writeFlockState(flockName, existingState);
+  }
+}
+
+/**
+ * Leader announces target selection to flock.
+ */
+async function announceFlockTarget(
+  flockName: string,
+  leader: string,
+  targetSystemId: string,
+  targetPoiId: string,
+  targetPoiName: string,
+  targetResourceId: string,
+  miningType: "ore" | "gas" | "ice",
+  rallySystem?: string,
+): Promise<void> {
+  const existingState = await readFlockState(flockName);
+  
+  const newState: FlockState = {
+    leader,
+    targetSystemId,
+    targetPoiId,
+    targetPoiName,
+    targetResourceId,
+    miningType,
+    phase: existingState?.phase === "mining" ? "mining" : "traveling",
+    members: existingState?.members || [leader],
+    lastUpdate: Date.now(),
+    rallySystem,
+  };
+  
+  await writeFlockState(flockName, newState);
+}
+
+/**
+ * Update flock phase.
+ */
+async function updateFlockPhase(
+  flockName: string,
+  phase: FlockState["phase"],
+): Promise<void> {
+  const existingState = await readFlockState(flockName);
+  
+  if (existingState) {
+    existingState.phase = phase;
+    await writeFlockState(flockName, existingState);
+  }
+}
+
 // ── Escort signaling ─────────────────────────────────────────
 
 /**
@@ -467,6 +704,92 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     };
     const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
 
+    // ── Flock mining integration ──
+    let isFlockLeader = false;
+    let flockTargetResource = "";
+    let flockTargetSystemId = "";
+    let flockTargetPoiId = "";
+    let flockTargetPoiName = "";
+    let flockMiningType: "ore" | "gas" | "ice" = "ore";
+    let flockPhase: FlockState["phase"] = "gathering";
+    let flockGroup: FlockGroupConfig | undefined;
+
+    if (settings.flockEnabled && settings.flockName) {
+      // Find the flock group config for this bot
+      flockGroup = settings.flockGroups.find(g => g.name === settings.flockName);
+      
+      if (settings.flockRole === "leader") {
+        isFlockLeader = true;
+        ctx.log("flock", `Flock mode: LEADER of "${settings.flockName}"`);
+        
+        // Register as leader
+        await registerFlockMember(settings.flockName, bot.username, true);
+        
+        // Determine target from flock group config or personal settings
+        const groupMiningType = flockGroup?.miningType ?? settings.miningType;
+        let actualMiningType: "ore" | "gas" | "ice" = "ore";
+        
+        if (groupMiningType === "auto") {
+          const detected = await detectMiningType(ctx);
+          if (!detected) {
+            ctx.log("error", "Cannot determine mining type for flock leader — waiting 30s");
+            await sleep(30000);
+            continue;
+          }
+          actualMiningType = detected;
+        } else {
+          actualMiningType = groupMiningType as "ore" | "gas" | "ice";
+        }
+        
+        const groupTarget = actualMiningType === "ice" 
+          ? (flockGroup?.targetIce || settings.targetIce)
+          : (actualMiningType === "ore" 
+            ? (flockGroup?.targetOre || settings.targetOre)
+            : (flockGroup?.targetGas || settings.targetGas));
+        
+        flockTargetResource = groupTarget || "";
+        flockMiningType = actualMiningType;
+        flockPhase = "gathering";
+        
+        ctx.log("flock", `Leader target: ${flockTargetResource || "any"} (${flockMiningType})`);
+      } else {
+        // Follower: read flock state and follow leader's decisions
+        const flockState = await readFlockState(settings.flockName);
+        
+        if (!flockState) {
+          ctx.log("flock", `Flock mode: FOLLOWER of "${settings.flockName}" — waiting for leader...`);
+          // Wait for leader to announce target
+          await sleep(5000);
+          continue;
+        }
+        
+        // Register as follower
+        const registered = await registerFlockMember(settings.flockName, bot.username, false);
+        if (!registered) {
+          ctx.log("error", "Failed to join flock — state may be stale");
+          await sleep(5000);
+          continue;
+        }
+        
+        ctx.log("flock", `Flock mode: FOLLOWER of "${settings.flockName}" (leader: ${flockState.leader})`);
+        
+        flockTargetResource = flockState.targetResourceId;
+        flockTargetSystemId = flockState.targetSystemId;
+        flockTargetPoiId = flockState.targetPoiId;
+        flockTargetPoiName = flockState.targetPoiName;
+        flockMiningType = flockState.miningType;
+        flockPhase = flockState.phase;
+        
+        // Check max members if configured
+        if (flockGroup?.maxMembers && flockState.members.length > flockGroup.maxMembers) {
+          ctx.log("warn", `Flock "${settings.flockName}" is full (${flockState.members.length}/${flockGroup.maxMembers}) — mining solo`);
+          // Continue with solo mining
+        } else {
+          ctx.log("flock", `Following leader to: ${flockTargetPoiName || flockTargetSystemId || "TBD"} (${flockTargetResource || "any"})`);
+        }
+      }
+    }
+
     // ── Re-evaluate mining type and target from settings each cycle ──
     let miningType: "ore" | "gas" | "ice" = "ore";
     if (settings.miningType === "auto") {
@@ -554,8 +877,19 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Determine effective target ──
-    const effectiveTarget = recoveredSession ? recoveredSession.targetResourceId : priorityTarget;
+    let effectiveTarget = recoveredSession ? recoveredSession.targetResourceId : priorityTarget;
     const isQuotaDriven = recoveredSession ? recoveredSession.isQuotaDriven : !!quotaTargetResource;
+
+    // ── Flock target override ──
+    // If flock mode is enabled and we have a flock target, use it instead
+    if (settings.flockEnabled && settings.flockName && flockTargetResource) {
+      // For followers, also override mining type and system/POI from flock state
+      if (!isFlockLeader) {
+        miningType = flockMiningType;
+        ctx.log("flock", `Using flock target: ${flockTargetResource} (${miningType})`);
+      }
+      effectiveTarget = flockTargetResource;
+    }
 
     // ── Status + fuel/hull checks ──
     yield "get_status";
@@ -691,6 +1025,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             recoveredSession = session;
             ctx.log("mining", `Started mining session: ${session.targetResourceName} @ ${session.targetPoiName}`);
           }
+
+          // ── Flock leader announces target ──
+          if (isFlockLeader && settings.flockEnabled && settings.flockName) {
+            const rallySystem = flockGroup?.rallySystem;
+            await announceFlockTarget(
+              settings.flockName,
+              bot.username,
+              targetSystemId,
+              targetPoiId,
+              targetPoiName,
+              effectiveTarget,
+              miningType,
+              rallySystem,
+            );
+            ctx.log("flock", `Announced target to flock: ${targetPoiName} @ ${targetSystemId}`);
+            await updateFlockPhase(settings.flockName, "traveling");
+          }
         }
       }
     } else {
@@ -716,6 +1067,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         updateMiningSession(bot.username, { state: "traveling_to_ore" });
       }
 
+      // Flock followers wait for leader to arrive first (optional synchronization)
+      if (!isFlockLeader && settings.flockEnabled && settings.flockName) {
+        ctx.log("flock", "Waiting 5s for leader to jump first...");
+        await sleep(5000);
+      }
+
       // Signal escorts before jumping
       const minerSettings = getMinerSettings(bot.username);
       if (minerSettings.escortName) {
@@ -733,6 +1090,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (recoveredSession) {
           updateMiningSession(bot.username, { state: "mining" });
         }
+      } else if (settings.flockEnabled && settings.flockName) {
+        // Update flock phase after successful arrival
+        await updateFlockPhase(settings.flockName, "traveling");
       }
     }
 
@@ -869,6 +1229,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         targetPoiId: miningPoi.id,
         targetPoiName: miningPoi.name,
       });
+    }
+
+    // Update flock phase to mining
+    if (settings.flockEnabled && settings.flockName && miningPoi) {
+      await updateFlockPhase(settings.flockName, "mining");
+      ctx.log("flock", "Flock phase updated: mining");
     }
 
     // ── Scavenge wrecks before harvesting ──
@@ -1374,6 +1740,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       await signalEscort(ctx, "dock", undefined, minerDockSettings.escortSignalChannel);
     }
 
+    // Signal flock that we're docking
+    if (settings.flockEnabled && settings.flockName) {
+      ctx.log("flock", "Signaling flock: miner docking...");
+      await updateFlockPhase(settings.flockName, "docked");
+    }
+
     const dockResp = await bot.exec("dock");
     if (dockResp.error && !dockResp.error.message.includes("already")) {
       ctx.log("error", `Dock failed: ${dockResp.error.message}`);
@@ -1459,6 +1831,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("mining", `Mining session completed: ${recoveredSession.cyclesMined} cycles, ${Object.entries(recoveredSession.resourcesMined).map(([k, v]) => `${v}x ${k}`).join(", ")}`);
       recoveredSession = null;
     }
+
+    // Flock: unregister member after cycle completes (optional - can stay in flock across cycles)
+    // Uncomment if you want bots to leave flock after each cycle:
+    // if (settings.flockEnabled && settings.flockName) {
+    //   await unregisterFlockMember(settings.flockName, bot.username);
+    //   ctx.log("flock", "Left flock after cycle completion");
+    // }
 
     // ── Mission handling: complete and accept missions ──
     yield "complete_missions";

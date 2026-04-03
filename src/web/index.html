@@ -8681,6 +8681,68 @@ function saveExplorerBotFocus(botName) {
   setTimeout(() => { btn.textContent = origText; }, 1500);
 }
 
+// ── Flock Mining Helpers ──────────────────────────────────────────
+
+function buildFlockGroupRows() {
+  const groups = settings.miner?.flockGroups || [];
+  let rows = '';
+  for (const group of groups) {
+    rows += `<tr data-flock-group="${esc(group.name)}">
+      <td style="padding:4px 8px">${esc(group.name)}</td>
+      <td style="padding:4px 8px">${esc(group.targetOre || '-')}</td>
+      <td style="padding:4px 8px">${esc(group.targetGas || '-')}</td>
+      <td style="padding:4px 8px">${esc(group.targetIce || '-')}</td>
+      <td style="padding:4px 8px">${esc(group.miningType || 'auto')}</td>
+      <td style="padding:4px 8px">${esc(group.rallySystem || '-')}</td>
+      <td style="padding:4px 8px">${esc(group.maxMembers || '-')}</td>
+      <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
+    </tr>`;
+  }
+  return rows;
+}
+
+function addFlockGroupRow() {
+  const name = document.getElementById('flock-group-name').value.trim();
+  const targetOre = document.getElementById('flock-group-targetOre').value;
+  const targetGas = document.getElementById('flock-group-targetGas').value;
+  const targetIce = document.getElementById('flock-group-targetIce').value;
+  const miningType = document.getElementById('flock-group-miningType').value;
+  const rallySystem = document.getElementById('flock-group-rallySystem').value.trim();
+  const maxMembers = document.getElementById('flock-group-maxMembers').value;
+
+  if (!name) {
+    alert('Flock group name is required');
+    return;
+  }
+
+  // Check if already exists
+  const existing = document.querySelector(`#flock-groups-tbody tr[data-flock-group="${CSS.escape(name)}"]`);
+  if (existing) {
+    alert('Flock group with this name already exists');
+    return;
+  }
+
+  const tbody = document.getElementById('flock-groups-tbody');
+  const tr = document.createElement('tr');
+  tr.dataset.flockGroup = name;
+  tr.innerHTML = `
+    <td style="padding:4px 8px">${esc(name)}</td>
+    <td style="padding:4px 8px">${esc(targetOre || '-')}</td>
+    <td style="padding:4px 8px">${esc(targetGas || '-')}</td>
+    <td style="padding:4px 8px">${esc(targetIce || '-')}</td>
+    <td style="padding:4px 8px">${esc(miningType)}</td>
+    <td style="padding:4px 8px">${esc(rallySystem || '-')}</td>
+    <td style="padding:4px 8px">${esc(maxMembers || '-')}</td>
+    <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
+  `;
+  tbody.appendChild(tr);
+
+  // Clear inputs
+  document.getElementById('flock-group-name').value = '';
+  document.getElementById('flock-group-rallySystem').value = '';
+  document.getElementById('flock-group-maxMembers').value = '5';
+}
+
 // ── Miner Settings ──────────────────────────────────────────
 
 function renderMinerSettings(panel) {
@@ -8965,6 +9027,78 @@ function renderMinerSettings(panel) {
         </select>
       </div>
 
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">🐦 Flock Mining</div>
+      <div class="setting-hint" style="margin-bottom:12px">Coordinate multiple miners to mine together at the same location. One bot acts as leader and decides where to mine, followers automatically follow the leader.</div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Enable Flock Mining</div>
+          <div class="setting-hint">When enabled, this miner will coordinate with other flock members.</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="set-miner-flockEnabled"${settings.miner?.flockEnabled ? ' checked' : ''} />
+          <span>Enable flock mining</span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Flock Name</div>
+          <div class="setting-hint">Unique identifier for this flock group. All members must use the same name.</div>
+        </div>
+        <input type="text" id="set-miner-flockName" value="${esc(settings.miner?.flockName || '')}" placeholder="e.g., iron_flock, copper_flock" />
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Flock Role</div>
+          <div class="setting-hint">Leader decides where to mine. Followers automatically go to the leader's location.</div>
+        </div>
+        <select id="set-miner-flockRole">
+          <option value="leader"${settings.miner?.flockRole === 'leader' ? ' selected' : ''}>Leader (decides target)</option>
+          <option value="follower"${settings.miner?.flockRole === 'follower' ? ' selected' : ''}>Follower (follows leader)</option>
+        </select>
+      </div>
+    </div>
+
+    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">Flock Groups Configuration</div>
+      <div class="setting-hint" style="margin-bottom:12px">Define multiple flock groups for different mining operations. Each group can target different resources.</div>
+      
+      <table id="flock-groups-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Flock Name</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Ore</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Gas</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Ice</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Mining Type</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Rally System</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Max Members</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody id="flock-groups-tbody">
+          ${buildFlockGroupRows()}
+        </tbody>
+      </table>
+      
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input type="text" id="flock-group-name" style="width:120px" placeholder="Flock name" />
+        <select id="flock-group-targetOre" style="flex:1;min-width:120px">${oreOpts.join('')}</select>
+        <select id="flock-group-targetGas" style="flex:1;min-width:120px">${gasOpts.join('')}</select>
+        <select id="flock-group-targetIce" style="flex:1;min-width:120px">${iceOpts.join('')}</select>
+        <select id="flock-group-miningType" style="width:140px">
+          <option value="auto">Auto</option>
+          <option value="ore">Ore</option>
+          <option value="gas">Gas</option>
+          <option value="ice">Ice</option>
+        </select>
+        <input type="text" id="flock-group-rallySystem" style="width:140px" placeholder="Rally system (opt)" />
+        <input type="number" id="flock-group-maxMembers" min="1" max="20" value="5" style="width:80px" placeholder="Max" />
+        <button class="secondary" onclick="addFlockGroupRow()">Add Group</button>
+      </div>
+    </div>
+
       <div class="setting-row">
         <div>
           <div class="setting-label">Harvesting System</div>
@@ -9080,6 +9214,22 @@ function saveMinerSettings() {
     return quotas;
   };
 
+  const collectFlockGroups = () => {
+    const groups = [];
+    for (const row of document.querySelectorAll('#flock-groups-tbody tr')) {
+      groups.push({
+        name: row.dataset.flockGroup,
+        targetOre: row.cells[1].textContent === '-' ? '' : row.cells[1].textContent,
+        targetGas: row.cells[2].textContent === '-' ? '' : row.cells[2].textContent,
+        targetIce: row.cells[3].textContent === '-' ? '' : row.cells[3].textContent,
+        miningType: row.cells[4].textContent,
+        rallySystem: row.cells[5].textContent === '-' ? '' : row.cells[5].textContent,
+        maxMembers: row.cells[6].textContent === '-' ? undefined : parseInt(row.cells[6].textContent),
+      });
+    }
+    return groups;
+  };
+
   const s = {
     miningType: document.getElementById('set-miner-miningType').value,
     targetOre: document.getElementById('set-miner-targetOre').value,
@@ -9102,6 +9252,11 @@ function saveMinerSettings() {
     oreQuotas: collectQuotas('ore-quota-table'),
     gasQuotas: collectQuotas('gas-quota-table'),
     iceQuotas: collectQuotas('ice-quota-table'),
+    // Flock mining settings
+    flockEnabled: document.getElementById('set-miner-flockEnabled').checked,
+    flockName: document.getElementById('set-miner-flockName').value,
+    flockRole: document.getElementById('set-miner-flockRole').value,
+    flockGroups: collectFlockGroups(),
   };
   send({ type: 'saveSettings', routine: 'miner', settings: s });
   settings.miner = s;

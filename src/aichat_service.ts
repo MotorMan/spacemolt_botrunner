@@ -1074,6 +1074,233 @@ export class AiChatService {
     return false;
   }
 
+  /**
+   * Gather comprehensive bot context for LLM prompts.
+   * Calls get_status, get_nearby, get_ship, get_active_missions, get_system, and get_poi.
+   * Returns a formatted string suitable for inclusion in system prompts.
+   */
+  private async gatherBotContext(bot: Bot): Promise<string> {
+    const lines: string[] = [];
+
+    // Get status (basic state)
+    try {
+      const statusResp = await bot.exec("get_status", {});
+      if (!statusResp.error && statusResp.result) {
+        const status = statusResp.result as any;
+        lines.push("## Current Status (get_status)");
+        lines.push(`- Credits: ${status.credits ?? "N/A"}`);
+        lines.push(`- Fuel: ${status.fuel ?? "N/A"} / ${status.max_fuel ?? "N/A"}`);
+        lines.push(`- Cargo: ${status.cargo ?? "N/A"} / ${status.max_cargo ?? "N/A"}`);
+        lines.push(`- Hull: ${status.hull ?? "N/A"} / ${status.max_hull ?? "N/A"}`);
+        lines.push(`- Shield: ${status.shield ?? "N/A"} / ${status.max_shield ?? "N/A"}`);
+        lines.push(`- Location: ${status.system ?? "unknown"} / ${status.poi ?? "unknown"}`);
+        lines.push(`- Docked: ${status.docked ?? false}`);
+        lines.push(`- Faction: ${status.faction_name ?? "None"}`);
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Current Status: Error retrieving");
+      lines.push("");
+    }
+
+    // Get ship details
+    try {
+      const shipResp = await bot.exec("get_ship", {});
+      if (!shipResp.error && shipResp.result) {
+        const ship = shipResp.result as any;
+        lines.push("## Ship Details (get_ship)");
+        lines.push(`- Ship Name: ${ship.name ?? "N/A"}`);
+        lines.push(`- Ship Type: ${ship.type ?? "N/A"}`);
+        if (ship.modules && Array.isArray(ship.modules)) {
+          lines.push(`- Installed Modules: ${ship.modules.map((m: any) => m.name || m.type || m).join(", ") || "None"}`);
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Ship Details: Error retrieving");
+      lines.push("");
+    }
+
+    // Get skills
+    try {
+      const skillsResp = await bot.exec("v2_get_skills", {});
+      if (!skillsResp.error && skillsResp.result) {
+        const skills = skillsResp.result as any;
+        lines.push("## Skills (v2_get_skills)");
+        
+        // Handle different response formats
+        const skillsList = Array.isArray(skills) ? skills : (skills.skills || []);
+        if (Array.isArray(skillsList) && skillsList.length > 0) {
+          const skillEntries = skillsList.map((s: any) => {
+            const name = s.name || s.skill_name || s.id || "Unknown";
+            const level = s.level ?? s.current_level ?? "?";
+            const xp = s.xp !== undefined ? ` (${s.xp} XP)` : "";
+            return `${name}: ${level}${xp}`;
+          });
+          lines.push(`- ${skillEntries.join(", ")}`);
+        } else if (typeof skillsList === "object" && !Array.isArray(skillsList)) {
+          // Dict format: { skill_name: { level, xp, ... } }
+          const entries = Object.entries(skillsList).map(([name, data]: [string, any]) => {
+            const level = data.level ?? "?";
+            const xp = data.xp !== undefined ? ` (${data.xp} XP)` : "";
+            return `${name}: ${level}${xp}`;
+          });
+          lines.push(`- ${entries.join(", ")}`);
+        } else {
+          lines.push("- No skills data available");
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Skills: Error retrieving");
+      lines.push("");
+    }
+
+    // Get nearby entities
+    try {
+      const nearbyResp = await bot.exec("get_nearby", {});
+      if (!nearbyResp.error && nearbyResp.result) {
+        const nearby = nearbyResp.result as any;
+        lines.push("## Nearby Entities (get_nearby)");
+        
+        const players = nearby.players || nearby.entities?.filter((e: any) => e.type === "player") || [];
+        const npcs = nearby.npcs || nearby.entities?.filter((e: any) => e.type === "npc") || [];
+        const stations = nearby.stations || nearby.entities?.filter((e: any) => e.type === "station") || [];
+        
+        if (players.length > 0) {
+          lines.push(`- Players (${players.length}): ${players.map((p: any) => p.name || p).join(", ")}`);
+        }
+        if (npcs.length > 0) {
+          lines.push(`- NPCs (${npcs.length}): ${npcs.map((n: any) => n.name || n).join(", ")}`);
+        }
+        if (stations.length > 0) {
+          lines.push(`- Stations (${stations.length}): ${stations.map((s: any) => s.name || s).join(", ")}`);
+        }
+        if (players.length === 0 && npcs.length === 0 && stations.length === 0) {
+          lines.push("- No entities nearby");
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Nearby Entities: Error retrieving");
+      lines.push("");
+    }
+
+    // Get active missions
+    try {
+      const missionsResp = await bot.exec("get_active_missions", {});
+      if (!missionsResp.error && missionsResp.result) {
+        const missions = missionsResp.result as any;
+        lines.push("## Active Missions (get_active_missions)");
+        
+        if (missions.missions && Array.isArray(missions.missions) && missions.missions.length > 0) {
+          for (const mission of missions.missions) {
+            lines.push(`- ${mission.name || "Unknown"}: ${mission.description || mission.objective || "No description"}`);
+            if (mission.progress) lines.push(`  Progress: ${mission.progress}`);
+            if (mission.reward) lines.push(`  Reward: ${mission.reward}`);
+          }
+        } else {
+          lines.push("- No active missions");
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Active Missions: Error retrieving");
+      lines.push("");
+    }
+
+    // Get completed missions
+    try {
+      const completedResp = await bot.exec("completed_missions", {});
+      if (!completedResp.error && completedResp.result) {
+        const completed = completedResp.result as any;
+        lines.push("## Completed Missions (completed_missions)");
+        
+        const missionsList = Array.isArray(completed) ? completed : (completed.missions || []);
+        if (Array.isArray(missionsList) && missionsList.length > 0) {
+          // Show last 10 completed missions
+          const recentMissions = missionsList.slice(-10);
+          lines.push(`- Total Completed: ${missionsList.length}`);
+          for (const mission of recentMissions) {
+            const name = mission.name || mission.mission_name || "Unknown";
+            const reward = mission.reward || mission.credits_earned ? ` (${mission.reward || mission.credits_earned} credits)` : "";
+            lines.push(`  * ${name}${reward}`);
+          }
+          if (missionsList.length > 10) {
+            lines.push(`  ... and ${missionsList.length - 10} more`);
+          }
+        } else {
+          lines.push("- No completed missions");
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Completed Missions: Error retrieving");
+      lines.push("");
+    }
+
+    // Get system info
+    try {
+      const systemResp = await bot.exec("get_system", {});
+      if (!systemResp.error && systemResp.result) {
+        const system = systemResp.result as any;
+        lines.push("## System Info (get_system)");
+        lines.push(`- System Name: ${system.name ?? bot.system ?? "unknown"}`);
+        lines.push(`- System Type: ${system.type ?? "N/A"}`);
+        lines.push(`- Security Level: ${system.security ?? "N/A"}`);
+        
+        if (system.pois && Array.isArray(system.pois) && system.pois.length > 0) {
+          lines.push(`- Points of Interest (${system.pois.length}):`);
+          for (const poi of system.pois.slice(0, 10)) {
+            lines.push(`  * ${poi.name} (${poi.type})${poi.has_base ? " [Station]" : ""}`);
+          }
+          if (system.pois.length > 10) {
+            lines.push(`  ... and ${system.pois.length - 10} more`);
+          }
+        }
+        
+        if (system.connections && Array.isArray(system.connections)) {
+          lines.push(`- Connected Systems: ${system.connections.map((c: any) => c.name || c.system_name || c).join(", ")}`);
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## System Info: Error retrieving");
+      lines.push("");
+    }
+
+    // Get POI info (if docked or at a POI)
+    if (bot.poi && bot.poi !== "") {
+      try {
+        const poiResp = await bot.exec("get_poi", { poi_id: bot.poi });
+        if (!poiResp.error && poiResp.result) {
+          const poi = poiResp.result as any;
+          lines.push("## Current POI Details (get_poi)");
+          lines.push(`- Name: ${poi.name ?? bot.poi}`);
+          lines.push(`- Type: ${poi.type ?? "N/A"}`);
+          lines.push(`- Description: ${poi.description ?? "N/A"}`);
+          if (poi.services && Array.isArray(poi.services)) {
+            lines.push(`- Services: ${poi.services.join(", ")}`);
+          }
+          if (poi.market && typeof poi.market === "object") {
+            lines.push(`- Market: Available`);
+          }
+          lines.push("");
+        }
+      } catch (err) {
+        lines.push("## Current POI Details: Error retrieving");
+        lines.push("");
+      }
+    }
+
+    return lines.join("\n") || "No additional context available.";
+  }
+
+  /**
+   * Generate and send a response.
+   * For local chat, the bot must be at the same location as the receiving bot.
+   * Returns: "sent" if response was sent, "traveling" if bot is traveling, "error" on failure.
+   */
   private async sendResponse(
     bot: Bot,
     msg: ChatMessage,
@@ -1092,6 +1319,10 @@ export class AiChatService {
     // Load galaxy map data for factual responses
     const mapSummary = getCachedMapSummary();
 
+    // Gather comprehensive real-time context from the bot
+    this.logFn("ai_chat_debug", `Gathering real-time context for ${bot.username}...`);
+    const botContext = await this.gatherBotContext(bot);
+
     const systemPrompt = `${personality}
 
 ## Galaxy Map Data (Real Game Data)
@@ -1104,12 +1335,19 @@ ${mapSummary}
 - You are currently in system: ${bot.system || "unknown"}
 - Chat channel: ${msg.channel}
 
+## Real-Time Game State
+This is your current situation in the game:
+
+${botContext}
+
 ## Response Rules
 - Keep responses short (1-3 sentences max)
 - Be natural and conversational
 - Don't spam or be repetitive
-- Use the map data above to provide accurate information about systems and resources
-- If asked about a system not listed, mention there are many more systems and suggest using /get_system in-game
+- Use the real-time game state above to provide accurate, contextual responses
+- Reference your actual status, ship, nearby players, missions, and location when relevant
+- If asked about something you can see in your current context, use that information
+- If asked about a system not in the map data, mention there are many more systems and suggest using /get_system in-game
 - If asked about game mechanics, share what you know`;
 
     const recentHistory = mem.conversationHistory
@@ -1497,25 +1735,35 @@ You are currently outraged and entitled. On top of your normal personality, you 
 - Use phrases like "Do you know who I am?", "This is unacceptable!", "Get me your supervisor!"
 - Still stay in-character with your base personality, but amplified with Karen energy` : "";
 
+    // Gather comprehensive real-time context
+    this.logFn("ai_chat_debug", `Gathering real-time context for customs response (${botName})...`);
+    const botContext = await this.gatherBotContext(bot);
+
     // Build context for the LLM
     const systemPrompt = `${basePersonality}${karenAddition}
 
-Context:
+## Your Current Situation
 - You are ${botName} in SpaceMolt
 - You are currently in an empire system
 - Customs has stopped you for a cargo scan
 - This has happened ${context.botStops} time(s) to you
 
-Task:
+## Real-Time Game State
+This is your current situation:
+
+${botContext}
+
+## Task
 Generate a brief chat message response to the customs agent.
 
-Style:
+## Style
 - Keep it in-character with your personality
 - Be concise (1-2 sentences max)
 - For stop_request: Acknowledge compliance or express mild annoyance
 - For cleared: Express relief or gratitude
 - For contraband: Show surprise, denial, or acceptance depending on personality
-- For evasion: Be defensive or apologetic`;
+- For evasion: Be defensive or apologetic
+- Use the real-time game state above to make your response more contextual and realistic`;
 
     let userMessage = "";
     switch (context.messageType) {

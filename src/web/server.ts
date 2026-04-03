@@ -292,7 +292,25 @@ export class WebServer {
           return Response.json(this.routines);
         }
         if (url.pathname === "/api/settings") {
-          return Response.json(this.settings);
+          // GET: Return current settings
+          if (req.method === "GET") {
+            return Response.json(this.settings);
+          }
+          // POST: Save settings
+          if (req.method === "POST") {
+            const updates = await req.json() as Record<string, unknown>;
+            // Merge updates into this.settings (deep merge for nested objects)
+            for (const [key, value] of Object.entries(updates)) {
+              if (typeof value === 'object' && value !== null && !Array.isArray(value) && key in this.settings && typeof this.settings[key] === 'object' && this.settings[key] !== null) {
+                // Deep merge nested objects
+                this.settings[key] = { ...this.settings[key], ...value };
+              } else {
+                this.settings[key] = value as Record<string, unknown>;
+              }
+            }
+            saveSettings(this.settings);
+            return Response.json(this.settings);
+          }
         }
         if (url.pathname === "/api/stats") {
           return Response.json(this.statsData.daily);
@@ -341,6 +359,25 @@ export class WebServer {
             return Response.json(result);
           }
           return Response.json({ ok: false, error: "No action handler" });
+        }
+
+        // POST chat endpoint (for fleet commands via faction chat)
+        if (url.pathname === "/api/chat" && req.method === "POST") {
+          const body = await req.json();
+          const { bot, channel, content } = body as { bot: string; channel: string; content: string };
+          if (!bot || !channel || !content) {
+            return Response.json({ error: { code: "invalid_request", message: "Missing bot, channel, or content" } });
+          }
+          const botInstance = getBot(bot);
+          if (!botInstance) {
+            return Response.json({ error: { code: "not_found", message: `Bot ${bot} not found` } });
+          }
+          try {
+            const result = await botInstance.exec("chat", { channel, content });
+            return Response.json(result);
+          } catch (err) {
+            return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
+          }
         }
 
         // Per-bot battle status endpoint

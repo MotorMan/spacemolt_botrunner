@@ -721,7 +721,7 @@ function switchTab(name) {
   if (name === 'stats') { renderStatsTab(); refreshFactionFunds(); }
   if (name === 'commandall') renderCommandAllControls();
   if (name === 'fleetcombat') {
-    renderFleetCombatControls();
+    renderFleetCombatControls(true); // Force render when tab is opened
     // Update battle UI visibility
     updateBattleUI();
   }
@@ -856,6 +856,7 @@ function connect() {
         bots = msg.bots || [];
         routines = msg.routines || [];
         settings = msg.settings || {};
+        window.currentSettings = settings; // Sync for use in render functions
         knownSystems = msg.knownSystems || [];
         knownOres = msg.knownOres || [];
         mobileCapitol = msg.mobileCapitol || null;
@@ -895,9 +896,9 @@ function connect() {
         if (profileBot) renderProfileSidebar();
         // Update stats tab bot list if visible
         if (document.getElementById('page-stats')?.classList.contains('active')) renderStatsTab();
-        // Update Fleet Combat controls if visible (refresh commander dropdown)
+        // Update Fleet Combat controls if visible (refresh commander dropdown only)
         if (document.getElementById('page-fleetcombat')?.classList.contains('active')) {
-          renderFleetCombatControls();
+          renderFleetCombatControls(false); // false = don't force full re-render
         }
         break;
       case 'log':
@@ -914,6 +915,7 @@ function connect() {
         }
         if (msg.settings) {
           settings = msg.settings;
+          window.currentSettings = settings; // Sync for use in render functions
           updateAiChatToggleButton();
         }
         break;
@@ -11695,19 +11697,30 @@ let fleetCombatFleetId = 'default';
 let fleetCombatFireMode = 'spread';
 let fleetCombatHuntingEnabled = true;
 let fleetCombatManualMode = false;
+let fleetCombatLastRenderedSettings = null;
 
 /** Render the Fleet Combat controls panel */
-function renderFleetCombatControls() {
+function renderFleetCombatControls(force = false) {
   const controls = document.getElementById('fleetCombatControls');
   if (!controls) return;
 
   // Get current settings
   const settings = window.currentSettings || {};
   const fleetHunterSettings = settings.fleet_hunter || {};
+  
+  // Check if settings have changed since last render (to avoid resetting inputs)
+  const settingsKey = JSON.stringify(fleetHunterSettings);
+  if (!force && fleetCombatLastRenderedSettings === settingsKey) {
+    // Settings haven't changed, only update dynamic elements (commander dropdown)
+    updateBattleCommanderDropdown();
+    return;
+  }
+  
   fleetCombatFleetId = fleetHunterSettings.fleetId || 'default';
   fleetCombatFireMode = fleetHunterSettings.fireMode || 'spread';
   fleetCombatHuntingEnabled = fleetHunterSettings.huntingEnabled ?? true;
   fleetCombatManualMode = fleetHunterSettings.manualMode ?? false;
+  fleetCombatLastRenderedSettings = settingsKey;
 
   // Build bot list for commander selection
   const botOpts = bots.length > 0
@@ -11788,7 +11801,7 @@ function renderFleetCombatControls() {
         <option value="">-- Select Commander --</option>
         ${runningBotOpts}
       </select>
-      ${battleState.commanderBot ? `<span style="margin-left:8px;font-size:11px;color:var(--green);font-weight:600">✓ Active</span>` : ''}
+      <span class="battle-commander-indicator" style="margin-left:8px;font-size:11px;color:var(--green);font-weight:600;display:${battleState.commanderBot ? 'inline' : 'none'}">✓ Active</span>
     </div>
 
     <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
@@ -11891,9 +11904,18 @@ function fcSetFleetId() {
     body: JSON.stringify({
       fleet_hunter: { fleetId },
     }),
-  }).then(() => {
+  })
+  .then(() => {
     logFleetCombat('Fleet ID saved to settings');
-  }).catch(err => {
+    // Refresh settings from server
+    return fetch('/api/settings');
+  })
+  .then(r => r.json())
+  .then(settingsData => {
+    window.currentSettings = settingsData;
+    settings = settingsData;
+  })
+  .catch(err => {
     logFleetCombat(`Error saving: ${err.message}`, 'error');
   });
 }
@@ -11909,9 +11931,18 @@ function fcSetFireMode() {
     body: JSON.stringify({
       fleet_hunter: { fireMode },
     }),
-  }).then(() => {
+  })
+  .then(() => {
     logFleetCombat('Fire mode saved to settings');
-  }).catch(err => {
+    // Refresh settings from server
+    return fetch('/api/settings');
+  })
+  .then(r => r.json())
+  .then(settingsData => {
+    window.currentSettings = settingsData;
+    settings = settingsData;
+  })
+  .catch(err => {
     logFleetCombat(`Error saving: ${err.message}`, 'error');
   });
 }
@@ -11926,10 +11957,21 @@ function fcSetHuntingEnabled(enabled) {
     body: JSON.stringify({
       fleet_hunter: { huntingEnabled: enabled },
     }),
-  }).then(() => {
+  })
+  .then(r => r.json())
+  .then(data => {
     logFleetCombat(`Hunting ${enabled ? 'enabled' : 'disabled'} in settings`);
-    renderFleetCombatControls(); // Re-render to update button states
-  }).catch(err => {
+    // Refresh settings from server and update UI
+    return fetch('/api/settings');
+  })
+  .then(r => r.json())
+  .then(settingsData => {
+    window.currentSettings = settingsData;
+    settings = settingsData;
+    // Force re-render to update button states
+    renderFleetCombatControls(true);
+  })
+  .catch(err => {
     logFleetCombat(`Error saving: ${err.message}`, 'error');
   });
 }
@@ -11944,10 +11986,21 @@ function fcSetManualMode(manual) {
     body: JSON.stringify({
       fleet_hunter: { manualMode: manual },
     }),
-  }).then(() => {
+  })
+  .then(r => r.json())
+  .then(data => {
     logFleetCombat(`${manual ? 'Manual mode enabled' : 'Auto mode enabled'} in settings`);
-    renderFleetCombatControls(); // Re-render to update button states
-  }).catch(err => {
+    // Refresh settings from server and update UI
+    return fetch('/api/settings');
+  })
+  .then(r => r.json())
+  .then(settingsData => {
+    window.currentSettings = settingsData;
+    settings = settingsData;
+    // Force re-render to update button states
+    renderFleetCombatControls(true);
+  })
+  .catch(err => {
     logFleetCombat(`Error saving: ${err.message}`, 'error');
   });
 }
@@ -12080,6 +12133,31 @@ function logFleetCombat(message, type = 'info') {
 function clearFleetCombatLog() {
   const log = document.getElementById('fleetCombatLog');
   if (log) log.innerHTML = '';
+}
+
+/** Update only the battle commander dropdown (called on status updates) */
+function updateBattleCommanderDropdown() {
+  const select = document.getElementById('battle-commander-select');
+  if (!select) return;
+  
+  const currentValue = select.value;
+  const runningBots = bots.filter(b => b.state === 'running');
+  
+  // Only rebuild options if the list of running bots changed
+  const newOptionsHtml = runningBots.length > 0
+    ? runningBots.map(b => `<option value="${esc(b.username)}"${battleState.commanderBot === b.username ? ' selected' : ''}>${esc(b.username)} (${esc(b.shipName || 'unknown')})</option>`).join('')
+    : '<option value="">No running bots</option>';
+  
+  if (select.innerHTML !== newOptionsHtml) {
+    select.innerHTML = newOptionsHtml;
+    select.value = currentValue; // Preserve current selection
+  }
+  
+  // Update the "Active" indicator
+  const indicator = select.parentElement.querySelector('.battle-commander-indicator');
+  if (indicator) {
+    indicator.style.display = battleState.commanderBot ? 'inline' : 'none';
+  }
 }
 
 /** Set the commander bot for battle operations */

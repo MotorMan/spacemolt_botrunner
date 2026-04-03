@@ -137,6 +137,8 @@ function getMinerSettings(username?: string): {
   ignoreDepletion: boolean;
   stayOutUntilFull: boolean;
   maxJumps: number;
+  escortName: string;
+  escortSignalChannel: "faction" | "local" | "file";
 } {
   const all = readSettings();
   const m = all.miner || {};
@@ -149,6 +151,11 @@ function getMinerSettings(username?: string): {
 
   function parseMiningType(val: unknown): MiningType | null {
     if (val === "auto" || val === "ore" || val === "gas" || val === "ice") return val;
+    return null;
+  }
+
+  function parseSignalChannel(val: unknown): "faction" | "local" | "file" | null {
+    if (val === "faction" || val === "local" || val === "file") return val;
     return null;
   }
 
@@ -178,6 +185,10 @@ function getMinerSettings(username?: string): {
     ignoreDepletion: (m.ignoreDepletion as boolean) ?? false,
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
     maxJumps: (m.maxJumps as number) ?? 10,
+    escortName: (botOverrides.escortName as string) || (m.escortName as string) || "",
+    escortSignalChannel:
+      parseSignalChannel(botOverrides.escortSignalChannel) ??
+      parseSignalChannel(m.escortSignalChannel) ?? "faction",
   };
 }
 
@@ -329,6 +340,36 @@ function findMiningPoi(
     // Fallback: any gas cloud
     const gasCloud = pois.find(p => isGasCloudPoi(p.type));
     return gasCloud ? { id: gasCloud.id, name: gasCloud.name } : null;
+  }
+}
+
+// ── Escort signaling ─────────────────────────────────────────
+
+/**
+ * Send a coordination signal to escort bots.
+ * Uses faction chat by default, can also use local log or file.
+ */
+async function signalEscort(
+  ctx: RoutineContext,
+  action: "jump" | "travel" | "dock" | "undock",
+  systemId?: string,
+  channel: "faction" | "local" | "file" = "faction",
+): Promise<void> {
+  const { bot } = ctx;
+  const message = `[ESCORT] ${action}${systemId ? ` ${systemId}` : ""}`;
+
+  if (channel === "faction") {
+    await bot.exec("chat", { channel: "faction", content: message });
+  } else if (channel === "local") {
+    ctx.log("escort", `Signal: ${message}`);
+  } else {
+    // File-based signaling for cross-bot coordination on same machine
+    const { writeFileSync, existsSync, mkdirSync } = await import("fs");
+    const { join } = await import("path");
+    const escortDir = join(process.cwd(), "data", "escort_signals");
+    if (!existsSync(escortDir)) mkdirSync(escortDir, { recursive: true });
+    const signalFile = join(escortDir, `${bot.username}.signal`);
+    writeFileSync(signalFile, JSON.stringify({ action, systemId, timestamp: Date.now() }));
   }
 }
 
@@ -536,6 +577,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       await repairShip(ctx);
     }
 
+    // Signal escorts that we're undocking (they should prepare to follow)
+    if (settings.escortName) {
+      ctx.log("escort", "Signaling escorts: miner undocking...");
+      await signalEscort(ctx, "undock", undefined, settings.escortSignalChannel);
+    }
+
     await ensureUndocked(ctx);
 
     // ── Determine mining destination ──
@@ -668,6 +715,15 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (recoveredSession) {
         updateMiningSession(bot.username, { state: "traveling_to_ore" });
       }
+
+      // Signal escorts before jumping
+      const minerSettings = getMinerSettings(bot.username);
+      if (minerSettings.escortName) {
+        ctx.log("escort", `Signaling escorts to jump to ${targetSystemId}...`);
+        await signalEscort(ctx, "jump", targetSystemId, minerSettings.escortSignalChannel);
+        await sleep(2000); // Brief pause to let escorts read the signal
+      }
+
       const arrived = await navigateToSystem(ctx, targetSystemId, safetyOpts);
       if (!arrived) {
         ctx.log("error", "Failed to reach target system — mining locally instead");
@@ -853,6 +909,28 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
+      // If we're in battle, re-issue flee command every cycle to ensure we stay in flee stance
+      if (battleState.inBattle) {
+        ctx.log("combat", "Re-issuing flee stance (ensuring we stay in flee mode)...");
+        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (fleeResp.error) {
+          ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+        }
+        // Check if we've successfully disengaged
+        const currentBattleStatus = await getBattleStatus(ctx);
+        if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+          ctx.log("combat", "Battle cleared - no longer in combat!");
+          battleState.inBattle = false;
+          battleState.battleId = null;
+          battleState.isFleeing = false;
+          stopReason = "battle escaped successfully";
+          break;
+        }
+        // Still in battle - continue to next cycle to re-flee again
+        await sleep(2000); // Brief pause before next flee attempt
+        continue;
+      }
+
       // Periodically check POI to see if resource is depleted (remaining: 0)
       if (effectiveTarget && bot.poi && !settings.ignoreDepletion &&
           (now - lastPoiCheck) > POI_CHECK_INTERVAL_MS) {
@@ -933,9 +1011,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                         if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
                           const battleDetected = await handleBattleNotifications(ctx, travelResp.notifications, battleState);
                           if (battleDetected) {
-                            ctx.log("error", "Battle detected while changing POI - fleeing!");
-                            stopReason = "battle detected";
-                            break;
+                            ctx.log("combat", "Battle detected while changing POI - initiating flee!");
+                            // Don't break - let the flee handling in main loop re-issue every cycle
+                            battleState.isFleeing = false;
                           }
                         }
                         
@@ -970,12 +1048,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Pre-mine battle check - prevents mine command from freezing if battle starts
       const preMineBattleCheck = await getBattleStatus(ctx);
       if (preMineBattleCheck && preMineBattleCheck.is_participant) {
-        ctx.log("combat", `PRE-MINE CHECK: IN BATTLE! Battle ID: ${preMineBattleCheck.battle_id} - fleeing!`);
+        ctx.log("combat", `PRE-MINE CHECK: IN BATTLE! Battle ID: ${preMineBattleCheck.battle_id} - initiating flee!`);
         battleState.inBattle = true;
         battleState.battleId = preMineBattleCheck.battle_id;
-        await fleeFromBattle(ctx, true, 35000);
-        stopReason = "battle detected (pre-mine)";
-        break;
+        battleState.isFleeing = false;
+        // Don't break - let the flee handling below re-issue flee every cycle
+        await fleeFromBattle(ctx, false, 5000); // Initial flee, don't wait for disengage
       }
 
       const mineResp = await bot.exec("mine");
@@ -984,9 +1062,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (mineResp.notifications && Array.isArray(mineResp.notifications)) {
         const battleDetected = await handleBattleNotifications(ctx, mineResp.notifications, battleState);
         if (battleDetected) {
-          ctx.log("error", "Battle detected while mining - fleeing!");
-          stopReason = "battle detected";
-          break;
+          ctx.log("combat", "Battle detected while mining - initiating flee (will re-issue every cycle)!");
+          // Don't break - let the flee handling below re-issue flee every cycle
+          battleState.isFleeing = false; // Reset so the loop will re-issue
         }
       }
 
@@ -1288,6 +1366,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Dock ──
     yield "dock";
+
+    // Signal escorts that we're docking (they should stay on patrol)
+    const minerDockSettings = getMinerSettings(bot.username);
+    if (minerDockSettings.escortName) {
+      ctx.log("escort", "Signaling escorts: miner docking...");
+      await signalEscort(ctx, "dock", undefined, minerDockSettings.escortSignalChannel);
+    }
+
     const dockResp = await bot.exec("dock");
     if (dockResp.error && !dockResp.error.message.includes("already")) {
       ctx.log("error", `Dock failed: ${dockResp.error.message}`);

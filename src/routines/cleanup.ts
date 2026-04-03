@@ -28,6 +28,9 @@ import {
   type SystemPOI,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
+  type BattleState,
+  handleBattleNotifications,
+  getBattleStatus,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -295,6 +298,14 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   if (bot.poi !== targetPoiId) {
     ctx.log("travel", `Traveling to home station...`);
     const tResp = await bot.exec("travel", { target_poi: targetPoiId });
+
+    // Check for battle after travel
+    if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+      ctx.log("combat", "Battle detected during travel to home station - fleeing!");
+      await sleep(5000);
+      return;
+    }
+
     if (tResp.error && !tResp.error.message.includes("already")) {
       ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
       return;
@@ -304,6 +315,12 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
 
   // Dock
   await ensureDocked(ctx);
+
+  // Check for battle after dock
+  if (await checkAndFleeFromBattle(ctx, "dock")) {
+    await sleep(5000);
+    return;
+  }
 
   // Deposit all non-fuel cargo to faction storage
   await bot.refreshCargo();
@@ -341,6 +358,15 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(10000); continue; }
+
+    // ── Battle state tracking (per-cycle initialization) ──
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "cleanup")) {
@@ -539,6 +565,14 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       await ensureUndocked(ctx);
       if (bot.poi !== station.poiId) {
         const tResp = await bot.exec("travel", { target_poi: station.poiId });
+
+        // Check for battle after travel
+        if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+          ctx.log("combat", "Battle detected during travel - fleeing!");
+          await sleep(5000);
+          continue;
+        }
+
         if (tResp.error && !tResp.error.message.includes("already")) {
           ctx.log("error", `Travel to ${station.poiName} failed: ${tResp.error.message} — skipping`);
           continue;
@@ -548,6 +582,13 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Dock
       await ensureDocked(ctx);
+
+      // Check for battle after dock
+      if (await checkAndFleeFromBattle(ctx, "dock")) {
+        await sleep(5000);
+        continue;
+      }
+
       if (!bot.docked) {
         ctx.log("error", `Could not dock at ${station.poiName} — skipping`);
         continue;

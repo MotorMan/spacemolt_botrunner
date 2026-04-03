@@ -812,11 +812,21 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       // Travel to destination POI and dock
       if (bot.poi !== recoveredSession.destPoi) {
         ctx.log("travel", `Traveling to ${recoveredSession.destPoiName}...`);
-        await bot.exec("travel", { target_poi: recoveredSession.destPoi });
+        const travelResp = await bot.exec("travel", { target_poi: recoveredSession.destPoi });
+        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+          ctx.log("combat", "Battle detected during travel — fleeing!");
+          await sleep(5000);
+          continue;
+        }
         bot.poi = recoveredSession.destPoi;
       }
 
       const dockResp = await bot.exec("dock");
+      if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
+        ctx.log("combat", "Battle detected during dock — fleeing!");
+        await sleep(5000);
+        continue;
+      }
       if (dockResp.error && !dockResp.error.message.includes("already")) {
         ctx.log("error", `Dock failed at destination: ${dockResp.error.message} — finding alternative buyer`);
         // Destination has no station - find alternative buyer with a dockable station
@@ -1008,7 +1018,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               const { pois } = await getSystemInfo(ctx);
               const homeStation = findStation(pois);
               if (homeStation) {
-                await bot.exec("travel", { target_poi: homeStation.id });
+                const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
+                if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+                  ctx.log("combat", "Battle detected during travel — fleeing!");
+                  await sleep(5000);
+                  continue;
+                }
                 await ensureDocked(ctx);
               }
             }
@@ -1384,6 +1399,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         await ensureUndocked(ctx);
         ctx.log("travel", `Traveling to ${candidate.sourcePoiName}...`);
         const tResp = await bot.exec("travel", { target_poi: candidate.sourcePoi });
+        if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+          ctx.log("combat", "Battle detected during travel — fleeing!");
+          await sleep(5000);
+          continue;
+        }
         if (tResp.error && !tResp.error.message.includes("already")) {
           ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
           releaseTradeLock(bot.username, candidate.itemId, "aborted:travel_failed");
@@ -1951,13 +1971,23 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     if (bot.poi !== route.destPoi) {
       ctx.log("travel", `Traveling to ${route.destPoiName}...`);
       const t2Resp = await bot.exec("travel", { target_poi: route.destPoi });
+      if (await checkBattleAfterCommand(ctx, t2Resp.notifications, "travel")) {
+        ctx.log("combat", "Battle detected during travel — fleeing!");
+        await sleep(5000);
+        continue;
+      }
       if (t2Resp.error && !t2Resp.error.message.includes("already")) {
         ctx.log("error", `Travel to dest failed: ${t2Resp.error.message}`);
         // Try to sell wherever we are
         const { pois } = await getSystemInfo(ctx);
         const station = findStation(pois);
         if (station) {
-          await bot.exec("travel", { target_poi: station.id });
+          const travelResp = await bot.exec("travel", { target_poi: station.id });
+          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+            ctx.log("combat", "Battle detected during travel — fleeing!");
+            await sleep(5000);
+            continue;
+          }
           bot.poi = station.id;
         }
       } else {
@@ -1981,6 +2011,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // Dock at destination
     yield "dock_dest";
     const d2Resp = await bot.exec("dock");
+    if (await checkBattleAfterCommand(ctx, d2Resp.notifications, "dock")) {
+      ctx.log("combat", "Battle detected during dock — fleeing!");
+      await sleep(5000);
+      continue;
+    }
     if (d2Resp.error && !d2Resp.error.message.includes("already")) {
       ctx.log("error", `Dock failed at dest: ${d2Resp.error.message}`);
       continue;
@@ -2065,6 +2100,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           if (bot.poi !== best.buyer.poiId) {
             await ensureUndocked(ctx);
             const tResp = await bot.exec("travel", { target_poi: best.buyer.poiId });
+            if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+              ctx.log("combat", "Battle detected during travel — fleeing!");
+              await sleep(5000);
+              continue;
+            }
             if (!tResp.error || tResp.error.message.includes("already")) {
               bot.poi = best.buyer.poiId;
             }
@@ -2127,6 +2167,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           if (bot.poi !== buyer.poiId) {
             await ensureUndocked(ctx);
             const tResp = await bot.exec("travel", { target_poi: buyer.poiId });
+            if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+              ctx.log("combat", "Battle detected during travel — fleeing!");
+              await sleep(5000);
+              continue;
+            }
             if (tResp.error && !tResp.error.message.includes("already")) continue;
             bot.poi = buyer.poiId;
           }
@@ -2184,11 +2229,16 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         if (homeStation) {
           if (bot.poi !== homeStation.id) {
             await ensureUndocked(ctx);
-            await bot.exec("travel", { target_poi: homeStation.id });
+            const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
+            if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+              ctx.log("combat", "Battle detected during travel — fleeing!");
+              await sleep(5000);
+              continue;
+            }
             bot.poi = homeStation.id;
           }
           await ensureDocked(ctx);
-          
+
           // Deposit unsold items
           await bot.refreshCargo();
           remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
@@ -2215,7 +2265,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
         if (bot.poi !== SOL_CENTRAL) {
           await ensureUndocked(ctx);
-          await bot.exec("travel", { target_poi: SOL_CENTRAL });
+          const travelResp = await bot.exec("travel", { target_poi: SOL_CENTRAL });
+          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+            ctx.log("combat", "Battle detected during travel — fleeing!");
+            await sleep(5000);
+            continue;
+          }
           bot.poi = SOL_CENTRAL;
         }
 
@@ -2277,7 +2332,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             const { pois: homePois } = await getSystemInfo(ctx);
             const homeStation = findStation(homePois);
             if (homeStation) {
-              await bot.exec("travel", { target_poi: homeStation.id });
+              const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
+              if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+                ctx.log("combat", "Battle detected during travel — fleeing!");
+                await sleep(5000);
+                continue;
+              }
               await ensureDocked(ctx, true);
               
               // Deposit excess credits to faction storage
@@ -2346,8 +2406,18 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           const { pois: homePois } = await getSystemInfo(ctx);
           const homeStation = findStation(homePois);
           if (homeStation) {
-            await bot.exec("travel", { target_poi: homeStation.id });
-            await bot.exec("dock");
+            const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
+            if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+              ctx.log("combat", "Battle detected during travel — fleeing!");
+              await sleep(5000);
+              continue;
+            }
+            const dockResp = await bot.exec("dock");
+            if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
+              ctx.log("combat", "Battle detected during dock — fleeing!");
+              await sleep(5000);
+              continue;
+            }
             bot.docked = true;
             bot.poi = homeStation.id;
             ctx.log("travel", `Docked at home station ${homeStation.name}`);

@@ -36,6 +36,10 @@ import {
   createTradeSession,
   type TradeSession,
 } from "./traderActivity.js";
+import {
+  type BattleState,
+  handleBattleNotifications,
+} from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -310,6 +314,15 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Battle state tracking (per-cycle initialization) ──
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
+
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "faction_trader")) {
       await sleep(5000);
@@ -421,7 +434,15 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       // Travel to destination POI and dock
       if (bot.poi !== recoveredSession.destPoi) {
         ctx.log("travel", `Traveling to ${recoveredSession.destPoiName}...`);
-        await bot.exec("travel", { target_poi: recoveredSession.destPoi });
+        const travelResp = await bot.exec("travel", { target_poi: recoveredSession.destPoi });
+
+        // Check for battle after travel
+        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+          ctx.log("combat", "Battle detected during travel - fleeing!");
+          await sleep(5000);
+          continue;
+        }
+
         bot.poi = recoveredSession.destPoi;
 
         // Check for pirates at destination
@@ -511,7 +532,15 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         // Travel to destination POI and dock
         if (bot.poi !== recoveredSession.destPoi) {
           ctx.log("travel", `Traveling to ${recoveredSession.destPoiName}...`);
-          await bot.exec("travel", { target_poi: recoveredSession.destPoi });
+          const travelResp = await bot.exec("travel", { target_poi: recoveredSession.destPoi });
+
+          // Check for battle after travel
+          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+            ctx.log("combat", "Battle detected during travel - fleeing!");
+            await sleep(5000);
+            continue;
+          }
+
           bot.poi = recoveredSession.destPoi;
         }
 
@@ -668,6 +697,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           if (homeStationPoi && bot.poi !== homeStationPoi) {
             await ensureUndocked(ctx);
             const tResp = await bot.exec("travel", { target_poi: homeStationPoi });
+
+            // Check for battle after travel
+            if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+              ctx.log("combat", "Battle detected during travel home - fleeing!");
+              await sleep(5000);
+              continue;
+            }
+
             if (!tResp.error || tResp.error.message.includes("already")) {
               bot.poi = homeStationPoi;
             }
@@ -1166,6 +1203,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       if (homeStationPoi && bot.poi !== homeStationPoi) {
         await ensureUndocked(ctx);
         const tResp = await bot.exec("travel", { target_poi: homeStationPoi });
+
+        // Check for battle after travel
+        if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+          ctx.log("combat", "Battle detected during travel home - fleeing!");
+          await sleep(5000);
+          continue;
+        }
+
         if (!tResp.error || tResp.error.message.includes("already")) {
           bot.poi = homeStationPoi;
         }

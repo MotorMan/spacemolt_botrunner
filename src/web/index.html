@@ -371,6 +371,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('ai')">AI</div>
         <div class="sidebar-item" onclick="switchSettingsTab('ai_chat')">AI Chat Service</div>
         <div class="sidebar-item" onclick="switchSettingsTab('hunter')">Hunter</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('escort')">Escort</div>
         <div class="sidebar-item" onclick="switchSettingsTab('fleet_hunter')">Fleet Hunter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cargo_mover')">CargoMover</div>
         <div class="sidebar-item" onclick="switchSettingsTab('fuel_transfer')">FuelTransfer</div>
@@ -4405,6 +4406,8 @@ function renderSettingsPanel() {
     renderAiChatSettings(panel);
   } else if (activeSettingsTab === 'hunter') {
     renderHunterSettings(panel);
+  } else if (activeSettingsTab === 'escort') {
+    renderEscortSettings(panel);
   } else if (activeSettingsTab === 'fleet_hunter') {
     renderFleetHunterSettings(panel);
   } else if (activeSettingsTab === 'cargo_mover') {
@@ -8944,6 +8947,26 @@ function renderMinerSettings(panel) {
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Escort Bot Name</div>
+          <div class="setting-hint">Username of an escort bot that should follow this miner. Leave empty if no escort. The miner will broadcast [ESCORT] signals for coordination.</div>
+        </div>
+        <input type="text" id="set-miner-escortName" value="${esc(settings.miner?.escortName || '')}" placeholder="escort_bot_username" />
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Escort Signal Channel</div>
+          <div class="setting-hint">How the miner sends signals to escorts. Faction chat is default and works across systems. File-based works for bots on the same machine.</div>
+        </div>
+        <select id="set-miner-escortSignalChannel">
+          <option value="faction"${(!settings.miner?.escortSignalChannel || settings.miner?.escortSignalChannel === 'faction') ? ' selected' : ''}>Faction Chat (cross-system)</option>
+          <option value="local"${settings.miner?.escortSignalChannel === 'local' ? ' selected' : ''}>Local Log Only (debug)</option>
+          <option value="file"${settings.miner?.escortSignalChannel === 'file' ? ' selected' : ''}>File-Based (same machine)</option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Harvesting System</div>
           <div class="setting-hint">Override system to harvest in. Bot will jump there on start.</div>
         </div>
@@ -9074,6 +9097,8 @@ function saveMinerSettings() {
     ignoreDepletion: document.getElementById('set-miner-ignoreDepletion').checked,
     stayOutUntilFull: document.getElementById('set-miner-stayOutUntilFull').checked,
     maxJumps: parseInt(document.getElementById('set-miner-maxJumps').value) || 10,
+    escortName: document.getElementById('set-miner-escortName').value,
+    escortSignalChannel: document.getElementById('set-miner-escortSignalChannel').value,
     oreQuotas: collectQuotas('ore-quota-table'),
     gasQuotas: collectQuotas('gas-quota-table'),
     iceQuotas: collectQuotas('ice-quota-table'),
@@ -9425,6 +9450,108 @@ function saveHunterSettings() {
   };
   send({ type: 'saveSettings', routine: 'hunter', settings: s });
   settings.hunter = s;
+}
+
+// ── Escort settings ─────────────────────────────────────────
+function renderEscortSettings(panel) {
+  const e = settings.escort || {};
+  const minerName = e.minerName || '';
+  const refuelThreshold = e.refuelThreshold ?? 40;
+  const repairThreshold = e.repairThreshold ?? 30;
+  const fleeThreshold = e.fleeThreshold ?? 20;
+  const maxAttackTier = e.maxAttackTier || 'large';
+  const fleeFromTier = e.fleeFromTier || 'boss';
+  const minPiratesToFlee = e.minPiratesToFlee ?? 3;
+
+  const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
+  const tierOpts = tierOptions.map(t => `<option value="${t}"${t === maxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
+  const fleeTierOpts = tierOptions.map(t => `<option value="${t}"${t === fleeFromTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
+
+  // Build miner dropdown from known bots
+  const knownBots = (window.discoveredBots || []).filter(b => b && b.trim());
+  const minerOpts = ['<option value="">(select a miner bot...)</option>', ...knownBots.map(b => `<option value="${esc(b)}"${b === minerName ? ' selected' : ''}>${esc(b)}</option>`)];
+  if (minerName && !knownBots.includes(minerName)) {
+    minerOpts.push(`<option value="${esc(minerName)}" selected>${esc(minerName)}</option>`);
+  }
+
+  panel.innerHTML = `
+    <h3>Escort Settings</h3>
+    <div class="settings-desc">Escort bots follow and protect a specified miner bot from pirates and hostile players. Multiple escorts can follow the same miner.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Miner to Follow</div>
+        <div class="setting-hint">Username of the miner bot this escort should protect. The escort will track the miner's location via faction chat signals.</div>
+      </div>
+      <select id="set-escort-minerName">${minerOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Return to station to refuel when fuel drops below this percentage.</div>
+      </div>
+      <input type="number" id="set-escort-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold (%)</div>
+        <div class="setting-hint">Abort patrol and retreat to a safe system when hull drops below this percentage.</div>
+      </div>
+      <input type="number" id="set-escort-repairThreshold" min="20" max="80" value="${repairThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Flee Threshold (%)</div>
+        <div class="setting-hint">Emergency flee from an active fight when hull drops below this percentage.</div>
+      </div>
+      <input type="number" id="set-escort-fleeThreshold" min="5" max="50" value="${fleeThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Attack Tier</div>
+        <div class="setting-hint">Maximum pirate tier to engage. Pirates above this tier will be ignored.</div>
+      </div>
+      <select id="set-escort-maxAttackTier">${tierOpts}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Flee From Tier</div>
+        <div class="setting-hint">Flee from combat if a pirate of this tier or higher is detected.</div>
+      </div>
+      <select id="set-escort-fleeFromTier">${fleeTierOpts}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Min Pirates to Flee</div>
+        <div class="setting-hint">Flee from combat if this many or more pirates are present in the area.</div>
+      </div>
+      <input type="number" id="set-escort-minPiratesToFlee" min="1" max="10" value="${minPiratesToFlee}">
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveEscortSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function saveEscortSettings() {
+  const s = {
+    minerName: document.getElementById('set-escort-minerName').value,
+    refuelThreshold: parseInt(document.getElementById('set-escort-refuelThreshold').value) || 40,
+    repairThreshold: parseInt(document.getElementById('set-escort-repairThreshold').value) || 30,
+    fleeThreshold: parseInt(document.getElementById('set-escort-fleeThreshold').value) || 20,
+    maxAttackTier: document.getElementById('set-escort-maxAttackTier').value,
+    fleeFromTier: document.getElementById('set-escort-fleeFromTier').value,
+    minPiratesToFlee: parseInt(document.getElementById('set-escort-minPiratesToFlee').value) || 3,
+  };
+  send({ type: 'saveSettings', routine: 'escort', settings: s });
+  settings.escort = s;
 }
 
 // ── Fleet Hunter settings ─────────────────────────────────────

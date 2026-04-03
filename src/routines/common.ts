@@ -1255,11 +1255,37 @@ export async function navigateToSystem(
     // Jump with retry logic for transient errors
     let jumpSuccess = false;
     let retries = 0;
+    let inBattleDuringJump = false;
     while (!jumpSuccess && retries < MAX_RETRIES_PER_JUMP && bot.state === "running") {
       retries++;
       ctx.log("travel", `Jumping to ${nextSystem} from ${bot.system}... (attempt ${retries}/${MAX_RETRIES_PER_JUMP})`);
       const jumpResp = await bot.exec("jump", { target_system: nextSystem });
-      
+
+      // Check for battle notifications after jump
+      if (jumpResp.notifications && Array.isArray(jumpResp.notifications)) {
+        const battleNotifs = parseBattleNotifications(jumpResp.notifications);
+        const hasBattle = battleNotifs.some(n => n.type === "battle_start" || n.type === "battle_hit");
+        if (hasBattle) {
+          ctx.log("combat", "Battle detected during jump - initiating flee!");
+          inBattleDuringJump = true;
+          // Re-issue flee every cycle while in battle
+          const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+          if (fleeResp.error) {
+            ctx.log("error", `Flee command failed: ${fleeResp.error.message}`);
+          }
+          // Check if disengaged
+          const battleStatus = await getBattleStatus(ctx);
+          if (!battleStatus || !battleStatus.is_participant) {
+            ctx.log("combat", "Battle cleared - continuing navigation");
+            inBattleDuringJump = false;
+          } else {
+            // Still in battle - wait and continue to re-flee
+            await sleep(2000);
+            continue;
+          }
+        }
+      }
+
       if (!jumpResp.error) {
         jumpSuccess = true;
         break;
@@ -1621,7 +1647,7 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
  */
 export async function fullSalvageWrecks(
   ctx: RoutineContext,
-  opts?: { fuelOnly?: boolean; enableTow?: boolean; minTowValue?: number },
+  opts?: { fuelOnly?: boolean; enableTow?: boolean; minTowValue?: number; battleState?: BattleState },
 ): Promise<{ itemsLooted: number; isTowing: boolean }> {
   const { bot } = ctx;
   if (bot.docked) return { itemsLooted: 0, isTowing: false };
@@ -1629,6 +1655,7 @@ export async function fullSalvageWrecks(
   const enableTow = opts?.enableTow ?? false;
   const minTowValue = opts?.minTowValue ?? 500;
   const fuelOnly = opts?.fuelOnly ?? false;
+  const battleState = opts?.battleState;
 
   const wrecksResp = await bot.exec("get_wrecks");
   const wrecks = parseWrecks(wrecksResp.result);
@@ -1673,6 +1700,15 @@ export async function fullSalvageWrecks(
           quantity: item.quantity,
         });
 
+        // Check for battle notifications after loot
+        if (battleState && lootResp.notifications && Array.isArray(lootResp.notifications)) {
+          const battleDetected = await handleBattleNotifications(ctx, lootResp.notifications, battleState);
+          if (battleDetected) {
+            ctx.log("combat", "Battle detected while looting wreck - initiating flee!");
+            battleState.isFleeing = false;
+          }
+        }
+
         if (lootResp.error) {
           const msg = lootResp.error.message.toLowerCase();
           if (msg.includes("empty") || msg.includes("not found")) break;
@@ -1694,6 +1730,14 @@ export async function fullSalvageWrecks(
       }
 
       const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
+      // Check for battle notifications after tow
+      if (battleState && towResp.notifications && Array.isArray(towResp.notifications)) {
+        const battleDetected = await handleBattleNotifications(ctx, towResp.notifications, battleState);
+        if (battleDetected) {
+          ctx.log("combat", "Battle detected while towing wreck - initiating flee!");
+          battleState.isFleeing = false;
+        }
+      }
       if (!towResp.error && towResp.result) {
         const tr = towResp.result as Record<string, unknown>;
         ctx.log("debug", `tow_wreck response: ${JSON.stringify(tr)}`);

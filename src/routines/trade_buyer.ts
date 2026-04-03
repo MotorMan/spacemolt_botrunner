@@ -26,6 +26,10 @@ import {
   type BaseServices,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
+  getBattleStatus,
+  type BattleState,
+  handleBattleNotifications,
+  fleeFromBattle,
 } from "./common.js";
 import {
   getActiveSession,
@@ -628,6 +632,15 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     const failedSources = new Set<string>();
     let attempts = 0;
 
+    // Battle state tracking for buy route loop
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
+
     // If we have a recovered session, execute it
     if (recoveredSession) {
       ctx.log("trade", `Executing recovered buy session: ${recoveredSession.itemName} (${recoveredSession.quantityBought}x @ ${recoveredSession.buyPricePerUnit}cr)`);
@@ -663,6 +676,27 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         if (bot.state !== "running") break;
         const candidate = routes[ri];
 
+        // If we're in battle, re-issue flee command every cycle
+        if (battleState.inBattle) {
+          ctx.log("combat", "Re-issuing flee stance during trade operations (ensuring we stay in flee mode)...");
+          const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+          if (fleeResp.error) {
+            ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+          }
+          // Check if we've successfully disengaged
+          const currentBattleStatus = await getBattleStatus(ctx);
+          if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+            ctx.log("combat", "Battle cleared - no longer in combat! Resuming trade operations...");
+            battleState.inBattle = false;
+            battleState.battleId = null;
+            battleState.isFleeing = false;
+          } else {
+            // Still in battle - wait briefly and continue to next cycle to re-flee
+            await sleep(2000);
+            continue;
+          }
+        }
+
         const sourceKey = `${candidate.sourceSystem}:${candidate.sourcePoi}:${candidate.itemId}`;
         if (failedSources.has(sourceKey)) continue;
         attempts++;
@@ -693,6 +727,14 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
           await ensureUndocked(ctx);
           ctx.log("travel", `Traveling to ${candidate.sourcePoiName}...`);
           const tResp = await bot.exec("travel", { target_poi: candidate.sourcePoi });
+          // Check for battle notifications after travel
+          if (tResp.notifications && Array.isArray(tResp.notifications)) {
+            const battleDetected = await handleBattleNotifications(ctx, tResp.notifications, battleState);
+            if (battleDetected) {
+              ctx.log("combat", "Battle detected during travel - initiating flee!");
+              battleState.isFleeing = false;
+            }
+          }
           if (tResp.error && !tResp.error.message.includes("already")) {
             ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
             continue;
@@ -835,6 +877,14 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         const creditsBefore = bot.credits;
         ctx.log("trade", `Buying ${qty}x ${candidate.itemName} at ${candidate.buyPrice}cr/ea...`);
         const buyResp = await bot.exec("buy", { item_id: candidate.itemId, quantity: qty });
+        // Check for battle notifications after buy
+        if (buyResp.notifications && Array.isArray(buyResp.notifications)) {
+          const battleDetected = await handleBattleNotifications(ctx, buyResp.notifications, battleState);
+          if (battleDetected) {
+            ctx.log("combat", "Battle detected during buy - initiating flee!");
+            battleState.isFleeing = false;
+          }
+        }
         if (buyResp.error) {
           failedSources.add(sourceKey);
           if (buyResp.error.message.includes("item_not_available") || buyResp.error.message.includes("not_available")) {

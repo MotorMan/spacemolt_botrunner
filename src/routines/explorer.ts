@@ -907,9 +907,31 @@ async function* sampleResourcePoi(
     // Check for battle notifications after mining
     const battleDetected = await handleBattleNotifications(ctx, mineResp.notifications || [], battleState);
     if (battleDetected) {
-      ctx.log("combat", "Battle detected while sampling - fleeing!");
-      await fleeFromBattle(ctx, true, 35000);
-      return;
+      ctx.log("combat", "Battle detected while sampling - initiating flee (will re-issue every cycle)!");
+      // Don't return - let the flee handling below re-issue flee every cycle
+      battleState.isFleeing = false; // Reset so the loop will re-issue
+    }
+
+    // If we're in battle, re-issue flee command every cycle to ensure we stay in flee stance
+    if (battleState.inBattle) {
+      ctx.log("combat", "Re-issuing flee stance while sampling (ensuring we stay in flee mode)...");
+      const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+      if (fleeResp.error) {
+        ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+      }
+      // Check if we've successfully disengaged
+      const currentBattleStatus = await getBattleStatus(ctx);
+      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+        ctx.log("combat", "Battle cleared - no longer in combat!");
+        battleState.inBattle = false;
+        battleState.battleId = null;
+        battleState.isFleeing = false;
+        // Continue sampling if we escaped
+      } else {
+        // Still in battle - wait briefly and continue to next cycle to re-flee
+        await sleep(2000);
+        continue; // Skip rest of loop, continue to next iteration to re-flee
+      }
     }
 
     if (mineResp.error) {

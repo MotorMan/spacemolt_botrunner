@@ -26,6 +26,10 @@ import {
   sleep,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
+  getBattleStatus,
+  type BattleState,
+  handleBattleNotifications,
+  fleeFromBattle,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -234,9 +238,39 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     let totalLooted = 0;
     let cargoFull = false;
 
+    // Battle state tracking for salvage loop
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
+
     if (!skipScanning) {
       for (const poi of visitPois) {
         if (bot.state !== "running") break;
+
+        // If we're in battle, re-issue flee command every cycle
+        if (battleState.inBattle) {
+          ctx.log("combat", "Re-issuing flee stance during salvage operations (ensuring we stay in flee mode)...");
+          const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+          if (fleeResp.error) {
+            ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+          }
+          // Check if we've successfully disengaged
+          const currentBattleStatus = await getBattleStatus(ctx);
+          if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+            ctx.log("combat", "Battle cleared - no longer in combat! Resuming salvage operations...");
+            battleState.inBattle = false;
+            battleState.battleId = null;
+            battleState.isFleeing = false;
+          } else {
+            // Still in battle - wait briefly and continue to next cycle to re-flee
+            await sleep(2000);
+            continue;
+          }
+        }
 
         // Check cargo before traveling
         await bot.refreshStatus();
@@ -258,6 +292,14 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         yield "travel_to_poi";
         ctx.log("travel", `Traveling to ${poi.name}...`);
         const travelResp = await bot.exec("travel", { target_poi: poi.id });
+        // Check for battle notifications after travel
+        if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
+          const battleDetected = await handleBattleNotifications(ctx, travelResp.notifications, battleState);
+          if (battleDetected) {
+            ctx.log("combat", "Battle detected during travel to POI - initiating flee!");
+            battleState.isFleeing = false;
+          }
+        }
         if (travelResp.error && !travelResp.error.message.includes("already")) {
           ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
           continue;
@@ -267,7 +309,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         // Salvage wrecks at this POI
         yield "scavenge";
         const result = settings.enableFullSalvage
-          ? await fullSalvageWrecks(ctx, { enableTow: settings.enableTowing, minTowValue: settings.minTowValue })
+          ? await fullSalvageWrecks(ctx, { enableTow: settings.enableTowing, minTowValue: settings.minTowValue, battleState })
           : { itemsLooted: await scavengeWrecks(ctx), isTowing: false };
         totalLooted += result.itemsLooted;
 

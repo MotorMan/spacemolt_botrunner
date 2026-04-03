@@ -39,6 +39,8 @@ import {
 import {
   type BattleState,
   handleBattleNotifications,
+  getBattleStatus,
+  fleeFromBattle,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -742,6 +744,27 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       while (remaining > 0 && bot.state === "running") {
         await bot.refreshStatus();
 
+        // Check battle status at start of each cycle
+        if (battleState.inBattle) {
+          ctx.log("combat", "Re-issuing flee stance during trade operations (ensuring we stay in flee mode)...");
+          const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+          if (fleeResp.error) {
+            ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+          }
+          // Check if we've successfully disengaged
+          const currentBattleStatus = await getBattleStatus(ctx);
+          if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+            ctx.log("combat", "Battle cleared - no longer in combat! Resuming trade operations...");
+            battleState.inBattle = false;
+            battleState.battleId = null;
+            battleState.isFleeing = false;
+          } else {
+            // Still in battle - wait briefly and continue to next cycle to re-flee
+            await sleep(2000);
+            continue;
+          }
+        }
+
         // For cargo recovery, sell directly from cargo
         if (isCargoRecovery) {
           await bot.refreshCargo();
@@ -822,9 +845,25 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         if (personalMode) {
           // Personal storage - use withdraw_items command
           wResp = await bot.exec("withdraw_items", { item_id: route!.itemId, quantity: wQty });
+          // Check for battle notifications after withdraw
+          if (wResp.notifications && Array.isArray(wResp.notifications)) {
+            const battleDetected = await handleBattleNotifications(ctx, wResp.notifications, battleState);
+            if (battleDetected) {
+              ctx.log("combat", "Battle detected during withdraw - initiating flee!");
+              battleState.isFleeing = false;
+            }
+          }
         } else {
           // Faction storage
           wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: wQty });
+          // Check for battle notifications after faction withdraw
+          if (wResp.notifications && Array.isArray(wResp.notifications)) {
+            const battleDetected = await handleBattleNotifications(ctx, wResp.notifications, battleState);
+            if (battleDetected) {
+              ctx.log("combat", "Battle detected during faction withdraw - initiating flee!");
+              battleState.isFleeing = false;
+            }
+          }
           if (wResp.error && wResp.error.message.includes("cargo_full")) {
             wQty = Math.max(1, Math.floor(wQty / 2));
             wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: wQty });
@@ -848,6 +887,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         remaining -= wQty;
 
         const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: wQty });
+        // Check for battle notifications after sell
+        if (sResp.notifications && Array.isArray(sResp.notifications)) {
+          const battleDetected = await handleBattleNotifications(ctx, sResp.notifications, battleState);
+          if (battleDetected) {
+            ctx.log("combat", "Battle detected during sell - initiating flee!");
+            battleState.isFleeing = false;
+          }
+        }
         if (sResp.error) {
           ctx.log("error", `Sell failed: ${sResp.error.message}`);
           // Fail the session if we have no successful sales yet

@@ -212,6 +212,38 @@ export class Bot {
     if (this.actionLog.length > this.maxLogEntries) {
       this.actionLog.shift();
     }
+
+    // Emergency Warp Stabilizer detection — monitor ALL log lines
+    // Check BEFORE logging to avoid recursion issues
+    if (message.includes("Emergency Warp Stabilizer activated")) {
+      // Log the emergency message directly without triggering another detection
+      const emergencyLine = `${timestamp} [emergency] ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`;
+      this.actionLog.push(emergencyLine);
+      const stopLine = `${timestamp} [system] ⛔ Routine stopped — please install a new stabilizer before resuming.`;
+      this.actionLog.push(stopLine);
+
+      if (this.onLog) {
+        this.onLog(this.username, "emergency", "⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.");
+        this.onLog(this.username, "system", "⛔ Routine stopped — please install a new stabilizer before resuming.");
+      } else {
+        console.log(
+          `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
+            `\x1b[91m[emergency]${RESET} ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`
+        );
+        console.log(
+          `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
+            `\x1b[93m[system]${RESET} ⛔ Routine stopped — please install a new stabilizer before resuming.`
+        );
+      }
+
+      // Stop the routine immediately
+      if (this._state === "running") {
+        this._state = "stopping";
+        this._abortController?.abort();
+      }
+      return; // Don't log the original message again, we've already handled it
+    }
+
     if (this.onLog) {
       this.onLog(this.username, category, message);
     } else {

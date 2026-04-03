@@ -16,6 +16,21 @@ import {
   getBotCustomsStats,
 } from "../customs.js";
 
+// ── Emergency Warp Stabilizer ────────────────────────────────
+
+/** The exact log message produced when the Emergency Warp Stabilizer activates. */
+export const EMERGENCY_WARP_STABILIZER_MESSAGE =
+  "Emergency Warp Stabilizer activated! Hull critical — warped to Confederacy Central Command. The module has been destroyed.";
+
+/**
+ * Check if the bot's current state indicates it should stop (e.g., due to emergency warp).
+ * This is a convenience helper for routines to check between actions.
+ * The actual detection and stop is handled automatically by bot.ts log method.
+ */
+export function shouldStopForEmergency(ctx: RoutineContext): boolean {
+  return ctx.bot.state !== "running";
+}
+
 // ── Types ────────────────────────────────────────────────────
 
 export interface BaseServices {

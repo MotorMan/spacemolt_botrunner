@@ -310,8 +310,26 @@ async function detectMiningType(ctx: RoutineContext): Promise<"ore" | "gas" | "i
 /** Get expected mining type for a resource ID. */
 function getMiningTypeForResource(resourceId: string): "ore" | "gas" | "ice" {
   const lower = resourceId.toLowerCase();
-  if (lower.includes("gas")) return "gas";
-  if (lower.includes("ice")) return "ice";
+  
+  // Gas resources (including legacy names like compressed_hydrogen)
+  if (lower.includes("gas") || 
+      lower.includes("hydrogen") || 
+      lower.includes("helium") || 
+      lower.includes("argon") || 
+      lower.includes("neon") || 
+      lower.includes("chlorine") || 
+      lower.includes("nitrogen") || 
+      lower.includes("oxygen") ||
+      lower.includes("compressed_")) {
+    return "gas";
+  }
+  
+  // Ice resources
+  if (lower.includes("ice") || lower.includes("frost") || lower.includes("cryo") || lower.includes("water_ice")) {
+    return "ice";
+  }
+  
+  // Default to ore
   return "ore";
 }
 
@@ -865,14 +883,31 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       miningType = settings.miningType;
     }
 
-    const targetResource = miningType === "ice" ? settings.targetIce : (miningType === "ore" ? settings.targetOre : settings.targetGas);
-    const resourceLabel = miningType === "ice" ? "ice" : (miningType === "ore" ? "ore" : "gas");
+    // Smart target selection: check the matching mining type first, but fall back
+    // to other fields if empty. This lets users set a single target in the web UI
+    // regardless of mining type (ore/gas/ice).
+    let targetResource = "";
+    let resourceLabel = "";
+    if (miningType === "ice") {
+      targetResource = settings.targetIce || settings.targetOre || settings.targetGas;
+      resourceLabel = targetResource === settings.targetGas ? "gas" : (targetResource === settings.targetOre ? "ore" : "ice");
+    } else if (miningType === "ore") {
+      targetResource = settings.targetOre || settings.targetGas || settings.targetIce;
+      resourceLabel = targetResource === settings.targetGas ? "gas" : (targetResource === settings.targetIce ? "ice" : "ore");
+    } else {
+      // gas
+      targetResource = settings.targetGas || settings.targetOre || settings.targetIce;
+      resourceLabel = targetResource === settings.targetOre ? "ore" : (targetResource === settings.targetIce ? "ice" : "gas");
+    }
 
     // Log mining configuration (re-checked each cycle)
     if (targetResource) {
       ctx.log("mining", `Target ${resourceLabel}: ${targetResource} (mode: ${settings.miningType})`);
     } else {
       ctx.log("mining", `Mining any ${resourceLabel} (no specific target configured)`);
+      // Debug: Log what settings were loaded to help diagnose targeting issues
+      ctx.log("debug", `Settings loaded: targetOre="${settings.targetOre}", targetGas="${settings.targetGas}", targetIce="${settings.targetIce}"`);
+      ctx.log("debug", `System targets: systemOre="${settings.systemOre}", systemGas="${settings.systemGas}", systemIce="${settings.systemIce}"`);
     }
 
     // ── Select quotas based on mining type ──
@@ -986,13 +1021,17 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let targetPoiId = "";
     let targetPoiName = "";
 
-    // CRITICAL FIX: Select configured system based on mining type (ore/gas/ice each have their own target system)
-    // Falls back to legacy `system` setting if type-specific system is not configured
-    const configuredSystem = miningType === "ore"
-      ? (settings.systemOre || settings.system)
-      : (miningType === "gas"
-        ? (settings.systemGas || settings.system)
-        : (settings.systemIce || settings.system));
+    // Smart system selection: check the matching mining type first, but fall back
+    // to other fields or legacy `system` setting if not configured.
+    let configuredSystem = "";
+    if (miningType === "ice") {
+      configuredSystem = settings.systemIce || settings.systemOre || settings.systemGas || settings.system || "";
+    } else if (miningType === "ore") {
+      configuredSystem = settings.systemOre || settings.systemGas || settings.systemIce || settings.system || "";
+    } else {
+      // gas
+      configuredSystem = settings.systemGas || settings.systemOre || settings.systemIce || settings.system || "";
+    }
     const maxJumps = settings.maxJumps || 10;
 
     if (configuredSystem) {
@@ -1172,9 +1211,28 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (recoveredSession) {
           updateMiningSession(bot.username, { state: "mining" });
         }
-      } else if (settings.flockEnabled && settings.flockName) {
-        // Update flock phase after successful arrival
-        await updateFlockPhase(settings.flockName, "traveling");
+      } else {
+        // MAP UPDATE: Record successful system arrival and update connections
+        // Get the fresh system info to update the map with current POI data
+        const { pois: newPois, systemId: newSystemId, connections: newConnections } = await getSystemInfo(ctx);
+        if (newSystemId && newPois.length > 0) {
+          mapStore.updateSystem({
+            id: newSystemId,
+            pois: newPois.map(p => ({
+              id: p.id,
+              name: p.name,
+              type: p.type,
+            })),
+            connections: newConnections,
+            last_visited: new Date().toISOString(),
+          });
+          ctx.log("map", `Updated map for ${newSystemId}: ${newPois.length} POIs, ${newConnections?.length || 0} connections`);
+        }
+        
+        if (settings.flockEnabled && settings.flockName) {
+          // Update flock phase after successful arrival
+          await updateFlockPhase(settings.flockName, "traveling");
+        }
       }
     }
 
@@ -1184,6 +1242,21 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     yield miningType === "ice" ? "find_ice_field" : (miningType === "ore" ? "find_ore_belt" : "find_gas_cloud");
     const { pois: initialPois, systemId } = await getSystemInfo(ctx);
     if (systemId) bot.system = systemId;
+
+    // CRITICAL MAP UPDATE: Record system visit and update POI data
+    // Miners are excellent map data sources since they visit systems frequently
+    if (systemId && initialPois.length > 0) {
+      mapStore.updateSystem({
+        id: systemId,
+        pois: initialPois.map(p => ({
+          id: p.id,
+          name: p.name,
+          type: p.type,
+        })),
+        last_visited: new Date().toISOString(),
+      });
+      ctx.log("map", `Updated map data for system ${systemId}: ${initialPois.length} POIs recorded`);
+    }
 
     let pois = initialPois;
     let miningPoi: { id: string; name: string } | null = null;
@@ -1845,6 +1918,25 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             resourcesMined: { ...recoveredSession.resourcesMined, [oreName]: currentMined + 1 },
             cyclesMined: recoveredSession.cyclesMined + 1,
           });
+        }
+
+        // MAP UPDATE: Record successful mining at this POI
+        // This helps validate that the POI still has this resource available
+        const sysData = mapStore.getSystem(bot.system);
+        const storedPoi = sysData?.pois.find(p => p.id === bot.poi);
+        if (storedPoi) {
+          const oreEntry = storedPoi.ores_found.find(o => o.item_id === oreId);
+          if (oreEntry) {
+            // Update last_seen and increment times_seen
+            oreEntry.last_seen = new Date().toISOString();
+            oreEntry.times_seen = (oreEntry.times_seen || 0) + 1;
+            // Clear depleted flag if it was marked depleted
+            if (oreEntry.depleted) {
+              oreEntry.depleted = false;
+              oreEntry.depleted_at = undefined;
+              ctx.log("map", `Cleared depletion flag for ${oreId} at ${bot.poi} (successful mining)`);
+            }
+          }
         }
       }
 

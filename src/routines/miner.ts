@@ -1638,7 +1638,56 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             }
           }
 
-          // If no quota target found and we're set for "any", find any nearby ore
+          // If no quota target found, try to find the originally configured target resource
+          // CRITICAL FIX: Always respect the configured targetGas/targetOre/targetIce settings
+          // Don't fall back to "any resource" if a specific target was configured
+          if (!newTarget && targetResource) {
+            ctx.log("mining", `Attempting to find configured target ${resourceLabel}: ${targetResource}...`);
+            
+            // Find locations for the configured target resource
+            const targetLocs = mapStore.findOreLocations(targetResource).filter(loc => {
+              const sys = mapStore.getSystem(loc.systemId);
+              const poi = sys?.pois.find(p => p.id === loc.poiId);
+              if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+              if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
+              if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
+              return true;
+            }).filter(loc => {
+              if (settings.ignoreDepletion) return true;
+              const sys = mapStore.getSystem(loc.systemId);
+              const poi = sys?.pois.find(p => p.id === loc.poiId);
+              const oreEntry = poi?.ores_found.find(o => o.item_id === targetResource);
+              if (!oreEntry?.depleted) return true;
+              return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+            });
+
+            if (targetLocs.length > 0) {
+              // Prefer current system, then closest by jumps (use blacklist)
+              const blacklist = getSystemBlacklist();
+              const locsWithDist = targetLocs
+                .map(loc => {
+                  const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                  return { ...loc, jumps: route ? route.length - 1 : 999 };
+                })
+                .filter(loc => loc.jumps <= maxJumps)
+                .sort((a, b) => {
+                  if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+                  if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+                  return a.jumps - b.jumps;
+                });
+
+              if (locsWithDist.length > 0) {
+                const chosen = locsWithDist[0];
+                newTarget = targetResource;
+                newPoiId = chosen.poiId;
+                newPoiName = chosen.poiName;
+                newSystemId = chosen.systemId;
+                ctx.log("mining", `Found configured target ${resourceLabel}: ${targetResource} @ ${chosen.poiName} (${chosen.jumps} jumps${chosen.systemId !== bot.system ? ` in ${chosen.systemId}` : ''})`);
+              }
+            }
+          }
+
+          // If still no target found and we're set for "any", find any nearby ore
           if (!newTarget && !targetResource) {
             // First try current system
             const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :

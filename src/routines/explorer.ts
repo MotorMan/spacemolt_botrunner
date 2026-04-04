@@ -657,38 +657,25 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             ctx.log("exploration", `Grouping enabled: ${nearbyUnknowns.length} additional unknown(s) near ${target.name}`);
           }
         }
-        
-        // Jump to target system
+
+        // Navigate to target system via connected jumps (not a single direct jump)
         await ensureUndocked(ctx);
-        ctx.log("travel", `Jumping directly to unknown system: ${target.name || target.id}...`);
-        const jumpResp = await bot.exec("jump", { target_system: target.id });
-        
-        // Check for battle after jump
-        if (await checkBattleAfterCommand(ctx, jumpResp.notifications, "jump")) {
-          ctx.log("error", "Battle detected during jump - fleeing!");
-          await sleep(5000);
-          continue;
-        }
-        
-        if (jumpResp.error) {
-          const msg = jumpResp.error.message.toLowerCase();
-          if (msg.includes("fuel")) {
-            ctx.log("error", "Insufficient fuel for direct jump — will refuel next loop");
-          } else {
-            ctx.log("error", `Direct jump failed: ${jumpResp.error.message}`);
-          }
+        ctx.log("travel", `Navigating to ${target.priority === "unknown" ? "unknown" : "stale"} system: ${target.name || target.id} (${target.distance} jumps via route)...`);
+        const arrived = await navigateToSystem(ctx, target.id, { fuelThresholdPct: currentSettings.refuelThreshold, hullThresholdPct: 30 });
+        if (!arrived) {
+          ctx.log("error", `Could not reach ${target.name || target.id} — will retry next loop`);
           await sleep(10000);
           continue;
         }
 
-        ctx.log("travel", `Jumped to unknown system: ${target.name || target.id}`);
+        ctx.log("travel", `Arrived at ${target.name || target.id}`);
         bot.stats.totalSystems++;
         await checkCustomsInspection(ctx, systemId);
-        
+
         // Check for pirates and battle
         const nearbyResp = await bot.exec("get_nearby");
         if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
-          ctx.log("error", "Battle detected after jump - fleeing!");
+          ctx.log("error", "Battle detected after arrival - fleeing!");
           await sleep(30000);
           continue;
         }
@@ -696,7 +683,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
           if (fled) {
             ctx.log("error", "Pirates detected - fled, will retry");
-            fledFromSystems.add(systemId); // Mark this system as hostile
+            fledFromSystems.add(systemId);
             await sleep(30000);
             continue;
           }

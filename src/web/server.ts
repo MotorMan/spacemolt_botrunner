@@ -351,6 +351,22 @@ export class WebServer {
           return Response.json({ lines, total: allLines.length });
         }
 
+        // Flock state endpoint
+        if (url.pathname.startsWith("/api/flock/") && req.method === "GET") {
+          const flockName = decodeURIComponent(url.pathname.slice("/api/flock/".length));
+          const flockPath = join(process.cwd(), "data", "flock_signals", `${flockName}.json`);
+          if (!existsSync(flockPath)) {
+            return new Response("Flock not found", { status: 404 });
+          }
+          try {
+            const raw = readFileSync(flockPath, "utf-8");
+            const state = JSON.parse(raw);
+            return Response.json(state);
+          } catch (e) {
+            return new Response("Invalid flock state", { status: 500 });
+          }
+        }
+
         // POST actions (fallback for non-WS clients)
         if (url.pathname === "/api/action" && req.method === "POST") {
           const action = (await req.json()) as WebAction;

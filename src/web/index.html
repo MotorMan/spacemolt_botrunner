@@ -4063,9 +4063,16 @@ function buildOreFilters() {
   const ores = new Map();
   for (const sys of Object.values(mapData)) {
     for (const poi of (sys.pois || [])) {
+      // Old-style mining data
       for (const ore of (poi.ores_found || [])) {
         if (ore.item_id && !ores.has(ore.item_id)) {
           ores.set(ore.item_id, ore.name || ore.item_id);
+        }
+      }
+      // New-style resource scan data
+      for (const res of (poi.resources || [])) {
+        if (res.resource_id && !ores.has(res.resource_id)) {
+          ores.set(res.resource_id, res.name || res.resource_id);
         }
       }
     }
@@ -4165,7 +4172,8 @@ function renderMap() {
 
     if (filterOres) {
       const hasOre = (sys.pois || []).some(poi =>
-        (poi.ores_found || []).some(o => activeOreFilters.has(o.item_id))
+        (poi.ores_found || []).some(o => activeOreFilters.has(o.item_id)) ||
+        (poi.resources || []).some(r => activeOreFilters.has(r.resource_id))
       );
       if (!hasOre) return false;
     }
@@ -4242,7 +4250,8 @@ function renderMap() {
     // POIs
     for (const poi of pois) {
       if (filterOres && !poi.has_base) {
-        const hasMatch = (poi.ores_found || []).some(o => activeOreFilters.has(o.item_id));
+        const hasMatch = (poi.ores_found || []).some(o => activeOreFilters.has(o.item_id)) ||
+                         (poi.resources || []).some(r => activeOreFilters.has(r.resource_id));
         if (!hasMatch) continue;
       }
 
@@ -8748,6 +8757,9 @@ function buildFlockGroupRows() {
       <td style="padding:4px 8px">${esc(group.targetGas || '-')}</td>
       <td style="padding:4px 8px">${esc(group.targetIce || '-')}</td>
       <td style="padding:4px 8px">${esc(group.miningType || 'auto')}</td>
+      <td style="padding:4px 8px">${esc(group.systemOre || '-')}</td>
+      <td style="padding:4px 8px">${esc(group.systemGas || '-')}</td>
+      <td style="padding:4px 8px">${esc(group.systemIce || '-')}</td>
       <td style="padding:4px 8px">${esc(group.rallySystem || '-')}</td>
       <td style="padding:4px 8px">${esc(group.maxMembers || '-')}</td>
       <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
@@ -8762,6 +8774,9 @@ function addFlockGroupRow() {
   const targetGas = document.getElementById('flock-group-targetGas').value;
   const targetIce = document.getElementById('flock-group-targetIce').value;
   const miningType = document.getElementById('flock-group-miningType').value;
+  const systemOre = document.getElementById('flock-group-systemOre').value.trim();
+  const systemGas = document.getElementById('flock-group-systemGas').value.trim();
+  const systemIce = document.getElementById('flock-group-systemIce').value.trim();
   const rallySystem = document.getElementById('flock-group-rallySystem').value.trim();
   const maxMembers = document.getElementById('flock-group-maxMembers').value;
 
@@ -8786,6 +8801,9 @@ function addFlockGroupRow() {
     <td style="padding:4px 8px">${esc(targetGas || '-')}</td>
     <td style="padding:4px 8px">${esc(targetIce || '-')}</td>
     <td style="padding:4px 8px">${esc(miningType)}</td>
+    <td style="padding:4px 8px">${esc(systemOre || '-')}</td>
+    <td style="padding:4px 8px">${esc(systemGas || '-')}</td>
+    <td style="padding:4px 8px">${esc(systemIce || '-')}</td>
     <td style="padding:4px 8px">${esc(rallySystem || '-')}</td>
     <td style="padding:4px 8px">${esc(maxMembers || '-')}</td>
     <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
@@ -8809,6 +8827,9 @@ function renderMinerSettings(panel) {
   const refuelThreshold = m.refuelThreshold ?? 50;
   const repairThreshold = m.repairThreshold ?? 40;
   const currentSystem = m.system || '';
+  const systemOre = m.systemOre || '';
+  const systemGas = m.systemGas || '';
+  const systemIce = m.systemIce || '';
   const homeSystem = m.homeSystem || '';
   const depositBot = m.depositBot || '';
   const targetOre = m.targetOre || '';
@@ -8842,6 +8863,37 @@ function renderMinerSettings(panel) {
   }
   if (homeSystem && !knownSystems.find(s => s.id === homeSystem)) {
     homeOpts.push(`<option value="${esc(homeSystem)}" selected>${esc(homeSystem)}</option>`);
+  }
+
+  // Build options for type-specific mining systems
+  const systemOreOpts = ['<option value="">(use legacy system setting)</option>'];
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+    const sel = sys.id === systemOre ? ' selected' : '';
+    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+    systemOreOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+  }
+  if (systemOre && !knownSystems.find(s => s.id === systemOre)) {
+    systemOreOpts.push(`<option value="${esc(systemOre)}" selected>${esc(systemOre)}</option>`);
+  }
+
+  const systemGasOpts = ['<option value="">(use legacy system setting)</option>'];
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+    const sel = sys.id === systemGas ? ' selected' : '';
+    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+    systemGasOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+  }
+  if (systemGas && !knownSystems.find(s => s.id === systemGas)) {
+    systemGasOpts.push(`<option value="${esc(systemGas)}" selected>${esc(systemGas)}</option>`);
+  }
+
+  const systemIceOpts = ['<option value="">(use legacy system setting)</option>'];
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+    const sel = sys.id === systemIce ? ' selected' : '';
+    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+    systemIceOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+  }
+  if (systemIce && !knownSystems.find(s => s.id === systemIce)) {
+    systemIceOpts.push(`<option value="${esc(systemIce)}" selected>${esc(systemIce)}</option>`);
   }
 
   // Build ore filter lists
@@ -8967,6 +9019,35 @@ function renderMinerSettings(panel) {
         <div class="setting-hint">Seek a specific ice type. Bot will look for ice fields with this resource.</div>
       </div>
       <select id="set-miner-targetIce">${iceOpts.join('')}</select>
+    </div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">⛏️ Mining Target Systems</div>
+      <div class="setting-hint" style="margin-bottom:12px">Configure separate target systems for each mining type. This allows miners to travel to optimized systems for each resource type instead of using a single system for all mining.</div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Ore Mining System</div>
+          <div class="setting-hint">Target system for ore mining. Falls back to legacy "System" setting if not specified.</div>
+        </div>
+        <select id="set-miner-systemOre">${systemOreOpts.join('')}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Gas Mining System</div>
+          <div class="setting-hint">Target system for gas harvesting. Falls back to legacy "System" setting if not specified.</div>
+        </div>
+        <select id="set-miner-systemGas">${systemGasOpts.join('')}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Ice Mining System</div>
+          <div class="setting-hint">Target system for ice mining. Falls back to legacy "System" setting if not specified.</div>
+        </div>
+        <select id="set-miner-systemIce">${systemIceOpts.join('')}</select>
+      </div>
     </div>
 
     <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
@@ -9128,6 +9209,9 @@ function renderMinerSettings(panel) {
           <th style="padding:4px 8px;text-align:left;font-size:12px">Target Gas</th>
           <th style="padding:4px 8px;text-align:left;font-size:12px">Target Ice</th>
           <th style="padding:4px 8px;text-align:left;font-size:12px">Mining Type</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">System Ore</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">System Gas</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">System Ice</th>
           <th style="padding:4px 8px;text-align:left;font-size:12px">Rally System</th>
           <th style="padding:4px 8px;text-align:left;font-size:12px">Max Members</th>
           <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
@@ -9148,6 +9232,9 @@ function renderMinerSettings(panel) {
           <option value="gas">Gas</option>
           <option value="ice">Ice</option>
         </select>
+        <select id="flock-group-systemOre" style="flex:1;min-width:120px">${systemOreOpts.join('')}</select>
+        <select id="flock-group-systemGas" style="flex:1;min-width:120px">${systemGasOpts.join('')}</select>
+        <select id="flock-group-systemIce" style="flex:1;min-width:120px">${systemIceOpts.join('')}</select>
         <input type="text" id="flock-group-rallySystem" style="width:140px" placeholder="Rally system (opt)" />
         <input type="number" id="flock-group-maxMembers" min="1" max="20" value="5" style="width:80px" placeholder="Max" />
         <button class="secondary" onclick="addFlockGroupRow()">Add Group</button>
@@ -9278,8 +9365,11 @@ function saveMinerSettings() {
         targetGas: row.cells[2].textContent === '-' ? '' : row.cells[2].textContent,
         targetIce: row.cells[3].textContent === '-' ? '' : row.cells[3].textContent,
         miningType: row.cells[4].textContent,
-        rallySystem: row.cells[5].textContent === '-' ? '' : row.cells[5].textContent,
-        maxMembers: row.cells[6].textContent === '-' ? undefined : parseInt(row.cells[6].textContent),
+        systemOre: row.cells[5].textContent === '-' ? '' : row.cells[5].textContent,
+        systemGas: row.cells[6].textContent === '-' ? '' : row.cells[6].textContent,
+        systemIce: row.cells[7].textContent === '-' ? '' : row.cells[7].textContent,
+        rallySystem: row.cells[8].textContent === '-' ? '' : row.cells[8].textContent,
+        maxMembers: row.cells[9].textContent === '-' ? undefined : parseInt(row.cells[9].textContent),
       });
     }
     return groups;
@@ -9291,6 +9381,9 @@ function saveMinerSettings() {
     targetGas: document.getElementById('set-miner-targetGas').value,
     targetIce: document.getElementById('set-miner-targetIce').value,
     system: document.getElementById('set-miner-system').value,
+    systemOre: document.getElementById('set-miner-systemOre').value,
+    systemGas: document.getElementById('set-miner-systemGas').value,
+    systemIce: document.getElementById('set-miner-systemIce').value,
     homeSystem: document.getElementById('set-miner-homeSystem').value,
     depositBot: (function() { const v = document.getElementById('set-miner-depositPrimary').value; return v.startsWith('bot:') ? v.slice(4) : ''; })(),
     depositMode: (function() { const v = document.getElementById('set-miner-depositPrimary').value; return v.startsWith('bot:') ? 'gift' : v; })(),

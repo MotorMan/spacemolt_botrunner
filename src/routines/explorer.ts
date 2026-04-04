@@ -7,12 +7,8 @@ import {
   isMinablePoi,
   isScenicPoi,
   isStationPoi,
-  isOreBeltPoi,
-  isGasCloudPoi,
-  isIceFieldPoi,
   findStation,
   getSystemInfo,
-  parseOreFromMineResult,
   collectFromStorage,
   ensureDocked,
   ensureUndocked,
@@ -31,100 +27,26 @@ import {
   checkCustomsInspection,
   checkAndFleeFromPirates,
   fleeFromBattle,
-  getBattleStatus,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
-  type BattleState,
-  handleBattleNotifications,
 } from "./common.js";
 
-/** Number of mine attempts per resource POI to sample ores. */
-const SAMPLE_MINES = 5;
 /** Minimum fuel % before heading back to refuel. */
 const FUEL_SAFETY_PCT = 40;
 /** Default minimum fuel % required before attempting a system jump. */
 const DEFAULT_JUMP_FUEL_PCT = 50;
 
-// ── Ship module detection ───────────────────────────────────
-
-interface ShipModules {
-  hasMiningLaser: boolean;
-  hasGasHarvester: boolean;
-  hasIceHarvester: boolean;
-  hasRadHarvester: boolean;
-}
-
-/** Detect ship mining/harvesting modules. */
-async function detectShipModules(ctx: RoutineContext): Promise<ShipModules> {
-  const { bot } = ctx;
-  const shipResp = await bot.exec("get_ship");
-  if (shipResp.error) {
-    ctx.log("error", `Failed to get ship info: ${shipResp.error.message}`);
-    return { hasMiningLaser: false, hasGasHarvester: false, hasIceHarvester: false, hasRadHarvester: false };
-  }
-
-  const shipData = shipResp.result as Record<string, unknown>;
-  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
-
-  const result: ShipModules = {
-    hasMiningLaser: false,
-    hasGasHarvester: false,
-    hasIceHarvester: false,
-    hasRadHarvester: false,
-  };
-
-  for (const mod of modules) {
-    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
-    const modId = (modObj?.id as string) || (modObj?.type_id as string) || "";
-    const modName = (modObj?.name as string) || "";
-    const modType = (modObj?.type as string) || "";
-
-    const checkStr = `${modId} ${modName} ${modType}`.toLowerCase();
-
-    if (checkStr.includes("mining_laser") || checkStr.includes("mining laser")) {
-      result.hasMiningLaser = true;
-    }
-    if (checkStr.includes("gas_harvester") || checkStr.includes("gas harvester")) {
-      result.hasGasHarvester = true;
-    }
-    if (checkStr.includes("ice_harvester") || checkStr.includes("ice harvester")) {
-      result.hasIceHarvester = true;
-    }
-    if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester") || checkStr.includes("radiation harvester")) {
-      result.hasRadHarvester = true;
-    }
-  }
-
-  return result;
-}
-
-/** Check if a POI type requires a specific module. */
-function poiRequiresModule(poiType: string, modules: ShipModules): { canAccess: boolean; missingModule?: string } {
-  const type = poiType.toLowerCase();
-  
-  // Gas clouds need gas harvester
-  if (isGasCloudPoi(poiType) && !modules.hasGasHarvester) {
-    return { canAccess: false, missingModule: "Gas Harvester" };
-  }
-  
-  // Ice fields need ice harvester
-  if (isIceFieldPoi(poiType) && !modules.hasIceHarvester) {
-    return { canAccess: false, missingModule: "Ice Harvester" };
-  }
-  
-  // Radiation nebulae need rad harvester
-  if (type.includes("radiation") || type.includes("rad_") || type.includes("radioactive")) {
-    if (!modules.hasRadHarvester) {
-      return { canAccess: false, missingModule: "Rad Harvester" };
-    }
-  }
-  
-  // Ore belts need mining laser
-  if (isOreBeltPoi(poiType) && !modules.hasMiningLaser) {
-    return { canAccess: false, missingModule: "Mining Laser" };
-  }
-  
-  return { canAccess: true };
+/** Format an ISO timestamp as a relative "time ago" string. */
+function timeAgoFromIso(isoStr: string | null): string {
+  if (!isoStr) return "unknown";
+  const diff = Date.now() - new Date(isoStr).getTime();
+  if (diff < 0) return "just now";
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
 }
 
 // ── Mission helpers ───────────────────────────────────────────
@@ -220,6 +142,8 @@ function getExplorerSettings(username?: string): {
   scanPois: boolean;
   directToUnknown: boolean;
   groupUnknowns: boolean;
+  scavengeEnabled: boolean;
+  loadFuelCellsAtHome: boolean;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -264,6 +188,20 @@ function getExplorerSettings(username?: string): {
       ? Boolean(e.groupUnknowns)
       : true;
 
+  // Scavenge: per-bot > global explorer > default false (unsafe near pirates)
+  const scavengeEnabled = botOverrides.scavengeEnabled !== undefined
+    ? Boolean(botOverrides.scavengeEnabled)
+    : e.scavengeEnabled !== undefined
+      ? Boolean(e.scavengeEnabled)
+      : false;
+
+  // Load fuel cells at home: per-bot > global explorer > default true
+  const loadFuelCellsAtHome = botOverrides.loadFuelCellsAtHome !== undefined
+    ? Boolean(botOverrides.loadFuelCellsAtHome)
+    : e.loadFuelCellsAtHome !== undefined
+      ? Boolean(e.loadFuelCellsAtHome)
+      : true;
+
   return {
     mode: (mode === "trade_update" ? "trade_update" : "explore") as ExplorerMode,
     acceptMissions,
@@ -274,6 +212,8 @@ function getExplorerSettings(username?: string): {
     scanPois,
     directToUnknown,
     groupUnknowns,
+    scavengeEnabled,
+    loadFuelCellsAtHome,
   };
 }
 
@@ -309,6 +249,20 @@ export function setExplorerDirectToUnknown(username: string, directToUnknown: bo
 export function setExplorerGroupUnknowns(username: string, groupUnknowns: boolean): void {
   writeSettings({
     [username]: { groupUnknowns },
+  });
+}
+
+/** Persist scavenge enabled setting for a specific bot. */
+export function setExplorerScavengeEnabled(username: string, scavengeEnabled: boolean): void {
+  writeSettings({
+    [username]: { scavengeEnabled },
+  });
+}
+
+/** Persist load fuel cells at home setting for a specific bot. */
+export function setExplorerLoadFuelCellsAtHome(username: string, loadFuelCellsAtHome: boolean): void {
+  writeSettings({
+    [username]: { loadFuelCellsAtHome },
   });
 }
 
@@ -392,6 +346,13 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (deposited > 0) ctx.log("trade", `Deposited ${deposited} items to storage`);
       }
 
+      // Load fuel cells to max cargo (explorer long-range mode)
+      const startupSettings = getExplorerSettings(bot.username);
+      if (startupSettings.loadFuelCellsAtHome) {
+        yield "startup_load_fuel_cells";
+        await loadFuelCellsToMax(ctx);
+      }
+
       // Refuel
       yield "startup_refuel";
       await tryRefuel(ctx);
@@ -408,7 +369,16 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
-    // ── Battle check — if in battle, flee immediately ──
+    // ── Battle check — check global WebSocket battle state first (works during 524 timeouts) ──
+    if (bot.isInBattle()) {
+      ctx.log("combat", "[WebSocket] Battle detected via WebSocket - fleeing immediately!");
+      if (await checkAndFleeFromBattle(ctx, "explorer")) {
+        await sleep(5000);
+        continue;
+      }
+    }
+
+    // ── Battle check — also check via API (fallback) ──
     if (await checkAndFleeFromBattle(ctx, "explorer")) {
       await sleep(5000);
       continue;
@@ -442,7 +412,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Survey the system to reveal hidden POIs ──
     // Only survey if scanPois is enabled
     const explorerSettings = getExplorerSettings(bot.username);
-    
+
     if (explorerSettings.scanPois) {
       yield "survey_system";
       const surveyResp = await bot.exec("survey_system");
@@ -472,23 +442,9 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // ── Detect ship modules for mining/harvesting ──
-    const shipModules = await detectShipModules(ctx);
-    const moduleInfo = [];
-    if (shipModules.hasMiningLaser) moduleInfo.push("Mining Laser");
-    if (shipModules.hasGasHarvester) moduleInfo.push("Gas Harvester");
-    if (shipModules.hasIceHarvester) moduleInfo.push("Ice Harvester");
-    if (shipModules.hasRadHarvester) moduleInfo.push("Rad Harvester");
-    if (moduleInfo.length > 0) {
-      ctx.log("info", `Ship equipped: ${moduleInfo.join(", ")}`);
-    } else {
-      ctx.log("warn", "No mining/harvesting modules detected — will skip resource POIs");
-    }
-
     // ── Classify POIs and determine what needs visiting ──
     const toVisit: Array<{ poi: SystemPOI; reason: string }> = [];
     let skippedCount = 0;
-    let skippedNoModule = 0;
 
     for (const poi of pois) {
       const isStation = isStationPoi(poi);
@@ -496,34 +452,27 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       const isScenic = isScenicPoi(poi.type);
       const minutesAgo = mapStore.minutesSinceExplored(systemId, poi.id);
 
-      // Check if we have the required module for this POI type
-      if (isMinable) {
-        const moduleCheck = poiRequiresModule(poi.type, shipModules);
-        if (!moduleCheck.canAccess) {
-          skippedNoModule++;
-          // Mark as explored to avoid revisiting
-          mapStore.markExplored(systemId, poi.id);
-          ctx.log("info", `Skipping ${poi.name}: requires ${moduleCheck.missingModule} (not equipped)`);
-          continue;
-        }
-      }
-
       if (isStation) {
         if (minutesAgo < STATION_REFRESH_MINS) { skippedCount++; continue; }
         toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : "refresh" });
       } else if (isMinable) {
-        // In quick survey mode, skip resource POIs that have already been sampled
-        if (explorerSettings.surveyMode === "quick") {
-          const storedPoi = mapStore.getSystem(systemId)?.pois.find(p => p.id === poi.id);
-          const hasOreData = (storedPoi?.ores_found?.length ?? 0) > 0;
-          if (hasOreData) { skippedCount++; continue; }
-        }
-        
-        // Always re-visit if explored but no ores were recorded
+        // Check if this POI has new-style resource scan data
         const storedPoi = mapStore.getSystem(systemId)?.pois.find(p => p.id === poi.id);
-        const hasOreData = (storedPoi?.ores_found?.length ?? 0) > 0;
-        if (minutesAgo < RESOURCE_REFRESH_MINS && hasOreData) { skippedCount++; continue; }
-        toVisit.push({ poi, reason: minutesAgo === Infinity ? "new" : (hasOreData ? "re-sample" : "no-data") });
+        const hasResourceData = (storedPoi?.resources?.length ?? 0) > 0;
+
+        // In quick survey mode, skip resource POIs that already have scan data
+        if (explorerSettings.surveyMode === "quick" && hasResourceData) {
+          if (minutesAgo < RESOURCE_REFRESH_MINS) { skippedCount++; continue; }
+        }
+
+        // Always re-scan if no resource data (old-style explored, needs new scan)
+        if (!hasResourceData) {
+          toVisit.push({ poi, reason: "needs-resource-scan" });
+        } else if (minutesAgo < RESOURCE_REFRESH_MINS) {
+          skippedCount++; continue;
+        } else {
+          toVisit.push({ poi, reason: "refresh" });
+        }
       } else if (isScenic) {
         // In quick survey mode, skip scenic POIs entirely
         if (explorerSettings.surveyMode === "quick") { skippedCount++; continue; }
@@ -538,11 +487,9 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     if (toVisit.length === 0) {
-      const moduleSkipMsg = skippedNoModule > 0 ? `, ${skippedNoModule} skipped (no module)` : "";
-      ctx.log("info", `${bot.system}: all ${skippedCount} POIs up to date${moduleSkipMsg} — moving on`);
+      ctx.log("info", `${bot.system}: all ${skippedCount} POIs up to date — moving on`);
     } else {
-      const moduleSkipMsg = skippedNoModule > 0 ? `, ${skippedNoModule} skipped (no module)` : "";
-      ctx.log("info", `${bot.system}: ${toVisit.length} to visit, ${skippedCount} already explored${moduleSkipMsg}`);
+      ctx.log("info", `${bot.system}: ${toVisit.length} to visit, ${skippedCount} already explored`);
     }
 
     // ── Hull check — repair if <= 40% ──
@@ -616,18 +563,20 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       bot.poi = poi.id;
 
-      // Scavenge wrecks/containers at each POI
-      yield "scavenge";
-      const scavengeResult = await scavengeWrecks(ctx);
+      // Scavenge wrecks/containers at each POI (only if enabled — unsafe near pirates)
+      if (explorerSettings.scavengeEnabled) {
+        yield "scavenge";
+        const scavengeResult = await scavengeWrecks(ctx);
 
-      // Check battle status after scavenge (it makes multiple commands)
-      if (await checkAndFleeFromBattle(ctx, "scavenge")) {
-        await sleep(5000);
-        continue;
+        // Check battle status after scavenge (it makes multiple commands)
+        if (await checkAndFleeFromBattle(ctx, "scavenge")) {
+          await sleep(5000);
+          continue;
+        }
       }
 
       if (isMinable) {
-        yield* sampleResourcePoi(ctx, systemId, poi);
+        yield* scanResourcePoi(ctx, systemId, poi);
       } else if (isStation) {
         yield* scanStation(ctx, systemId, poi);
       } else {
@@ -660,15 +609,19 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Pick next system to explore ──
     yield "pick_next_system";
 
-    // ── Direct to Unknown mode: jump directly to farthest unknown system ──
+    // ── Direct to Unknown mode: jump directly to nearest unknown or stale system ──
     if (currentSettings.directToUnknown) {
       const blacklist = getSystemBlacklist();
       const unknowns = findUnknownSystems(ctx, systemId, blacklist);
-      
+
       if (unknowns.length > 0) {
-        // Pick the farthest unknown system
+        // Pick the nearest high-priority target (unknown first, then stale)
         const target = unknowns[0];
-        ctx.log("exploration", `Direct-to-Unknown: Found ${unknowns.length} unknown system(s), targeting farthest: ${target.name} (${target.distance} jumps)`);
+        const priorityLabel = target.priority === "unknown" ? "unknown" : "stale";
+        const staleInfo = target.priority === "stale" && target.oldestPoiUpdate
+          ? ` (oldest data: ${timeAgoFromIso(target.oldestPoiUpdate)})`
+          : "";
+        ctx.log("exploration", `Direct-to-${priorityLabel}: Found ${unknowns.length} system(s) needing exploration, targeting nearest: ${target.name} (${target.distance} jumps)${staleInfo}`);
         
         // Load fuel cells if cargo space available
         if (bot.cargoMax > 0 && bot.cargo < bot.cargoMax) {
@@ -880,91 +833,61 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
 // ── POI visit sub-routines ───────────────────────────────────
 
-/** Sample mine at a resource POI to discover ores. */
-async function* sampleResourcePoi(
+/** Scan a resource POI using get_poi to discover resources without mining. */
+async function* scanResourcePoi(
   ctx: RoutineContext,
   systemId: string,
   poi: SystemPOI,
 ): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
-  yield `sample_${poi.id}`;
-  const oresFound = new Set<string>();
-  let mined = 0;
-  let cantMine = false;
+  yield `scan_${poi.id}`;
 
-  // Battle state tracking for sampling loop
-  const battleState: BattleState = {
-    inBattle: false,
-    battleId: null,
-    battleStartTick: null,
-    lastHitTick: null,
-    isFleeing: false,
-  };
+  // Call get_poi to get resource information
+  const poiResp = await bot.exec("get_poi", { poi_id: poi.id });
 
-  for (let i = 0; i < SAMPLE_MINES && bot.state === "running"; i++) {
-    const mineResp = await bot.exec("mine");
-
-    // Check for battle notifications after mining
-    const battleDetected = await handleBattleNotifications(ctx, mineResp.notifications || [], battleState);
-    if (battleDetected) {
-      ctx.log("combat", "Battle detected while sampling - initiating flee (will re-issue every cycle)!");
-      // Don't return - let the flee handling below re-issue flee every cycle
-      battleState.isFleeing = false; // Reset so the loop will re-issue
-    }
-
-    // If we're in battle, re-issue flee command every cycle to ensure we stay in flee stance
-    if (battleState.inBattle) {
-      ctx.log("combat", "Re-issuing flee stance while sampling (ensuring we stay in flee mode)...");
-      const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
-      if (fleeResp.error) {
-        ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
-      }
-      // Check if we've successfully disengaged
-      const currentBattleStatus = await getBattleStatus(ctx);
-      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
-        ctx.log("combat", "Battle cleared - no longer in combat!");
-        battleState.inBattle = false;
-        battleState.battleId = null;
-        battleState.isFleeing = false;
-        // Continue sampling if we escaped
-      } else {
-        // Still in battle - wait briefly and continue to next cycle to re-flee
-        await sleep(2000);
-        continue; // Skip rest of loop, continue to next iteration to re-flee
-      }
-    }
-
-    if (mineResp.error) {
-      const msg = mineResp.error.message.toLowerCase();
-      if (msg.includes("no asteroids") || msg.includes("depleted") || msg.includes("no minable") || msg.includes("nothing to mine")) break;
-      if (msg.includes("cargo") && msg.includes("full")) break;
-      // Missing module — mark as explored to avoid revisiting, but don't sample
-      if (msg.includes("gas harvester") || msg.includes("ice harvester")) {
-        mapStore.markExplored(systemId, poi.id);
-        return;
-      }
-      if (mined === 0) cantMine = true;
-      break;
-    }
-
-    mined++;
-    const { oreId, oreName } = parseOreFromMineResult(mineResp.result);
-    if (oreId) {
-      mapStore.recordMiningYield(systemId, poi.id, { item_id: oreId, name: oreName });
-      oresFound.add(oreName);
-    }
-
-    yield "sampling";
+  // Check for battle after get_poi
+  if (await checkBattleAfterCommand(ctx, poiResp.notifications, "get_poi")) {
+    ctx.log("combat", "Battle detected at POI scan - fleeing!");
+    await sleep(5000);
+    return;
   }
 
-  // Single summary line
-  if (oresFound.size > 0) {
-    ctx.log("mining", `Sampled ${poi.name}: ${[...oresFound].join(", ")} (${mined} cycles)`);
-  }
-
-  if (!cantMine) {
+  if (poiResp.error) {
+    ctx.log("error", `get_poi failed for ${poi.name}: ${poiResp.error.message}`);
     mapStore.markExplored(systemId, poi.id);
+    return;
   }
+
+  // Parse resource data from response
+  const result = poiResp.result as Record<string, unknown>;
+  const poiData = result?.poi as Record<string, unknown> | undefined;
+  const resources = (
+    Array.isArray(result?.resources) ? result.resources :
+    Array.isArray(poiData?.resources) ? poiData.resources :
+    []
+  ) as Array<Record<string, unknown>>;
+
+  if (resources.length > 0) {
+    const resourceData = resources.map((r) => ({
+      resource_id: (r.resource_id as string) || "",
+      name: (r.name as string) || (r.resource_id as string) || "",
+      richness: (r.richness as number) || 0,
+      remaining: (r.remaining as number) || 0,
+      max_remaining: (r.max_remaining as number) || 0,
+      depletion_percent: (r.depletion_percent as number) || 100,
+    }));
+
+    // Store resource data in map
+    mapStore.updatePoiResources(systemId, poi.id, resourceData);
+
+    // Log discovered resources
+    const resourceNames = resourceData.map(r => r.name).join(", ");
+    ctx.log("exploration", `Scanned ${poi.name}: ${resourceNames}`);
+  } else {
+    ctx.log("info", `Scanned ${poi.name}: no resources found`);
+  }
+
+  mapStore.markExplored(systemId, poi.id);
 }
 
 /** Dock at station, scan market/orders/missions, refuel. */
@@ -1298,14 +1221,17 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       }
       bot.poi = target.stationPoi;
 
-      // ── Scavenge wrecks en route ──
-      yield "scavenge";
-      const scavengeResult = await scavengeWrecks(ctx);
+      // ── Scavenge wrecks en route (only if enabled — unsafe near pirates) ──
+      const tradeSettings = getExplorerSettings(bot.username);
+      if (tradeSettings.scavengeEnabled) {
+        yield "scavenge";
+        const scavengeResult = await scavengeWrecks(ctx);
 
-      // Check battle status after scavenge
-      if (await checkAndFleeFromBattle(ctx, "scavenge")) {
-        await sleep(5000);
-        continue;
+        // Check battle status after scavenge
+        if (await checkAndFleeFromBattle(ctx, "scavenge")) {
+          await sleep(5000);
+          continue;
+        }
       }
 
       // ── Dock and scan ──
@@ -1369,14 +1295,36 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
 // ── Helpers ──────────────────────────────────────────────────
 
+/** Threshold in days for considering POI data stale. */
+const STALE_POI_DAYS = 7;
+
 /**
- * Find all unknown systems (systems with 0 POIs mapped) reachable from current system.
- * Returns systems sorted by distance (farthest first).
+ * Find systems that need exploration, sorted by priority then distance (nearest first).
+ *
+ * Priority tiers:
+ *   1. Systems with 0 POIs (completely unknown / never explored)
+ *   2. Systems where all POIs are stale (last_updated > 7 days ago)
+ *
+ * Within each tier, systems are sorted by jump distance ascending (nearest first).
  */
-function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklist: string[]): Array<{ id: string; name: string; distance: number; route: string[] }> {
-  const { log } = ctx;
-  const allSystems = mapStore.getAllSystems();
-  const unknowns: Array<{ id: string; name: string; distance: number; route: string[] }> = [];
+function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklist: string[]): Array<{
+  id: string;
+  name: string;
+  distance: number;
+  route: string[];
+  priority: "unknown" | "stale";
+  oldestPoiUpdate: string | null;
+}> {
+  const unknowns: Array<{
+    id: string;
+    name: string;
+    distance: number;
+    route: string[];
+    priority: "unknown" | "stale";
+    oldestPoiUpdate: string | null;
+  }> = [];
+
+  const staleThreshold = Date.now() - STALE_POI_DAYS * 24 * 60 * 60 * 1000;
 
   // BFS to find all reachable systems and their distances
   const visited = new Set<string>();
@@ -1401,45 +1349,86 @@ function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklis
       const newRoute = [...route, connId];
       const newDistance = distance + 1;
 
-      // Check if this system is "unknown" (has 0 POIs mapped - never explored)
       const targetSys = mapStore.getSystem(connId);
       if (targetSys) {
-        // System is in map.json - check if it has 0 POIs (unexplored)
+        // System is in map.json — check POI status
         const poiCount = targetSys.pois?.length ?? 0;
+
         if (poiCount === 0) {
+          // Completely unknown — never explored
           unknowns.push({
             id: connId,
             name: conn.system_name || connId,
             distance: newDistance,
             route: newRoute,
+            priority: "unknown",
+            oldestPoiUpdate: null,
           });
+        } else {
+          // Has POIs — check if all are stale
+          const now = Date.now();
+          let allStale = true;
+          let oldestUpdate: string | null = null;
+          let oldestTime = Infinity;
+
+          for (const poi of targetSys.pois) {
+            const updateTime = poi.last_updated ? new Date(poi.last_updated).getTime() : 0;
+            if (updateTime > staleThreshold) {
+              allStale = false; // At least one POI is fresh
+            }
+            if (updateTime < oldestTime) {
+              oldestTime = updateTime;
+              oldestUpdate = poi.last_updated || null;
+            }
+          }
+
+          if (allStale && oldestUpdate) {
+            // All POIs are stale — needs re-exploration
+            unknowns.push({
+              id: connId,
+              name: conn.system_name || connId,
+              distance: newDistance,
+              route: newRoute,
+              priority: "stale",
+              oldestPoiUpdate: oldestUpdate,
+            });
+          }
         }
+
         // Continue BFS through known systems (whether explored or not)
         queue.push({ systemId: connId, distance: newDistance, route: newRoute });
       } else {
-        // System not in map.json at all - also consider it unknown
+        // System not in map.json at all — also consider it unknown
         unknowns.push({
           id: connId,
           name: conn.system_name || connId,
           distance: newDistance,
           route: newRoute,
+          priority: "unknown",
+          oldestPoiUpdate: null,
         });
       }
     }
   }
 
-  // Sort by distance (farthest first)
-  unknowns.sort((a, b) => b.distance - a.distance);
+  // Sort: unknown priority first, then stale; within each tier, nearest first
+  unknowns.sort((a, b) => {
+    if (a.priority !== b.priority) {
+      return a.priority === "unknown" ? -1 : 1;
+    }
+    return a.distance - b.distance; // nearest first
+  });
+
   return unknowns;
 }
 
 /**
- * Find unknown systems near a target system (for grouping).
- * Returns systems within maxJumps of the target that have 0 POIs.
+ * Find unknown or stale systems near a target system (for grouping).
+ * Returns systems within maxJumps that have 0 POIs or all-stale POIs.
  */
 function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps: number, blacklist: string[]): string[] {
-  const allSystems = mapStore.getAllSystems();
   const nearby: string[] = [];
+  const staleThreshold = Date.now() - STALE_POI_DAYS * 24 * 60 * 60 * 1000;
 
   // BFS from target system
   const visited = new Set<string>();
@@ -1462,14 +1451,20 @@ function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps:
       if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
 
       visited.add(connId);
-      
-      // Check if this system is "unknown" (has 0 POIs or not in map)
+
       const targetSys = mapStore.getSystem(connId);
       if (targetSys) {
-        // System is in map.json - check if it has 0 POIs (unexplored)
         const poiCount = targetSys.pois?.length ?? 0;
         if (poiCount === 0) {
           nearby.push(connId);
+        } else {
+          // Check if all POIs are stale
+          let allStale = true;
+          for (const poi of targetSys.pois) {
+            const updateTime = poi.last_updated ? new Date(poi.last_updated).getTime() : 0;
+            if (updateTime > staleThreshold) { allStale = false; break; }
+          }
+          if (allStale) nearby.push(connId);
         }
         // Continue BFS through known systems
         queue.push({ systemId: connId, distance: distance + 1 });
@@ -1484,16 +1479,96 @@ function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps:
 }
 
 /**
+ * Load fuel cells to max cargo capacity at faction home (Sol Central).
+ * Uses storage to withdraw credits if needed, prioritizes home base where fuel cells are cheap and abundant.
+ */
+async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+
+  // Check current cargo space
+  const cargoResp = await bot.exec("get_cargo");
+  if (!cargoResp.result || typeof cargoResp.result !== "object") {
+    ctx.log("error", "Could not get cargo status");
+    return false;
+  }
+
+  const cResult = cargoResp.result as Record<string, unknown>;
+  const cargoItems = (
+    Array.isArray(cResult) ? cResult :
+    Array.isArray(cResult.items) ? cResult.items :
+    Array.isArray(cResult.cargo) ? cResult.cargo :
+    []
+  ) as Array<Record<string, unknown>>;
+
+  let currentCargo = 0;
+  let fuelCellCount = 0;
+  for (const item of cargoItems) {
+    const itemId = (item.item_id as string) || "";
+    const quantity = (item.quantity as number) || 0;
+    currentCargo += quantity;
+    if (itemId.toLowerCase().includes("fuel_cell")) {
+      fuelCellCount = quantity;
+    }
+  }
+
+  const availableSpace = bot.cargoMax - currentCargo;
+  if (availableSpace <= 0) {
+    ctx.log("info", `Cargo hold full — already loaded with ${fuelCellCount} fuel cells`);
+    return true;
+  }
+
+  // Try to buy fuel cells at current station
+  ctx.log("trade", `Loading ${availableSpace} fuel cells for long-range exploration...`);
+  const buyResp = await bot.exec("buy_item", {
+    item_id: "fuel_cell",
+    quantity: availableSpace
+  });
+
+  if (!buyResp.error) {
+    const newFuelCells = fuelCellCount + availableSpace;
+    ctx.log("trade", `Loaded ${availableSpace} fuel cells (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    return true;
+  }
+
+  // If buy failed, try to withdraw credits from storage and retry
+  const errorMsg = (buyResp.error.message || "").toLowerCase();
+  if (errorMsg.includes("credit") || errorMsg.includes("not enough") || errorMsg.includes("insufficient")) {
+    ctx.log("trade", "Not enough credits — withdrawing from storage...");
+    const withdrawResp = await bot.exec("withdraw_credits");
+    if (!withdrawResp.error) {
+      await bot.refreshStatus();
+      ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying fuel cell purchase...`);
+      const retryResp = await bot.exec("buy_item", {
+        item_id: "fuel_cell",
+        quantity: availableSpace
+      });
+      if (!retryResp.error) {
+        const newFuelCells = fuelCellCount + availableSpace;
+        ctx.log("trade", `Loaded ${availableSpace} fuel cells (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
+        return true;
+      }
+      ctx.log("error", `Still could not buy fuel cells: ${retryResp.error.message}`);
+    } else {
+      ctx.log("error", `Could not withdraw credits: ${withdrawResp.error.message}`);
+    }
+  } else {
+    ctx.log("error", `Could not buy fuel cells: ${buyResp.error.message}`);
+  }
+
+  return false;
+}
+
+/**
  * Load cargo hold with fuel cells for long journeys.
  * Fills cargo to max capacity with fuel cells.
  */
 async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   const { bot, log } = ctx;
-  
+
   // Find a station with fuel cells
   const { pois } = await getSystemInfo(ctx);
   const station = findStation(pois);
-  
+
   if (!station) {
     log("error", "No station in current system to load fuel cells");
     return false;
@@ -1506,7 +1581,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
       log("error", `Could not reach station: ${travelResp.error.message}`);
       return false;
     }
-    
+
     const dockResp = await bot.exec("dock");
     if (dockResp.error && !dockResp.error.message.includes("already")) {
       log("error", `Could not dock: ${dockResp.error.message}`);

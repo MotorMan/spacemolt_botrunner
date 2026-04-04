@@ -147,6 +147,14 @@ export class Bot {
     aiResponseSent: boolean; // Track if AI response was already sent
   } = { active: false, since: 0, system: "", poi: "", outcome: null, aiResponseSent: false };
 
+  /** Global battle state - updated by WebSocket notifications even when HTTP is hanging */
+  currentBattle: {
+    inBattle: boolean;
+    battleId: string | null;
+    lastUpdate: number; // Timestamp of last battle update
+    participants: Array<Record<string, unknown>>;
+  } = { inBattle: false, battleId: null, lastUpdate: 0, participants: [] };
+
   /** Timestamp when customs hold was last cleared (prevents rapid re-triggering). */
   private customsClearedAt: number = 0;
 
@@ -281,6 +289,22 @@ export class Bot {
       }
       if (resp.error && resp.error.message?.includes("502")) {
         this.log("error", `HTTP 502: Bad Gateway (after ${MAX_502_RETRIES} retries)`);
+      }
+    }
+
+    // Handle HTTP 524 Timeout — server took too long to respond (common during battles)
+    // Retry with backoff since battle notifications may still be flowing via WebSocket
+    if (resp.error && resp.error.message && resp.error.message.includes("524")) {
+      const MAX_524_RETRIES = 3;
+      for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
+        const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
+        this.log("warn", `HTTP 524 Timeout — retry ${retry + 1}/${MAX_524_RETRIES} after ${waitTime/1000}s...`);
+        await sleep(waitTime);
+        resp = await this.api.execute(command, payload);
+        if (!resp.error || !resp.error.message?.includes("524")) break;
+      }
+      if (resp.error && resp.error.message?.includes("524")) {
+        this.log("error", `HTTP 524: Timeout (after ${MAX_524_RETRIES} retries)`);
       }
     }
 
@@ -787,13 +811,34 @@ export class Bot {
    */
   isCustomsHold(): boolean {
     if (!this.customsHold.active) return false;
-    
+
     // Auto-timeout after 30 seconds (customs ship should have arrived by then)
     const elapsed = Date.now() - this.customsHold.since;
     if (elapsed > 30000) {
       this.log("customs", "⏰ CUSTOMS TIMEOUT: Proceeding after 30s wait");
       this.customsHold.active = false;
       this.customsHold.outcome = "cleared";
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Check if we're currently in a battle based on global WebSocket state.
+   * This works even when HTTP requests are hanging (524 timeouts).
+   * @returns true if in battle, false otherwise
+   */
+  isInBattle(): boolean {
+    // Check if we're in battle and the last update was recent (within 60 seconds)
+    if (!this.currentBattle.inBattle) return false;
+    
+    const timeSinceUpdate = Date.now() - this.currentBattle.lastUpdate;
+    if (timeSinceUpdate > 60000) {
+      // Battle state is stale - clear it
+      this.currentBattle.inBattle = false;
+      this.currentBattle.battleId = null;
+      this.currentBattle.participants = [];
       return false;
     }
     
@@ -1054,6 +1099,42 @@ export class Bot {
       let data = notif.data as Record<string, unknown> | string | undefined;
       if (typeof data === "string") {
         try { data = JSON.parse(data) as Record<string, unknown>; } catch { /* leave as string */ }
+      }
+
+      // ── BATTLE STATE TRACKING: Update global battle state from WebSocket notifications ──
+      // This allows battle detection even when HTTP requests are hanging (524 timeouts)
+      if (msgType === "battle_update" && data && typeof data === "object") {
+        const battleId = (data.battle_id as string) || "";
+        const tick = (data.tick as number) || 0;
+        const participants = Array.isArray(data.participants) ? data.participants : [];
+        
+        if (battleId) {
+          // We're in battle - update global state
+          this.currentBattle.inBattle = true;
+          this.currentBattle.battleId = battleId;
+          this.currentBattle.lastUpdate = Date.now();
+          this.currentBattle.participants = participants as Array<Record<string, unknown>>;
+          
+          debugLog("bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
+        }
+      } else if (msgType === "battle_damage" && data && typeof data === "object") {
+        // Battle damage also indicates we're in battle
+        const attackerName = (data.attacker_name as string) || "";
+        const targetName = (data.target_name as string) || "";
+        const totalDamage = (data.total_damage as number) || 0;
+        
+        debugLog("bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
+      } else if (type === "system" && data && typeof data === "object") {
+        const message = (data.message as string) || "";
+        const msgLower = message.toLowerCase();
+        
+        // Check for disengage/battle end messages
+        if (msgLower.includes("disengaged from battle") || msgLower.includes("battle ended")) {
+          this.currentBattle.inBattle = false;
+          this.currentBattle.battleId = null;
+          this.currentBattle.participants = [];
+          debugLog("bot:battle", `${this.username} battle ended`);
+        }
       }
 
       if (type === "system" && data && typeof data === "object") {

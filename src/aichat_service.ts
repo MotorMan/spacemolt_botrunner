@@ -1087,15 +1087,21 @@ export class AiChatService {
       const statusResp = await bot.exec("get_status", {});
       if (!statusResp.error && statusResp.result) {
         const status = statusResp.result as any;
+        
+        // The response may have nested structures: { player: {...}, ship: {...} }
+        // or flat fields. Handle both.
+        const player = status.player || status;
+        const ship = status.ship || {};
+        
         lines.push("## Current Status (get_status)");
-        lines.push(`- Credits: ${status.credits ?? "N/A"}`);
-        lines.push(`- Fuel: ${status.fuel ?? "N/A"} / ${status.max_fuel ?? "N/A"}`);
-        lines.push(`- Cargo: ${status.cargo ?? "N/A"} / ${status.max_cargo ?? "N/A"}`);
-        lines.push(`- Hull: ${status.hull ?? "N/A"} / ${status.max_hull ?? "N/A"}`);
-        lines.push(`- Shield: ${status.shield ?? "N/A"} / ${status.max_shield ?? "N/A"}`);
-        lines.push(`- Location: ${status.system ?? "unknown"} / ${status.poi ?? "unknown"}`);
-        lines.push(`- Docked: ${status.docked ?? false}`);
-        lines.push(`- Faction: ${status.faction_name ?? "None"}`);
+        lines.push(`- Credits: ${player.credits ?? status.credits ?? "N/A"}`);
+        lines.push(`- Fuel: ${ship.fuel ?? status.fuel ?? "N/A"} / ${ship.max_fuel ?? status.max_fuel ?? "N/A"}`);
+        lines.push(`- Cargo: ${ship.cargo_used ?? status.cargo ?? "N/A"} / ${ship.cargo_capacity ?? status.max_cargo ?? "N/A"}`);
+        lines.push(`- Hull: ${ship.hull ?? status.hull ?? "N/A"} / ${ship.max_hull ?? status.max_hull ?? "N/A"}`);
+        lines.push(`- Shield: ${ship.shield ?? status.shield ?? "N/A"} / ${ship.max_shield ?? status.max_shield ?? "N/A"}`);
+        lines.push(`- Location: ${player.current_system ?? status.system ?? "unknown"} / ${player.current_poi ?? status.poi ?? "unknown"}`);
+        lines.push(`- Docked: ${player.docked_at_base ?? status.docked ?? false}`);
+        lines.push(`- Faction: ${status.faction_name ?? player.faction_name ?? "None"}`);
         lines.push("");
       }
     } catch (err) {
@@ -1108,11 +1114,32 @@ export class AiChatService {
       const shipResp = await bot.exec("get_ship", {});
       if (!shipResp.error && shipResp.result) {
         const ship = shipResp.result as any;
+        // Ship data may be nested under .ship or flat
+        const shipData = ship.ship || ship;
+        
         lines.push("## Ship Details (get_ship)");
-        lines.push(`- Ship Name: ${ship.name ?? "N/A"}`);
-        lines.push(`- Ship Type: ${ship.type ?? "N/A"}`);
-        if (ship.modules && Array.isArray(ship.modules)) {
-          lines.push(`- Installed Modules: ${ship.modules.map((m: any) => m.name || m.type || m).join(", ") || "None"}`);
+        lines.push(`- Name: ${shipData.name ?? "N/A"}`);
+        lines.push(`- Type: ${shipData.type ?? shipData.ship_type ?? "N/A"}`);
+        lines.push(`- Class: ${shipData.class ?? "N/A"}`);
+        lines.push(`- Hull: ${shipData.hull ?? "N/A"} / ${shipData.max_hull ?? "N/A"} (hit points, NOT percentage)`);
+        lines.push(`- Shield: ${shipData.shield ?? shipData.shields ?? "N/A"} / ${shipData.max_shield ?? shipData.max_shields ?? "N/A"} (hit points, NOT percentage)`);
+        lines.push(`- Fuel: ${shipData.fuel ?? "N/A"} / ${shipData.max_fuel ?? "N/A"} (units, NOT percentage)`);
+        lines.push(`- Cargo: ${shipData.cargo_used ?? "N/A"} / ${shipData.cargo_capacity ?? shipData.max_cargo ?? "N/A"} (units used/total, NOT percentage)`);
+        lines.push(`- CPU: ${shipData.cpu_used ?? "N/A"} / ${shipData.cpu_capacity ?? shipData.cpu_max ?? "N/A"}`);
+        lines.push(`- Power: ${shipData.power_used ?? "N/A"} / ${shipData.power_capacity ?? shipData.power_max ?? "N/A"}`);
+        lines.push(`- Speed: ${shipData.speed ?? "N/A"}`);
+        lines.push(`- Armor: ${shipData.armor ?? "N/A"}`);
+        
+        // Modules/weapons - these are technical IDs like "mining_laser_i", "gas_harvester_iii", "autocannon_i"
+        const modules = shipData.modules || shipData.mods || shipData.installed_mods || [];
+        if (Array.isArray(modules) && modules.length > 0) {
+          const moduleNames = modules.map((m: any) => {
+            if (typeof m === "string") return m;
+            return m.name || m.mod_id || m.id || m.type || "Unknown";
+          });
+          lines.push(`- Installed Modules (technical IDs - describe them accurately based on their names): ${moduleNames.join(", ")}`);
+        } else {
+          lines.push("- Modules: None");
         }
         lines.push("");
       }
@@ -1121,28 +1148,61 @@ export class AiChatService {
       lines.push("");
     }
 
+    // Get cargo inventory
+    try {
+      const cargoResp = await bot.exec("get_cargo", {});
+      if (!cargoResp.error && cargoResp.result) {
+        const cargo = cargoResp.result as any;
+        lines.push("## Cargo Inventory (get_cargo)");
+        
+        // Handle both array and { items: [...] } formats
+        const items = Array.isArray(cargo) ? cargo : (cargo.items || cargo.cargo || []);
+        if (Array.isArray(items) && items.length > 0) {
+          for (const item of items) {
+            const itemName = item.name || item.item_name || item.type || "Unknown";
+            const quantity = item.quantity ?? item.amount ?? item.count ?? "?";
+            lines.push(`- ${itemName}: ${quantity}`);
+          }
+        } else {
+          lines.push("- Cargo hold empty");
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Cargo Inventory: Error retrieving");
+      lines.push("");
+    }
+
     // Get skills
     try {
-      const skillsResp = await bot.exec("v2_get_skills", {});
+      const skillsResp = await bot.exec("get_skills", {});
       if (!skillsResp.error && skillsResp.result) {
-        const skills = skillsResp.result as any;
-        lines.push("## Skills (v2_get_skills)");
+        const skillsData = skillsResp.result as any;
+        lines.push("## Skills (get_skills)");
         
-        // Handle different response formats
-        const skillsList = Array.isArray(skills) ? skills : (skills.skills || []);
-        if (Array.isArray(skillsList) && skillsList.length > 0) {
-          const skillEntries = skillsList.map((s: any) => {
+        // Handle different response formats (same as bot.ts checkSkills)
+        let skillsContainer = skillsData;
+        if (!Array.isArray(skillsData) && skillsData.skills !== undefined) {
+          skillsContainer = skillsData.skills;
+        }
+
+        if (Array.isArray(skillsContainer) && skillsContainer.length > 0) {
+          const skillEntries = skillsContainer.map((s: any) => {
             const name = s.name || s.skill_name || s.id || "Unknown";
-            const level = s.level ?? s.current_level ?? "?";
+            const level = s.level ?? s.current_level ?? 0;
             const xp = s.xp !== undefined ? ` (${s.xp} XP)` : "";
             return `${name}: ${level}${xp}`;
           });
           lines.push(`- ${skillEntries.join(", ")}`);
-        } else if (typeof skillsList === "object" && !Array.isArray(skillsList)) {
-          // Dict format: { skill_name: { level, xp, ... } }
-          const entries = Object.entries(skillsList).map(([name, data]: [string, any]) => {
-            const level = data.level ?? "?";
-            const xp = data.xp !== undefined ? ` (${data.xp} XP)` : "";
+        } else if (typeof skillsContainer === "object" && !Array.isArray(skillsContainer)) {
+          // Dict format: { skill_name: { level, xp, ... } } or { skill_name: level }
+          const entries = Object.entries(skillsContainer).map(([key, val]: [string, any]) => {
+            if (typeof val === "number") {
+              return `${key}: ${val}`;
+            }
+            const level = val.level ?? val.current_level ?? "?";
+            const xp = val.xp !== undefined ? ` (${val.xp} XP)` : "";
+            const name = val.name || key;
             return `${name}: ${level}${xp}`;
           });
           lines.push(`- ${entries.join(", ")}`);
@@ -1347,6 +1407,8 @@ ${botContext}
 - Use the real-time game state above to provide accurate, contextual responses
 - Reference your actual status, ship, nearby players, missions, and location when relevant
 - If asked about something you can see in your current context, use that information
+- Hull, shield, fuel, and cargo values are ABSOLUTE numbers (hit points/units), NOT percentages. Say "550 hull" not "55% hull"
+- Module names are technical IDs (e.g., "gas_harvester_iii" = Gas Harvester III, "mining_laser_i" = Mining Laser I). Describe them accurately based on their actual names
 - If asked about a system not in the map data, mention there are many more systems and suggest using /get_system in-game
 - If asked about game mechanics, share what you know`;
 

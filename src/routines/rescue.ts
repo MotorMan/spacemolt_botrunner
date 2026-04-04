@@ -44,6 +44,21 @@ import {
   isOwnBot,
 } from "../rescueBlackBook.js";
 import {
+  addToRescueQueue,
+  getNextRescue,
+  markRescueCompleted,
+  incrementRescueAttempt,
+  optimizeRescueRoute,
+  setCurrentRoute,
+  getCurrentRoute,
+  advanceRoute,
+  getCurrentRouteSystem,
+  getRescuesInSystem,
+  getQueueStats,
+  cleanupStaleQueue,
+  getRescueQueue,
+} from "../rescueQueue.js";
+import {
   getCooperationSettings,
   isCooperationEnabled,
   sendRescueClaim,
@@ -463,6 +478,34 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       }
 
       const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
+
+      // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
+      for (const target of targets) {
+        if (isOwnBot(target.username)) {
+          const result = addToRescueQueue(
+            target.username,
+            target.system,
+            target.poi,
+            target.fuelPct,
+            target.docked
+          );
+          if (result.added) {
+            ctx.log("rescue", `📋 Added ${target.username} to rescue queue at ${target.system}/${target.poi} (${target.fuelPct}% fuel)`);
+          }
+        }
+      }
+
+      // Clean up stale queue entries
+      cleanupStaleQueue();
+
+      // Get queue stats for logging
+      const queueStats = getQueueStats();
+      if (queueStats.pending > 0) {
+        ctx.log("rescue", `📋 Rescue queue: ${queueStats.pending} pending across ${queueStats.systems.length} system(s), ${queueStats.completed} completed`);
+        if (queueStats.systems.length > 0) {
+          ctx.log("rescue", `📍 Systems in queue: ${queueStats.systems.join(", ")}`);
+        }
+      }
 
       // ── Check for MAYDAY requests if no fleet targets ──
       let maydayTarget: RescueTarget | null = null;
@@ -1280,6 +1323,16 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {
       completeRescueSession(bot.username);
+      
+      // Also mark the queue entry as completed if this was our own bot
+      if (isOwnBot(target.username)) {
+        const queue = getRescueQueue();
+        const queuedRescue = queue.pending.find(r => r.targetUsername === target.username);
+        if (queuedRescue) {
+          markRescueCompleted(queuedRescue.id);
+          ctx.log("rescue", `📋 Marked ${target.username} as completed in rescue queue`);
+        }
+      }
     }
 
     if (isManualRescueTarget) {
@@ -2120,6 +2173,16 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {
       completeRescueSession(bot.username);
+
+      // Also mark the queue entry as completed if this was our own bot
+      if (isOwnBot(mayday.sender)) {
+        const queue = getRescueQueue();
+        const queuedRescue = queue.pending.find(r => r.targetUsername === mayday.sender);
+        if (queuedRescue) {
+          markRescueCompleted(queuedRescue.id);
+          ctx.log("rescue", `📋 Marked ${mayday.sender} as completed in rescue queue`);
+        }
+      }
     }
 
     await bot.refreshStatus();
@@ -2428,6 +2491,34 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
       const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
 
+      // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
+      for (const target of targets) {
+        if (isOwnBot(target.username)) {
+          const result = addToRescueQueue(
+            target.username,
+            target.system,
+            target.poi,
+            target.fuelPct,
+            target.docked
+          );
+          if (result.added) {
+            ctx.log("rescue", `📋 Added ${target.username} to rescue queue at ${target.system}/${target.poi} (${target.fuelPct}% fuel)`);
+          }
+        }
+      }
+
+      // Clean up stale queue entries
+      cleanupStaleQueue();
+
+      // Get queue stats for logging
+      const queueStats = getQueueStats();
+      if (queueStats.pending > 0) {
+        ctx.log("rescue", `📋 Rescue queue: ${queueStats.pending} pending across ${queueStats.systems.length} system(s), ${queueStats.completed} completed`);
+        if (queueStats.systems.length > 0) {
+          ctx.log("rescue", `📍 Systems in queue: ${queueStats.systems.join(", ")}`);
+        }
+      }
+
       // ── Check for MAYDAY requests if no fleet targets ──
       let maydayTarget: RescueTarget | null = null;
       if (targets.length === 0) {
@@ -2591,7 +2682,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           if (elapsedMs >= IDLE_RETURN_THRESHOLD_MS) {
             ctx.log("rescue", `⏱️ Idle for ${Math.round(elapsedMs / 1000)}s — returning home...`);
             isReturningIdle = true;
-            
+
             // Immediately execute return home
             ctx.log("rescue", `🏠 Returning home after idle timeout...`);
             yield "return_home";
@@ -2614,13 +2705,53 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           idleStartTime = 0;
         }
 
-        // No one needs help — scavenge where we are and idle
-        yield "idle_scavenge";
-        if (!bot.docked) {
-          await scavengeWrecks(ctx);
+        // ── RESCUE QUEUE: Check if we have queued rescues before idling ──
+        const queueStats = getQueueStats();
+        if (queueStats.pending > 0) {
+          ctx.log("rescue", `📋 Rescue queue has ${queueStats.pending} pending rescues — checking for optimized route...`);
+          
+          // Optimize route based on current location
+          const optimizedRoute = optimizeRescueRoute(bot.system);
+          if (optimizedRoute.length > 0) {
+            setCurrentRoute(optimizedRoute);
+            ctx.log("rescue", `🗺️ Optimized route set: ${optimizedRoute.join(" → ")}`);
+            
+            // Get the first system in the route
+            const firstSystem = optimizedRoute[0];
+            const rescuesInSystem = getRescuesInSystem(firstSystem);
+            
+            if (rescuesInSystem.length > 0) {
+              // Pick the most critical rescue in the first system
+              rescuesInSystem.sort((a, b) => a.fuelPct - b.fuelPct);
+              const queuedRescue = rescuesInSystem[0];
+              
+              ctx.log("rescue", `🎯 Selecting queued rescue: ${queuedRescue.targetUsername} at ${queuedRescue.system}/${queuedRescue.poi} (${queuedRescue.fuelPct}%)`);
+              
+              target = {
+                username: queuedRescue.targetUsername,
+                system: queuedRescue.system,
+                poi: queuedRescue.poi,
+                fuelPct: queuedRescue.fuelPct,
+                docked: queuedRescue.docked,
+              };
+              isMaydayTarget = false;
+              logCategory = "rescue";
+              
+              // Skip the idle/scavenge and go directly to rescue
+              incrementRescueAttempt(queuedRescue.id);
+            }
+          }
         }
-        await sleep(settings.scanIntervalSec * 1000);
-        continue;
+        
+        if (!target) {
+          // No queued rescues or queue is empty — scavenge and idle
+          yield "idle_scavenge";
+          if (!bot.docked) {
+            await scavengeWrecks(ctx);
+          }
+          await sleep(settings.scanIntervalSec * 1000);
+          continue;
+        }
       }
 
       // ── Rescue the most critical bot ──
@@ -2867,44 +2998,130 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Travel to stranded bot's POI ──
     if (target.poi) {
       yield "travel_to_target";
-      
-      // Resolve POI name to POI ID by querying system info
-      let targetPoiId: string | null = null;
-      let targetPoiName: string = target.poi;
-      
-      try {
-        const { pois } = await getSystemInfo(ctx);
-        // Find POI by name (case-insensitive match)
-        const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
-        if (matchedPoi) {
-          targetPoiId = matchedPoi.id;
-          targetPoiName = matchedPoi.name;
-          ctx.log(logCategory, `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
-        } else {
-          // Try partial match as fallback
-          const partialMatch = pois.find(p => p.name.toLowerCase().includes(target.poi.toLowerCase()) || target.poi.toLowerCase().includes(p.name.toLowerCase()));
-          if (partialMatch) {
-            targetPoiId = partialMatch.id;
-            targetPoiName = partialMatch.name;
-            ctx.log(logCategory, `Partial POI match: "${target.poi}" -> ID: ${targetPoiId}`);
+
+      // For our own bots, refresh position from fleet status before traveling
+      const isOurBot = isOwnBot(target.username);
+      if (isOurBot) {
+        ctx.log("rescue", `🔄 Refreshing position for our own bot ${target.username}...`);
+        const fleet = ctx.getFleetStatus?.() || [];
+        const targetBot = fleet.find(b => b.username === target.username);
+        if (targetBot) {
+          const oldPoi = target.poi;
+          target.poi = targetBot.poi || target.poi;
+          target.system = targetBot.system || target.system;
+          target.docked = targetBot.docked;
+          if (oldPoi !== target.poi) {
+            ctx.log("rescue", `📍 Position updated for ${target.username}: ${oldPoi} -> ${target.poi}`);
           }
         }
-      } catch (e) {
-        ctx.log("warn", `Could not query system POIs: ${e}`);
       }
-      
-      // Use POI ID if resolved, otherwise fall back to name
-      const travelTarget = targetPoiId || target.poi;
-      
-      ctx.log(logCategory, `Traveling to ${target.username}'s location (${targetPoiName})...`);
-      const travelResp = await bot.exec("travel", { target_poi: travelTarget });
-      if (travelResp.error && !travelResp.error.message.includes("already")) {
-        ctx.log("error", `Travel failed: ${travelResp.error.message}`);
-        // Try docking at station to send gift instead
-      } else {
-        // Success - update bot.poi with the resolved name
-        bot.poi = targetPoiName;
+
+      // Track attempts for hidden POI detection
+      let travelAttempts = 0;
+      const maxTravelAttempts = isOurBot ? 5 : 1; // Retry more for our own bots
+      let travelSuccess = false;
+
+      while (travelAttempts < maxTravelAttempts && !travelSuccess) {
+        travelAttempts++;
+
+        // For our own bots, refresh position on each attempt
+        if (isOurBot && travelAttempts > 1) {
+          ctx.log("rescue", `🔄 Re-refreshing position for ${target.username} (attempt ${travelAttempts})...`);
+          const fleet = ctx.getFleetStatus?.() || [];
+          const targetBot = fleet.find(b => b.username === target.username);
+          if (targetBot) {
+            target.poi = targetBot.poi || target.poi;
+            target.system = targetBot.system || target.system;
+            target.docked = targetBot.docked;
+            ctx.log("rescue", `📍 Position refreshed: ${target.system}/${target.poi}`);
+          }
+        }
+
+        // Resolve POI name to POI ID by querying system info
+        let targetPoiId: string | null = null;
+        let targetPoiName: string = target.poi;
+
+        try {
+          const { pois } = await getSystemInfo(ctx);
+          // Find POI by name (case-insensitive match)
+          const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
+          if (matchedPoi) {
+            targetPoiId = matchedPoi.id;
+            targetPoiName = matchedPoi.name;
+            ctx.log(logCategory, `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
+          } else {
+            // Try partial match as fallback
+            const partialMatch = pois.find(p => p.name.toLowerCase().includes(target.poi.toLowerCase()) || target.poi.toLowerCase().includes(p.name.toLowerCase()));
+            if (partialMatch) {
+              targetPoiId = partialMatch.id;
+              targetPoiName = partialMatch.name;
+              ctx.log(logCategory, `Partial POI match: "${target.poi}" -> ID: ${targetPoiId}`);
+            }
+          }
+        } catch (e) {
+          ctx.log("warn", `Could not query system POIs: ${e}`);
+        }
+
+        // Use POI ID if resolved, otherwise fall back to name
+        const travelTarget = targetPoiId || target.poi;
+
+        ctx.log(logCategory, `Traveling to ${target.username}'s location (${targetPoiName})... (attempt ${travelAttempts}/${maxTravelAttempts})`);
+        const travelResp = await bot.exec("travel", { target_poi: travelTarget });
+        if (travelResp.error && !travelResp.error.message.includes("already")) {
+          ctx.log("error", `Travel failed: ${travelResp.error.message}`);
+
+          // For our own bots, this might be a hidden POI - try jumping out and back
+          if (isOurBot && travelAttempts < maxTravelAttempts) {
+            ctx.log("rescue", `🔀 Possible hidden POI detected! Attempting jump-out-and-back to find ${target.username}...`);
+
+            // Find a connected system to jump to
+            const { pois } = await getSystemInfo(ctx);
+            const jumpGate = pois.find(p => p.type === "jump_gate" || p.type === "stargate");
+
+            if (jumpGate) {
+              ctx.log("rescue", `🚀 Jumping to ${jumpGate.name} to reset entry...`);
+              const jumpResp = await bot.exec("travel", { target_poi: jumpGate.id });
+
+              if (!jumpResp.error || jumpResp.error.message.includes("already")) {
+                // Now jump back to the target POI
+                await sleep(2000); // Brief pause for system to update
+
+                ctx.log("rescue", `🚀 Jumping back to ${targetPoiName}...`);
+                const returnResp = await bot.exec("travel", { target_poi: travelTarget });
+
+                if (!returnResp.error || returnResp.error.message.includes("already")) {
+                  ctx.log("rescue", `✓ Successfully jumped back in - checking if we landed in the hidden POI`);
+                  bot.poi = targetPoiName;
+                  travelSuccess = true;
+                } else {
+                  ctx.log("warn", `Return jump failed: ${returnResp.error?.message}`);
+                }
+              } else {
+                ctx.log("warn", `Initial jump failed: ${jumpResp.error?.message}`);
+              }
+            } else {
+              ctx.log("warn", `No jump gate found to reset entry`);
+            }
+          } else if (!isOurBot) {
+            // Try docking at station to send gift instead
+          }
+        } else {
+          // Success - update bot.poi with the resolved name
+          bot.poi = targetPoiName;
+          travelSuccess = true;
+        }
+
+        // If we haven't succeeded and this is our bot, refresh position again
+        if (!travelSuccess && isOurBot && travelAttempts < maxTravelAttempts) {
+          ctx.log("rescue", `⏳ Waiting before next attempt for ${target.username}...`);
+          await sleep(3000);
+        }
       }
+
+      if (!travelSuccess) {
+        ctx.log("error", `Failed to reach ${target.username} at ${target.poi} after ${maxTravelAttempts} attempts`);
+      }
+
       // Update session state after traveling to POI
       if (recoveredSession || getActiveRescueSession(bot.username)) {
         updateRescueSession(bot.username, { state: "at_poi" });
@@ -2924,6 +3141,30 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     // Check if target is actually at the location (for non-station targets)
     let targetFound = true;
     if (!target.docked) {
+      // For our own bots, do one final position refresh before checking
+      const isOurBot = isOwnBot(target.username);
+      if (isOurBot) {
+        ctx.log("rescue", `🔄 Final position check for our bot ${target.username}...`);
+        const fleet = ctx.getFleetStatus?.() || [];
+        const targetBot = fleet.find(b => b.username === target.username);
+        if (targetBot) {
+          const oldPoi = target.poi;
+          target.poi = targetBot.poi || target.poi;
+          target.system = targetBot.system || target.system;
+          if (oldPoi !== target.poi) {
+            ctx.log("rescue", `📍 Position updated: ${oldPoi} -> ${target.poi}`);
+            // Try traveling to the new POI immediately
+            ctx.log("rescue", `🚀 Traveling to updated position...`);
+            const { pois } = await getSystemInfo(ctx);
+            const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
+            if (matchedPoi) {
+              await bot.exec("travel", { target_poi: matchedPoi.id });
+              bot.poi = target.poi;
+            }
+          }
+        }
+      }
+
       // Use get_nearby to verify target is present
       const nearbyResp = await bot.exec("get_nearby");
       if (!nearbyResp.error && nearbyResp.result) {
@@ -2948,6 +3189,31 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         if (!targetHere) {
           targetFound = false;
           ctx.log("error", `Target ${target.username} not found at ${target.poi} - they may have left or it was a false alarm`);
+
+          // For our own bots, NEVER record as ghost - they're just in a hidden POI
+          if (isOurBot) {
+            ctx.log("rescue", `👻 Our bot ${target.username} not found - likely in hidden POI, will keep trying`);
+            ctx.log("rescue", `💡 Hidden POI detected: ${target.poi} in ${target.system}`);
+            
+            // Don't fail the session - keep retrying by not marking mayday as handled
+            // and returning to the start of the loop
+            ctx.log("rescue", `🔄 Will retry rescue for ${target.username}...`);
+            
+            // Return home first
+            if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
+              ctx.log("rescue", `🏠 Returning home before retry...`);
+              await ensureUndocked(ctx);
+              const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+              const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+              if (arrived) {
+                ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+              }
+            }
+            
+            // Retry by continuing the loop without failing the session
+            await sleep(5000);
+            continue;
+          }
 
           // Record ghost incident in BlackBook (skipped for our own bots)
           recordGhost(target.username);
@@ -3338,6 +3604,16 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {
       completeRescueSession(bot.username);
+      
+      // Also mark the queue entry as completed if this was our own bot
+      if (isOwnBot(target.username)) {
+        const queue = getRescueQueue();
+        const queuedRescue = queue.pending.find(r => r.targetUsername === target.username);
+        if (queuedRescue) {
+          markRescueCompleted(queuedRescue.id);
+          ctx.log("rescue", `📋 Marked ${target.username} as completed in rescue queue`);
+        }
+      }
     }
 
     if (isMaydayTarget) {

@@ -4260,14 +4260,43 @@ function renderMap() {
       }
       html += `</div>`;
 
-      // Ores
+      // Ores (legacy mining data)
       if (poi.ores_found && poi.ores_found.length > 0) {
         html += `<div class="poi-section">`;
-        html += `<div class="poi-section-title">Resources Mined</div>`;
+        html += `<div class="poi-section-title">Resources Mined (Legacy)</div>`;
         html += `<div class="poi-ore-list">`;
         for (const ore of poi.ores_found) {
           const hl = filterOres && activeOreFilters.has(ore.item_id) ? ' highlight' : '';
           html += `<span class="poi-ore-tag${hl}">${esc(ore.name)} x${ore.total_mined}</span>`;
+        }
+        html += `</div></div>`;
+      }
+
+      // Resource scan data (new get_poi data)
+      if (poi.resources && poi.resources.length > 0) {
+        html += `<div class="poi-section">`;
+        html += `<div class="poi-section-title">Resource Scan</div>`;
+        html += `<div class="poi-resource-grid">`;
+        for (const res of poi.resources) {
+          // depletion_percent = % available (100 = full, 0 = empty)
+          const availColor = res.depletion_percent >= 80 ? '#2196f3' : 
+                            res.depletion_percent >= 50 ? '#4caf50' : 
+                            res.depletion_percent >= 20 ? '#ff9800' : '#f44336';
+          html += `<div class="resource-card">`;
+          html += `<div class="resource-name">${esc(res.name)}</div>`;
+          html += `<div class="resource-stats">`;
+          html += `<div class="resource-row"><span class="resource-label">Richness:</span><span class="resource-value">${res.richness}</span></div>`;
+          html += `<div class="resource-row"><span class="resource-label">Remaining:</span><span class="resource-value">${res.remaining.toLocaleString()}</span></div>`;
+          html += `<div class="resource-row"><span class="resource-label">Max:</span><span class="resource-value">${res.max_remaining.toLocaleString()}</span></div>`;
+          html += `</div>`;
+          html += `<div class="resource-depletion-bar">`;
+          html += `<div class="resource-depletion-fill" style="width:${res.depletion_percent}%;background:${availColor}"></div>`;
+          html += `<span class="resource-depletion-text">${res.depletion_percent.toFixed(1)}% available</span>`;
+          html += `</div>`;
+          if (res.last_scanned) {
+            html += `<div class="resource-scanned">Scanned ${timeAgo(res.last_scanned)}</div>`;
+          }
+          html += `</div>`;
         }
         html += `</div></div>`;
       }
@@ -8519,6 +8548,8 @@ function renderExplorerSettings(panel) {
   const avoidLowSec = explorer.avoidLowSec ?? false;
   const directToUnknown = explorer.directToUnknown ?? false;
   const groupUnknowns = explorer.groupUnknowns ?? true;
+  const scavengeEnabled = explorer.scavengeEnabled ?? false;
+  const loadFuelCellsAtHome = explorer.loadFuelCellsAtHome ?? true;
 
   // Per-bot focus area overrides for trade_update mode
   const explorerBots = bots.filter(b => {
@@ -8620,11 +8651,11 @@ function renderExplorerSettings(panel) {
     <div class="setting-row">
       <div>
         <div class="setting-label">Direct to Unknown</div>
-        <div class="setting-hint">Jump directly to the farthest unknown system instead of wandering randomly. Loads cargo with fuel cells before departure.</div>
+        <div class="setting-hint">Jump directly to the nearest unexplored system (0 POIs) or stale system (all POIs &gt;7 days old). Prioritizes unknown, then nearest. Loads cargo with fuel cells before departure.</div>
       </div>
       <select id="set-explorer-directToUnknown">
         <option value="false"${!directToUnknown ? ' selected' : ''}>No (explore nearby)</option>
-        <option value="true"${directToUnknown ? ' selected' : ''}>Yes (jump to farthest unknown)</option>
+        <option value="true"${directToUnknown ? ' selected' : ''}>Yes (jump to nearest unknown/stale)</option>
       </select>
     </div>
 
@@ -8636,6 +8667,28 @@ function renderExplorerSettings(panel) {
       <select id="set-explorer-groupUnknowns">
         <option value="false"${!groupUnknowns ? ' selected' : ''}>No</option>
         <option value="true"${groupUnknowns ? ' selected' : ''}>Yes</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Scavenge Wrecks</div>
+        <div class="setting-hint" style="color:var(--red)">⚠ WARNING: Scavenging takes extra ticks and is unsafe near pirates (they attack on tick 3). Disabled by default.</div>
+      </div>
+      <select id="set-explorer-scavengeEnabled">
+        <option value="false"${!scavengeEnabled ? ' selected' : ''}>No (safer, faster)</option>
+        <option value="true"${scavengeEnabled ? ' selected' : ''}>Yes (risk pirates)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Load Fuel Cells at Home</div>
+        <div class="setting-hint">Fill cargo hold with fuel cells at startup for extreme range exploration. 65 fuel cells ≈ 1500+ fuel equivalent. Enabled by default.</div>
+      </div>
+      <select id="set-explorer-loadFuelCellsAtHome">
+        <option value="false"${!loadFuelCellsAtHome ? ' selected' : ''}>No</option>
+        <option value="true"${loadFuelCellsAtHome ? ' selected' : ''}>Yes (max range)</option>
       </select>
     </div>
 
@@ -8657,6 +8710,8 @@ function saveExplorerSettings() {
     repairThreshold: parseInt(document.getElementById('set-explorer-repairThreshold').value) || 40,
     directToUnknown: document.getElementById('set-explorer-directToUnknown').value === 'true',
     groupUnknowns: document.getElementById('set-explorer-groupUnknowns').value === 'true',
+    scavengeEnabled: document.getElementById('set-explorer-scavengeEnabled').value === 'true',
+    loadFuelCellsAtHome: document.getElementById('set-explorer-loadFuelCellsAtHome').value === 'true',
   };
   send({ type: 'saveSettings', routine: 'explorer', settings: s });
   settings.explorer = s;
@@ -9280,11 +9335,14 @@ function renderSalvagerSettings(panel) {
   const minTowValue = sv.minTowValue ?? 500;
   const preferScrap = sv.preferScrap ?? false;
   const autoCloak = sv.autoCloak ?? false;
+  const maxRoamJumps = sv.maxRoamJumps ?? 0;
+  const roamBaseSystems = Array.isArray(sv.roamBaseSystems) ? sv.roamBaseSystems.join(', ') : (sv.roamBaseSystems || '');
+  const depositAtSalvageYard = sv.depositAtSalvageYard ?? false;
 
   // Salvage yard stations list - mobile_capital is dynamic
   const mcLocation = mobileCapitol ? mobileCapitol.systemName || mobileCapitol.systemId : 'unknown (not discovered)';
   const salvageYardStations = [
-    { id: 'alpha_centauri_colonial_station', name: 'Alpha Centauri Colonial Station', system: 'sol' },
+    { id: 'alpha_centauri_colonial_station', name: 'Alpha Centauri Colonial Station', system: 'alpha_centauri' },
     { id: 'node_alpha_processing_station', name: 'Node Alpha Processing Station', system: 'node_alpha' },
     { id: 'the_anvil_arsenal', name: 'The Anvil Arsenal', system: 'the_anvil' },
     { id: 'mobile_capital', name: 'Mobile Capital', system: mcLocation },
@@ -9452,6 +9510,30 @@ function renderSalvagerSettings(panel) {
       <label class="checkbox-label"><input type="checkbox" id="set-salvager-autoCloak"${autoCloak ? ' checked' : ''}> Enable auto cloak</label>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Roam Jumps</div>
+        <div class="setting-hint">Maximum BFS search radius from base systems. 0 = only scan direct neighbors. Set higher (e.g. 3-5) to roam further for wrecks.</div>
+      </div>
+      <input type="number" id="set-salvager-maxRoamJumps" min="0" max="20" value="${maxRoamJumps}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Roam Base Systems</div>
+        <div class="setting-hint">Comma-separated list of systems to use as roaming centers. Bot will scan each base system + all systems within Max Roam Jumps. Leave empty to use current system.</div>
+      </div>
+      <input type="text" id="set-salvager-roamBaseSystems" placeholder="e.g. sol, alpha_centauri, starfall" value="${esc(roamBaseSystems)}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Deposit at Salvage Yard</div>
+        <div class="setting-hint">When enabled, unload cargo at the current station instead of returning to home system. Saves time when roaming far from home.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-salvager-depositAtSalvageYard"${depositAtSalvageYard ? ' checked' : ''}> Deposit cargo at salvage yard (don't return home)</label>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveSalvagerSettings()">Save Settings</button>
     </div>
@@ -9474,6 +9556,9 @@ function saveSalvagerSettings() {
     autoCloak: document.getElementById('set-salvager-autoCloak').checked,
     salvageYardStation: document.getElementById('set-salvager-salvageYardStation').value,
     salvageYardSystem: document.getElementById('set-salvager-salvageYardSystem').value,
+    maxRoamJumps: parseInt(document.getElementById('set-salvager-maxRoamJumps').value) || 0,
+    roamBaseSystems: document.getElementById('set-salvager-roamBaseSystems').value,
+    depositAtSalvageYard: document.getElementById('set-salvager-depositAtSalvageYard').checked,
   };
   send({ type: 'saveSettings', routine: 'salvager', settings: s });
   settings.salvager = s;

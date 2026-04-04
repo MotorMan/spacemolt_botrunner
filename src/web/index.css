@@ -1142,6 +1142,73 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   font-weight: 600;
 }
 
+/* Resource scan display */
+.poi-resource-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 8px;
+}
+.resource-card {
+  background: #0d1117;
+  border: 1px solid #21262d;
+  border-radius: 6px;
+  padding: 8px;
+}
+.resource-name {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin-bottom: 6px;
+}
+.resource-stats {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+}
+.resource-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 2px 0;
+}
+.resource-label {
+  color: var(--text-dim);
+}
+.resource-value {
+  color: var(--text);
+  font-weight: 500;
+}
+.resource-depletion-bar {
+  position: relative;
+  height: 16px;
+  background: #161b22;
+  border-radius: 8px;
+  overflow: hidden;
+  margin-top: 6px;
+}
+.resource-depletion-fill {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  transition: width 0.3s ease, background 0.3s ease;
+}
+.resource-depletion-text {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 9px;
+  font-weight: 600;
+  color: #fff;
+  text-shadow: 0 0 2px rgba(0,0,0,0.8);
+}
+.resource-scanned {
+  font-size: 9px;
+  color: var(--text-dim);
+  margin-top: 4px;
+  text-align: right;
+}
+
 /* Market table */
 .mkt-table {
   width: 100%;

@@ -144,11 +144,11 @@ export function stationHasService(poi: SystemPOI, service: keyof BaseServices): 
 
 /** Known salvage yard station IDs (one per empire). */
 export const SALVAGE_YARD_STATIONS = [
-  "alpha_centauri_colonial_station", // Sol
-  "node_alpha_processing_station",   // Node
-  "the_anvil_arsenal",               // Anvil
-  "mobile_capital",                  // Mobile empire (dynamic - location tracked by mapStore)
-  "cargo_lanes_freight_depot",       // Cargo Lanes
+  "alpha_centauri_colonial_station",   // Sol (legacy name — may not exist in all instances)
+  "node_alpha_processing_station",     // Node
+  "the_anvil_arsenal",                 // Anvil
+  "mobile_capital",                    // Mobile empire (dynamic - location tracked by mapStore)
+  "cargo_lanes_freight_depot",         // Cargo Lanes
 ];
 
 /** Pirate station systems — these are hostile and should be avoided. */
@@ -172,12 +172,17 @@ export function isPirateSystem(systemId: string): boolean {
 
 /** Find a station with a salvage yard service. Returns null if none found. */
 export function findSalvageYardStation(pois: SystemPOI[]): SystemPOI | null {
-  // First try: check services flag
-  const byService = pois.find(p => isStationPoi(p) && p.services?.salvage_yard !== false);
-  if (byService) return byService;
-  
-  // Second try: match known salvage yard station IDs
-  return pois.find(p => isStationPoi(p) && SALVAGE_YARD_STATIONS.includes(p.id)) || null;
+  // First try: match known salvage yard station IDs (explicit list)
+  const known = pois.find(p => isStationPoi(p) && SALVAGE_YARD_STATIONS.includes(p.id));
+  if (known) return known;
+
+  // Second try: explicit salvage_yard === true (not optimistic — must be confirmed)
+  const withService = pois.find(p => isStationPoi(p) && p.services?.salvage_yard === true);
+  if (withService) return withService;
+
+  // Third try: ANY station (salvage yards may not have the service flag set in map data)
+  // This ensures we can still process towed wrecks even if the service flag is missing
+  return pois.find(p => isStationPoi(p)) || null;
 }
 
 /** Get the system ID for a known salvage yard station. */
@@ -187,12 +192,13 @@ export function getSystemForSalvageYard(stationId: string): string | null {
     return getMobileCapitolSystem();
   }
   
-  // Map other salvage yard stations to their systems (update as discovered)
+  // Map other salvage yard stations to their systems
   const stationToSystem: Record<string, string> = {
-    "alpha_centauri_colonial_station": "sol",            // Sol empire
-    "node_alpha_processing_station": "node_alpha",       // Node empire (guess - update if different)
-    "the_anvil_arsenal": "the_anvil",                    // Anvil empire (guess - update if different)
-    "cargo_lanes_freight_depot": "cargo_lanes",          // Cargo Lanes empire (guess - update if different)
+    "alpha_centauri_colonial_station": "alpha_centauri",  // Alpha Centauri empire
+    "node_alpha_processing_station": "node_alpha",        // Node empire
+    "the_anvil_arsenal": "the_anvil",                     // Anvil empire
+    "cargo_lanes_freight_depot": "cargo_lanes",           // Cargo Lanes empire
+    "starfall_salvage_station": "starfall",               // Starfall system
   };
   return stationToSystem[stationId] || null;
 }
@@ -2194,6 +2200,9 @@ export interface BattleNotification {
   battleId?: string;
   tick?: number;
   message?: string;
+  /** Battle participants data - used for pirate detection */
+  participants?: Array<Record<string, unknown>>;
+  sides?: Array<Record<string, unknown>>;
 }
 
 /**
@@ -2265,6 +2274,44 @@ export function parseBattleNotification(notification: unknown): BattleNotificati
       type: "battle_start",
       battleId: undefined, // Will be populated by get_battle_status
       message: "Joined battle",
+    };
+  }
+
+  // Check for battle_update msg_type (periodic battle state updates)
+  // Format from debug log: msg_type: "battle_update", data: { battle_id, tick, your_zone, your_stance, participants, sides, ... }
+  if (msgType === "battle_update" && data && typeof data === "object") {
+    const updateData = data as Record<string, unknown>;
+    const battleId = (updateData.battle_id as string) || "";
+    const tick = (updateData.tick as number) || 0;
+    const participants = Array.isArray(updateData.participants) ? updateData.participants as Array<Record<string, unknown>> : undefined;
+    const sides = Array.isArray(updateData.sides) ? updateData.sides as Array<Record<string, unknown>> : undefined;
+    
+    // If we have a battle_id, this means we're still in battle
+    if (battleId) {
+      return {
+        type: "battle_tick",
+        battleId,
+        tick,
+        participants,
+        sides,
+        message: `Battle update - tick: ${tick}`,
+      };
+    }
+  }
+
+  // Check for battle_damage msg_type (damage events)
+  // Format from debug log: msg_type: "battle_damage", data: { tick, attacker_id, attacker_name, target_id, target_name, total_damage, ... }
+  if (msgType === "battle_damage" && data && typeof data === "object") {
+    const damageData = data as Record<string, unknown>;
+    const attackerName = (damageData.attacker_name as string) || "";
+    const targetName = (damageData.target_name as string) || "";
+    const totalDamage = (damageData.total_damage as number) || 0;
+    const tick = (damageData.tick as number) || 0;
+    
+    return {
+      type: "battle_hit",
+      tick,
+      message: `${attackerName} hit ${targetName} for ${totalDamage} damage (tick: ${tick})`,
     };
   }
 
@@ -2664,12 +2711,30 @@ export async function handleBattleNotifications(
         battleState.battleId = battleNotif.battleId || null;
         battleState.battleStartTick = Date.now();
         battleState.isFleeing = false;
+        
+        // Check for pirates in battle participants
+        if (battleNotif.participants) {
+          const pirateResult = parsePiratesFromBattleParticipants(battleNotif.participants);
+          if (pirateResult.hasPirates) {
+            ctx.log("combat", `⚠️ PIRATES DETECTED IN BATTLE! ${pirateResult.pirateCount} pirate(s), highest tier: ${pirateResult.highestTier}`);
+          }
+        }
+        
         // Immediately initiate flee
         ctx.log("combat", "Initiating emergency flee!");
         await fleeFromBattle(ctx, true, 35000);
         return true;
 
       case "battle_tick":
+        // Check for pirates in battle participants (from battle_update)
+        if (battleNotif.participants) {
+          const pirateResult = parsePiratesFromBattleParticipants(battleNotif.participants);
+          if (pirateResult.hasPirates && !battleState.isFleeing) {
+            ctx.log("combat", `⚠️ PIRATES DETECTED IN BATTLE UPDATE! ${pirateResult.pirateCount} pirate(s) - fleeing!`);
+            battleState.isFleeing = false; // Reset to trigger flee
+          }
+        }
+        
         if (battleState.inBattle && !battleState.isFleeing) {
           ctx.log("combat", `Battle tick ${battleNotif.tick} - combat continues (we're still in battle!)`);
           // If we somehow missed the battle start, flee now
@@ -2876,6 +2941,99 @@ export async function checkAndFleeFromPirates(
   // Not a jump command - we need to flee NOW
   await emergencyFleeFromPirates(ctx, pirateResult);
   return true;
+}
+
+/**
+ * Detect pirates from battle participant data.
+ * This is a fallback when get_nearby fails or during battle.
+ * @param battleParticipants - Array of battle participants from battle_update
+ * @returns PirateDetectionResult with detected pirates
+ */
+export function parsePiratesFromBattleParticipants(battleParticipants: unknown[]): PirateDetectionResult {
+  if (!Array.isArray(battleParticipants)) {
+    return { hasPirates: false, pirateCount: 0, highestTier: null, pirates: [] };
+  }
+
+  const pirates: NearbyEntity[] = [];
+
+  for (const participant of battleParticipants) {
+    if (!participant || typeof participant !== "object") continue;
+    const p = participant as Record<string, unknown>;
+
+    // Check if this is a pirate participant
+    // Pirates typically have faction_id that doesn't match player factions
+    // Or they might be identified by ship class names like "raider", "eviction_notice", etc.
+    const playerId = (p.player_id as string) || "";
+    const username = (p.username as string) || (p.name as string) || "";
+    const shipClass = (p.ship_class as string) || "";
+    const factionId = (p.faction_id as string) || "";
+
+    // Known pirate ship classes (from game data and logs)
+    const pirateShipClasses = [
+      "raider",
+      "eviction_notice",
+      "buccaneer",
+      "marauder",
+      "freebooter",
+      "corsair",
+      "plunderer",
+      "reaver",
+      "predator",
+      "banshee",
+    ];
+
+    // Check if ship class indicates pirate
+    const isPirateShip = pirateShipClasses.some(cls => 
+      shipClass.toLowerCase().includes(cls) || shipClass.toLowerCase() === cls
+    );
+
+    // Also check for pirate faction IDs (these are faction IDs that belong to pirates)
+    // From the log: Breacher (raider) is attacking - ship_class: eviction_notice
+    const isPirateFaction = factionId && (
+      factionId === "pirate" || 
+      factionId.toLowerCase().includes("pirate") ||
+      // Known pirate faction IDs from game
+      factionId === "d8f3a7b2c1e4f5a6b7c8d9e0f1a2b3c4" || // Example - replace with actual IDs
+      factionId === "pirates"
+    );
+
+    if (isPirateShip || isPirateFaction) {
+      pirates.push({
+        id: playerId || username,
+        name: username || playerId,
+        type: "pirate",
+        faction: "pirate",
+        isNPC: true,
+        isPirate: true,
+        tier: "raider", // Default to raider for battle-detected pirates
+        isBoss: false,
+        hull: p.hull_pct as number,
+        maxHull: 100,
+        shield: p.shield_pct as number,
+        maxShield: 100,
+        status: p.stance as string,
+      });
+    }
+  }
+
+  let highestTier: PirateTier | null = null;
+  let highestThreat = 0;
+  for (const pirate of pirates) {
+    if (pirate.tier) {
+      const threat = getPirateThreatLevel(pirate.tier);
+      if (threat > highestThreat) {
+        highestThreat = threat;
+        highestTier = pirate.tier;
+      }
+    }
+  }
+
+  return {
+    hasPirates: pirates.length > 0,
+    pirateCount: pirates.length,
+    highestTier,
+    pirates,
+  };
 }
 
 // ── Customs Inspection ───────────────────────────────────────

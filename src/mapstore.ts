@@ -23,6 +23,17 @@ export interface OreRecord {
   depleted_at?: string;
 }
 
+/** Resource data from get_poi scan */
+export interface ResourceRecord {
+  resource_id: string;
+  name: string;
+  richness: number;
+  remaining: number;
+  max_remaining: number;
+  depletion_percent: number;
+  last_scanned: string;
+}
+
 /** Depletion timeout in milliseconds - POIs can be re-checked after this long. */
 export const DEPLETION_TIMEOUT_MS = 3 * 60 * 60 * 1000; // 3 hours
 
@@ -77,6 +88,7 @@ export interface StoredPOI {
   base_type: string | null;
   services: string[];
   ores_found: OreRecord[];
+  resources: ResourceRecord[];
   market: MarketRecord[];
   orders: OrderRecord[];
   missions: MissionRecord[];
@@ -259,6 +271,7 @@ class MapStore {
           base_type: (p.base_type as string) ?? prev?.base_type ?? null,
           services: (p.services as string[]) ?? prev?.services ?? [],
           ores_found: prev?.ores_found ?? [],
+          resources: prev?.resources ?? [],
           market: prev?.market ?? [],
           orders: prev?.orders ?? [],
           missions: prev?.missions ?? [],
@@ -522,6 +535,35 @@ class MapStore {
     this.scheduleSave();
   }
 
+  /** Update POI resource data from get_poi scan. */
+  updatePoiResources(systemId: string, poiId: string, resources: Array<{
+    resource_id: string;
+    name: string;
+    richness: number;
+    remaining: number;
+    max_remaining: number;
+    depletion_percent: number;
+  }>): void {
+    const sys = this.data.systems[systemId];
+    if (!sys) return;
+
+    const poi = sys.pois.find((p) => p.id === poiId);
+    if (!poi) return;
+
+    poi.resources = resources.map((r) => ({
+      resource_id: r.resource_id,
+      name: r.name,
+      richness: r.richness,
+      remaining: r.remaining,
+      max_remaining: r.max_remaining,
+      depletion_percent: r.depletion_percent,
+      last_scanned: now(),
+    }));
+
+    poi.last_updated = now();
+    this.scheduleSave();
+  }
+
   /** Mark an ore as depleted at a POI. */
   markOreDepleted(systemId: string, poiId: string, oreId: string): void {
     const sys = this.data.systems[systemId];
@@ -686,6 +728,14 @@ class MapStore {
     poiName: string;
     totalMined: number;
     hasStation: boolean;
+    /** Current remaining units from last get_poi scan (0 if never scanned) */
+    remaining: number;
+    /** Max remaining units from last get_poi scan */
+    maxRemaining: number;
+    /** Depletion percent from last get_poi scan (0-100) */
+    depletionPercent: number;
+    /** Minutes since last resource scan */
+    minutesSinceScan: number;
   }> {
     const results: Array<{
       systemId: string;
@@ -694,6 +744,10 @@ class MapStore {
       poiName: string;
       totalMined: number;
       hasStation: boolean;
+      remaining: number;
+      maxRemaining: number;
+      depletionPercent: number;
+      minutesSinceScan: number;
     }> = [];
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
@@ -702,6 +756,15 @@ class MapStore {
       for (const poi of sys.pois) {
         const ore = poi.ores_found.find((o) => o.item_id === oreId);
         if (ore) {
+          // Check for resource scan data
+          const resource = poi.resources?.find((r) => r.resource_id === oreId);
+          const remaining = resource?.remaining ?? 0;
+          const maxRemaining = resource?.max_remaining ?? 0;
+          const depletionPercent = resource?.depletion_percent ?? 0;
+          const minutesSinceScan = resource?.last_scanned
+            ? (Date.now() - new Date(resource.last_scanned).getTime()) / 60000
+            : Infinity;
+
           results.push({
             systemId: sysId,
             systemName: sys.name || sysId,
@@ -709,6 +772,10 @@ class MapStore {
             poiName: poi.name || poi.id,
             totalMined: ore.total_mined,
             hasStation,
+            remaining,
+            maxRemaining,
+            depletionPercent,
+            minutesSinceScan,
           });
         }
       }
@@ -716,6 +783,96 @@ class MapStore {
 
     results.sort((a, b) => b.totalMined - a.totalMined);
     return results;
+  }
+
+  /**
+   * Estimate minutes until a resource regenerates based on depletion level.
+   * Model: resources regen ~25% every 3 hours (180 minutes).
+   * Returns 0 if resource is not depleted enough to need regen.
+   */
+  estimateRegenTime(depletionPercent: number, minutesSinceScan: number): number {
+    // If less than 75% depleted, no regen needed
+    if (depletionPercent < 75) return 0;
+
+    // Base regen: 25% per 180 minutes
+    // For every 25% depleted beyond 75%, need 180 more minutes
+    const excessDepletion = depletionPercent - 75;
+    const regenCycles = Math.ceil(excessDepletion / 25);
+    return regenCycles * 180;
+  }
+
+  /**
+   * Find the best mining location for a resource, scored by abundance and accessibility.
+   * Prefers POIs with high remaining resources, low depletion, and recent scans.
+   */
+  findBestMiningLocation(oreId: string, fromSystem?: string, blacklist?: string[]): Array<{
+    systemId: string;
+    systemName: string;
+    poiId: string;
+    poiName: string;
+    resourceId: string;
+    totalMined: number;
+    hasStation: boolean;
+    remaining: number;
+    maxRemaining: number;
+    depletionPercent: number;
+    minutesSinceScan: number;
+    jumpsAway: number;
+    /** Composite score: higher = better. Factors in remaining, depletion, distance, scan freshness */
+    score: number;
+  }> {
+    const locations = this.findOreLocations(oreId);
+    const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
+    const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+
+    const scored = locations
+      .filter(loc => !blacklistSet.has(loc.systemId.toLowerCase()))
+      .map(loc => {
+        // Calculate jumps from origin
+        let jumpsAway = 0;
+        if (fromSystem && fromSystem !== loc.systemId) {
+          const route = this.findRoute(fromSystem, loc.systemId, blacklistArr);
+          jumpsAway = route ? route.length - 1 : 999;
+        }
+
+        // Score components:
+        // 1. Resource abundance (0-100 points)
+        let abundanceScore = 0;
+        if (loc.maxRemaining > 0) {
+          // Use remaining/max ratio, scaled to 0-100
+          abundanceScore = (loc.remaining / loc.maxRemaining) * 100;
+        } else if (loc.totalMined > 0) {
+          // No scan data — use historical yield as proxy (capped at 50)
+          abundanceScore = Math.min(50, Math.log10(loc.totalMined) * 10);
+        }
+
+        // 2. Availability bonus (0-50 points) — depletion_percent = % available (100 = full)
+        const availabilityScore = (loc.depletionPercent / 100) * 50;
+
+        // 3. Distance penalty (0-30 points)
+        const distanceScore = Math.max(0, 30 - jumpsAway * 5);
+
+        // 4. Scan freshness bonus (0-20 points)
+        let freshnessScore = 20;
+        if (loc.minutesSinceScan === Infinity) {
+          freshnessScore = 5; // Never scanned — uncertain
+        } else if (loc.minutesSinceScan > 180) {
+          freshnessScore = 10; // Stale data
+        }
+
+        const score = abundanceScore + availabilityScore + distanceScore + freshnessScore;
+
+        return {
+          ...loc,
+          resourceId: oreId,
+          jumpsAway,
+          score: Math.round(score * 100) / 100,
+        };
+      });
+
+    // Sort by score descending
+    scored.sort((a, b) => b.score - a.score);
+    return scored;
   }
 
   /** BFS pathfinding between two systems using known connections. Returns system IDs in order, or null if no path. */

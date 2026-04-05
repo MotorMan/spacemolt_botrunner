@@ -854,7 +854,38 @@ async function* scanResourcePoi(
     []
   ) as Array<Record<string, unknown>>;
 
-  if (resources.length > 0) {
+  // Register/update the POI in mapstore with full data from get_poi
+  // This captures hidden POIs that aren't in get_system response
+  if (poiData) {
+    const resourceData = resources.map((r) => ({
+      resource_id: (r.resource_id as string) || "",
+      name: (r.name as string) || (r.resource_id as string) || "",
+      richness: (r.richness as number) || 0,
+      remaining: (r.remaining as number) || 0,
+      max_remaining: (r.max_remaining as number) || 0,
+      depletion_percent: (r.depletion_percent as number) || 100,
+    }));
+
+    mapStore.registerPoiFromScan(systemId, {
+      id: (poiData.id as string) || poi.id,
+      name: (poiData.name as string) || poi.name,
+      type: (poiData.type as string) || poi.type,
+      hidden: poiData.hidden as boolean | undefined,
+      reveal_difficulty: poiData.reveal_difficulty as number | undefined,
+      resources: resourceData.length > 0 ? resourceData : undefined,
+    });
+
+    // Log discovered resources
+    if (resourceData.length > 0) {
+      const resourceNames = resourceData.map(r => r.name).join(", ");
+      const hiddenTag = poiData.hidden ? " [HIDDEN]" : "";
+      ctx.log("exploration", `Scanned${hiddenTag} ${poi.name}: ${resourceNames}`);
+    } else {
+      const hiddenTag = poiData.hidden ? " [HIDDEN]" : "";
+      ctx.log("info", `Scanned${hiddenTag} ${poi.name}: no resources found`);
+    }
+  } else if (resources.length > 0) {
+    // Fallback if poi object not present but resources are
     const resourceData = resources.map((r) => ({
       resource_id: (r.resource_id as string) || "",
       name: (r.name as string) || (r.resource_id as string) || "",

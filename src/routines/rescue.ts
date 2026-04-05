@@ -190,6 +190,101 @@ async function sendRescueBill(
 /** Normalize system name for comparison (handles underscores vs spaces, case) */
 const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
 
+/**
+ * Check if a rescue target still needs rescue by verifying their current fuel and position.
+ * Returns an object with:
+ *   - needsRescue: whether the target still needs rescue
+ *   - currentFuelPct: current fuel percentage (if available)
+ *   - currentSystem: current system (if available)
+ *   - currentDocked: whether currently docked (if available)
+ *   - reason: why rescue is no longer needed (if applicable)
+ */
+async function checkTargetStillNeedsRescue(
+  ctx: RoutineContext,
+  targetUsername: string,
+  originalFuelPct: number,
+  originalSystem: string,
+  originalDocked: boolean,
+): Promise<{
+  needsRescue: boolean;
+  currentFuelPct: number | null;
+  currentSystem: string | null;
+  currentDocked: boolean | null;
+  reason?: string;
+}> {
+  const { bot } = ctx;
+
+  // Get current fleet status to find the target
+  const fleet = ctx.getFleetStatus?.() || [];
+  const targetBot = fleet.find(b => b.username === targetUsername);
+
+  if (!targetBot) {
+    // Target not in fleet - can't verify status
+    // This might mean they logged off or fleet status is unavailable
+    ctx.log("rescue", `⚠️ Cannot verify ${targetUsername} status - not in fleet list`);
+    return {
+      needsRescue: true, // Assume they still need rescue
+      currentFuelPct: null,
+      currentSystem: null,
+      currentDocked: null,
+      reason: "Target not in fleet status",
+    };
+  }
+
+  const currentFuelPct = targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100;
+  const currentSystem = targetBot.system;
+  const currentDocked = targetBot.docked;
+
+  // Check if target has refueled themselves
+  if (currentFuelPct > 25 && originalFuelPct <= 10) {
+    // Significant fuel increase indicates they refueled
+    ctx.log("rescue", `✓ ${targetUsername} no longer needs rescue - fuel increased from ${originalFuelPct}% to ${currentFuelPct}% (self-refueled)`);
+    return {
+      needsRescue: false,
+      currentFuelPct,
+      currentSystem,
+      currentDocked,
+      reason: `Target self-refueled: ${originalFuelPct}% → ${currentFuelPct}%`,
+    };
+  }
+
+  // Check if target has moved to a different system
+  if (currentSystem && normalizeSystemName(currentSystem) !== normalizeSystemName(originalSystem)) {
+    ctx.log("rescue", `✓ ${targetUsername} no longer needs rescue - moved from ${originalSystem} to ${currentSystem}`);
+    return {
+      needsRescue: false,
+      currentFuelPct,
+      currentSystem,
+      currentDocked,
+      reason: `Target moved: ${originalSystem} → ${currentSystem}`,
+    };
+  }
+
+  // Check if target is now docked (might be refueling at station)
+  if (currentDocked && !originalDocked && currentFuelPct > originalFuelPct) {
+    ctx.log("rescue", `✓ ${targetUsername} is now docked and refueling - fuel ${currentFuelPct}% (was ${originalFuelPct}%)`);
+    // Don't cancel rescue yet - they might still need fuel after refueling
+    // Only cancel if fuel is above threshold
+    if (currentFuelPct > 25) {
+      return {
+        needsRescue: false,
+        currentFuelPct,
+        currentSystem,
+        currentDocked,
+        reason: `Target docked and refueled: ${currentFuelPct}%`,
+      };
+    }
+  }
+
+  // Target still needs rescue
+  return {
+    needsRescue: true,
+    currentFuelPct,
+    currentSystem,
+    currentDocked,
+  };
+}
+
 /** Find bots that need fuel rescue. */
 function findStrandedBots(
   fleet: BotStatus[],
@@ -682,29 +777,43 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             if (!arrived) {
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
             } else {
-              ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
-              
+              // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+              await bot.refreshStatus();
+              ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+
               // If home station is configured, travel there and dock
               if (settings.homeStation) {
                 const [expectedSystem, stationId] = settings.homeStation.split('|');
+                ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
+                
                 if (expectedSystem === homeSystem && stationId) {
-                  ctx.log("rescue", `🚀 Traveling to home station...`);
+                  ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
                   const travelResp = await bot.exec("travel", { target_poi: stationId });
-                  if (!travelResp.error) {
+                  if (travelResp.error) {
+                    ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+                  } else {
                     ctx.log("rescue", `⚓ Docking at home station...`);
                     const dockResp = await bot.exec("dock");
-                    if (!dockResp.error) {
+                    if (dockResp.error) {
+                      ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+                    } else {
                       ctx.log("rescue", `✓ Docked at home station`);
                       // Refuel after docking
                       ctx.log("rescue", `⛽ Refueling at home station...`);
                       const refuelResp = await bot.exec("refuel");
-                      if (!refuelResp.error) {
+                      if (refuelResp.error) {
+                        ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                      } else {
                         await bot.refreshStatus();
                         ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                       }
                     }
                   }
+                } else {
+                  ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
                 }
+              } else {
+                ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
               }
             }
             isReturningIdle = false;
@@ -859,7 +968,32 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           }
         }
 
-        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+        const safetyOpts = {
+          fuelThresholdPct: settings.refuelThreshold,
+          hullThresholdPct: 30,
+          onJump: async (jumpNumber: number) => {
+            // Check if target still needs rescue on every jump
+            const statusCheck = await checkTargetStillNeedsRescue(
+              ctx,
+              target!.username,
+              target!.fuelPct,
+              target!.system,
+              target!.docked,
+            );
+
+            if (!statusCheck.needsRescue) {
+              ctx.log("rescue", `🛑 ABORTING rescue - ${statusCheck.reason}`);
+              return false; // Abort navigation
+            }
+
+            // Log progress every 5 jumps
+            if (jumpNumber % 5 === 0 && statusCheck.currentFuelPct !== null) {
+              ctx.log("rescue", `📍 Jump ${jumpNumber}: ${target!.username} fuel at ${statusCheck.currentFuelPct}% in ${statusCheck.currentSystem}`);
+            }
+
+            return true; // Continue navigation
+          },
+        };
         const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
         if (!arrived) {
           ctx.log("error", `Could not reach ${target.system} — will retry next scan`);
@@ -1117,7 +1251,9 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       if (!arrived) {
         ctx.log("error", `Failed to return to home system ${homeSystem}`);
       } else {
-        ctx.log(logCategory, `✓ Arrived at home system ${homeSystem}`);
+        // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+        await bot.refreshStatus();
+        ctx.log(logCategory, `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
         // If home station is configured, travel there and dock
         ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", homeSystem: "${homeSystem}"`);
@@ -1128,31 +1264,31 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           if (expectedSystem === homeSystem && stationId) {
             ctx.log(logCategory, `🚀 Traveling to home station (${stationId})...`);
             const travelResp = await bot.exec("travel", { target_poi: stationId });
-            if (!travelResp.error) {
+            if (travelResp.error) {
+              ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+            } else {
               ctx.log(logCategory, `⚓ Docking at home station...`);
               const dockResp = await bot.exec("dock");
-              if (!dockResp.error) {
+              if (dockResp.error) {
+                ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+              } else {
                 ctx.log(logCategory, `✓ Docked at home station`);
                 // Refuel after docking
                 ctx.log(logCategory, `⛽ Refueling at home station...`);
                 const refuelResp = await bot.exec("refuel");
-                if (!refuelResp.error) {
+                if (refuelResp.error) {
+                  ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                } else {
                   await bot.refreshStatus();
                   ctx.log(logCategory, `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-                } else {
-                  ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
                 }
-              } else {
-                ctx.log("error", `Dock failed: ${dockResp.error.message}`);
               }
-            } else {
-              ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
             }
           } else {
-            ctx.log("warn", `homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
+            ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
           }
         } else {
-          ctx.log("rescue", `⚠️ homeStation not configured - will use ensureFueled to refuel at ${homeSystem}`);
+          ctx.log("warn", `⚠️ homeStation not configured - will use ensureFueled to refuel at ${homeSystem}`);
         }
       }
       // Update session state for return home
@@ -1608,23 +1744,31 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     if (!arrived) {
       ctx.log("error", `Failed to return to home system ${homeSystem}`);
     } else {
-      ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+      // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+      await bot.refreshStatus();
+      ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
       // If home station is configured, travel there and dock
       if (settings.homeStation) {
         const [expectedSystem, stationId] = settings.homeStation.split('|');
         if (expectedSystem === homeSystem && stationId) {
-          ctx.log("rescue", `🚀 Traveling to home station...`);
+          ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
           const travelResp = await bot.exec("travel", { target_poi: stationId });
-          if (!travelResp.error) {
+          if (travelResp.error) {
+            ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+          } else {
             ctx.log("rescue", `⚓ Docking at home station...`);
             const dockResp = await bot.exec("dock");
-            if (!dockResp.error) {
+            if (dockResp.error) {
+              ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+            } else {
               ctx.log("rescue", `✓ Docked at home station`);
               // Refuel after docking
               ctx.log("rescue", `⛽ Refueling at home station...`);
               const refuelResp = await bot.exec("refuel");
-              if (!refuelResp.error) {
+              if (refuelResp.error) {
+                ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+              } else {
                 await bot.refreshStatus();
                 ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
               }
@@ -2108,23 +2252,31 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       if (!arrived) {
         ctx.log("error", `Failed to return to home system ${homeSystem}`);
       } else {
-        ctx.log("mayday", `✓ Arrived at home system ${homeSystem}`);
+        // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+        await bot.refreshStatus();
+        ctx.log("mayday", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
         // If home station is configured, travel there and dock
         if (settings.homeStation) {
           const [expectedSystem, stationId] = settings.homeStation.split('|');
           if (expectedSystem === homeSystem && stationId) {
-            ctx.log("mayday", `🚀 Traveling to home station...`);
+            ctx.log("mayday", `🚀 Traveling to home station (${stationId})...`);
             const travelResp = await bot.exec("travel", { target_poi: stationId });
-            if (!travelResp.error) {
+            if (travelResp.error) {
+              ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+            } else {
               ctx.log("mayday", `⚓ Docking at home station...`);
               const dockResp = await bot.exec("dock");
-              if (!dockResp.error) {
+              if (dockResp.error) {
+                ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+              } else {
                 ctx.log("mayday", `✓ Docked at home station`);
                 // Refuel after docking
                 ctx.log("mayday", `⛽ Refueling at home station...`);
                 const refuelResp = await bot.exec("refuel");
-                if (!refuelResp.error) {
+                if (refuelResp.error) {
+                  ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                } else {
                   await bot.refreshStatus();
                   ctx.log("mayday", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                 }
@@ -2692,7 +2844,44 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             if (!arrived) {
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
             } else {
-              ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+              // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+              await bot.refreshStatus();
+              ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+
+              // If home station is configured, travel there and dock
+              if (settings.homeStation) {
+                const [expectedSystem, stationId] = settings.homeStation.split('|');
+                ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
+                
+                if (expectedSystem === homeSystem && stationId) {
+                  ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
+                  const travelResp = await bot.exec("travel", { target_poi: stationId });
+                  if (travelResp.error) {
+                    ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+                  } else {
+                    ctx.log("rescue", `⚓ Docking at home station...`);
+                    const dockResp = await bot.exec("dock");
+                    if (dockResp.error) {
+                      ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+                    } else {
+                      ctx.log("rescue", `✓ Docked at home station`);
+                      // Refuel after docking
+                      ctx.log("rescue", `⛽ Refueling at home station...`);
+                      const refuelResp = await bot.exec("refuel");
+                      if (refuelResp.error) {
+                        ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                      } else {
+                        await bot.refreshStatus();
+                        ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                      }
+                    }
+                  }
+                } else {
+                  ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
+                }
+              } else {
+                ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
+              }
             }
             isReturningIdle = false;
             idleStartTime = 0;
@@ -2976,7 +3165,32 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
-      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+      const safetyOpts = {
+        fuelThresholdPct: settings.refuelThreshold,
+        hullThresholdPct: 30,
+        onJump: async (jumpNumber: number) => {
+          // Check if target still needs rescue on every jump
+          const statusCheck = await checkTargetStillNeedsRescue(
+            ctx,
+            target!.username,
+            target!.fuelPct,
+            target!.system,
+            target!.docked,
+          );
+
+          if (!statusCheck.needsRescue) {
+            ctx.log("rescue", `🛑 ABORTING rescue - ${statusCheck.reason}`);
+            return false; // Abort navigation
+          }
+
+          // Log progress every 5 jumps
+          if (jumpNumber % 5 === 0 && statusCheck.currentFuelPct !== null) {
+            ctx.log("rescue", `📍 Jump ${jumpNumber}: ${target!.username} fuel at ${statusCheck.currentFuelPct}% in ${statusCheck.currentSystem}`);
+          }
+
+          return true; // Continue navigation
+        },
+      };
       const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Could not reach ${target.system} — will retry next scan`);
@@ -3018,8 +3232,9 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Track attempts for hidden POI detection
       let travelAttempts = 0;
-      const maxTravelAttempts = isOurBot ? 5 : 1; // Retry more for our own bots
+      const maxTravelAttempts = isOurBot ? 5 : 3; // Retry more for our own bots, but always try search for others
       let travelSuccess = false;
+      let searchAttempted = false; // Track if we've tried the hidden POI search
 
       while (travelAttempts < maxTravelAttempts && !travelSuccess) {
         travelAttempts++;
@@ -3070,39 +3285,56 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         if (travelResp.error && !travelResp.error.message.includes("already")) {
           ctx.log("error", `Travel failed: ${travelResp.error.message}`);
 
-          // For our own bots, this might be a hidden POI - try jumping out and back
-          if (isOurBot && travelAttempts < maxTravelAttempts) {
+          // Check if this might be a hidden POI - try jumping out and back
+          // This can happen for ANY bot (not just our own) when they're in a hidden POI
+          const isUnknownDestination = travelResp.error.message.toLowerCase().includes("unknown");
+          
+          if ((isOurBot || isUnknownDestination) && !searchAttempted && travelAttempts < maxTravelAttempts) {
             ctx.log("rescue", `🔀 Possible hidden POI detected! Attempting jump-out-and-back to find ${target.username}...`);
+            searchAttempted = true;
 
-            // Find a connected system to jump to
+            // Find all connected systems (jump gates) to try
             const { pois } = await getSystemInfo(ctx);
-            const jumpGate = pois.find(p => p.type === "jump_gate" || p.type === "stargate");
+            const jumpGates = pois.filter(p => p.type === "jump_gate" || p.type === "stargate");
 
-            if (jumpGate) {
-              ctx.log("rescue", `🚀 Jumping to ${jumpGate.name} to reset entry...`);
-              const jumpResp = await bot.exec("travel", { target_poi: jumpGate.id });
+            if (jumpGates.length > 0) {
+              ctx.log("rescue", `📍 Found ${jumpGates.length} connected system(s) to search: ${jumpGates.map(g => g.name).join(', ')}`);
+              
+              // Try each connected system until we find the hidden POI
+              let foundHiddenPoi = false;
+              for (const jumpGate of jumpGates) {
+                if (foundHiddenPoi) break; // Stop if we already found it
+                
+                ctx.log("rescue", `🚀 Trying jump to ${jumpGate.name} to reset entry...`);
+                const jumpResp = await bot.exec("travel", { target_poi: jumpGate.id });
 
-              if (!jumpResp.error || jumpResp.error.message.includes("already")) {
-                // Now jump back to the target POI
-                await sleep(2000); // Brief pause for system to update
+                if (!jumpResp.error || jumpResp.error.message.includes("already")) {
+                  // Now jump back to the target POI
+                  await sleep(2000); // Brief pause for system to update
 
-                ctx.log("rescue", `🚀 Jumping back to ${targetPoiName}...`);
-                const returnResp = await bot.exec("travel", { target_poi: travelTarget });
+                  ctx.log("rescue", `🚀 Jumping back to ${targetPoiName} from ${jumpGate.name}...`);
+                  const returnResp = await bot.exec("travel", { target_poi: travelTarget });
 
-                if (!returnResp.error || returnResp.error.message.includes("already")) {
-                  ctx.log("rescue", `✓ Successfully jumped back in - checking if we landed in the hidden POI`);
-                  bot.poi = targetPoiName;
-                  travelSuccess = true;
+                  if (!returnResp.error || returnResp.error.message.includes("already")) {
+                    ctx.log("rescue", `✓ Successfully jumped back in from ${jumpGate.name} - found hidden POI!`);
+                    bot.poi = targetPoiName;
+                    travelSuccess = true;
+                    foundHiddenPoi = true;
+                  } else {
+                    ctx.log("warn", `Return jump from ${jumpGate.name} failed: ${returnResp.error?.message}`);
+                  }
                 } else {
-                  ctx.log("warn", `Return jump failed: ${returnResp.error?.message}`);
+                  ctx.log("warn", `Jump to ${jumpGate.name} failed: ${jumpResp.error?.message}`);
                 }
-              } else {
-                ctx.log("warn", `Initial jump failed: ${jumpResp.error?.message}`);
+              }
+              
+              if (!foundHiddenPoi) {
+                ctx.log("warn", `Hidden POI search completed - tried all ${jumpGates.length} connected system(s) without success`);
               }
             } else {
-              ctx.log("warn", `No jump gate found to reset entry`);
+              ctx.log("warn", `No jump gates found to reset entry`);
             }
-          } else if (!isOurBot) {
+          } else if (!isOurBot && !isUnknownDestination) {
             // Try docking at station to send gift instead
           }
         } else {
@@ -3120,6 +3352,129 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
       if (!travelSuccess) {
         ctx.log("error", `Failed to reach ${target.username} at ${target.poi} after ${maxTravelAttempts} attempts`);
+        
+        // If we attempted the hidden POI search but still couldn't reach, try one more thing:
+        // Check if the target is actually in the system by looking at fleet status
+        const isOurBot = isOwnBot(target.username);
+        if (isOurBot) {
+          ctx.log("rescue", `🔍 Checking fleet status for ${target.username} after travel failure...`);
+          const fleet = ctx.getFleetStatus?.() || [];
+          const targetBot = fleet.find(b => b.username === target.username);
+          
+          if (targetBot && targetBot.system === target.system) {
+            ctx.log("rescue", `✓ Target ${target.username} is confirmed in ${target.system} (POI: ${targetBot.poi})`);
+            ctx.log("rescue", `🔀 Hidden POI confirmed! Retrying with fresh POI information...`);
+            
+            // Update target info and try one more time with a fresh travel attempt
+            target.poi = targetBot.poi || target.poi;
+            
+            // Try the search function one more time with ALL connected systems
+            const { pois } = await getSystemInfo(ctx);
+            const jumpGates = pois.filter(p => p.type === "jump_gate" || p.type === "stargate");
+            
+            if (jumpGates.length > 0) {
+              ctx.log("rescue", `🚀 Final attempt: Trying all ${jumpGates.length} connected system(s) to find hidden POI...`);
+              let foundInFinalAttempt = false;
+              
+              for (const jumpGate of jumpGates) {
+                if (foundInFinalAttempt) break;
+                
+                ctx.log("rescue", `🚀 Jumping to ${jumpGate.name}...`);
+                const jumpResp = await bot.exec("travel", { target_poi: jumpGate.id });
+                
+                if (!jumpResp.error || jumpResp.error.message.includes("already")) {
+                  await sleep(2000);
+                  ctx.log("rescue", `🚀 Jumping back to ${target.poi} from ${jumpGate.name}...`);
+                  const returnResp = await bot.exec("travel", { target_poi: target.poi });
+                  
+                  if (!returnResp.error || returnResp.error.message.includes("already")) {
+                    ctx.log("rescue", `✓ Successfully found hidden POI on final attempt via ${jumpGate.name}!`);
+                    bot.poi = target.poi;
+                    travelSuccess = true;
+                    foundInFinalAttempt = true;
+                  } else {
+                    ctx.log("warn", `Final return jump from ${jumpGate.name} failed: ${returnResp.error?.message}`);
+                  }
+                } else {
+                  ctx.log("warn", `Final jump to ${jumpGate.name} failed: ${jumpResp.error?.message}`);
+                }
+              }
+              
+              if (!foundInFinalAttempt) {
+                ctx.log("error", `Final search attempt failed - tried all ${jumpGates.length} connected system(s)`);
+              }
+            }
+          }
+        }
+        
+        // If still no success after all attempts, we need to handle the failure
+        if (!travelSuccess) {
+          ctx.log("error", `All rescue attempts failed for ${target.username} at ${target.poi}`);
+          
+          // For our own bots, don't record as ghost - they're just in a hidden POI
+          if (isOurBot) {
+            ctx.log("rescue", `👻 Our bot ${target.username} not reachable - likely in hidden POI`);
+            ctx.log("rescue", `💡 Will retry rescue when bot is in a visible location`);
+            
+            // Return home and retry later
+            if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
+              ctx.log("rescue", `🏠 Returning home before retry...`);
+              await ensureUndocked(ctx);
+              const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+              const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+              if (arrived) {
+                ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+              }
+            }
+            
+            // Don't fail the session permanently - just continue the loop
+            await sleep(10000);
+            continue;
+          }
+          
+          // For non-own bots, record ghost and fail normally
+          recordGhost(target.username);
+          const currentGhosts = getPlayerRecord(target.username).ghostCount;
+          ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
+          
+          // Send grumpy faction chat message about being ghosted
+          const aiChatService = (globalThis as any).aiChatService;
+          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+            try {
+              const result = await aiChatService.sendFactionMessage(bot, {
+                messageType: "rescue_no_show",
+                targetName: target.username,
+                isMayday: isMaydayTarget,
+                isBot: !isMaydayTarget,
+                currentSystem: bot.system,
+                targetSystem: target.system,
+                targetPoi: target.poi || undefined,
+              });
+              if (!result.ok) {
+                ctx.log("ai_chat_debug", `Faction announcement (no_show) skipped: ${result.error}`);
+              }
+            } catch (e) {
+              ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
+            }
+          }
+          
+          if (recoveredSession || getActiveRescueSession(bot.username)) {
+            failRescueSession(bot.username, "Could not reach target - all attempts failed");
+          }
+          markMaydayHandled({ sender: target.username, system: target.system, poi: target.poi || "", fuelPct: target.fuelPct, timestamp: Date.now(), currentFuel: 0, maxFuel: 0, rawMessage: "" });
+          
+          // Return home after failed rescue
+          if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
+            ctx.log("rescue", `🚨 All rescue attempts failed - returning home to safety...`);
+            await ensureUndocked(ctx);
+            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+            const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+            if (arrived) {
+              ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+            }
+          }
+          continue;
+        }
       }
 
       // Update session state after traveling to POI
@@ -3528,23 +3883,31 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       if (!arrived) {
         ctx.log("error", `Failed to return to home system ${homeSystem}`);
       } else {
-        ctx.log(logCategory, `✓ Arrived at home system ${homeSystem}`);
-        
+        // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+        await bot.refreshStatus();
+        ctx.log(logCategory, `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+
         // If home station is configured, travel there and dock
         if (settings.homeStation) {
           const [expectedSystem, stationId] = settings.homeStation.split('|');
           if (expectedSystem === homeSystem && stationId) {
-            ctx.log("rescue", `🚀 Traveling to home station...`);
+            ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
             const travelResp = await bot.exec("travel", { target_poi: stationId });
-            if (!travelResp.error) {
+            if (travelResp.error) {
+              ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+            } else {
               ctx.log("rescue", `⚓ Docking at home station...`);
               const dockResp = await bot.exec("dock");
-              if (!dockResp.error) {
+              if (dockResp.error) {
+                ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+              } else {
                 ctx.log("rescue", `✓ Docked at home station`);
                 // Refuel after docking
                 ctx.log("rescue", `⛽ Refueling at home station...`);
                 const refuelResp = await bot.exec("refuel");
-                if (!refuelResp.error) {
+                if (refuelResp.error) {
+                  ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                } else {
                   await bot.refreshStatus();
                   ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                 }

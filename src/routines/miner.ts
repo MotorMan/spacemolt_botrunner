@@ -38,6 +38,101 @@ import {
   fleeFromBattle,
 } from "./common.js";
 
+// ── Deep core mining constants ───────────────────────────────────────────
+
+/**
+ * Ores that require deep core equipment (survey scanner + extractor) to mine.
+ * These are typically found in hidden POIs with extreme high density.
+ */
+const DEEP_CORE_ORES = new Set([
+  "void_essence",
+  "fury_crystal",
+  "legacy_ore",
+  "prismatic_nebulite",
+  "exotic_matter",
+]);
+
+/**
+ * Check if a resource ID requires deep core equipment to mine.
+ */
+function isDeepCoreOre(resourceId: string): boolean {
+  return DEEP_CORE_ORES.has(resourceId);
+}
+
+/**
+ * Check if the ship has a deep core survey scanner equipped.
+ * This is required to detect hidden POIs and deep core ores.
+ */
+async function hasDeepCoreSurveyScanner(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error || !shipResp.result) return false;
+
+  const shipData = shipResp.result as Record<string, unknown>;
+  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = (modObj?.id as string) || (modObj?.type_id as string) || "";
+    const modName = (modObj?.name as string) || "";
+    const modSpecial = (modObj?.special as string) || "";
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`.toLowerCase();
+    if (checkStr.includes("deep_core_survey_scanner") ||
+        checkStr.includes("deep core survey scanner") ||
+        modSpecial.includes("deep_core_detection")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Check if the ship has a deep core extractor equipped.
+ * This is required to mine deep core ores from hidden POIs.
+ */
+async function hasDeepCoreExtractor(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error || !shipResp.result) return false;
+
+  const shipData = shipResp.result as Record<string, unknown>;
+  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = (modObj?.id as string) || (modObj?.type_id as string) || "";
+    const modName = (modObj?.name as string) || "";
+    const modSpecial = (modObj?.special as string) || "";
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`.toLowerCase();
+    if (checkStr.includes("deep_core_extractor") ||
+        checkStr.includes("deep core extractor") ||
+        modSpecial.includes("rare_ore_access")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Check if the ship has full deep core mining capability (both scanner and extractor).
+ * Returns an object with detailed capability info.
+ */
+async function getDeepCoreCapability(ctx: RoutineContext): Promise<{
+  hasScanner: boolean;
+  hasExtractor: boolean;
+  canMine: boolean;
+}> {
+  const hasScanner = await hasDeepCoreSurveyScanner(ctx);
+  const hasExtractor = await hasDeepCoreExtractor(ctx);
+  return {
+    hasScanner,
+    hasExtractor,
+    canMine: hasScanner && hasExtractor,
+  };
+}
+
 // ── Mission helpers ───────────────────────────────────────────
 
 /** Mission types and keywords that are suitable for miners. */
@@ -151,6 +246,8 @@ function getMinerSettings(username?: string): {
   oreQuotas: Record<string, number>;
   gasQuotas: Record<string, number>;
   iceQuotas: Record<string, number>;
+  jettisonOres: string[]; // Ore IDs to jettison when found in cargo during mining
+  deepCoreJettisonOres: string[]; // Ore IDs to jettison when mining deep core (hidden POIs)
   depletionTimeoutHours: number;
   ignoreDepletion: boolean;
   stayOutUntilFull: boolean;
@@ -227,6 +324,8 @@ function getMinerSettings(username?: string): {
     oreQuotas: (m.oreQuotas as Record<string, number>) || {},
     gasQuotas: (m.gasQuotas as Record<string, number>) || {},
     iceQuotas: (m.iceQuotas as Record<string, number>) || {},
+    jettisonOres: (m.jettisonOres as string[]) || [],
+    deepCoreJettisonOres: (m.deepCoreJettisonOres as string[]) || [],
     depletionTimeoutHours: (m.depletionTimeoutHours as number) || 3,
     ignoreDepletion: (m.ignoreDepletion as boolean) ?? false,
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
@@ -303,16 +402,62 @@ async function detectMiningType(ctx: RoutineContext): Promise<"ore" | "gas" | "i
     return "ore";
   }
 
+  // Check for deep core equipment (survey scanner + extractor) — counts as ore mining
+  const deepCoreCap = await getDeepCoreCapability(ctx);
+  if (deepCoreCap.canMine) {
+    ctx.log("info", "Deep core mining equipment detected — ore mining mode (hidden POIs)");
+    return "ore";
+  }
+
   ctx.log("error", "No mining equipment detected on ship");
   return null;
+}
+
+/** Quick check: does the ship have equipment for a specific mining type? */
+async function hasEquipmentForMiningType(ctx: RoutineContext, miningType: "ore" | "gas" | "ice"): Promise<boolean> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error) return false;
+
+  const shipData = shipResp.result as Record<string, unknown>;
+  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  const moduleStr = modules.map(m => {
+    const obj = typeof m === "object" && m !== null ? m as Record<string, unknown> : {};
+    return `${obj.id || ""} ${obj.name || ""} ${obj.type || ""}`.toLowerCase();
+  }).join(" ");
+
+  switch (miningType) {
+    case "ore":
+      return moduleStr.includes("mining_laser") || moduleStr.includes("mining laser") ||
+             moduleStr.includes("deep_core_survey_scanner") || moduleStr.includes("deep core survey scanner");
+    case "gas": return moduleStr.includes("gas_harvester") || moduleStr.includes("gas harvester");
+    case "ice": return moduleStr.includes("ice_harvester") || moduleStr.includes("ice harvester");
+  }
+}
+
+/** Detect deep core mining capability and log it. */
+async function logDeepCoreCapability(ctx: RoutineContext): Promise<void> {
+  const deepCoreCap = await getDeepCoreCapability(ctx);
+  if (deepCoreCap.hasScanner || deepCoreCap.hasExtractor) {
+    const parts: string[] = [];
+    if (deepCoreCap.hasScanner) parts.push("survey scanner");
+    if (deepCoreCap.hasExtractor) parts.push("deep core extractor");
+    ctx.log("mining", `Deep core equipment detected: ${parts.join(" + ")}`);
+    if (deepCoreCap.canMine) {
+      ctx.log("mining", "Deep core mining capability: FULL (can mine hidden POIs)");
+    } else {
+      if (!deepCoreCap.hasScanner) ctx.log("warn", "Deep core mining INCOMPLETE: missing survey scanner");
+      if (!deepCoreCap.hasExtractor) ctx.log("warn", "Deep core mining INCOMPLETE: missing extractor");
+    }
+  }
 }
 
 /** Get expected mining type for a resource ID. */
 function getMiningTypeForResource(resourceId: string): "ore" | "gas" | "ice" {
   const lower = resourceId.toLowerCase();
-  
+
   // Gas resources (including legacy names like compressed_hydrogen)
-  if (lower.includes("gas") || 
+  if (lower.includes("gas") ||
       lower.includes("hydrogen") || 
       lower.includes("helium") || 
       lower.includes("argon") || 
@@ -640,6 +785,35 @@ async function signalEscort(
   }
 }
 
+/**
+ * Dump all non-fuel cargo at the current station. Used when returning home early due to depletion.
+ */
+async function dumpCargo(ctx: RoutineContext, settings: ReturnType<typeof getMinerSettings>): Promise<void> {
+  const { bot } = ctx;
+  await bot.refreshCargo();
+  const cargoItems = bot.inventory.filter(i => {
+    if (i.quantity <= 0) return false;
+    const lower = i.itemId.toLowerCase();
+    return !lower.includes("fuel") && !lower.includes("energy_cell");
+  });
+  if (cargoItems.length === 0) {
+    ctx.log("harvesting", "No cargo to deposit");
+    return;
+  }
+  for (const item of cargoItems) {
+    if (settings.depositMode === "faction") {
+      const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+      if (fResp.error) {
+        await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+      }
+    } else {
+      await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+    }
+  }
+  const names = cargoItems.map(i => `${i.quantity}x ${i.name}`).join(", ");
+  ctx.log("harvesting", `Deposited ${names} — cargo cleared`);
+}
+
 // ── Miner routine ────────────────────────────────────────────
 
 export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -658,8 +832,16 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (activeSession.targetResourceId) {
       const locations = mapStore.findOreLocations(activeSession.targetResourceId);
       if (locations.length > 0) {
-        ctx.log("mining", `Session validated: ${activeSession.targetResourceName} still available in map`);
-        recoveredSession = activeSession;
+        // Also check if we have equipment for this resource type
+        const sessionMiningType = getMiningTypeForResource(activeSession.targetResourceId);
+        const hasEquipment = await hasEquipmentForMiningType(ctx, sessionMiningType);
+        if (!hasEquipment) {
+          ctx.log("error", `Session invalid: no equipment for ${sessionMiningType} mining (${activeSession.targetResourceName}) — abandoning`);
+          failMiningSession(bot.username, "No equipment for resource type");
+        } else {
+          ctx.log("mining", `Session validated: ${activeSession.targetResourceName} still available in map`);
+          recoveredSession = activeSession;
+        }
       } else {
         ctx.log("error", `Session invalid: ${activeSession.targetResourceName} no longer in map - abandoning`);
         failMiningSession(bot.username, "Target resource no longer in map");
@@ -670,87 +852,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
   }
 
-  // ── Startup: return home and dump non-fuel cargo to storage ──
-  await bot.refreshStatus();
-  await bot.refreshCargo();
-  const nonFuelCargo = bot.inventory.filter(i => {
-    const lower = i.itemId.toLowerCase();
-    return !lower.includes("fuel") && !lower.includes("energy_cell") && i.quantity > 0;
-  });
-  if (nonFuelCargo.length > 0) {
-    // Validate bot.system before navigation
-    if (!bot.system) {
-      ctx.log("error", "Bot system not initialized — refreshing status...");
-      await bot.refreshStatus();
-    }
-    if (bot.system && bot.system !== homeSystem) {
-      ctx.log("harvesting", `Startup: returning to home system ${homeSystem} to deposit cargo...`);
-      const fueled = await ensureFueled(ctx, 50);
-      if (fueled) {
-        await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 50, hullThresholdPct: 30 });
-      }
-    } else if (!bot.system) {
-      ctx.log("error", "Cannot return home — bot system unknown");
-    }
-    await ensureDocked(ctx);
-    const startupSettings = getMinerSettings(bot.username);
-    for (const item of nonFuelCargo) {
-      if (startupSettings.depositMode === "faction") {
-        const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
-        if (fResp.error) {
-          await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
-        }
-      } else {
-        await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
-      }
-    }
-    const names = nonFuelCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
-    ctx.log("harvesting", `Startup: deposited ${names} — cargo clear for harvesting`);
-  }
-
-  // ── Startup: load fuel cells at sol_central for long-range mining ──
-  await bot.refreshStatus();
-  await bot.refreshCargo();
-  const cargoSpaceUsed = bot.cargo;
-  const availableSpace = bot.cargoMax - cargoSpaceUsed;
-  if (availableSpace > 0) {
-    ctx.log("harvesting", `Startup: loading ${availableSpace} fuel cells for long-range mining...`);
-    // At sol_central, withdraw credits from faction storage if needed
-    const buyResp = await bot.exec("buy_item", {
-      item_id: "fuel_cell",
-      quantity: availableSpace
-    });
-    if (buyResp.error) {
-      const errorMsg = (buyResp.error.message || "").toLowerCase();
-      if (errorMsg.includes("credit") || errorMsg.includes("not enough") || errorMsg.includes("insufficient")) {
-        ctx.log("harvesting", "Not enough credits — withdrawing from faction storage...");
-        const withdrawResp = await bot.exec("withdraw_credits");
-        if (!withdrawResp.error) {
-          await bot.refreshStatus();
-          ctx.log("harvesting", `Withdrew credits — now ${bot.credits} credits, retrying fuel cell purchase...`);
-          const retryResp = await bot.exec("buy_item", {
-            item_id: "fuel_cell",
-            quantity: availableSpace
-          });
-          if (!retryResp.error) {
-            ctx.log("harvesting", `Loaded ${availableSpace} fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
-          } else {
-            ctx.log("error", `Still could not buy fuel cells: ${retryResp.error.message}`);
-          }
-        } else {
-          ctx.log("error", `Could not withdraw credits: ${withdrawResp.error.message}`);
-        }
-      } else {
-        ctx.log("error", `Could not buy fuel cells: ${buyResp.error.message}`);
-      }
-    } else {
-      ctx.log("harvesting", `Loaded ${availableSpace} fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
-    }
-  } else {
-    ctx.log("harvesting", `Startup: cargo hold full — skipping fuel cell load`);
-  }
-
-  // ── Startup: accept missions after docking ──
+  // ── Startup: accept missions ──
   await completeActiveMissions(ctx);
   await checkAndAcceptMinerMissions(ctx);
 
@@ -775,6 +877,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       hullThresholdPct: settings.repairThreshold,
     };
     const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
+
+    // ── Deep core equipment detection (log once per cycle) ──
+    await logDeepCoreCapability(ctx);
 
     // ── Flock mining integration ──
     let isFlockLeader = false;
@@ -883,20 +988,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       miningType = settings.miningType;
     }
 
-    // Smart target selection: check the matching mining type first, but fall back
-    // to other fields if empty. This lets users set a single target in the web UI
-    // regardless of mining type (ore/gas/ice).
+    // Smart target selection: when mining type is auto-detected, only use the
+    // matching target field (no cross-type fallback). A gas harvester should
+    // never be forced to mine ore just because targetGas is empty.
+    // When mining type is manually forced, fall back to other targets as backup.
     let targetResource = "";
     let resourceLabel = "";
+    const isAutoDetected = settings.miningType === "auto";
+
     if (miningType === "ice") {
-      targetResource = settings.targetIce || settings.targetOre || settings.targetGas;
+      targetResource = isAutoDetected ? settings.targetIce : (settings.targetIce || settings.targetOre || settings.targetGas);
       resourceLabel = targetResource === settings.targetGas ? "gas" : (targetResource === settings.targetOre ? "ore" : "ice");
     } else if (miningType === "ore") {
-      targetResource = settings.targetOre || settings.targetGas || settings.targetIce;
+      targetResource = isAutoDetected ? settings.targetOre : (settings.targetOre || settings.targetGas || settings.targetIce);
       resourceLabel = targetResource === settings.targetGas ? "gas" : (targetResource === settings.targetIce ? "ice" : "ore");
     } else {
       // gas
-      targetResource = settings.targetGas || settings.targetOre || settings.targetIce;
+      targetResource = isAutoDetected ? settings.targetGas : (settings.targetGas || settings.targetOre || settings.targetIce);
       resourceLabel = targetResource === settings.targetOre ? "ore" : (targetResource === settings.targetIce ? "ice" : "gas");
     }
 
@@ -976,6 +1084,31 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let effectiveTarget = recoveredSession ? recoveredSession.targetResourceId : priorityTarget;
     const isQuotaDriven = recoveredSession ? recoveredSession.isQuotaDriven : !!quotaTargetResource;
 
+    // ── Deep core ore equipment validation ──
+    // If the target is a deep core ore, verify we have the proper equipment
+    if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
+      const deepCoreCap = await getDeepCoreCapability(ctx);
+      if (!deepCoreCap.canMine) {
+        ctx.log("error", `Target ${effectiveTarget} is a deep core ore — requires deep core survey scanner + extractor`);
+        if (!deepCoreCap.hasScanner) {
+          ctx.log("error", "  Missing: Deep Core Survey Scanner (detection capability)");
+        }
+        if (!deepCoreCap.hasExtractor) {
+          ctx.log("error", "  Missing: Deep Core Extractor (mining capability)");
+        }
+        ctx.log("error", "  Skipping deep core target — selecting alternative target");
+        // Clear the target so we fall back to non-deep-core mining
+        effectiveTarget = "";
+        if (recoveredSession) {
+          ctx.log("mining", "Abandoning recovered session due to equipment mismatch");
+          failMiningSession(bot.username, "Deep core ore — missing equipment");
+          recoveredSession = null;
+        }
+      } else {
+        ctx.log("mining", `Deep core target validated: ${effectiveTarget} (scanner + extractor equipped)`);
+      }
+    }
+
     // ── Flock target override ──
     // If flock mode is enabled and we have a flock target, use it instead
     if (settings.flockEnabled && settings.flockName && flockTargetResource) {
@@ -984,7 +1117,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         miningType = flockMiningType;
         ctx.log("flock", `Using flock target: ${flockTargetResource} (${miningType})`);
       }
-      effectiveTarget = flockTargetResource;
+      
+      // Deep core validation for flock target
+      if (isDeepCoreOre(flockTargetResource)) {
+        const deepCoreCap = await getDeepCoreCapability(ctx);
+        if (!deepCoreCap.canMine) {
+          ctx.log("error", `Flock target ${flockTargetResource} is a deep core ore — skipping (missing equipment)`);
+          if (!deepCoreCap.hasScanner) ctx.log("error", "  Missing: Deep Core Survey Scanner");
+          if (!deepCoreCap.hasExtractor) ctx.log("error", "  Missing: Deep Core Extractor");
+          // Don't override effectiveTarget — continue with solo mining instead
+        } else {
+          effectiveTarget = flockTargetResource;
+          ctx.log("mining", `Flock deep core target validated: ${flockTargetResource}`);
+        }
+      } else {
+        effectiveTarget = flockTargetResource;
+      }
     }
 
     // ── Status + fuel/hull checks ──
@@ -1051,7 +1199,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         return true;
       }).filter(loc => {
         // Skip depleted ores (unless depletion has expired or ignoreDepletion is enabled)
-        if (settings.ignoreDepletion) return true; // ignore depletion markings, mine anyway
+        if (settings.ignoreDepletion) {
+          // Even with ignoreDepletion, skip completely exhausted POIs (0 remaining)
+          if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+            return false;
+          }
+          return true;
+        }
         const sys = mapStore.getSystem(loc.systemId);
         const poi = sys?.pois.find(p => p.id === loc.poiId);
         const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
@@ -1089,7 +1243,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           if (configuredSystem) {
             chosenLoc = scoredLocations.find(loc => loc.systemId === configuredSystem);
             if (chosenLoc) {
-              const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% depleted)`;
+              const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available)`;
               ctx.log("mining", `Found ${effectiveTarget} in configured harvesting system ${configuredSystem} (${chosenLoc.jumps} jumps) ${scanInfo} — manual override active`);
             }
           }
@@ -1097,14 +1251,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           if (!chosenLoc) {
             chosenLoc = scoredLocations.find(loc => loc.systemId === bot.system);
             if (chosenLoc) {
-              const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% depleted)`;
+              const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available)`;
               ctx.log("mining", `Found ${effectiveTarget} in current system ${bot.system} ${scanInfo}`);
             }
           }
           // Pick best scored location (already sorted by composite score)
           if (!chosenLoc) {
             chosenLoc = scoredLocations[0];
-            const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% depleted, score: ${chosenLoc.score})`;
+            const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available, score: ${chosenLoc.score})`;
             ctx.log("mining", `Selected ${effectiveTarget} at ${chosenLoc.poiName} in ${chosenLoc.systemName} (${chosenLoc.jumps} jumps) ${scanInfo}`);
           }
 
@@ -1238,6 +1392,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (bot.state !== "running") break;
 
+    // ── Determine active jettison list (deep core vs regular) ──
+    const isDeepCoreMining = effectiveTarget && isDeepCoreOre(effectiveTarget);
+    const activeJettisonList = isDeepCoreMining && settings.deepCoreJettisonOres.length > 0
+      ? settings.deepCoreJettisonOres
+      : settings.jettisonOres;
+
     // ── Find mining POI and station in current system ──
     yield miningType === "ice" ? "find_ice_field" : (miningType === "ore" ? "find_ore_belt" : "find_gas_cloud");
     const { pois: initialPois, systemId } = await getSystemInfo(ctx);
@@ -1328,9 +1488,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     const preScanResp = await bot.exec("get_poi", { poi_id: miningPoi.id });
     if (!preScanResp.error && preScanResp.result) {
       const scanResult = preScanResp.result as Record<string, unknown>;
+      const poiData = scanResult?.poi as Record<string, unknown> | undefined;
       const scanResources = (
         Array.isArray(scanResult?.resources) ? scanResult.resources :
-        Array.isArray((scanResult?.poi as Record<string, unknown>)?.resources) ? (scanResult.poi as Record<string, unknown>).resources :
+        Array.isArray(poiData?.resources) ? poiData.resources :
         []
       ) as Array<Record<string, unknown>>;
 
@@ -1344,7 +1505,20 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           max_remaining: (r.max_remaining as number) || 0,
           depletion_percent: (r.depletion_percent as number) || 100,
         }));
-        mapStore.updatePoiResources(bot.system, miningPoi.id, resourceData);
+
+        // Register/update the POI with full data (captures hidden POIs)
+        if (poiData) {
+          mapStore.registerPoiFromScan(bot.system, {
+            id: (poiData.id as string) || miningPoi.id,
+            name: (poiData.name as string) || miningPoi.name,
+            type: (poiData.type as string) || "",
+            hidden: poiData.hidden as boolean | undefined,
+            reveal_difficulty: poiData.reveal_difficulty as number | undefined,
+            resources: resourceData,
+          });
+        } else {
+          mapStore.updatePoiResources(bot.system, miningPoi.id, resourceData);
+        }
 
         // Check if target resource is still available
         if (effectiveTarget) {
@@ -1363,10 +1537,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     if (!miningPoi) {
-      // POI was depleted — search for alternative in current system
+      // POI was depleted — search for alternative in current system first
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
-        if (p.id === targetPoiId) return false; // Skip the one we just scanned
         if (miningType === "ore") return isOreBeltPoi(p.type);
         if (miningType === "gas") return isGasCloudPoi(p.type);
         if (miningType === "ice") return isIceFieldPoi(p.type);
@@ -1376,8 +1549,99 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         miningPoi = { id: altPoi.id, name: altPoi.name };
         ctx.log("mining", `Found alternative: ${altPoi.name}`);
       } else {
-        ctx.log("error", `No alternative ${resourceLabel} found — returning home`);
-        break;
+        // No alternative in current system — search broader map for non-depleted locations
+        ctx.log("mining", "No alternative in current system — searching map for non-depleted locations...");
+        const broaderLocations = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+          const sys = mapStore.getSystem(loc.systemId);
+          const poi = sys?.pois.find(p => p.id === loc.poiId);
+          if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+          if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
+          if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
+          return true;
+        }).filter(loc => {
+          // Skip completely exhausted POIs
+          if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+            return false;
+          }
+          if (settings.ignoreDepletion) return true;
+          const sys = mapStore.getSystem(loc.systemId);
+          const poi = sys?.pois.find(p => p.id === loc.poiId);
+          const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+          if (!oreEntry?.depleted) return true;
+          return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+        });
+
+        if (broaderLocations.length > 0) {
+          // Prefer configured system, then closest by jumps
+          const blacklist = getSystemBlacklist();
+          const scored = broaderLocations
+            .map(loc => {
+              const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+              return { ...loc, jumps: route ? route.length - 1 : 999 };
+            })
+            .filter(loc => loc.jumps <= maxJumps)
+            .sort((a, b) => {
+              if (configuredSystem && a.systemId === configuredSystem && b.systemId !== configuredSystem) return -1;
+              if (configuredSystem && b.systemId === configuredSystem && a.systemId !== configuredSystem) return -1;
+              if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+              if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+              return a.jumps - b.jumps;
+            });
+
+          if (scored.length > 0) {
+            const chosen = scored[0];
+            ctx.log("mining", `Found ${effectiveTarget} at ${chosen.poiName} in ${chosen.systemName} (${chosen.jumps} jumps) — navigating there`);
+            const arrived = await navigateToSystem(ctx, chosen.systemId, safetyOpts);
+            if (arrived) {
+              // Refresh pois list for new system and retry travel
+              const { pois: newPois } = await getSystemInfo(ctx);
+              pois = newPois;
+              bot.system = chosen.systemId;
+              const newMiningPoi = pois.find(p => {
+                if (miningType === "ore") return isOreBeltPoi(p.type);
+                if (miningType === "gas") return isGasCloudPoi(p.type);
+                if (miningType === "ice") return isIceFieldPoi(p.type);
+                return false;
+              });
+              if (newMiningPoi) {
+                miningPoi = { id: newMiningPoi.id, name: newMiningPoi.name };
+                ctx.log("mining", `Will travel to ${newMiningPoi.name}`);
+              } else {
+                ctx.log("error", `No suitable ${resourceLabel} POI found in ${chosen.systemName} — returning home to retry next cycle`);
+                await ensureUndocked(ctx);
+                const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+                if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+                await ensureDocked(ctx);
+                await dumpCargo(ctx, settings);
+                continue;
+              }
+            } else {
+              ctx.log("error", "Failed to reach alternative system — returning home to retry next cycle");
+              await ensureUndocked(ctx);
+              const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+              if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+              await ensureDocked(ctx);
+              await dumpCargo(ctx, settings);
+              continue;
+            }
+          } else {
+            ctx.log("error", `No alternative ${resourceLabel} within ${maxJumps} jumps — returning home to retry next cycle`);
+            await ensureUndocked(ctx);
+            const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+            if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+            await ensureDocked(ctx);
+            await dumpCargo(ctx, settings);
+            continue;
+          }
+        } else {
+          ctx.log("error", `No alternative ${resourceLabel} found anywhere — returning home to retry next cycle`);
+          await ensureUndocked(ctx);
+          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+          if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+          await ensureDocked(ctx);
+          await dumpCargo(ctx, settings);
+          continue;
+        }
       }
     }
 
@@ -1517,11 +1781,33 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const poiResp = await bot.exec("get_poi", { poi_id: bot.poi });
         if (!poiResp.error && poiResp.result) {
           const result = poiResp.result as Record<string, unknown>;
+          const poiData = result?.poi as Record<string, unknown> | undefined;
           const resources = Array.isArray(result.resources)
             ? (result.resources as Array<Record<string, unknown>>)
-            : Array.isArray((result.poi as Record<string, unknown>)?.resources)
-            ? ((result.poi as Record<string, unknown>).resources as Array<Record<string, unknown>>)
+            : Array.isArray(poiData?.resources)
+            ? (poiData.resources as Array<Record<string, unknown>>)
             : [];
+
+          // Register/update the POI with full data (captures hidden POIs)
+          if (poiData && resources.length > 0) {
+            const resourceData = resources.map((r) => ({
+              resource_id: (r.resource_id as string) || (r.id as string) || "",
+              name: (r.name as string) || (r.resource_id as string) || "",
+              richness: (r.richness as number) || 0,
+              remaining: (r.remaining as number) ?? (r.quantity as number) ?? 0,
+              max_remaining: (r.max_remaining as number) || 0,
+              depletion_percent: (r.depletion_percent as number) || 100,
+            }));
+
+            mapStore.registerPoiFromScan(bot.system, {
+              id: (poiData.id as string) || bot.poi,
+              name: (poiData.name as string) || "",
+              type: (poiData.type as string) || "",
+              hidden: poiData.hidden as boolean | undefined,
+              reveal_difficulty: poiData.reveal_difficulty as number | undefined,
+              resources: resourceData,
+            });
+          }
 
           for (const res of resources) {
             const resId = (res.resource_id as string) || (res.id as string) || "";
@@ -1550,6 +1836,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                       const poi = sys?.pois.find(p => p.id === loc.poiId);
                       const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
                       if (!oreEntry?.depleted) return true;
+                      // Even with ignoreDepletion, skip completely exhausted POIs
+                      if (settings.ignoreDepletion) {
+                        if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+                          return false;
+                        }
+                        return true;
+                      }
                       return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
                     });
 
@@ -1624,6 +1917,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (stopReason) break;
       }
 
+      // JETTISON: Clear jettison-listed ores from cargo before mining
+      if (activeJettisonList.length > 0) {
+        await bot.refreshCargo();
+        for (const jettisonOreId of activeJettisonList) {
+          const cargoItem = bot.inventory.find(i => i.itemId === jettisonOreId);
+          if (cargoItem && cargoItem.quantity > 0) {
+            const jettisonResp = await bot.exec("jettison", { item_id: jettisonOreId, quantity: cargoItem.quantity });
+            if (!jettisonResp.error) {
+              const dcTag = isDeepCoreMining ? " [deep core]" : "";
+              ctx.log("mining", `Jettisoned ${cargoItem.quantity}x ${cargoItem.name || jettisonOreId} (pre-mine cargo cleanup${dcTag})`);
+              await bot.refreshCargo();
+            }
+          }
+        }
+      }
+
       // Pre-mine battle check - prevents mine command from freezing if battle starts
       const preMineBattleCheck = await getBattleStatus(ctx);
       if (preMineBattleCheck && preMineBattleCheck.is_participant) {
@@ -1658,18 +1967,16 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           // Re-pick a new target from quotas, or find any nearby ore if no quotas remain
           ctx.log("mining", `${resourceLabel} field depleted — searching for new target...`);
 
-          // Try to find a new target from quotas
-          await bot.refreshFactionStorage();
-          const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
-
+          // CRITICAL FIX: Check global/configured target FIRST before falling back to quotas
+          // This ensures energy_crystal (or any global target) doesn't get ignored when depleted
           let newTarget: string | null = null;
           let newPoiId: string | null = null;
           let newPoiName: string | null = null;
           let newSystemId: string | null = null;
 
-          if (newQuotaTarget) {
-            // Find locations for the new quota target
-            const newLocs = mapStore.findOreLocations(newQuotaTarget).filter(loc => {
+          if (targetResource) {
+            ctx.log("mining", `Checking for configured global target ${resourceLabel}: ${targetResource}...`);
+            const globalTargetLocs = mapStore.findOreLocations(targetResource).filter(loc => {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
@@ -1677,19 +1984,79 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
               return true;
             }).filter(loc => {
-              if (settings.ignoreDepletion) return true;
+              if (settings.ignoreDepletion) {
+                if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+                  return false;
+                }
+                return true;
+              }
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
-              const oreEntry = poi?.ores_found.find(o => o.item_id === newQuotaTarget);
+              const oreEntry = poi?.ores_found.find(o => o.item_id === targetResource);
               if (!oreEntry?.depleted) return true;
               return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
             });
 
-            if (newLocs.length > 0) {
-              newTarget = newQuotaTarget;
-              // Prefer current system, then closest by jumps (use blacklist)
+            if (globalTargetLocs.length > 0) {
               const blacklist = getSystemBlacklist();
-              const locsWithDist = newLocs
+              const locsWithDist = globalTargetLocs
+                .map(loc => {
+                  const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                  return { ...loc, jumps: route ? route.length - 1 : 999 };
+                })
+                .filter(loc => loc.jumps <= maxJumps)
+                .sort((a, b) => {
+                  if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+                  if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+                  return a.jumps - b.jumps;
+                });
+
+              if (locsWithDist.length > 0) {
+                const chosen = locsWithDist[0];
+                newTarget = targetResource;
+                newPoiId = chosen.poiId;
+                newPoiName = chosen.poiName;
+                newSystemId = chosen.systemId;
+                ctx.log("mining", `Found global target ${resourceLabel}: ${targetResource} @ ${chosen.poiName} (${chosen.jumps} jumps${chosen.systemId !== bot.system ? ` in ${chosen.systemId}` : ''})`);
+              }
+            }
+          }
+
+          // If no global target available, try quotas
+          if (!newTarget) {
+            ctx.log("mining", `Global target not available — checking quotas...`);
+            await bot.refreshFactionStorage();
+            const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
+
+            if (newQuotaTarget) {
+              // Find locations for the new quota target
+              const newLocs = mapStore.findOreLocations(newQuotaTarget).filter(loc => {
+                const sys = mapStore.getSystem(loc.systemId);
+                const poi = sys?.pois.find(p => p.id === loc.poiId);
+                if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+                if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
+                if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
+                return true;
+              }).filter(loc => {
+                if (settings.ignoreDepletion) {
+                  // Even with ignoreDepletion, skip completely exhausted POIs
+                  if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+                    return false;
+                  }
+                  return true;
+                }
+                const sys = mapStore.getSystem(loc.systemId);
+                const poi = sys?.pois.find(p => p.id === loc.poiId);
+                const oreEntry = poi?.ores_found.find(o => o.item_id === newQuotaTarget);
+                if (!oreEntry?.depleted) return true;
+                return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+              });
+
+              if (newLocs.length > 0) {
+                newTarget = newQuotaTarget;
+                // Prefer current system, then closest by jumps (use blacklist)
+                const blacklist = getSystemBlacklist();
+                const locsWithDist = newLocs
                 .map(loc => {
                   const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
                   return { ...loc, jumps: route ? route.length - 1 : 999 };
@@ -1708,54 +2075,6 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 newSystemId = chosen.systemId;
                 ctx.log("mining", `Quota pick: ${newQuotaTarget} @ ${chosen.poiName} (${chosen.jumps} jumps${chosen.systemId !== bot.system ? ` in ${chosen.systemId}` : ''})`);
               }
-            }
-          }
-
-          // If no quota target found, try to find the originally configured target resource
-          // CRITICAL FIX: Always respect the configured targetGas/targetOre/targetIce settings
-          // Don't fall back to "any resource" if a specific target was configured
-          if (!newTarget && targetResource) {
-            ctx.log("mining", `Attempting to find configured target ${resourceLabel}: ${targetResource}...`);
-            
-            // Find locations for the configured target resource
-            const targetLocs = mapStore.findOreLocations(targetResource).filter(loc => {
-              const sys = mapStore.getSystem(loc.systemId);
-              const poi = sys?.pois.find(p => p.id === loc.poiId);
-              if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-              if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
-              if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
-              return true;
-            }).filter(loc => {
-              if (settings.ignoreDepletion) return true;
-              const sys = mapStore.getSystem(loc.systemId);
-              const poi = sys?.pois.find(p => p.id === loc.poiId);
-              const oreEntry = poi?.ores_found.find(o => o.item_id === targetResource);
-              if (!oreEntry?.depleted) return true;
-              return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
-            });
-
-            if (targetLocs.length > 0) {
-              // Prefer current system, then closest by jumps (use blacklist)
-              const blacklist = getSystemBlacklist();
-              const locsWithDist = targetLocs
-                .map(loc => {
-                  const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-                  return { ...loc, jumps: route ? route.length - 1 : 999 };
-                })
-                .filter(loc => loc.jumps <= maxJumps)
-                .sort((a, b) => {
-                  if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
-                  if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
-                  return a.jumps - b.jumps;
-                });
-
-              if (locsWithDist.length > 0) {
-                const chosen = locsWithDist[0];
-                newTarget = targetResource;
-                newPoiId = chosen.poiId;
-                newPoiName = chosen.poiName;
-                newSystemId = chosen.systemId;
-                ctx.log("mining", `Found configured target ${resourceLabel}: ${targetResource} @ ${chosen.poiName} (${chosen.jumps} jumps${chosen.systemId !== bot.system ? ` in ${chosen.systemId}` : ''})`);
               }
             }
           }
@@ -1814,10 +2133,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
                   // Check if not depleted (or expired)
                   const oreEntry = poi.ores_found.find(o => o.item_id === loc.resourceId || o.item_id === effectiveTarget);
-                  if (oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) continue;
+                  if (oreEntry?.depleted) {
+                    // Skip completely exhausted POIs regardless of settings
+                    if (loc.remaining <= 0 && loc.maxRemaining > 0) continue;
+                    if (!isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) continue;
+                  }
 
                   // Found a good target
-                  const scanInfo = loc.minutesSinceScan === Infinity ? "(never scanned)" : `(${loc.remaining.toLocaleString()}/${loc.maxRemaining.toLocaleString()}, ${loc.depletionPercent.toFixed(1)}% depleted, score: ${loc.score})`;
+                  const scanInfo = loc.minutesSinceScan === Infinity ? "(never scanned)" : `(${loc.remaining.toLocaleString()}/${loc.maxRemaining.toLocaleString()}, ${loc.depletionPercent.toFixed(1)}% available, score: ${loc.score})`;
                   newTarget = effectiveTarget || oreEntry?.item_id || loc.resourceId;
                   newPoiId = loc.poiId;
                   newPoiName = loc.poiName;
@@ -1910,6 +2233,31 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         mapStore.recordMiningYield(bot.system, bot.poi, { item_id: oreId, name: oreName });
         resourcesMinedMap.set(oreName, (resourcesMinedMap.get(oreName) || 0) + 1);
         bot.stats.totalMined++;
+
+        // JETTISON: If the mined ore is in the jettison list, dump it immediately
+        if (activeJettisonList.includes(oreId)) {
+          const jettisonResp = await bot.exec("jettison", { item_id: oreId, quantity: 9999 });
+          if (!jettisonResp.error) {
+            const dcTag = isDeepCoreMining ? " [deep core]" : "";
+            ctx.log("mining", `Jettisoned ${oreName} (low-value ore configured for jettison${dcTag})`);
+            await bot.refreshCargo();
+          }
+        }
+
+        // JETTISON: Also clear any other jettison-listed ores that may have accumulated in cargo
+        for (const jettisonOreId of activeJettisonList) {
+          if (jettisonOreId === oreId) continue; // Already jettisoned above
+          const cargoItem = bot.inventory.find(i => i.itemId === jettisonOreId);
+          if (cargoItem && cargoItem.quantity > 0) {
+            const jettisonResp = await bot.exec("jettison", { item_id: jettisonOreId, quantity: cargoItem.quantity });
+            if (!jettisonResp.error) {
+              const jettisonName = cargoItem.name || jettisonOreId;
+              const dcTag = isDeepCoreMining ? " [deep core]" : "";
+              ctx.log("mining", `Jettisoned ${cargoItem.quantity}x ${jettisonName} (configured for jettison${dcTag})`);
+              await bot.refreshCargo();
+            }
+          }
+        }
 
         // Update session with mined resources
         if (recoveredSession) {

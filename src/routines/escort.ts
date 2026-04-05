@@ -85,6 +85,7 @@ function getEscortSettings(username?: string): {
   autoCloak: boolean;
   ammoThreshold: number;
   maxReloadAttempts: number;
+  signalChannel: "faction" | "local" | "file";
 } {
   const all = readSettings();
   const e = all.escort || {};
@@ -101,6 +102,7 @@ function getEscortSettings(username?: string): {
     autoCloak: (e.autoCloak as boolean) ?? false,
     ammoThreshold: (e.ammoThreshold as number) || 5,
     maxReloadAttempts: (e.maxReloadAttempts as number) || 3,
+    signalChannel: ((e.signalChannel as string) || "file") as "faction" | "local" | "file",
   };
 }
 
@@ -187,6 +189,7 @@ async function checkEscortSignals(
 ): Promise<{ action: "jump" | "travel" | "dock" | "undock"; systemId?: string } | null> {
   const { bot } = ctx;
 
+  // Strategy 1: Check faction chat
   const chatResp = await bot.exec("get_chat_history", { channel: "faction" });
   if (chatResp.error || !chatResp.result) return null;
 
@@ -215,6 +218,38 @@ async function checkEscortSignals(
   }
 
   return null;
+}
+
+/**
+ * Check for file-based escort signals from the miner.
+ * This is more reliable than faction chat if both bots run on the same machine.
+ */
+async function checkFileEscortSignals(
+  minerName: string,
+): Promise<{ action: "jump" | "travel" | "dock" | "undock"; systemId?: string; timestamp: number } | null> {
+  try {
+    const { readFileSync, existsSync } = await import("fs");
+    const { join } = await import("path");
+    const signalFile = join(process.cwd(), "data", "escort_signals", `${minerName}.signal`);
+    
+    if (!existsSync(signalFile)) return null;
+    
+    const content = readFileSync(signalFile, "utf-8");
+    const signal = JSON.parse(content) as { action: string; systemId?: string; timestamp: number };
+    
+    // Check if signal is recent (within last 5 minutes)
+    if (Date.now() - signal.timestamp > 5 * 60 * 1000) {
+      return null; // Signal too old
+    }
+    
+    return {
+      action: signal.action as "jump" | "travel" | "dock" | "undock",
+      systemId: signal.systemId,
+      timestamp: signal.timestamp,
+    };
+  } catch {
+    return null;
+  }
 }
 
 // ── Nearby entity parsing (reused from hunter) ───────────────
@@ -611,7 +646,10 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
   let totalKills = 0;
   let lastMinerSystemCheck = 0;
-  const MINER_CHECK_INTERVAL_MS = 15_000; // Check miner location every 15 seconds
+  const MINER_CHECK_INTERVAL_MS = 10_000; // Check miner location every 10 seconds
+  let minerSystem: string | null = null;
+  let consecutiveFailedChecks = 0;
+  const MAX_FAILED_CHECKS = 5; // After this many failures, dock and wait
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -664,9 +702,44 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Check for escort coordination signals from miner ──
     yield "check_escort_signals";
-    const escortSignal = await checkEscortSignals(ctx, minerName);
+
+    // Check signals based on configured channel preference
+    let escortSignal = null;
+    
+    ctx.log("escort", `Checking for signals from ${minerName} via ${settings.signalChannel}...`);
+
+    if (settings.signalChannel === "file") {
+      // File-based signals (most reliable if on same machine)
+      ctx.log("escort", `Checking file signal: data/escort_signals/${minerName}.signal`);
+      escortSignal = await checkFileEscortSignals(minerName);
+      if (escortSignal) {
+        ctx.log("escort", `✓ Found file signal: ${escortSignal.action} ${escortSignal.systemId || ''}`);
+      } else {
+        ctx.log("escort", `✗ No valid file signal found`);
+      }
+    } else if (settings.signalChannel === "faction") {
+      // Faction chat signals
+      ctx.log("escort", `Checking faction chat for signals from ${minerName}...`);
+      escortSignal = await checkEscortSignals(ctx, minerName);
+      if (escortSignal) {
+        ctx.log("escort", `✓ Found faction chat signal: ${escortSignal.action} ${escortSignal.systemId || ''}`);
+      } else {
+        ctx.log("escort", `✗ No faction chat signal found from ${minerName}`);
+      }
+    }
+
+    // If primary channel failed, try the other as fallback
+    if (!escortSignal && settings.signalChannel === "file") {
+      ctx.log("escort", `Falling back to faction chat check...`);
+      escortSignal = await checkEscortSignals(ctx, minerName);
+    } else if (!escortSignal && settings.signalChannel === "faction") {
+      ctx.log("escort", `Falling back to file signal check...`);
+      escortSignal = await checkFileEscortSignals(minerName);
+    }
+
     if (escortSignal) {
       ctx.log("escort", `Received escort signal: ${escortSignal.action}${escortSignal.systemId ? ` ${escortSignal.systemId}` : ""}`);
+      consecutiveFailedChecks = 0; // Reset failure counter on successful signal
 
       if (escortSignal.action === "dock") {
         ctx.log("escort", "Miner signaling dock — standing by at current location");
@@ -678,171 +751,355 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         const targetSystem = escortSignal.systemId;
         if (targetSystem !== bot.system) {
           ctx.log("escort", `Following miner to ${targetSystem}...`);
-          const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
+          
+          // Add onJump callback to re-check miner location after each jump
+          const jumpSafetyOpts = {
+            ...safetyOpts,
+            onJump: async (jumpNumber: number) => {
+              // Re-check miner location after each jump
+              if (ctx.getFleetStatus) {
+                const fleetStatus = ctx.getFleetStatus();
+                const minerBot = fleetStatus.find(b => b.username?.toLowerCase() === minerName.toLowerCase());
+                if (minerBot?.system && minerBot.system !== targetSystem) {
+                  ctx.log("escort", `⚠ Miner moved from ${targetSystem} to ${minerBot.system} during travel (after jump ${jumpNumber}) — recalculating route...`);
+                  // Note: We continue to original target since signal was explicit
+                  // But we update our tracking variable
+                  minerSystem = minerBot.system;
+                  setMinerLocation(minerName, minerBot.system);
+                }
+              }
+              return true; // Continue navigation
+            },
+          };
+          
+          const arrived = await navigateToSystem(ctx, targetSystem, jumpSafetyOpts);
           if (arrived) {
+            minerSystem = targetSystem;
             setMinerLocation(minerName, targetSystem);
+            consecutiveFailedChecks = 0;
           } else {
             ctx.log("error", `Failed to reach ${targetSystem}`);
+            consecutiveFailedChecks++;
           }
+        } else {
+          ctx.log("escort", `Already in ${targetSystem} — standing by`);
+          minerSystem = targetSystem;
+          setMinerLocation(minerName, targetSystem);
         }
       }
+    } else {
+      ctx.log("escort", `⚠ No signals received from ${minerName}`);
     }
 
-    // ── Determine miner's current system ──
+    // ── Determine miner's current system (fallback if no signal) ──
     const now = Date.now();
     if ((now - lastMinerSystemCheck) > MINER_CHECK_INTERVAL_MS) {
       lastMinerSystemCheck = now;
 
-      // Try faction chat first
-      let minerSystem = await scanFactionForMinerLocation(ctx, minerName);
-
-      // Fall back to cache
+      // If we already have a recent signal, use that
       if (!minerSystem) {
-        minerSystem = getMinerLocation(minerName);
+        // Strategy 1: Try to get miner's status directly from fleet (most reliable!)
+        let detectedSystem: string | null = null;
+        
+        if (ctx.getFleetStatus) {
+          const fleetStatus = ctx.getFleetStatus();
+          const minerBot = fleetStatus.find(b => b.username?.toLowerCase() === minerName.toLowerCase());
+          if (minerBot?.system) {
+            detectedSystem = minerBot.system;
+            ctx.log("escort", `✓ Located miner via fleet status: ${minerName} is in ${detectedSystem}`);
+          }
+        }
+
+        // Strategy 2: Try faction chat scan if direct status failed
+        if (!detectedSystem) {
+          detectedSystem = await scanFactionForMinerLocation(ctx, minerName);
+          if (detectedSystem) {
+            ctx.log("escort", `✓ Located miner via faction chat scan: ${detectedSystem}`);
+          }
+        }
+
+        // Strategy 3: Check cache
+        if (!detectedSystem) {
+          detectedSystem = getMinerLocation(minerName);
+          if (detectedSystem) {
+            ctx.log("escort", `✓ Located miner via cache: ${detectedSystem}`);
+          }
+        }
+
+        if (detectedSystem) {
+          minerSystem = detectedSystem;
+          consecutiveFailedChecks = 0;
+        } else {
+          consecutiveFailedChecks++;
+          ctx.log("escort", `✗ Cannot determine miner location (attempt ${consecutiveFailedChecks}/${MAX_FAILED_CHECKS})`);
+
+          if (consecutiveFailedChecks >= MAX_FAILED_CHECKS) {
+            ctx.log("escort", `⚠ Too many failed location checks — docking and waiting for signal...`);
+            const docked = await navigateToSafeStation(ctx, safetyOpts);
+            if (docked) {
+              await tryRefuel(ctx);
+              await repairShip(ctx);
+              await ensureUndocked(ctx);
+            }
+            consecutiveFailedChecks = 0;
+            await sleep(30000);
+            continue;
+          }
+        }
       }
 
+      // If miner is in a different system, jump to them
       if (minerSystem && minerSystem !== bot.system) {
         ctx.log("escort", `Miner ${minerName} detected in ${minerSystem} — following...`);
-        const arrived = await navigateToSystem(ctx, minerSystem, safetyOpts);
+        
+        // Add onJump callback to re-check miner location after each jump
+        const jumpSafetyOpts = {
+          ...safetyOpts,
+          onJump: async (jumpNumber: number) => {
+            // Re-check miner location after each jump
+            if (ctx.getFleetStatus) {
+              const fleetStatus = ctx.getFleetStatus();
+              const minerBot = fleetStatus.find(b => b.username?.toLowerCase() === minerName.toLowerCase());
+              if (minerBot?.system && minerBot.system !== minerSystem) {
+                ctx.log("escort", `⚠ Miner moved from ${minerSystem} to ${minerBot.system} during travel (after jump ${jumpNumber}) — recalculating route...`);
+                minerSystem = minerBot.system;
+                // Update cache with new location
+                setMinerLocation(minerName, minerBot.system);
+              }
+              // Also track POI if available
+              if (minerBot?.poi) {
+                ctx.log("escort", `Miner POI during travel: ${minerBot.poi}`);
+              }
+            }
+            return true; // Continue navigation
+          },
+        };
+        
+        const arrived = await navigateToSystem(ctx, minerSystem, jumpSafetyOpts);
         if (!arrived) {
           ctx.log("error", `Could not reach ${minerSystem} — will retry next cycle`);
-          await sleep(30000);
+          consecutiveFailedChecks++;
+          await sleep(15000);
           continue;
         }
+        consecutiveFailedChecks = 0;
+        // Update cache with current location
+        setMinerLocation(minerName, minerSystem);
+        ctx.log("escort", `✓ Successfully joined miner in ${minerSystem}`);
+      } else if (minerSystem) {
+        ctx.log("escort", `✓ Already in same system as miner (${minerSystem})`);
+        // Update cache with current location
+        setMinerLocation(minerName, minerSystem);
       }
     }
 
     if (bot.state !== "running") break;
 
-    // ── Ensure we're undocked for patrol ──
-    await ensureUndocked(ctx);
-
-    // ── Scan system for threats ──
-    yield "scan_system";
-    await fetchSecurityLevel(ctx, bot.system);
-    const { pois } = await getSystemInfo(ctx);
-
-    // ── Patrol nearby POIs for threats ──
-    const patrolPois = pois.filter(p => !isStationPoi(p));
-
-    if (patrolPois.length === 0) {
-      ctx.log("info", "No POIs to patrol — staying near station");
-      await sleep(10000);
+    // ── If we don't know where the miner is, DOCK and wait ──
+    if (!minerSystem) {
+      ctx.log("escort", `⚠ Miner location unknown — docking and waiting for signals...`);
+      const docked = await navigateToSafeStation(ctx, safetyOpts);
+      if (docked) {
+        await tryRefuel(ctx);
+        await repairShip(ctx);
+      }
+      await sleep(15000);
       continue;
     }
 
-    ctx.log("escort", `Patrolling ${patrolPois.length} POI(s) in ${bot.system}...`);
+    // ── Ensure we're undocked ──
+    await ensureUndocked(ctx);
 
-    let patrolKills = 0;
-    let abortPatrol = false;
-
-    for (const poi of patrolPois) {
-      if (bot.state !== "running" || abortPatrol) break;
-
-      await bot.refreshStatus();
-      const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-      const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      if (midHull <= settings.repairThreshold) {
-        ctx.log("system", `Hull at ${midHull}% — aborting patrol, heading to station`);
-        abortPatrol = true;
-        break;
+    // ── TRAVEL TO MINER'S POI ──
+    // The escort must be at the SAME POI as the miner to get pulled into battles
+    yield "travel_to_miner_poi";
+    
+    let minerPoi: string | null = null;
+    let minerPoiName: string | null = null;
+    let validPoi = false;
+    
+    // Get miner's POI from fleet status
+    if (ctx.getFleetStatus) {
+      const fleetStatus = ctx.getFleetStatus();
+      const minerBot = fleetStatus.find(b => b.username?.toLowerCase() === minerName.toLowerCase());
+      if (minerBot?.poi) {
+        minerPoi = minerBot.poi;
+        minerPoiName = minerBot.poi;
+        ctx.log("escort", `Miner ${minerName} is at POI: ${minerPoiName}`);
       }
-      if (midFuel < settings.refuelThreshold) {
-        ctx.log("system", `Fuel at ${midFuel}% — aborting patrol, heading to refuel`);
-        abortPatrol = true;
-        break;
+    }
+    
+    // Validate POI exists in current system before trying to travel
+    if (minerPoi) {
+      const { pois } = await getSystemInfo(ctx);
+      const poiExists = pois.some(p => p.id === minerPoi || p.name === minerPoi);
+      
+      if (poiExists) {
+        validPoi = true;
+        ctx.log("escort", `✓ POI ${minerPoiName} exists in ${bot.system}`);
+      } else {
+        ctx.log("warn", `POI ${minerPoiName} not found in ${bot.system} — miner may be at a sub-POI or resource node`);
       }
-
-      // Travel to POI
-      yield "travel_to_poi";
-      ctx.log("travel", `Patrolling ${poi.name}...`);
-      const travelResp = await bot.exec("travel", { target_poi: poi.id });
-      if (travelResp.error && !travelResp.error.message.includes("already")) {
-        ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
-        continue;
+    }
+    
+    // Travel to miner's POI if it's valid and we're not already there
+    if (validPoi && minerPoi && bot.poi !== minerPoi) {
+      ctx.log("escort", `Traveling to miner's POI: ${minerPoiName}...`);
+      const travelResp = await bot.exec("travel", { target_poi: minerPoi });
+      if (travelResp.error) {
+        const msg = travelResp.error.message.toLowerCase();
+        if (!msg.includes("already") && !msg.includes("arrived")) {
+          ctx.log("warn", `Could not travel to miner's POI: ${travelResp.error.message} — will scan system-wide`);
+        } else {
+          bot.poi = minerPoi;
+          ctx.log("escort", `✓ Arrived at miner's POI: ${minerPoiName}`);
+        }
+      } else {
+        bot.poi = minerPoi;
+        ctx.log("escort", `✓ Traveling to miner's POI: ${minerPoiName}`);
       }
-      bot.poi = poi.id;
+    } else if (validPoi && minerPoi) {
+      ctx.log("escort", `✓ Already at miner's POI: ${minerPoiName}`);
+    } else if (minerPoi) {
+      ctx.log("warn", `Invalid POI ${minerPoiName} — scanning system-wide for threats`);
+    } else {
+      ctx.log("warn", "Could not determine miner's POI — scanning system-wide for threats");
+    }
 
-      // Scan for hostile targets
-      yield "scan_for_targets";
-      const nearbyResp = await bot.exec("get_nearby");
-      if (nearbyResp.error) {
-        ctx.log("error", `get_nearby at ${poi.name}: ${nearbyResp.error.message}`);
-        continue;
-      }
-
+    // ── STAY PUT: Do not patrol POIs ──
+    // The escort should remain at the miner's current POI (or system-wide if POI invalid)
+    // to be available for combat when the miner is attacked
+    yield "standby";
+    ctx.log("escort", `Standing by at ${validPoi ? minerPoiName : bot.system} — monitoring for threats to miner...`);
+    
+    // Scan for nearby hostiles that might threaten the miner
+    yield "scan_system";
+    await fetchSecurityLevel(ctx, bot.system);
+    
+    const nearbyResp = await bot.exec("get_nearby");
+    if (!nearbyResp.error && nearbyResp.result) {
       bot.trackNearbyPlayers(nearbyResp.result);
-
       const entities = parseNearby(nearbyResp.result);
       const targets = entities.filter(e => isHostileTarget(e, settings.maxAttackTier));
 
-      if (targets.length === 0) {
-        ctx.log("escort", `No threats at ${poi.name}`);
-        await scavengeWrecks(ctx);
-        continue;
-      }
-
-      ctx.log("combat", `Found ${targets.length} hostile(s) at ${poi.name}: ${targets.map(t => t.name).join(", ")}`);
-
-      // Engage each target
-      for (const target of targets) {
-        if (bot.state !== "running") break;
-
-        await bot.refreshStatus();
-        const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-        if (preHull <= settings.repairThreshold) {
-          ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
-          abortPatrol = true;
-          break;
-        }
-
-        // Pre-fight ammo check
-        if (bot.ammo === 0) {
-          ctx.log("combat", "Out of ammo — aborting patrol to resupply");
-          abortPatrol = true;
-          break;
-        }
-
-        yield "engage";
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee);
-
-        if (won) {
-          totalKills++;
-          patrolKills++;
-          ctx.log("combat", `Kill #${totalKills} — looting wreck...`);
-
-          yield "loot";
-          await scavengeWrecks(ctx);
-
-          // Post-kill reload
-          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
-          if (!hasAmmo) {
-            ctx.log("combat", "No ammo after kill — aborting patrol to resupply");
-            abortPatrol = true;
-          }
+      if (targets.length > 0) {
+        ctx.log("combat", `Found ${targets.length} hostile(s) in system: ${targets.map(t => t.name).join(", ")}`);
+        
+        // Engage threats
+        for (const target of targets) {
+          if (bot.state !== "running") break;
 
           await bot.refreshStatus();
-          ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
-        } else {
-          ctx.log("combat", "Retreated — aborting patrol to dock and repair");
-          abortPatrol = true;
-          break;
+          const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+          if (preHull <= settings.repairThreshold) {
+            ctx.log("system", `Hull at ${preHull}% — too low for combat, docking...`);
+            break;
+          }
+
+          // Pre-fight ammo check
+          if (bot.ammo === 0) {
+            ctx.log("combat", "Out of ammo — docking to resupply");
+            break;
+          }
+
+          yield "engage";
+          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee);
+
+          if (won) {
+            totalKills++;
+            ctx.log("combat", `Kill #${totalKills} — looting wreck...`);
+
+            yield "loot";
+            await scavengeWrecks(ctx);
+
+            // Post-kill reload
+            const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+            if (!hasAmmo) {
+              ctx.log("combat", "No ammo after kill — docking to resupply");
+              break;
+            }
+
+            await bot.refreshStatus();
+            ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
+          } else {
+            ctx.log("combat", "Retreated — docking to repair");
+            break;
+          }
         }
+      } else {
+        ctx.log("escort", `No threats in ${bot.system} — standing by`);
       }
     }
 
-    // ── Post-patrol decision ──
-    yield "post_patrol";
+    // ── PERIODIC MINER LOCATION CHECK ──
+    // Verify the miner is still in this system - if not, follow them
+    yield "verify_miner_location";
+    
+    let minerStillHere = false;
+    
+    // Check 1: Look for miner in nearby entities
+    if (nearbyResp.result) {
+      const entities = parseNearby(nearbyResp.result);
+      const minerFound = entities.find(e => e.name?.toLowerCase() === minerName.toLowerCase());
+      if (minerFound) {
+        minerStillHere = true;
+        ctx.log("escort", `✓ Miner ${minerName} spotted nearby`);
+      }
+    }
+    
+    // Check 2: If not in nearby, check fleet status
+    if (!minerStillHere && ctx.getFleetStatus) {
+      const fleetStatus = ctx.getFleetStatus();
+      const minerBot = fleetStatus.find(b => b.username?.toLowerCase() === minerName.toLowerCase());
+      
+      if (minerBot?.system) {
+        const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+        
+        if (normalizeSystemName(minerBot.system) !== normalizeSystemName(bot.system)) {
+          ctx.log("escort", `⚠ Miner ${minerName} has moved to ${minerBot.system} — following...`);
+          minerSystem = minerBot.system;
+          setMinerLocation(minerName, minerBot.system);
+          
+          // Follow the miner immediately
+          const arrived = await navigateToSystem(ctx, minerSystem, safetyOpts);
+          if (arrived) {
+            ctx.log("escort", `✓ Successfully followed miner to ${minerSystem}`);
+            // Continue to next cycle to re-sync at new location
+            continue;
+          } else {
+            ctx.log("error", `Failed to follow miner to ${minerSystem}`);
+          }
+        } else {
+          minerStillHere = true;
+          ctx.log("escort", `✓ Miner still in ${bot.system} (not nearby, but same system)`);
+          
+          // Update POI tracking if miner moved to a different POI
+          if (minerBot.poi && minerBot.poi !== minerPoi) {
+            ctx.log("escort", `Miner moved to POI: ${minerBot.poi} — traveling to join...`);
+            minerPoi = minerBot.poi;
+            minerPoiName = minerBot.poi;
+            // Next cycle will handle POI travel
+          }
+        }
+      }
+    }
+    
+    if (!minerStillHere) {
+      ctx.log("warn", "Could not verify miner location — will re-check next cycle");
+    }
+
+    // ── Post-cycle decision ──
+    yield "post_cycle";
     await bot.refreshStatus();
     const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
 
-    const needsRepair = abortPatrol || postHull <= settings.repairThreshold;
+    const needsRepair = postHull <= settings.repairThreshold;
     const needsFuel = postFuel < settings.refuelThreshold;
 
     if (needsRepair || needsFuel) {
       const reason = needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`;
-      ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Returning to safe system (${reason})...`);
+      ctx.log("system", `Cycle complete — docking (${reason})...`);
 
       yield "dock";
       const docked = await navigateToSafeStation(ctx, safetyOpts);
@@ -875,10 +1132,12 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       yield "check_skills";
       await bot.checkSkills();
 
-      ctx.log("info", `Escort cycle complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
+      yield "undock";
+      await ensureUndocked(ctx);
 
+      ctx.log("info", `Escort cycle complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
     } else {
-      ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Hull: ${postHull}% | Fuel: ${postFuel}% — continuing escort...`);
+      ctx.log("system", `Cycle complete. Hull: ${postHull}% | Fuel: ${postFuel}% — continuing escort...`);
     }
   }
 };

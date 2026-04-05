@@ -94,6 +94,10 @@ export interface StoredPOI {
   missions: MissionRecord[];
   last_explored: string | null;
   last_updated: string;
+  /** Whether this POI is hidden (not visible on get_system, only discovered via get_poi or scanning) */
+  hidden?: boolean;
+  /** Difficulty to reveal this hidden POI (0-100) */
+  reveal_difficulty?: number;
 }
 
 export interface PirateSighting {
@@ -277,6 +281,9 @@ class MapStore {
           missions: prev?.missions ?? [],
           last_explored: prev?.last_explored ?? null,
           last_updated: now(),
+          // Preserve hidden flag if present in API response
+          hidden: (p.hidden as boolean) ?? prev?.hidden ?? false,
+          reveal_difficulty: (p.reveal_difficulty as number) ?? prev?.reveal_difficulty,
         };
       });
 
@@ -564,6 +571,85 @@ class MapStore {
     this.scheduleSave();
   }
 
+  /** Register or update a POI discovered via get_poi (including hidden POIs). */
+  registerPoiFromScan(systemId: string, poiData: {
+    id: string;
+    name: string;
+    type: string;
+    hidden?: boolean;
+    reveal_difficulty?: number;
+    resources?: Array<{
+      resource_id: string;
+      name: string;
+      richness: number;
+      remaining: number;
+      max_remaining: number;
+      depletion_percent: number;
+    }>;
+  }): void {
+    let sys = this.data.systems[systemId];
+    if (!sys) {
+      // Create system entry if it doesn't exist
+      sys = {
+        id: systemId,
+        name: systemId,
+        connections: [],
+        pois: [],
+        pirate_sightings: [],
+        wrecks: [],
+        last_updated: now(),
+      };
+      this.data.systems[systemId] = sys;
+    }
+
+    let poi = sys.pois.find((p) => p.id === poiData.id);
+    if (!poi) {
+      // New POI - create it
+      poi = {
+        id: poiData.id,
+        name: poiData.name,
+        type: poiData.type,
+        has_base: false,
+        base_id: null,
+        base_name: null,
+        base_type: null,
+        services: [],
+        ores_found: [],
+        resources: [],
+        market: [],
+        orders: [],
+        missions: [],
+        last_explored: null,
+        last_updated: now(),
+        hidden: poiData.hidden ?? false,
+        reveal_difficulty: poiData.reveal_difficulty,
+      };
+      sys.pois.push(poi);
+    }
+
+    // Update POI metadata (in case it changed)
+    poi.name = poiData.name || poi.name;
+    poi.type = poiData.type || poi.type;
+    if (poiData.hidden !== undefined) poi.hidden = poiData.hidden;
+    if (poiData.reveal_difficulty !== undefined) poi.reveal_difficulty = poiData.reveal_difficulty;
+    poi.last_updated = now();
+
+    // Update resources if provided
+    if (poiData.resources && poiData.resources.length > 0) {
+      poi.resources = poiData.resources.map((r) => ({
+        resource_id: r.resource_id,
+        name: r.name,
+        richness: r.richness,
+        remaining: r.remaining,
+        max_remaining: r.max_remaining,
+        depletion_percent: r.depletion_percent,
+        last_scanned: now(),
+      }));
+    }
+
+    this.scheduleSave();
+  }
+
   /** Mark an ore as depleted at a POI. */
   markOreDepleted(systemId: string, poiId: string, oreId: string): void {
     const sys = this.data.systems[systemId];
@@ -786,18 +872,19 @@ class MapStore {
   }
 
   /**
-   * Estimate minutes until a resource regenerates based on depletion level.
+   * Estimate minutes until a resource regenerates based on availability level.
    * Model: resources regen ~25% every 3 hours (180 minutes).
+   * depletion_percent from game API means "% available" (100 = full, 0 = empty).
    * Returns 0 if resource is not depleted enough to need regen.
    */
   estimateRegenTime(depletionPercent: number, minutesSinceScan: number): number {
-    // If less than 75% depleted, no regen needed
-    if (depletionPercent < 75) return 0;
+    // If more than 75% available, no regen needed
+    if (depletionPercent > 75) return 0;
 
     // Base regen: 25% per 180 minutes
-    // For every 25% depleted beyond 75%, need 180 more minutes
-    const excessDepletion = depletionPercent - 75;
-    const regenCycles = Math.ceil(excessDepletion / 25);
+    // For every 25% missing beyond 75% threshold, need 180 more minutes
+    const missingPercent = 100 - depletionPercent;
+    const regenCycles = Math.ceil(missingPercent / 25);
     return regenCycles * 180;
   }
 
@@ -827,6 +914,13 @@ class MapStore {
 
     const scored = locations
       .filter(loc => !blacklistSet.has(loc.systemId.toLowerCase()))
+      .filter(loc => {
+        // Skip completely exhausted locations (0% available = empty)
+        if (loc.depletionPercent <= 0 && loc.remaining <= 0) return false;
+        // Skip nearly-depleted locations (<10% available) — not worth traveling to
+        if (loc.depletionPercent < 10) return false;
+        return true;
+      })
       .map(loc => {
         // Calculate jumps from origin
         let jumpsAway = 0;
@@ -836,21 +930,23 @@ class MapStore {
         }
 
         // Score components:
-        // 1. Resource abundance (0-100 points)
+        // 1. Resource abundance (0-100 points) — based on remaining/max ratio
         let abundanceScore = 0;
         if (loc.maxRemaining > 0) {
-          // Use remaining/max ratio, scaled to 0-100
           abundanceScore = (loc.remaining / loc.maxRemaining) * 100;
         } else if (loc.totalMined > 0) {
           // No scan data — use historical yield as proxy (capped at 50)
           abundanceScore = Math.min(50, Math.log10(loc.totalMined) * 10);
         }
 
-        // 2. Availability bonus (0-50 points) — depletion_percent = % available (100 = full)
+        // 2. Availability bonus (0-50 points) — depletion_percent from game API means
+        // "% available" (100 = full, 0 = empty), despite the misleading name
         const availabilityScore = (loc.depletionPercent / 100) * 50;
 
-        // 3. Distance penalty (0-30 points)
-        const distanceScore = Math.max(0, 30 - jumpsAway * 5);
+        // 3. Distance penalty (0-40 points) — gentler slope: 2 points per jump
+        // This ensures distance still matters even for far systems
+        // 0 jumps: 40, 10 jumps: 20, 20 jumps: 0
+        const distanceScore = Math.max(0, 40 - jumpsAway * 2);
 
         // 4. Scan freshness bonus (0-20 points)
         let freshnessScore = 20;
@@ -860,7 +956,16 @@ class MapStore {
           freshnessScore = 10; // Stale data
         }
 
-        const score = abundanceScore + availabilityScore + distanceScore + freshnessScore;
+        // 5. Depletion penalty — heavily penalize low-availability systems
+        // This discourages selecting systems that are nearly empty
+        // Even if they pass the 10% threshold, we still want to prefer healthier systems
+        let depletionPenalty = 0;
+        if (loc.depletionPercent < 25) {
+          // Linear penalty: 0% at 25% availability, -30 points at 10%
+          depletionPenalty = -30 * ((25 - loc.depletionPercent) / 15);
+        }
+
+        const score = abundanceScore + availabilityScore + distanceScore + freshnessScore + depletionPenalty;
 
         return {
           ...loc,

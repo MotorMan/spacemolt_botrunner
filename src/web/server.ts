@@ -288,6 +288,39 @@ export class WebServer {
         if (url.pathname === "/api/map") {
           return Response.json({ systems: mapStore.getAllSystems() });
         }
+        if (url.pathname === "/api/map/register-poi" && req.method === "POST") {
+          const body = await req.json() as {
+            system_id: string;
+            poi: {
+              id: string;
+              name: string;
+              type: string;
+              hidden?: boolean;
+              reveal_difficulty?: number;
+              resources?: Array<{
+                resource_id: string;
+                name: string;
+                richness: number;
+                remaining: number;
+                max_remaining: number;
+                depletion_percent: number;
+              }>;
+            };
+          };
+          if (body?.system_id && body?.poi?.id) {
+            mapStore.registerPoiFromScan(body.system_id, body.poi);
+            return Response.json({ ok: true });
+          }
+          return Response.json({ ok: false, error: "Missing system_id or poi.id" }, { status: 400 });
+        }
+        if (url.pathname === "/api/map/register-system" && req.method === "POST") {
+          const body = await req.json() as { system_data: Record<string, unknown> };
+          if (body?.system_data) {
+            mapStore.updateSystem(body.system_data);
+            return Response.json({ ok: true });
+          }
+          return Response.json({ ok: false, error: "Missing system_data" }, { status: 400 });
+        }
         if (url.pathname === "/api/routines") {
           return Response.json(this.routines);
         }

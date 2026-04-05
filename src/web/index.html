@@ -58,6 +58,7 @@
         <option value="trader">Trader</option>
         <option value="explorer">Explorer</option>
         <option value="hunter">Hunter</option>
+        <option value="escort">Escort</option>
         <option value="hauler">Hauler</option>
         <option value="salvager">Salvager</option>
         <option value="scout">Scout</option>
@@ -748,6 +749,7 @@ async function fetchInitialData() {
     // Merge discovered bots with status data (discovered gives us usernames even if not logged in)
     const statusBots = botsRes || [];
     const discoveredUsernames = discoveredRes?.usernames || [];
+    window.discoveredBots = discoveredUsernames;
     const statusByUsername = new Map(statusBots.map(b => [b.username, b]));
 
     // Build complete bot list: include discovered bots even if no status yet
@@ -1757,7 +1759,7 @@ function renderProfileTopbar() {
     }
     actions += `
       <span class="profile-ore-label" style="margin-left:8px">Follow:</span>
-      <select id="profile-minerName" onchange="saveProfileEscortMiner()">${minerOpts.join('')}</select>`;
+      <select id="profile-minerName" onclick="event.stopPropagation()" onchange="saveProfileEscortMiner()">${minerOpts.join('')}</select>`;
   }
 
   document.getElementById('profileActions').innerHTML = actions;
@@ -2218,6 +2220,11 @@ function renderManualControls() {
     <div class="cmd-group">
       <button class="primary sm" onclick="mcExec('mine')">Mine</button>
       <button class="sm" onclick="mcExec('scan')">Scan</button>
+    </div>
+
+    <div class="cmd-group">
+      <button class="sm" onclick="mcScanCurrentPoi()" title="Scan current POI and register data to map (discovers hidden POIs)">📡 Scan Current POI</button>
+      <button class="sm" onclick="mcSurveySystem()" title="Survey system to reveal hidden POIs (requires scanner module)">🔭 Survey System</button>
     </div>
 
     <div class="cmd-group">
@@ -3344,6 +3351,139 @@ function startCooldownIndicator() {
     controls.classList.remove('exec-cooldown');
     cooldownTimer = null;
   }, TICK_COOLDOWN_MS);
+}
+
+/** Scan current POI and register the data to map (discovers hidden POIs). */
+function mcScanCurrentPoi() {
+  if (!profileBot) return;
+  const bot = bots.find(b => b.username === profileBot);
+  if (!bot || !bot.poi) {
+    logResponse(`<span class="resp-err">Not at a POI — travel to a POI first</span>`);
+    return;
+  }
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > get_poi { poi_id: "${esc(bot.poi)}" }</span>`);
+
+  sendExec(profileBot, 'get_poi', { poi_id: bot.poi }, (result) => {
+    if (result.ok && result.data) {
+      logResponse(`<span class="resp-ok">OK</span>` + formatResult('get_poi', result.data));
+
+      // Parse and register POI data to mapstore
+      const data = result.data;
+      const poiData = data.poi || {};
+      const resources = Array.isArray(data.resources) ? data.resources :
+                        Array.isArray(poiData.resources) ? poiData.resources : [];
+
+      if (poiData.id) {
+        const hiddenTag = poiData.hidden ? ' [HIDDEN]' : '';
+        logResponse(`<span class="resp-info">POI: ${esc(poiData.name || poiData.id)} [${esc(poiData.type || 'unknown')}]${esc(hiddenTag)}</span>`);
+
+        if (resources.length > 0) {
+          const resNames = resources.map(r => r.name || r.resource_id).join(', ');
+          logResponse(`<span class="resp-info">Resources: ${esc(resNames)}</span>`);
+        }
+
+        // Register to mapstore via backend endpoint
+        fetch('/api/map/register-poi', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            system_id: bot.system,
+            poi: {
+              id: poiData.id,
+              name: poiData.name || poiData.id,
+              type: poiData.type || '',
+              hidden: !!poiData.hidden,
+              reveal_difficulty: poiData.reveal_difficulty || undefined,
+              resources: resources.map(r => ({
+                resource_id: r.resource_id || '',
+                name: r.name || r.resource_id || '',
+                richness: r.richness || 0,
+                remaining: r.remaining || 0,
+                max_remaining: r.max_remaining || 0,
+                depletion_percent: r.depletion_percent ?? 100,
+              })),
+            },
+          }),
+        }).catch(() => {});
+      }
+    } else {
+      logResponse(`<span class="resp-err">Error: ${esc(result.error || 'unknown')}</span>`);
+    }
+
+    // Refresh profile after scan
+    setTimeout(() => {
+      renderProfileSidebar();
+      renderManualControls();
+    }, 500);
+  });
+}
+
+/** Survey the current system to reveal hidden POIs and register them to the map. */
+function mcSurveySystem() {
+  if (!profileBot) return;
+  const bot = bots.find(b => b.username === profileBot);
+  if (!bot) return;
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > survey_system</span>`);
+
+  sendExec(profileBot, 'survey_system', {}, (result) => {
+    if (result.ok && result.data) {
+      logResponse(`<span class="resp-ok">OK</span>` + formatResult('survey_system', result.data));
+
+      const surveyData = result.data;
+      const systemId = surveyData.system_id || bot.system || '';
+      const newlyRevealed = Array.isArray(surveyData.newly_revealed) ? surveyData.newly_revealed : [];
+      const alreadyRevealed = Array.isArray(surveyData.already_revealed) ? surveyData.already_revealed : [];
+      const allDiscovered = [...newlyRevealed, ...alreadyRevealed];
+
+      if (allDiscovered.length > 0 && systemId) {
+        // Register each discovered POI to the map
+        for (const poi of allDiscovered) {
+          const resources = Array.isArray(poi.resources) ? poi.resources.map(r => ({
+            resource_id: r.resource_id || '',
+            name: r.name || r.resource_id || '',
+            richness: r.richness || 0,
+            remaining: r.remaining || 0,
+            max_remaining: r.max_remaining || 0,
+            depletion_percent: r.depletion_percent ?? 100,
+          })) : [];
+
+          fetch('/api/map/register-poi', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              system_id: systemId,
+              poi: {
+                id: poi.id,
+                name: poi.name || poi.id,
+                type: poi.type || '',
+                hidden: true,
+                resources,
+              },
+            }),
+          }).catch(() => {});
+        }
+
+        const hiddenNames = allDiscovered.map(p => p.name || p.id).join(', ');
+        logResponse(`<span class="resp-info">🎯 Registered ${allDiscovered.length} hidden POI(s) to map: ${esc(hiddenNames)}</span>`);
+      } else {
+        logResponse(`<span class="resp-info">No hidden POIs found in survey</span>`);
+      }
+
+      // Also refresh system data for regular POIs
+      sendExec(profileBot, 'get_system', {}, () => {
+        setTimeout(() => {
+          renderProfileSidebar();
+          renderManualControls();
+        }, 500);
+      });
+    } else {
+      logResponse(`<span class="resp-err">Error: ${esc(result.error || 'unknown')}</span>`);
+    }
+  });
 }
 
 function mcExecCustom() {
@@ -8929,6 +9069,8 @@ function renderMinerSettings(panel) {
   const oreQuotas = m.oreQuotas || {};
   const gasQuotas = m.gasQuotas || {};
   const iceQuotas = m.iceQuotas || {};
+  const jettisonOres = m.jettisonOres || [];
+  const deepCoreJettisonOres = m.deepCoreJettisonOres || [];
   const depletionTimeoutHours = m.depletionTimeoutHours ?? 3;
   const ignoreDepletion = m.ignoreDepletion ?? false;
   const maxJumps = m.maxJumps ?? 10;
@@ -9046,6 +9188,33 @@ function renderMinerSettings(panel) {
   const oreQuotaRows = buildQuotaRows(oreQuotas, oreOres);
   const gasQuotaRows = buildQuotaRows(gasQuotas, gasOres);
   const iceQuotaRows = buildQuotaRows(iceQuotas, iceOres);
+
+  // Jettison ores table
+  function buildJettisonRows(ores, allOres) {
+    let rows = '';
+    for (const oreId of ores) {
+      const oreName = allOres.find(o => o.item_id === oreId)?.name || oreId;
+      rows += `<tr data-ore-id="${esc(oreId)}">
+        <td style="padding:4px 8px">${esc(oreName)}</td>
+        <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
+      </tr>`;
+    }
+    return rows;
+  }
+
+  function buildJettisonOreOpts(ores) {
+    const opts = ['<option value="">-- select --</option>'];
+    for (const ore of ores) {
+      opts.push(`<option value="${esc(ore.item_id)}">${esc(ore.name)}</option>`);
+    }
+    return opts.join('');
+  }
+
+  const jettisonRows = buildJettisonRows(jettisonOres, oreOres);
+  const jettisonOreOpts = buildJettisonOreOpts(oreOres);
+
+  const deepCoreJettisonRows = buildJettisonRows(deepCoreJettisonOres, oreOres);
+  const deepCoreJettisonOreOpts = buildJettisonOreOpts(oreOres);
 
   function buildQuotaOreOpts(ores) {
     const opts = ['<option value="">-- select --</option>'];
@@ -9196,6 +9365,38 @@ function renderMinerSettings(panel) {
     </div>
 
     <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">🗑️ Jettison Ores</div>
+      <div class="setting-hint" style="margin-bottom:12px">Ores listed here will be automatically jettisoned when found in cargo during mining. Useful for clearing low-value ores when faction storage is capped.</div>
+      <table id="jettison-ore-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Ore to Jettison</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${jettisonRows}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="jettison-add-ore" style="flex:1">${jettisonOreOpts}</select>
+        <button class="secondary" onclick="addJettisonOre()">Add</button>
+      </div>
+    </div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">⛏️ Deep Core Jettison Ores</div>
+      <div class="setting-hint" style="margin-bottom:12px">Ores listed here will be jettisoned when mining deep core (hidden POIs). Deep core POIs often contain mixed low-value ores alongside the target resource — use this to filter out unwanted byproducts while keeping the valuable deep core ore.</div>
+      <table id="deep-core-jettison-ore-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Ore to Jettison</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${deepCoreJettisonRows}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="deep-core-jettison-add-ore" style="flex:1">${deepCoreJettisonOreOpts}</select>
+        <button class="secondary" onclick="addDeepCoreJettisonOre()">Add</button>
+      </div>
+    </div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
       <div class="setting-row">
         <div>
           <div class="setting-label">Depletion Timeout (Hours)</div>
@@ -9245,12 +9446,12 @@ function renderMinerSettings(panel) {
       <div class="setting-row">
         <div>
           <div class="setting-label">Escort Signal Channel</div>
-          <div class="setting-hint">How the miner sends signals to escorts. Faction chat is default and works across systems. File-based works for bots on the same machine.</div>
+          <div class="setting-hint">How the miner sends signals to escorts. Faction chat works across systems. File-based is most reliable for bots on the same machine.</div>
         </div>
         <select id="set-miner-escortSignalChannel">
           <option value="faction"${(!settings.miner?.escortSignalChannel || settings.miner?.escortSignalChannel === 'faction') ? ' selected' : ''}>Faction Chat (cross-system)</option>
-          <option value="local"${settings.miner?.escortSignalChannel === 'local' ? ' selected' : ''}>Local Log Only (debug)</option>
           <option value="file"${settings.miner?.escortSignalChannel === 'file' ? ' selected' : ''}>File-Based (same machine)</option>
+          <option value="local"${settings.miner?.escortSignalChannel === 'local' ? ' selected' : ''}>Local Log Only (debug)</option>
         </select>
       </div>
 
@@ -9444,6 +9645,56 @@ function addOreQuotaRow(type) {
   oreSelect.value = '';
 }
 
+function addJettisonOre() {
+  const oreSelect = document.getElementById('jettison-add-ore');
+  if (!oreSelect) return;
+  const oreId = oreSelect.value;
+  if (!oreId) return;
+
+  // Check if ore already in table
+  const existing = document.querySelector(`#jettison-ore-table tr[data-ore-id="${oreId}"]`);
+  if (existing) return;
+
+  const oreOresList = knownOres.filter(o => {
+    const n = o.name.toLowerCase();
+    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo');
+  });
+  const oreName = oreOresList.find(o => o.item_id === oreId)?.name || oreId;
+  const tbody = document.querySelector('#jettison-ore-table tbody');
+  const tr = document.createElement('tr');
+  tr.dataset.oreId = oreId;
+  tr.innerHTML = `
+    <td style="padding:4px 8px">${esc(oreName)}</td>
+    <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>`;
+  tbody.appendChild(tr);
+  oreSelect.value = '';
+}
+
+function addDeepCoreJettisonOre() {
+  const oreSelect = document.getElementById('deep-core-jettison-add-ore');
+  if (!oreSelect) return;
+  const oreId = oreSelect.value;
+  if (!oreId) return;
+
+  // Check if ore already in table
+  const existing = document.querySelector(`#deep-core-jettison-ore-table tr[data-ore-id="${oreId}"]`);
+  if (existing) return;
+
+  const oreOresList = knownOres.filter(o => {
+    const n = o.name.toLowerCase();
+    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo');
+  });
+  const oreName = oreOresList.find(o => o.item_id === oreId)?.name || oreId;
+  const tbody = document.querySelector('#deep-core-jettison-ore-table tbody');
+  const tr = document.createElement('tr');
+  tr.dataset.oreId = oreId;
+  tr.innerHTML = `
+    <td style="padding:4px 8px">${esc(oreName)}</td>
+    <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>`;
+  tbody.appendChild(tr);
+  oreSelect.value = '';
+}
+
 function saveMinerSettings() {
   const collectQuotas = (tableId) => {
     const quotas = {};
@@ -9453,6 +9704,24 @@ function saveMinerSettings() {
       if (oreId && qty > 0) quotas[oreId] = qty;
     }
     return quotas;
+  };
+
+  const collectJettisonOres = () => {
+    const ores = [];
+    for (const row of document.querySelectorAll('#jettison-ore-table tbody tr')) {
+      const oreId = row.dataset.oreId;
+      if (oreId) ores.push(oreId);
+    }
+    return ores;
+  };
+
+  const collectDeepCoreJettisonOres = () => {
+    const ores = [];
+    for (const row of document.querySelectorAll('#deep-core-jettison-ore-table tbody tr')) {
+      const oreId = row.dataset.oreId;
+      if (oreId) ores.push(oreId);
+    }
+    return ores;
   };
 
   const collectFlockGroups = () => {
@@ -9499,6 +9768,8 @@ function saveMinerSettings() {
     oreQuotas: collectQuotas('ore-quota-table'),
     gasQuotas: collectQuotas('gas-quota-table'),
     iceQuotas: collectQuotas('ice-quota-table'),
+    jettisonOres: collectJettisonOres(),
+    deepCoreJettisonOres: collectDeepCoreJettisonOres(),
     // Flock mining settings
     flockEnabled: document.getElementById('set-miner-flockEnabled').checked,
     flockName: document.getElementById('set-miner-flockGroup').value,
@@ -9893,6 +10164,7 @@ function renderEscortSettings(panel) {
   const globalMaxAttackTier = e.maxAttackTier || 'large';
   const globalFleeFromTier = e.fleeFromTier || 'boss';
   const globalMinPiratesToFlee = e.minPiratesToFlee ?? 3;
+  const globalSignalChannel = e.signalChannel || 'faction';
 
   const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
   const tierOpts = tierOptions.map(t => `<option value="${t}"${t === globalMaxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
@@ -9961,6 +10233,23 @@ function renderEscortSettings(panel) {
           ${escortBotRows}
         </tbody>
       </table>
+    </div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">⚙ Global Coordination Settings</div>
+      <div class="setting-hint" style="margin-bottom:12px">How the escort bot receives location signals from the miner.</div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Signal Channel</div>
+          <div class="setting-hint">Method used to receive location signals from the miner bot. <strong>File</strong> is most reliable for bots on the same machine. <strong>Faction Chat</strong> works across different machines.</div>
+        </div>
+        <select id="set-escort-signalChannel">
+          <option value="faction"${globalSignalChannel === 'faction' ? ' selected' : ''}>Faction Chat (cross-system)</option>
+          <option value="file"${globalSignalChannel === 'file' ? ' selected' : ''}>File-based (same machine)</option>
+          <option value="local"${globalSignalChannel === 'local' ? ' selected' : ''}>Local Log Only</option>
+        </select>
+      </div>
     </div>
 
     <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
@@ -10042,6 +10331,7 @@ function saveEscortSettings() {
     maxAttackTier: document.getElementById('set-escort-maxAttackTier').value,
     fleeFromTier: document.getElementById('set-escort-fleeFromTier').value,
     minPiratesToFlee: parseInt(document.getElementById('set-escort-minPiratesToFlee').value) || 3,
+    signalChannel: document.getElementById('set-escort-signalChannel').value,
   };
   send({ type: 'saveSettings', routine: 'escort', settings: s });
   settings.escort = s;

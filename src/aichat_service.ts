@@ -556,6 +556,14 @@ export class AiChatService {
    * Add a chat message to the queue.
    */
   addChatMessage(msg: ChatMessage): void {
+    // CRITICAL: Filter self-messages (bot responding to its own chat messages)
+    // This is a belt-and-suspenders check - bot.ts should already filter these,
+    // but we double-check here to prevent self-talk loops
+    if (msg.sender === msg.botUsername) {
+      this.logFn("ai_chat_debug", `Self-message ignored: ${msg.sender} === ${msg.botUsername}`);
+      return;
+    }
+
     // Check if message mentions any bot
     const bots = AiChatService.getBots();
     let isMention = false;
@@ -732,29 +740,14 @@ export class AiChatService {
     }
 
     // Skip messages from AI bots (prevent self-talk loops)
-    // BUT: Allow the mentioned bot to respond even if it recently sent messages
+    // Note: Self-messages are already filtered in addChatMessage(), so this is extra safety
     const bots = AiChatService.getBots();
     const isFromAiBot = bots?.some(b => b.username === msg.sender);
-    
+
     if (isFromAiBot) {
-      // Check if this message mentions a different bot - if so, allow it through
-      // This prevents AI-to-AI loops while allowing mentioned bots to respond
-      let mentionedBotName: string | null = null;
-      for (const bot of bots || []) {
-        if (messageMentionsBot(msg.content, bot.username)) {
-          mentionedBotName = bot.username;
-          break;
-        }
-      }
-      
-      // If message mentions a bot, it's likely a human message that got attributed wrong
-      // OR it's an AI responding to a human - either way, let it through for mention processing
-      if (mentionedBotName) {
-        this.logFn("ai_chat_debug", `Message from AI bot ${msg.sender} mentions ${mentionedBotName} - processing for mention`);
-      } else {
-        this.logFn("ai_chat_debug", `Ignoring message from AI bot: ${msg.sender}`);
-        return;
-      }
+      // Allow AI bot messages through - they can create fun faction conversations
+      // The self-message check in addChatMessage() prevents bots from responding to themselves
+      this.logFn("ai_chat_debug", `Message from AI bot ${msg.sender} - allowing for bot-to-bot conversation`);
     }
 
     // Check if message mentions ANY of our bots

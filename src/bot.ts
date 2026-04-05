@@ -208,6 +208,62 @@ export class Bot {
     return creds?.empire || "";
   }
 
+  /**
+   * Execute an API command with a timeout. If the timeout fires, check if we
+   * arrived at the target (success) or not (return timeout error for retry).
+   */
+  private async execWithTimeout(
+    command: string,
+    payload: Record<string, unknown> | undefined,
+    timeoutMs: number,
+    targetId: string,
+  ): Promise<ApiResponse> {
+    // Race the API call against a timeout
+    const apiPromise = this.api.execute(command, payload);
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error(`TIMEOUT`)), timeoutMs);
+    });
+
+    try {
+      return await Promise.race([apiPromise, timeoutPromise]);
+    } catch (err) {
+      if (err instanceof Error && err.message === "TIMEOUT") {
+        this.log("warn", `${command} timed out after ${timeoutMs / 1000}s — checking position...`);
+        // Refresh status to see where we actually are
+        await this.refreshStatus();
+
+        // For jump: check if we're in the target system
+        if (command === "jump" && targetId) {
+          const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+          if (normalizeSystemName(this.system) === normalizeSystemName(targetId)) {
+            this.log("travel", `✓ Timeout check: confirmed at target ${targetId} — treating as success`);
+            return { error: undefined, result: { message: "Jump completed (timeout recovery)" }, notifications: [] };
+          }
+        }
+
+        // For travel: check if we're at the target POI or system
+        if (command === "travel" && targetId) {
+          const normalize = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+          // Target could be a POI ID or system ID
+          if (normalize(this.poi) === normalize(targetId) || normalize(this.system) === normalize(targetId)) {
+            this.log("travel", `✓ Timeout check: confirmed at target ${targetId} — treating as success`);
+            return { error: undefined, result: { message: "Travel completed (timeout recovery)" }, notifications: [] };
+          }
+        }
+
+        // Not at target — return timeout error so caller can retry
+        this.log("error", `${command} timed out — not at target ${targetId} (currently at ${this.system}/${this.poi})`);
+        return {
+          error: { code: "timeout", message: `${command} timed out after ${timeoutMs / 1000}s` },
+          result: undefined,
+          notifications: [],
+        };
+      }
+      // Re-throw other errors
+      throw err;
+    }
+  }
+
   log(category: string, message: string): void {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
     const line = `${timestamp} [${category}] ${message}`;
@@ -269,7 +325,16 @@ export class Bot {
 
     this._lastAction = command;
     debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
-    let resp = await this.api.execute(command, payload);
+
+    // Apply 120s timeout to jump/travel commands to detect hangs
+    // Max normal jump time is 110s (without towing), so 120s is safe threshold
+    let resp: ApiResponse;
+    if (command === "jump" || command === "travel") {
+      const targetSystem = (payload?.target_system as string) || (payload?.target_poi as string) || "";
+      resp = await this.execWithTimeout(command, payload, 120_000, targetSystem);
+    } else {
+      resp = await this.api.execute(command, payload);
+    }
 
     // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
     // This prevents 502 errors from breaking routines mid-operation

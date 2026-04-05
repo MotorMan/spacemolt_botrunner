@@ -1301,6 +1301,7 @@ export async function navigateToSystem(
 
       // Check if error is transient (network timeout, connection issue, etc.)
       const isTransient =
+        jumpResp.error.code === "timeout" || // Our custom timeout from execWithTimeout
         errorMsg.includes("timeout") ||
         errorMsg.includes("524") || // HTTP 524 Request Timeout
         errorMsg.includes("502") || // HTTP 502 Bad Gateway (server-side issue)

@@ -1,4 +1,4 @@
-import { debugLog } from "./debug.js";
+import { debugLogForBot } from "./debug.js";
 
 const COLORS: Record<string, string> = {
   setup: "\x1b[34m",    // blue
@@ -284,7 +284,7 @@ function parseNotification(n: unknown): { tag: string; category: string; text: s
   if (typeof n !== "object" || n === null) return null;
 
   // Debug: log raw notification structure
-  debugLog("notification:raw", "incoming", n);
+  debugLogForBot("SYSTEM", "notification:raw", "incoming", n);
 
 
   const notif = n as Record<string, unknown>;

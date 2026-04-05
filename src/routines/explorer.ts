@@ -369,6 +369,9 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Clean up expired temporary blacklists ──
+    cleanupTemporaryBlacklist();
+
     // ── Battle check — check global WebSocket battle state first (works during 524 timeouts) ──
     if (bot.isInBattle()) {
       ctx.log("combat", "[WebSocket] Battle detected via WebSocket - fleeing immediately!");
@@ -408,6 +411,69 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Try to capture security level
     await fetchSecurityLevel(ctx, systemId);
+
+    // ── Proactive pirate stronghold proximity check ──
+    // If within 3-4 jumps of a pirate stronghold, be EXTREMELY vigilant
+    const proximityResult = await checkPirateStrongholdProximity(ctx, systemId, 4);
+    if (proximityResult.nearStronghold) {
+      ctx.log("combat", `[ALERT] Within ${proximityResult.jumpsToStronghold} jumps of pirate stronghold (${proximityResult.nearestStronghold})! Enhanced vigilance mode active.`);
+      
+      // Check nearby for pirates IMMEDIATELY
+      yield "proximity_pirate_check";
+      const nearbyResp = await bot.exec("get_nearby");
+      
+      // Check for battle after get_nearby
+      if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
+        ctx.log("combat", "Battle detected during proximity check - fleeing immediately!");
+        if (await checkAndFleeFromBattle(ctx, "explorer")) {
+          await sleep(5000);
+          continue;
+        }
+      }
+      
+      // Check for pirates in the area
+      if (nearbyResp.result && typeof nearbyResp.result === "object") {
+        const { parseNearbyForPirates } = await import("./common.js");
+        const pirateResult = parseNearbyForPirates(nearbyResp.result);
+        
+        if (pirateResult.hasPirates) {
+          ctx.log("combat", `[CRITICAL] Pirates detected near stronghold! ${pirateResult.pirateCount} pirate(s) spotted. Fleeing immediately!`);
+          
+          // Record pirate sighting with names
+          await recordPirateSighting(ctx, systemId, pirateResult.pirates);
+          
+          // Add temporary blacklist for this system
+          addTemporaryPirateBlacklist(systemId, 30); // 30 minutes
+          
+          // Flee back the way we came
+          if (lastSystem) {
+            ctx.log("combat", `Fleeing back to ${lastSystem} (the way we came)...`);
+            await ensureUndocked(ctx);
+            const fleeJump = await bot.exec("jump", { target_system: lastSystem });
+            if (fleeJump.error) {
+              ctx.log("error", `Failed to flee to ${lastSystem}: ${fleeJump.error.message}`);
+              // Try emergency flee if jump fails
+              const { emergencyFleeFromPirates } = await import("./common.js");
+              await emergencyFleeFromPirates(ctx, pirateResult);
+            } else {
+              ctx.log("combat", `Successfully fled to ${lastSystem}`);
+              bot.stats.totalSystems++;
+              // Continue to next iteration to rescan new system
+              await sleep(5000);
+              continue;
+            }
+          } else {
+            // No lastSystem to flee to, use emergency flee
+            ctx.log("combat", "No previous system to flee to - using emergency flee");
+            const { emergencyFleeFromPirates } = await import("./common.js");
+            await emergencyFleeFromPirates(ctx, pirateResult);
+          }
+          
+          await sleep(5000);
+          continue;
+        }
+      }
+    }
 
     // ── Survey the system to reveal hidden POIs ──
     // Only survey if scanPois is enabled
@@ -1661,11 +1727,12 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  */
 function pickNextSystem(connections: Connection[], visited: Set<string>, lastSystem: string | null, fledFromSystems: Set<string>): Connection | null {
   const blacklist = getSystemBlacklist();
-  
-  // Filter out blacklisted systems and systems we've fled from
-  const nonBlacklistedConns = connections.filter(c => 
+
+  // Filter out blacklisted systems, systems we've fled from, and temporarily blacklisted systems
+  const nonBlacklistedConns = connections.filter(c =>
     !blacklist.some(b => b.toLowerCase() === c.id.toLowerCase()) &&
-    !fledFromSystems.has(c.id)
+    !fledFromSystems.has(c.id) &&
+    !isTemporarilyBlacklisted(c.id)
   );
   
   // Separate connections into pirate and non-pirate
@@ -1725,10 +1792,11 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
   let candidates = lastSystem ? connections.filter(c => c.id !== lastSystem) : connections;
   if (candidates.length === 0) candidates = connections;
 
-  // Filter out blacklisted systems and systems we've fled from
-  const nonBlacklisted = candidates.filter(c => 
+  // Filter out blacklisted systems, systems we've fled from, and temporarily blacklisted systems
+  const nonBlacklisted = candidates.filter(c =>
     !blacklist.some(b => b.toLowerCase() === c.id.toLowerCase()) &&
-    !fledFromSystems.has(c.id)
+    !fledFromSystems.has(c.id) &&
+    !isTemporarilyBlacklisted(c.id)
   );
   // If all are blacklisted, use original candidates (trapped situation)
   candidates = nonBlacklisted.length > 0 ? nonBlacklisted : candidates;
@@ -1778,4 +1846,128 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
   ctx.log("info", `Connection scores: ${connInfo} — picking ${chosen.conn.name || chosen.conn.id}`);
 
   return chosen.conn;
+}
+
+// ── Pirate Stronghold Proximity Detection ────────────────────
+
+/**
+ * Check if the current system is within N jumps of a pirate stronghold.
+ * Returns information about the nearest stronghold and distance.
+ */
+async function checkPirateStrongholdProximity(
+  ctx: RoutineContext,
+  currentSystem: string,
+  maxJumps: number,
+): Promise<{
+  nearStronghold: boolean;
+  jumpsToStronghold: number;
+  nearestStronghold: string;
+}> {
+  const { PIRATE_SYSTEMS } = await import("./common.js");
+  
+  // BFS from current system to find nearest pirate stronghold
+  const visited = new Set<string>();
+  const queue: Array<{ systemId: string; distance: number }> = [
+    { systemId: currentSystem, distance: 0 }
+  ];
+  visited.add(currentSystem);
+
+  while (queue.length > 0) {
+    const { systemId, distance } = queue.shift()!;
+    
+    // Check if this is a pirate system
+    if (PIRATE_SYSTEMS.some(ps => systemId.toLowerCase() === ps || systemId.toLowerCase().includes(ps))) {
+      return {
+        nearStronghold: true,
+        jumpsToStronghold: distance,
+        nearestStronghold: systemId,
+      };
+    }
+    
+    // Stop if we've gone too far
+    if (distance >= maxJumps) continue;
+
+    // Get system from map store
+    const sys = mapStore.getSystem(systemId);
+    if (!sys) continue;
+
+    // Add connections to queue
+    for (const conn of sys.connections) {
+      const connId = conn.system_id;
+      if (!connId) continue;
+      if (visited.has(connId)) continue;
+      
+      visited.add(connId);
+      queue.push({ systemId: connId, distance: distance + 1 });
+    }
+  }
+
+  return {
+    nearStronghold: false,
+    jumpsToStronghold: maxJumps + 1,
+    nearestStronghold: "",
+  };
+}
+
+/**
+ * Record pirate sighting in map data with pirate names.
+ */
+async function recordPirateSighting(
+  ctx: RoutineContext,
+  systemId: string,
+  pirates: Array<{ name?: string; tier?: string; isBoss?: boolean }>,
+): Promise<void> {
+  const { mapStore } = await import("../mapstore.js");
+  
+  for (const pirate of pirates) {
+    const pirateName = pirate.name || "Unknown Pirate";
+    ctx.log("combat", `📍 Recording pirate sighting: ${pirateName} in ${systemId}`);
+    
+    // Update map store with pirate sighting
+    mapStore.recordPirate(systemId, {
+      name: pirateName,
+    });
+  }
+}
+
+/** Temporary pirate blacklist with expiration (in-memory) */
+const temporaryPirateBlacklist = new Map<string, number>(); // systemId -> expiresAt timestamp
+
+/**
+ * Add a system to the temporary pirate blacklist.
+ * @param systemId System to blacklist
+ * @param durationMinutes How long to blacklist (default: 30 minutes)
+ */
+function addTemporaryPirateBlacklist(systemId: string, durationMinutes: number = 30): void {
+  const expiresAt = Date.now() + durationMinutes * 60 * 1000;
+  temporaryPirateBlacklist.set(systemId, expiresAt);
+  console.log(`[BLACKLIST] Added ${systemId} to temporary pirate blacklist for ${durationMinutes} minutes`);
+}
+
+/**
+ * Check if a system is temporarily blacklisted due to recent pirate activity.
+ */
+function isTemporarilyBlacklisted(systemId: string): boolean {
+  const expiresAt = temporaryPirateBlacklist.get(systemId);
+  if (!expiresAt) return false;
+  
+  // Remove expired entries
+  if (Date.now() > expiresAt) {
+    temporaryPirateBlacklist.delete(systemId);
+    return false;
+  }
+  
+  return true;
+}
+
+/**
+ * Clean up expired temporary blacklists (call periodically).
+ */
+function cleanupTemporaryBlacklist(): void {
+  const now = Date.now();
+  for (const [systemId, expiresAt] of temporaryPirateBlacklist.entries()) {
+    if (now > expiresAt) {
+      temporaryPirateBlacklist.delete(systemId);
+    }
+  }
 }

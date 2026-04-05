@@ -1,22 +1,8 @@
 import { log, logError } from "./ui.js";
-import { commandLog } from "./commandLogger.js";
 import { reconnectQueue } from "./reconnectqueue.js";
-import { debugLog } from "./debug.js";
+import { debugLogForBot } from "./debug.js";
 import { SessionManager } from "./session.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
-import {
-  logSession,
-  logSessionCreate,
-  logSessionInvalidate,
-  logSessionChange,
-  logSessionError,
-  logSessionCheck,
-  logRenewalCooldown,
-  logRenewalQueue,
-  logSessionRestore,
-  logSessionSave,
-  logSessionDetail,
-} from "./sessiondebug.js";
 
 export interface ApiSession {
   id: string;
@@ -198,7 +184,6 @@ export class SpaceMoltAPI {
     const botName = this._botName || "unknown";
 
     if (!token || !token.sessionId) {
-      logSessionRestore(botName, "none", false, "No saved session token found");
       return false;
     }
 
@@ -208,7 +193,7 @@ export class SpaceMoltAPI {
     const v2Expired = token.v2SessionId && v2ExpiresAt <= now;
 
     if (v2Expired && token.v2SessionId) {
-      logSessionDetail(botName, "V2_EXPIRED_ON_LOAD", "V2 session expired on disk, not restoring", {
+      debugLogForBot(botName, "api:restoreSession", `V2 session expired on disk, not restoring`, {
         v2SessionId: token.v2SessionId.slice(0, 8),
         expiresAt: token.v2ExpiresAt,
         now: new Date(now).toISOString(),
@@ -233,15 +218,7 @@ export class SpaceMoltAPI {
       };
     }
 
-    logSessionRestore(botName, token.sessionId, true);
-    logSessionDetail(botName, "RESTORED", "Session restored from disk", {
-      fromSession: oldSession?.id?.slice(0, 8) || "none",
-      toSession: this.session.id.slice(0, 8),
-      hasV2: !!this.v2Session,
-      v2Skipped: v2Expired ? "expired" : "none",
-    });
-
-    debugLog("api:restoreSession", `${botName} session restored from disk`, {
+    debugLogForBot(botName, "api:restoreSession", `${botName} session restored from disk`, {
       sessionId: this.session.id.slice(0, 8),
       hasV2: !!this.v2Session,
     });
@@ -270,10 +247,7 @@ export class SpaceMoltAPI {
 
   async execute(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
-    commandLog("api", `Executing command: ${botName}:${command}`, { command, payload });
-
-    // Log session state for debugging
-    logSessionCheck(botName, !!this.session, this.session?.id || null, this.session?.expiresAt || null);
+    debugLogForBot(botName, "api:execute", `${botName} > ${command}`, payload);
 
     const cacheTtl = COMMAND_TTL[command];
     const cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
@@ -328,7 +302,7 @@ export class SpaceMoltAPI {
 
         // Check if recovery is already in progress - if so, wait for it to complete
         if (this._recoveryInProgress) {
-          debugLog("api:execute", `${botName} recovery already in progress, waiting for completion...`);
+          debugLogForBot(botName, "api:execute", `${botName} recovery already in progress, waiting for completion...`);
           // Wait longer to allow recovery to complete (session creation can take time due to rate limiting)
           await sleep(5000);
           // After waiting, just retry - the sessions should be refreshed now
@@ -358,45 +332,35 @@ export class SpaceMoltAPI {
             await sleep(waitTime);
           }
 
-          // Log full error response for debugging
-          logSessionError(botName, command, payload, code, resp.error.message || "", resp);
-          logSessionInvalidate(botName, "API returned session error", code, resp.error.message, this.session?.id);
-
           // Clear BOTH sessions - they may both be expired (especially V2 expiring first)
           // This prevents the loop where V1 is renewed but V2 stays expired
-          debugLog("api:execute", `${botName} session invalid, clearing both V1 and V2 sessions`);
+          debugLogForBot(botName, "api:execute", `${botName} session invalid, clearing both V1 and V2 sessions`);
           const oldSessionId = this.session?.id;
           const oldV2SessionId = this.v2Session?.id;
           this.session = null;
           this.v2Session = null;
 
           try {
-            debugLog("api:recovery", `${botName} starting session recovery (old V1: ${oldSessionId?.slice(0, 8) || "none"}, old V2: ${oldV2SessionId?.slice(0, 8) || "none"})`);
+            debugLogForBot(botName, "api:recovery", `${botName} starting session recovery (old V1: ${oldSessionId?.slice(0, 8) || "none"}, old V2: ${oldV2SessionId?.slice(0, 8) || "none"})`);
             await this.ensureSession();
             // CRITICAL: Always ensure V2 session exists after recovery, even if the
             // failing command was V1-only. V2 session expiration can cause V1 commands
             // to fail indirectly, so we must renew both to break the recovery loop.
             await this.ensureV2Session();
-            const newV1Id = this.session?.id?.slice(0, 8) || "none";
-            const newV2Id = this.v2Session?.id?.slice(0, 8) || "none";
-            debugLog("api:recovery", `${botName} session recovery complete (new V1: ${newV1Id}, new V2: ${newV2Id})`);
-            logSessionChange(botName, oldSessionId || null, (this.session as ApiSession | null)?.id || "", "recovery from session error");
-            logSessionDetail(botName, "V2_SESSION_DURING_RECOVERY", "V2 session ensured during recovery", {
-              hadV2: !!oldV2SessionId,
-              newV2Session: (this.v2Session as ApiSession | null)?.id?.slice(0, 8) || "none",
-            });
+            const newV1Id = (this.session as ApiSession | null)?.id?.slice(0, 8) || "none";
+            const newV2Id = (this.v2Session as ApiSession | null)?.id?.slice(0, 8) || "none";
+            debugLogForBot(botName, "api:recovery", `${botName} session recovery complete (new V1: ${newV1Id}, new V2: ${newV2Id})`);
             // Reset recovery count on successful session creation
             this._recoveryCount = 0;
             return this.execute(command, payload);
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             log("error", `${botName} session renewal failed: ${msg}`);
-            logSessionDetail(botName, "RENEWAL_FAILED", msg, { error: msg, command });
             return { error: { code: "session_renewal_failed", message: msg } };
           }
         } finally {
           this._recoveryInProgress = false;
-          debugLog("api:recovery", `${botName} recovery flag cleared`);
+          debugLogForBot(botName, "api:recovery", `${botName} recovery flag cleared`);
         }
       }
     }
@@ -493,12 +457,11 @@ export class SpaceMoltAPI {
         const timeSinceLastCreate = now - lastSessionCreateTime;
         if (timeSinceLastCreate < SESSION_CREATE_INTERVAL) {
           const waitTime = SESSION_CREATE_INTERVAL - timeSinceLastCreate;
-          debugLog("api:createSession", `${botName} rate limited, waiting ${waitTime}ms`);
+          debugLogForBot(botName, "api:createSession", `${botName} rate limited, waiting ${waitTime}ms`);
           await sleep(waitTime);
         }
 
         log("system", `Creating new session for ${botName}...`);
-        logSessionDetail(botName, "CREATE_START", "Starting session creation", { attempt: attempt + 1, maxAttempts: MAX_RECONNECT_ATTEMPTS });
 
         const resp = await fetch(`${this.baseUrl}/session`, {
           method: "POST",
@@ -507,20 +470,15 @@ export class SpaceMoltAPI {
 
         if (!resp.ok) {
           const error = `Failed to create session: ${resp.status} ${resp.statusText}`;
-          logSessionDetail(botName, "CREATE_FAILED", error, { status: resp.status, statusText: resp.statusText, attempt: attempt + 1 });
           throw new Error(error);
         }
 
         const data = (await resp.json()) as ApiResponse;
         if (data.session) {
-          const oldSession = this.session;
           this.session = data.session;
           lastSessionCreateTime = Date.now(); // Update global rate limiter
           log("system", `Session created for ${botName}: ${this.session.id.slice(0, 8)}...`);
-          logSessionCreate(botName, this.session.id, this.session.expiresAt, oldSession ? "renewal" : "initial", data);
-          logSessionSave(botName, this.session.id, this.v2Session?.id);
         } else {
-          logSessionDetail(botName, "CREATE_FAILED", "No session in response", { response: data });
           throw new Error("No session in response");
         }
 
@@ -542,7 +500,7 @@ export class SpaceMoltAPI {
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
-        debugLog("api:createSession", `${botName} attempt ${attempt + 1} failed, retrying in ${delay}ms`);
+        debugLogForBot(botName, "api:createSession", `${botName} attempt ${attempt + 1} failed, retrying in ${delay}ms`);
         await sleep(delay);
       }
     }
@@ -563,7 +521,7 @@ export class SpaceMoltAPI {
         v2SessionId = this.v2Session.id;
       } else {
         // V2 session expired, clear it
-        logSessionDetail(this._botName || "unknown", "V2_EXPIRED", "V2 session expired, clearing from save", {
+        debugLogForBot(this._botName || "unknown", "api:saveSession", `V2 session expired, clearing from save`, {
           v2SessionId: this.v2Session.id.slice(0, 8),
           expiresAt: this.v2Session.expiresAt,
           now: new Date(now).toISOString(),
@@ -583,7 +541,6 @@ export class SpaceMoltAPI {
     }
 
     this._sessionManager.saveSessionToken(token);
-    logSessionSave(this._botName || "unknown", this.session.id, v2SessionId);
   }
 
   private async ensureV2Session(): Promise<void> {
@@ -619,7 +576,7 @@ export class SpaceMoltAPI {
         const timeSinceLastCreate = now - lastSessionCreateTime;
         if (timeSinceLastCreate < SESSION_CREATE_INTERVAL) {
           const waitTime = SESSION_CREATE_INTERVAL - timeSinceLastCreate;
-          debugLog("api:createV2Session", `${botName} rate limited, waiting ${waitTime}ms`);
+          debugLogForBot(botName, "api:createV2Session", `${botName} rate limited, waiting ${waitTime}ms`);
           await sleep(waitTime);
         }
 
@@ -678,7 +635,7 @@ export class SpaceMoltAPI {
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
-        debugLog("api:createV2Session", `${botName} attempt ${attempt + 1} failed`);
+        debugLogForBot(botName, "api:createV2Session", `${botName} attempt ${attempt + 1} failed`);
         await sleep(delay);
       }
     }

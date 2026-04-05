@@ -443,6 +443,10 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
     if (bot.system !== sourceSystem) {
       await ensureUndocked(ctx);
+      if (bot.state !== "running") {
+        ctx.log("system", "⛔ Stopping — emergency detected");
+        return;
+      }
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Cannot refuel to reach source system");
@@ -451,7 +455,11 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       }
       ctx.log("travel", `Heading to source system ${sourceSystem}...`);
       const arrived = await navigateToSystem(ctx, sourceSystem, safetyOpts);
-      if (!arrived) {
+      if (!arrived || bot.state !== "running") {
+        if (bot.state !== "running") {
+          ctx.log("system", "⛔ Stopping — emergency detected");
+          return;
+        }
         ctx.log("error", `Failed to reach ${sourceSystem}`);
         await sleep(30000);
         continue;
@@ -462,9 +470,17 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     // Only travel to and dock at source station if not already there
     if (!bot.docked || bot.poi !== settings.sourceStation) {
       await ensureUndocked(ctx);
+      if (bot.state !== "running") {
+        ctx.log("system", "⛔ Stopping — emergency detected");
+        return;
+      }
       if (bot.poi !== settings.sourceStation) {
         ctx.log("travel", `Traveling to source station ${settings.sourceStation}...`);
         const tResp = await bot.exec("travel", { target_poi: settings.sourceStation });
+        if (bot.state !== "running") {
+          ctx.log("system", "⛔ Stopping — emergency detected");
+          return;
+        }
         if (tResp.error && !tResp.error.message.includes("already")) {
           ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
           await sleep(30000);
@@ -604,6 +620,10 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     // Now travel to destination and deliver what we loaded
     yield "travel_to_dest";
     await ensureUndocked(ctx);
+    if (bot.state !== "running") {
+      ctx.log("system", "⛔ Stopping — emergency detected");
+      return;
+    }
     const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
     if (!fueled) {
       ctx.log("error", "Cannot refuel for delivery");
@@ -614,7 +634,11 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     if (bot.system !== destSystem) {
       ctx.log("travel", `Heading to ${destSystem}...`);
       const arrived = await navigateToSystem(ctx, destSystem, safetyOpts);
-      if (!arrived) {
+      if (!arrived || bot.state !== "running") {
+        if (bot.state !== "running") {
+          ctx.log("system", "⛔ Stopping — emergency detected");
+          return;
+        }
         ctx.log("error", `Failed to reach ${destSystem}`);
         allJobsCompleted = false;
         break;
@@ -622,9 +646,17 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     }
 
     await ensureUndocked(ctx);
+    if (bot.state !== "running") {
+      ctx.log("system", "⛔ Stopping — emergency detected");
+      return;
+    }
     if (bot.poi !== settings.destinationStation) {
       ctx.log("travel", `Traveling to ${settings.destinationStation}...`);
       const tResp = await bot.exec("travel", { target_poi: settings.destinationStation });
+      if (bot.state !== "running") {
+        ctx.log("system", "⛔ Stopping — emergency detected");
+        return;
+      }
       if (tResp.error && !tResp.error.message.includes("already")) {
         ctx.log("error", `Travel to dest failed: ${tResp.error.message}`);
         allJobsCompleted = false;
@@ -712,6 +744,10 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     // Travel back to source system if needed
     if (bot.system !== sourceSystem) {
       await ensureUndocked(ctx);
+      if (bot.state !== "running") {
+        ctx.log("system", "⛔ Stopping — emergency detected");
+        return;
+      }
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Cannot refuel to return to source");
@@ -720,7 +756,11 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       }
       ctx.log("travel", `Heading back to ${sourceSystem}...`);
       const arrived = await navigateToSystem(ctx, sourceSystem, safetyOpts);
-      if (!arrived) {
+      if (!arrived || bot.state !== "running") {
+        if (bot.state !== "running") {
+          ctx.log("system", "⛔ Stopping — emergency detected");
+          return;
+        }
         ctx.log("error", `Failed to reach ${sourceSystem}`);
         await sleep(30000);
         continue;
@@ -729,9 +769,17 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
     // Travel to source station and dock
     await ensureUndocked(ctx);
+    if (bot.state !== "running") {
+      ctx.log("system", "⛔ Stopping — emergency detected");
+      return;
+    }
     if (bot.poi !== settings.sourceStation) {
       ctx.log("travel", `Traveling back to ${settings.sourceStation}...`);
       const tResp = await bot.exec("travel", { target_poi: settings.sourceStation });
+      if (bot.state !== "running") {
+        ctx.log("system", "⛔ Stopping — emergency detected");
+        return;
+      }
       if (tResp.error && !tResp.error.message.includes("already")) {
         ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
         await sleep(30000);

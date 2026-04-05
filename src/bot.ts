@@ -1,7 +1,7 @@
 import { SpaceMoltAPI, type ApiResponse } from "./api.js";
 import { SessionManager, type Credentials } from "./session.js";
 import { log, logError, logNotifications } from "./ui.js";
-import { debugLog } from "./debug.js";
+import { debugLogForBot } from "./debug.js";
 import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
@@ -9,11 +9,6 @@ import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsCh
 import { processPrivateMessage as processCooperationPrivateMessage } from "./cooperation/rescueCooperation.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
-
-// Simple sleep helper to avoid circular dependency with common.ts
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 export interface CargoItem {
   itemId: string;
@@ -273,7 +268,7 @@ export class Bot {
     }
 
     this._lastAction = command;
-    debugLog("bot:exec", `${this.username} > ${command}`, payload);
+    debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
     let resp = await this.api.execute(command, payload);
 
     // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
@@ -338,7 +333,7 @@ export class Bot {
     if (resp.error) {
       const msg = resp.error.message || "";
       if (resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress")) {
-        debugLog("bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
+        debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
         this.log("system", "Action pending — waiting for server to process...");
         await sleep(10_000);
         // Refresh status before retry to ensure we're in a valid state
@@ -465,17 +460,17 @@ export class Bot {
   /** Fetch current game state and cache it. */
   async refreshStatus(): Promise<ApiResponse> {
     const resp = await this.exec("get_status");
-    debugLog("bot:refreshStatus", `${this.username} get_status response`, resp.result);
+    debugLogForBot(this.username, "bot:refreshStatus", `${this.username} get_status response`, resp.result);
     if (resp.result && typeof resp.result === "object") {
       const r = resp.result as Record<string, unknown>;
-      debugLog("bot:refreshStatus", `${this.username} top-level keys`, Object.keys(r));
+      debugLogForBot(this.username, "bot:refreshStatus", `${this.username} top-level keys`, Object.keys(r));
 
       // Player data may be nested under r.player or flat at top level
       const player = r.player as Record<string, unknown> | undefined;
       const p = player || r;
 
       this.credits = (p.credits as number) ?? this.credits;
-      debugLog("bot:credits", `${this.username} credits=${this.credits} raw=${p.credits}`);
+      debugLogForBot(this.username, "bot:credits", `${this.username} credits=${this.credits} raw=${p.credits}`);
       this.system = (p.current_system as string) ?? this.system;
       this.poi = (p.current_poi as string) ?? (p.poi_id as string) ?? this.poi;
       this.docked = p.docked_at_base != null
@@ -491,7 +486,7 @@ export class Bot {
 
       // Ship fields
       const ship = r.ship as Record<string, unknown> | undefined;
-      debugLog("bot:ship", `${this.username} ship object`, ship);
+      debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
       if (ship) {
         const rawName = (ship.name as string) || "";
         const shipType = (ship.ship_type as string) || (ship.type as string) || "";
@@ -868,8 +863,10 @@ export class Bot {
       this.log("customs", "⏰ Customs scan timeout - proceeding");
       return "timeout";
     }
-    
-    return this.customsHold.outcome || "cleared";
+
+    const outcome = this.customsHold.outcome;
+    if (outcome === "pending") return "cleared";
+    return outcome || "cleared";
   }
 
   /**
@@ -929,9 +926,9 @@ export class Bot {
             if (!contentLower.includes("mayday") && !isEmpireNpc) {
               playerNameStore.add(sender);
             } else if (isEmpireNpc) {
-              debugLog("playernames:skip", `${this.username}`, `Ignored empire NPC sender: "${sender}"`);
+              debugLogForBot(this.username, "playernames:skip", `${this.username}`, `Ignored empire NPC sender: "${sender}"`);
             } else {
-              debugLog("playernames:skip", `${this.username}`, `Ignored MAYDAY sender: "${sender}"`);
+              debugLogForBot(this.username, "playernames:skip", `${this.username}`, `Ignored MAYDAY sender: "${sender}"`);
             }
           }
 
@@ -1015,7 +1012,7 @@ export class Bot {
                   // Start customs hold - this will block travel/jump actions
                   this.startCustomsHold();
                   this.log("customs", "📋 Scan in progress - waiting for clearance...");
-                  logCustomsStop(this.username, this.system, this.poi, "pending");
+                  logCustomsStop(this.username, this.system, "pending");
 
                   // Send AI chat response to customs (only once per entire customs encounter)
                   // Check both aiResponseSent flag AND if we're still in the same hold session
@@ -1033,19 +1030,19 @@ export class Bot {
                 } else if (customsDetection.type === "cleared") {
                   // Clear the hold - scan complete, all good
                   this.clearCustomsHold("cleared");
-                  logCustomsStop(this.username, this.system, this.poi, "cleared");
+                  logCustomsStop(this.username, this.system, "cleared");
                   // No AI response for clearance - just log and continue
                 } else if (customsDetection.type === "contraband") {
                   // Clear hold - contraband found, penalty process complete
                   this.clearCustomsHold("contraband");
                   this.log("customs", "⚠️ Contraband detected - penalty process complete");
-                  logCustomsStop(this.username, this.system, this.poi, "contraband");
+                  logCustomsStop(this.username, this.system, "contraband");
                   // No AI response for contraband - just log and continue
                 } else if (customsDetection.type === "evasion_warning") {
                   // Clear hold - evasion noted, process complete
                   this.clearCustomsHold("evasion");
                   this.log("customs", "⚠️ Evasion warning - process complete");
-                  logCustomsStop(this.username, this.system, this.poi, "evasion");
+                  logCustomsStop(this.username, this.system, "evasion");
                   // No AI response for evasion - just log and continue
                 }
               }
@@ -1114,16 +1111,16 @@ export class Bot {
           this.currentBattle.battleId = battleId;
           this.currentBattle.lastUpdate = Date.now();
           this.currentBattle.participants = participants as Array<Record<string, unknown>>;
-          
-          debugLog("bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
+
+          debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
         }
       } else if (msgType === "battle_damage" && data && typeof data === "object") {
         // Battle damage also indicates we're in battle
         const attackerName = (data.attacker_name as string) || "";
         const targetName = (data.target_name as string) || "";
         const totalDamage = (data.total_damage as number) || 0;
-        
-        debugLog("bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
+
+        debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
       } else if (type === "system" && data && typeof data === "object") {
         const message = (data.message as string) || "";
         const msgLower = message.toLowerCase();
@@ -1133,7 +1130,7 @@ export class Bot {
           this.currentBattle.inBattle = false;
           this.currentBattle.battleId = null;
           this.currentBattle.participants = [];
-          debugLog("bot:battle", `${this.username} battle ended`);
+          debugLogForBot(this.username, "bot:battle", `${this.username} battle ended`);
         }
       }
 
@@ -1288,7 +1285,7 @@ export class Bot {
     const data = nearbyResult as Record<string, unknown>;
 
     // Debug: log what keys we have
-    debugLog("playernames:track", `${this.username}`, `get_nearby result keys: ${Object.keys(data).join(", ")}`);
+    debugLogForBot(this.username, "playernames:track", `${this.username}`, `get_nearby result keys: ${Object.keys(data).join(", ")}`);
 
     // First, collect all empire NPC names to exclude them from player tracking
     const empireNpcNames = new Set<string>();
@@ -1357,7 +1354,7 @@ export class Bot {
     }
 
     const totalFound = totalPlayersFound + piratesArray.length + empireNpcsArray.length;
-    debugLog("playernames:track", `${this.username}`, `Found ${totalFound} entities: ${totalPlayersFound} players, ${piratesArray.length} pirates, ${empireNpcsArray.length} empire NPCs. Added ${playerCount} new players, ${pirateCount} new pirates, ${empireNpcCount} new empire NPCs`);
+    debugLogForBot(this.username, "playernames:track", `${this.username}`, `Found ${totalFound} entities: ${totalPlayersFound} players, ${piratesArray.length} pirates, ${empireNpcsArray.length} empire NPCs. Added ${playerCount} new players, ${pirateCount} new pirates, ${empireNpcCount} new empire NPCs`);
 
     if (playerCount > 0 || pirateCount > 0 || empireNpcCount > 0) {
       this.log("playernames", `Discovered ${playerCount} new player(s), ${pirateCount} new pirate(s), ${empireNpcCount} new empire NPC(s) from nearby scan`);

@@ -24,7 +24,7 @@ import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
 import { setLogSink } from "./ui.js";
-import { debugLog } from "./debug.js";
+import { debugLogForBot } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { AiChatService } from "./aichat_service.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
@@ -97,22 +97,11 @@ function discoverBots(): void {
 /** Categories that go to the broadcast panel instead of bot log. */
 const BROADCAST_CATEGORIES = new Set(["broadcast", "chat", "dm"]);
 
-const LOGS_DIR = join(BASE_DIR, "data", "logs");
-
-/** Append a line to a bot's persistent log file (data/logs/{username}.log). */
-function appendBotLog(username: string, line: string): void {
-  try {
-    if (!existsSync(LOGS_DIR)) mkdirSync(LOGS_DIR, { recursive: true });
-    appendFileSync(join(LOGS_DIR, `${username}.log`), line + "\n");
-  } catch { /* ignore write errors */ }
-}
-
 function setupBotLogging(bot: Bot): void {
   bot.onLog = (username, category, message) => {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
-    const datestamp = new Date().toISOString().slice(0, 10);
     const line = `${timestamp} [${username}] [${category}] ${message}`;
-    debugLog("bot:onLog", `${username} cat=${category}`, message);
+    debugLogForBot(username, "bot:onLog", `${username} cat=${category}`, message);
     if (category === "system" || category === "error") {
       server.logSystem(line);
     }
@@ -120,8 +109,6 @@ function setupBotLogging(bot: Bot): void {
     // Per-bot log for profile page activity log
     const botLine = `${timestamp} [${category}] ${message}`;
     server.logBot(username, botLine);
-    // Persistent per-bot log file
-    appendBotLog(username, `${datestamp} ${botLine}`);
   };
   bot.onFactionLog = (_username, line) => {
     server.logFaction(line);
@@ -464,7 +451,7 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
     await bot.login();
   }
 
-  debugLog("exec:handler", `${botName} > ${command}`, params);
+  debugLogForBot(botName, "exec:handler", `${botName} > ${command}`, params);
   let resp = await bot.exec(command, params);
 
   // Track player names from get_nearby responses
@@ -534,11 +521,11 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   }
 
   if (resp.error) {
-    debugLog("exec:result", `${botName} > ${command} ERROR`, { error: resp.error.message, hasResult: resp.result !== undefined });
+    debugLogForBot(botName, "exec:result", `${botName} > ${command} ERROR`, { error: resp.error.message, hasResult: resp.result !== undefined });
     return { ok: false, error: resp.error.message, data: resp.result };
   }
 
-  debugLog("exec:result", `${botName} > ${command} OK`, { hasResult: resp.result !== undefined, resultType: typeof resp.result });
+  debugLogForBot(botName, "exec:result", `${botName} > ${command} OK`, { hasResult: resp.result !== undefined, resultType: typeof resp.result });
   return { ok: true, message: `${command} executed`, data: resp.result };
 }
 
@@ -558,12 +545,12 @@ async function main(): Promise<void> {
   // Route global ui.log() calls through the web server
   setLogSink((category, message) => {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
-    debugLog("sink:route", `category=${category}`, message);
+    debugLogForBot("SYSTEM", "sink:route", `category=${category}`, message);
     if (BROADCAST_CATEGORIES.has(category)) {
       const tagMatch = message.match(/^\[([^\]]+)\]\s*(.*)/s);
       if (tagMatch) {
         const [, tag, content] = tagMatch;
-        debugLog("sink:broadcast", `tag=${tag}`, content);
+        debugLogForBot("SYSTEM", "sink:broadcast", `tag=${tag}`, content);
         server.logBroadcast(`${tag} ${timestamp}`);
         server.logBroadcast(content);
         server.logBroadcast("");
@@ -574,10 +561,10 @@ async function main(): Promise<void> {
     }
     const line = `${timestamp} [${category}] ${message}`;
     if (category === "error") {
-      debugLog("sink:system", "error routed to system panel", line);
+      debugLogForBot("SYSTEM", "sink:system", "error routed to system panel", line);
       server.logSystem(line);
     }
-    debugLog("sink:activity", "routed to bot log", line);
+    debugLogForBot("SYSTEM", "sink:activity", "routed to bot log", line);
     server.logActivity(line);
   });
 
@@ -791,7 +778,7 @@ async function main(): Promise<void> {
           if (existsSync(sessionFile)) {
             try {
               rmSync(sessionFile);
-              debugLog("shutdown", `Deleted session file for ${botName}`);
+              debugLogForBot(botName, "shutdown", `Deleted session file for ${botName}`);
             } catch (err) {
               server.logSystem(`Warning: Failed to delete session file for ${botName}: ${err}`);
             }

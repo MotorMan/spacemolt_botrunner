@@ -167,6 +167,57 @@ table.bot-table td {
   white-space: nowrap;
   vertical-align: middle;
 }
+
+/* Column width optimization: give more space to fuel/cargo bars */
+table.bot-table thead th:nth-child(1),
+table.bot-table tbody td:nth-child(1) {
+  /* Name */
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+table.bot-table thead th:nth-child(2),
+table.bot-table tbody td:nth-child(2) {
+  /* Ship */
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+table.bot-table thead th:nth-child(3),
+table.bot-table tbody td:nth-child(3) {
+  /* State */
+  width: 1%;
+  white-space: nowrap;
+}
+table.bot-table thead th:nth-child(4),
+table.bot-table tbody td:nth-child(4) {
+  /* Credits */
+  width: 1%;
+  white-space: nowrap;
+}
+table.bot-table thead th:nth-child(5),
+table.bot-table tbody td:nth-child(5) {
+  /* Fuel */
+  min-width: 140px;
+}
+table.bot-table thead th:nth-child(6),
+table.bot-table tbody td:nth-child(6) {
+  /* Hull/Shield */
+  width: 1%;
+  white-space: nowrap;
+}
+table.bot-table thead th:nth-child(7),
+table.bot-table tbody td:nth-child(7) {
+  /* Cargo */
+  min-width: 140px;
+}
+table.bot-table thead th:nth-child(8),
+table.bot-table tbody td:nth-child(8) {
+  /* Location */
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 .bot-name-cell {
   color: var(--accent);
   cursor: pointer;
@@ -237,6 +288,38 @@ table.bot-table.compact-mode .row-actions button {
 .cargo-cell.cargo-full {
   color: var(--orange);
   font-weight: 600;
+}
+
+/* ── Cell bars for table view ──────────────────── */
+.cell-bar-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cell-bar-track {
+  flex: 1;
+  position: relative;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 3px;
+}
+.cell-bar-fuel {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.cell-bar-cargo {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}
+.cell-bar-text {
+  font-size: 10px;
+  color: var(--text-dim);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+  white-space: nowrap;
+  min-width: 42px;
+  text-align: right;
 }
 
 /* ── Grid View ──────────────────────────────────── */
@@ -316,13 +399,14 @@ table.bot-table.compact-mode .row-actions button {
   transition: width 0.3s;
 }
 .grid-bar-fill.bar-fuel {
-  background: var(--cyan);
+  /* Dynamic gradient set by JS based on fuel level */
 }
 .grid-bar-fill.bar-fuel.low {
-  background: var(--red);
+  /* Dynamic gradient set by JS, animation for low fuel */
+  animation: pulse-fuel 2s ease-in-out infinite;
 }
 .grid-bar-fill.bar-cargo {
-  background: var(--orange);
+  /* Dynamic gradient set by JS based on cargo level */
 }
 .grid-bar-value {
   width: 55px;
@@ -2465,7 +2549,6 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 
 .bar-fuel {
   height: 8px;
-  background: linear-gradient(90deg, #b45309, var(--fuel-color), #fcd34d);
   border-radius: 4px;
   transition: width 0.3s ease;
   position: relative;
@@ -2483,7 +2566,6 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 
 .bar-cargo {
   height: 6px;
-  background: linear-gradient(90deg, #059669, var(--cargo-color), #6ee7b7);
   border-radius: 3px;
   transition: width 0.3s ease;
 }

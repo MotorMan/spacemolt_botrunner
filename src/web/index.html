@@ -1038,11 +1038,14 @@ function renderBots() {
     return;
   }
   tbody.innerHTML = bots.map(bot => {
+    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
     const fuelDisplay = bot.maxFuel > 0 ? `${bot.fuel}/${bot.maxFuel}` : `${bot.fuel}`;
     const isLowFuel = bot.maxFuel > 0 && (bot.fuel / bot.maxFuel) < 0.2;
     const fuelClass = isLowFuel ? 'low-fuel' : '';
+    const fuelGradient = getFuelGradient(fuelPct);
     const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
     const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+    const cargoPct = bot.cargoMax > 0 ? Math.round((bot.cargo / bot.cargoMax) * 100) : 0;
     const cargoDisplay = bot.cargoMax > 0 ? `${bot.cargo}/${bot.cargoMax}` : `${bot.cargo}`;
     const isCargoFull = bot.cargoMax > 0 && (bot.cargo / bot.cargoMax) > 0.9;
     const cargoClass = isCargoFull ? 'cargo-full' : '';
@@ -1065,9 +1068,19 @@ function renderBots() {
       <td class="ship-cell">${esc(bot.shipName || '-')}</td>
       <td><span class="state-badge state-${bot.state}">${esc(stateLabel)}</span></td>
       <td>${num(bot.credits)}cr</td>
-      <td class="fuel-cell ${fuelClass}">${fuelDisplay}</td>
+      <td class="fuel-cell ${fuelClass}">
+        <div class="cell-bar-wrapper">
+          <div class="cell-bar-track"><div class="cell-bar-fuel" style="width:${fuelPct}%;${fuelGradient}"></div></div>
+          <span class="cell-bar-text">${fuelDisplay}</span>
+        </div>
+      </td>
       <td class="hull-shield-cell">${hullShd}</td>
-      <td class="cargo-cell ${cargoClass}">${cargoDisplay}</td>
+      <td class="cargo-cell ${cargoClass}">
+        <div class="cell-bar-wrapper">
+          <div class="cell-bar-track"><div class="cell-bar-cargo" style="width:${cargoPct}%;${getCargoGradient(cargoPct)}"></div></div>
+          <span class="cell-bar-text">${cargoDisplay}</span>
+        </div>
+      </td>
       <td class="location-cell" title="${esc(loc)}">${esc(loc)}</td>
       <td><div class="row-actions">${actions}</div></td>
     </tr>`;
@@ -1093,6 +1106,76 @@ const routineIcons = {
 
 function getRoutineIcon(routine) {
   return routineIcons[routine] || routineIcons.unknown;
+}
+
+/**
+ * Calculate fuel bar gradient based on fuel percentage
+ * >50%: solid green
+ * 35-50%: gradient from green to yellow
+ * 25-35%: gradient from yellow to red  
+ * <25%: solid red
+ */
+function getFuelGradient(fuelPct) {
+  if (fuelPct > 50) {
+    return 'background: linear-gradient(90deg, #22c55e, #4ade80);';
+  } else if (fuelPct > 35) {
+    // Interpolate between green and yellow
+    const t = (50 - fuelPct) / 15; // 0 at 50%, 1 at 35%
+    const r = Math.round(34 + t * (234 - 34));
+    const g = Math.round(197 + t * (183 - 197));
+    const b = Math.round(94 + t * (8 - 94));
+    const r2 = Math.round(74 + t * (250 - 74));
+    const g2 = Math.round(222 + t * (204 - 222));
+    const b2 = Math.round(128 + t * (107 - 128));
+    return `background: linear-gradient(90deg, rgb(${r},${g},${b}), rgb(${r2},${g2},${b2}));`;
+  } else if (fuelPct > 25) {
+    // Interpolate between yellow and red
+    const t = (35 - fuelPct) / 10; // 0 at 35%, 1 at 25%
+    const r = Math.round(234 + t * (239 - 234));
+    const g = Math.round(183 + t * (68 - 183));
+    const b = Math.round(8 + t * (68 - 8));
+    const r2 = Math.round(250 + t * (248 - 250));
+    const g2 = Math.round(204 + t * (113 - 204));
+    const b2 = Math.round(107 + t * (113 - 107));
+    return `background: linear-gradient(90deg, rgb(${r},${g},${b}), rgb(${r2},${g2},${b2}));`;
+  } else {
+    return 'background: linear-gradient(90deg, #dc2626, #f87171);';
+  }
+}
+
+/**
+ * Calculate cargo bar gradient based on cargo percentage
+ * <=50%: solid green
+ * 50-75%: gradient from green to yellow
+ * 75-85%: gradient from yellow to orange
+ * >85%: solid orange
+ */
+function getCargoGradient(cargoPct) {
+  if (cargoPct <= 50) {
+    return 'background: linear-gradient(90deg, #22c55e, #4ade80);';
+  } else if (cargoPct <= 75) {
+    // Interpolate between green and yellow
+    const t = (cargoPct - 50) / 25; // 0 at 50%, 1 at 75%
+    const r = Math.round(34 + t * (234 - 34));
+    const g = Math.round(197 + t * (183 - 197));
+    const b = Math.round(94 + t * (8 - 94));
+    const r2 = Math.round(74 + t * (250 - 74));
+    const g2 = Math.round(222 + t * (204 - 222));
+    const b2 = Math.round(128 + t * (107 - 128));
+    return `background: linear-gradient(90deg, rgb(${r},${g},${b}), rgb(${r2},${g2},${b2}));`;
+  } else if (cargoPct <= 85) {
+    // Interpolate between yellow and orange
+    const t = (cargoPct - 75) / 10; // 0 at 75%, 1 at 85%
+    const r = Math.round(234 + t * (249 - 234));
+    const g = Math.round(183 + t * (115 - 183));
+    const b = Math.round(8 + t * (13 - 8));
+    const r2 = Math.round(250 + t * (251 - 250));
+    const g2 = Math.round(204 + t * (146 - 204));
+    const b2 = Math.round(107 + t * (46 - 107));
+    return `background: linear-gradient(90deg, rgb(${r},${g},${b}), rgb(${r2},${g2},${b2}));`;
+  } else {
+    return 'background: linear-gradient(90deg, #ea580c, #f97316);';
+  }
 }
 
 function enableRoutineGroups() {
@@ -1155,6 +1238,8 @@ function renderBotGridCard(bot) {
   const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
   const cargoPct = bot.cargoMax > 0 ? Math.round((bot.cargo / bot.cargoMax) * 100) : 0;
   const isLowFuel = fuelPct < 20;
+  const fuelGradient = getFuelGradient(fuelPct);
+  const cargoGradient = getCargoGradient(cargoPct);
   const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
   const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
 
@@ -1169,14 +1254,14 @@ function renderBotGridCard(bot) {
         <div class="grid-bar-row">
           <span class="grid-bar-label">Fuel</span>
           <div class="grid-bar-track">
-            <div class="grid-bar-fill bar-fuel ${isLowFuel ? 'low' : ''}" style="width:${fuelPct}%"></div>
+            <div class="grid-bar-fill bar-fuel ${isLowFuel ? 'low' : ''}" style="width:${fuelPct}%;${fuelGradient}"></div>
           </div>
           <span class="grid-bar-value ${isLowFuel ? 'low-fuel' : ''}">${bot.fuel}/${bot.maxFuel}</span>
         </div>
         <div class="grid-bar-row">
           <span class="grid-bar-label">Cargo</span>
           <div class="grid-bar-track">
-            <div class="grid-bar-fill bar-cargo" style="width:${cargoPct}%"></div>
+            <div class="grid-bar-fill bar-cargo" style="width:${cargoPct}%;${cargoGradient}"></div>
           </div>
           <span class="grid-bar-value">${bot.cargo}/${bot.cargoMax}</span>
         </div>
@@ -1339,6 +1424,8 @@ function renderBotCard(bot) {
   const cargoPct = bot.cargoMax > 0 ? Math.round((bot.cargo / bot.cargoMax) * 100) : 0;
   const isExpanded = routineGroupsState.expandedBots.has(bot.username);
   const isLowFuel = fuelPct < 20;
+  const fuelGradient = getFuelGradient(fuelPct);
+  const cargoGradient = getCargoGradient(cargoPct);
 
   return `
     <div class="bot-card routine-${bot.routine} ${isExpanded ? 'expanded' : ''}"
@@ -1367,14 +1454,14 @@ function renderBotCard(bot) {
         <div class="bar-row">
           <span class="bar-label">Hull</span>
           <div class="bar-container">
-            <div class="bar-fuel ${isLowFuel ? 'low' : ''}" style="width:${fuelPct}%"></div>
+            <div class="bar-fuel ${isLowFuel ? 'low' : ''}" style="width:${fuelPct}%;${fuelGradient}"></div>
           </div>
           <span class="bar-value">${fuelPct}%</span>
         </div>
         <div class="bar-row">
           <span class="bar-label">Cargo</span>
           <div class="bar-container">
-            <div class="bar-cargo" style="width:${cargoPct}%"></div>
+            <div class="bar-cargo" style="width:${cargoPct}%;${cargoGradient}"></div>
           </div>
           <span class="bar-value">${cargoPct}%</span>
         </div>

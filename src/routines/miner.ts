@@ -1558,6 +1558,27 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         targetSystemId = bot.system;
         targetPoiId = "";
         targetPoiName = "";
+        
+        // CRITICAL FIX: Re-validate deep core equipment after jump timeout failure.
+        // Jump timeouts can leave the bot in an inconsistent state where equipment
+        // detection may have failed. Re-check and re-apply deep core restrictions.
+        if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
+          ctx.log("mining", "Re-validating deep core equipment after jump failure...");
+          const deepCoreCapRecheck = await getDeepCoreCapability(ctx);
+          if (!deepCoreCapRecheck.canMine) {
+            ctx.log("error", "Deep core equipment not detected after jump failure — cannot mine deep core ore");
+            ctx.log("error", "  Clearing deep core target to prevent mining wrong ore type");
+            effectiveTarget = "";
+            if (recoveredSession) {
+              ctx.log("mining", "Abandoning recovered session: equipment lost after jump timeout");
+              failMiningSession(bot.username, "Deep core equipment lost after jump timeout");
+              recoveredSession = null;
+            }
+          } else {
+            ctx.log("mining", "Deep core equipment re-validated after jump failure");
+          }
+        }
+        
         if (recoveredSession) {
           updateMiningSession(bot.username, { state: "mining" });
         }
@@ -1661,6 +1682,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Fallback: any matching POI type
     if (!miningPoi) {
+      // CRITICAL FIX: For deep core miners, don't fall back to mining regular ores
+      // if the deep core target isn't available in the current system.
+      if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
+        ctx.log("mining", `Deep core miner: ${effectiveTarget} not found in current system — waiting for next cycle to retry target`);
+        await sleep(30000);
+        continue;
+      }
+      
       if (miningType === "ice") {
         const iceField = pois.find(p => isIceFieldPoi(p.type));
         if (iceField) miningPoi = { id: iceField.id, name: iceField.name };
@@ -2165,14 +2194,74 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
           // CRITICAL FIX: Check global/configured target FIRST before falling back to quotas
           // This ensures energy_crystal (or any global target) doesn't get ignored when depleted
+          // DEEP CORE FIX: If this is a deep core miner, only accept deep core ore targets
           let newTarget: string | null = null;
           let newPoiId: string | null = null;
           let newPoiName: string | null = null;
           let newSystemId: string | null = null;
 
-          if (targetResource) {
-            ctx.log("mining", `Checking for configured global target ${resourceLabel}: ${targetResource}...`);
-            const globalTargetLocs = mapStore.findOreLocations(targetResource).filter(loc => {
+          // For deep core miners, check if we should search for deep core ores instead
+          const currentDeepCoreCap = await getDeepCoreCapability(ctx);
+          const isDeepCoreMiner = currentDeepCoreCap.canMine;
+          let searchTarget = targetResource;
+          
+          if (isDeepCoreMiner && (!searchTarget || !isDeepCoreOre(searchTarget))) {
+            ctx.log("mining", "Deep core miner — searching for deep core ore target after depletion...");
+            // Search for any available deep core ore
+            for (const deepCoreOre of DEEP_CORE_ORES) {
+              const deepCoreLocs = mapStore.findOreLocations(deepCoreOre).filter(loc => {
+                const sys = mapStore.getSystem(loc.systemId);
+                const poi = sys?.pois.find(p => p.id === loc.poiId);
+                return isOreBeltPoi(poi?.type || "") || poi?.hidden === true;
+              }).filter(loc => {
+                if (settings.ignoreDepletion) {
+                  if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+                    return false;
+                  }
+                  return true;
+                }
+                const sys = mapStore.getSystem(loc.systemId);
+                const poi = sys?.pois.find(p => p.id === loc.poiId);
+                const oreEntry = poi?.ores_found.find(o => o.item_id === deepCoreOre);
+                if (!oreEntry?.depleted) return true;
+                return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+              });
+
+              if (deepCoreLocs.length > 0) {
+                const blacklist = getSystemBlacklist();
+                const locsWithDist = deepCoreLocs
+                  .map(loc => {
+                    const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                    return { ...loc, jumps: route ? route.length - 1 : 999 };
+                  })
+                  .filter(loc => loc.jumps <= maxJumps)
+                  .sort((a, b) => {
+                    if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+                    if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+                    return a.jumps - b.jumps;
+                  });
+
+                if (locsWithDist.length > 0) {
+                  const chosen = locsWithDist[0];
+                  newTarget = deepCoreOre;
+                  newPoiId = chosen.poiId;
+                  newPoiName = chosen.poiName;
+                  newSystemId = chosen.systemId;
+                  const hiddenTag = chosen.isHidden ? " [HIDDEN POI]" : "";
+                  ctx.log("mining", `Found deep core target: ${deepCoreOre} @ ${chosen.poiName} (${chosen.jumps} jumps)${hiddenTag}`);
+                  break;
+                }
+              }
+            }
+
+            if (!newTarget) {
+              ctx.log("mining", "No deep core ores available — waiting for next cycle to retry");
+              stopReason = "no deep core ores available";
+              break;
+            }
+          } else if (searchTarget) {
+            ctx.log("mining", `Checking for configured global target ${resourceLabel}: ${searchTarget}...`);
+            const globalTargetLocs = mapStore.findOreLocations(searchTarget).filter(loc => {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
@@ -2276,7 +2365,15 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
 
           // If still no target found and we're set for "any", find any nearby ore
+          // DEEP CORE FIX: Don't fall back to regular ores for deep core miners
           if (!newTarget && !targetResource) {
+            // For deep core miners, don't fall back to regular ores
+            if (isDeepCoreMiner) {
+              ctx.log("mining", "Deep core miner — no target found, will wait for next cycle");
+              stopReason = "no deep core target available";
+              break;
+            }
+            
             // First try current system
             const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                            miningType === "ore" ? pois.filter(p => isOreBeltPoi(p.type)) :
@@ -2353,6 +2450,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             // Update target and continue mining
             const oldTarget = effectiveTarget;
             const oldPoi = miningPoi;
+            
+            // CRITICAL: Update effectiveTarget to the new target
+            effectiveTarget = newTarget;
 
             // Update session if active
             if (recoveredSession) {

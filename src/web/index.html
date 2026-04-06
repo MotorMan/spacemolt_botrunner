@@ -73,7 +73,9 @@
       <div style="margin-left:auto;display:flex;gap:6px;">
         <span class="filter-chip active" onclick="toggleShowDetails()">📄 Details: <span id="detailsToggleText">Off</span></span>
         <span class="filter-chip" onclick="toggleCollapseAll()">📌 Collapse All</span>
-        <button class="sm" onclick="toggleRoutineGroupsLayout()" title="Switch back to Table view">📊 Table View</button>
+        <button class="sm" onclick="toggleCompactMode()" id="compactModeBtn" title="Toggle compact mode">📐 Compact: Off</button>
+        <button class="sm" onclick="toggleGridView()" id="gridViewBtn" title="Toggle grid view">🔲 Grid: Off</button>
+        <button class="sm" onclick="toggleRoutineGroupsLayout()" title="Switch back to Table view">📊 Groups View</button>
       </div>
     </div>
     <div class="bot-table-wrap" id="originalTableWrap">
@@ -96,9 +98,9 @@
         </div>
       </div>
       <div class="bot-table-scroll">
-        <table class="bot-table">
+        <table class="bot-table" id="botTable">
           <thead>
-            <tr>
+            <tr id="botTableHeaderRow">
               <th>Name</th>
               <th>Ship</th>
               <th>State</th>
@@ -957,6 +959,10 @@ function connect() {
         if (document.getElementById('page-missions')?.classList.contains('active')) {
           renderMissionsFromMap();
         }
+        // Re-render settings tab if it's active (to update miner ore dropdowns)
+        if (document.getElementById('page-settings')?.classList.contains('active')) {
+          renderSettingsPanel();
+        }
         break;
       case 'statsUpdate':
         statsDaily = msg.statsDaily || {};
@@ -997,17 +1003,49 @@ function renderBots() {
   }
   pendingBotRender = false;
 
+  // Grid view rendering
+  if (gridView) {
+    const wrap = document.getElementById('originalTableWrap');
+    let gridContainer = document.getElementById('botGridContainer');
+    if (!gridContainer) {
+      const table = document.getElementById('botTable');
+      gridContainer = document.createElement('div');
+      gridContainer.id = 'botGridContainer';
+      gridContainer.className = 'bot-grid';
+      table.parentNode.insertBefore(gridContainer, table);
+      table.style.display = 'none';
+    }
+    gridContainer.style.display = 'grid';
+    document.getElementById('botTable').style.display = 'none';
+    if (bots.length === 0) {
+      gridContainer.innerHTML = '<div class="grid-empty">No bots configured</div>';
+      return;
+    }
+    gridContainer.innerHTML = bots.map(bot => renderBotGridCard(bot)).join('');
+    return;
+  } else {
+    // Make sure table is visible
+    const table = document.getElementById('botTable');
+    table.style.display = '';
+    const gridContainer = document.getElementById('botGridContainer');
+    if (gridContainer) gridContainer.style.display = 'none';
+  }
+
   const tbody = document.getElementById('botTableBody');
   if (bots.length === 0) {
     tbody.innerHTML = '<tr class="empty-row"><td colspan="9">No bots configured</td></tr>';
     return;
   }
   tbody.innerHTML = bots.map(bot => {
-    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) + '%' : bot.fuel;
+    const fuelDisplay = bot.maxFuel > 0 ? `${bot.fuel}/${bot.maxFuel}` : `${bot.fuel}`;
+    const isLowFuel = bot.maxFuel > 0 && (bot.fuel / bot.maxFuel) < 0.2;
+    const fuelClass = isLowFuel ? 'low-fuel' : '';
     const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
     const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+    const cargoDisplay = bot.cargoMax > 0 ? `${bot.cargo}/${bot.cargoMax}` : `${bot.cargo}`;
+    const isCargoFull = bot.cargoMax > 0 && (bot.cargo / bot.cargoMax) > 0.9;
+    const cargoClass = isCargoFull ? 'cargo-full' : '';
     const hullShd = (bot.maxHull > 0 || bot.maxShield > 0) ? `${bot.hull}/${bot.shield}` : '-';
-    const cargo = bot.cargoMax > 0 ? `${bot.cargo}/${bot.cargoMax}` : `${bot.cargo}`;
     let actions = '';
     if (bot.state !== 'running' && bot.state !== 'stopping') {
       const prevSel = document.getElementById(`routine-${bot.username}`);
@@ -1023,13 +1061,13 @@ function renderBots() {
     }
     return `<tr>
       <td class="bot-name-cell" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}</td>
-      <td>${esc(bot.shipName || '-')}</td>
+      <td class="ship-cell">${esc(bot.shipName || '-')}</td>
       <td><span class="state-badge state-${bot.state}">${esc(stateLabel)}</span></td>
       <td>${num(bot.credits)}cr</td>
-      <td>${fuelPct}</td>
-      <td>${hullShd}</td>
-      <td>${cargo}</td>
-      <td style="color:var(--cyan)">${esc(loc)}</td>
+      <td class="fuel-cell ${fuelClass}">${fuelDisplay}</td>
+      <td class="hull-shield-cell">${hullShd}</td>
+      <td class="cargo-cell ${cargoClass}">${cargoDisplay}</td>
+      <td class="location-cell" title="${esc(loc)}">${esc(loc)}</td>
       <td><div class="row-actions">${actions}</div></td>
     </tr>`;
   }).join('');
@@ -1057,10 +1095,18 @@ function getRoutineIcon(routine) {
 }
 
 function enableRoutineGroups() {
+  console.log('[Groups] Enabling groups, bots count:', bots.length);
   document.body.classList.add('routine-groups-active');
   document.getElementById('originalTableWrap').style.display = 'none';
-  document.getElementById('routineGroupsContainer').style.display = 'grid';
+  // Clean up grid container from table view if it exists
+  const gridContainer = document.getElementById('botGridContainer');
+  if (gridContainer) gridContainer.remove();
+  const botTable = document.getElementById('botTable');
+  if (botTable) botTable.style.display = '';
+  const container = document.getElementById('routineGroupsContainer');
+  container.style.display = 'grid';
   document.getElementById('routineGroupsFilterBar').style.display = 'flex';
+  console.log('[Groups] Container visible, calling renderRoutineGroups');
   renderRoutineGroups();
 }
 
@@ -1080,42 +1126,151 @@ function toggleRoutineGroupsLayout() {
   }
 }
 
+// ── Compact Mode & Grid View toggles ──────────────────────
+let compactMode = false;
+let gridView = false;
+
+function toggleCompactMode() {
+  compactMode = !compactMode;
+  gridView = false; // disable grid when compact is on
+  document.getElementById('gridViewBtn').textContent = '🔲 Grid: Off';
+  document.getElementById('compactModeBtn').textContent = compactMode ? '📐 Compact: On' : '📐 Compact: Off';
+  document.getElementById('botTable').classList.toggle('compact-mode', compactMode);
+  document.getElementById('originalTableWrap').classList.toggle('grid-view', false);
+  renderBots();
+}
+
+function toggleGridView() {
+  gridView = !gridView;
+  compactMode = false; // disable compact when grid is on
+  document.getElementById('compactModeBtn').textContent = '📐 Compact: Off';
+  document.getElementById('gridViewBtn').textContent = gridView ? '🔲 Grid: On' : '🔲 Grid: Off';
+  document.getElementById('botTable').classList.toggle('compact-mode', false);
+  document.getElementById('originalTableWrap').classList.toggle('grid-view', gridView);
+  renderBots();
+}
+
+function renderBotGridCard(bot) {
+  const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
+  const cargoPct = bot.cargoMax > 0 ? Math.round((bot.cargo / bot.cargoMax) * 100) : 0;
+  const isLowFuel = fuelPct < 20;
+  const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
+  const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+
+  return `
+    <div class="grid-bot-card" onclick="openProfile('${esc(bot.username)}')">
+      <div class="grid-bot-header">
+        <span class="grid-bot-name">${esc(bot.username)}</span>
+        <span class="state-badge state-${bot.state}">${esc(stateLabel)}</span>
+      </div>
+      <div class="grid-bot-ship">${esc(bot.shipName || '-')}</div>
+      <div class="grid-bot-bars">
+        <div class="grid-bar-row">
+          <span class="grid-bar-label">Fuel</span>
+          <div class="grid-bar-track">
+            <div class="grid-bar-fill bar-fuel ${isLowFuel ? 'low' : ''}" style="width:${fuelPct}%"></div>
+          </div>
+          <span class="grid-bar-value ${isLowFuel ? 'low-fuel' : ''}">${bot.fuel}/${bot.maxFuel}</span>
+        </div>
+        <div class="grid-bar-row">
+          <span class="grid-bar-label">Cargo</span>
+          <div class="grid-bar-track">
+            <div class="grid-bar-fill bar-cargo" style="width:${cargoPct}%"></div>
+          </div>
+          <span class="grid-bar-value">${bot.cargo}/${bot.cargoMax}</span>
+        </div>
+      </div>
+      <div class="grid-bot-location" title="${esc(loc)}">📍 ${esc(loc)}</div>
+      <div class="grid-bot-actions" onclick="event.stopPropagation()">
+        ${bot.state !== 'running' && bot.state !== 'stopping' ? `
+          <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>
+          <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" style="padding:2px 6px">✕</button>
+        ` : bot.state === 'running' ? `
+          <button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>
+        ` : ''}
+      </div>
+    </div>
+  `;
+}
+
 function renderRoutineGroups() {
   const container = document.getElementById('routineGroupsContainer');
   const emptyState = document.getElementById('emptyState');
   if (!container) return;
-  
+
   const filteredBots = bots.filter(bot => {
     const matchesSearch = !routineGroupsState.currentFilter.search || bot.username.toLowerCase().includes(routineGroupsState.currentFilter.search);
     const matchesRoutine = !routineGroupsState.currentFilter.routine || bot.routine === routineGroupsState.currentFilter.routine;
     const matchesStatus = !routineGroupsState.currentFilter.status || bot.state === routineGroupsState.currentFilter.status;
     return matchesSearch && matchesRoutine && matchesStatus;
   });
-  
+
   if (filteredBots.length === 0) {
-    emptyState.style.display = 'block';
+    if (emptyState) emptyState.style.display = 'block';
     container.style.display = 'none';
     return;
-  } else {
-    emptyState.style.display = 'none';
-    container.style.display = 'grid';
   }
-  
+  if (emptyState) emptyState.style.display = 'none';
+  container.style.display = 'grid';
+
   const grouped = {};
   filteredBots.forEach(bot => {
-    if (!grouped[bot.routine]) grouped[bot.routine] = [];
-    grouped[bot.routine].push(bot);
+    const r = bot.routine || 'unknown';
+    if (!grouped[r]) grouped[r] = [];
+    grouped[r].push(bot);
   });
-  
-  const allRoutines = [...new Set([...Object.keys(grouped), ...routines])];
-  
-  container.innerHTML = allRoutines.map(routine => {
-    const routineBots = grouped[routine] || [];
+
+  // Only include routines that actually have bots
+  const visibleRoutines = Object.keys(grouped).sort();
+
+  // Calculate span for each group based on bot count
+  const isCollapsed = routineGroupsState.allCollapsed;
+
+  // Build items for packing algorithm
+  const items = visibleRoutines.map(routine => ({
+    routine,
+    botCount: grouped[routine].length,
+    span: isCollapsed ? 2 : getSpanForBotCount(grouped[routine].length)
+  }));
+
+  // Shelf-packing: sort by span descending, then place in rows
+  const sorted = [...items].sort((a, b) => b.span - a.span || b.botCount - a.botCount);
+  const shelves = []; // { row, remaining, items: [] }
+  const positions = {};
+
+  for (const item of sorted) {
+    let placed = false;
+    // Try to find a shelf with enough remaining space
+    for (const shelf of shelves) {
+      if (shelf.remaining >= item.span) {
+        const col = 13 - shelf.remaining;
+        positions[item.routine] = { row: shelf.row, col, span: item.span };
+        shelf.remaining -= item.span;
+        shelf.items.push(item.routine);
+        placed = true;
+        break;
+      }
+    }
+    // Create new shelf if no existing one fits
+    if (!placed) {
+      const row = shelves.length + 1;
+      positions[item.routine] = { row, col: 1, span: item.span };
+      shelves.push({ row, remaining: 12 - item.span, items: [item.routine] });
+    }
+  }
+
+  // Render in original sorted order (alphabetical by routine name)
+  container.innerHTML = visibleRoutines.map(routine => {
+    const routineBots = grouped[routine];
     const runningCount = routineBots.filter(b => b.state === 'running').length;
-    const isHidden = routineBots.length === 0 && routineGroupsState.currentFilter.routine === '';
-    
+    const isDense = routineBots.length >= 8 && routineBots.length < 15;
+    const isUltraDense = routineBots.length >= 15;
+    const densityClass = isUltraDense ? 'ultra-dense' : (isDense ? 'dense' : '');
+    const pos = positions[routine];
+    const span = pos ? pos.span : 4;
+
     return `
-      <div class="routine-group routine-${routine} ${isHidden ? 'hidden' : ''} ${routineGroupsState.allCollapsed ? 'collapsed' : ''}" data-routine="${routine}">
+      <div class="routine-group routine-${routine}" data-routine="${routine}" data-span="${span}" style="grid-row:${pos.row};grid-column:${pos.col}/span ${pos.span};">
         <div class="routine-group-header" onclick="toggleRoutineGroup('${routine}')">
           <div class="routine-group-title">
             <span class="routine-group-chevron">▶</span>
@@ -1128,7 +1283,7 @@ function renderRoutineGroups() {
             <span>${runningCount}/${routineBots.length} running</span>
           </div>
         </div>
-        <div class="routine-group-body">
+        <div class="routine-group-body ${densityClass}">
           ${routineBots.map(bot => renderBotCard(bot)).join('')}
         </div>
       </div>
@@ -1136,9 +1291,44 @@ function renderRoutineGroups() {
   }).join('');
 }
 
+function getSpanForBotCount(count) {
+  if (count <= 0) return 2;
+  if (count === 1) return 2;
+  if (count === 2) return 3;
+  if (count <= 4) return 4;
+  if (count <= 8) return 6;
+  if (count <= 15) return 8;
+  if (count <= 25) return 10;
+  return 12;
+}
+
+// Re-calculate group layout on resize
+let groupResizeTimer = null;
+window.addEventListener('resize', () => {
+  if (!document.body.classList.contains('routine-groups-active')) return;
+  clearTimeout(groupResizeTimer);
+  groupResizeTimer = setTimeout(() => renderRoutineGroups(), 150);
+});
+
 function toggleRoutineGroup(routine) {
   const group = document.querySelector(`.routine-group[data-routine="${routine}"]`);
   if (group) group.classList.toggle('collapsed');
+}
+
+function toggleCollapseAll() {
+  routineGroupsState.allCollapsed = !routineGroupsState.allCollapsed;
+  renderRoutineGroups();
+}
+
+function filterBots() {
+  routineGroupsState.currentFilter.search = (document.getElementById('botSearch')?.value || '').toLowerCase();
+  routineGroupsState.currentFilter.routine = document.getElementById('routineFilter')?.value || '';
+  routineGroupsState.currentFilter.status = document.getElementById('statusFilter')?.value || '';
+  if (document.body.classList.contains('routine-groups-active')) {
+    renderRoutineGroups();
+  } else {
+    renderBots();
+  }
 }
 
 function renderBotCard(bot) {

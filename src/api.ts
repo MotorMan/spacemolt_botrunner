@@ -130,7 +130,7 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   install_mod: [...INV_STATUS, ...INV_SHIP, ...INV_CARGO],
   uninstall_mod: [...INV_STATUS, ...INV_SHIP, ...INV_CARGO],
   repair: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
-  refuel: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
+  refuel: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_CARGO],
   accept_mission: [...INV_STATUS, ...INV_MISSIONS],
   complete_mission: [...INV_STATUS, ...INV_MISSIONS],
   abandon_mission: [...INV_STATUS, ...INV_MISSIONS],

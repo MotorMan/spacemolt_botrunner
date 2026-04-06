@@ -208,6 +208,151 @@ table.bot-table td {
   padding: 16px 10px;
 }
 
+/* ── Compact Mode ───────────────────────────────── */
+table.bot-table.compact-mode {
+  font-size: 11px;
+}
+table.bot-table.compact-mode thead th {
+  padding: 4px 6px;
+  font-size: 10px;
+}
+table.bot-table.compact-mode td {
+  padding: 4px 6px;
+}
+table.bot-table.compact-mode .state-badge {
+  font-size: 9px;
+  padding: 1px 5px;
+}
+table.bot-table.compact-mode .row-actions select,
+table.bot-table.compact-mode .row-actions button {
+  font-size: 10px;
+  padding: 2px 4px;
+}
+
+/* ── Fuel & Cargo cell indicators ───────────────── */
+.fuel-cell.low-fuel {
+  color: var(--red);
+  font-weight: 600;
+}
+.cargo-cell.cargo-full {
+  color: var(--orange);
+  font-weight: 600;
+}
+
+/* ── Grid View ──────────────────────────────────── */
+.bot-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 8px;
+  padding: 8px 0;
+}
+.grid-empty {
+  color: var(--text-dim);
+  font-style: italic;
+  text-align: center;
+  padding: 24px;
+  grid-column: 1 / -1;
+}
+.grid-bot-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px;
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.grid-bot-card:hover {
+  background: var(--bg-row-hover);
+  border-color: var(--accent);
+}
+.grid-bot-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 4px;
+}
+.grid-bot-name {
+  font-weight: 600;
+  color: var(--accent);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 130px;
+}
+.grid-bot-ship {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-bottom: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.grid-bot-bars {
+  margin-bottom: 4px;
+}
+.grid-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 3px;
+  font-size: 10px;
+}
+.grid-bar-label {
+  width: 28px;
+  color: var(--text-dim);
+  flex-shrink: 0;
+}
+.grid-bar-track {
+  flex: 1;
+  height: 6px;
+  background: #21262d;
+  border-radius: 3px;
+  overflow: hidden;
+}
+.grid-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.3s;
+}
+.grid-bar-fill.bar-fuel {
+  background: var(--cyan);
+}
+.grid-bar-fill.bar-fuel.low {
+  background: var(--red);
+}
+.grid-bar-fill.bar-cargo {
+  background: var(--orange);
+}
+.grid-bar-value {
+  width: 55px;
+  text-align: right;
+  color: var(--text);
+  font-family: monospace;
+  font-size: 9px;
+  flex-shrink: 0;
+}
+.grid-bar-value.low-fuel {
+  color: var(--red);
+}
+.grid-bot-location {
+  font-size: 10px;
+  color: var(--cyan);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  margin-bottom: 4px;
+}
+.grid-bot-actions {
+  display: flex;
+  gap: 4px;
+  justify-content: flex-end;
+}
+.grid-bot-actions button {
+  font-size: 10px;
+  padding: 2px 6px;
+}
+
 /* ── Stats bar ──────────────────────────────────── */
 .stats-bar {
   display: flex;
@@ -2022,37 +2167,15 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 
 .routine-groups-container {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
-  gap: 12px;
-  padding: 16px;
+  grid-template-columns: repeat(12, 1fr);
+  grid-auto-rows: min-content;
+  gap: 10px;
+  padding: 12px;
   overflow-y: auto;
   flex: 1;
   min-height: 0;
   width: 100%;
-}
-
-@media (max-width: 1400px) {
-  .routine-groups-container {
-    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
-  }
-}
-
-@media (max-width: 1200px) {
-  .routine-groups-container {
-    grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
-  }
-}
-
-@media (max-width: 900px) {
-  .routine-groups-container {
-    grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  }
-}
-
-@media (max-width: 768px) {
-  .routine-groups-container {
-    grid-template-columns: 1fr;
-  }
+  align-content: start;
 }
 
 .routine-group {
@@ -2063,7 +2186,13 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   display: flex;
   flex-direction: column;
   transition: all 0.2s ease;
-  min-height: 0;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.3);
+  /* grid-column and grid-row set by JS packing algorithm */
+}
+
+.routine-group:hover {
+  box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+  border-color: #444c56;
 }
 
 .routine-group.hidden {
@@ -2151,10 +2280,53 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .routine-group-body {
   padding: 8px;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 8px;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 6px;
   transition: all 0.2s ease;
+  width: 100%;
 }
+
+/* Dense mode: smaller cards when many bots in a group */
+.routine-group-body.dense {
+  grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
+  gap: 4px;
+}
+
+.routine-group-body.dense .bot-card {
+  padding: 6px 8px;
+}
+
+.routine-group-body.dense .bot-card-name { font-size: 11px; }
+.routine-group-body.dense .bot-card-bars { gap: 2px; }
+.routine-group-body.dense .bar-row { gap: 4px; font-size: 8px; }
+.routine-group-body.dense .bar-label { min-width: 28px; font-size: 8px; }
+.routine-group-body.dense .bar-container { height: 4px; }
+.routine-group-body.dense .bar-value { min-width: 30px; font-size: 8px; }
+.routine-group-body.dense .bot-card-info { display: none !important; }
+.routine-group-body.dense .bot-card-ship { display: none; }
+
+/* Ultra-dense: for groups with 15+ bots */
+.routine-group-body.ultra-dense {
+  grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+  gap: 3px;
+}
+
+.routine-group-body.ultra-dense .bot-card {
+  padding: 4px 6px;
+  border-radius: 4px;
+}
+
+.routine-group-body.ultra-dense .bot-card-name { font-size: 10px; margin-bottom: 3px; }
+.routine-group-body.ultra-dense .bot-card-ship { display: none; }
+.routine-group-body.ultra-dense .bot-card-bars { gap: 1px; }
+.routine-group-body.ultra-dense .bar-row { gap: 3px; font-size: 7px; margin-bottom: 1px; }
+.routine-group-body.ultra-dense .bar-label { min-width: 24px; font-size: 7px; }
+.routine-group-body.ultra-dense .bar-container { height: 3px; }
+.routine-group-body.ultra-dense .bar-value { min-width: 26px; font-size: 7px; }
+.routine-group-body.ultra-dense .bot-card-info { display: none !important; }
+.routine-group-body.ultra-dense .bot-card-actions { display: none !important; }
+.routine-group-body.ultra-dense .status-label { font-size: 7px; }
+.routine-group-body.ultra-dense .status-dot { width: 4px; height: 4px; }
 
 .bot-card {
   background: var(--bg-input);
@@ -2169,7 +2341,7 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .bot-card:hover {
   background: var(--bg-row-hover);
   border-color: var(--accent);
-  transform: translateX(3px);
+  transform: scale(1.01);
 }
 
 .bot-card.expanded {

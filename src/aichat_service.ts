@@ -560,7 +560,7 @@ export class AiChatService {
     // This is a belt-and-suspenders check - bot.ts should already filter these,
     // but we double-check here to prevent self-talk loops
     if (msg.sender === msg.botUsername) {
-      this.logFn("ai_chat_debug", `Self-message ignored: ${msg.sender} === ${msg.botUsername}`);
+      this.logFn("ai_chat", `🚫 SELF-MESSAGE BLOCKED: ${msg.sender} === ${msg.botUsername} [${msg.channel}] "${msg.content.slice(0, 50)}"`);
       return;
     }
 
@@ -1524,7 +1524,7 @@ ${botContext}
     const systemPrompt = `${personality || "You are a helpful rescue pilot in SpaceMolt."}
 
 Context:
-- Your callsign: ${bot.username}
+- You are: ${bot.username} (use "I" and "me" when referring to yourself, NOT your name)
 - You are currently in: ${context.currentSystem}
 - Stranded pilot is in: ${context.targetSystem}${context.jumps ? ` (${context.jumps} jumps away)` : ""}
 - ${context.situation}
@@ -1536,7 +1536,8 @@ Style:
 - Keep it natural and in-character
 - Be concise (this is a radio transmission)
 - Include relevant details (ETA, jumps, etc.) if provided
-- Don't be overly verbose`;
+- Don't be overly verbose
+- Use 1st person ("I", "me", "my") when talking about yourself`;
 
     const userMessage = `Generate a private message to ${targetPlayer}:
 
@@ -1651,7 +1652,7 @@ Message:`;
     const systemPrompt = `${personality || "You are a rescue pilot in SpaceMolt."}
 
 Context:
-- Your callsign: ${bot.username}
+- You are: ${bot.username} (use "I" and "me" when referring to yourself, NOT your name)
 - You are currently in: ${context.currentSystem}
 - Target location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}${jumps ? ` (${jumps} jumps from your previous location)` : ""}
 - Target name: ${targetName}
@@ -1667,7 +1668,8 @@ Style:
 - ${styleGuide}
 - ${messageType === "rescue_no_show" ? "Show genuine annoyance - you wasted fuel and time!" : "Include relevant details (location, status) if appropriate"}
 - Don't be overly verbose
-- Mention the target by name (${targetName}) naturally in the message`;
+- Mention the target by name (${targetName}) naturally in the message
+- IMPORTANT: Use 1st person ("I", "me", "my") when talking about yourself. Do NOT say "${bot.username} here" or refer to yourself in 3rd person`;
 
     const userMessage = `Generate a faction chat message:
 

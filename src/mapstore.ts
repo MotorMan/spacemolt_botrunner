@@ -258,12 +258,16 @@ class MapStore {
       }));
     }
 
-    // Merge POIs — preserve existing ore & market data
+    // Merge POIs — preserve existing ore & market data AND hidden POIs
     const pois = systemData.pois as Array<Record<string, unknown>> | undefined;
     if (Array.isArray(pois)) {
       const existingPois = new Map(sys.pois.map((p) => [p.id, p]));
-      sys.pois = pois.map((p) => {
+      const updatedPoiIds = new Set<string>();
+
+      // Update/create POIs from the API response
+      const updatedPois = pois.map((p) => {
         const poiId = (p.id as string) || "";
+        updatedPoiIds.add(poiId);
         const prev = existingPois.get(poiId);
         return {
           id: poiId,
@@ -286,6 +290,16 @@ class MapStore {
           reveal_difficulty: (p.reveal_difficulty as number) ?? prev?.reveal_difficulty,
         };
       });
+
+      // Preserve hidden POIs that aren't in the API response
+      // (hidden POIs only appear via get_poi scans, not get_system)
+      for (const [poiId, existingPoi] of existingPois) {
+        if (!updatedPoiIds.has(poiId) && existingPoi.hidden) {
+          updatedPois.push(existingPoi as typeof updatedPois[number]);
+        }
+      }
+
+      sys.pois = updatedPois;
 
       // Auto-detect mobile_capitol station and update its location
       const mobileCapitolPoi = sys.pois.find((p) => p.id === "mobile_capital");
@@ -806,7 +820,7 @@ class MapStore {
     return this.data.systems[systemId]?.connections ?? [];
   }
 
-  /** Find all locations where a specific ore has been mined, sorted by total_mined descending (excluding pirate systems). */
+  /** Find all locations where a specific ore/resource has been mined or scanned. Checks both ores_found (mining history) and resources (scan data) so hidden POIs are included. */
   findOreLocations(oreId: string): Array<{
     systemId: string;
     systemName: string;
@@ -822,6 +836,10 @@ class MapStore {
     depletionPercent: number;
     /** Minutes since last resource scan */
     minutesSinceScan: number;
+    /** Whether this POI is hidden (deep core mining location) */
+    isHidden: boolean;
+    /** Richness of the resource (mining efficiency) */
+    richness: number;
   }> {
     const results: Array<{
       systemId: string;
@@ -834,36 +852,45 @@ class MapStore {
       maxRemaining: number;
       depletionPercent: number;
       minutesSinceScan: number;
+      isHidden: boolean;
+      richness: number;
     }> = [];
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
       if (this.isPirateSystem(sysId)) continue;
       const hasStation = sys.pois.some((p) => p.has_base);
       for (const poi of sys.pois) {
+        // Check both ores_found (mining history) AND resources (scan data)
+        // Hidden POIs often only have data in resources (from get_poi scans)
         const ore = poi.ores_found.find((o) => o.item_id === oreId);
-        if (ore) {
-          // Check for resource scan data
-          const resource = poi.resources?.find((r) => r.resource_id === oreId);
-          const remaining = resource?.remaining ?? 0;
-          const maxRemaining = resource?.max_remaining ?? 0;
-          const depletionPercent = resource?.depletion_percent ?? 0;
-          const minutesSinceScan = resource?.last_scanned
-            ? (Date.now() - new Date(resource.last_scanned).getTime()) / 60000
-            : Infinity;
+        const resource = poi.resources?.find((r) => r.resource_id === oreId);
 
-          results.push({
-            systemId: sysId,
-            systemName: sys.name || sysId,
-            poiId: poi.id,
-            poiName: poi.name || poi.id,
-            totalMined: ore.total_mined,
-            hasStation,
-            remaining,
-            maxRemaining,
-            depletionPercent,
-            minutesSinceScan,
-          });
-        }
+        // Skip if resource not found in either source
+        if (!ore && !resource) continue;
+
+        const remaining = resource?.remaining ?? 0;
+        const maxRemaining = resource?.max_remaining ?? 0;
+        const depletionPercent = resource?.depletion_percent ?? 0;
+        const richness = resource?.richness ?? 0;
+        const minutesSinceScan = resource?.last_scanned
+          ? (Date.now() - new Date(resource.last_scanned).getTime()) / 60000
+          : Infinity;
+        const totalMined = ore?.total_mined ?? 0;
+
+        results.push({
+          systemId: sysId,
+          systemName: sys.name || sysId,
+          poiId: poi.id,
+          poiName: poi.name || poi.id,
+          totalMined,
+          hasStation,
+          remaining,
+          maxRemaining,
+          depletionPercent,
+          minutesSinceScan,
+          isHidden: poi.hidden ?? false,
+          richness,
+        });
       }
     }
 
@@ -891,6 +918,7 @@ class MapStore {
   /**
    * Find the best mining location for a resource, scored by abundance and accessibility.
    * Prefers POIs with high remaining resources, low depletion, and recent scans.
+   * HEAVILY priorit hidden POIs (deep core mining) over regular POIs.
    */
   findBestMiningLocation(oreId: string, fromSystem?: string, blacklist?: string[]): Array<{
     systemId: string;
@@ -905,7 +933,11 @@ class MapStore {
     depletionPercent: number;
     minutesSinceScan: number;
     jumpsAway: number;
-    /** Composite score: higher = better. Factors in remaining, depletion, distance, scan freshness */
+    /** Whether this POI is hidden (deep core mining location) */
+    isHidden: boolean;
+    /** Richness of the resource (mining efficiency) */
+    richness: number;
+    /** Composite score: higher = better. Factors in remaining, depletion, distance, scan freshness, hidden status */
     score: number;
   }> {
     const locations = this.findOreLocations(oreId);
@@ -965,7 +997,18 @@ class MapStore {
           depletionPenalty = -30 * ((25 - loc.depletionPercent) / 15);
         }
 
-        const score = abundanceScore + availabilityScore + distanceScore + freshnessScore + depletionPenalty;
+        // 6. HIDDEN POI BONUS (CRITICAL for deep core mining)
+        // Hidden POIs are exclusive, high-value locations that should be prioritized
+        // They typically have: single ore type, high richness, large pools
+        // Score bonus: +200 points (guarantees they beat regular POIs)
+        const hiddenPoiBonus = loc.isHidden ? 200 : 0;
+
+        // 7. Richness bonus (0-30 points)
+        // Higher richness = more efficient mining (more ore per action)
+        // Richness ranges from ~1-100+, so scale accordingly
+        const richnessScore = Math.min(30, loc.richness * 0.3);
+
+        const score = abundanceScore + availabilityScore + distanceScore + freshnessScore + depletionPenalty + hiddenPoiBonus + richnessScore;
 
         return {
           ...loc,
@@ -1017,9 +1060,16 @@ class MapStore {
     const ores = new Map<string, string>();
     for (const sys of Object.values(this.data.systems)) {
       for (const poi of sys.pois) {
+        // From mining results (ores_found)
         for (const ore of poi.ores_found) {
           if (ore.item_id && !ores.has(ore.item_id)) {
             ores.set(ore.item_id, ore.name || ore.item_id);
+          }
+        }
+        // From POI scans (resources)
+        for (const res of poi.resources || []) {
+          if (res.resource_id && !ores.has(res.resource_id)) {
+            ores.set(res.resource_id, res.name || res.resource_id);
           }
         }
       }

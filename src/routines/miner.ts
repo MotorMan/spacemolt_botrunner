@@ -1238,36 +1238,96 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
           targetSystemId = bot.system;
         } else {
+          // ── Recovered session upgrade check ──
+          // If we have a recovered session, check if the best scored location is
+          // significantly better than the session's current POI. If so, abandon
+          // the old session and start fresh at the better location.
+          if (recoveredSession) {
+            const bestLoc = scoredLocations[0];
+            const sessionPoiId = recoveredSession.targetPoiId;
+            const sessionPoiName = recoveredSession.targetPoiName;
+
+            // Check if best location is different from session's POI
+            if (bestLoc.poiId !== sessionPoiId) {
+              // Hidden POI always wins over regular POIs for deep core mining
+              const bestIsHidden = bestLoc.isHidden;
+              const sessionIsHidden = sessionPoiId ? (() => {
+                const sys = mapStore.getSystem(recoveredSession.targetSystemId);
+                const poi = sys?.pois.find(p => p.id === sessionPoiId);
+                return poi?.hidden ?? false;
+              })() : false;
+
+              let shouldUpgrade = false;
+              let upgradeReason = "";
+
+              if (bestIsHidden && !sessionIsHidden) {
+                shouldUpgrade = true;
+                upgradeReason = `hidden POI upgrade (${bestLoc.poiName} vs ${sessionPoiName})`;
+              } else if (!bestIsHidden && !sessionIsHidden) {
+                // Both regular POIs — check if best is significantly better
+                // Compare: remaining pool size + richness + score
+                const sessionSys = mapStore.getSystem(recoveredSession.targetSystemId);
+                const sessionPoi = sessionSys?.pois.find(p => p.id === sessionPoiId);
+                const sessionResource = sessionPoi?.resources?.find(r => r.resource_id === effectiveTarget);
+                const sessionRemaining = sessionResource?.remaining ?? 0;
+                const sessionRichness = sessionResource?.richness ?? 0;
+
+                // Upgrade if new location has 2x+ remaining OR 2x+ richness OR 50+ point score advantage
+                if (bestLoc.remaining >= sessionRemaining * 2 && bestLoc.remaining > 1000) {
+                  shouldUpgrade = true;
+                  upgradeReason = `much larger pool (${bestLoc.remaining.toLocaleString()} vs ${sessionRemaining.toLocaleString()})`;
+                } else if (bestLoc.richness >= sessionRichness * 2 && bestLoc.richness > 10) {
+                  shouldUpgrade = true;
+                  upgradeReason = `much higher richness (${bestLoc.richness} vs ${sessionRichness})`;
+                } else if (bestLoc.score - (recoveredSession as any).lastKnownScore > 50) {
+                  shouldUpgrade = true;
+                  upgradeReason = `significantly better score (${bestLoc.score} vs session)`;
+                }
+              }
+
+              if (shouldUpgrade) {
+                ctx.log("mining", `Upgrading mining location: ${upgradeReason} — abandoning old session`);
+                failMiningSession(bot.username, `Location upgrade: ${upgradeReason}`);
+                recoveredSession = null;
+              } else {
+                ctx.log("mining", `Keeping recovered session at ${sessionPoiName} (no significant upgrade available)`);
+              }
+            }
+          }
+
           // CRITICAL FIX: Always prefer configured harvesting system if set (manual override)
           let chosenLoc: typeof scoredLocations[0] | undefined;
           if (configuredSystem) {
             chosenLoc = scoredLocations.find(loc => loc.systemId === configuredSystem);
             if (chosenLoc) {
-              const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available)`;
-              ctx.log("mining", `Found ${effectiveTarget} in configured harvesting system ${configuredSystem} (${chosenLoc.jumps} jumps) ${scanInfo} — manual override active`);
+              const hiddenTag = chosenLoc.isHidden ? " [HIDDEN POI]" : "";
+              const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available, richness: ${chosenLoc.richness})`;
+              ctx.log("mining", `Found ${effectiveTarget} in configured harvesting system ${configuredSystem} (${chosenLoc.jumps} jumps)${hiddenTag} ${scanInfo} — manual override active`);
             }
           }
           // If no location in configured system, prefer current system (0 jumps)
           if (!chosenLoc) {
             chosenLoc = scoredLocations.find(loc => loc.systemId === bot.system);
             if (chosenLoc) {
-              const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available)`;
-              ctx.log("mining", `Found ${effectiveTarget} in current system ${bot.system} ${scanInfo}`);
+              const hiddenTag = chosenLoc.isHidden ? " [HIDDEN POI]" : "";
+              const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available, richness: ${chosenLoc.richness})`;
+              ctx.log("mining", `Found ${effectiveTarget} in current system ${bot.system}${hiddenTag} ${scanInfo}`);
             }
           }
           // Pick best scored location (already sorted by composite score)
           if (!chosenLoc) {
             chosenLoc = scoredLocations[0];
-            const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available, score: ${chosenLoc.score})`;
-            ctx.log("mining", `Selected ${effectiveTarget} at ${chosenLoc.poiName} in ${chosenLoc.systemName} (${chosenLoc.jumps} jumps) ${scanInfo}`);
+            const hiddenTag = chosenLoc.isHidden ? " [HIDDEN POI]" : "";
+            const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available, richness: ${chosenLoc.richness}, score: ${chosenLoc.score})`;
+            ctx.log("mining", `Selected ${effectiveTarget} at ${chosenLoc.poiName} in ${chosenLoc.systemName} (${chosenLoc.jumps} jumps)${hiddenTag} ${scanInfo}`);
           }
 
           targetSystemId = chosenLoc.systemId;
           targetPoiId = chosenLoc.poiId;
           targetPoiName = chosenLoc.poiName;
 
-          // Create mining session if we don't have one and we're traveling to a new target
-          if (!recoveredSession && targetSystemId !== bot.system) {
+          // Create mining session if we don't have one and we're targeting a specific POI
+          if (!recoveredSession && targetPoiId) {
             const sysData = mapStore.getSystem(targetSystemId);
             const session = createMiningSession({
               botUsername: bot.username,
@@ -2140,12 +2200,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                   }
 
                   // Found a good target
-                  const scanInfo = loc.minutesSinceScan === Infinity ? "(never scanned)" : `(${loc.remaining.toLocaleString()}/${loc.maxRemaining.toLocaleString()}, ${loc.depletionPercent.toFixed(1)}% available, score: ${loc.score})`;
+                  const hiddenTag = loc.isHidden ? " [HIDDEN POI]" : "";
+                  const scanInfo = loc.minutesSinceScan === Infinity ? "(never scanned)" : `(${loc.remaining.toLocaleString()}/${loc.maxRemaining.toLocaleString()}, ${loc.depletionPercent.toFixed(1)}% available, richness: ${loc.richness}, score: ${loc.score})`;
                   newTarget = effectiveTarget || oreEntry?.item_id || loc.resourceId;
                   newPoiId = loc.poiId;
                   newPoiName = loc.poiName;
                   newSystemId = loc.systemId;
-                  ctx.log("mining", `Found ${newTarget} @ ${loc.poiName} in ${loc.systemName} (${loc.jumpsAway} jumps) ${scanInfo} - stayOutUntilFull`);
+                  ctx.log("mining", `Found ${newTarget} @ ${loc.poiName} in ${loc.systemName} (${loc.jumpsAway} jumps)${hiddenTag} ${scanInfo} - stayOutUntilFull`);
                   break;
                 }
               }

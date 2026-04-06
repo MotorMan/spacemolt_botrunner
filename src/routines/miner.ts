@@ -50,6 +50,7 @@ const DEEP_CORE_ORES = new Set([
   "legacy_ore",
   "prismatic_nebulite",
   "exotic_matter",
+  "dark_matter_residue",
 ]);
 
 /**
@@ -344,16 +345,22 @@ function getMinerSettings(username?: string): {
   };
 }
 
-/** Detect mining type from ship modules. */
-async function detectMiningType(ctx: RoutineContext): Promise<"ore" | "gas" | "ice" | null> {
+/** Detect mining type from ship modules. Uses cached modules if provided for resilience. */
+async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]): Promise<"ore" | "gas" | "ice" | null> {
   const { bot } = ctx;
-  const shipResp = await bot.exec("get_ship");
-  if (shipResp.error) {
-    ctx.log("error", `Failed to get ship info: ${shipResp.error.message}`);
-    return null;
+  let shipData: Record<string, unknown>;
+
+  if (cachedModules) {
+    shipData = { modules: cachedModules };
+  } else {
+    const shipResp = await bot.exec("get_ship");
+    if (shipResp.error) {
+      ctx.log("error", `Failed to get ship info: ${shipResp.error.message}`);
+      return null;
+    }
+    shipData = shipResp.result as Record<string, unknown>;
   }
 
-  const shipData = shipResp.result as Record<string, unknown>;
   const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
 
   let hasMiningLaser = false;
@@ -414,13 +421,19 @@ async function detectMiningType(ctx: RoutineContext): Promise<"ore" | "gas" | "i
 }
 
 /** Quick check: does the ship have equipment for a specific mining type? */
-async function hasEquipmentForMiningType(ctx: RoutineContext, miningType: "ore" | "gas" | "ice"): Promise<boolean> {
+async function hasEquipmentForMiningType(ctx: RoutineContext, miningType: "ore" | "gas" | "ice", cachedModules?: unknown[]): Promise<boolean> {
   const { bot } = ctx;
-  const shipResp = await bot.exec("get_ship");
-  if (shipResp.error) return false;
+  let modules: unknown[];
 
-  const shipData = shipResp.result as Record<string, unknown>;
-  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  if (cachedModules) {
+    modules = cachedModules;
+  } else {
+    const shipResp = await bot.exec("get_ship");
+    if (shipResp.error) return false;
+    const shipData = shipResp.result as Record<string, unknown>;
+    modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  }
+
   const moduleStr = modules.map(m => {
     const obj = typeof m === "object" && m !== null ? m as Record<string, unknown> : {};
     return `${obj.id || ""} ${obj.name || ""} ${obj.type || ""}`.toLowerCase();
@@ -800,18 +813,45 @@ async function dumpCargo(ctx: RoutineContext, settings: ReturnType<typeof getMin
     ctx.log("harvesting", "No cargo to deposit");
     return;
   }
+  let hadFallback = false;
   for (const item of cargoItems) {
     if (settings.depositMode === "faction") {
       const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
       if (fResp.error) {
+        ctx.log("warn", `Faction deposit failed for ${item.name}: ${fResp.error.message} — falling back to personal storage`);
         await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+        hadFallback = true;
       }
     } else {
       await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
     }
   }
   const names = cargoItems.map(i => `${i.quantity}x ${i.name}`).join(", ");
-  ctx.log("harvesting", `Deposited ${names} — cargo cleared`);
+  const locationTag = hadFallback ? " to personal storage (fallback)" : "";
+  ctx.log("harvesting", `Deposited ${names}${locationTag} — cargo cleared`);
+}
+
+/**
+ * Cache ship modules at routine start or after death recovery.
+ * This avoids repeated get_ship calls that may return incomplete data
+ * when the server is still processing (e.g. after a jump timeout).
+ * Returns the modules array, or null if detection failed.
+ */
+async function cacheShipModules(ctx: RoutineContext): Promise<unknown[] | null> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error) {
+    ctx.log("warn", `Failed to cache ship modules: ${shipResp.error.message}`);
+    return null;
+  }
+  const shipData = shipResp.result as Record<string, unknown>;
+  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  if (modules.length === 0) {
+    ctx.log("warn", "Ship modules not returned from get_ship — server may still be processing");
+    return null;
+  }
+  ctx.log("system", `Cached ${modules.length} ship modules for routine use`);
+  return modules;
 }
 
 // ── Miner routine ────────────────────────────────────────────
@@ -822,6 +862,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
   const settings0 = getMinerSettings(bot.username);
   const homeSystem = settings0.homeSystem || bot.system;
+
+  // ── Cache ship modules at routine start ──
+  // This avoids repeated get_ship calls that may return incomplete data
+  // when the server is still processing (e.g. after a jump timeout).
+  let cachedModules: unknown[] | null = await cacheShipModules(ctx);
 
   // ── Mining session recovery ──
   const activeSession = getActiveMiningSession(bot.username);
@@ -834,7 +879,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (locations.length > 0) {
         // Also check if we have equipment for this resource type
         const sessionMiningType = getMiningTypeForResource(activeSession.targetResourceId);
-        const hasEquipment = await hasEquipmentForMiningType(ctx, sessionMiningType);
+        const hasEquipment = await hasEquipmentForMiningType(ctx, sessionMiningType, cachedModules || undefined);
         if (!hasEquipment) {
           ctx.log("error", `Session invalid: no equipment for ${sessionMiningType} mining (${activeSession.targetResourceName}) — abandoning`);
           failMiningSession(bot.username, "No equipment for resource type");
@@ -860,6 +905,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Refresh cached ship modules after death recovery ──
+    // (modules could change if ship was destroyed and replaced)
+    cachedModules = await cacheShipModules(ctx);
 
     // ── Battle state tracking (per-cycle initialization) ──
     const battleState: BattleState = {
@@ -907,7 +956,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         let actualMiningType: "ore" | "gas" | "ice" = "ore";
         
         if (groupMiningType === "auto") {
-          const detected = await detectMiningType(ctx);
+          const detected = await detectMiningType(ctx, cachedModules || undefined);
           if (!detected) {
             ctx.log("error", "Cannot determine mining type for flock leader — waiting 30s");
             await sleep(30000);
@@ -935,7 +984,15 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         flockMiningType = actualMiningType;
         flockPhase = "gathering";
 
-        ctx.log("flock", `Leader target: ${flockTargetResource || "any"} (${flockMiningType}) @ ${groupSystem || "any system"}`);
+        // Deep core miner restriction for flock leaders: if this miner has deep core equipment,
+        // only accept deep core ore targets. Ignore regular ore targets from settings.
+        const deepCoreCap = await getDeepCoreCapability(ctx);
+        if (deepCoreCap.canMine && flockTargetResource && !isDeepCoreOre(flockTargetResource)) {
+          ctx.log("flock", `Deep core miner — ignoring regular ore target "${flockTargetResource}", will search for deep core ores`);
+          flockTargetResource = "";
+        }
+
+        ctx.log("flock", `Leader target: ${flockTargetResource || "any deep core ore"} (${flockMiningType}) @ ${groupSystem || "any system"}`);
       } else {
         // Follower: read flock state and follow leader's decisions
         const flockState = await readFlockState(settings.flockName);
@@ -977,7 +1034,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Re-evaluate mining type and target from settings each cycle ──
     let miningType: "ore" | "gas" | "ice" = "ore";
     if (settings.miningType === "auto") {
-      const detected = await detectMiningType(ctx);
+      const detected = await detectMiningType(ctx, cachedModules || undefined);
       if (!detected) {
         ctx.log("error", "Cannot determine mining type — please check ship equipment");
         await sleep(30000);
@@ -1083,6 +1140,88 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Determine effective target ──
     let effectiveTarget = recoveredSession ? recoveredSession.targetResourceId : priorityTarget;
     const isQuotaDriven = recoveredSession ? recoveredSession.isQuotaDriven : !!quotaTargetResource;
+    const maxJumps = settings.maxJumps || 10;
+    
+    // Initialize target location variables (may be set by deep core search below)
+    let targetSystemId = "";
+    let targetPoiId = "";
+    let targetPoiName = "";
+
+    // ── Deep core miner restriction ──
+    // If the miner has full deep core capability, restrict mining to deep core ores only
+    // This prevents deep core miners from being assigned to mundane regular ores
+    const deepCoreCap = await getDeepCoreCapability(ctx);
+    if (deepCoreCap.canMine) {
+      // If current target is not a deep core ore, search for one
+      if (effectiveTarget && !isDeepCoreOre(effectiveTarget)) {
+        ctx.log("mining", `Deep core miner detected — restricting to deep core ores only`);
+        ctx.log("mining", `Target ${effectiveTarget} is NOT a deep core ore — searching for deep core target`);
+        effectiveTarget = "";
+        if (recoveredSession) {
+          ctx.log("mining", "Abandoning recovered session: not a deep core ore");
+          failMiningSession(bot.username, "Not a deep core ore");
+          recoveredSession = null;
+        }
+      }
+
+      // If no effective target, search for available deep core ores
+      if (!effectiveTarget) {
+        ctx.log("mining", "Searching for available deep core ore targets...");
+        const blacklist = getSystemBlacklist();
+        let foundDeepCoreTarget = false;
+
+        // Try each deep core ore to find an available target
+        for (const deepCoreOre of DEEP_CORE_ORES) {
+          const locations = mapStore.findOreLocations(deepCoreOre).filter(loc => {
+            const sys = mapStore.getSystem(loc.systemId);
+            const poi = sys?.pois.find(p => p.id === loc.poiId);
+            // Deep core ores are in hidden POIs, so check for ore belts (they might be hidden)
+            return isOreBeltPoi(poi?.type || "") || poi?.hidden === true;
+          }).filter(loc => {
+            // Skip completely exhausted POIs
+            if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+              return false;
+            }
+            if (settings.ignoreDepletion) return true;
+            const sys = mapStore.getSystem(loc.systemId);
+            const poi = sys?.pois.find(p => p.id === loc.poiId);
+            const oreEntry = poi?.ores_found.find(o => o.item_id === deepCoreOre);
+            if (!oreEntry?.depleted) return true;
+            return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+          });
+
+          if (locations.length > 0) {
+            // Score locations and pick best one
+            const scoredLocations = mapStore.findBestMiningLocation(deepCoreOre, bot.system, blacklist)
+              .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+              .map(loc => {
+                const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                return { ...loc, jumps: route ? route.length - 1 : 999 };
+              })
+              .filter(loc => loc.jumps <= maxJumps);
+
+            if (scoredLocations.length > 0) {
+              const chosen = scoredLocations[0];
+              effectiveTarget = deepCoreOre;
+              targetPoiId = chosen.poiId;
+              targetPoiName = chosen.poiName;
+              targetSystemId = chosen.systemId;
+              const hiddenTag = chosen.isHidden ? " [HIDDEN POI]" : "";
+              const scanInfo = chosen.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosen.remaining.toLocaleString()}/${chosen.maxRemaining.toLocaleString()}, richness: ${chosen.richness})`;
+              ctx.log("mining", `Found deep core target: ${deepCoreOre} @ ${chosen.poiName} in ${chosen.systemName} (${chosen.jumps} jumps)${hiddenTag} ${scanInfo}`);
+              foundDeepCoreTarget = true;
+              break;
+            }
+          }
+        }
+
+        if (!foundDeepCoreTarget) {
+          ctx.log("error", "No deep core ore targets found — waiting 60s before retry");
+          await sleep(60000);
+          continue;
+        }
+      }
+    }
 
     // ── Deep core ore equipment validation ──
     // If the target is a deep core ore, verify we have the proper equipment
@@ -1165,9 +1304,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Determine mining destination ──
     yield "find_destination";
-    let targetSystemId = "";
-    let targetPoiId = "";
-    let targetPoiName = "";
+    // targetSystemId, targetPoiId, targetPoiName already declared above
 
     // Smart system selection: check the matching mining type first, but fall back
     // to other fields or legacy `system` setting if not configured.
@@ -1180,7 +1317,6 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       // gas
       configuredSystem = settings.systemGas || settings.systemOre || settings.systemIce || settings.system || "";
     }
-    const maxJumps = settings.maxJumps || 10;
 
     if (configuredSystem) {
       ctx.log("mining", `Configured harvesting system for ${miningType}: ${configuredSystem}`);
@@ -2369,10 +2505,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (bot.state !== "running") break;
 
     // ── Return to home system if we traveled away ──
-    // When stayOutUntilFull is enabled, only return home if cargo is full
+    // When stayOutUntilFull is enabled, only return home if cargo is full OR
+    // if we stopped mining due to depletion (no alternative POI found)
     const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
-    const shouldReturnHome = settings.stayOutUntilFull 
-      ? (fillRatio >= cargoThresholdRatio && bot.system !== homeSystem && homeSystem)
+    const isDepleted = stopReason && stopReason.includes("depleted");
+    const shouldReturnHome = settings.stayOutUntilFull
+      ? ((fillRatio >= cargoThresholdRatio || isDepleted) && bot.system !== homeSystem && homeSystem)
       : (bot.system !== homeSystem && homeSystem);
 
     if (shouldReturnHome) {
@@ -2461,11 +2599,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const modeLabel: Record<string, string> = {
         storage: "station storage", faction: "faction storage", sell: "market",
       };
-      const primaryLabel = settings.depositBot
+      const intendedLabel = settings.depositBot
         ? `${settings.depositBot}'s storage`
         : (modeLabel[settings.depositMode] || "storage");
 
       const unloadedItems: string[] = [];
+      let hadFallback = false;
       for (const item of cargoItems) {
         const itemId = (item.item_id as string) || "";
         const quantity = (item.quantity as number) || 0;
@@ -2475,17 +2614,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (settings.depositMode === "sell") {
           const sellResp = await bot.exec("sell", { item_id: itemId, quantity });
           if (sellResp.error) {
+            ctx.log("warn", `Market sell failed for ${displayName} — falling back to personal storage`);
             await bot.exec("deposit_items", { item_id: itemId, quantity });
+            hadFallback = true;
           }
         } else if (settings.depositMode === "faction") {
           const fResp = await bot.exec("faction_deposit_items", { item_id: itemId, quantity });
           if (fResp.error) {
+            ctx.log("warn", `Faction deposit failed for ${displayName}: ${fResp.error.message} — falling back to personal storage`);
             await bot.exec("deposit_items", { item_id: itemId, quantity });
+            hadFallback = true;
           }
         } else if (settings.depositBot) {
           const gResp = await bot.exec("send_gift", { recipient: settings.depositBot, item_id: itemId, quantity });
           if (gResp.error) {
+            ctx.log("warn", `Gift to ${settings.depositBot} failed for ${displayName}: ${gResp.error.message} — falling back to personal storage`);
             await bot.exec("deposit_items", { item_id: itemId, quantity });
+            hadFallback = true;
           }
         } else {
           await bot.exec("deposit_items", { item_id: itemId, quantity });
@@ -2495,7 +2640,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       if (unloadedItems.length > 0) {
-        ctx.log("trade", `Unloaded ${unloadedItems.join(", ")} → ${primaryLabel}`);
+        const actualLabel = hadFallback ? "personal storage (fallback)" : intendedLabel;
+        ctx.log("trade", `Unloaded ${unloadedItems.join(", ")} → ${actualLabel}`);
       }
 
       // Update session state after depositing

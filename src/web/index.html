@@ -873,7 +873,10 @@ function connect() {
         renderMapStats();
         setTimeout(refreshFactionFunds, 2000);
         updateChatBotSelect();
-        renderSettingsPanel();
+        // Only re-render settings if settings tab is not active (to avoid clearing unsaved changes)
+        if (!document.getElementById('page-settings')?.classList.contains('active')) {
+          renderSettingsPanel();
+        }
         updateAiChatToggleButton();
         updateBulkStartDropdown();
         if (msg.logs) {
@@ -959,10 +962,8 @@ function connect() {
         if (document.getElementById('page-missions')?.classList.contains('active')) {
           renderMissionsFromMap();
         }
-        // Re-render settings tab if it's active (to update miner ore dropdowns)
-        if (document.getElementById('page-settings')?.classList.contains('active')) {
-          renderSettingsPanel();
-        }
+        // NOTE: Do NOT re-render settings panel on mapUpdate - it clears unsaved changes
+        // The settings panel will be updated with new ore/system data when user next switches tabs
         break;
       case 'statsUpdate':
         statsDaily = msg.statsDaily || {};
@@ -6271,6 +6272,17 @@ function renderTradeBuyerSettings(panel) {
   const buyItems = Array.isArray(t.buyItems) ? t.buyItems : [];
   const maxPrices = t.maxPrices || {};
 
+  // Build home system dropdown options
+  const homeOpts = ['<option value="">(select home system)</option>'];
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+    const sel = sys.id === homeSystem ? ' selected' : '';
+    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+    homeOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+  }
+  if (homeSystem && !knownSystems.find(s => s.id === homeSystem)) {
+    homeOpts.push(`<option value="${esc(homeSystem)}" selected>${esc(homeSystem)}</option>`);
+  }
+
   // Use catalog items
   const catalogItems = Object.values(catalog.items || {}).filter(i => i.tradeable !== false);
   catalogItems.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
@@ -6317,7 +6329,7 @@ function renderTradeBuyerSettings(panel) {
         <div class="setting-label">Home System</div>
         <div class="setting-hint">Required. The system where items will be deposited to faction storage.</div>
       </div>
-      <input type="text" id="set-trade_buyer-homeSystem" value="${esc(homeSystem)}" placeholder="e.g. sol" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px">
+      <select id="set-trade_buyer-homeSystem" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;min-width:200px">${homeOpts.join('')}</select>
     </div>
 
     <div class="setting-row">

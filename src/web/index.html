@@ -377,9 +377,6 @@
         <div class="sidebar-item" onclick="switchSettingsTab('escort')">Escort</div>
         <div class="sidebar-item" onclick="switchSettingsTab('fleet_hunter')">Fleet Hunter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cargo_mover')">CargoMover</div>
-        <div class="sidebar-item" onclick="switchSettingsTab('fuel_transfer')">FuelTransfer</div>
-        <div class="sidebar-item" onclick="switchSettingsTab('manual_rescue')">ManualRescue</div>
-        <div class="sidebar-item" onclick="switchSettingsTab('mayday')">MaydayRescue</div>
       </div>
       <div class="settings-panel" id="settingsContent">
         <!-- filled by JS -->
@@ -4933,12 +4930,6 @@ function renderSettingsPanel() {
     renderFleetHunterSettings(panel);
   } else if (activeSettingsTab === 'cargo_mover') {
     renderCargoMoverSettings(panel);
-  } else if (activeSettingsTab === 'fuel_transfer') {
-    renderFuelTransferSettings(panel);
-  } else if (activeSettingsTab === 'manual_rescue') {
-    renderManualRescueSettings(panel);
-  } else if (activeSettingsTab === 'mayday') {
-    renderMaydaySettings(panel);
   }
 }
 
@@ -5854,6 +5845,7 @@ function renderRescueSettings(panel) {
   const cooperationEnabled = r.cooperationEnabled ?? false;
   const partnerBotName = r.partnerBotName || '';
   const cooperationMaxDelaySeconds = r.cooperationMaxDelaySeconds ?? 30;
+  const creditTopOffAmount = r.creditTopOffAmount ?? 10000;
 
   // Build system options from mapData
   const systems = Object.keys(mapData || {}).sort();
@@ -5976,10 +5968,18 @@ function renderRescueSettings(panel) {
 
     <div class="settings-group" style="background:rgba(59,130,246,0.1);border-left:3px solid var(--accent);padding:12px">
       <small style="color:var(--dim)">
-        <strong>How it works:</strong> When both bots detect the same MAYDAY, they exchange distance info (jumps away). 
+        <strong>How it works:</strong> When both bots detect the same MAYDAY, they exchange distance info (jumps away).
         The closer bot takes priority. Messages include timestamps to handle chat delays.
         Format: <code style="background:rgba(0,0,0,0.2);padding:2px 4px">RESCUE_CLAIM|player|system|timestamp|jumps|bot_name</code>
       </small>
+    </div>
+
+    <hr style="border-color:var(--dim);opacity:0.3;margin:16px 0">
+
+    <div class="settings-group">
+      <label>💰 Credit top-off amount (0 = disabled)</label>
+      <input type="number" id="set-rescue-creditTopOffAmount" value="${creditTopOffAmount}" min="0" max="100000" step="1000" style="width:100px">
+      <small style="color:var(--dim)">Automatically top up all fleet bots (including self) to this credit amount from faction treasury (default: 10000)</small>
     </div>
 
     <button class="btn" onclick="saveRescueSettings()">Save</button>
@@ -6002,121 +6002,10 @@ function saveRescueSettings() {
     cooperationEnabled: document.getElementById('set-rescue-cooperationEnabled').checked || false,
     partnerBotName: document.getElementById('set-rescue-partnerBotName').value || '',
     cooperationMaxDelaySeconds: parseInt(document.getElementById('set-rescue-cooperationMaxDelay').value) || 30,
+    creditTopOffAmount: parseInt(document.getElementById('set-rescue-creditTopOffAmount').value) || 10000,
   };
   send({ type: 'saveSettings', routine: 'rescue', settings: s });
   alert('FuelRescue settings saved!');
-}
-
-// ── MaydayRescue settings ──────────────────────────────────
-function renderMaydaySettings(panel) {
-  const m = settings.mayday || {};
-  const fuelThreshold = m.fuelThreshold ?? 25;
-  const autoRefuel = m.autoRefuel !== false;
-
-  panel.innerHTML = `
-    <h3 style="margin:0 0 12px;color:var(--text)">MaydayRescue Settings</h3>
-    <p style="color:var(--dim);font-size:0.85em;margin:0 0 16px">
-      Automatically responds to MAYDAY emergency chat messages from stranded pilots.
-      Validates requests to avoid ambushes by only responding to ships with critically low fuel.
-    </p>
-
-    <div class="settings-group">
-      <label>Max fuel threshold to respond (%)</label>
-      <input type="number" id="set-mayday-fuelThreshold" value="${fuelThreshold}" min="5" max="50" style="width:80px">
-      <small style="color:var(--dim)">Only respond to MAYDAYs where pilot has less than this % fuel (avoids ambushes)</small>
-    </div>
-
-    <div class="settings-group">
-      <label style="display:flex;align-items:center;gap:8px">
-        <input type="checkbox" id="set-mayday-autoRefuel" ${autoRefuel ? 'checked' : ''}>
-        Auto-refuel after each rescue
-      </label>
-      <small style="color:var(--dim)">Automatically refuel to 100% after completing a rescue mission</small>
-    </div>
-
-    <div class="settings-hint" style="margin-top:16px;padding:12px;background:rgba(255,100,100,0.1);border-left:3px solid var(--red)">
-      <strong>⚠️ Ambush Protection:</strong> Always verify the MAYDAY sender's fuel level before responding.
-      The default 25% threshold helps filter out fake distress calls from pirates.
-    </div>
-
-    <button class="btn" onclick="saveMaydaySettings()" style="margin-top:16px">Save</button>
-  `;
-}
-
-function saveMaydaySettings() {
-  const s = {
-    fuelThreshold: parseInt(document.getElementById('set-mayday-fuelThreshold').value) || 25,
-    autoRefuel: document.getElementById('set-mayday-autoRefuel').checked,
-  };
-  send({ type: 'saveSettings', routine: 'mayday', settings: s });
-  alert('MaydayRescue settings saved!');
-}
-
-// ── FuelTransfer settings ──────────────────────────────────
-function renderFuelTransferSettings(panel) {
-  const f = settings.fuel_transfer || {};
-  const refuelThreshold = f.refuelThreshold ?? 60;
-  const homeSystem = f.homeSystem || '';
-
-  // Build system options from mapData
-  const systems = Object.keys(mapData || {}).sort();
-  const sysOpts = ['<option value="">(none - use starting system)</option>'];
-  for (const sys of systems) {
-    const sel = sys === homeSystem ? ' selected' : '';
-    sysOpts.push(`<option value="${esc(sys)}"${sel}>${esc(sys)}</option>`);
-  }
-
-  panel.innerHTML = `
-    <h3 style="margin:0 0 12px;color:var(--text)">FuelTransfer Settings</h3>
-    <p style="color:var(--dim);font-size:0.85em;margin:0 0 16px">
-      Uses a dedicated fuel transfer ship with Refueling Pump module to directly refuel stranded ships.
-      Requires the refueling_pump module to be installed on the ship.
-    </p>
-
-    <div class="settings-group">
-      <label>Home System</label>
-      <select id="set-fueltransfer-homeSystem" style="width:100%;max-width:300px">${sysOpts.join('')}</select>
-      <small style="color:var(--dim)">Return to this system after completing rescues (defaults to starting system if not set)</small>
-    </div>
-
-    <div class="settings-group">
-      <label>Self refuel threshold (%)</label>
-      <input type="number" id="set-fueltransfer-refuelThreshold" value="${refuelThreshold}" min="30" max="90" style="width:80px">
-      <small style="color:var(--dim)">Keep transfer ship's own fuel above this level</small>
-    </div>
-
-    <button class="btn" onclick="saveFuelTransferSettings()" style="margin-top:16px">Save</button>
-  `;
-}
-
-function saveFuelTransferSettings() {
-  const s = {
-    homeSystem: document.getElementById('set-fueltransfer-homeSystem').value || '',
-    refuelThreshold: parseInt(document.getElementById('set-fueltransfer-refuelThreshold').value) || 60,
-  };
-  send({ type: 'saveSettings', routine: 'fuel_transfer', settings: s });
-  alert('FuelTransfer settings saved!');
-}
-
-// ── ManualRescue settings ──────────────────────────────────
-function renderManualRescueSettings(panel) {
-  panel.innerHTML = `
-    <h3 style="margin:0 0 12px;color:var(--text)">ManualRescue Settings</h3>
-    <p style="color:var(--dim);font-size:0.85em;margin:0 0 16px">
-      Manual player rescue missions are initiated from the bot's profile page.
-      Use the Manual Player Rescue controls to send a rescue bot to a specific player at a specific location.
-    </p>
-
-    <div class="settings-hint" style="padding:12px;background:rgba(100,100,255,0.1);border-left:3px solid var(--blue)">
-      <strong>ℹ️ How to use:</strong>
-      <ol style="margin:8px 0 0 16px;color:var(--dim)">
-        <li>Open a bot's profile page</li>
-        <li>Scroll to "Manual Player Rescue" section</li>
-        <li>Select system, POI, and enter player name</li>
-        <li>Click "🚀 Start Rescue Mission"</li>
-      </ol>
-    </div>
-  `;
 }
 
 // ── Coordinator Settings ────────────────────────────────────

@@ -5,7 +5,7 @@ import { SessionManager } from "./session.js";
 import { minerRoutine } from "./routines/miner.js";
 import { explorerRoutine } from "./routines/explorer.js";
 import { crafterRoutine } from "./routines/crafter.js";
-import { rescueRoutine, fuelTransferRoutine, manualPlayerRescueRoutine, maydayRescueRoutine } from "./routines/rescue.js";
+import { rescueRoutine } from "./routines/rescue.js";
 import { coordinatorRoutine } from "./routines/coordinator.js";
 import { traderRoutine } from "./routines/trader.js";
 import { salvagerRoutine } from "./routines/salvager.js";
@@ -57,9 +57,6 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   explorer: { name: "Explorer", fn: explorerRoutine },
   crafter: { name: "Crafter", fn: crafterRoutine },
   rescue: { name: "FuelRescue", fn: rescueRoutine },
-  fuel_transfer: { name: "FuelTransfer", fn: fuelTransferRoutine },
-  manual_rescue: { name: "ManualRescue", fn: manualPlayerRescueRoutine },
-  mayday: { name: "MaydayRescue", fn: maydayRescueRoutine },
   coordinator: { name: "Coordinator", fn: coordinatorRoutine },
   trader: { name: "Trader", fn: traderRoutine },
   salvager: { name: "Salvager", fn: salvagerRoutine },

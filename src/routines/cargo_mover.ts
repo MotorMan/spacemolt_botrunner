@@ -355,16 +355,16 @@ async function depositToDestination(
       return { success: false, depositedQty: 0 };
     }
 
-    // Prevent sending gifts to self — fall back to faction deposit
+    // Prevent sending gifts to self — fall back to personal storage deposit
     if (destinationBotName.toLowerCase() === bot.username.toLowerCase()) {
-      ctx.log("warn", `⚠️ destinationBotName (${destinationBotName}) is this bot — falling back to faction deposit`);
-      logCargoActivity(bot.username, "deposit_start", `Self-gift detected for ${quantity}x ${itemId} — falling back to faction deposit`, {
+      ctx.log("warn", `⚠️ destinationBotName (${destinationBotName}) is this bot — falling back to personal storage deposit`);
+      logCargoActivity(bot.username, "deposit_start", `Self-gift detected for ${quantity}x ${itemId} — falling back to personal storage deposit`, {
         itemId,
         quantity,
         location: `${bot.system}/${bot.poi}`,
       });
-      // Fall through to faction deposit below
-      storageType = "faction";
+      // Fall through to personal storage deposit below
+      storageType = "personal";
     } else {
       // Check cargo before sending to verify later
       const cargoBefore = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
@@ -1009,29 +1009,31 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       await repairShip(ctx);
     }
 
-    // Clear ALL unrelated cargo items to personal storage before starting
-    // This ensures we start with a clean cargo hold and load fresh from storage
+    // Clear unrelated cargo items to FACTION storage (not personal) so other bots can access them
     yield "clear_cargo";
-    ctx.log("cargo", `🧹 Clearing unrelated cargo items to personal storage...`);
+    ctx.log("cargo", `🧹 Clearing unrelated cargo items to faction storage...`);
     await bot.refreshCargo();
     if (bot.inventory.length > 0) {
       const itemsToClear = bot.inventory.filter(item => {
         // Keep fuel/energy cells for operations
         const lower = item.itemId.toLowerCase();
         if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
-        // Deposit everything else to personal storage
-        return true;
+        // Check if this is one of our configured items to move
+        const isConfiguredItem = settings.items.some(ci => ci.itemId === item.itemId);
+        // Deposit non-configured items to faction storage so other bots can use them
+        return !isConfiguredItem;
       });
       if (itemsToClear.length > 0) {
         const deposited: string[] = [];
         for (const item of itemsToClear) {
           if (item.quantity <= 0) continue;
-          const dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+          // Deposit to faction storage, not personal storage
+          const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
           if (!dResp.error) deposited.push(`${item.quantity}x ${item.name}`);
         }
         if (deposited.length > 0) {
-          ctx.log("cargo", `✅ Cleared cargo to personal storage: ${deposited.join(", ")}`);
-          logCargoActivity(bot.username, "deposit_success", `Cleared cargo to personal storage: ${deposited.join(", ")}`, {
+          ctx.log("cargo", `✅ Cleared cargo to faction storage: ${deposited.join(", ")}`);
+          logCargoActivity(bot.username, "deposit_success", `Cleared cargo to faction storage: ${deposited.join(", ")}`, {
             location: `${bot.system}/${bot.poi}`,
           });
         }

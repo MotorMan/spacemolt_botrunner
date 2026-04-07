@@ -2184,8 +2184,40 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (mineResp.error) {
         const msg = mineResp.error.message.toLowerCase();
         if (msg.includes("depleted") || msg.includes("no resources") || msg.includes("no gas") || msg.includes("no ice") || msg.includes("no minable")) {
-          // Mark this ore as depleted in the map (unless ignoreDepletion is enabled)
-          if (effectiveTarget && bot.poi && !settings.ignoreDepletion) {
+          // VERIFY actual remaining resources before marking as depleted
+          // This prevents false positives from transient errors that mention "depleted"
+          let actuallyDepleted = false;
+          try {
+            const verifyResp = await bot.exec("get_poi", { poi_id: bot.poi });
+            if (!verifyResp.error && verifyResp.result) {
+              const result = verifyResp.result as Record<string, unknown>;
+              const poiData = result?.poi as Record<string, unknown> | undefined;
+              const resources = Array.isArray(result.resources)
+                ? (result.resources as Array<Record<string, unknown>>)
+                : Array.isArray(poiData?.resources)
+                ? (poiData.resources as Array<Record<string, unknown>>)
+                : [];
+              
+              for (const res of resources) {
+                const resId = (res.resource_id as string) || (res.id as string) || "";
+                if (resId === effectiveTarget) {
+                  const remaining = (res.remaining as number) ?? (res.quantity as number) ?? null;
+                  actuallyDepleted = remaining !== null && remaining <= 0;
+                  if (!actuallyDepleted) {
+                    ctx.log("mining", `Mine error says "depleted" but ${effectiveTarget} still has ${remaining} remaining — NOT marking as depleted`);
+                  }
+                  break;
+                }
+              }
+            }
+          } catch (e) {
+            ctx.log("warn", `Failed to verify POI status before marking depleted: ${e}`);
+            // If we can't verify, assume it's actually depleted to be safe
+            actuallyDepleted = true;
+          }
+
+          // Only mark as depleted if we confirmed resources are actually at 0
+          if (actuallyDepleted && effectiveTarget && bot.poi && !settings.ignoreDepletion) {
             mapStore.markOreDepleted(bot.system, bot.poi, effectiveTarget);
             ctx.log("mining", `Marked ${effectiveTarget} at ${bot.poi} as depleted`);
           }

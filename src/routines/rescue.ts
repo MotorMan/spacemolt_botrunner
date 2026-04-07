@@ -86,6 +86,7 @@ function getRescueSettings(): {
   cooperationEnabled: boolean;
   partnerBotName: string;
   cooperationMaxDelaySeconds: number;
+  creditTopOffAmount: number;
 } {
   const all = readSettings();
   const r = all.rescue || {};
@@ -121,6 +122,8 @@ function getRescueSettings(): {
     partnerBotName: (r.partnerBotName as string) || '',
     /** Max acceptable delay for cooperation messages */
     cooperationMaxDelaySeconds: (r.cooperationMaxDelaySeconds as number) || 30,
+    /** Credits threshold for topping off bots (0 = disabled) */
+    creditTopOffAmount: (r.creditTopOffAmount as number) || 10000,
   };
 }
 
@@ -317,36 +320,169 @@ function findStrandedBots(
  */
 async function hasRefuelingPump(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
-  
+
   try {
     const shipResp = await bot.exec("get_ship");
     if (shipResp.error) {
       ctx.log("warn", `Could not get ship info: ${shipResp.error.message}`);
       return false;
     }
-    
+
     const shipData = shipResp.result as Record<string, unknown> | undefined;
     if (!shipData) return false;
-    
+
     const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
-    
+
     for (const mod of modules) {
       const m = mod as Record<string, unknown>;
       const moduleId = (m.type_id as string) || (m.id as string) || "";
       const moduleName = (m.name as string) || "";
-      
+
       if (moduleId.includes("refueling_pump") || moduleName.toLowerCase().includes("refueling pump")) {
         ctx.log("rescue", "✓ Refueling Pump module detected");
         return true;
       }
     }
-    
+
     ctx.log("warn", "Refueling Pump module NOT detected on this ship");
     return false;
   } catch (err) {
     ctx.log("warn", `Error checking for Refueling Pump: ${err}`);
     return false;
   }
+}
+
+/**
+ * Credit top-off function — redistributes credits from faction treasury
+ * to ONE bot that is running low, including self.
+ * This is designed to be called repeatedly in a background loop,
+ * processing one bot per invocation.
+ * 
+ * @returns true if a bot was topped off, false if no bots needed it
+ */
+async function topOffOneBot(ctx: RoutineContext, targetAmount: number): Promise<boolean> {
+  const { bot } = ctx;
+
+  if (targetAmount <= 0) {
+    ctx.log("rescue", "💰 topOffOneBot: targetAmount is 0, returning false");
+    return false;
+  }
+
+  // Only top off when docked (can't send gifts while undocked)
+  if (!bot.docked) {
+    ctx.log("rescue", "💰 topOffOneBot: bot not docked, returning false");
+    return false;
+  }
+
+  const fleet = ctx.getFleetStatus?.() || [];
+  ctx.log("rescue", `💰 topOffOneBot: checking ${fleet.length} fleet members for credits below ${targetAmount}cr`);
+
+  // Find first bot (other than self) that needs topping off
+  for (const member of fleet) {
+    if (member.username === bot.username) continue;
+    if (member.state !== "running" && member.state !== "idle") continue;
+    if (member.credits >= targetAmount) continue;
+
+    const needed = targetAmount - member.credits;
+    ctx.log("rescue", `💰 ${member.username} has ${member.credits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
+    // Withdraw from faction treasury
+    ctx.log("rescue", `💰 Withdrawing ${needed}cr from faction treasury for ${member.username}...`);
+    const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+    if (withdrawResp.error) {
+      ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
+      return false; // treasury likely empty, stop trying
+    }
+
+    ctx.log("rescue", `💰 Successfully withdrew ${needed}cr, sending to ${member.username}...`);
+    // Send credits to the bot
+    const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
+    if (giftResp.error) {
+      ctx.log("rescue", `💰 Gift to ${member.username} failed: ${giftResp.error.message}`);
+      // Re-deposit withdrawn credits back
+      await bot.exec("faction_deposit_credits", { amount: needed });
+      return false;
+    } else {
+      ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
+      return true; // Successfully topped off one bot
+    }
+  }
+
+  // Top off self if needed
+  ctx.log("rescue", `💰 No other bots need topping off, checking self...`);
+  await bot.refreshStatus();
+  if (bot.credits < targetAmount) {
+    const needed = targetAmount - bot.credits;
+    ctx.log("rescue", `💰 Self has ${bot.credits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
+    const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+    if (withdrawResp.error) {
+      ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for self: ${withdrawResp.error.message}`);
+      return false;
+    }
+
+    ctx.log("rescue", `💰 Withdrew ${needed}cr from faction treasury for self (now at ${bot.credits + needed}cr)`);
+    return true;
+  }
+
+  ctx.log("rescue", `💰 Self credits OK (${bot.credits}cr >= ${targetAmount}cr), no action needed`);
+  return false; // No bots needed topping off
+}
+
+/**
+ * Background credit top-off loop — runs independently every 60 seconds,
+ * only when docked at sol_central. Non-blocking to the main rescue loop.
+ */
+function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number): void {
+  if (targetAmount <= 0) {
+    ctx.log("rescue", "💰 Credit top-off disabled (amount is 0)");
+    return;
+  }
+
+  ctx.log("rescue", `💰 Credit top-off background loop started (target: ${targetAmount}cr, interval: 60s)`);
+
+  const intervalMs = 60 * 1000; // 1 minute
+
+  const loop = async () => {
+    try {
+      const { bot } = ctx;
+
+      // Refresh bot status to get current docked state and system
+      await bot.refreshStatus();
+
+      ctx.log("rescue", `💰 Background credit check - docked: ${bot.docked}, system: ${bot.system}, credits: ${bot.credits}`);
+
+      // Only run when docked
+      if (!bot.docked) {
+        ctx.log("rescue", `💰 Skipping credit top-off — not docked (docked: ${bot.docked})`);
+        return;
+      }
+
+      // Check if we're at sol_central (or home system if configured)
+      const settings = getRescueSettings();
+      const expectedSystem = settings.homeSystem || "sol_central";
+
+      if (normalizeSystemName(bot.system) !== normalizeSystemName(expectedSystem)) {
+        ctx.log("rescue", `💰 Skipping credit top-off — not at ${expectedSystem} (current: ${bot.system})`);
+        return;
+      }
+
+      ctx.log("rescue", `💰 At ${expectedSystem}, checking fleet credits...`);
+      const toppedOff = await topOffOneBot(ctx, targetAmount);
+
+      if (toppedOff) {
+        ctx.log("rescue", `💰 Successfully topped off a bot — will check again in ${intervalMs / 1000}s`);
+      } else {
+        ctx.log("rescue", `💰 No bots need topping off this cycle`);
+      }
+    } catch (err) {
+      ctx.log("rescue", `💰 Credit top-off background loop error: ${err}`);
+    }
+  };
+
+  // Run immediately on start, then every minute
+  loop();
+  setInterval(loop, intervalMs);
 }
 
 // ── FuelTransfer routine (using refuel command) ─────────────────
@@ -409,6 +545,9 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     ctx.log("rescue", `🤝 Marked ${botName} as our bot (will not blacklist)`);
   }
   ctx.log("rescue", `✓ Marked ${ourBotNames.length} bots as our own (excluded from ghost tracking)`);
+
+  // ── Start background credit top-off loop (non-blocking) ──
+  startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -2474,6 +2613,9 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   } else if (homeSystem) {
     ctx.log("rescue", `✓ Bot started at home base (${homeSystem})`);
   }
+
+  // ── Start background credit top-off loop (non-blocking) ──
+  startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
 
   // Log category - determined when target is selected
   let logCategory: string = "rescue";

@@ -3912,15 +3912,29 @@ async function loadFullBotLog() {
       return;
     }
     log.innerHTML = '';
+    let matched = 0;
+    let skipped = 0;
     for (const line of data.lines) {
-      // Persistent log format: "YYYY-MM-DD HH:MM:SS [cat] msg" — strip date prefix for display
-      const stripped = line.replace(/^\d{4}-\d{2}-\d{2}\s+/, '');
-      const result = formatBotLogLine(stripped);
+      // Debug log format: "YYYY-MM-DDTHH:MM:SS.sssZ [bot:onLog] Bot Name cat=category "message""
+      // Bot names can contain spaces, so we match everything up to "cat="
+      const m = line.match(/^(\d{4}-\d{2}-\d{2}T(\d{2}:\d{2}:\d{2})\.\d+Z)\s+\[bot:onLog\]\s+(.+?)\s+cat=(\S+)\s+"?([\s\S]*?)"?\s*$/);
+      if (!m) {
+        skipped++;
+        if (skipped <= 3) console.log('[loadFullBotLog] Failed to match:', line);
+        continue; // Skip non-bot:onLog lines (should already be filtered server-side)
+      }
+      matched++;
+      const [, , time, , cat, msg] = m;
+      // Clean up message: remove surrounding quotes if present
+      const cleanMsg = msg.replace(/^"|"$/g, '').trim();
+      const reconstructedLine = `${time} [${cat}] ${cleanMsg}`;
+      const result = formatBotLogLine(reconstructedLine);
       const div = document.createElement('div');
       div.className = `log-entry ${result.catClass}`.trim();
       div.innerHTML = result.html;
       log.prepend(div);
     }
+    console.log(`[loadFullBotLog] Matched: ${matched}, Skipped: ${skipped}`);
     log.scrollTop = 0;
     const countNote = document.createElement('div');
     countNote.className = 'log-entry';

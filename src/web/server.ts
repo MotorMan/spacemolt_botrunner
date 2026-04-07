@@ -391,18 +391,20 @@ export class WebServer {
           return Response.json({ ok: false, error: "No shutdown handler" });
         }
 
-        // Per-bot persistent log files
+        // Per-bot persistent log files (debug logs with [bot:onLog] entries)
         if (url.pathname.startsWith("/api/logs/")) {
           const botName = decodeURIComponent(url.pathname.slice("/api/logs/".length));
           const tail = parseInt(url.searchParams.get("tail") || "200");
-          const logPath = join(process.cwd(), "data", "logs", `${botName}.log`);
+          const logPath = join(process.cwd(), "data", "logs", `${botName}_debug.log`);
           if (!existsSync(logPath)) {
             return Response.json({ lines: [] });
           }
           const content = readFileSync(logPath, "utf-8");
           const allLines = content.split("\n").filter(l => l);
-          const lines = allLines.slice(-tail);
-          return Response.json({ lines, total: allLines.length });
+          // Filter only [bot:onLog] lines (activity log entries)
+          const botOnLogLines = allLines.filter(line => line.includes("[bot:onLog]"));
+          const lines = botOnLogLines.slice(-tail);
+          return Response.json({ lines, total: botOnLogLines.length });
         }
 
         // Flock state endpoint

@@ -124,6 +124,7 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   faction_deposit_items: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
   faction_deposit_credits: INV_STATUS,
   faction_withdraw_credits: INV_STATUS,
+  send_gift: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION, ...INV_CARGO, ...INV_SHIP],
   create_sell_order: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET],
   create_buy_order: [...INV_STATUS, ...INV_MARKET],
   cancel_order: [...INV_STATUS, ...INV_MARKET],

@@ -354,43 +354,97 @@ async function depositToDestination(
       });
       return { success: false, depositedQty: 0 };
     }
-    const sResp = await bot.exec("send_gift", {
-      item_id: itemId,
-      quantity,
-      recipient_username: destinationBotName,
-    });
-    if (!sResp.error) {
-      ctx.log("cargo", `Sent gift: ${quantity}x ${itemId} to ${destinationBotName}`);
-      logCargoActivity(bot.username, "deposit_success", `Sent ${quantity}x ${itemId} as gift to ${destinationBotName}`, {
+
+    // Prevent sending gifts to self — fall back to faction deposit
+    if (destinationBotName.toLowerCase() === bot.username.toLowerCase()) {
+      ctx.log("warn", `⚠️ destinationBotName (${destinationBotName}) is this bot — falling back to faction deposit`);
+      logCargoActivity(bot.username, "deposit_start", `Self-gift detected for ${quantity}x ${itemId} — falling back to faction deposit`, {
         itemId,
-        itemName: bot.inventory.find(i => i.itemId === itemId)?.name || itemId,
         quantity,
         location: `${bot.system}/${bot.poi}`,
       });
-      return { success: true, depositedQty: quantity };
+      // Fall through to faction deposit below
+      storageType = "faction";
+    } else {
+      // Check cargo before sending to verify later
+      const cargoBefore = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+
+      const sResp = await bot.exec("send_gift", {
+        item_id: itemId,
+        quantity,
+        recipient: destinationBotName,
+      });
+
+      // Refresh cargo to verify the gift actually went through
+      await bot.refreshCargo();
+      const cargoAfter = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+      const actuallySent = Math.max(0, cargoBefore - cargoAfter);
+
+      if (!sResp.error && actuallySent > 0) {
+        ctx.log("cargo", `✅ Sent gift: ${actuallySent}x ${itemId} to ${destinationBotName}`);
+        logCargoActivity(bot.username, "deposit_success", `Sent ${actuallySent}x ${itemId} as gift to ${destinationBotName}`, {
+          itemId,
+          itemName: bot.inventory.find(i => i.itemId === itemId)?.name || itemId,
+          quantity: actuallySent,
+          location: `${bot.system}/${bot.poi}`,
+        });
+        return { success: true, depositedQty: actuallySent };
+      }
+
+      // send_gift reported success but items are still in cargo — verify failure
+      if (!sResp.error && actuallySent === 0) {
+        ctx.log("error", `⚠️ send_gift reported success but ${quantity}x ${itemId} still in cargo — gift likely failed silently`);
+        logCargoActivity(bot.username, "deposit_failed", `send_gift reported success but items still in cargo (${quantity}x ${itemId})`, {
+          itemId,
+          quantity,
+          location: `${bot.system}/${bot.poi}`,
+          error: "Gift reported success but items not removed from cargo",
+        });
+        return { success: false, depositedQty: 0 };
+      }
+
+      ctx.log("error", `send_gift failed: ${sResp.error?.message || 'unknown error'}`);
+      logCargoActivity(bot.username, "deposit_failed", `send_gift failed: ${sResp.error?.message || 'unknown error'}`, {
+        itemId,
+        quantity,
+        location: `${bot.system}/${bot.poi}`,
+        error: sResp.error?.message || 'unknown error',
+      });
+      return { success: false, depositedQty: 0 };
     }
-    ctx.log("error", `send_gift failed: ${sResp.error.message}`);
-    logCargoActivity(bot.username, "deposit_failed", `send_gift failed: ${sResp.error.message}`, {
-      itemId,
-      quantity,
-      location: `${bot.system}/${bot.poi}`,
-      error: sResp.error.message,
-    });
-    return { success: false, depositedQty: 0 };
   }
 
   if (storageType === "faction") {
+    // Check faction storage before deposit for verification
+    const factionBefore = bot.factionStorage.find((i) => i.itemId === itemId)?.quantity || 0;
+
     const dResp = await bot.exec("faction_deposit_items", { item_id: itemId, quantity });
     if (!dResp.error) {
-      logFactionActivity(ctx, "deposit", `Deposited ${quantity}x ${itemId} (cargo mover)`);
-      ctx.log("cargo", `Deposited to faction storage: ${quantity}x ${itemId}`);
-      logCargoActivity(bot.username, "deposit_success", `Deposited ${quantity}x ${itemId} to faction storage`, {
-        itemId,
-        itemName: bot.inventory.find(i => i.itemId === itemId)?.name || itemId,
-        quantity,
-        location: `${bot.system}/${bot.poi}`,
-      });
-      return { success: true, depositedQty: quantity };
+      // Refresh faction storage to verify actual deposit
+      await bot.refreshFactionStorage();
+      const factionAfter = bot.factionStorage.find((i) => i.itemId === itemId)?.quantity || 0;
+      const actuallyDeposited = Math.max(0, factionAfter - factionBefore);
+
+      if (actuallyDeposited > 0) {
+        logFactionActivity(ctx, "deposit", `Deposited ${actuallyDeposited}x ${itemId} (cargo mover)`);
+        ctx.log("cargo", `✅ Deposited to faction storage: ${actuallyDeposited}x ${itemId} (verified)`);
+        logCargoActivity(bot.username, "deposit_success", `Deposited ${actuallyDeposited}x ${itemId} to faction storage (verified)`, {
+          itemId,
+          itemName: bot.inventory.find(i => i.itemId === itemId)?.name || itemId,
+          quantity: actuallyDeposited,
+          location: `${bot.system}/${bot.poi}`,
+        });
+        return { success: true, depositedQty: actuallyDeposited };
+      } else {
+        ctx.log("error", `⚠️ Faction deposit reported success but storage unchanged for ${itemId}`);
+        logCargoActivity(bot.username, "deposit_failed", `Faction deposit reported success but storage unchanged (${quantity}x ${itemId})`, {
+          itemId,
+          quantity,
+          location: `${bot.system}/${bot.poi}`,
+          error: "Deposit reported success but faction storage unchanged",
+        });
+        return { success: false, depositedQty: 0 };
+      }
     }
     ctx.log("error", `Faction deposit failed: ${dResp.error.message}`);
     logCargoActivity(bot.username, "deposit_failed", `Faction deposit failed: ${dResp.error.message}`, {
@@ -403,16 +457,35 @@ async function depositToDestination(
   }
 
   // Personal storage - use deposit_items command (cargo → personal storage)
+  // Check personal storage before deposit for verification
+  const personalBefore = bot.storage.find((i) => i.itemId === itemId)?.quantity || 0;
+
   const dResp = await bot.exec("deposit_items", { item_id: itemId, quantity });
   if (!dResp.error) {
-    ctx.log("cargo", `Deposited to personal storage: ${quantity}x ${itemId}`);
-    logCargoActivity(bot.username, "deposit_success", `Deposited ${quantity}x ${itemId} to personal storage`, {
-      itemId,
-      itemName: bot.inventory.find(i => i.itemId === itemId)?.name || itemId,
-      quantity,
-      location: `${bot.system}/${bot.poi}`,
-    });
-    return { success: true, depositedQty: quantity };
+    // Refresh personal storage to verify actual deposit
+    await bot.refreshStorage();
+    const personalAfter = bot.storage.find((i) => i.itemId === itemId)?.quantity || 0;
+    const actuallyDeposited = Math.max(0, personalAfter - personalBefore);
+
+    if (actuallyDeposited > 0) {
+      ctx.log("cargo", `✅ Deposited to personal storage: ${actuallyDeposited}x ${itemId} (verified)`);
+      logCargoActivity(bot.username, "deposit_success", `Deposited ${actuallyDeposited}x ${itemId} to personal storage (verified)`, {
+        itemId,
+        itemName: bot.inventory.find(i => i.itemId === itemId)?.name || itemId,
+        quantity: actuallyDeposited,
+        location: `${bot.system}/${bot.poi}`,
+      });
+      return { success: true, depositedQty: actuallyDeposited };
+    } else {
+      ctx.log("error", `⚠️ Personal deposit reported success but storage unchanged for ${itemId}`);
+      logCargoActivity(bot.username, "deposit_failed", `Personal deposit reported success but storage unchanged (${quantity}x ${itemId})`, {
+        itemId,
+        quantity,
+        location: `${bot.system}/${bot.poi}`,
+        error: "Deposit reported success but personal storage unchanged",
+      });
+      return { success: false, depositedQty: 0 };
+    }
   }
   ctx.log("error", `Personal storage deposit failed: ${dResp.error.message}`);
   logCargoActivity(bot.username, "deposit_failed", `Personal storage deposit failed: ${dResp.error.message}`, {
@@ -662,6 +735,144 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     if (!destSystem) {
       ctx.log("error", `Unknown destination station: ${settings.destinationStation}`);
       await sleep(60000);
+      continue;
+    }
+
+    // ── CARGO DELIVERY RECOVERY ─────────────────────────────────
+    // On restart, check if bot has cargo items that need to be delivered.
+    // If so, skip directly to delivery instead of going back to source.
+    await bot.refreshCargo();
+    const cargoItemsToDeliver = bot.inventory.filter(item => {
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) return false;
+      // Check if this item is one of our configured items
+      return settings.items.some(ci => ci.itemId === item.itemId);
+    });
+
+    if (cargoItemsToDeliver.length > 0) {
+      ctx.log("cargo", `🔄 CARGO RECOVERY: Found ${cargoItemsToDeliver.length} item type(s) in cargo that need delivery`);
+      for (const item of cargoItemsToDeliver) {
+        ctx.log("cargo", `   - ${item.quantity}x ${item.name}`);
+      }
+      logCargoActivity(bot.username, "resume", `Recovering ${cargoItemsToDeliver.length} item type(s) from cargo for delivery`, {
+        location: `${bot.system}/${bot.poi}`,
+        quantity: cargoItemsToDeliver.reduce((sum, i) => sum + i.quantity, 0),
+      });
+
+      // Navigate to destination and deliver cargo
+      yield "recover_cargo_delivery";
+
+      // Ensure we're undocked and fueled
+      await ensureUndocked(ctx);
+      if (bot.state !== "running") {
+        ctx.log("system", "⛔ Stopping — emergency detected");
+        return;
+      }
+
+      const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+      if (!fueled) {
+        ctx.log("error", "Cannot refuel for cargo delivery");
+        logCargoActivity(bot.username, "error", "Cannot refuel for cargo recovery delivery", {
+          location: `${bot.system}/${bot.poi}`,
+        });
+        await sleep(30000);
+        continue;
+      }
+
+      // Navigate to destination system if needed
+      if (bot.system !== destSystem) {
+        ctx.log("travel", `Heading to destination system ${destSystem} to deliver recovered cargo...`);
+        logCargoActivity(bot.username, "navigation", `Navigating to destination for cargo recovery delivery`, {
+          location: `${bot.system} → ${destSystem}`,
+        });
+        const arrived = await navigateToSystem(ctx, destSystem, safetyOpts);
+        if (!arrived || bot.state !== "running") {
+          if (bot.state !== "running") {
+            ctx.log("system", "⛔ Stopping — emergency detected");
+            return;
+          }
+          ctx.log("error", `Failed to reach ${destSystem} for cargo delivery`);
+          logCargoActivity(bot.username, "error", `Failed to reach destination for cargo recovery`, {
+            location: `${bot.system}/${bot.poi}`,
+          });
+          await sleep(30000);
+          continue;
+        }
+        ctx.log("cargo", `✅ Arrived at destination system ${destSystem}`);
+      }
+
+      // Travel to destination station
+      await ensureUndocked(ctx);
+      if (bot.state !== "running") {
+        ctx.log("system", "⛔ Stopping — emergency detected");
+        return;
+      }
+      if (bot.poi !== settings.destinationStation) {
+        ctx.log("travel", `Traveling to destination station ${settings.destinationStation}...`);
+        const tResp = await bot.exec("travel", { target_poi: settings.destinationStation });
+        if (bot.state !== "running") {
+          ctx.log("system", "⛔ Stopping — emergency detected");
+          return;
+        }
+        if (tResp.error && !tResp.error.message.includes("already")) {
+          ctx.log("error", `Travel to destination failed: ${tResp.error.message}`);
+          await sleep(30000);
+          continue;
+        }
+        bot.poi = settings.destinationStation;
+      }
+
+      // Dock at destination
+      yield "dock_dest";
+      if (!await dockAtStation(ctx)) {
+        ctx.log("error", "Could not dock at destination for cargo delivery");
+        await sleep(30000);
+        continue;
+      }
+      ctx.log("cargo", `✅ Docked at destination station ${settings.destinationStation}`);
+
+      // Deliver all cargo
+      yield "deposit_items";
+      await bot.refreshCargo();
+      const itemsToDeposit = [...bot.inventory];
+      const deliveredItems: { itemId: string; quantity: number }[] = [];
+
+      if (itemsToDeposit.length > 0) {
+        ctx.log("cargo", `📦 Delivering recovered cargo to destination...`);
+        for (const item of itemsToDeposit) {
+          if (item.quantity <= 0) continue;
+          const lower = item.itemId.toLowerCase();
+          if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+
+          const depositResult = await depositToDestination(
+            ctx,
+            item.itemId,
+            item.quantity,
+            settings.destinationStorageType,
+            settings.destinationBotName,
+          );
+          if (depositResult.success) {
+            ctx.log("cargo", `✅ Delivered ${depositResult.depositedQty}x ${item.name}`);
+            deliveredItems.push({ itemId: item.itemId, quantity: depositResult.depositedQty });
+          }
+        }
+
+        // Update delivery tracking
+        if (deliveredItems.length > 0) {
+          const itemIds = deliveredItems.map((d) => d.itemId);
+          const quantities = deliveredItems.map((d) => d.quantity);
+          updateDeliveryTracking(ctx, itemIds, quantities, settings);
+        }
+      }
+
+      ctx.log("cargo", `✅ Cargo recovery complete — delivered ${deliveredItems.length} item type(s)`);
+      logCargoActivity(bot.username, "trip_complete", `Cargo recovery delivery complete`, {
+        location: `${bot.system}/${bot.poi}`,
+        quantity: deliveredItems.reduce((sum, d) => sum + d.quantity, 0),
+      });
+
+      // After recovery, continue to next cycle (which will go back to source for more)
+      await sleep(5000);
       continue;
     }
 

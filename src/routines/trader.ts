@@ -2450,64 +2450,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Faction donation (10% of profit) ──
     await factionDonateProfit(ctx, actualProfit);
 
-    // ── Deposit excess credits to faction storage at home base ──
-    await bot.refreshStatus();
-    if (bot.credits > TRADER_DEPOSIT_THRESHOLD) {
-      const excessCredits = bot.credits - TRADER_WORKING_BALANCE;
-      const homeSystemForDeposit = settings.homeSystem || startSystem;
-      
-      if (homeSystemForDeposit && bot.system !== homeSystemForDeposit) {
-        ctx.log("trade", `Excess credits detected (${bot.credits}cr) — returning to home system ${homeSystemForDeposit} to deposit ${excessCredits}cr`);
-        await ensureUndocked(ctx);
-        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-        if (fueled) {
-          const arrived = await navigateToSystem(ctx, homeSystemForDeposit, safetyOpts);
-          if (arrived) {
-            // Dock at home station
-            const { pois: homePois } = await getSystemInfo(ctx);
-            const homeStation = findStation(homePois);
-            if (homeStation) {
-              const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
-              if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
-                ctx.log("combat", "Battle detected during travel — fleeing!");
-                await sleep(2000);
-                continue;
-              }
-              await ensureDocked(ctx, true);
-              
-              // Deposit excess credits to faction storage
-              const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
-              if (!depositResp.error) {
-                ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
-                logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);
-              } else {
-                ctx.log("error", `Failed to deposit credits: ${depositResp.error.message}`);
-              }
-            }
-          }
-        }
-      } else if (bot.docked) {
-        // Already at home and docked - deposit immediately
-        const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
-        if (!depositResp.error) {
-          ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
-          logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);
-        } else {
-          ctx.log("error", `Failed to deposit credits: ${depositResp.error.message}`);
-        }
-      }
-    }
-
-    // ── Maintenance ──
-    yield "post_trade_maintenance";
-    await tryRefuel(ctx);
-    await repairShip(ctx);
-
-    // ── Check skills ──
-    yield "check_skills";
-    await bot.checkSkills();
-
-    // ── Check for next trade from current location before returning home ──
+    // ── Check for next trade before considering excess credit deposit ──
     const homeSystem = settings.homeSystem || startSystem;
     yield "seek_next_trade";
     await bot.refreshStatus();
@@ -2524,6 +2467,73 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const nextMarketRoutes = findTradeOpportunities(settings, bot.system, nextCargoCapacity);
     const nextRoutes = [...nextCargoRoutes, ...nextMarketRoutes].sort((a, b) => b.totalProfit - a.totalProfit);
 
+    // ── Deposit excess credits to faction storage ──
+    // Only deposit if:
+    // 1. We're currently at the home station (convenient opportunity), OR
+    // 2. There are no more profitable trades to do
+    await bot.refreshStatus();
+    const hasProfitableTrades = nextRoutes.length > 0;
+    const isAtHomeStation = homeSystem && bot.system === homeSystem && bot.docked;
+    const noTradesAndHasExcess = !hasProfitableTrades && bot.credits > TRADER_DEPOSIT_THRESHOLD;
+
+    if (bot.credits > TRADER_WORKING_BALANCE && (isAtHomeStation || noTradesAndHasExcess)) {
+      const excessCredits = bot.credits - TRADER_WORKING_BALANCE;
+      const homeSystemForDeposit = homeSystem;
+
+      if (isAtHomeStation) {
+        // We're at home station - deposit immediately
+        ctx.log("trade", `At home station with ${bot.credits}cr — depositing ${excessCredits}cr to faction storage`);
+        const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+        if (!depositResp.error) {
+          ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
+          logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);
+        } else {
+          ctx.log("error", `Failed to deposit credits: ${depositResp.error.message}`);
+        }
+      } else if (noTradesAndHasExcess && homeSystemForDeposit && bot.system !== homeSystemForDeposit) {
+        // No trades available and we have excess - return home to deposit
+        ctx.log("trade", `No profitable trades and excess credits detected (${bot.credits}cr) — returning to home system ${homeSystemForDeposit} to deposit ${excessCredits}cr`);
+        await ensureUndocked(ctx);
+        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (fueled) {
+          const arrived = await navigateToSystem(ctx, homeSystemForDeposit, safetyOpts);
+          if (arrived) {
+            // Dock at home station
+            const { pois: homePois } = await getSystemInfo(ctx);
+            const homeStation = findStation(homePois);
+            if (homeStation) {
+              const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
+              if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+                ctx.log("combat", "Battle detected during travel — fleeing!");
+                await sleep(2000);
+                continue;
+              }
+              await ensureDocked(ctx, true);
+
+              // Deposit excess credits to faction storage
+              const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+              if (!depositResp.error) {
+                ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
+                logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);
+              } else {
+                ctx.log("error", `Failed to deposit credits: ${depositResp.error.message}`);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ── Maintenance ──
+    yield "post_trade_maintenance";
+    await tryRefuel(ctx);
+    await repairShip(ctx);
+
+    // ── Check skills ──
+    yield "check_skills";
+    await bot.checkSkills();
+
+    // ── Continue with next trade or return home ──
     if (nextRoutes.length > 0) {
       ctx.log("trade", `Found ${nextRoutes.length} routes from current location — continuing trading`);
       // Skip the return home — the main loop will pick up these routes

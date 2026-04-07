@@ -1329,7 +1329,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const sys = mapStore.getSystem(loc.systemId);
         const poi = sys?.pois.find(p => p.id === loc.poiId);
         if (!poi) return true; // keep if type unknown
-        if (miningType === "ore") return isOreBeltPoi(poi.type);
+        if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
         if (miningType === "gas") return isGasCloudPoi(poi.type);
         if (miningType === "ice") return isIceFieldPoi(poi.type);
         return true;
@@ -1655,7 +1655,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       for (const poi of pois) {
         const isMatchingType =
           (miningType === "ice" && isIceFieldPoi(poi.type)) ||
-          (miningType === "ore" && isOreBeltPoi(poi.type)) ||
+          (miningType === "ore" && (isOreBeltPoi(poi.type) || poi.hidden === true)) ||
           (miningType === "gas" && isGasCloudPoi(poi.type));
 
         if (!isMatchingType) continue;
@@ -1694,7 +1694,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const iceField = pois.find(p => isIceFieldPoi(p.type));
         if (iceField) miningPoi = { id: iceField.id, name: iceField.name };
       } else if (miningType === "ore") {
-        const oreBelt = pois.find(p => isOreBeltPoi(p.type));
+        const oreBelt = pois.find(p => isOreBeltPoi(p.type) || p.hidden === true);
         if (oreBelt) miningPoi = { id: oreBelt.id, name: oreBelt.name };
       } else if (miningType === "gas") {
         const gasCloud = pois.find(p => isGasCloudPoi(p.type));
@@ -1765,7 +1765,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       // POI was depleted — search for alternative in current system first
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
-        if (miningType === "ore") return isOreBeltPoi(p.type);
+        if (miningType === "ore") return isOreBeltPoi(p.type) || p.hidden === true;
         if (miningType === "gas") return isGasCloudPoi(p.type);
         if (miningType === "ice") return isIceFieldPoi(p.type);
         return false;
@@ -1823,7 +1823,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               pois = newPois;
               bot.system = chosen.systemId;
               const newMiningPoi = pois.find(p => {
-                if (miningType === "ore") return isOreBeltPoi(p.type);
+                if (miningType === "ore") return isOreBeltPoi(p.type) || p.hidden === true;
                 if (miningType === "gas") return isGasCloudPoi(p.type);
                 if (miningType === "ice") return isIceFieldPoi(p.type);
                 return false;
@@ -2376,7 +2376,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             
             // First try current system
             const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
-                           miningType === "ore" ? pois.filter(p => isOreBeltPoi(p.type)) :
+                           miningType === "ore" ? pois.filter(p => isOreBeltPoi(p.type) || p.hidden === true) :
                            pois.filter(p => isGasCloudPoi(p.type));
 
             for (const poi of allPois) {
@@ -2420,7 +2420,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                   if (!poi) continue;
 
                   // Verify POI type matches
-                  if (miningType === "ore" && !isOreBeltPoi(poi.type)) continue;
+                  if (miningType === "ore" && !isOreBeltPoi(poi.type) && !poi.hidden) continue;
                   if (miningType === "gas" && !isGasCloudPoi(poi.type)) continue;
                   if (miningType === "ice" && !isIceFieldPoi(poi.type)) continue;
 

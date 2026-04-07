@@ -927,6 +927,22 @@ function connect() {
           updateAiChatToggleButton();
         }
         break;
+      case 'settings_updated':
+        // Settings were updated on disk by a bot routine (e.g., cargo mover delivery tracking)
+        settings = msg.settings;
+        window.currentSettings = settings;
+        // Only re-render if settings tab is active (user is watching)
+        if (document.getElementById('page-settings')?.classList.contains('active')) {
+          // Re-render current tab content to show updated delivery counts
+          const activeTab = document.querySelector('.settings-tab.active');
+          if (activeTab) {
+            const tabId = activeTab.id?.replace('tab-', '');
+            if (tabId === 'cargo_mover') {
+              renderCargoMoverSettings(document.getElementById('settingsContent'));
+            }
+          }
+        }
+        break;
       case 'botLog':
         if (msg.username && msg.line) {
           if (!botLogBuffers[msg.username]) botLogBuffers[msg.username] = [];

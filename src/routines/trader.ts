@@ -26,6 +26,8 @@ import {
   isPirateSystem,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
+  getBattleStatus,
+  type BattleState,
 } from "./common.js";
 import {
   getActiveSession,
@@ -783,15 +785,50 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
   const startSystem = bot.system;
 
+  // Battle state tracking for continuous flee re-issuing
+  const battleState: BattleState = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+  };
+
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
     // ── Battle check ──
-    if (await checkAndFleeFromBattle(ctx, "trader")) {
-      await sleep(5000);
-      continue;
+    // If we're already in battle from previous cycle, re-issue flee command
+    if (battleState.inBattle) {
+      ctx.log("combat", "Re-issuing flee stance during trade operations (ensuring we stay in flee mode)...");
+      const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+      if (fleeResp.error) {
+        ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+      }
+
+      // Check battle status to see if we've escaped
+      const currentBattleStatus = await getBattleStatus(ctx);
+      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+        ctx.log("combat", "Battle cleared - no longer in combat! Resuming trade operations...");
+        battleState.inBattle = false;
+        battleState.battleId = null;
+        battleState.isFleeing = false;
+      } else {
+        // Still in battle - wait briefly and continue to next cycle to re-flee
+        await sleep(2000);
+        continue;
+      }
+    } else {
+      // Not in battle - do a fresh check
+      if (await checkAndFleeFromBattle(ctx, "trader")) {
+        // Battle detected - set battle state and flee
+        battleState.inBattle = true;
+        battleState.isFleeing = false;
+        await sleep(2000);
+        continue;
+      }
     }
 
     // ── Fleet coordination cleanup (periodic stale lock cleanup) ──
@@ -877,34 +914,34 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           return true;
         },
       });
-      
+
       if (!arrived) {
         ctx.log("error", "Failed to reach destination for recovered session — will retry");
         await ensureDocked(ctx);
         await sleep(60000);
         continue;
       }
-      
+
       // Arrived at destination - update session state and continue to sell phase
       updateTradeSession(bot.username, { state: "at_destination" });
       bot.system = recoveredSession.destSystem;
-      
+
       // Travel to destination POI and dock
       if (bot.poi !== recoveredSession.destPoi) {
         ctx.log("travel", `Traveling to ${recoveredSession.destPoiName}...`);
         const travelResp = await bot.exec("travel", { target_poi: recoveredSession.destPoi });
-        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
           ctx.log("combat", "Battle detected during travel — fleeing!");
-          await sleep(5000);
+          await sleep(2000);
           continue;
         }
         bot.poi = recoveredSession.destPoi;
       }
 
       const dockResp = await bot.exec("dock");
-      if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
+      if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
         ctx.log("combat", "Battle detected during dock — fleeing!");
-        await sleep(5000);
+        await sleep(2000);
         continue;
       }
       if (dockResp.error && !dockResp.error.message.includes("already")) {
@@ -1099,9 +1136,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               const homeStation = findStation(pois);
               if (homeStation) {
                 const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
-                if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+                if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
                   ctx.log("combat", "Battle detected during travel — fleeing!");
-                  await sleep(5000);
+                  await sleep(2000);
                   continue;
                 }
                 await ensureDocked(ctx);
@@ -1479,9 +1516,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         await ensureUndocked(ctx);
         ctx.log("travel", `Traveling to ${candidate.sourcePoiName}...`);
         const tResp = await bot.exec("travel", { target_poi: candidate.sourcePoi });
-        if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+        if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
           ctx.log("combat", "Battle detected during travel — fleeing!");
-          await sleep(5000);
+          await sleep(2000);
           continue;
         }
         if (tResp.error && !tResp.error.message.includes("already")) {
@@ -2051,9 +2088,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     if (bot.poi !== route.destPoi) {
       ctx.log("travel", `Traveling to ${route.destPoiName}...`);
       const t2Resp = await bot.exec("travel", { target_poi: route.destPoi });
-      if (await checkBattleAfterCommand(ctx, t2Resp.notifications, "travel")) {
+      if (await checkBattleAfterCommand(ctx, t2Resp.notifications, "travel", battleState)) {
         ctx.log("combat", "Battle detected during travel — fleeing!");
-        await sleep(5000);
+        await sleep(2000);
         continue;
       }
       if (t2Resp.error && !t2Resp.error.message.includes("already")) {
@@ -2063,9 +2100,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const station = findStation(pois);
         if (station) {
           const travelResp = await bot.exec("travel", { target_poi: station.id });
-          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
             ctx.log("combat", "Battle detected during travel — fleeing!");
-            await sleep(5000);
+            await sleep(2000);
             continue;
           }
           bot.poi = station.id;
@@ -2091,9 +2128,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // Dock at destination
     yield "dock_dest";
     const d2Resp = await bot.exec("dock");
-    if (await checkBattleAfterCommand(ctx, d2Resp.notifications, "dock")) {
+    if (await checkBattleAfterCommand(ctx, d2Resp.notifications, "dock", battleState)) {
       ctx.log("combat", "Battle detected during dock — fleeing!");
-      await sleep(5000);
+      await sleep(2000);
       continue;
     }
     if (d2Resp.error && !d2Resp.error.message.includes("already")) {
@@ -2194,13 +2231,13 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               }
             }
           }
-          
+
           if (bot.poi !== best.buyer.poiId) {
             await ensureUndocked(ctx);
             const tResp = await bot.exec("travel", { target_poi: best.buyer.poiId });
-            if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+            if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
               ctx.log("combat", "Battle detected during travel — fleeing!");
-              await sleep(5000);
+              await sleep(2000);
               continue;
             }
             if (!tResp.error || tResp.error.message.includes("already")) {
@@ -2265,9 +2302,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           if (bot.poi !== buyer.poiId) {
             await ensureUndocked(ctx);
             const tResp = await bot.exec("travel", { target_poi: buyer.poiId });
-            if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+            if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
               ctx.log("combat", "Battle detected during travel — fleeing!");
-              await sleep(5000);
+              await sleep(2000);
               continue;
             }
             if (tResp.error && !tResp.error.message.includes("already")) continue;
@@ -2328,9 +2365,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           if (bot.poi !== homeStation.id) {
             await ensureUndocked(ctx);
             const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
-            if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+            if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
               ctx.log("combat", "Battle detected during travel — fleeing!");
-              await sleep(5000);
+              await sleep(2000);
               continue;
             }
             bot.poi = homeStation.id;
@@ -2364,9 +2401,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         if (bot.poi !== SOL_CENTRAL) {
           await ensureUndocked(ctx);
           const travelResp = await bot.exec("travel", { target_poi: SOL_CENTRAL });
-          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
             ctx.log("combat", "Battle detected during travel — fleeing!");
-            await sleep(5000);
+            await sleep(2000);
             continue;
           }
           bot.poi = SOL_CENTRAL;
@@ -2431,9 +2468,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             const homeStation = findStation(homePois);
             if (homeStation) {
               const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
-              if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+              if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
                 ctx.log("combat", "Battle detected during travel — fleeing!");
-                await sleep(5000);
+                await sleep(2000);
                 continue;
               }
               await ensureDocked(ctx, true);
@@ -2505,15 +2542,15 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           const homeStation = findStation(homePois);
           if (homeStation) {
             const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
-            if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+            if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
               ctx.log("combat", "Battle detected during travel — fleeing!");
-              await sleep(5000);
+              await sleep(2000);
               continue;
             }
             const dockResp = await bot.exec("dock");
-            if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
+            if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
               ctx.log("combat", "Battle detected during dock — fleeing!");
-              await sleep(5000);
+              await sleep(2000);
               continue;
             }
             bot.docked = true;

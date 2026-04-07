@@ -230,6 +230,27 @@ export class WebServer {
     saveSettings(this.settings);
   }
 
+  /** Reload settings from disk and broadcast to all connected clients.
+   *  Called periodically to catch external writes (e.g., from bot routines). */
+  reloadSettingsFromDisk(): void {
+    const diskSettings = loadSettings();
+    // Check if settings actually changed
+    const diskJson = JSON.stringify(diskSettings);
+    const memJson = JSON.stringify(this.settings);
+    if (diskJson !== memJson) {
+      this.settings = diskSettings;
+      // Broadcast settings update to all connected clients
+      for (const ws of this.clients) {
+        try {
+          ws.send(JSON.stringify({
+            type: "settings_updated",
+            settings: this.settings,
+          }));
+        } catch { /* ignore dead connections */ }
+      }
+    }
+  }
+
   // ── Bot assignment persistence (auto-resume on restart) ───
 
   saveBotAssignment(username: string, routine: string): void {
@@ -615,6 +636,11 @@ export class WebServer {
         },
       },
     });
+
+    // Periodically reload settings from disk to catch external writes (e.g., from bot routines)
+    setInterval(() => {
+      this.reloadSettingsFromDisk();
+    }, 10000); // Check every 10 seconds
 
     console.log(`Dashboard: http://localhost:${this.port}`);
   }

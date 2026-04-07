@@ -364,6 +364,47 @@ function isHostileTarget(entity: NearbyEntity, maxAttackTier: PirateTier = "larg
   return factionMatch || typeMatch || nameMatch;
 }
 
+// ── Security zone detection ─────────────────────────────────
+
+/**
+ * Check if the current system has security/police monitoring.
+ * Returns true if the system is monitored (NOT lawless).
+ * In these systems, we should NOT attack back to avoid police retaliation.
+ */
+function isSecurityMonitoredSystem(securityLevel: string | undefined): boolean {
+  if (!securityLevel) return false;
+  const level = securityLevel.toLowerCase().trim();
+
+  // Empire/high security systems are monitored
+  if (level.includes("high") || level.includes("maximum") || level.includes("empire")) {
+    return true;
+  }
+
+  // Medium security is also monitored
+  if (level.includes("medium") || level.includes("moderate")) {
+    return true;
+  }
+
+  // Lawless/null systems are NOT monitored (safe to fight)
+  if (level.includes("lawless") || level.includes("null") || level.includes("unregulated")) {
+    return false;
+  }
+
+  // Low security/frontier may or may not be monitored - treat as monitored to be safe
+  if (level.includes("low") || level.includes("frontier")) {
+    return true;
+  }
+
+  // Numeric security > 25 is considered monitored
+  const numeric = parseInt(level, 10);
+  if (!isNaN(numeric) && numeric > 25) {
+    return true;
+  }
+
+  // Default to true if we can't determine - better safe than sorry
+  return false;
+}
+
 // ── Combat (simplified from hunter) ─────────────────────────
 
 async function engageTarget(
@@ -372,10 +413,18 @@ async function engageTarget(
   fleeThreshold: number,
   fleeFromTier: PirateTier,
   minPiratesToFlee: number,
+  securityMonitored: boolean,
 ): Promise<boolean> {
   const { bot } = ctx;
 
   if (!target.id) return false;
+
+  // If we're in a security monitored system, DO NOT attack - flee instead
+  if (securityMonitored) {
+    ctx.log("combat", `⚠ SECURITY MONITORED ZONE - Cannot attack ${target.name} - fleeing to avoid police!`);
+    await bot.exec("stance", { stance: "flee" });
+    return false;
+  }
 
   const scanResp = await bot.exec("scan", { target_id: target.id });
   if (scanResp.error) {
@@ -425,12 +474,40 @@ async function engageTarget(
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
 
-    // Emergency flee
+    // Emergency flee if hull critical
     if (hullPct <= fleeThreshold) {
       ctx.log("combat", `Hull critical (${hullPct}%) — fleeing!`);
       await bot.exec("stance", { stance: "flee" });
       await bot.exec("retreat");
       return false;
+    }
+
+    // If in security monitored space, keep fleeing every tick
+    if (securityMonitored) {
+      ctx.log("combat", `Security monitored zone - issuing flee command (tick ${tick + 1})`);
+      await bot.exec("stance", { stance: "flee" });
+      
+      // Check if we've successfully fled the combat
+      const nearbyCheck = await bot.exec("get_nearby");
+      if (!nearbyCheck.error && nearbyCheck.result) {
+        bot.trackNearbyPlayers(nearbyCheck.result);
+        const entities = parseNearby(nearbyCheck.result);
+        
+        // If target is no longer nearby, we've successfully fled
+        if (!entities.some(e => e.id === target.id)) {
+          ctx.log("combat", `Successfully fled from ${target.name} in security monitored zone`);
+          return false;
+        }
+      }
+      
+      // Continue fleeing for a few ticks before giving up
+      if (tick >= 10) {
+        ctx.log("combat", `Could not escape ${target.name} after 10 ticks in monitored zone - attempting retreat`);
+        await bot.exec("retreat");
+        return false;
+      }
+      
+      continue;
     }
 
     // Check for pirate-based flee conditions
@@ -975,7 +1052,17 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     // Scan for nearby hostiles that might threaten the miner
     yield "scan_system";
     await fetchSecurityLevel(ctx, bot.system);
+
+    // Check if we're in a security monitored system
+    const currentSystemSecurity = mapStore.getSystem(bot.system)?.security_level;
+    const securityMonitored = isSecurityMonitoredSystem(currentSystemSecurity);
     
+    if (securityMonitored) {
+      ctx.log("combat", `⚠ SECURITY MONITORED ZONE detected (${currentSystemSecurity}) - will flee from attackers instead of fighting back`);
+    } else {
+      ctx.log("combat", `✓ Lawless space detected (${currentSystemSecurity}) - free to engage hostiles`);
+    }
+
     const nearbyResp = await bot.exec("get_nearby");
     if (!nearbyResp.error && nearbyResp.result) {
       bot.trackNearbyPlayers(nearbyResp.result);
@@ -984,7 +1071,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
       if (targets.length > 0) {
         ctx.log("combat", `Found ${targets.length} hostile(s) in system: ${targets.map(t => t.name).join(", ")}`);
-        
+
         // Engage threats
         for (const target of targets) {
           if (bot.state !== "running") break;
@@ -1003,7 +1090,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
           }
 
           yield "engage";
-          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee);
+          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, securityMonitored);
 
           if (won) {
             totalKills++;

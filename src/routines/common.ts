@@ -54,6 +54,8 @@ export interface SystemPOI {
   base_id: string | null;
   /** Station services (refuel, repair, market, etc.) — null if unknown or no base. */
   services: BaseServices | null;
+  /** Hidden POIs (e.g., secret ore belts) */
+  hidden?: boolean;
 }
 
 export interface Connection {

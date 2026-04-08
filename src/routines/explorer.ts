@@ -1940,8 +1940,22 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
     return true;
   }
 
-  // Try to buy fuel cells at current station
-  ctx.log("trade", `Loading ${availableSpace} fuel cells for long-range exploration...`);
+  // Try to withdraw fuel cells from faction storage
+  ctx.log("trade", `Loading ${availableSpace} fuel cells from faction storage for long-range exploration...`);
+  const withdrawResp = await bot.exec("faction_withdraw_items", {
+    item_id: "fuel_cell",
+    quantity: availableSpace
+  });
+
+  if (!withdrawResp.error) {
+    const newFuelCells = fuelCellCount + availableSpace;
+    ctx.log("trade", `Loaded ${availableSpace} fuel cells from faction storage (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    return true;
+  }
+
+  // If faction withdraw failed, try to buy fuel cells from station market as fallback
+  const errorMsg = (withdrawResp.error.message || "").toLowerCase();
+  ctx.log("warn", `Could not withdraw fuel cells: ${withdrawResp.error.message} — trying to buy from market...`);
   const buyResp = await bot.exec("buy_item", {
     item_id: "fuel_cell",
     quantity: availableSpace
@@ -1949,16 +1963,16 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
   if (!buyResp.error) {
     const newFuelCells = fuelCellCount + availableSpace;
-    ctx.log("trade", `Loaded ${availableSpace} fuel cells (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    ctx.log("trade", `Bought ${availableSpace} fuel cells from market (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // If buy failed, try to withdraw credits from storage and retry
-  const errorMsg = (buyResp.error.message || "").toLowerCase();
-  if (errorMsg.includes("credit") || errorMsg.includes("not enough") || errorMsg.includes("insufficient")) {
+  // If buy also failed, try to withdraw credits and retry
+  const buyErrorMsg = (buyResp.error.message || "").toLowerCase();
+  if (buyErrorMsg.includes("credit") || buyErrorMsg.includes("not enough") || buyErrorMsg.includes("insufficient")) {
     ctx.log("trade", "Not enough credits — withdrawing from storage...");
-    const withdrawResp = await bot.exec("withdraw_credits");
-    if (!withdrawResp.error) {
+    const withdrawCreditsResp = await bot.exec("withdraw_credits");
+    if (!withdrawCreditsResp.error) {
       await bot.refreshStatus();
       ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying fuel cell purchase...`);
       const retryResp = await bot.exec("buy_item", {
@@ -1972,7 +1986,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
       }
       ctx.log("error", `Still could not buy fuel cells: ${retryResp.error.message}`);
     } else {
-      ctx.log("error", `Could not withdraw credits: ${withdrawResp.error.message}`);
+      ctx.log("error", `Could not withdraw credits: ${withdrawCreditsResp.error.message}`);
     }
   } else {
     ctx.log("error", `Could not buy fuel cells: ${buyResp.error.message}`);

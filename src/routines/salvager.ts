@@ -450,6 +450,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           if (rFuelPct < safetyOpts.fuelThresholdPct) break;
 
           yield "travel_to_poi";
+          ctx.log("travel", `Traveling to ${poi.name} (${roamSystemId})...`);
           const tResp = await bot.exec("travel", { target_poi: poi.id });
           if (tResp.error && !tResp.error.message.includes("already")) continue;
           bot.poi = poi.id;

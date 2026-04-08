@@ -119,19 +119,59 @@ async function hasDeepCoreExtractor(ctx: RoutineContext): Promise<boolean> {
 /**
  * Check if the ship has full deep core mining capability (both scanner and extractor).
  * Returns an object with detailed capability info.
+ * During field_test mission, only extractor is required.
  */
-async function getDeepCoreCapability(ctx: RoutineContext): Promise<{
+async function getDeepCoreCapability(ctx: RoutineContext, fieldTestActive: boolean = false): Promise<{
   hasScanner: boolean;
   hasExtractor: boolean;
   canMine: boolean;
 }> {
   const hasScanner = await hasDeepCoreSurveyScanner(ctx);
   const hasExtractor = await hasDeepCoreExtractor(ctx);
+  
+  // During field_test mission, we can mine with just the extractor
+  // (no scanner required since we're using directional jump method)
+  const canMine = fieldTestActive ? hasExtractor : (hasScanner && hasExtractor);
+  
   return {
     hasScanner,
     hasExtractor,
-    canMine: hasScanner && hasExtractor,
+    canMine,
   };
+}
+
+/**
+ * Check if the 'field_test' mission is currently active.
+ * This is the early game mission that gives you the deep core extractor
+ * and tasks you with mining 10 exotic matter, but you don't have the
+ * survey scanner yet.
+ */
+async function hasFieldTestMission(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const activeResp = await bot.exec("get_active_missions");
+  if (activeResp.error || !activeResp.result) return false;
+
+  const result = activeResp.result as Record<string, unknown>;
+  const missions = Array.isArray(activeResp.result)
+    ? activeResp.result
+    : Array.isArray(result.missions)
+    ? result.missions
+    : [];
+
+  for (const mission of missions) {
+    const missionObj = typeof mission === "object" && mission !== null ? mission as Record<string, unknown> : null;
+    const missionId = (missionObj?.id as string) || (missionObj?.mission_id as string) || "";
+    const missionName = (missionObj?.name as string) || "";
+    const missionDesc = (missionObj?.description as string) || "";
+    const missionType = (missionObj?.type as string) || "";
+
+    const checkStr = `${missionId} ${missionName} ${missionDesc} ${missionType}`.toLowerCase();
+    if (checkStr.includes("field_test") || checkStr.includes("field test")) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 // ── Mission helpers ───────────────────────────────────────────
@@ -410,9 +450,15 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   }
 
   // Check for deep core equipment (survey scanner + extractor) — counts as ore mining
-  const deepCoreCap = await getDeepCoreCapability(ctx);
+  // During field_test mission, only extractor is required
+  const fieldTestActive = await hasFieldTestMission(ctx);
+  const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
   if (deepCoreCap.canMine) {
-    ctx.log("info", "Deep core mining equipment detected — ore mining mode (hidden POIs)");
+    if (fieldTestActive) {
+      ctx.log("info", "Deep core mining equipment detected — ore mining mode (extractor only, field_test mission)");
+    } else {
+      ctx.log("info", "Deep core mining equipment detected — ore mining mode (hidden POIs)");
+    }
     return "ore";
   }
 
@@ -449,18 +495,26 @@ async function hasEquipmentForMiningType(ctx: RoutineContext, miningType: "ore" 
 }
 
 /** Detect deep core mining capability and log it. */
-async function logDeepCoreCapability(ctx: RoutineContext): Promise<void> {
-  const deepCoreCap = await getDeepCoreCapability(ctx);
+async function logDeepCoreCapability(ctx: RoutineContext, fieldTestActive: boolean = false): Promise<void> {
+  const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
   if (deepCoreCap.hasScanner || deepCoreCap.hasExtractor) {
     const parts: string[] = [];
     if (deepCoreCap.hasScanner) parts.push("survey scanner");
     if (deepCoreCap.hasExtractor) parts.push("deep core extractor");
     ctx.log("mining", `Deep core equipment detected: ${parts.join(" + ")}`);
-    if (deepCoreCap.canMine) {
-      ctx.log("mining", "Deep core mining capability: FULL (can mine hidden POIs)");
+    if (fieldTestActive) {
+      if (deepCoreCap.canMine) {
+        ctx.log("mining", "Deep core mining capability: EXTRACTOR ONLY (field_test mission active - using directional jump method)");
+      } else {
+        ctx.log("warn", "Deep core mining INCOMPLETE: missing extractor");
+      }
     } else {
-      if (!deepCoreCap.hasScanner) ctx.log("warn", "Deep core mining INCOMPLETE: missing survey scanner");
-      if (!deepCoreCap.hasExtractor) ctx.log("warn", "Deep core mining INCOMPLETE: missing extractor");
+      if (deepCoreCap.canMine) {
+        ctx.log("mining", "Deep core mining capability: FULL (can mine hidden POIs)");
+      } else {
+        if (!deepCoreCap.hasScanner) ctx.log("warn", "Deep core mining INCOMPLETE: missing survey scanner");
+        if (!deepCoreCap.hasExtractor) ctx.log("warn", "Deep core mining INCOMPLETE: missing extractor");
+      }
     }
   }
 }
@@ -927,8 +981,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     };
     const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
 
+    // ── Check for field_test mission (early game mining mission) ──
+    const fieldTestActive = await hasFieldTestMission(ctx);
+    if (fieldTestActive) {
+      ctx.log("mining", "Field test mission detected - mining with extractor only (directional jump method)");
+    }
+
     // ── Deep core equipment detection (log once per cycle) ──
-    await logDeepCoreCapability(ctx);
+    await logDeepCoreCapability(ctx, fieldTestActive);
 
     // ── Flock mining integration ──
     let isFlockLeader = false;
@@ -986,7 +1046,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
         // Deep core miner restriction for flock leaders: if this miner has deep core equipment,
         // only accept deep core ore targets. Ignore regular ore targets from settings.
-        const deepCoreCap = await getDeepCoreCapability(ctx);
+        const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
         if (deepCoreCap.canMine && flockTargetResource && !isDeepCoreOre(flockTargetResource)) {
           ctx.log("flock", `Deep core miner — ignoring regular ore target "${flockTargetResource}", will search for deep core ores`);
           flockTargetResource = "";
@@ -1150,7 +1210,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Deep core miner restriction ──
     // If the miner has full deep core capability, restrict mining to deep core ores only
     // This prevents deep core miners from being assigned to mundane regular ores
-    const deepCoreCap = await getDeepCoreCapability(ctx);
+    // During field_test mission, only extractor is required
+    const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
     if (deepCoreCap.canMine) {
       // If current target is not a deep core ore, search for one
       if (effectiveTarget && !isDeepCoreOre(effectiveTarget)) {
@@ -1166,12 +1227,19 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // If no effective target, search for available deep core ores
       if (!effectiveTarget) {
-        ctx.log("mining", "Searching for available deep core ore targets...");
+        // During field_test mission, force exotic_matter as the target
+        if (fieldTestActive) {
+          ctx.log("mining", "Field test mission active - targeting exotic_matter for mission completion");
+          effectiveTarget = "exotic_matter";
+        } else {
+          ctx.log("mining", "Searching for available deep core ore targets...");
+        }
         const blacklist = getSystemBlacklist();
         let foundDeepCoreTarget = false;
 
         // Try each deep core ore to find an available target
-        for (const deepCoreOre of DEEP_CORE_ORES) {
+        const oresToCheck = fieldTestActive ? ["exotic_matter"] : Array.from(DEEP_CORE_ORES);
+        for (const deepCoreOre of oresToCheck) {
           const locations = mapStore.findOreLocations(deepCoreOre).filter(loc => {
             const sys = mapStore.getSystem(loc.systemId);
             const poi = sys?.pois.find(p => p.id === loc.poiId);
@@ -1226,10 +1294,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Deep core ore equipment validation ──
     // If the target is a deep core ore, verify we have the proper equipment
     if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
-      const deepCoreCap = await getDeepCoreCapability(ctx);
+      const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
       if (!deepCoreCap.canMine) {
-        ctx.log("error", `Target ${effectiveTarget} is a deep core ore — requires deep core survey scanner + extractor`);
-        if (!deepCoreCap.hasScanner) {
+        if (fieldTestActive) {
+          ctx.log("error", `Target ${effectiveTarget} is a deep core ore — requires deep core extractor (field_test mission)`);
+        } else {
+          ctx.log("error", `Target ${effectiveTarget} is a deep core ore — requires deep core survey scanner + extractor`);
+        }
+        if (!deepCoreCap.hasScanner && !fieldTestActive) {
           ctx.log("error", "  Missing: Deep Core Survey Scanner (detection capability)");
         }
         if (!deepCoreCap.hasExtractor) {
@@ -1244,7 +1316,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           recoveredSession = null;
         }
       } else {
-        ctx.log("mining", `Deep core target validated: ${effectiveTarget} (scanner + extractor equipped)`);
+        if (fieldTestActive) {
+          ctx.log("mining", `Deep core target validated: ${effectiveTarget} (extractor only - field_test mission)`);
+        } else {
+          ctx.log("mining", `Deep core target validated: ${effectiveTarget} (scanner + extractor equipped)`);
+        }
       }
     }
 
@@ -1259,10 +1335,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       
       // Deep core validation for flock target
       if (isDeepCoreOre(flockTargetResource)) {
-        const deepCoreCap = await getDeepCoreCapability(ctx);
+        const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
         if (!deepCoreCap.canMine) {
           ctx.log("error", `Flock target ${flockTargetResource} is a deep core ore — skipping (missing equipment)`);
-          if (!deepCoreCap.hasScanner) ctx.log("error", "  Missing: Deep Core Survey Scanner");
+          if (!deepCoreCap.hasScanner && !fieldTestActive) ctx.log("error", "  Missing: Deep Core Survey Scanner");
           if (!deepCoreCap.hasExtractor) ctx.log("error", "  Missing: Deep Core Extractor");
           // Don't override effectiveTarget — continue with solo mining instead
         } else {
@@ -1517,6 +1593,25 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
+    // ── Field test mission: force navigation to markeb, then jump to ironpeak ──
+    // During field_test mission, we may not have the survey scanner yet,
+    // so we use the directional jump method to reach ironpeak hidden pockets
+    if (fieldTestActive && effectiveTarget === "exotic_matter") {
+      ctx.log("mining", "Field test mission: forcing navigation to markeb system");
+      targetSystemId = "markeb";
+      
+      // Check if we're already in markeb
+      if (bot.system !== "markeb") {
+        ctx.log("mining", "Navigating to markeb system as waypoint before ironpeak...");
+        // We'll handle this in the navigation section below
+      } else {
+        ctx.log("mining", "Already in markeb system - will jump to ironpeak for mining");
+        // Set the target POI to ironpeak (hidden pocket)
+        targetPoiId = "ironpeak";
+        targetPoiName = "Ironpeak";
+      }
+    }
+
     // ── Navigate to target system if needed ──
     if (targetSystemId && targetSystemId !== bot.system) {
       yield "navigate_to_target";
@@ -1532,7 +1627,32 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // CRITICAL FIX: If rally system is configured, navigate to it first as a waypoint
       const rallySystem = flockGroup?.rallySystem;
-      if (rallySystem && settings.flockEnabled && settings.flockName && rallySystem !== bot.system && rallySystem !== targetSystemId) {
+      
+      // FIELD TEST MISSION: Navigate to markeb first, then jump to ironpeak
+      if (fieldTestActive && targetSystemId === "markeb") {
+        ctx.log("mining", "Field test mission: navigating to markeb system...");
+        const markebArrived = await navigateToSystem(ctx, "markeb", safetyOpts);
+        if (markebArrived) {
+          ctx.log("mining", "Arrived at markeb system - now jumping to ironpeak hidden pocket...");
+          // After arriving at markeb, set target to ironpeak
+          targetSystemId = "ironpeak";
+          targetPoiId = "ironpeak";
+          targetPoiName = "Ironpeak";
+          
+          // Now navigate to ironpeak
+          const ironpeakArrived = await navigateToSystem(ctx, "ironpeak", safetyOpts);
+          if (!ironpeakArrived) {
+            ctx.log("error", "Failed to reach ironpeak from markeb — will retry next cycle");
+            await sleep(30000);
+            continue;
+          }
+          ctx.log("mining", "Successfully arrived at ironpeak - ready to mine exotic_matter");
+        } else {
+          ctx.log("error", "Failed to reach markeb system — will retry next cycle");
+          await sleep(30000);
+          continue;
+        }
+      } else if (rallySystem && settings.flockEnabled && settings.flockName && rallySystem !== bot.system && rallySystem !== targetSystemId) {
         ctx.log("flock", `Navigating to rally system ${rallySystem} as waypoint before mining target...`);
         const rallyArrived = await navigateToSystem(ctx, rallySystem, safetyOpts);
         if (rallyArrived) {
@@ -1564,7 +1684,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         // detection may have failed. Re-check and re-apply deep core restrictions.
         if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
           ctx.log("mining", "Re-validating deep core equipment after jump failure...");
-          const deepCoreCapRecheck = await getDeepCoreCapability(ctx);
+          const deepCoreCapRecheck = await getDeepCoreCapability(ctx, fieldTestActive);
           if (!deepCoreCapRecheck.canMine) {
             ctx.log("error", "Deep core equipment not detected after jump failure — cannot mine deep core ore");
             ctx.log("error", "  Clearing deep core target to prevent mining wrong ore type");
@@ -1749,12 +1869,29 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (effectiveTarget) {
           const targetResource = scanResources.find(r => (r.resource_id as string) === effectiveTarget);
           const remaining = (targetResource?.remaining as number) ?? 0;
-          if (remaining <= 0) {
-            ctx.log("mining", `Pre-scan: ${effectiveTarget} depleted at ${miningPoi.name} — marking depleted and searching for alternative`);
-            mapStore.markOreDepleted(bot.system, miningPoi.id, effectiveTarget);
-            // Don't travel here — fall through to depletion handling below
-            miningPoi = null;
-          } else {
+          const maxRemaining = (targetResource?.max_remaining as number) ?? 0;
+          
+          // CRITICAL FIX: Only mark depleted if we have CONFIRMED evidence of 0 remaining
+          // AND the max_remaining was previously > 0 (proves it was actually mined/scanned)
+          // This prevents false depletion markers from POIs that were never properly checked
+          if (remaining <= 0 && maxRemaining > 0) {
+            // Double-check: verify this isn't a stale/incorrect reading
+            // by checking if we have any prior map data for this POI
+            const sysData = mapStore.getSystem(bot.system);
+            const existingPoi = sysData?.pois.find(p => p.id === miningPoi!.id);
+            const existingOreEntry = existingPoi?.ores_found.find(o => o.item_id === effectiveTarget);
+
+            // If we have prior evidence this POI had resources, mark it depleted
+            // Otherwise, log a warning and don't mark it (prevents false positives)
+            if (existingOreEntry || maxRemaining > 0) {
+              ctx.log("mining", `Pre-scan: ${effectiveTarget} depleted at ${miningPoi!.name} (${remaining}/${maxRemaining}) — marking depleted and searching for alternative`);
+              mapStore.markOreDepleted(bot.system, miningPoi!.id, effectiveTarget);
+              // Don't travel here — fall through to depletion handling below
+              miningPoi = null;
+            } else {
+              ctx.log("warn", `Pre-scan: ${effectiveTarget} shows 0 remaining at ${miningPoi!.name} but no prior mining history — NOT marking depleted (may be unscanned POI)`);
+            }
+          } else if (remaining > 0) {
             ctx.log("mining", `Pre-scan: ${effectiveTarget} has ${remaining.toLocaleString()} units remaining at ${miningPoi.name}`);
           }
         }
@@ -1870,6 +2007,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
+    // miningPoi is guaranteed non-null here after the depletion check
+    if (!miningPoi) continue;
+
     // ── Travel to mining location ──
     yield miningType === "ice" ? "travel_to_ice_field" : (miningType === "ore" ? "travel_to_belt" : "travel_to_cloud");
     const travelResp = await bot.exec("travel", { target_poi: miningPoi.id });
@@ -1950,7 +2090,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     const resourcesMinedMap = new Map<string, number>();
     let lastPoiCheck = 0;
     let lastBattleCheck = 0;
-    const POI_CHECK_INTERVAL_MS = 60_000; // Check POI remaining every 60 seconds
+    const POI_CHECK_INTERVAL_MS = 600_000; // Check POI remaining every 10 minutes
     const BATTLE_CHECK_INTERVAL_MS = 8_000; // Check battle status every 8 seconds (< 1 game tick)
 
     while (bot.state === "running") {
@@ -2000,9 +2140,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // Periodically check POI to see if resource is depleted (remaining: 0)
+      // DEEP CORE FIX: This check also ensures deep core miners stay on deep core tasks
       if (effectiveTarget && bot.poi && !settings.ignoreDepletion &&
           (now - lastPoiCheck) > POI_CHECK_INTERVAL_MS) {
         lastPoiCheck = now;
+        
+        // DEEP CORE GUARD: Verify we're still mining a deep core ore if we have deep core equipment
+        const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
+        if (deepCoreCap.canMine && isDeepCoreOre(effectiveTarget)) {
+          ctx.log("mining", `Deep core guard check: confirming still on deep core task (${effectiveTarget})`);
+        } else if (deepCoreCap.canMine && !isDeepCoreOre(effectiveTarget)) {
+          ctx.log("warn", `Deep core miner is NOT on a deep core target! Current target: ${effectiveTarget} — this should not happen, will re-select target`);
+          // Force re-selection of target on next cycle
+          targetResource = "";
+          continue;
+        }
+        
         const poiResp = await bot.exec("get_poi", { poi_id: bot.poi });
         if (!poiResp.error && poiResp.result) {
           const result = poiResp.result as Record<string, unknown>;
@@ -2032,14 +2185,20 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               reveal_difficulty: poiData.reveal_difficulty as number | undefined,
               resources: resourceData,
             });
+            
+            ctx.log("map", `Updated map for ${bot.system}: POI ${poiData.name || bot.poi} scan data recorded`);
           }
 
           for (const res of resources) {
             const resId = (res.resource_id as string) || (res.id as string) || "";
             if (resId === effectiveTarget) {
               const remaining = (res.remaining as number) ?? (res.quantity as number) ?? null;
-              if (remaining !== null && remaining <= 0) {
-                ctx.log("mining", `POI check: ${effectiveTarget} is depleted (remaining: ${remaining})`);
+              const maxRemaining = (res.max_remaining as number) ?? 0;
+              
+              // CRITICAL FIX: Only mark depleted if we have CONFIRMED evidence
+              // Same logic as pre-scan: require maxRemaining > 0 to prove it was actually scanned/mined
+              if (remaining !== null && remaining <= 0 && maxRemaining > 0) {
+                ctx.log("mining", `POI check: ${effectiveTarget} is depleted (remaining: ${remaining}, max: ${maxRemaining})`);
                 mapStore.markOreDepleted(bot.system, bot.poi, effectiveTarget);
                 
                 // If stayOutUntilFull is enabled and cargo is not full, search for new POI
@@ -2202,9 +2361,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 const resId = (res.resource_id as string) || (res.id as string) || "";
                 if (resId === effectiveTarget) {
                   const remaining = (res.remaining as number) ?? (res.quantity as number) ?? null;
-                  actuallyDepleted = remaining !== null && remaining <= 0;
+                  const maxRemaining = (res.max_remaining as number) ?? 0;
+                  // CRITICAL FIX: Only mark depleted if confirmed 0 AND had resources before
+                  actuallyDepleted = remaining !== null && remaining <= 0 && maxRemaining > 0;
                   if (!actuallyDepleted) {
-                    ctx.log("mining", `Mine error says "depleted" but ${effectiveTarget} still has ${remaining} remaining — NOT marking as depleted`);
+                    ctx.log("mining", `Mine error says "depleted" but ${effectiveTarget} still has ${remaining} remaining (max: ${maxRemaining}) — NOT marking as depleted`);
                   }
                   break;
                 }
@@ -2233,7 +2394,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           let newSystemId: string | null = null;
 
           // For deep core miners, check if we should search for deep core ores instead
-          const currentDeepCoreCap = await getDeepCoreCapability(ctx);
+          const currentDeepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
           const isDeepCoreMiner = currentDeepCoreCap.canMine;
           let searchTarget = targetResource;
           
@@ -2534,7 +2695,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               bot.poi = newPoiId;
             }
 
-            miningPoi = { id: newPoiId, name: newPoiName };
+            miningPoi = { id: newPoiId!, name: newPoiName! };
             ctx.log("mining", `Continuing mining session with new target: ${newTarget}`);
             continue; // Continue the harvest loop with new target
           } else {

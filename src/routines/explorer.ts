@@ -130,7 +130,7 @@ const RESOURCE_REFRESH_MINS = 120;
 
 // ── Per-bot settings ─────────────────────────────────────────
 
-export type ExplorerMode = "explore" | "trade_update";
+export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan";
 
 function getExplorerSettings(username?: string): {
   mode: ExplorerMode;
@@ -203,7 +203,7 @@ function getExplorerSettings(username?: string): {
       : true;
 
   return {
-    mode: (mode === "trade_update" ? "trade_update" : "explore") as ExplorerMode,
+    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : "explore") as ExplorerMode,
     acceptMissions,
     focusAreaSystem,
     maxJumps,
@@ -221,6 +221,13 @@ function getExplorerSettings(username?: string): {
 export function setExplorerMode(username: string, mode: ExplorerMode): void {
   writeSettings({
     [username]: { explorerMode: mode },
+  });
+}
+
+/** Persist deep core scan mode setting for a specific bot. */
+export function setExplorerDeepCoreScan(username: string, enabled: boolean): void {
+  writeSettings({
+    [username]: { explorerMode: enabled ? "deep_core_scan" : "explore" },
   });
 }
 
@@ -284,6 +291,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   const initialSettings = getExplorerSettings(bot.username);
   if (initialSettings.mode === "trade_update") {
     yield* tradeUpdateRoutine(ctx);
+    return;
+  }
+  if (initialSettings.mode === "deep_core_scan") {
+    yield* deepCoreScanRoutine(ctx);
     return;
   }
 
@@ -392,6 +403,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (modeCheck.mode === "trade_update") {
       ctx.log("system", "Mode changed to trade_update — switching routines...");
       yield* tradeUpdateRoutine(ctx);
+      return;
+    }
+    if (modeCheck.mode === "deep_core_scan") {
+      ctx.log("system", "Mode changed to deep_core_scan — switching routines...");
+      yield* deepCoreScanRoutine(ctx);
       return;
     }
 
@@ -1140,6 +1156,329 @@ async function* visitOtherPoi(
   }
 
   mapStore.markExplored(systemId, poi.id);
+}
+
+// ── Deep Core Scan routine ───────────────────────────────────
+
+/**
+ * Deep core scan mode — visits known hidden POIs to refresh their resource data.
+ * Requires deep core survey scanner module to access hidden POIs.
+ * Focuses on re-scanning hidden POIs that contain valuable deep core ores.
+ */
+async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  // ── Check for deep core survey scanner ──
+  const scannerCap = await hasDeepCoreSurveyScanner(ctx);
+  if (!scannerCap) {
+    ctx.log("error", "Deep core scan mode requires a deep core survey scanner module!");
+    ctx.log("error", "Please equip a deep core survey scanner and try again.");
+    await sleep(30000);
+    return;
+  }
+
+  ctx.log("system", "Deep Core Scan mode — refreshing known hidden POIs...");
+
+  // ── Startup: dock at local station to clear cargo & refuel ──
+  yield "startup_prep";
+  await bot.refreshStatus();
+  const { pois: startPois } = await getSystemInfo(ctx);
+  const startStation = findStation(startPois);
+  if (startStation) {
+    ctx.log("system", `Startup: docking at ${startStation.name} to clear cargo & refuel...`);
+
+    if (bot.poi !== startStation.id) {
+      await ensureUndocked(ctx);
+      const tResp = await bot.exec("travel", { target_poi: startStation.id });
+      if (tResp.error && !tResp.error.message.includes("already")) {
+        ctx.log("error", `Could not reach station: ${tResp.error.message}`);
+      }
+    }
+
+    if (!bot.docked) {
+      const dResp = await bot.exec("dock");
+      if (!dResp.error || dResp.error.message.includes("already")) {
+        bot.docked = true;
+      }
+    }
+
+    if (bot.docked) {
+      await collectFromStorage(ctx);
+      yield "startup_refuel";
+      await tryRefuel(ctx);
+      await bot.refreshStatus();
+      const startFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      ctx.log("system", `Startup complete — Fuel: ${startFuel}% | Cargo: ${bot.cargo}/${bot.cargoMax}`);
+    }
+  }
+
+  const visitedHiddenPois = new Set<string>(); // Track visited hidden POIs this cycle
+  let lastSystem: string | null = null;
+
+  while (bot.state === "running") {
+    // ── Death recovery ──
+    const alive = await detectAndRecoverFromDeath(ctx);
+    if (!alive) { await sleep(30000); continue; }
+
+    // ── Battle check ──
+    if (bot.isInBattle()) {
+      ctx.log("combat", "[WebSocket] Battle detected via WebSocket - fleeing immediately!");
+      if (await checkAndFleeFromBattle(ctx, "deep_core_scan")) {
+        await sleep(5000);
+        continue;
+      }
+    }
+
+    if (await checkAndFleeFromBattle(ctx, "deep_core_scan")) {
+      await sleep(5000);
+      continue;
+    }
+
+    // ── Re-check mode after recovery ──
+    const modeCheck = getExplorerSettings(bot.username);
+    if (modeCheck.mode !== "deep_core_scan") {
+      ctx.log("system", `Mode changed to ${modeCheck.mode} — switching routines...`);
+      if (modeCheck.mode === "trade_update") {
+        yield* tradeUpdateRoutine(ctx);
+      }
+      return;
+    }
+
+    // ── Find hidden POIs that need scanning ──
+    yield "find_hidden_pois";
+    const hiddenPois = findHiddenPoisToScan(ctx);
+
+    if (hiddenPois.length === 0) {
+      ctx.log("info", "No hidden POIs found to scan — run explorer mode first to discover them!");
+      await sleep(30000);
+      continue;
+    }
+
+    ctx.log("info", `Found ${hiddenPois.length} hidden POI(s) to scan`);
+
+    // ── Visit each hidden POI ──
+    for (const hiddenPoi of hiddenPois) {
+      if (bot.state !== "running") break;
+
+      // ── Navigate to target system if needed ──
+      yield "fuel_check";
+      const fueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
+      if (!fueled) {
+        ctx.log("error", "Cannot refuel — waiting 30s...");
+        await sleep(30000);
+        continue;
+      }
+
+      if (hiddenPoi.systemId !== bot.system) {
+        yield "navigate";
+        await ensureUndocked(ctx);
+        const blacklist = getSystemBlacklist();
+        const arrived = await navigateToSystem(ctx, hiddenPoi.systemId, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+        if (!arrived) {
+          ctx.log("error", `Could not reach ${hiddenPoi.systemName} — skipping POI`);
+          continue;
+        }
+        lastSystem = bot.system;
+      }
+
+      if (bot.state !== "running") break;
+
+      // ── Survey system to reveal hidden POIs ──
+      yield "survey_system";
+      const surveyResp = await bot.exec("survey_system");
+
+      if (await checkBattleAfterCommand(ctx, surveyResp.notifications, "survey_system")) {
+        ctx.log("combat", "Battle detected during survey - fleeing!");
+        await sleep(5000);
+        continue;
+      }
+
+      if (!surveyResp.error) {
+        ctx.log("info", `Surveyed ${bot.system} — hidden POIs should now be accessible`);
+      } else {
+        const msg = surveyResp.error.message.toLowerCase();
+        if (!msg.includes("already") && !msg.includes("cooldown")) {
+          ctx.log("info", `Survey: ${surveyResp.error.message}`);
+        }
+      }
+
+      // ── Travel to hidden POI ──
+      yield "travel_to_poi";
+      await ensureUndocked(ctx);
+      const tResp = await bot.exec("travel", { target_poi: hiddenPoi.poiId });
+
+      if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+        ctx.log("combat", "Battle detected during travel - fleeing!");
+        await sleep(5000);
+        continue;
+      }
+
+      if (tResp.error) {
+        ctx.log("error", `Travel to ${hiddenPoi.poiName} failed: ${tResp.error.message}`);
+        continue;
+      }
+      bot.poi = hiddenPoi.poiId;
+
+      // ── Scan the hidden POI ──
+      yield `scan_${hiddenPoi.poiId}`;
+      const poiResp = await bot.exec("get_poi", { poi_id: hiddenPoi.poiId });
+
+      if (await checkBattleAfterCommand(ctx, poiResp.notifications, "get_poi")) {
+        ctx.log("combat", "Battle detected at POI scan - fleeing!");
+        await sleep(5000);
+        continue;
+      }
+
+      if (poiResp.error) {
+        ctx.log("error", `get_poi failed for ${hiddenPoi.poiName}: ${poiResp.error.message}`);
+        continue;
+      }
+
+      // Parse and update mapstore with POI data
+      const result = poiResp.result as Record<string, unknown>;
+      const poiData = result?.poi as Record<string, unknown> | undefined;
+      const resources = (
+        Array.isArray(result?.resources) ? result.resources :
+        Array.isArray(poiData?.resources) ? poiData.resources :
+        []
+      ) as Array<Record<string, unknown>>;
+
+      if (poiData) {
+        const resourceData = resources.map((r) => ({
+          resource_id: (r.resource_id as string) || "",
+          name: (r.name as string) || (r.resource_id as string) || "",
+          richness: (r.richness as number) || 0,
+          remaining: (r.remaining as number) || 0,
+          max_remaining: (r.max_remaining as number) || 0,
+          depletion_percent: (r.depletion_percent as number) || 100,
+        }));
+
+        mapStore.registerPoiFromScan(hiddenPoi.systemId, {
+          id: (poiData.id as string) || hiddenPoi.poiId,
+          name: (poiData.name as string) || hiddenPoi.poiName,
+          type: (poiData.type as string) || hiddenPoi.poiType,
+          hidden: true,
+          reveal_difficulty: poiData.reveal_difficulty as number | undefined,
+          resources: resourceData.length > 0 ? resourceData : undefined,
+        });
+
+        if (resourceData.length > 0) {
+          const resourceNames = resourceData.map(r => r.name).join(", ");
+          ctx.log("exploration", `🎯 Scanned hidden POI ${hiddenPoi.poiName}: ${resourceNames}`);
+        } else {
+          ctx.log("info", `Scanned hidden POI ${hiddenPoi.poiName}: no resources found`);
+        }
+      }
+
+      visitedHiddenPois.add(`${hiddenPoi.systemId}:${hiddenPoi.poiId}`);
+      mapStore.markExplored(hiddenPoi.systemId, hiddenPoi.poiId);
+
+      // ── Check cargo — if full, return home to deposit ──
+      await bot.refreshStatus();
+      if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
+        yield "deposit_cargo";
+        await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+      }
+    }
+
+    // ── Check skills ──
+    yield "check_skills";
+    await bot.checkSkills();
+
+    // ── Cycle complete — restart ──
+    await bot.refreshStatus();
+    const cycleFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("info", `Deep core scan cycle done — visited ${visitedHiddenPois.size} POI(s), ${bot.credits} cr, ${cycleFuel}% fuel`);
+    visitedHiddenPois.clear(); // Reset for next cycle
+    await sleep(5000);
+  }
+}
+
+/**
+ * Find all hidden POIs that need scanning across all known systems.
+ * Returns POIs sorted by staleness (oldest first).
+ */
+function findHiddenPoisToScan(ctx: RoutineContext): Array<{
+  systemId: string;
+  systemName: string;
+  poiId: string;
+  poiName: string;
+  poiType: string;
+  staleMins: number;
+}> {
+  const allSystems = mapStore.getAllSystems();
+  const hiddenPois: Array<{
+    systemId: string;
+    systemName: string;
+    poiId: string;
+    poiName: string;
+    poiType: string;
+    staleMins: number;
+  }> = [];
+
+  const staleThreshold = Date.now() - RESOURCE_REFRESH_MINS * 60 * 1000;
+
+  for (const [sysId, sys] of Object.entries(allSystems)) {
+    // Skip pirate systems
+    if (isPirateSystem(sysId)) continue;
+
+    for (const poi of sys.pois) {
+      // Only include hidden POIs
+      if (!poi.hidden) continue;
+
+      // Check how stale the data is
+      let oldestMins = Infinity;
+      if (poi.last_updated) {
+        const mins = (Date.now() - new Date(poi.last_updated).getTime()) / 60000;
+        oldestMins = mins;
+      }
+
+      // Skip if recently scanned
+      if (oldestMins < RESOURCE_REFRESH_MINS) continue;
+
+      hiddenPois.push({
+        systemId: sysId,
+        systemName: sys.name,
+        poiId: poi.id,
+        poiName: poi.name,
+        poiType: poi.type,
+        staleMins: oldestMins,
+      });
+    }
+  }
+
+  // Sort by staleness (oldest first)
+  hiddenPois.sort((a, b) => b.staleMins - a.staleMins);
+
+  return hiddenPois;
+}
+
+/**
+ * Check if the ship has a deep core survey scanner equipped.
+ * Reused from miner.ts — checks ship modules for scanner.
+ */
+async function hasDeepCoreSurveyScanner(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error || !shipResp.result) return false;
+
+  const shipData = shipResp.result as Record<string, unknown>;
+  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = (modObj?.id as string) || (modObj?.type_id as string) || "";
+    const modName = (modObj?.name as string) || "";
+    const modSpecial = (modObj?.special as string) || "";
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`.toLowerCase();
+    if (checkStr.includes("deep_core_survey_scanner") ||
+        checkStr.includes("deep core survey scanner") ||
+        modSpecial.includes("deep_core_detection")) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ── Trade Update routine ─────────────────────────────────────

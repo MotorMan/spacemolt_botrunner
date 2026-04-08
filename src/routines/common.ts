@@ -1522,10 +1522,18 @@ interface WreckItem {
   quantity: number;
 }
 
+interface WreckModule {
+  id: string;
+  type_id: string;
+  name: string;
+  type: string;
+}
+
 interface Wreck {
   wreck_id: string;
   name: string;
   items: WreckItem[];
+  modules: WreckModule[];
 }
 
 /** Parse wreck list from get_wrecks response. */
@@ -1547,6 +1555,12 @@ function parseWrecks(result: unknown): Wreck[] {
       []
     ) as Array<Record<string, unknown>>;
 
+    // Parse modules array
+    const rawModules = (
+      Array.isArray(w.modules) ? w.modules :
+      []
+    ) as Array<Record<string, unknown>>;
+
     return {
       wreck_id: (w.wreck_id as string) || (w.id as string) || "",
       name: (w.name as string) || (w.type as string) || "wreck",
@@ -1555,6 +1569,12 @@ function parseWrecks(result: unknown): Wreck[] {
         name: (i.name as string) || (i.item_id as string) || "",
         quantity: (i.quantity as number) || 1,
       })).filter(i => i.item_id),
+      modules: rawModules.map(m => ({
+        id: (m.id as string) || "",
+        type_id: (m.type_id as string) || "",
+        name: (m.name as string) || "",
+        type: (m.type as string) || "",
+      })).filter(m => m.id),
     };
   }).filter(w => w.wreck_id);
 }
@@ -1754,6 +1774,19 @@ export async function fullSalvageWrecks(
         const shipClass = (tr.ship_class as string) || "unknown";
 
         if (salvageValue >= minTowValue) {
+          // Log modules from the wreck's modules array
+          const moduleCount = wreck.modules.length;
+          
+          if (moduleCount > 0) {
+            const moduleList = wreck.modules.map(m => {
+              const name = m.name || m.type || m.type_id || m.id;
+              return name;
+            }).join(", ");
+            ctx.log("scavenge", `📦 Wreck contains ${moduleCount} module(s): ${moduleList}`);
+          } else {
+            ctx.log("scavenge", `📦 Wreck contains no modules`);
+          }
+
           towedWrecks.push({
             wreck_id: wreck.wreck_id,
             name: wreck.name,
@@ -1805,9 +1838,10 @@ export async function fullSalvageWrecks(
 
 /**
  * Process towed wrecks at a salvage yard station.
+ * - First, loot any modules from the towed wreck
  * - If salvaging skill < 2: sell_wreck for credits + XP
  * - If salvaging skill >= 2: scrap_wreck for materials (or sell if preferred)
- * 
+ *
  * Must be docked at a station with salvage_yard service.
  * Returns number of wrecks processed.
  */
@@ -1837,60 +1871,204 @@ export async function processTowedWrecks(
     return 0;
   }
 
-  // Check salvaging skill level
+  // Step 1: Loot modules from the towed wreck before selling/scrapping
+  ctx.log("scavenge", "Checking towed wreck for lootable modules...");
+  const wrecksResp = await bot.exec("get_wrecks");
+  const wrecks = parseWrecks(wrecksResp.result);
+
+  // Find the towed wreck in the list (it should still be accessible)
+  let modulesLooted = 0;
+  for (const wreck of wrecks) {
+    // Check modules array (not items)
+    if (wreck.modules.length === 0) {
+      ctx.log("scavenge", "📦 Towed wreck has no modules to loot");
+      break;
+    }
+
+    ctx.log("scavenge", `📦 Towed wreck ${wreck.name} contains ${wreck.modules.length} module(s): ${wreck.modules.map(m => m.name || m.type || m.type_id || m.id).join(", ")}`);
+
+    // Loot ALL modules and cargo from the wreck (no item_id specified = loots everything to cargo hold)
+    // Check cargo space first
+    await bot.refreshStatus();
+    const moduleCargoCost = wreck.modules.length * 10; // Typical module size is 10 each
+    if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
+      ctx.log("scavenge", `Cargo full while looting modules (${bot.cargo}/${bot.cargoMax}) — depositing items to make space...`);
+
+      // We're already docked, so deposit all non-fuel items from inventory
+      await bot.refreshCargo();
+      let deposited = false;
+      for (const cargoItem of bot.inventory) {
+        const lower = cargoItem.itemId.toLowerCase();
+        if (!lower.includes("fuel") && !lower.includes("energy_cell") && cargoItem.quantity > 0) {
+          const depositResp = await bot.exec("deposit_items", { item_id: cargoItem.itemId, quantity: cargoItem.quantity });
+          if (!depositResp.error) {
+            ctx.log("scavenge", `Deposited ${cargoItem.quantity}x ${cargoItem.name} to storage`);
+            deposited = true;
+          }
+        }
+      }
+
+      if (!deposited) {
+        ctx.log("warn", "No items to deposit — cannot make space for modules");
+        break;
+      }
+      
+      // Re-check cargo after deposit
+      await bot.refreshStatus();
+      if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
+        ctx.log("warn", "Still no cargo space after deposit — skipping module loot");
+        break;
+      }
+    }
+
+    // Loot ALL modules and cargo from wreck (no item_id = loots everything)
+    const lootResp = await bot.exec("loot_wreck", {
+      wreck_id: wreck.wreck_id,
+    });
+
+    if (lootResp.error) {
+      const msg = lootResp.error.message.toLowerCase();
+      if (msg.includes("no_space") || msg.includes("not enough cargo")) {
+        ctx.log("scavenge", "Still no cargo space — depositing ALL current items and retrying...");
+        // Deposit all non-fuel items to make space
+        await bot.refreshCargo();
+        for (const cargoItem of bot.inventory) {
+          const lower = cargoItem.itemId.toLowerCase();
+          if (!lower.includes("fuel") && !lower.includes("energy_cell") && cargoItem.quantity > 0) {
+            await bot.exec("deposit_items", { item_id: cargoItem.itemId, quantity: cargoItem.quantity });
+          }
+        }
+        // Retry looting everything
+        const retryResp = await bot.exec("loot_wreck", {
+          wreck_id: wreck.wreck_id,
+        });
+        if (!retryResp.error) {
+          modulesLooted = wreck.modules.length;
+          ctx.log("scavenge", `✓ Looted all modules from wreck`);
+        } else {
+          ctx.log("error", `Failed to loot modules after deposit: ${retryResp.error.message}`);
+        }
+      } else if (msg.includes("empty") || msg.includes("not found")) {
+        ctx.log("warn", "Wreck is empty or not found — stopping module loot");
+      } else {
+        ctx.log("error", `Failed to loot modules: ${lootResp.error.message}`);
+      }
+    } else {
+      modulesLooted = wreck.modules.length;
+      ctx.log("scavenge", `✓ Looted all modules from wreck`);
+    }
+
+    if (modulesLooted > 0) {
+      ctx.log("scavenge", `✅ Successfully looted ${modulesLooted} module(s) from towed wreck`);
+    }
+    break; // Only process the first wreck (we're only towing one)
+  }
+
+  // Step 2: Check salvaging skill level
   await bot.checkSkills();
   const salvagingLevel = bot.getSkillLevel("salvaging");
   const canScrap = salvagingLevel >= 2;
 
-  let processed = 0;
+  ctx.log("debug", `Salvaging skill level: ${salvagingLevel}, canScrap: ${canScrap}, preferScrap: ${preferScrap}`);
 
-  // Try to scrap if preferred and skill allows, otherwise sell
+  let processed = 0;
+  const MAX_SALVAGE_RETRIES = 3;
+
+  // Try to scrap if preferred and skill allows, with retries
   if (preferScrap && canScrap) {
-    const scrapResp = await bot.exec("scrap_wreck");
-    if (!scrapResp.error && scrapResp.result) {
-      const sr = scrapResp.result as Record<string, unknown>;
-      const items = (sr.items as Array<Record<string, unknown>>) || [];
-      if (items.length > 0) {
-        const names = items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || "material"}`).join(", ");
-        ctx.log("scavenge", `Scrapped wreck for: ${names}`);
-        processed++;
+    let scrapSuccess = false;
+    
+    for (let attempt = 1; attempt <= MAX_SALVAGE_RETRIES; attempt++) {
+      ctx.log("scavenge", `🔄 Scrap attempt ${attempt}/${MAX_SALVAGE_RETRIES}...`);
+      const scrapResp = await bot.exec("scrap_wreck");
+      
+      if (!scrapResp.error && scrapResp.result) {
+        const sr = scrapResp.result as Record<string, unknown>;
+        // Scrap response uses 'materials' field
+        const materials = (sr.materials as Array<Record<string, unknown>>) || [];
+        const totalValue = (sr.total_value as number) || 0;
+        const message = (sr.message as string) || "";
+        
+        if (materials.length > 0) {
+          const names = materials.map(m => `${(m.quantity as number) || 1}x ${(m.name as string) || "material"}`).join(", ");
+          ctx.log("scavenge", `✅ Scrapped wreck for: ${names} (total value: ${totalValue}cr)`);
+          if (message) ctx.log("scavenge", `   ${message}`);
+          processed++;
+          scrapSuccess = true;
+          break; // Success - exit retry loop
+        } else {
+          ctx.log("warn", `Scrap attempt ${attempt} returned no materials — retrying...`);
+        }
+      } else if (scrapResp.error) {
+        const errMsg = scrapResp.error.message.toLowerCase();
+        if (errMsg.includes("not_towing")) {
+          ctx.log("warn", `Server says not towing during scrap (attempt ${attempt}) — clearing tow flag`);
+          bot.towingWreck = false;
+          break; // Stop retrying - we're no longer towing
+        } else {
+          ctx.log("error", `Scrap attempt ${attempt} failed: ${scrapResp.error.message}`);
+        }
       }
-    } else if (scrapResp.error) {
-      const errMsg = scrapResp.error.message.toLowerCase();
-      if (errMsg.includes("not_towing")) {
-        ctx.log("warn", "Server says not towing during scrap — clearing tow flag");
-        bot.towingWreck = false;
-      } else {
-        ctx.log("error", `Scrap failed: ${scrapResp.error.message} - falling back to sell`);
+      
+      // Wait briefly before retry (give server time to process)
+      if (attempt < MAX_SALVAGE_RETRIES) {
+        await sleep(2000);
       }
-      // Fall through to sell
+    }
+    
+    if (!scrapSuccess && bot.towingWreck) {
+      ctx.log("warn", `All ${MAX_SALVAGE_RETRIES} scrap attempts failed — falling back to sell`);
     }
   }
 
-  if (processed === 0) {
-    // Sell the wreck for credits + XP
-    const sellResp = await bot.exec("sell_wreck");
-    if (!sellResp.error && sellResp.result) {
-      const sr = sellResp.result as Record<string, unknown>;
-      const credits = (sr.credits as number) || (sr.earned as number) || 0;
-      const xp = (sr.xp as number) || (sr.experience as number) || 0;
-      if (credits > 0 || xp > 0) {
-        ctx.log("scavenge", `Sold wreck for ${credits}cr + ${xp} XP`);
-        processed++;
+  // If scrap failed or not preferred, sell the wreck (also with retries)
+  if (processed === 0 && bot.towingWreck) {
+    let sellSuccess = false;
+    
+    for (let attempt = 1; attempt <= MAX_SALVAGE_RETRIES; attempt++) {
+      ctx.log("scavenge", `💰 Sell attempt ${attempt}/${MAX_SALVAGE_RETRIES}...`);
+      const sellResp = await bot.exec("sell_wreck");
+      
+      if (!sellResp.error && sellResp.result) {
+        const sr = sellResp.result as Record<string, unknown>;
+        const credits = (sr.credits as number) || (sr.earned as number) || 0;
+        const xp = (sr.xp as number) || (sr.experience as number) || 0;
+        const items = (sr.items as Array<Record<string, unknown>>) || [];
+
+        if (credits > 0 || xp > 0 || items.length > 0) {
+          const itemDetails = items.length > 0 ? ` + ${items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || "material"}`).join(", ")}` : "";
+          ctx.log("scavenge", `✅ Sold wreck for ${credits}cr + ${xp} XP${itemDetails}`);
+          processed++;
+          sellSuccess = true;
+          break; // Success - exit retry loop
+        } else {
+          ctx.log("warn", `Sell attempt ${attempt} returned no credits, XP, or items — retrying...`);
+        }
+      } else if (sellResp.error) {
+        const errMsg = sellResp.error.message.toLowerCase();
+        if (errMsg.includes("not_towing")) {
+          ctx.log("warn", `Server says not towing during sell (attempt ${attempt}) — clearing tow flag`);
+          bot.towingWreck = false;
+          break; // Stop retrying - we're no longer towing
+        } else {
+          ctx.log("error", `Sell attempt ${attempt} failed: ${sellResp.error.message}`);
+        }
       }
-    } else if (sellResp.error) {
-      const errMsg = sellResp.error.message.toLowerCase();
-      if (errMsg.includes("not_towing")) {
-        ctx.log("warn", "Server says not towing during sell — clearing tow flag");
-        bot.towingWreck = false;
-      } else {
-        ctx.log("error", `Sell wreck failed: ${sellResp.error.message}`);
+      
+      // Wait briefly before retry (give server time to process)
+      if (attempt < MAX_SALVAGE_RETRIES) {
+        await sleep(2000);
       }
+    }
+    
+    if (!sellSuccess && bot.towingWreck) {
+      ctx.log("error", `All ${MAX_SALVAGE_RETRIES} sell attempts failed — wreck may be lost`);
     }
   }
 
   // Reset towing flag after successful processing
   if (processed > 0) {
+    ctx.log("scavenge", `Successfully processed wreck (processed=${processed}) — clearing tow flag`);
     bot.towingWreck = false;
   }
 

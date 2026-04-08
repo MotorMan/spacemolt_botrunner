@@ -368,6 +368,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('faction_trader')">Faction Trader</div>
         <div class="sidebar-item" onclick="switchSettingsTab('trade_buyer')">Trade Buyer</div>
         <div class="sidebar-item" onclick="switchSettingsTab('miner')">Miner</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('miner_quotas')">Miner Quotas</div>
         <div class="sidebar-item" onclick="switchSettingsTab('salvager')">Salvager</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cleanup')">Cleanup</div>
         <div class="sidebar-item" onclick="switchSettingsTab('return_home')">Return Home</div>
@@ -1910,6 +1911,7 @@ function renderProfileTopbar() {
       <select id="profile-explorerMode" onchange="saveProfileExplorerMode()">
         <option value="explore"${explorerMode === 'explore' ? ' selected' : ''}>Explore new systems</option>
         <option value="trade_update"${explorerMode === 'trade_update' ? ' selected' : ''}>Update trade data</option>
+        <option value="deep_core_scan"${explorerMode === 'deep_core_scan' ? ' selected' : ''}>Scan hidden POIs</option>
       </select>
       <span class="profile-ore-label" style="margin-left:8px">Direct to Unknown:</span>
       <select id="profile-directToUnknown" onchange="saveProfileDirectToUnknown()" style="width:auto;padding:2px 6px;font-size:11px">
@@ -2451,6 +2453,28 @@ function renderManualControls() {
     .map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`)
     .join('') || '<option value="">No other bots</option>';
 
+  // Build gift item options from both cargo and storage
+  const giftItems = [];
+  if (bot.inventory && bot.inventory.length > 0) {
+    for (const i of bot.inventory) {
+      giftItems.push({ itemId: i.itemId, name: i.name, quantity: i.quantity, source: 'cargo' });
+    }
+  }
+  if (bot.storage && bot.storage.length > 0) {
+    for (const i of bot.storage) {
+      // Avoid duplicates - if item already in cargo, just mark it has storage too
+      const existing = giftItems.find(g => g.itemId === i.itemId);
+      if (existing) {
+        existing.hasStorage = true;
+      } else {
+        giftItems.push({ itemId: i.itemId, name: i.name, quantity: i.quantity, source: 'storage' });
+      }
+    }
+  }
+  const giftItemOpts = giftItems.length > 0
+    ? giftItems.map(i => `<option value="${esc(i.itemId)}" data-max="${i.quantity}" data-source="${i.source}">${esc(i.name)} (${i.quantity})</option>`).join('')
+    : '<option value="">No items</option>';
+
   // Build recipe options for crafting — only show craftable recipes
   const have = getOwnedItems(bot);
   let craftSection = '';
@@ -2629,10 +2653,28 @@ function renderManualControls() {
 
     <div class="cmd-group">
       <label>Gift Item</label>
+      <select id="mc-gift-source">
+        <option value="cargo">From Cargo</option>
+        <option value="storage" selected>From Storage</option>
+      </select>
       <select id="mc-gift-target">${otherBotOpts}</select>
-      <select id="mc-gift-item" onchange="syncQty(this,'mc-gift-qty')">${cargoOpts}</select>
+      <select id="mc-gift-item" onchange="syncQty(this,'mc-gift-qty')">${giftItemOpts}</select>
       <input type="number" id="mc-gift-qty" min="1" value="1">
-      <button class="sm" onclick="mcExec('send_gift',{recipient:val('mc-gift-target'),item_id:val('mc-gift-item'),quantity:intVal('mc-gift-qty')})">Send</button>
+      <button class="sm" onclick="mcSendGift()">Send</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Gift Send All</label>
+      <select id="mc-giftall-target">${otherBotOpts}</select>
+      <input type="text" id="mc-giftall-custom" placeholder="Or enter player name..." style="width:140px;font-size:12px;padding:4px 8px">
+      <button class="primary sm" onclick="mcGiftSendAll()">Start Queue</button>
+      <button class="sm" onclick="mcStopGiftSendAll()">Stop</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Gift Queue Status</label>
+      <span id="mc-gift-queue-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
+      <button class="sm" onclick="mcRefreshStorageForGiftSendAll()" title="Refresh storage lists">Refresh</button>
     </div>
 
     <div class="cmd-group">
@@ -3193,12 +3235,226 @@ function mcStopDepositAll() {
     logResponse('<span class="resp-err">No deposit queue running</span>');
     return;
   }
-  
+
   depositAllRunning = false;
   const remaining = depositAllQueue.items.length - depositAllQueue.index;
   logResponse(`<span class="resp-err">Deposit All stopped. ${remaining} items remaining.</span>`);
   depositAllQueue = null;
   mcUpdateQueueStatus();
+}
+
+// ── Gift Send All Queue System ───────────────────────────────
+
+let giftSendAllQueue = null;  // { mode: string, items: Array<{item_id, quantity, source, target}>, index: number }
+let giftSendAllRunning = false;
+
+/** Refresh both cargo and storage before starting gift send all */
+function mcRefreshStorageForGiftSendAll() {
+  if (!profileBot) return;
+
+  const bot = bots.find(b => b.username === profileBot);
+  if (!bot) return;
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > refreshing storage for gift send all</span>`);
+
+  // Refresh cargo (get_cargo returns inventory)
+  sendExec(profileBot, 'get_cargo', {}, (cargoResult) => {
+    if (cargoResult.ok && cargoResult.data) {
+      const cargoData = cargoResult.data.cargo || cargoResult.data.items || [];
+      bot.inventory = cargoData;
+      logResponse(`<span class="resp-ok">Cargo: ${cargoData.length} items</span>`);
+    }
+
+    // Refresh station storage
+    sendExec(profileBot, 'view_storage', {}, (storageResult) => {
+      if (storageResult.ok && storageResult.data) {
+        const storageData = storageResult.data.storage || storageResult.data.items || [];
+        bot.storage = storageData;
+        logResponse(`<span class="resp-ok">Station storage: ${storageData.length} items</span>`);
+      }
+      renderManualControls();
+    });
+  });
+}
+
+/** Build the gift send all queue based on mode */
+function mcBuildGiftSendAllQueue(targetName) {
+  const bot = bots.find(b => b.username === profileBot);
+  if (!bot) return null;
+
+  // Storage uses itemId (camelCase)
+  const storage = bot.storage || [];
+
+  const items = [];
+
+  // Gift all items from personal storage to a player
+  // Command: storage action=deposit source=storage target="Player Name" item_id=X quantity=Y
+  for (const item of storage) {
+    const itemId = item.itemId || item.item_id;
+    const qty = item.quantity || item.count || 1;
+    if (qty > 0 && itemId) {
+      items.push({ item_id: itemId, quantity: qty, source: 'storage', target: targetName });
+    }
+  }
+
+  return { items, index: 0, targetName };
+}
+
+/** Update the gift queue status display */
+function mcUpdateGiftQueueStatus() {
+  const statusEl = document.getElementById('mc-gift-queue-status');
+  if (!statusEl) return;
+
+  if (!giftSendAllRunning || !giftSendAllQueue) {
+    statusEl.textContent = 'Idle';
+    statusEl.style.color = 'var(--text-dim)';
+    return;
+  }
+
+  const { items, index } = giftSendAllQueue;
+  const remaining = items.length - index;
+  statusEl.textContent = `Processing: ${index}/${items.length} (${remaining} remaining)`;
+  statusEl.style.color = giftSendAllRunning ? 'var(--green)' : 'var(--yellow)';
+}
+
+/** Process next item in the gift queue */
+function mcProcessGiftQueue() {
+  if (!giftSendAllRunning || !giftSendAllQueue) return;
+
+  const { items, index } = giftSendAllQueue;
+
+  if (index >= items.length) {
+    // Queue complete
+    logResponse(`<span class="resp-ok">Gift Send All complete! All items sent.</span>`);
+    giftSendAllRunning = false;
+    giftSendAllQueue = null;
+    mcUpdateGiftQueueStatus();
+    return;
+  }
+
+  const item = items[index];
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > gifting ${item.quantity}x ${item.item_id} to ${item.target} (${index + 1}/${items.length})</span>`);
+
+  // All gift operations use the storage command
+  // Format: storage action=deposit source=storage target=X item_id=Y quantity=Z
+  const command = 'storage';
+  const params = {
+    action: 'deposit',
+    source: 'storage',
+    target: item.target,
+    item_id: item.item_id,
+    quantity: item.quantity
+  };
+
+  sendExec(profileBot, command, params, (result) => {
+    if (result.ok) {
+      logResponse(`<span class="resp-ok">OK</span>`);
+    } else {
+      logResponse(`<span class="resp-err">Failed: ${esc(result.error || 'unknown')}</span>`);
+    }
+
+    giftSendAllQueue.index++;
+    mcUpdateGiftQueueStatus();
+
+    // Wait a bit before next item (respect tick rate)
+    setTimeout(mcProcessGiftQueue, TICK_COOLDOWN_MS + 500);
+  });
+}
+
+/** Start the gift send all queue */
+function mcGiftSendAll() {
+  if (!profileBot) return;
+  if (giftSendAllRunning) {
+    logResponse('<span class="resp-err">Gift Send All already running</span>');
+    return;
+  }
+
+  // Get target: use custom input if provided, otherwise use dropdown
+  let targetName = val('mc-giftall-custom').trim();
+  if (!targetName) {
+    targetName = val('mc-giftall-target');
+  }
+
+  if (!targetName) {
+    logResponse('<span class="resp-err">Please select or enter a target recipient</span>');
+    return;
+  }
+
+  const queue = mcBuildGiftSendAllQueue(targetName);
+
+  if (!queue || queue.items.length === 0) {
+    logResponse('<span class="resp-err">No items to gift in storage</span>');
+    return;
+  }
+
+  giftSendAllQueue = queue;
+  giftSendAllRunning = true;
+
+  logResponse(`<span class="resp-cmd">Starting Gift Send All → ${targetName} (${queue.items.length} items)</span>`);
+  mcUpdateGiftQueueStatus();
+
+  // Start processing
+  setTimeout(mcProcessGiftQueue, 500);
+}
+
+/** Stop the gift send all queue */
+function mcStopGiftSendAll() {
+  if (!giftSendAllRunning) {
+    logResponse('<span class="resp-err">No gift queue running</span>');
+    return;
+  }
+
+  giftSendAllRunning = false;
+  const remaining = giftSendAllQueue.items.length - giftSendAllQueue.index;
+  logResponse(`<span class="resp-err">Gift Send All stopped. ${remaining} items remaining.</span>`);
+  giftSendAllQueue = null;
+  mcUpdateGiftQueueStatus();
+}
+
+/** Send a single gift using the storage command (supports cargo or storage source) */
+function mcSendGift() {
+  if (!profileBot) return;
+
+  const source = val('mc-gift-source');
+  const recipient = val('mc-gift-target');
+  const itemId = val('mc-gift-item');
+  const quantity = intVal('mc-gift-qty');
+
+  if (!recipient) {
+    logResponse('<span class="resp-err">Please select a recipient</span>');
+    return;
+  }
+  if (!itemId) {
+    logResponse('<span class="resp-err">Please select an item</span>');
+    return;
+  }
+
+  // Use storage command for both cargo and storage sources
+  const command = 'storage';
+  const params = {
+    action: 'deposit',
+    target: recipient,
+    item_id: itemId,
+    quantity: quantity
+  };
+
+  // Add source parameter if sending from storage
+  if (source === 'storage') {
+    params.source = 'storage';
+  }
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > gifting ${quantity}x ${itemId} to ${recipient} (from ${source})</span>`);
+
+  sendExec(profileBot, command, params, (result) => {
+    if (result.ok) {
+      logResponse(`<span class="resp-ok">✓ Gift sent successfully</span>`);
+    } else {
+      logResponse(`<span class="resp-err">Failed: ${esc(result.error || 'unknown')}</span>`);
+    }
+  });
 }
 
 function val(id) { return document.getElementById(id)?.value || ''; }
@@ -3414,17 +3670,45 @@ const FORMATTERS = {
   },
 
   send_gift(d) {
-    const lines = [d.message || 'Gift sent'];
-    const cr = d.credits_transferred || d.credits_sent || d.credits || 0;
-    if (cr) lines.push(`Credits sent: ${Number(cr).toLocaleString()}cr`);
-    const items = d.items_sent || d.items || [];
-    if (Array.isArray(items) && items.length > 0) {
-      for (const i of items) {
-        lines.push(`Sent: ${i.quantity || 1}x ${esc(i.name || i.item_id || '?')}`);
+    const lines = [];
+    
+    // Handle storage command response format
+    if (d.action === 'deposit') {
+      const target = d.target || d.recipient || '';
+      const source = d.source || 'cargo';
+      const item = d.item_id || d.item || '';
+      const qty = d.quantity || d.deposited || '';
+      
+      if (item && qty) {
+        lines.push(`Sent ${qty}x ${esc(String(item))}`);
       }
+      if (target) {
+        if (target === 'faction') {
+          lines.push('To faction storage');
+        } else if (target === 'self') {
+          lines.push('To personal storage');
+        } else {
+          lines.push(`To: ${esc(target)}`);
+        }
+      }
+      if (source === 'storage') {
+        lines.push('(from personal storage)');
+      }
+    } else {
+      // Legacy send_gift response format
+      lines.push(d.message || 'Gift sent');
+      const cr = d.credits_transferred || d.credits_sent || d.credits || 0;
+      if (cr) lines.push(`Credits sent: ${Number(cr).toLocaleString()}cr`);
+      const items = d.items_sent || d.items || [];
+      if (Array.isArray(items) && items.length > 0) {
+        for (const i of items) {
+          lines.push(`Sent: ${i.quantity || 1}x ${esc(i.name || i.item_id || '?')}`);
+        }
+      }
+      if (d.recipient) lines.push(`To: ${esc(d.recipient)}`);
+      lines.push('(Credits go to recipient storage — they must withdraw)');
     }
-    if (d.recipient) lines.push(`To: ${esc(d.recipient)}`);
-    lines.push('(Credits go to recipient storage — they must withdraw)');
+    
     // Also dump raw data for debugging
     lines.push('Raw: ' + esc(JSON.stringify(d)));
     return lines.join('\n');
@@ -4898,6 +5182,8 @@ function renderSettingsPanel() {
     renderSystemBlacklistSettings(panel);
   } else if (activeSettingsTab === 'miner') {
     renderMinerSettings(panel);
+  } else if (activeSettingsTab === 'miner_quotas') {
+    renderMinerQuotasSettings(panel);
   } else if (activeSettingsTab === 'crafter') {
     renderCrafterSettings(panel);
   } else if (activeSettingsTab === 'rescue') {
@@ -9274,9 +9560,6 @@ function renderMinerSettings(panel) {
   const targetOre = m.targetOre || '';
   const targetGas = m.targetGas || '';
   const targetIce = m.targetIce || '';
-  const oreQuotas = m.oreQuotas || {};
-  const gasQuotas = m.gasQuotas || {};
-  const iceQuotas = m.iceQuotas || {};
   const jettisonOres = m.jettisonOres || [];
   const deepCoreJettisonOres = m.deepCoreJettisonOres || [];
   const depletionTimeoutHours = m.depletionTimeoutHours ?? 3;
@@ -9378,25 +9661,6 @@ function renderMinerSettings(panel) {
     iceOpts.push(`<option value="${esc(targetIce)}" selected>${esc(targetIce)}</option>`);
   }
 
-  // Quota table rows
-  function buildQuotaRows(quotas, allOres) {
-    let rows = '';
-    for (const [oreId, target] of Object.entries(quotas)) {
-      if (target <= 0) continue;
-      const oreName = allOres.find(o => o.item_id === oreId)?.name || oreId;
-      rows += `<tr data-ore-id="${esc(oreId)}">
-        <td style="padding:4px 8px">${esc(oreName)}</td>
-        <td style="padding:4px 8px"><input type="number" min="1" max="999999" value="${target}" class="quota-qty" style="width:80px" /></td>
-        <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
-      </tr>`;
-    }
-    return rows;
-  }
-
-  const oreQuotaRows = buildQuotaRows(oreQuotas, oreOres);
-  const gasQuotaRows = buildQuotaRows(gasQuotas, gasOres);
-  const iceQuotaRows = buildQuotaRows(iceQuotas, iceOres);
-
   // Jettison ores table
   function buildJettisonRows(ores, allOres) {
     let rows = '';
@@ -9423,18 +9687,6 @@ function renderMinerSettings(panel) {
 
   const deepCoreJettisonRows = buildJettisonRows(deepCoreJettisonOres, oreOres);
   const deepCoreJettisonOreOpts = buildJettisonOreOpts(oreOres);
-
-  function buildQuotaOreOpts(ores) {
-    const opts = ['<option value="">-- select --</option>'];
-    for (const ore of ores) {
-      opts.push(`<option value="${esc(ore.item_id)}">${esc(ore.name)}</option>`);
-    }
-    return opts.join('');
-  }
-
-  const quotaOreOpts = buildQuotaOreOpts(oreOres);
-  const quotaGasOpts = buildQuotaOreOpts(gasOres);
-  const quotaIceOpts = buildQuotaOreOpts(iceOres);
 
   function minerDepositOpts(current) {
     const opts = [];
@@ -9519,57 +9771,8 @@ function renderMinerSettings(panel) {
     </div>
 
     <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
-      <div class="setting-label" style="margin-bottom:8px">Ore Quotas</div>
-      <div class="setting-hint" style="margin-bottom:12px">Maintain target stock levels per ore in faction storage. Miners will prioritize the ore with the biggest deficit. When all quotas are met, miners fall back to local mining.</div>
-      <table id="ore-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
-        <thead><tr style="border-bottom:1px solid var(--border)">
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Ore</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
-          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
-        </tr></thead>
-        <tbody>${oreQuotaRows}</tbody>
-      </table>
-      <div style="display:flex;gap:8px;align-items:center">
-        <select id="ore-quota-add-ore" style="flex:1">${quotaOreOpts}</select>
-        <input type="number" id="ore-quota-add-qty" min="1" max="999999" value="1000" style="width:80px" placeholder="Qty" />
-        <button class="secondary" onclick="addOreQuotaRow('ore')">Add</button>
-      </div>
-    </div>
-
-    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
-      <div class="setting-label" style="margin-bottom:8px">Gas Quotas</div>
-      <div class="setting-hint" style="margin-bottom:12px">Target stock levels for gas resources in faction storage.</div>
-      <table id="gas-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
-        <thead><tr style="border-bottom:1px solid var(--border)">
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Gas</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
-          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
-        </tr></thead>
-        <tbody>${gasQuotaRows}</tbody>
-      </table>
-      <div style="display:flex;gap:8px;align-items:center">
-        <select id="gas-quota-add-ore" style="flex:1">${quotaGasOpts}</select>
-        <input type="number" id="gas-quota-add-qty" min="1" max="999999" value="1000" style="width:80px" placeholder="Qty" />
-        <button class="secondary" onclick="addOreQuotaRow('gas')">Add</button>
-      </div>
-    </div>
-
-    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
-      <div class="setting-label" style="margin-bottom:8px">Ice Quotas</div>
-      <div class="setting-hint" style="margin-bottom:12px">Target stock levels for ice resources in faction storage.</div>
-      <table id="ice-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
-        <thead><tr style="border-bottom:1px solid var(--border)">
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Ice</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
-          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
-        </tr></thead>
-        <tbody>${iceQuotaRows}</tbody>
-      </table>
-      <div style="display:flex;gap:8px;align-items:center">
-        <select id="ice-quota-add-ore" style="flex:1">${quotaIceOpts}</select>
-        <input type="number" id="ice-quota-add-qty" min="1" max="999999" value="1000" style="width:80px" placeholder="Qty" />
-        <button class="secondary" onclick="addOreQuotaRow('ice')">Add</button>
-      </div>
+      <div class="setting-label" style="margin-bottom:8px">📊 Quotas</div>
+      <div class="setting-hint" style="margin-bottom:12px">Ore, gas, ice, and deep core quotas have been moved to a dedicated page to reduce scrolling. <a href="#" onclick="switchSettingsTab('miner_quotas'); return false;">Click here to open Miner Quotas settings</a>.</div>
     </div>
 
     <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
@@ -9904,16 +10107,6 @@ function addDeepCoreJettisonOre() {
 }
 
 function saveMinerSettings() {
-  const collectQuotas = (tableId) => {
-    const quotas = {};
-    for (const row of document.querySelectorAll(`#${tableId} tbody tr`)) {
-      const oreId = row.dataset.oreId;
-      const qty = parseInt(row.querySelector('.quota-qty').value) || 0;
-      if (oreId && qty > 0) quotas[oreId] = qty;
-    }
-    return quotas;
-  };
-
   const collectJettisonOres = () => {
     const ores = [];
     for (const row of document.querySelectorAll('#jettison-ore-table tbody tr')) {
@@ -9973,9 +10166,8 @@ function saveMinerSettings() {
     maxJumps: parseInt(document.getElementById('set-miner-maxJumps').value) || 10,
     escortName: document.getElementById('set-miner-escortName').value,
     escortSignalChannel: document.getElementById('set-miner-escortSignalChannel').value,
-    oreQuotas: collectQuotas('ore-quota-table'),
-    gasQuotas: collectQuotas('gas-quota-table'),
-    iceQuotas: collectQuotas('ice-quota-table'),
+    // Note: oreQuotas, gasQuotas, iceQuotas, deepCoreQuotas are managed in Miner Quotas settings page
+    // They are preserved from existing settings when saving from this page
     jettisonOres: collectJettisonOres(),
     deepCoreJettisonOres: collectDeepCoreJettisonOres(),
     // Flock mining settings
@@ -9984,8 +10176,193 @@ function saveMinerSettings() {
     flockRole: document.getElementById('set-miner-flockRole').value,
     flockGroups: collectFlockGroups(),
   };
+  
+  // Preserve existing quotas when saving from main miner settings
+  const existingMiner = settings.miner || {};
+  if (existingMiner.oreQuotas) s.oreQuotas = existingMiner.oreQuotas;
+  if (existingMiner.gasQuotas) s.gasQuotas = existingMiner.gasQuotas;
+  if (existingMiner.iceQuotas) s.iceQuotas = existingMiner.iceQuotas;
+  if (existingMiner.deepCoreQuotas) s.deepCoreQuotas = existingMiner.deepCoreQuotas;
+  
   send({ type: 'saveSettings', routine: 'miner', settings: s });
   settings.miner = s;
+}
+
+// ── Miner Quotas Settings ───────────────────────────────────────
+
+function renderMinerQuotasSettings(panel) {
+  const m = settings.miner || {};
+  const oreQuotas = m.oreQuotas || {};
+  const gasQuotas = m.gasQuotas || {};
+  const iceQuotas = m.iceQuotas || {};
+  const deepCoreQuotas = m.deepCoreQuotas || {};
+
+  // Build ore filter lists
+  const oreOres = knownOres.filter(o => {
+    const n = o.name.toLowerCase();
+    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo');
+  });
+  const gasOres = knownOres.filter(o => {
+    const n = o.name.toLowerCase();
+    return n.includes('gas') || n.includes('nebula') || n.includes('plasma') || n.includes('hydrogen') || n.includes('helium');
+  });
+  const iceOres = knownOres.filter(o => {
+    const n = o.name.toLowerCase();
+    return n.includes('ice') || n.includes('frost') || n.includes('cryo') || n.includes('water');
+  });
+  // Deep core ores - full list from miner.ts
+  const deepCoreOresList = [
+    { item_id: 'void_essence', name: 'Void Essence' },
+    { item_id: 'fury_crystal', name: 'Fury Crystal' },
+    { item_id: 'legacy_ore', name: 'Legacy Ore' },
+    { item_id: 'prismatic_nebulite', name: 'Prismatic Nebulite' },
+    { item_id: 'exotic_matter', name: 'Exotic Matter' },
+    { item_id: 'dark_matter_residue', name: 'Dark Matter Residue' },
+  ];
+
+  // Quota table rows builder
+  function buildQuotaRows(quotas, allOres) {
+    let rows = '';
+    for (const [oreId, target] of Object.entries(quotas)) {
+      if (target <= 0) continue;
+      const oreName = allOres.find(o => o.item_id === oreId)?.name || oreId;
+      rows += `<tr data-ore-id="${esc(oreId)}">
+        <td style="padding:4px 8px">${esc(oreName)}</td>
+        <td style="padding:4px 8px"><input type="number" min="1" max="999999" value="${target}" class="quota-qty" style="width:80px" /></td>
+        <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
+      </tr>`;
+    }
+    return rows;
+  }
+
+  const oreQuotaRows = buildQuotaRows(oreQuotas, oreOres);
+  const gasQuotaRows = buildQuotaRows(gasQuotas, gasOres);
+  const iceQuotaRows = buildQuotaRows(iceQuotas, iceOres);
+  const deepCoreQuotaRows = buildQuotaRows(deepCoreQuotas, deepCoreOresList);
+
+  // Ore options for quota add dropdowns
+  function buildQuotaOreOpts(ores) {
+    const opts = ['<option value="">-- select --</option>'];
+    for (const ore of ores) {
+      opts.push(`<option value="${esc(ore.item_id)}">${esc(ore.name)}</option>`);
+    }
+    return opts.join('');
+  }
+
+  const quotaOreOpts = buildQuotaOreOpts(oreOres);
+  const quotaGasOpts = buildQuotaOreOpts(gasOres);
+  const quotaIceOpts = buildQuotaOreOpts(iceOres);
+  const quotaDeepCoreOpts = buildQuotaOreOpts(deepCoreOresList);
+
+  panel.innerHTML = `
+    <h3>Miner Quotas Settings</h3>
+    <div class="settings-desc">Configure target stock levels for faction storage. Miners will prioritize resources with the biggest deficit. Separate quotas for each mining type.</div>
+
+    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">⛏️ Ore Quotas</div>
+      <div class="setting-hint" style="margin-bottom:12px">Maintain target stock levels per ore in faction storage. Miners will prioritize the ore with the biggest deficit.</div>
+      <table id="ore-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Ore</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${oreQuotaRows}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="ore-quota-add-ore" style="flex:1">${quotaOreOpts}</select>
+        <input type="number" id="ore-quota-add-qty" min="1" max="999999" value="1000" style="width:80px" placeholder="Qty" />
+        <button class="secondary" onclick="addOreQuotaRow('ore')">Add</button>
+      </div>
+    </div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">💨 Gas Quotas</div>
+      <div class="setting-hint" style="margin-bottom:12px">Target stock levels for gas resources in faction storage.</div>
+      <table id="gas-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Gas</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${gasQuotaRows}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="gas-quota-add-ore" style="flex:1">${quotaGasOpts}</select>
+        <input type="number" id="gas-quota-add-qty" min="1" max="999999" value="1000" style="width:80px" placeholder="Qty" />
+        <button class="secondary" onclick="addOreQuotaRow('gas')">Add</button>
+      </div>
+    </div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">🧊 Ice Quotas</div>
+      <div class="setting-hint" style="margin-bottom:12px">Target stock levels for ice resources in faction storage.</div>
+      <table id="ice-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Ice</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${iceQuotaRows}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="ice-quota-add-ore" style="flex:1">${quotaIceOpts}</select>
+        <input type="number" id="ice-quota-add-qty" min="1" max="999999" value="1000" style="width:80px" placeholder="Qty" />
+        <button class="secondary" onclick="addOreQuotaRow('ice')">Add</button>
+      </div>
+    </div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">⛏️ Deep Core Quotas</div>
+      <div class="setting-hint" style="margin-bottom:12px">Target stock levels for deep core resources (hidden POIs). These are high-value ores that require special equipment to mine.</div>
+      <table id="deepcore-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Deep Core Ore</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${deepCoreQuotaRows}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="deepcore-quota-add-ore" style="flex:1">${quotaDeepCoreOpts}</select>
+        <input type="number" id="deepcore-quota-add-qty" min="1" max="999999" value="1000" style="width:80px" placeholder="Qty" />
+        <button class="secondary" onclick="addOreQuotaRow('deepcore')">Add</button>
+      </div>
+    </div>
+
+    <div style="margin-top:24px;padding-top:16px;border-top:1px solid var(--border)">
+      <button class="primary" onclick="saveMinerQuotasSettings()">💾 Save Quotas</button>
+    </div>
+  `;
+}
+
+function saveMinerQuotasSettings() {
+  const collectQuotas = (tableId) => {
+    const quotas = {};
+    for (const row of document.querySelectorAll(`#${tableId} tbody tr`)) {
+      const oreId = row.dataset.oreId;
+      const qty = parseInt(row.querySelector('.quota-qty').value) || 0;
+      if (oreId && qty > 0) quotas[oreId] = qty;
+    }
+    return quotas;
+  };
+
+  const quotas = {
+    oreQuotas: collectQuotas('ore-quota-table'),
+    gasQuotas: collectQuotas('gas-quota-table'),
+    iceQuotas: collectQuotas('ice-quota-table'),
+    deepCoreQuotas: collectQuotas('deepcore-quota-table'),
+  };
+
+  // Merge with existing miner settings
+  const existingMinerSettings = settings.miner || {};
+  const updatedSettings = { ...existingMinerSettings, ...quotas };
+
+  send({ type: 'saveSettings', routine: 'miner', settings: updatedSettings });
+  settings.miner = updatedSettings;
+  
+  // Show feedback
+  alert('Miner quotas saved successfully!');
 }
 
 // ── Salvager Settings ───────────────────────────────────────
@@ -11589,7 +11966,7 @@ function renderFleetPanel(ships, username, error) {
       const etaHtml = buildEta ? `<span style="font-size:10px;color:var(--text-dim);margin-left:4px">${esc(String(buildEta))}</span>` : '';
 
       // Build bot dropdown for gifting
-      const botOptions = bots.filter(b => b.username !== username).map(b => 
+      const botOptions = bots.filter(b => b.username !== username).map(b =>
         `<option value="${esc(b.username)}">${esc(b.username)}</option>`
       ).join('');
       const giftDropdown = !isActive && !isBuilding ? `
@@ -11602,15 +11979,34 @@ function renderFleetPanel(ships, username, error) {
         <button class="sm" style="color:var(--cyan)" onclick="shipGift('${esc(username)}','${esc(id)}','${esc(name)}')">Gift</button>
       ` : '';
 
+      // Check if ship is at the same station as the carrier (for deposit)
+      const bot = bots.find(b => b.username === username);
+      const carrierStation = bot?.location || '';
+      const carrierName = shipyardShipData?.ship?.name || shipyardShipData?.ship?.ship_name || '';
+      const shipLocation = s.location || s.system || '';
+      const shipStoredInCarrier = s.stored_in_ship || s.carrier_ship || s.stored_on || '';
+      const isAtSameStation = bot?.docked && shipLocation === carrierStation && !isActive;
+      const isStoredInThisCarrier = carrierName && (shipStoredInCarrier === carrierName || s.carrier_name === carrierName);
+
+      // Deposit/Withdraw buttons
+      const depositBtn = isAtSameStation
+        ? `<button class="sm" style="color:var(--green)" onclick="shipDepositIntoCarrier('${esc(username)}','${esc(id)}','${esc(name)}')" title="Deposit into carrier">📦 Deposit</button>`
+        : '';
+      const withdrawBtn = isStoredInThisCarrier
+        ? `<button class="sm" style="color:var(--cyan)" onclick="shipWithdrawFromCarrier('${esc(username)}','${esc(id)}','${esc(name)}')" title="Withdraw from carrier">📤 Withdraw</button>`
+        : '';
+
       html += `<div class="shipyard-ship-card">
         <div style="flex:1">
           <div class="ssc-name">${esc(name)} ${cls && name !== cls ? `<span style="font-weight:400;color:var(--text-dim);font-size:11px">${esc(cls)}</span>` : ''} ${isActive ? '<span class="shipyard-active-badge">Active</span>' : ''}${buildBadge}${etaHtml}</div>
-          <div class="ssc-detail">${esc(loc)}</div>
+          <div class="ssc-detail">${esc(loc)}${shipStoredInCarrier ? ` <span style="color:var(--cyan);font-size:10px">📦 Stored in: ${esc(shipStoredInCarrier)}</span>` : ''}</div>
           ${statsHtml}
         </div>
         <div class="ssc-actions">
           ${!isActive && !isBuilding ? `<button class="sm" onclick="shipGoTo('${esc(username)}','${esc(id)}','${esc(rawLoc)}')">Go</button>` : ''}
           ${!isActive && !isBuilding ? `<button class="sm" onclick="shipSwitch('${esc(username)}','${esc(id)}')">Switch</button>` : ''}
+          ${depositBtn}
+          ${withdrawBtn}
           ${!isActive && !isBuilding ? `<button class="sm" style="color:var(--red)" onclick="shipSell('${esc(username)}','${esc(id)}','${esc(name)}')">Sell</button>` : ''}
           ${giftDropdown}
         </div>
@@ -12046,17 +12442,8 @@ function fetchCargoMods(username) {
       container.innerHTML = '<div class="faction-no-data">Cargo is empty</div>';
       return;
     }
-    // Filter to module-type items; fall back to showing all if none match
-    const mods = items.filter(i => {
-      const cat = (i.category || i.type || '').toLowerCase();
-      const name = (i.name || '').toLowerCase();
-      return cat.includes('module') || cat.includes('mod') || cat.includes('weapon') ||
-        cat.includes('defense') || cat.includes('utility') || cat.includes('equipment') ||
-        name.includes('module') || name.includes('laser') || name.includes('shield') ||
-        name.includes('armor') || name.includes('scanner') || name.includes('harvester') ||
-        name.includes('drill') || name.includes('engine') || name.includes('booster');
-    });
-    container.innerHTML = renderModItemsList(mods.length > 0 ? mods : items, username, 'cargo');
+    // Show all items in cargo (no filtering)
+    container.innerHTML = renderModItemsList(items, username, 'cargo');
   });
 }
 
@@ -12075,17 +12462,8 @@ function fetchStorageMods(username) {
       container.innerHTML = '<div class="faction-no-data">Storage is empty</div>';
       return;
     }
-    // Filter to module-type items; fall back to showing all
-    const mods = items.filter(i => {
-      const cat = (i.category || i.type || '').toLowerCase();
-      const name = (i.name || '').toLowerCase();
-      return cat.includes('module') || cat.includes('mod') || cat.includes('weapon') ||
-        cat.includes('defense') || cat.includes('utility') || cat.includes('equipment') ||
-        name.includes('module') || name.includes('laser') || name.includes('shield') ||
-        name.includes('armor') || name.includes('scanner') || name.includes('harvester') ||
-        name.includes('drill') || name.includes('engine') || name.includes('booster');
-    });
-    container.innerHTML = renderModItemsList(mods.length > 0 ? mods : items, username, 'storage');
+    // Show all items in storage (no filtering)
+    container.innerHTML = renderModItemsList(items, username, 'storage');
   });
 }
 
@@ -12205,13 +12583,46 @@ function shipGift(username, shipId, name) {
   }
   
   if (!confirm(`Gift ${name || 'this ship'} to ${recipient}? This cannot be undone.`)) return;
-  
+
   sendExec(username, 'send_gift', { recipient: recipient, ship_id: shipId }, (result) => {
     if (result.ok) {
       appendLine('system', `${username} gifted ${name || 'a ship'} to ${recipient}`);
       if (shipyardActivePanel === 'fleet') fetchFleetList(username);
     } else {
       appendLine('system', `Gift ship failed: ${result.error || 'unknown'}`);
+    }
+  });
+}
+
+/** Deposit a ship into the carrier ship's storage */
+function shipDepositIntoCarrier(username, shipId, shipName) {
+  if (!shipId) return;
+  if (!confirm(`Deposit ${shipName || 'this ship'} into carrier storage? It will use cargo bays.`)) return;
+  
+  sendExec(username, 'storage', { action: 'deposit', quantity: 1, item_id: shipId }, (result) => {
+    if (result.ok) {
+      const data = result.data || {};
+      const storageTotal = data.storage_total ?? '?';
+      const cargoRemaining = data.cargo_remaining ?? '?';
+      appendLine('system', `${username} deposited ${shipName || 'a ship'} into carrier (storage: ${storageTotal}, cargo remaining: ${cargoRemaining})`);
+      if (shipyardActivePanel === 'fleet') fetchFleetList(username);
+    } else {
+      appendLine('system', `Deposit ship failed: ${result.error || 'unknown'}`);
+    }
+  });
+}
+
+/** Withdraw a ship from the carrier ship's storage */
+function shipWithdrawFromCarrier(username, shipId, shipName) {
+  if (!shipId) return;
+  if (!confirm(`Withdraw ${shipName || 'this ship'} from carrier storage?`)) return;
+  
+  sendExec(username, 'storage', { action: 'withdraw', quantity: 1, item_id: shipId }, (result) => {
+    if (result.ok) {
+      appendLine('system', `${username} withdrew ${shipName || 'a ship'} from carrier`);
+      if (shipyardActivePanel === 'fleet') fetchFleetList(username);
+    } else {
+      appendLine('system', `Withdraw ship failed: ${result.error || 'unknown'}`);
     }
   });
 }
@@ -12502,6 +12913,37 @@ function renderCommandAllControls() {
     ? bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join('')
     : '<option value="">No bots available</option>';
 
+  // Build gift item options from both cargo and storage across all bots
+  const caGiftItems = new Map();
+  for (const bot of bots) {
+    // Add cargo items
+    if (bot.inventory && bot.inventory.length > 0) {
+      for (const item of bot.inventory) {
+        const id = item.itemId || item.item_id;
+        if (caGiftItems.has(id)) {
+          caGiftItems.get(id).quantity += item.quantity || 1;
+        } else {
+          caGiftItems.set(id, { itemId: id, name: item.name || id, quantity: item.quantity || 1, source: 'cargo' });
+        }
+      }
+    }
+    // Add storage items
+    if (bot.storage && bot.storage.length > 0) {
+      for (const item of bot.storage) {
+        const id = item.itemId || item.item_id;
+        if (caGiftItems.has(id)) {
+          caGiftItems.get(id).quantity += item.quantity || 1;
+          caGiftItems.get(id).hasStorage = true;
+        } else {
+          caGiftItems.set(id, { itemId: id, name: item.name || id, quantity: item.quantity || 1, source: 'storage', hasStorage: true });
+        }
+      }
+    }
+  }
+  const caGiftItemOpts = caGiftItems.size > 0
+    ? [...caGiftItems.values()].map(i => `<option value="${esc(i.itemId)}" data-source="${i.source}">${esc(i.name)} (${i.quantity})</option>`).join('')
+    : '<option value="">No items in fleet</option>';
+
   controls.innerHTML = `
     <div class="cmd-group">
       <label>Travel (All Bots)</label>
@@ -12580,10 +13022,27 @@ function renderCommandAllControls() {
 
     <div class="cmd-group">
       <label>Gift Item (All Bots → Target)</label>
+      <select id="ca-gift-source">
+        <option value="cargo">From Cargo</option>
+        <option value="storage" selected>From Storage</option>
+      </select>
       <select id="ca-gift-target">${allBotOpts}</select>
-      <select id="ca-gift-item">${cargoOpts}</select>
+      <select id="ca-gift-item">${caGiftItemOpts}</select>
       <input type="number" id="ca-gift-qty" min="1" value="1">
-      <button class="sm" onclick="caExec('send_gift',{recipient:val('ca-gift-target'),item_id:val('ca-gift-item'),quantity:intVal('ca-gift-qty')})">Send</button>
+      <button class="sm" onclick="caSendGift()">Send</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Gift Send All (All Bots → Target)</label>
+      <select id="ca-giftall-target">${allBotOpts}</select>
+      <input type="text" id="ca-giftall-custom" placeholder="Or enter player name..." style="width:140px;font-size:12px;padding:4px 8px">
+      <button class="primary sm" onclick="caGiftSendAll()">Start Queue</button>
+      <button class="sm" onclick="caStopGiftSendAll()">Stop</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Gift Queue Status</label>
+      <span id="ca-gift-queue-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
     </div>
 
     <div class="cmd-group">
@@ -12740,6 +13199,196 @@ function toggleCommandAllFactionWithdrawSort() {
     factionWithdrawSortOrder = checkbox.checked ? 'quantity' : 'alpha';
     renderCommandAllControls();
   }
+}
+
+/** Send a single gift from all bots using the storage command */
+function caSendGift() {
+  const source = val('ca-gift-source');
+  const recipient = val('ca-gift-target');
+  const itemId = val('ca-gift-item');
+  const quantity = intVal('ca-gift-qty');
+
+  if (!recipient) {
+    caLog('<span class="resp-err">Select a recipient</span>');
+    return;
+  }
+  if (!itemId) {
+    caLog('<span class="resp-err">Select an item</span>');
+    return;
+  }
+
+  // Include all bots: running OR idle
+  const allBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
+  if (allBots.length === 0) {
+    caLog('<span class="resp-warn">No bots available to command</span>');
+    return;
+  }
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  caLog(`<span class="resp-cmd">${ts} > FLEET: gifting ${quantity}x ${itemId} to ${recipient} (from ${source}) (${allBots.length} bots)</span>`);
+
+  // Execute on each bot with delay
+  let index = 0;
+  function executeNext() {
+    if (index >= allBots.length) return;
+
+    const bot = allBots[index];
+    const command = 'storage';
+    const params = {
+      action: 'deposit',
+      target: recipient,
+      item_id: itemId,
+      quantity: quantity
+    };
+    if (source === 'storage') {
+      params.source = 'storage';
+    }
+
+    sendExec(bot.username, command, params, (result) => {
+      const status = result.ok ? '<span class="resp-ok">✓</span>' : `<span class="resp-err">✗ ${esc(result.error || 'unknown')}</span>`;
+      const stateLabel = bot.state === 'running' ? '(running)' : '(idle)';
+      caLog(`<span class="resp-bot">${esc(bot.username)} ${stateLabel}:</span> ${status}`);
+    });
+
+    index++;
+    if (index < allBots.length) {
+      setTimeout(executeNext, COMMAND_ALL_DELAY_MS);
+    }
+  }
+
+  executeNext();
+}
+
+// ── Command All Gift Send All Queue System ───────────────────────────────
+
+let caGiftSendAllQueue = null;  // { items: Array<{bot, item_id, quantity, target}>, index: number }
+let caGiftSendAllRunning = false;
+
+/** Update the command all gift queue status display */
+function caUpdateGiftQueueStatus() {
+  const statusEl = document.getElementById('ca-gift-queue-status');
+  if (!statusEl) return;
+
+  if (!caGiftSendAllRunning || !caGiftSendAllQueue) {
+    statusEl.textContent = 'Idle';
+    statusEl.style.color = 'var(--text-dim)';
+    return;
+  }
+
+  const { items, index } = caGiftSendAllQueue;
+  const remaining = items.length - index;
+  statusEl.textContent = `Processing: ${index}/${items.length} (${remaining} remaining)`;
+  statusEl.style.color = caGiftSendAllRunning ? 'var(--green)' : 'var(--yellow)';
+}
+
+/** Process next item in the command all gift queue */
+function caProcessGiftQueue() {
+  if (!caGiftSendAllRunning || !caGiftSendAllQueue) return;
+
+  const { items, index } = caGiftSendAllQueue;
+
+  if (index >= items.length) {
+    // Queue complete
+    caLog(`<span class="resp-ok">Fleet Gift Send All complete! All items sent.</span>`);
+    caGiftSendAllRunning = false;
+    caGiftSendAllQueue = null;
+    caUpdateGiftQueueStatus();
+    return;
+  }
+
+  const item = items[index];
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  caLog(`<span class="resp-cmd">${ts} > ${esc(item.bot.username)} gifting ${item.quantity}x ${item.item_id} to ${item.target}</span>`);
+
+  const command = 'storage';
+  const params = {
+    action: 'deposit',
+    source: 'storage',
+    target: item.target,
+    item_id: item.item_id,
+    quantity: item.quantity
+  };
+
+  sendExec(item.bot.username, command, params, (result) => {
+    if (result.ok) {
+      caLog(`<span class="resp-ok">OK</span>`);
+    } else {
+      caLog(`<span class="resp-err">Failed: ${esc(result.error || 'unknown')}</span>`);
+    }
+
+    caGiftSendAllQueue.index++;
+    caUpdateGiftQueueStatus();
+
+    // Wait a bit before next item
+    setTimeout(caProcessGiftQueue, TICK_COOLDOWN_MS + 500);
+  });
+}
+
+/** Start the command all gift send all queue */
+function caGiftSendAll() {
+  if (caGiftSendAllRunning) {
+    caLog('<span class="resp-err">Fleet Gift Send All already running</span>');
+    return;
+  }
+
+  // Get target: use custom input if provided, otherwise use dropdown
+  let targetName = val('ca-giftall-custom').trim();
+  if (!targetName) {
+    targetName = val('ca-giftall-target');
+  }
+
+  if (!targetName) {
+    caLog('<span class="resp-err">Please select or enter a target recipient</span>');
+    return;
+  }
+
+  // Include all bots: running OR idle
+  const allBots = bots.filter(b => b.state === 'running' || b.state === 'idle');
+  if (allBots.length === 0) {
+    caLog('<span class="resp-warn">No bots available to command</span>');
+    return;
+  }
+
+  // Build queue items from all bots' storage
+  const items = [];
+  for (const bot of allBots) {
+    const storage = bot.storage || [];
+    for (const item of storage) {
+      const itemId = item.itemId || item.item_id;
+      const qty = item.quantity || item.count || 1;
+      if (qty > 0 && itemId) {
+        items.push({ bot, item_id: itemId, quantity: qty, target: targetName });
+      }
+    }
+  }
+
+  if (items.length === 0) {
+    caLog('<span class="resp-err">No items to gift in fleet storage</span>');
+    return;
+  }
+
+  caGiftSendAllQueue = { items, index: 0 };
+  caGiftSendAllRunning = true;
+
+  caLog(`<span class="resp-cmd">Starting Fleet Gift Send All → ${targetName} (${items.length} items across ${allBots.length} bots)</span>`);
+  caUpdateGiftQueueStatus();
+
+  // Start processing
+  setTimeout(caProcessGiftQueue, 500);
+}
+
+/** Stop the command all gift send all queue */
+function caStopGiftSendAll() {
+  if (!caGiftSendAllRunning) {
+    caLog('<span class="resp-err">No fleet gift queue running</span>');
+    return;
+  }
+
+  caGiftSendAllRunning = false;
+  const remaining = caGiftSendAllQueue.items.length - caGiftSendAllQueue.index;
+  caLog(`<span class="resp-err">Fleet Gift Send All stopped. ${remaining} items remaining.</span>`);
+  caGiftSendAllQueue = null;
+  caUpdateGiftQueueStatus();
 }
 
 /** Execute faction withdraw for all bots using two-step queue */

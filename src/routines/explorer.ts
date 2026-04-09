@@ -665,16 +665,40 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         yield* visitOtherPoi(ctx, systemId, poi, fledFromSystems);
       }
 
-      // ── Check cargo — if full, return to Sol Central to deposit ──
+      // ── Check cargo — if full with non-fuel-cell items, return to Sol Central to deposit ──
       await bot.refreshStatus();
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
-        yield "deposit_cargo";
-        await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
-        // After depositing, we're likely in Sol — break to restart system scan
-        await bot.refreshStatus();
-        if (bot.system !== systemId) {
-          ctx.log("info", `Moved to ${bot.system} after deposit — restarting system scan`);
-          break;
+        // Check if cargo is full of only fuel cells (intentional for exploration)
+        const cargoResp = await bot.exec("get_cargo");
+        let isOnlyFuelCells = true;
+        if (cargoResp.result && typeof cargoResp.result === "object") {
+          const cResult = cargoResp.result as Record<string, unknown>;
+          const cargoItems = (
+            Array.isArray(cResult) ? cResult :
+            Array.isArray(cResult.items) ? (cResult.items as Array<Record<string, unknown>>) :
+            Array.isArray(cResult.cargo) ? (cResult.cargo as Array<Record<string, unknown>>) :
+            []
+          );
+          for (const item of cargoItems) {
+            const itemId = (item.item_id as string) || "";
+            if (!itemId.toLowerCase().includes("fuel_cell")) {
+              isOnlyFuelCells = false;
+              break;
+            }
+          }
+        }
+        
+        if (!isOnlyFuelCells) {
+          yield "deposit_cargo";
+          await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+          // After depositing, we're likely in Sol — break to restart system scan
+          await bot.refreshStatus();
+          if (bot.system !== systemId) {
+            ctx.log("info", `Moved to ${bot.system} after deposit — restarting system scan`);
+            break;
+          }
+        } else {
+          ctx.log("info", `Cargo full with fuel cells (${bot.cargo}/${bot.cargoMax}) — continuing exploration`);
         }
       }
     }
@@ -1373,11 +1397,35 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
       visitedHiddenPois.add(`${hiddenPoi.systemId}:${hiddenPoi.poiId}`);
       mapStore.markExplored(hiddenPoi.systemId, hiddenPoi.poiId);
 
-      // ── Check cargo — if full, return home to deposit ──
+      // ── Check cargo — if full with non-fuel-cell items, return home to deposit ──
       await bot.refreshStatus();
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
-        yield "deposit_cargo";
-        await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+        // Check if cargo is full of only fuel cells (intentional for exploration)
+        const cargoResp = await bot.exec("get_cargo");
+        let isOnlyFuelCells = true;
+        if (cargoResp.result && typeof cargoResp.result === "object") {
+          const cResult = cargoResp.result as Record<string, unknown>;
+          const cargoItems = (
+            Array.isArray(cResult) ? cResult :
+            Array.isArray(cResult.items) ? (cResult.items as Array<Record<string, unknown>>) :
+            Array.isArray(cResult.cargo) ? (cResult.cargo as Array<Record<string, unknown>>) :
+            []
+          );
+          for (const item of cargoItems) {
+            const itemId = (item.item_id as string) || "";
+            if (!itemId.toLowerCase().includes("fuel_cell")) {
+              isOnlyFuelCells = false;
+              break;
+            }
+          }
+        }
+        
+        if (!isOnlyFuelCells) {
+          yield "deposit_cargo";
+          await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+        } else {
+          ctx.log("info", `Cargo full with fuel cells (${bot.cargo}/${bot.cargoMax}) — continuing exploration`);
+        }
       }
     }
 
@@ -1695,11 +1743,35 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         }
       }
 
-      // ── Deposit cargo if getting full ──
+      // ── Check cargo — if full with non-fuel-cell items, return home to deposit ──
       await bot.refreshStatus();
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
-        yield "deposit_cargo";
-        await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+        // Check if cargo is full of only fuel cells (intentional for exploration)
+        const cargoResp = await bot.exec("get_cargo");
+        let isOnlyFuelCells = true;
+        if (cargoResp.result && typeof cargoResp.result === "object") {
+          const cResult = cargoResp.result as Record<string, unknown>;
+          const cargoItems = (
+            Array.isArray(cResult) ? cResult :
+            Array.isArray(cResult.items) ? (cResult.items as Array<Record<string, unknown>>) :
+            Array.isArray(cResult.cargo) ? (cResult.cargo as Array<Record<string, unknown>>) :
+            []
+          );
+          for (const item of cargoItems) {
+            const itemId = (item.item_id as string) || "";
+            if (!itemId.toLowerCase().includes("fuel_cell")) {
+              isOnlyFuelCells = false;
+              break;
+            }
+          }
+        }
+        
+        if (!isOnlyFuelCells) {
+          yield "deposit_cargo";
+          await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+        } else {
+          ctx.log("info", `Cargo full with fuel cells (${bot.cargo}/${bot.cargoMax}) — continuing exploration`);
+        }
       }
 
       // ── Check skills ──

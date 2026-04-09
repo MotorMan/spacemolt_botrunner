@@ -4798,7 +4798,12 @@ function openSystemMap(sysId) {
 
     // Label
     const labelColor = isHere ? '#81c784' : '#78909c';
-    svg += `<text x="${x}" y="${y + r + s * 0.03}" text-anchor="middle" dominant-baseline="hanging" fill="${labelColor}" font-size="${s * 0.035}" font-family="sans-serif" style="pointer-events:none">${esc(p.name || p.id)}</text>`;
+    const labelY = y + r + s * 0.03;
+    svg += `<text x="${x}" y="${labelY}" text-anchor="middle" dominant-baseline="hanging" fill="${labelColor}" font-size="${s * 0.035}" font-family="sans-serif" style="pointer-events:none">${esc(p.name || p.id)}</text>`;
+    // Hidden indicator
+    if (p.hidden) {
+      svg += `<text x="${x}" y="${labelY + s * 0.04}" text-anchor="middle" dominant-baseline="hanging" fill="#9e9e9e" font-size="${s * 0.025}" font-family="sans-serif" opacity="0.7" style="pointer-events:none">🔒</text>`;
+    }
   }
 
   svg += `</svg>`;
@@ -5025,6 +5030,7 @@ function renderMap() {
       html += `<span class="poi-icon">${poiIcon(poi.type)}</span>`;
       html += `<span class="poi-name">${esc(poi.name || poi.id)}</span>`;
       html += `<span class="poi-type-badge">${esc(poi.type)}</span>`;
+      if (poi.hidden) html += `<span class="poi-hidden-badge" title="Hidden POI (revealed via survey)">🔒</span>`;
       if (poi.has_base) html += `<span class="poi-base-name">${esc(poi.base_name || 'Station')}</span>`;
       if (poi.last_explored) {
         html += `<span class="mkt-age" style="margin-left:auto">explored ${timeAgo(poi.last_explored)}</span>`;
@@ -10026,6 +10032,9 @@ function addOreQuotaRow(type) {
   } else if (type === 'ice') {
     oreSelect = document.getElementById('ice-quota-add-ore');
     qtyInput = document.getElementById('ice-quota-add-qty');
+  } else if (type === 'deepcore') {
+    oreSelect = document.getElementById('deepcore-quota-add-ore');
+    qtyInput = document.getElementById('deepcore-quota-add-qty');
   }
   if (!oreSelect || !qtyInput) return;
 
@@ -10034,16 +10043,25 @@ function addOreQuotaRow(type) {
   if (!oreId) return;
 
   // Check if ore already in table
-  const tableId = type === 'ore' ? 'ore-quota-table' : type === 'gas' ? 'gas-quota-table' : 'ice-quota-table';
+  const tableId = type === 'ore' ? 'ore-quota-table' : type === 'gas' ? 'gas-quota-table' : type === 'ice' ? 'ice-quota-table' : 'deepcore-quota-table';
   const existing = document.querySelector(`#${tableId} tr[data-ore-id="${oreId}"]`);
   if (existing) {
     existing.querySelector('.quota-qty').value = qty;
     return;
   }
 
+  const deepCoreOresList = [
+    { item_id: 'void_essence', name: 'Void Essence' },
+    { item_id: 'fury_crystal', name: 'Fury Crystal' },
+    { item_id: 'legacy_ore', name: 'Legacy Ore' },
+    { item_id: 'prismatic_nebulite', name: 'Prismatic Nebulite' },
+    { item_id: 'exotic_matter', name: 'Exotic Matter' },
+    { item_id: 'dark_matter_residue', name: 'Dark Matter Residue' },
+  ];
   const allOres = type === 'ore' ? knownOres.filter(o => !o.name.toLowerCase().includes('gas') && !o.name.toLowerCase().includes('ice'))
     : type === 'gas' ? knownOres.filter(o => o.name.toLowerCase().includes('gas'))
-    : knownOres.filter(o => o.name.toLowerCase().includes('ice'));
+    : type === 'ice' ? knownOres.filter(o => o.name.toLowerCase().includes('ice'))
+    : deepCoreOresList;
   const oreName = allOres.find(o => o.item_id === oreId)?.name || oreId;
   const tbody = document.querySelector(`#${tableId} tbody`);
   const tr = document.createElement('tr');

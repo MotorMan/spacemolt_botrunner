@@ -239,6 +239,17 @@ export class Bot {
             this.log("travel", `✓ Timeout check: confirmed at target ${targetId} — treating as success`);
             return { error: undefined, result: { message: "Jump completed (timeout recovery)" }, notifications: [] };
           }
+          
+          // CRITICAL: Check if we're in battle (jump was interrupted by combat)
+          // The battle state is tracked via WebSocket even when HTTP hangs
+          if (this.currentBattle.inBattle) {
+            this.log("combat", `Jump interrupted by battle! Battle ID: ${this.currentBattle.battleId} — we're in ${this.system}, not ${targetId}`);
+            return {
+              error: { code: "battle_interrupt", message: `Jump interrupted by battle ${this.currentBattle.battleId}` },
+              result: undefined,
+              notifications: [],
+            };
+          }
         }
 
         // For travel: check if we're at the target POI or system
@@ -248,6 +259,16 @@ export class Bot {
           if (normalize(this.poi) === normalize(targetId) || normalize(this.system) === normalize(targetId)) {
             this.log("travel", `✓ Timeout check: confirmed at target ${targetId} — treating as success`);
             return { error: undefined, result: { message: "Travel completed (timeout recovery)" }, notifications: [] };
+          }
+          
+          // CRITICAL: Check if we're in battle (travel was interrupted by combat)
+          if (this.currentBattle.inBattle) {
+            this.log("combat", `Travel interrupted by battle! Battle ID: ${this.currentBattle.battleId} — we're in ${this.system}, not ${targetId}`);
+            return {
+              error: { code: "battle_interrupt", message: `Travel interrupted by battle ${this.currentBattle.battleId}` },
+              result: undefined,
+              notifications: [],
+            };
           }
         }
 
@@ -1185,17 +1206,40 @@ export class Bot {
         const targetName = (data.target_name as string) || "";
         const totalDamage = (data.total_damage as number) || 0;
 
+        // CRITICAL: Set battle state on damage too (battle_update might not arrive first)
+        const battleId = (data.battle_id as string) || this.currentBattle.battleId || "";
+        if (battleId || attackerName) {
+          this.currentBattle.inBattle = true;
+          if (battleId) {
+            this.currentBattle.battleId = battleId;
+          }
+          this.currentBattle.lastUpdate = Date.now();
+        }
+
         debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
       } else if (type === "system" && data && typeof data === "object") {
         const message = (data.message as string) || "";
         const msgLower = message.toLowerCase();
-        
+
         // Check for disengage/battle end messages
         if (msgLower.includes("disengaged from battle") || msgLower.includes("battle ended")) {
           this.currentBattle.inBattle = false;
           this.currentBattle.battleId = null;
           this.currentBattle.participants = [];
           debugLogForBot(this.username, "bot:battle", `${this.username} battle ended`);
+        }
+        
+        // CRITICAL: Detect battle interruption messages
+        // These come when a jump/travel action is interrupted by combat
+        if (msgLower.includes("interrupted by combat") || msgLower.includes("attacking you")) {
+          this.currentBattle.inBattle = true;
+          this.currentBattle.lastUpdate = Date.now();
+          // Try to extract battle ID if present in the message
+          const battleIdMatch = message.match(/Battle ID:\s*([a-f0-9]+)/i);
+          if (battleIdMatch && !this.currentBattle.battleId) {
+            this.currentBattle.battleId = battleIdMatch[1];
+          }
+          debugLogForBot(this.username, "bot:battle", `${this.username} battle detected via system message: ${message}`);
         }
       }
 

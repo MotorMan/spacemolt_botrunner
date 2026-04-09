@@ -1269,6 +1269,9 @@ export async function navigateToSystem(
       ctx.log("travel", `Jumping to ${nextSystem} from ${bot.system}... (attempt ${retries}/${MAX_RETRIES_PER_JUMP})`);
       const jumpResp = await bot.exec("jump", { target_system: nextSystem });
 
+      // Track if we handled a battle interrupt to avoid double error handling
+      let battleInterruptHandled = false;
+
       // Check for battle notifications after jump
       if (jumpResp.notifications && Array.isArray(jumpResp.notifications)) {
         const battleNotifs = parseBattleNotifications(jumpResp.notifications);
@@ -1276,6 +1279,7 @@ export async function navigateToSystem(
         if (hasBattle) {
           ctx.log("combat", "Battle detected during jump - initiating flee!");
           inBattleDuringJump = true;
+          battleInterruptHandled = true;
           // Re-issue flee every cycle while in battle
           const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
           if (fleeResp.error) {
@@ -1294,14 +1298,45 @@ export async function navigateToSystem(
         }
       }
 
+      // CRITICAL: Check for battle interrupt error (jump timed out due to battle)
+      if (jumpResp.error && jumpResp.error.code === "battle_interrupt") {
+        ctx.log("combat", `Battle interrupt detected! ${jumpResp.error.message} - initiating flee!`);
+        inBattleDuringJump = true;
+        battleInterruptHandled = true;
+        // Re-issue flee every cycle while in battle
+        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (fleeResp.error) {
+          ctx.log("error", `Flee command failed: ${fleeResp.error.message}`);
+        }
+        // Check if disengaged
+        const battleStatus = await getBattleStatus(ctx);
+        if (!battleStatus || !battleStatus.is_participant) {
+          ctx.log("combat", "Battle cleared - continuing navigation");
+          inBattleDuringJump = false;
+          // Battle was cleared, but we still have an error - need to retry the jump
+          // Fall through to error handling below
+        } else {
+          // Still in battle - wait and continue to re-flee
+          await sleep(2000);
+          continue;
+        }
+      }
+
       if (!jumpResp.error) {
         jumpSuccess = true;
         break;
       }
-      
+
+      // If we handled battle interrupt and battle is now cleared, treat as transient and retry
+      if (battleInterruptHandled && !inBattleDuringJump) {
+        ctx.log("travel", "Battle interrupt handled and cleared - retrying jump");
+        // Fall through to retry logic below
+      }
+
       const errorMsg = jumpResp.error.message.toLowerCase();
 
       // Check if error is transient (network timeout, connection issue, etc.)
+      // Note: battle_interrupt is handled separately above, so we don't include it here
       const isTransient =
         jumpResp.error.code === "timeout" || // Our custom timeout from execWithTimeout
         errorMsg.includes("timeout") ||

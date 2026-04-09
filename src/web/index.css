@@ -1338,6 +1338,12 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   color: var(--cyan);
   font-weight: 500;
 }
+.poi-hidden-badge {
+  font-size: 12px;
+  padding: 0 4px;
+  opacity: 0.7;
+  cursor: help;
+}
 
 /* POI sub-sections */
 .poi-section {

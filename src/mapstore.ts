@@ -285,8 +285,10 @@ class MapStore {
           missions: prev?.missions ?? [],
           last_explored: prev?.last_explored ?? null,
           last_updated: now(),
-          // Preserve hidden flag if present in API response
-          hidden: (p.hidden as boolean) ?? prev?.hidden ?? false,
+          // Preserve hidden flag: once a POI is marked hidden, it stays hidden
+          // even if the API doesn't return the flag (hidden POIs revealed by survey
+          // should remain tracked as hidden for explorer reference)
+          hidden: (p.hidden as boolean) || prev?.hidden || false,
           reveal_difficulty: (p.reveal_difficulty as number) ?? prev?.reveal_difficulty,
         };
       });
@@ -644,7 +646,8 @@ class MapStore {
     // Update POI metadata (in case it changed)
     poi.name = poiData.name || poi.name;
     poi.type = poiData.type || poi.type;
-    if (poiData.hidden !== undefined) poi.hidden = poiData.hidden;
+    // Once a POI is marked hidden, it stays hidden - don't overwrite with false
+    if (poiData.hidden) poi.hidden = poiData.hidden;
     if (poiData.reveal_difficulty !== undefined) poi.reveal_difficulty = poiData.reveal_difficulty;
     poi.last_updated = now();
 

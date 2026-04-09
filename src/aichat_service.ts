@@ -173,6 +173,7 @@ function getAiChatSettings(): {
   personality: string;
   lockDurationSec: number;
   conversationCooldownSec: number;
+  factionChatRoundsLimit: number; // Max rounds of AI responses in faction chat (0 = unlimited)
 } {
   const all = readSettings();
   const s = (all.ai_chat || {}) as Record<string, unknown>;
@@ -209,6 +210,7 @@ function getAiChatSettings(): {
     personality: (s.personality as string) || DEFAULT_PERSONALITY,
     lockDurationSec: (s.lockDurationSec as number) || 60,
     conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
+    factionChatRoundsLimit: (s.factionChatRoundsLimit as number) ?? 5,
   };
 }
 
@@ -414,7 +416,12 @@ export class AiChatService {
   // Track consecutive AI responses to prevent loops
   private consecutiveResponses = new Map<string, number>();
   private readonly MAX_CONSECUTIVE_RESPONSES = 3; // Max 3 AI responses in a row before requiring human input
-  
+
+  // Track faction chat rounds to prevent endless bot-to-bot conversations
+  private factionChatRounds = 0;
+  private factionChatRoundResetTime = 0;
+  private readonly FACTION_CHAT_ROUND_RESET_MS = 5 * 60 * 1000; // Reset counter after 5 minutes of no faction chat
+
   // Chat log file
   private readonly CHAT_LOG_FILE = join(process.cwd(), "data", "chat.log");
 
@@ -531,6 +538,46 @@ export class AiChatService {
         }
       }
     }
+  }
+
+  /**
+   * Check if faction chat rounds limit has been reached.
+   * Returns true if we should skip responding due to round limit.
+   */
+  private checkFactionChatRoundsLimit(settings: ReturnType<typeof getAiChatSettings>): boolean {
+    // If limit is 0 or not set, no limit applied
+    if (!settings.factionChatRoundsLimit || settings.factionChatRoundsLimit <= 0) {
+      return false;
+    }
+
+    const now = Date.now();
+
+    // Reset counter if enough time has passed since last faction chat activity
+    if (now - this.factionChatRoundResetTime > this.FACTION_CHAT_ROUND_RESET_MS) {
+      this.factionChatRounds = 0;
+    }
+
+    // Check if we've hit the limit
+    if (this.factionChatRounds >= settings.factionChatRoundsLimit) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Increment the faction chat round counter.
+   */
+  private incrementFactionChatRounds(): void {
+    const now = Date.now();
+
+    // Reset if enough time has passed
+    if (now - this.factionChatRoundResetTime > this.FACTION_CHAT_ROUND_RESET_MS) {
+      this.factionChatRounds = 0;
+    }
+
+    this.factionChatRounds++;
+    this.factionChatRoundResetTime = now;
   }
 
   /**
@@ -796,6 +843,14 @@ export class AiChatService {
 
     this.logFn("ai_chat", `Should respond to [${msg.channel}] ${msg.sender}: ${reason}`);
 
+    // Check faction chat rounds limit (only for faction channel)
+    if (msg.channel === "faction") {
+      if (this.checkFactionChatRoundsLimit(settings)) {
+        this.logFn("ai_chat", `Faction chat rounds limit reached (${this.factionChatRounds}/${settings.factionChatRoundsLimit}), skipping`);
+        return;
+      }
+    }
+
     // Select responder(s) for non-mention messages
     // For local chat, prefer the bot that received the message (guaranteed to be at correct location)
     const candidates = this.selectResponderCandidates(msg, msg.channel === "local" ? (msg.botUsername || "") : "");
@@ -951,12 +1006,19 @@ export class AiChatService {
     const addedBots = new Set<string>();
 
     // Priority 1: The receiving bot (if specified) - it's guaranteed to be at the correct location for local chat
+    // BUT: For faction chat, only add receiving bot to the pool (don't prioritize it) to encourage randomness
     if (receivingBot) {
       const target = bots.find(b => b.username === receivingBot);
       this.logFn("ai_chat_debug", `Looking for receiving bot ${receivingBot}: found=${!!target}, state=${target?.state}, session=${!!target?.api.getSession()}`);
       if (target && (target.state === "running" || target.state === "idle") && target.api.getSession()) {
-        candidates.push(target);
-        addedBots.add(target.username);
+        // For local chat, prioritize receiving bot (must be at correct location)
+        // For faction/system chat, just add to pool without prioritizing
+        if (msg.channel === "local") {
+          candidates.push(target);
+        } else {
+          // Add to pool but don't prioritize - will be shuffled later for faction chat
+          addedBots.add(target.username);
+        }
       }
     }
 
@@ -995,7 +1057,6 @@ export class AiChatService {
         this.logFn("ai_chat_debug", `Skipping locked bot: ${bot.username}`);
         continue;
       }
-      candidates.push(bot);
       addedBots.add(bot.username);
     }
 
@@ -1003,8 +1064,32 @@ export class AiChatService {
     for (const bot of bots) {
       if (addedBots.has(bot.username)) continue;
       if (bot.api.getSession()) {
-        candidates.push(bot);
         addedBots.add(bot.username);
+      }
+    }
+
+    // For FACTION chat: shuffle all available bots to ensure randomness
+    // This prevents the same bots (#1, #2) from always dominating
+    if (msg.channel === "faction") {
+      const allAvailableBots: Bot[] = [];
+      for (const bot of bots) {
+        if (addedBots.has(bot.username)) {
+          allAvailableBots.push(bot);
+        }
+      }
+      // Fisher-Yates shuffle for true randomness
+      for (let i = allAvailableBots.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [allAvailableBots[i], allAvailableBots[j]] = [allAvailableBots[j], allAvailableBots[i]];
+      }
+      candidates.push(...allAvailableBots);
+      this.logFn("ai_chat_debug", `Faction chat: shuffled ${allAvailableBots.length} candidates for randomness`);
+    } else {
+      // For other channels, add remaining bots in order (Priority 4 + Fallback)
+      for (const bot of bots) {
+        if (addedBots.has(bot.username) && !candidates.includes(bot)) {
+          candidates.push(bot);
+        }
       }
     }
 
@@ -1472,6 +1557,13 @@ ${botContext}
           mem.conversationHistory = mem.conversationHistory.slice(-50);
         }
         saveMemory(mem);
+
+        // Increment faction chat rounds counter if this was a faction chat message
+        if (msg.channel === "faction") {
+          this.incrementFactionChatRounds();
+          this.logFn("ai_chat_debug", `Faction chat round ${this.factionChatRounds}/${settings.factionChatRoundsLimit || "∞"}`);
+        }
+
         return "sent";
       } else {
         // Check if error is due to traveling

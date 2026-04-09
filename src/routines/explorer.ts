@@ -314,7 +314,13 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (bot.poi !== startStation.id) {
       await ensureUndocked(ctx);
       const tResp = await bot.exec("travel", { target_poi: startStation.id });
-      if (tResp.error && !tResp.error.message.includes("already")) {
+
+      // Check for battle after travel
+      if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+        ctx.log("combat", "Battle detected during startup travel - fleeing!");
+        await sleep(5000);
+        // Continue to main loop which will handle battle
+      } else if (tResp.error && !tResp.error.message.includes("already")) {
         ctx.log("error", `Could not reach station: ${tResp.error.message}`);
       }
     }
@@ -322,7 +328,13 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Dock
     if (!bot.docked) {
       const dResp = await bot.exec("dock");
-      if (!dResp.error || dResp.error.message.includes("already")) {
+
+      // Check for battle after dock
+      if (await checkBattleAfterCommand(ctx, dResp.notifications, "dock")) {
+        ctx.log("combat", "Battle detected during startup dock - fleeing!");
+        await sleep(5000);
+        // Continue to main loop which will handle battle
+      } else if (!dResp.error || dResp.error.message.includes("already")) {
         bot.docked = true;
       }
     }
@@ -1053,6 +1065,14 @@ async function* scanStation(
   let missionCount = 0;
 
   const marketResp = await bot.exec("view_market");
+
+  // Check for battle after view_market
+  if (await checkBattleAfterCommand(ctx, marketResp.notifications, "view_market")) {
+    ctx.log("combat", "Battle detected during market scan - fleeing!");
+    await sleep(5000);
+    return;
+  }
+
   if (marketResp.result && typeof marketResp.result === "object") {
     mapStore.updateMarket(systemId, poi.id, marketResp.result as Record<string, unknown>);
     const result = marketResp.result as Record<string, unknown>;
@@ -1066,6 +1086,14 @@ async function* scanStation(
   }
 
   const missionsResp = await bot.exec("get_missions");
+
+  // Check for battle after get_missions
+  if (await checkBattleAfterCommand(ctx, missionsResp.notifications, "get_missions")) {
+    ctx.log("combat", "Battle detected during mission scan - fleeing!");
+    await sleep(5000);
+    return;
+  }
+
   if (missionsResp.result && typeof missionsResp.result === "object") {
     const mData = missionsResp.result as Record<string, unknown>;
     const missions = (
@@ -1133,7 +1161,15 @@ async function* scanStation(
 
   // Undock
   yield `undock_${poi.id}`;
-  await bot.exec("undock");
+  const undockResp = await bot.exec("undock");
+
+  // Check for battle after undock
+  if (await checkBattleAfterCommand(ctx, undockResp.notifications, "undock")) {
+    ctx.log("combat", "Battle detected during undock - fleeing!");
+    await sleep(5000);
+    return;
+  }
+
   bot.docked = false;
 
   mapStore.markExplored(systemId, poi.id);
@@ -1714,16 +1750,40 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       } else {
         // POI not found in live data — try docking anyway
         const dResp = await bot.exec("dock");
+
+        // Check for battle after dock
+        if (await checkBattleAfterCommand(ctx, dResp.notifications, "dock")) {
+          ctx.log("combat", "Battle detected during docking - fleeing!");
+          await sleep(5000);
+          continue;
+        }
+
         if (!dResp.error || dResp.error.message.includes("already")) {
           bot.docked = true;
           await collectFromStorage(ctx);
 
           const marketResp = await bot.exec("view_market");
+
+          // Check for battle after view_market
+          if (await checkBattleAfterCommand(ctx, marketResp.notifications, "view_market")) {
+            ctx.log("combat", "Battle detected during market scan - fleeing!");
+            await sleep(5000);
+            continue;
+          }
+
           if (marketResp.result && typeof marketResp.result === "object") {
             mapStore.updateMarket(target.systemId, target.stationPoi, marketResp.result as Record<string, unknown>);
           }
 
           const missResp = await bot.exec("get_missions");
+
+          // Check for battle after get_missions
+          if (await checkBattleAfterCommand(ctx, missResp.notifications, "get_missions")) {
+            ctx.log("combat", "Battle detected during mission scan - fleeing!");
+            await sleep(5000);
+            continue;
+          }
+
           if (missResp.result && typeof missResp.result === "object") {
             const mData = missResp.result as Record<string, unknown>;
             const missions = (
@@ -1736,7 +1796,16 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           }
 
           await tryRefuel(ctx);
-          await bot.exec("undock");
+
+          const undockResp = await bot.exec("undock");
+
+          // Check for battle after undock
+          if (await checkBattleAfterCommand(ctx, undockResp.notifications, "undock")) {
+            ctx.log("combat", "Battle detected during undock - fleeing!");
+            await sleep(5000);
+            continue;
+          }
+
           bot.docked = false;
           mapStore.markExplored(target.systemId, target.stationPoi);
           ctx.log("info", `Updated ${target.stationName} in ${target.systemName}`);
@@ -1982,6 +2051,14 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
   // Check current cargo space
   const cargoResp = await bot.exec("get_cargo");
+
+  // Check for battle after get_cargo
+  if (await checkBattleAfterCommand(ctx, cargoResp.notifications, "get_cargo")) {
+    ctx.log("combat", "Battle detected during cargo check - fleeing!");
+    await sleep(5000);
+    return false;
+  }
+
   if (!cargoResp.result || typeof cargoResp.result !== "object") {
     ctx.log("error", "Could not get cargo status");
     return false;
@@ -2019,6 +2096,13 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
     quantity: availableSpace
   });
 
+  // Check for battle after faction_withdraw_items
+  if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
+    ctx.log("combat", "Battle detected during fuel cell withdraw - fleeing!");
+    await sleep(5000);
+    return false;
+  }
+
   if (!withdrawResp.error) {
     const newFuelCells = fuelCellCount + availableSpace;
     ctx.log("trade", `Loaded ${availableSpace} fuel cells from faction storage (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
@@ -2033,6 +2117,13 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
     quantity: availableSpace
   });
 
+  // Check for battle after buy_item
+  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy_item")) {
+    ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
+    await sleep(5000);
+    return false;
+  }
+
   if (!buyResp.error) {
     const newFuelCells = fuelCellCount + availableSpace;
     ctx.log("trade", `Bought ${availableSpace} fuel cells from market (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
@@ -2044,6 +2135,14 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   if (buyErrorMsg.includes("credit") || buyErrorMsg.includes("not enough") || buyErrorMsg.includes("insufficient")) {
     ctx.log("trade", "Not enough credits — withdrawing from storage...");
     const withdrawCreditsResp = await bot.exec("withdraw_credits");
+
+    // Check for battle after withdraw_credits
+    if (await checkBattleAfterCommand(ctx, withdrawCreditsResp.notifications, "withdraw_credits")) {
+      ctx.log("combat", "Battle detected during credits withdraw - fleeing!");
+      await sleep(5000);
+      return false;
+    }
+
     if (!withdrawCreditsResp.error) {
       await bot.refreshStatus();
       ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying fuel cell purchase...`);
@@ -2051,6 +2150,14 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
         item_id: "fuel_cell",
         quantity: availableSpace
       });
+
+      // Check for battle after retry buy_item
+      if (await checkBattleAfterCommand(ctx, retryResp.notifications, "buy_item")) {
+        ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
+        await sleep(5000);
+        return false;
+      }
+
       if (!retryResp.error) {
         const newFuelCells = fuelCellCount + availableSpace;
         ctx.log("trade", `Loaded ${availableSpace} fuel cells (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
@@ -2086,12 +2193,28 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   // Dock at station
   if (!bot.docked) {
     const travelResp = await bot.exec("travel", { target_poi: station.id });
+
+    // Check for battle after travel
+    if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+      log("combat", "Battle detected during travel - fleeing!");
+      await sleep(5000);
+      return false;
+    }
+
     if (travelResp.error && !travelResp.error.message.includes("already")) {
       log("error", `Could not reach station: ${travelResp.error.message}`);
       return false;
     }
 
     const dockResp = await bot.exec("dock");
+
+    // Check for battle after dock
+    if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
+      log("combat", "Battle detected during dock - fleeing!");
+      await sleep(5000);
+      return false;
+    }
+
     if (dockResp.error && !dockResp.error.message.includes("already")) {
       log("error", `Could not dock: ${dockResp.error.message}`);
       return false;
@@ -2101,6 +2224,14 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
 
   // Check current cargo
   const cargoResp = await bot.exec("get_cargo");
+
+  // Check for battle after get_cargo
+  if (await checkBattleAfterCommand(ctx, cargoResp.notifications, "get_cargo")) {
+    log("combat", "Battle detected during cargo check - fleeing!");
+    await sleep(5000);
+    return false;
+  }
+
   if (!cargoResp.result || typeof cargoResp.result !== "object") {
     log("error", "Could not get cargo status");
     return false;
@@ -2132,6 +2263,13 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
     item_id: "fuel_cell",
     quantity: availableSpace
   });
+
+  // Check for battle after buy_item
+  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy_item")) {
+    log("combat", "Battle detected during fuel cell purchase - fleeing!");
+    await sleep(5000);
+    return false;
+  }
 
   if (buyResp.error) {
     log("error", `Could not buy fuel cells: ${buyResp.error.message}`);

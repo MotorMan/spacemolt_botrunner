@@ -708,6 +708,18 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
         if (bot.system !== candidate.sourceSystem) {
           await ensureUndocked(ctx);
+          
+          // Pre-travel battle check - prevents travel from being interrupted
+          const preTravelBattleCheck = await getBattleStatus(ctx);
+          if (preTravelBattleCheck && preTravelBattleCheck.is_participant) {
+            ctx.log("combat", `PRE-TRAVEL CHECK: IN BATTLE! Battle ID: ${preTravelBattleCheck.battle_id} - initiating flee!`);
+            battleState.inBattle = true;
+            battleState.battleId = preTravelBattleCheck.battle_id;
+            battleState.isFleeing = false;
+            await fleeFromBattle(ctx, false, 5000);
+            continue;
+          }
+          
           const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
           if (!fueled) {
             ctx.log("error", "Cannot refuel for buy run — waiting 30s");
@@ -725,6 +737,18 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
         if (bot.poi !== candidate.sourcePoi) {
           await ensureUndocked(ctx);
+          
+          // Check battle after undock
+          const undockBattleCheck = await getBattleStatus(ctx);
+          if (undockBattleCheck && undockBattleCheck.is_participant) {
+            ctx.log("combat", `POST-UNDOCK CHECK: IN BATTLE! Battle ID: ${undockBattleCheck.battle_id} - initiating flee!`);
+            battleState.inBattle = true;
+            battleState.battleId = undockBattleCheck.battle_id;
+            battleState.isFleeing = false;
+            await fleeFromBattle(ctx, false, 5000);
+            continue;
+          }
+          
           ctx.log("travel", `Traveling to ${candidate.sourcePoiName}...`);
           const tResp = await bot.exec("travel", { target_poi: candidate.sourcePoi });
           // Check for battle notifications after travel
@@ -734,6 +758,16 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
               ctx.log("combat", "Battle detected during travel - initiating flee!");
               battleState.isFleeing = false;
             }
+          }
+          // Also check battle status directly (in case we missed notifications)
+          const directBattleCheck = await getBattleStatus(ctx);
+          if (directBattleCheck && directBattleCheck.is_participant) {
+            ctx.log("combat", `DIRECT CHECK: IN BATTLE after travel! Battle ID: ${directBattleCheck.battle_id} - fleeing!`);
+            battleState.inBattle = true;
+            battleState.battleId = directBattleCheck.battle_id;
+            await fleeFromBattle(ctx, true, 35000);
+            ctx.log("error", "Battle detected - fled, will retry route");
+            continue;
           }
           if (tResp.error && !tResp.error.message.includes("already")) {
             ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
@@ -885,6 +919,16 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
             battleState.isFleeing = false;
           }
         }
+        // Also check battle status directly after buy (in case we missed notifications)
+        const postBuyBattleCheck = await getBattleStatus(ctx);
+        if (postBuyBattleCheck && postBuyBattleCheck.is_participant) {
+          ctx.log("combat", `POST-BUY CHECK: IN BATTLE! Battle ID: ${postBuyBattleCheck.battle_id} - fleeing!`);
+          battleState.inBattle = true;
+          battleState.battleId = postBuyBattleCheck.battle_id;
+          await fleeFromBattle(ctx, true, 35000);
+          ctx.log("error", "Battle detected after buy - fled, will continue to home with cargo");
+          // Don't continue - we have items in cargo, need to proceed to home
+        }
         if (buyResp.error) {
           failedSources.add(sourceKey);
           if (buyResp.error.message.includes("item_not_available") || buyResp.error.message.includes("not_available")) {
@@ -944,6 +988,19 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     // ── Phase 2: Travel to home and deposit ──
     yield "travel_to_home";
     await ensureUndocked(ctx);
+
+    // Post-undock battle check
+    const postUndockBattleCheck = await getBattleStatus(ctx);
+    if (postUndockBattleCheck && postUndockBattleCheck.is_participant) {
+      ctx.log("combat", `POST-UNDOCK (HOME): IN BATTLE! Battle ID: ${postUndockBattleCheck.battle_id} - initiating flee!`);
+      battleState.inBattle = true;
+      battleState.battleId = postUndockBattleCheck.battle_id;
+      battleState.isFleeing = false;
+      await fleeFromBattle(ctx, false, 5000);
+      await ensureDocked(ctx);
+      await sleep(30000);
+      continue;
+    }
 
     const cargoSafetyOpts = { ...safetyOpts, noJettison: true };
     const fueled2 = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
@@ -1005,9 +1062,40 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     // Travel to home station POI
     await ensureUndocked(ctx);
+    
+    // Pre-travel to home station battle check
+    const preHomeStationBattleCheck = await getBattleStatus(ctx);
+    if (preHomeStationBattleCheck && preHomeStationBattleCheck.is_participant) {
+      ctx.log("combat", `PRE-HOME-STATION: IN BATTLE! Battle ID: ${preHomeStationBattleCheck.battle_id} - initiating flee!`);
+      battleState.inBattle = true;
+      battleState.battleId = preHomeStationBattleCheck.battle_id;
+      battleState.isFleeing = false;
+      await fleeFromBattle(ctx, false, 5000);
+      await sleep(5000);
+      continue;
+    }
+    
     if (bot.poi !== homeStation.id) {
       ctx.log("travel", `Traveling to ${homeStation.name}...`);
       const t2Resp = await bot.exec("travel", { target_poi: homeStation.id });
+      // Check for battle notifications after travel
+      if (t2Resp.notifications && Array.isArray(t2Resp.notifications)) {
+        const battleDetected = await handleBattleNotifications(ctx, t2Resp.notifications, battleState);
+        if (battleDetected) {
+          ctx.log("combat", "Battle detected during travel to home station - initiating flee!");
+          battleState.isFleeing = false;
+        }
+      }
+      // Direct battle check after travel
+      const travelHomeBattleCheck = await getBattleStatus(ctx);
+      if (travelHomeBattleCheck && travelHomeBattleCheck.is_participant) {
+        ctx.log("combat", `TRAVEL HOME: IN BATTLE! Battle ID: ${travelHomeBattleCheck.battle_id} - fleeing!`);
+        battleState.inBattle = true;
+        battleState.battleId = travelHomeBattleCheck.battle_id;
+        await fleeFromBattle(ctx, true, 35000);
+        ctx.log("trade", "Battle detected during travel home - fled, will retry");
+        continue;
+      }
       if (t2Resp.error && !t2Resp.error.message.includes("already")) {
         ctx.log("error", `Travel to home station failed: ${t2Resp.error.message}`);
       } else {

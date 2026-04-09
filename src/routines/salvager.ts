@@ -351,18 +351,27 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("travel", `Traveling to ${poi.name}...`);
         const travelResp = await bot.exec("travel", { target_poi: poi.id });
         // Check for battle notifications after travel
-        if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
-          const battleDetected = await handleBattleNotifications(ctx, travelResp.notifications, battleState);
-          if (battleDetected) {
-            ctx.log("combat", "Battle detected during travel to POI - initiating flee!");
-            battleState.isFleeing = false;
-          }
+        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+          ctx.log("combat", "Battle detected during travel to POI - initiating flee!");
+          battleState.isFleeing = false;
+          continue;
         }
         if (travelResp.error && !travelResp.error.message.includes("already")) {
           ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
           continue;
         }
         bot.poi = poi.id;
+
+        // Pre-salvage battle check - prevents salvage command from freezing if battle starts
+        const preSalvageBattleCheck = await getBattleStatus(ctx);
+        if (preSalvageBattleCheck && preSalvageBattleCheck.is_participant) {
+          ctx.log("combat", `PRE-SALVAGE CHECK: IN BATTLE! Battle ID: ${preSalvageBattleCheck.battle_id} - initiating flee!`);
+          battleState.inBattle = true;
+          battleState.battleId = preSalvageBattleCheck.battle_id;
+          battleState.isFleeing = false;
+          await fleeFromBattle(ctx, false, 5000); // Initial flee, don't wait for disengage
+          continue;
+        }
 
         // Salvage wrecks at this POI
         yield "scavenge";
@@ -452,12 +461,28 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           yield "travel_to_poi";
           ctx.log("travel", `Traveling to ${poi.name} (${roamSystemId})...`);
           const tResp = await bot.exec("travel", { target_poi: poi.id });
+          if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
+            ctx.log("combat", "Battle detected during roam travel - initiating flee!");
+            battleState.isFleeing = false;
+            break;
+          }
           if (tResp.error && !tResp.error.message.includes("already")) continue;
           bot.poi = poi.id;
 
+          // Pre-salvage battle check for roam system
+          const preSalvageBattleCheck = await getBattleStatus(ctx);
+          if (preSalvageBattleCheck && preSalvageBattleCheck.is_participant) {
+            ctx.log("combat", `PRE-SALVAGE CHECK (roam): IN BATTLE! Battle ID: ${preSalvageBattleCheck.battle_id} - initiating flee!`);
+            battleState.inBattle = true;
+            battleState.battleId = preSalvageBattleCheck.battle_id;
+            battleState.isFleeing = false;
+            await fleeFromBattle(ctx, false, 5000);
+            break;
+          }
+
           yield "scavenge";
           const result = settings.enableFullSalvage
-            ? await fullSalvageWrecks(ctx, { enableTow: settings.enableTowing, minTowValue: settings.minTowValue })
+            ? await fullSalvageWrecks(ctx, { enableTow: settings.enableTowing, minTowValue: settings.minTowValue, battleState })
             : { itemsLooted: await scavengeWrecks(ctx), isTowing: false };
           totalLooted += result.itemsLooted;
           if (result.itemsLooted > 0) {
@@ -605,7 +630,10 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         yield "travel_to_salvage_yard";
         ctx.log("travel", `Traveling to salvage yard: ${salvageYardStation.name}...`);
         const travelResp = await bot.exec("travel", { target_poi: salvageYardStation.id });
-        if (travelResp.error && !travelResp.error.message.includes("already")) {
+        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel_to_salvage_yard", battleState)) {
+          ctx.log("combat", "Battle detected during travel to salvage yard - initiating flee!");
+          battleState.isFleeing = false;
+        } else if (travelResp.error && !travelResp.error.message.includes("already")) {
           ctx.log("error", `Travel to salvage yard failed: ${travelResp.error.message}`);
         } else {
           bot.poi = salvageYardStation.id;
@@ -621,7 +649,10 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
             yield "travel_to_salvage_yard";
             ctx.log("travel", `Traveling to configured station: ${configuredStation.name}...`);
             const travelResp = await bot.exec("travel", { target_poi: configuredStation.id });
-            if (travelResp.error && !travelResp.error.message.includes("already")) {
+            if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel_to_salvage_yard", battleState)) {
+              ctx.log("combat", "Battle detected during travel to salvage yard - initiating flee!");
+              battleState.isFleeing = false;
+            } else if (travelResp.error && !travelResp.error.message.includes("already")) {
               ctx.log("error", `Travel to salvage yard failed: ${travelResp.error.message}`);
             } else {
               bot.poi = configuredStation.id;
@@ -678,7 +709,10 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "travel_to_station";
     if (stationPoi) {
       const travelStationResp = await bot.exec("travel", { target_poi: stationPoi.id });
-      if (travelStationResp.error && !travelStationResp.error.message.includes("already")) {
+      if (await checkBattleAfterCommand(ctx, travelStationResp.notifications, "travel_to_station", battleState)) {
+        ctx.log("combat", "Battle detected during travel to station - initiating flee!");
+        battleState.isFleeing = false;
+      } else if (travelStationResp.error && !travelStationResp.error.message.includes("already")) {
         ctx.log("error", `Travel to station failed: ${travelStationResp.error.message}`);
       }
     }
@@ -717,6 +751,11 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
             for (const otherStation of otherStations) {
               ctx.log("travel", `Trying station: ${otherStation.name}`);
               const travelResp = await bot.exec("travel", { target_poi: otherStation.id });
+              if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+                ctx.log("combat", "Battle detected while trying other stations - initiating flee!");
+                battleState.isFleeing = false;
+                break;
+              }
               if (travelResp.error) {
                 ctx.log("error", `Travel failed: ${travelResp.error.message}`);
                 continue;

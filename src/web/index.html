@@ -5032,7 +5032,22 @@ function renderMap() {
       html += `<span class="poi-type-badge">${esc(poi.type)}</span>`;
       if (poi.hidden) html += `<span class="poi-hidden-badge" title="Hidden POI (revealed via survey)">🔒</span>`;
       if (poi.has_base) html += `<span class="poi-base-name">${esc(poi.base_name || 'Station')}</span>`;
-      if (poi.last_explored) {
+      if (poi.hidden) {
+        // Hidden POIs show their scan status differently
+        if (poi.last_explored) {
+          html += `<span class="mkt-age" style="margin-left:auto">hidden (scanned ${timeAgo(poi.last_explored)})</span>`;
+        } else if (poi.resources && poi.resources.length > 0) {
+          // Has resource data from scan but not formally "explored"
+          const lastScan = poi.resources[poi.resources.length - 1]?.last_scanned;
+          if (lastScan) {
+            html += `<span class="mkt-age" style="margin-left:auto;color:var(--cyan)">hidden (scanned ${timeAgo(lastScan)})</span>`;
+          } else {
+            html += `<span class="mkt-age" style="margin-left:auto;color:var(--cyan)">hidden</span>`;
+          }
+        } else {
+          html += `<span class="mkt-age" style="margin-left:auto;color:var(--cyan)">hidden</span>`;
+        }
+      } else if (poi.last_explored) {
         html += `<span class="mkt-age" style="margin-left:auto">explored ${timeAgo(poi.last_explored)}</span>`;
       } else {
         html += `<span class="mkt-age" style="margin-left:auto;color:var(--yellow)">unexplored</span>`;
@@ -6138,6 +6153,7 @@ function renderRescueSettings(panel) {
   const partnerBotName = r.partnerBotName || '';
   const cooperationMaxDelaySeconds = r.cooperationMaxDelaySeconds ?? 30;
   const creditTopOffAmount = r.creditTopOffAmount ?? 10000;
+  const creditTopOffMinThreshold = r.creditTopOffMinThreshold ?? 10000;
 
   // Build system options from mapData
   const systems = Object.keys(mapData || {}).sort();
@@ -6274,6 +6290,12 @@ function renderRescueSettings(panel) {
       <small style="color:var(--dim)">Automatically top up all fleet bots (including self) to this credit amount from faction treasury (default: 10000)</small>
     </div>
 
+    <div class="settings-group">
+      <label>💰 Credit top-off minimum threshold</label>
+      <input type="number" id="set-rescue-creditTopOffMinThreshold" value="${creditTopOffMinThreshold}" min="0" max="100000" step="1000" style="width:100px">
+      <small style="color:var(--dim)">Only top off bots that have LESS than this amount (prevents constant top-offs, default: 10000)</small>
+    </div>
+
     <button class="btn" onclick="saveRescueSettings()">Save</button>
   `;
 }
@@ -6295,6 +6317,7 @@ function saveRescueSettings() {
     partnerBotName: document.getElementById('set-rescue-partnerBotName').value || '',
     cooperationMaxDelaySeconds: parseInt(document.getElementById('set-rescue-cooperationMaxDelay').value) || 30,
     creditTopOffAmount: parseInt(document.getElementById('set-rescue-creditTopOffAmount').value) || 10000,
+    creditTopOffMinThreshold: parseInt(document.getElementById('set-rescue-creditTopOffMinThreshold').value) || 10000,
   };
   send({ type: 'saveSettings', routine: 'rescue', settings: s });
   alert('FuelRescue settings saved!');
@@ -6978,6 +7001,7 @@ function renderAiChatSettings(panel) {
   const personality = ac.personality || '';
   const lockDurationSec = ac.lockDurationSec ?? 60;
   const conversationCooldownSec = ac.conversationCooldownSec ?? 15;
+  const factionChatRoundsLimit = ac.factionChatRoundsLimit ?? 5;
 
   const inputStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box"`;
   const textareaStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box;min-height:150px;font-family:monospace;font-size:12px;white-space:pre-wrap"`;
@@ -7043,6 +7067,14 @@ function renderAiChatSettings(panel) {
         <div class="setting-hint">Minimum time between AI responses in the same conversation. Prevents spam and allows natural conversation flow.</div>
       </div>
       <input type="number" id="set-aichat-conversationCooldownSec" min="5" max="120" value="${conversationCooldownSec}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Faction Chat Rounds Limit</div>
+        <div class="setting-hint">Maximum number of AI response rounds in faction chat before pausing. Prevents endless bot-to-bot conversations. Set to 0 for unlimited. Counter resets after 5 minutes of inactivity.</div>
+      </div>
+      <input type="number" id="set-aichat-factionChatRoundsLimit" min="0" max="50" value="${factionChatRoundsLimit}">
     </div>
 
     <div class="setting-row">
@@ -7126,6 +7158,7 @@ function saveAiChatSettings() {
     personality: document.getElementById('set-aichat-personality').value.trim(),
     lockDurationSec: parseInt(document.getElementById('set-aichat-lockDurationSec').value) || 60,
     conversationCooldownSec: parseInt(document.getElementById('set-aichat-conversationCooldownSec').value) || 15,
+    factionChatRoundsLimit: parseInt(document.getElementById('set-aichat-factionChatRoundsLimit').value) ?? 5,
   };
   send({ type: 'saveSettings', routine: 'ai_chat', settings: s });
   settings.ai_chat = s;

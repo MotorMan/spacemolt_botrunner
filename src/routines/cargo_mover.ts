@@ -32,6 +32,7 @@ import {
   checkBattleAfterCommand,
   getItemSize,
   maxItemsForCargo,
+  type BattleState,
 } from "./common.js";
 import {
   logCargoActivity,
@@ -662,6 +663,15 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
   });
 
   while (bot.state === "running") {
+    // Initialize battle state for this cycle
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
+
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) {
       logCargoActivity(bot.username, "death_recovery", "Bot died, recovering...", {
@@ -813,6 +823,15 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         if (bot.state !== "running") {
           ctx.log("system", "⛔ Stopping — emergency detected");
           return;
+        }
+        // Check for battle interruption after travel command
+        if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
+          ctx.log("error", "Battle detected during cargo recovery travel - fleeing!");
+          logCargoActivity(bot.username, "battle_encounter", "Battle detected during travel to destination (cargo recovery)", {
+            location: `${bot.system}/${bot.poi}`,
+          });
+          await sleep(5000);
+          continue;
         }
         if (tResp.error && !tResp.error.message.includes("already")) {
           ctx.log("error", `Travel to destination failed: ${tResp.error.message}`);
@@ -973,6 +992,15 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             location: `${bot.system}/${bot.poi}`,
           });
           return;
+        }
+        // Check for battle interruption after travel command
+        if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
+          ctx.log("error", "Battle detected during travel to source station - fleeing!");
+          logCargoActivity(bot.username, "battle_encounter", "Battle detected during travel to source station", {
+            location: `${bot.system}/${bot.poi}`,
+          });
+          await sleep(5000);
+          continue;
         }
         if (tResp.error && !tResp.error.message.includes("already")) {
           ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
@@ -1296,6 +1324,16 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         });
         return;
       }
+      // Check for battle interruption after travel command
+      if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
+        ctx.log("error", "Battle detected during travel to destination - fleeing!");
+        logCargoActivity(bot.username, "battle_encounter", "Battle detected during travel to destination with cargo", {
+          location: `${bot.system}/${bot.poi}`,
+        });
+        allJobsCompleted = false;
+        await sleep(5000);
+        continue;
+      }
       if (tResp.error && !tResp.error.message.includes("already")) {
         ctx.log("error", `Travel to dest failed: ${tResp.error.message}`);
         logCargoActivity(bot.username, "error", `Travel to destination failed: ${tResp.error.message}`, {
@@ -1477,6 +1515,15 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           location: `${bot.system}/${bot.poi}`,
         });
         return;
+      }
+      // Check for battle interruption after travel command
+      if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
+        ctx.log("error", "Battle detected during return travel to source - fleeing!");
+        logCargoActivity(bot.username, "battle_encounter", "Battle detected during return travel to source station", {
+          location: `${bot.system}/${bot.poi}`,
+        });
+        await sleep(5000);
+        continue;
       }
       if (tResp.error && !tResp.error.message.includes("already")) {
         ctx.log("error", `Travel to source failed: ${tResp.error.message}`);

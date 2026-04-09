@@ -494,6 +494,168 @@ async function hasEquipmentForMiningType(ctx: RoutineContext, miningType: "ore" 
   }
 }
 
+/**
+ * Survey the current system to reveal hidden POIs.
+ * This is required before a bot can travel to a hidden POI it hasn't discovered yet.
+ * Returns true if the survey was successful (or already surveyed), false on error.
+ */
+async function surveySystemForHiddenPois(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  
+  ctx.log("mining", "Surveying system to reveal hidden POIs...");
+  const surveyResp = await bot.exec("survey_system");
+  
+  // Check for battle notifications after survey
+  if (surveyResp.notifications && Array.isArray(surveyResp.notifications)) {
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
+    const battleDetected = await handleBattleNotifications(ctx, surveyResp.notifications, battleState);
+    if (battleDetected) {
+      ctx.log("error", "Battle detected during survey - will retry later");
+      return false;
+    }
+  }
+  
+  if (surveyResp.error) {
+    const errorMsg = surveyResp.error.message.toLowerCase();
+    // "already surveyed" is not an error - just means we've already done it
+    if (errorMsg.includes("already surveyed")) {
+      ctx.log("mining", "System already surveyed - hidden POIs should be visible");
+      return true;
+    }
+    // "no_scanner" means we don't have the equipment
+    if (errorMsg.includes("no_scanner") || errorMsg.includes("no scanner")) {
+      ctx.log("error", "Survey failed: no survey scanner equipped");
+      return false;
+    }
+    // Other errors
+    ctx.log("error", `Survey failed: ${surveyResp.error.message}`);
+    return false;
+  }
+  
+  // Survey was successful - update map with newly revealed POIs
+  ctx.log("mining", "System surveyed successfully - hidden POIs now accessible");
+  
+  // Refresh system info to get the newly revealed POIs
+  const { pois: newPois, systemId } = await getSystemInfo(ctx);
+  if (systemId && newPois.length > 0) {
+    mapStore.updateSystem({
+      id: systemId,
+      pois: newPois.map(p => ({
+        id: p.id,
+        name: p.name,
+        type: p.type,
+      })),
+      last_visited: new Date().toISOString(),
+    });
+    ctx.log("map", `Updated map for ${systemId}: ${newPois.length} POIs recorded (including hidden POIs)`);
+  }
+  
+  return true;
+}
+
+/**
+ * Check if a travel error is due to an unknown destination (hidden POI not yet discovered).
+ */
+function isUnknownDestinationError(error: { message: string } | null | undefined): boolean {
+  if (!error) return false;
+  const msg = error.message.toLowerCase();
+  return msg.includes("unknown destination") || msg.includes("unknown poi");
+}
+
+/**
+ * Attempt to travel to a POI, and if it fails due to unknown destination
+ * (hidden POI not yet discovered), survey the system and retry.
+ */
+async function travelToPoiWithSurvey(
+  ctx: RoutineContext,
+  poiId: string,
+  poiName: string,
+  isHidden: boolean,
+): Promise<{ success: boolean; error?: string }> {
+  const { bot } = ctx;
+  
+  // First attempt to travel
+  const travelResp = await bot.exec("travel", { target_poi: poiId });
+  
+  // Check for battle notifications
+  if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
+    const battleDetected = await handleBattleNotifications(ctx, travelResp.notifications, battleState);
+    if (battleDetected) {
+      ctx.log("error", "Battle detected during travel - fleeing!");
+      return { success: false, error: "battle detected" };
+    }
+  }
+  
+  // Check if travel was successful
+  if (!travelResp.error || travelResp.error.message.includes("already")) {
+    bot.poi = poiId;
+    return { success: true };
+  }
+  
+  // Travel failed - check if it's because the POI is unknown (hidden, not yet discovered)
+  if (isUnknownDestinationError(travelResp.error)) {
+    ctx.log("error", `Travel failed: Unknown destination ${poiId} — hidden POI not yet discovered`);
+    
+    // Only attempt survey if this is actually a hidden POI
+    if (!isHidden) {
+      ctx.log("error", `Travel failed: ${travelResp.error.message}`);
+      return { success: false, error: travelResp.error.message };
+    }
+    
+    // Survey the system to reveal the hidden POI
+    const surveySuccess = await surveySystemForHiddenPois(ctx);
+    if (!surveySuccess) {
+      return { success: false, error: "survey failed" };
+    }
+    
+    // Retry travel after survey
+    ctx.log("mining", `Retrying travel to hidden POI ${poiName} after survey...`);
+    const retryResp = await bot.exec("travel", { target_poi: poiId });
+    
+    // Check for battle notifications on retry
+    if (retryResp.notifications && Array.isArray(retryResp.notifications)) {
+      const battleState: BattleState = {
+        inBattle: false,
+        battleId: null,
+        battleStartTick: null,
+        lastHitTick: null,
+        isFleeing: false,
+      };
+      const battleDetected = await handleBattleNotifications(ctx, retryResp.notifications, battleState);
+      if (battleDetected) {
+        ctx.log("error", "Battle detected during retry travel - fleeing!");
+        return { success: false, error: "battle detected" };
+      }
+    }
+    
+    if (!retryResp.error || retryResp.error.message.includes("already")) {
+      bot.poi = poiId;
+      ctx.log("mining", `Successfully traveled to hidden POI ${poiName} after survey`);
+      return { success: true };
+    } else {
+      ctx.log("error", `Failed to travel to hidden POI even after survey: ${retryResp.error.message}`);
+      return { success: false, error: retryResp.error.message };
+    }
+  }
+  
+  // Some other travel error
+  ctx.log("error", `Travel failed: ${travelResp.error.message}`);
+  return { success: false, error: travelResp.error.message };
+}
+
 /** Detect deep core mining capability and log it. */
 async function logDeepCoreCapability(ctx: RoutineContext, fieldTestActive: boolean = false): Promise<void> {
   const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
@@ -906,6 +1068,126 @@ async function cacheShipModules(ctx: RoutineContext): Promise<unknown[] | null> 
   }
   ctx.log("system", `Cached ${modules.length} ship modules for routine use`);
   return modules;
+}
+
+// ── Deep core mining efficiency helpers ───────────────────────────────────
+
+/**
+ * Find the best hidden POI for a given deep core ore.
+ * Prioritizes hidden POIs with high richness.
+ * Returns null if no suitable hidden POI found.
+ */
+function findBestHiddenPoiForOre(
+  oreId: string,
+  currentSystem: string,
+  currentPoiId: string,
+  maxJumps: number,
+  ignoreDepletion: boolean,
+  depletionTimeoutMs: number,
+  minRichness: number = 50, // Only consider POIs with richness >= this
+): { poiId: string; poiName: string; systemId: string; systemName: string; richness: number; remaining: number; jumps: number; isHidden: boolean } | null {
+  const locations = mapStore.findOreLocations(oreId).filter(loc => {
+    // Skip current POI
+    if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
+    
+    // Must be a hidden POI
+    const sys = mapStore.getSystem(loc.systemId);
+    const poi = sys?.pois.find(p => p.id === loc.poiId);
+    if (!poi?.hidden) return false;
+    
+    return true;
+  }).filter(loc => {
+    // Skip completely exhausted POIs
+    if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+      return false;
+    }
+    if (ignoreDepletion) return true;
+    const sys = mapStore.getSystem(loc.systemId);
+    const poi = sys?.pois.find(p => p.id === loc.poiId);
+    const oreEntry = poi?.ores_found.find(o => o.item_id === oreId);
+    if (!oreEntry?.depleted) return true;
+    return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+  }).filter(loc => {
+    // Only consider high richness POIs
+    return loc.richness >= minRichness;
+  });
+
+  if (locations.length === 0) return null;
+
+  // Score and sort by distance and richness
+  const blacklist = getSystemBlacklist();
+  const scored = locations
+    .map(loc => {
+      const route = mapStore.findRoute(currentSystem, loc.systemId, blacklist);
+      return { ...loc, jumps: route ? route.length - 1 : 999 };
+    })
+    .filter(loc => loc.jumps <= maxJumps)
+    .sort((a, b) => {
+      // Prefer current system
+      if (a.systemId === currentSystem && b.systemId !== currentSystem) return -1;
+      if (b.systemId === currentSystem && a.systemId !== currentSystem) return 1;
+      // Then by richness (higher is better)
+      if (b.richness !== a.richness) return b.richness - a.richness;
+      // Then by distance
+      return a.jumps - b.jumps;
+    });
+
+  if (scored.length === 0) return null;
+
+  const chosen = scored[0];
+  const sysData = mapStore.getSystem(chosen.systemId);
+  return {
+    poiId: chosen.poiId,
+    poiName: chosen.poiName,
+    systemId: chosen.systemId,
+    systemName: sysData?.name || chosen.systemId,
+    richness: chosen.richness,
+    remaining: chosen.remaining,
+    jumps: chosen.jumps,
+    isHidden: true,
+  };
+}
+
+/**
+ * Check if all hidden POIs for a given ore are currently depleted (on timer).
+ * Returns true if there are hidden POIs but all are on depletion cooldown.
+ */
+function areAllHiddenPoisDepleted(
+  oreId: string,
+  currentSystem: string,
+  currentPoiId: string,
+  ignoreDepletion: boolean,
+  depletionTimeoutMs: number,
+): boolean {
+  const allHiddenLocations = mapStore.findOreLocations(oreId).filter(loc => {
+    // Skip current POI
+    if (loc.poiId === currentPoiId && loc.systemId === currentSystem) return false;
+    
+    // Must be a hidden POI
+    const sys = mapStore.getSystem(loc.systemId);
+    const poi = sys?.pois.find(p => p.id === loc.poiId);
+    if (!poi?.hidden) return false;
+    
+    return true;
+  });
+
+  if (allHiddenLocations.length === 0) return false; // No hidden POIs exist
+
+  // Check if ALL of them are depleted and not expired
+  const allDepleted = allHiddenLocations.every(loc => {
+    // Skip completely exhausted POIs (0 remaining)
+    if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+      return true; // Consider as "depleted"
+    }
+    if (ignoreDepletion) return false;
+    const sys = mapStore.getSystem(loc.systemId);
+    const poi = sys?.pois.find(p => p.id === loc.poiId);
+    const oreEntry = poi?.ores_found.find(o => o.item_id === oreId);
+    if (!oreEntry?.depleted) return false;
+    return !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+  });
+
+  return allDepleted;
 }
 
 // ── Miner routine ────────────────────────────────────────────
@@ -2012,24 +2294,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Travel to mining location ──
     yield miningType === "ice" ? "travel_to_ice_field" : (miningType === "ore" ? "travel_to_belt" : "travel_to_cloud");
-    const travelResp = await bot.exec("travel", { target_poi: miningPoi.id });
     
-    // Check for battle notifications during travel
-    if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
-      const battleDetected = await handleBattleNotifications(ctx, travelResp.notifications, battleState);
-      if (battleDetected) {
-        ctx.log("error", "Battle detected during travel - fleeing!");
-        await sleep(5000);
-        continue;
-      }
-    }
+    // Check if this is a hidden POI (need to survey before traveling if not yet discovered)
+    const sysData = mapStore.getSystem(bot.system);
+    const poiData = sysData?.pois.find(p => p.id === miningPoi!.id);
+    const isHiddenPoi = poiData?.hidden ?? false;
     
-    if (travelResp.error && !travelResp.error.message.includes("already")) {
-      ctx.log("error", `Travel failed: ${travelResp.error.message}`);
+    // Use the new travel function that handles hidden POI discovery
+    const travelResult = await travelToPoiWithSurvey(ctx, miningPoi.id, miningPoi.name, isHiddenPoi);
+    
+    if (!travelResult.success) {
+      ctx.log("error", `Travel to mining location failed: ${travelResult.error}`);
       await sleep(5000);
       continue;
     }
-    bot.poi = miningPoi.id;
+    
+    // bot.poi is already set by travelToPoiWithSurvey
 
     // Check for pirates at mining location
     const nearbyResp = await bot.exec("get_nearby");
@@ -2141,10 +2421,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Periodically check POI to see if resource is depleted (remaining: 0)
       // DEEP CORE FIX: This check also ensures deep core miners stay on deep core tasks
+      // RICHNESS CHECK: Also check for significantly better POIs periodically
       if (effectiveTarget && bot.poi && !settings.ignoreDepletion &&
           (now - lastPoiCheck) > POI_CHECK_INTERVAL_MS) {
         lastPoiCheck = now;
-        
+
         // DEEP CORE GUARD: Verify we're still mining a deep core ore if we have deep core equipment
         const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
         if (deepCoreCap.canMine && isDeepCoreOre(effectiveTarget)) {
@@ -2155,7 +2436,137 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           targetResource = "";
           continue;
         }
+
+        // ── RICHNESS UPGRADE CHECK ──
+        // Check if there's a significantly better POI available (not just depleted check)
+        // This prevents miners from staying at very low richness POIs indefinitely
+        const blacklist = getSystemBlacklist();
+        const currentSys = mapStore.getSystem(bot.system);
+        const currentPoi = currentSys?.pois.find(p => p.id === bot.poi);
         
+        // Get current POI resource data from stored resources (has richness/remaining)
+        const currentPoiObj = currentPoi as unknown as Record<string, unknown> | undefined;
+        const currentPoiResources = currentPoiObj?.resources as Array<Record<string, unknown>> | undefined;
+        const currentResourceData = currentPoiResources?.find(r => (r.resource_id as string) === effectiveTarget);
+        const currentRichness = (currentResourceData?.richness as number) ?? 0;
+        const currentRemaining = (currentResourceData?.remaining as number) ?? 0;
+
+        // Only search for upgrades if current POI has low richness (< 20) OR has been significantly depleted
+        const richnessThreshold = 20;
+        const depletionThreshold = 0.5; // 50% depleted
+        const maxRemaining = (currentResourceData?.max_remaining as number) ?? 0;
+        const depletionPercent = maxRemaining > 0 ? currentRemaining / maxRemaining : 1;
+
+        const shouldSearchForUpgrade = currentRichness < richnessThreshold || depletionPercent < depletionThreshold;
+
+        if (shouldSearchForUpgrade) {
+          ctx.log("mining", `Richness check: current POI has richness ${currentRichness}, ${((1 - depletionPercent) * 100).toFixed(1)}% depleted — searching for better options...`);
+
+          // Find best available POI for this resource
+          const allLocations = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+            if (loc.poiId === bot.poi && loc.systemId === bot.system) return false; // Skip current POI
+            const sys = mapStore.getSystem(loc.systemId);
+            const poi = sys?.pois.find(p => p.id === loc.poiId);
+            if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+            if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
+            if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
+            return true;
+          }).filter(loc => {
+            const sys = mapStore.getSystem(loc.systemId);
+            const poi = sys?.pois.find(p => p.id === loc.poiId);
+            const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+            if (!oreEntry?.depleted) return true;
+            if (settings.ignoreDepletion) {
+              if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+                return false;
+              }
+              return true;
+            }
+            return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+          });
+
+          if (allLocations.length > 0) {
+            const scoredLocations = allLocations
+              .map(loc => {
+                const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                const jumps = route ? route.length - 1 : 999;
+                return { ...loc, jumps };
+              })
+              .filter(loc => loc.jumps <= maxJumps)
+              .sort((a, b) => {
+                // Sort by richness first, then by remaining, then by distance
+                if (b.richness !== a.richness) return b.richness - a.richness;
+                if (b.remaining !== a.remaining) return b.remaining - a.remaining;
+                return a.jumps - b.jumps;
+              });
+
+            if (scoredLocations.length > 0) {
+              const bestLoc = scoredLocations[0];
+              const bestRichness = bestLoc.richness ?? 0;
+              const bestRemaining = bestLoc.remaining ?? 0;
+
+              // Upgrade criteria: 2x+ richness OR 2x+ remaining pool (same logic as startup check)
+              let shouldUpgrade = false;
+              let upgradeReason = "";
+
+              if (bestLoc.isHidden && !currentPoi?.hidden) {
+                shouldUpgrade = true;
+                upgradeReason = `hidden POI upgrade (${bestLoc.poiName} vs ${currentPoi?.name})`;
+              } else if (bestRichness >= currentRichness * 2 && bestRichness > 10) {
+                shouldUpgrade = true;
+                upgradeReason = `much higher richness (${bestRichness} vs ${currentRichness})`;
+              } else if (bestRemaining >= currentRemaining * 2 && bestRemaining > 1000) {
+                shouldUpgrade = true;
+                upgradeReason = `much larger pool (${bestRemaining.toLocaleString()} vs ${currentRemaining.toLocaleString()})`;
+              }
+
+              if (shouldUpgrade) {
+                ctx.log("mining", `RICHNESS UPGRADE: ${upgradeReason} — switching POIs`);
+
+                // Travel to new system if needed
+                if (bestLoc.systemId !== bot.system) {
+                  ctx.log("mining", `Traveling to ${bestLoc.systemName} for better POI...`);
+                  const arrived = await navigateToSystem(ctx, bestLoc.systemId, safetyOpts);
+                  if (arrived) {
+                    const { pois: newPois } = await getSystemInfo(ctx);
+                    pois = newPois;
+                    bot.system = bestLoc.systemId;
+                  } else {
+                    ctx.log("error", "Failed to reach new system for richness upgrade");
+                  }
+                }
+
+                // Travel to new POI using the survey-aware travel function
+                const travelResult = await travelToPoiWithSurvey(ctx, bestLoc.poiId, bestLoc.poiName, bestLoc.isHidden);
+
+                if (travelResult.success) {
+                  miningPoi = { id: bestLoc.poiId, name: bestLoc.poiName };
+                  ctx.log("mining", `Switched to better POI: ${bestLoc.poiName} (richness: ${bestRichness}, remaining: ${bestRemaining.toLocaleString()})`);
+
+                  // Update session if active
+                  if (recoveredSession) {
+                    updateMiningSession(bot.username, {
+                      targetPoiId: bestLoc.poiId,
+                      targetPoiName: bestLoc.poiName,
+                      targetSystemId: bestLoc.systemId,
+                      targetSystemName: bestLoc.systemName,
+                    });
+                    ctx.log("mining", `Updated mining session to new POI: ${bestLoc.poiName}`);
+                  }
+
+                  lastPoiCheck = 0; // Reset POI check timer
+                  continue; // Continue mining at new POI
+                } else {
+                  ctx.log("error", `Failed to travel to better POI: ${travelResult.error}`);
+                }
+              } else {
+                ctx.log("mining", `No significantly better POI found (current: richness ${currentRichness}, remaining ${currentRemaining.toLocaleString()})`);
+              }
+            }
+          }
+        }
+
+        // ── DEPLETION CHECK (original logic) ──
         const poiResp = await bot.exec("get_poi", { poi_id: bot.poi });
         if (!poiResp.error && poiResp.result) {
           const result = poiResp.result as Record<string, unknown>;
@@ -2387,70 +2798,251 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
           // CRITICAL FIX: Check global/configured target FIRST before falling back to quotas
           // This ensures energy_crystal (or any global target) doesn't get ignored when depleted
-          // DEEP CORE FIX: If this is a deep core miner, only accept deep core ore targets
+          // DEEP CORE FIX: If this is a deep core miner, use efficient hidden POI rotation
           let newTarget: string | null = null;
           let newPoiId: string | null = null;
           let newPoiName: string | null = null;
           let newSystemId: string | null = null;
 
-          // For deep core miners, check if we should search for deep core ores instead
+          // For deep core miners, implement efficient hidden POI rotation:
+          // 1. First, try to find another hidden POI with the SAME ore (high richness)
+          // 2. If none found, check if all hidden POIs for this ore are depleted (on timer)
+          // 3. If all hidden POIs depleted, switch to NEXT deep core ore in quota
+          // 4. Only mine low richness POIs when all hidden POIs are on timer
           const currentDeepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
           const isDeepCoreMiner = currentDeepCoreCap.canMine;
           let searchTarget = targetResource;
-          
-          if (isDeepCoreMiner && (!searchTarget || !isDeepCoreOre(searchTarget))) {
-            ctx.log("mining", "Deep core miner — searching for deep core ore target after depletion...");
-            // Search for any available deep core ore
-            for (const deepCoreOre of DEEP_CORE_ORES) {
-              const deepCoreLocs = mapStore.findOreLocations(deepCoreOre).filter(loc => {
-                const sys = mapStore.getSystem(loc.systemId);
-                const poi = sys?.pois.find(p => p.id === loc.poiId);
-                return isOreBeltPoi(poi?.type || "") || poi?.hidden === true;
-              }).filter(loc => {
-                if (settings.ignoreDepletion) {
-                  if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
-                    return false;
-                  }
-                  return true;
-                }
-                const sys = mapStore.getSystem(loc.systemId);
-                const poi = sys?.pois.find(p => p.id === loc.poiId);
-                const oreEntry = poi?.ores_found.find(o => o.item_id === deepCoreOre);
-                if (!oreEntry?.depleted) return true;
-                return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
-              });
 
-              if (deepCoreLocs.length > 0) {
-                const blacklist = getSystemBlacklist();
-                const locsWithDist = deepCoreLocs
-                  .map(loc => {
-                    const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-                    return { ...loc, jumps: route ? route.length - 1 : 999 };
+          if (isDeepCoreMiner && effectiveTarget && isDeepCoreOre(effectiveTarget)) {
+            ctx.log("mining", `Deep core miner: ${effectiveTarget} depleted — searching for next hidden POI...`);
+            
+            // Step 1: Search for another hidden POI with the SAME ore (high richness)
+            const hiddenPoi = findBestHiddenPoiForOre(
+              effectiveTarget,
+              bot.system,
+              bot.poi || "",
+              maxJumps,
+              settings.ignoreDepletion,
+              depletionTimeoutMs,
+              50 // Minimum richness threshold
+            );
+            
+            if (hiddenPoi) {
+              // Found another high-richness hidden POI for the same ore
+              newTarget = effectiveTarget;
+              newPoiId = hiddenPoi.poiId;
+              newPoiName = hiddenPoi.poiName;
+              newSystemId = hiddenPoi.systemId;
+              ctx.log("mining", `Found hidden POI: ${effectiveTarget} @ ${hiddenPoi.poiName} in ${hiddenPoi.systemName} (${hiddenPoi.jumps} jumps, richness: ${hiddenPoi.richness})`);
+            } else {
+              // Step 2: Check if all hidden POIs for this ore are depleted (on timer)
+              const allHiddenDepleted = areAllHiddenPoisDepleted(
+                effectiveTarget,
+                bot.system,
+                bot.poi || "",
+                settings.ignoreDepletion,
+                depletionTimeoutMs
+              );
+              
+              if (allHiddenDepleted) {
+                ctx.log("mining", `All hidden POIs for ${effectiveTarget} are depleted (on timer) — switching to next quota ore`);
+                // Step 3: Switch to the next deep core ore in the quota
+                // Get all deep core ores that have quotas or are available
+                const deepCoreQuotaEntries = Object.entries(quotas).filter(([oreId]) => isDeepCoreOre(oreId));
+                
+                // Sort by deficit to pick the next most needed ore
+                await bot.refreshFactionStorage();
+                const sortedDeepCoreOres = deepCoreQuotaEntries
+                  .map(([oreId, target]) => {
+                    const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
+                    const deficit = target - current;
+                    return { oreId, deficit, current, target };
                   })
-                  .filter(loc => loc.jumps <= maxJumps)
-                  .sort((a, b) => {
-                    if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
-                    if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
-                    return a.jumps - b.jumps;
-                  });
-
-                if (locsWithDist.length > 0) {
-                  const chosen = locsWithDist[0];
-                  newTarget = deepCoreOre;
-                  newPoiId = chosen.poiId;
-                  newPoiName = chosen.poiName;
-                  newSystemId = chosen.systemId;
-                  const hiddenTag = chosen.isHidden ? " [HIDDEN POI]" : "";
-                  ctx.log("mining", `Found deep core target: ${deepCoreOre} @ ${chosen.poiName} (${chosen.jumps} jumps)${hiddenTag}`);
+                  .filter(entry => entry.deficit > 0)
+                  .sort((a, b) => b.deficit - a.deficit);
+                
+                // Try each deep core ore in quota priority order
+                for (const quotaEntry of sortedDeepCoreOres) {
+                  if (quotaEntry.oreId === effectiveTarget) continue; // Skip current ore
+                  
+                  const nextHiddenPoi = findBestHiddenPoiForOre(
+                    quotaEntry.oreId,
+                    bot.system,
+                    bot.poi || "",
+                    maxJumps,
+                    settings.ignoreDepletion,
+                    depletionTimeoutMs,
+                    50
+                  );
+                  
+                  if (nextHiddenPoi) {
+                    newTarget = quotaEntry.oreId;
+                    newPoiId = nextHiddenPoi.poiId;
+                    newPoiName = nextHiddenPoi.poiName;
+                    newSystemId = nextHiddenPoi.systemId;
+                    ctx.log("mining", `Switched to next quota ore: ${quotaEntry.oreId} @ ${nextHiddenPoi.poiName} in ${nextHiddenPoi.systemName} (${nextHiddenPoi.jumps} jumps, richness: ${nextHiddenPoi.richness}, deficit: ${quotaEntry.deficit})`);
+                    break;
+                  }
+                }
+                
+                // If no hidden POIs found for any quota ore, check if ALL hidden POIs are on timer
+                if (!newTarget) {
+                  // Check if there are ANY hidden POIs available for deep core ores
+                  let anyHiddenAvailable = false;
+                  for (const deepCoreOre of DEEP_CORE_ORES) {
+                    const anyPoi = findBestHiddenPoiForOre(
+                      deepCoreOre,
+                      bot.system,
+                      bot.poi || "",
+                      maxJumps,
+                      settings.ignoreDepletion,
+                      depletionTimeoutMs,
+                      30 // Lower threshold to be more inclusive
+                    );
+                    if (anyPoi) {
+                      anyHiddenAvailable = true;
+                      break;
+                    }
+                  }
+                  
+                  if (!anyHiddenAvailable) {
+                    // Step 4: All hidden POIs are on depletion timer - fall back to low richness mining
+                    ctx.log("mining", "All hidden POIs depleted across all deep core ores — falling back to low richness mining");
+                    
+                    // Try to find any deep core ore POI (including low richness)
+                    for (const deepCoreOre of DEEP_CORE_ORES) {
+                      const anyPoiResult = findBestHiddenPoiForOre(
+                        deepCoreOre,
+                        bot.system,
+                        bot.poi || "",
+                        maxJumps,
+                        settings.ignoreDepletion,
+                        depletionTimeoutMs,
+                        0 // Accept any richness
+                      );
+                      
+                      if (anyPoiResult) {
+                        newTarget = deepCoreOre;
+                        newPoiId = anyPoiResult.poiId;
+                        newPoiName = anyPoiResult.poiName;
+                        newSystemId = anyPoiResult.systemId;
+                        ctx.log("mining", `Found low richness deep core target: ${deepCoreOre} @ ${anyPoiResult.poiName} (${anyPoiResult.jumps} jumps, richness: ${anyPoiResult.richness})`);
+                        break;
+                      }
+                    }
+                    
+                    if (!newTarget) {
+                      ctx.log("mining", "No deep core ores available at all — waiting for depletion timers");
+                      stopReason = "all deep core POIs on depletion timer";
+                      break;
+                    }
+                  } else {
+                    ctx.log("mining", "Some hidden POIs still available but not meeting richness threshold — will retry next cycle");
+                    stopReason = "waiting for hidden POI richness recovery";
+                    break;
+                  }
+                }
+              } else {
+                // Not all hidden POIs are depleted, but none found with high richness
+                // This means there might be some low-richness ones - skip them for now
+                ctx.log("mining", `No high-richness hidden POIs for ${effectiveTarget} — switching to next quota ore`);
+                
+                // Switch to next quota ore (same logic as above)
+                const deepCoreQuotaEntries = Object.entries(quotas).filter(([oreId]) => isDeepCoreOre(oreId));
+                await bot.refreshFactionStorage();
+                const sortedDeepCoreOres = deepCoreQuotaEntries
+                  .map(([oreId, target]) => {
+                    const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
+                    const deficit = target - current;
+                    return { oreId, deficit, current, target };
+                  })
+                  .filter(entry => entry.deficit > 0)
+                  .sort((a, b) => b.deficit - a.deficit);
+                
+                for (const quotaEntry of sortedDeepCoreOres) {
+                  if (quotaEntry.oreId === effectiveTarget) continue;
+                  
+                  const nextHiddenPoi = findBestHiddenPoiForOre(
+                    quotaEntry.oreId,
+                    bot.system,
+                    bot.poi || "",
+                    maxJumps,
+                    settings.ignoreDepletion,
+                    depletionTimeoutMs,
+                    50
+                  );
+                  
+                  if (nextHiddenPoi) {
+                    newTarget = quotaEntry.oreId;
+                    newPoiId = nextHiddenPoi.poiId;
+                    newPoiName = nextHiddenPoi.poiName;
+                    newSystemId = nextHiddenPoi.systemId;
+                    ctx.log("mining", `Switched to next quota ore: ${quotaEntry.oreId} @ ${nextHiddenPoi.poiName} in ${nextHiddenPoi.systemName} (${nextHiddenPoi.jumps} jumps, richness: ${nextHiddenPoi.richness})`);
+                    break;
+                  }
+                }
+                
+                if (!newTarget) {
+                  ctx.log("mining", "No alternative deep core ores with high richness — waiting for next cycle");
+                  stopReason = "no high-richness hidden POIs available";
                   break;
                 }
               }
             }
+          } else if (isDeepCoreMiner && (!targetResource || !isDeepCoreOre(targetResource))) {
+            // Deep core miner without a specific target - search for any deep core ore
+            ctx.log("mining", "Deep core miner — searching for deep core ore target after depletion...");
+            // Search for any available deep core ore with hidden POIs
+            for (const deepCoreOre of DEEP_CORE_ORES) {
+              const hiddenPoiResult = findBestHiddenPoiForOre(
+                deepCoreOre,
+                bot.system,
+                bot.poi || "",
+                maxJumps,
+                settings.ignoreDepletion,
+                depletionTimeoutMs,
+                50
+              );
+              
+              if (hiddenPoiResult) {
+                newTarget = deepCoreOre;
+                newPoiId = hiddenPoiResult.poiId;
+                newPoiName = hiddenPoiResult.poiName;
+                newSystemId = hiddenPoiResult.systemId;
+                ctx.log("mining", `Found deep core target: ${deepCoreOre} @ ${hiddenPoiResult.poiName} in ${hiddenPoiResult.systemName} (${hiddenPoiResult.jumps} jumps, richness: ${hiddenPoiResult.richness})`);
+                break;
+              }
+            }
 
             if (!newTarget) {
-              ctx.log("mining", "No deep core ores available — waiting for next cycle to retry");
-              stopReason = "no deep core ores available";
-              break;
+              ctx.log("mining", "No high-richness hidden POIs available — checking for any hidden POI...");
+              // Fallback to any hidden POI regardless of richness
+              for (const deepCoreOre of DEEP_CORE_ORES) {
+                const anyPoiResult = findBestHiddenPoiForOre(
+                  deepCoreOre,
+                  bot.system,
+                  bot.poi || "",
+                  maxJumps,
+                  settings.ignoreDepletion,
+                  depletionTimeoutMs,
+                  0
+                );
+                
+                if (anyPoiResult) {
+                  newTarget = deepCoreOre;
+                  newPoiId = anyPoiResult.poiId;
+                  newPoiName = anyPoiResult.poiName;
+                  newSystemId = anyPoiResult.systemId;
+                  ctx.log("mining", `Found low richness deep core target: ${deepCoreOre} @ ${anyPoiResult.poiName} (${anyPoiResult.jumps} jumps, richness: ${anyPoiResult.richness})`);
+                  break;
+                }
+              }
+              
+              if (!newTarget) {
+                ctx.log("mining", "No deep core ores available — waiting for next cycle to retry");
+                stopReason = "no deep core ores available";
+                break;
+              }
             }
           } else if (searchTarget) {
             ctx.log("mining", `Checking for configured global target ${resourceLabel}: ${searchTarget}...`);
@@ -2719,6 +3311,30 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       harvestCycles++;
 
       const { oreId, oreName } = parseOreFromMineResult(mineResp.result);
+      
+      // MINING RESULT SUMMARY: Log exactly what was mined for visibility
+      if (mineResp.result && typeof mineResp.result === "object") {
+        const result = mineResp.result as Record<string, unknown>;
+        const quantity = (result.quantity as number) ?? (result.amount as number) ?? 1;
+        const richness = (result.richness as number) ?? 0;
+        const resourceType = (result.resource_type as string) ?? (result.type as string) ?? "";
+        const poiName = (result.poi_name as string) ?? (result.location as string) ?? miningPoi?.name ?? "";
+        
+        // Build a detailed summary of what was mined
+        const summaryParts = [`Mined ${quantity}x ${oreName || "unknown"}`];
+        if (poiName) summaryParts.push(`@ ${poiName}`);
+        if (richness > 0) summaryParts.push(`[richness: ${richness}]`);
+        if (resourceType) summaryParts.push(`[type: ${resourceType}]`);
+        if (oreId && oreId !== oreName) summaryParts.push(`[id: ${oreId}]`);
+        
+        const dcTag = isDeepCoreMining ? " [DEEP CORE]" : "";
+        ctx.log("mining", `${summaryParts.join(" ")}${dcTag}`);
+      } else if (oreId) {
+        // Fallback if result structure is unexpected
+        const dcTag = isDeepCoreMining ? " [deep core]" : "";
+        ctx.log("mining", `Mined ${oreName}${dcTag}`);
+      }
+      
       if (oreId && bot.poi) {
         mapStore.recordMiningYield(bot.system, bot.poi, { item_id: oreId, name: oreName });
         resourcesMinedMap.set(oreName, (resourcesMinedMap.get(oreName) || 0) + 1);

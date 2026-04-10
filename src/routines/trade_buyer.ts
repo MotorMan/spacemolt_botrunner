@@ -113,11 +113,12 @@ async function recoverBuySession(
 
       if (cargoQty < session.quantityBought) {
         ctx.log("trade", `Recovered with partial cargo: ${cargoQty}/${session.quantityBought}x ${session.itemName}`);
-        session = updateTradeSession(session.botUsername, {
+        const updated = await updateTradeSession(session.botUsername, {
           quantityBought: cargoQty,
           sellQuantity: cargoQty,
           notes: (session.notes || "") + ` | Partial recovery: ${cargoQty}/${session.quantityBought}x remaining`,
-        })!;
+        });
+        if (updated) session = updated;
       }
     }
   }
@@ -134,10 +135,11 @@ async function recoverBuySession(
 
     if (session.destSystem !== homeSystem) {
       ctx.log("trade", `Correcting destination to home system ${homeSystem}`);
-      session = updateTradeSession(session.botUsername, {
+      const updated = await updateTradeSession(session.botUsername, {
         destSystem: homeSystem,
         notes: (session.notes || "") + ` | Destination corrected to home system ${homeSystem}`,
-      })!;
+      });
+      if (updated) session = updated;
     }
   }
 
@@ -511,7 +513,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         onJump: async (jumpNum) => {
           const session = getActiveSession(bot.username);
           if (session) {
-            updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
+            await updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
           }
           return true;
         },
@@ -524,7 +526,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         continue;
       }
 
-      updateTradeSession(bot.username, { state: "at_destination" });
+      await updateTradeSession(bot.username, { state: "at_destination" });
       bot.system = settings.homeSystem;
 
       if (bot.poi !== homeStation.id) {
@@ -664,9 +666,9 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       totalSpent = recoveredSession.investedCredits;
 
       if (bot.system === settings.homeSystem) {
-        updateTradeSession(bot.username, { state: "at_destination" });
+        await updateTradeSession(bot.username, { state: "at_destination" });
       } else if (recoveredSession.jumpsCompleted > 0) {
-        updateTradeSession(bot.username, { state: "in_transit" });
+        await updateTradeSession(bot.username, { state: "in_transit" });
       }
     }
 
@@ -961,7 +963,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
           isCargoRoute: false,
           investedCredits: actualSpent,
         });
-        startTradeSession(session);
+        await startTradeSession(session);
         ctx.log("trade", `Buy session started: ${session.sessionId}`);
 
         mapStore.reserveTradeQuantity(
@@ -977,7 +979,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     if (!route || buyQty <= 0) {
       const activeSession = getActiveSession(bot.username);
       if (activeSession) {
-        failTradeSession(bot.username, "No valid route found");
+        await failTradeSession(bot.username, "No valid route found");
       }
 
       ctx.log("trade", "All routes failed — waiting 60s before re-scanning");
@@ -1016,7 +1018,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
       const activeSession = getActiveSession(bot.username);
       if (activeSession) {
-        updateTradeSession(bot.username, {
+        await updateTradeSession(bot.username, {
           state: "in_transit",
           jumpsCompleted: 0,
         });
@@ -1029,7 +1031,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
           const session = getActiveSession(bot.username);
           if (session) {
-            updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
+            await updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
           }
 
           try {
@@ -1047,7 +1049,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
         const session = getActiveSession(bot.username);
         if (session) {
-          updateTradeSession(bot.username, {
+          await updateTradeSession(bot.username, {
             state: "in_transit",
             notes: (session.notes || "") + " | Network interruption - will retry",
           });
@@ -1150,7 +1152,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     ctx.log("trade", `Buy run complete: ${depositedLabel}x ${route.itemName} — spent ${totalSpent}cr (${route.jumps} jumps)`);
 
     const actualRevenue = 0;
-    const completedSession = completeTradeSession(bot.username, actualRevenue, actualProfit);
+    const completedSession = await completeTradeSession(bot.username, actualRevenue, actualProfit);
     if (completedSession) {
       ctx.log("trade", `Session completed: ${completedSession.sessionId}`);
     }

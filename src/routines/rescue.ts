@@ -953,11 +953,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           isReturningIdle = false;
         } else {
           ctx.log("rescue", `${activeSession.targetUsername} has been refueled (${fuelPct}%) - clearing session`);
-          failRescueSession(bot.username, "Target no longer needs rescue");
+          await failRescueSession(bot.username, "Target no longer needs rescue");
         }
       } else {
         ctx.log("rescue", `Target ${activeSession.targetUsername} not in fleet - clearing session`);
-        failRescueSession(bot.username, "Target not found in fleet");
+        await failRescueSession(bot.username, "Target not found in fleet");
       }
     }
 
@@ -1159,6 +1159,69 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             } else {
               ctx.log("coop", `🤝 ✗ No partner claim found yet - will proceed and send claim (partner may respond with their claim)`);
             }
+          }
+
+          // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
+          const { getSystemBlacklist } = await import("../web/server.js");
+          const { mapStore } = await import("../mapstore.js");
+          const blacklist = getSystemBlacklist();
+          const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+          
+          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          if (isBlacklisted) {
+            ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
+            const lockoutMinutes = settings.maydayPirateLockoutMinutes;
+            addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+              try {
+                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                  situation: `Declining MAYDAY - your location (${mayday.system}) is in a blacklisted system we cannot navigate to.`,
+                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                  fuelRefueled: undefined, playerFuelPct: mayday.fuelPct,
+                });
+              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+            }
+            markMaydayHandled(mayday);
+            continue;
+          }
+          
+          let viableRoute = false;
+          try {
+            const mappedRoute = mapStore.findRoute(bot.system, mayday.system, blacklist);
+            if (mappedRoute && mappedRoute.length > 1) {
+              viableRoute = true;
+            } else {
+              const routeResp = await bot.exec("find_route", { target_system: mayday.system });
+              if (!routeResp.error && routeResp.result) {
+                const routeData = routeResp.result as Record<string, unknown>;
+                const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
+                if (routeData.found && serverRoute && serverRoute.length > 1) {
+                  const blacklistedOnRoute = serverRoute.find(r => 
+                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                  );
+                  if (!blacklistedOnRoute) viableRoute = true;
+                }
+              }
+            }
+          } catch (e) { ctx.log("warn", `Error checking route: ${e}`); }
+          
+          if (!viableRoute) {
+            ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - NO VIABLE ROUTE to ${mayday.system}`);
+            const lockoutMinutes = settings.maydayPirateLockoutMinutes;
+            addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+              try {
+                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                  situation: `Declining MAYDAY - no safe route to your location (${mayday.system}).`,
+                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                  fuelRefueled: undefined, playerFuelPct: mayday.fuelPct,
+                });
+              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+            }
+            markMaydayHandled(mayday);
+            continue;
           }
 
           // Check jump range
@@ -1398,7 +1461,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         lastUpdatedAt: new Date().toISOString(),
         state: "navigating",
       };
-      startRescueSession(session);
+      await startRescueSession(session);
       ctx.log("rescue", `Created rescue session for ${target.username}`);
     }
 
@@ -1500,22 +1563,6 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           ctx.log("warn", `Could not calculate route to ${target.system}: ${e}`);
         }
 
-        // ── RESCUE COOPERATION: Send en-route notification to stranded player ──
-        ctx.log("rescue", `📧 En-route notification check: isMayday=${isMaydayTarget}, isManual=${isManualRescueTarget}`);
-        // Let them know we're on our way (only for MAYDAY rescues, not fleet rescues)
-        if (isMaydayTarget || isManualRescueTarget) {
-          const aiChatService = (globalThis as any).aiChatService;
-          if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
-            aiChatService.sendRescueEnRouteNotification(bot, target.username, jumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
-              if (!result.ok) {
-                ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
-              }
-            }).catch((err: Error) => {
-              ctx.log("warn", `Error sending en-route notification: ${err.message}`);
-            });
-          }
-        }
-
         const safetyOpts = {
           fuelThresholdPct: settings.refuelThreshold,
           hullThresholdPct: 30,
@@ -1544,9 +1591,30 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         };
         const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
         if (!arrived) {
-          ctx.log("error", `Could not reach ${target.system} — will retry next scan`);
-          if (recoveredSession || getActiveRescueSession(bot.username)) {
-            failRescueSession(bot.username, "Could not reach target system");
+          // Track consecutive failures to prevent infinite retry loops
+          const activeSession = getActiveRescueSession(bot.username);
+          const failureReason = `Could not reach ${target.system}`;
+
+          if (activeSession) {
+            const failures = (activeSession.consecutiveFailures || 0) + 1;
+            await updateRescueSession(bot.username, {
+              consecutiveFailures: failures,
+              lastFailureReason: failureReason
+            });
+
+            if (failures >= 3) {
+              ctx.log("error", `❌ ${failureReason} — ABORTING after ${failures} consecutive failures`);
+              await failRescueSession(bot.username, `Aborted after ${failures} consecutive navigation failures`);
+              await sleep(settings.scanIntervalSec * 1000);
+              continue;
+            }
+
+            ctx.log("error", `${failureReason} — failure #${failures}/3, will retry next scan`);
+          } else {
+            ctx.log("error", `${failureReason} — will retry next scan`);
+            if (recoveredSession) {
+              await failRescueSession(bot.username, "Could not reach target system");
+            }
           }
           await sleep(settings.scanIntervalSec * 1000);
           continue;
@@ -1555,12 +1623,27 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         await bot.refreshStatus();
         ctx.log("travel", `Arrived in ${bot.system}`);
 
+        // ── RESCUE COOPERATION: Send en-route notification to stranded player (AFTER successful navigation) ──
+        // Only notify if this is a MAYDAY or manual rescue (not fleet rescues)
+        if (isMaydayTarget || isManualRescueTarget) {
+          const aiChatService = (globalThis as any).aiChatService;
+          if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
+            aiChatService.sendRescueEnRouteNotification(bot, target.username, jumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
+              if (!result.ok) {
+                ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
+              }
+            }).catch((err: Error) => {
+              ctx.log("warn", `Error sending en-route notification: ${err.message}`);
+            });
+          }
+        }
+
         // ── PIRATE AWARENESS: Scan for pirates immediately after arrival ──
         const pirateScan = await checkAndFleeFromPiratesRescue(ctx, "arrival scan");
         if (pirateScan) {
           ctx.log("combat", "🚨 Pirates detected on arrival! Rescue mission aborted - will retry after fleeing.");
           if (recoveredSession || getActiveRescueSession(bot.username)) {
-            failRescueSession(bot.username, "Pirates detected on arrival - fleeing");
+            await failRescueSession(bot.username, "Pirates detected on arrival - fleeing");
           }
           await sleep(5000);
           continue;
@@ -1568,7 +1651,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
         // Update session state and jumps after successful navigation
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          updateRescueSession(bot.username, { state: "at_system", jumpsCompleted: jumpsToTarget });
+          await updateRescueSession(bot.username, { state: "at_system", jumpsCompleted: jumpsToTarget });
         }
       }
 
@@ -1621,7 +1704,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         }
         // Update session state after traveling to POI
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          updateRescueSession(bot.username, { state: "at_poi" });
+          await updateRescueSession(bot.username, { state: "at_poi" });
         }
       }
 
@@ -1630,7 +1713,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
       // Update session state before fuel delivery
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "delivering_fuel" });
+        await updateRescueSession(bot.username, { state: "delivering_fuel" });
       }
 
       // ── PIRATE AWARENESS: Final scan before committing to fuel transfer ──
@@ -1638,7 +1721,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       if (preRefuelScan) {
         ctx.log("combat", "🚨 Pirates detected before refuel! Aborting fuel transfer and fleeing!");
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          failRescueSession(bot.username, "Pirates detected before refuel - fleeing");
+          await failRescueSession(bot.username, "Pirates detected before refuel - fleeing");
         }
         await sleep(5000);
         continue;
@@ -1909,7 +1992,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       }
       // Update session state for return home
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "returning_home" });
+        await updateRescueSession(bot.username, { state: "returning_home" });
       }
     } else if (!homeSystem) {
       ctx.log("warn", "No home system set — skipping return home");
@@ -2013,7 +2096,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         );
         
         // Update session with billing info
-        updateRescueSession(bot.username, {
+        await updateRescueSession(bot.username, {
           jumpsCompleted: jumpsToTarget,
           totalJumps: estimatedTotalJumps,
           fuelDelivered,
@@ -2084,8 +2167,8 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      completeRescueSession(bot.username);
-      
+      await completeRescueSession(bot.username);
+
       // Also mark the queue entry as completed if this was our own bot
       if (isOwnBot(target.username)) {
         const queue = getRescueQueue();
@@ -2734,7 +2817,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         lastUpdatedAt: new Date().toISOString(),
         state: "navigating",
       };
-      startRescueSession(session);
+      await startRescueSession(session);
       ctx.log("mayday", `Created MAYDAY rescue session for ${mayday.sender}`);
     }
 
@@ -2774,7 +2857,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       if (!arrived) {
         ctx.log("error", `Could not reach ${mayday.system} - MAYDAY response failed`);
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          failRescueSession(bot.username, "Could not reach target system");
+          await failRescueSession(bot.username, "Could not reach target system");
         }
         markMaydayHandled(mayday);
         await sleep(5000);
@@ -2782,7 +2865,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       }
       // Update session state after successful navigation
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "at_system" });
+        await updateRescueSession(bot.username, { state: "at_system" });
       }
     }
 
@@ -2803,7 +2886,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     bot.poi = mayday.poi;
     // Update session state after traveling to POI
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      updateRescueSession(bot.username, { state: "at_poi" });
+      await updateRescueSession(bot.username, { state: "at_poi" });
     }
 
     // ── Find and refuel target ──
@@ -2812,7 +2895,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
     // Update session state before fuel delivery
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      updateRescueSession(bot.username, { state: "delivering_fuel" });
+      await updateRescueSession(bot.username, { state: "delivering_fuel" });
     }
 
     const nearbyResp = await bot.exec("get_nearby");
@@ -2988,7 +3071,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       }
       // Update session state for return home
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "returning_home" });
+        await updateRescueSession(bot.username, { state: "returning_home" });
       }
     } else if (!homeSystem) {
       ctx.log("warn", "No home system set — skipping return home");
@@ -3025,7 +3108,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      completeRescueSession(bot.username);
+      await completeRescueSession(bot.username);
 
       // Also mark the queue entry as completed if this was our own bot
       if (isOwnBot(mayday.sender)) {
@@ -3290,12 +3373,12 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         } else {
           // Target has been refueled - clear the session
           ctx.log("rescue", `${activeSession.targetUsername} has been refueled (${fuelPct}%) - clearing session`);
-          failRescueSession(bot.username, "Target no longer needs rescue");
+          await failRescueSession(bot.username, "Target no longer needs rescue");
         }
       } else {
         // Target not in fleet - they may have logged off or session is stale
         ctx.log("rescue", `Target ${activeSession.targetUsername} not in fleet - clearing session`);
-        failRescueSession(bot.username, "Target not found in fleet");
+        await failRescueSession(bot.username, "Target not found in fleet");
       }
     }
 
@@ -3506,6 +3589,69 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             } else {
               ctx.log("coop", `🤝 ✗ No partner claim found yet - will proceed and send claim (partner may respond with their claim)`);
             }
+          }
+
+          // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
+          const { getSystemBlacklist } = await import("../web/server.js");
+          const { mapStore } = await import("../mapstore.js");
+          const blacklist = getSystemBlacklist();
+          const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+          
+          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          if (isBlacklisted) {
+            ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
+            const lockoutMinutes = settings.maydayPirateLockoutMinutes;
+            addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+              try {
+                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                  situation: `Declining MAYDAY - your location (${mayday.system}) is in a blacklisted system we cannot navigate to.`,
+                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                  fuelRefueled: undefined, playerFuelPct: mayday.fuelPct,
+                });
+              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+            }
+            markMaydayHandled(mayday);
+            continue;
+          }
+          
+          let viableRoute = false;
+          try {
+            const mappedRoute = mapStore.findRoute(bot.system, mayday.system, blacklist);
+            if (mappedRoute && mappedRoute.length > 1) {
+              viableRoute = true;
+            } else {
+              const routeResp = await bot.exec("find_route", { target_system: mayday.system });
+              if (!routeResp.error && routeResp.result) {
+                const routeData = routeResp.result as Record<string, unknown>;
+                const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
+                if (routeData.found && serverRoute && serverRoute.length > 1) {
+                  const blacklistedOnRoute = serverRoute.find(r => 
+                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                  );
+                  if (!blacklistedOnRoute) viableRoute = true;
+                }
+              }
+            }
+          } catch (e) { ctx.log("warn", `Error checking route: ${e}`); }
+          
+          if (!viableRoute) {
+            ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - NO VIABLE ROUTE to ${mayday.system}`);
+            const lockoutMinutes = settings.maydayPirateLockoutMinutes;
+            addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+              try {
+                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                  situation: `Declining MAYDAY - no safe route to your location (${mayday.system}).`,
+                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                  fuelRefueled: undefined, playerFuelPct: mayday.fuelPct,
+                });
+              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+            }
+            markMaydayHandled(mayday);
+            continue;
           }
 
           // Check jump range
@@ -3735,7 +3881,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         lastUpdatedAt: new Date().toISOString(),
         state: "navigating",
       };
-      startRescueSession(session);
+      await startRescueSession(session);
       ctx.log("rescue", `Created rescue session for ${target.username}`);
 
       // Send faction chat announcement for rescue start
@@ -3884,7 +4030,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("error", "No fuel cells available and not enough credits to help — waiting for better situation...");
         // Fail the session if we can't acquire resources
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          failRescueSession(bot.username, "Could not acquire fuel cells or credits");
+          await failRescueSession(bot.username, "Could not acquire fuel cells or credits");
         }
         await sleep(settings.scanIntervalSec * 1000);
         continue;
@@ -3922,21 +4068,6 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("warn", `Could not calculate route to ${target.system}: ${e}`);
       }
 
-      // ── RESCUE COOPERATION: Send en-route notification to stranded player ──
-      // Let them know we're on our way (only for MAYDAY rescues, not fleet rescues)
-      if (isMaydayTarget || isManualRescueTarget) {
-        const aiChatService = (globalThis as any).aiChatService;
-        if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
-          aiChatService.sendRescueEnRouteNotification(bot, target.username, jumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
-            if (!result.ok) {
-              ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
-            }
-          }).catch((err: Error) => {
-            ctx.log("warn", `Error sending en-route notification: ${err.message}`);
-          });
-        }
-      }
-
       const safetyOpts = {
         fuelThresholdPct: settings.refuelThreshold,
         hullThresholdPct: 30,
@@ -3965,17 +4096,53 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       };
       const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
       if (!arrived) {
-        ctx.log("error", `Could not reach ${target.system} — will retry next scan`);
-        // Fail the session if we can't reach the target
-        if (recoveredSession || getActiveRescueSession(bot.username)) {
-          failRescueSession(bot.username, "Could not reach target system");
+        // Track consecutive failures to prevent infinite retry loops
+        const activeSession = getActiveRescueSession(bot.username);
+        const failureReason = `Could not reach ${target.system}`;
+
+        if (activeSession) {
+          const failures = (activeSession.consecutiveFailures || 0) + 1;
+          await updateRescueSession(bot.username, {
+            consecutiveFailures: failures,
+            lastFailureReason: failureReason
+          });
+
+          if (failures >= 3) {
+            ctx.log("error", `❌ ${failureReason} — ABORTING after ${failures} consecutive failures`);
+            await failRescueSession(bot.username, `Aborted after ${failures} consecutive navigation failures`);
+            await sleep(settings.scanIntervalSec * 1000);
+            continue;
+          }
+
+          ctx.log("error", `${failureReason} — failure #${failures}/3, will retry next scan`);
+        } else {
+          ctx.log("error", `${failureReason} — will retry next scan`);
+          if (recoveredSession) {
+            await failRescueSession(bot.username, "Could not reach target system");
+          }
         }
         await sleep(settings.scanIntervalSec * 1000);
         continue;
       }
+
+      // ── RESCUE COOPERATION: Send en-route notification to stranded player (AFTER successful navigation) ──
+      // Only notify if this is a MAYDAY or manual rescue (not fleet rescues)
+      if (isMaydayTarget || isManualRescueTarget) {
+        const aiChatService = (globalThis as any).aiChatService;
+        if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
+          aiChatService.sendRescueEnRouteNotification(bot, target.username, jumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
+            if (!result.ok) {
+              ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
+            }
+          }).catch((err: Error) => {
+            ctx.log("warn", `Error sending en-route notification: ${err.message}`);
+          });
+        }
+      }
+      
       // Update session state and jumps after successful navigation
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "at_system", jumpsCompleted: jumpsToTarget });
+        await updateRescueSession(bot.username, { state: "at_system", jumpsCompleted: jumpsToTarget });
       }
     }
 
@@ -4231,10 +4398,10 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           }
           
           if (recoveredSession || getActiveRescueSession(bot.username)) {
-            failRescueSession(bot.username, "Could not reach target - all attempts failed");
+            await failRescueSession(bot.username, "Could not reach target - all attempts failed");
           }
           markMaydayHandled({ sender: target.username, system: target.system, poi: target.poi || "", fuelPct: target.fuelPct, timestamp: Date.now(), currentFuel: 0, maxFuel: 0, rawMessage: "" });
-          
+
           // Return home after failed rescue
           if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
             ctx.log("rescue", `🚨 All rescue attempts failed - returning home to safety...`);
@@ -4251,7 +4418,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Update session state after traveling to POI
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "at_poi" });
+        await updateRescueSession(bot.username, { state: "at_poi" });
       }
 
       // Skip faction chat announcement for arrival - save cooldown for completion message
@@ -4262,7 +4429,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Update session state before fuel delivery
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      updateRescueSession(bot.username, { state: "delivering_fuel" });
+      await updateRescueSession(bot.username, { state: "delivering_fuel" });
     }
 
     // Check if target is actually at the location (for non-station targets)
@@ -4379,7 +4546,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
           // Fail the session and return home
           if (recoveredSession || getActiveRescueSession(bot.username)) {
-            failRescueSession(bot.username, "Target not found at location");
+            await failRescueSession(bot.username, "Target not found at location");
           }
           markMaydayHandled({ sender: target.username, system: target.system, poi: target.poi || "", fuelPct: target.fuelPct, timestamp: Date.now(), currentFuel: 0, maxFuel: 0, rawMessage: "" });
 
@@ -4450,10 +4617,10 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log(logCategory, `  Their fuel: ${targetFuelNow}`);
         }
         ctx.log(logCategory, `Delivery complete for ${target.username}!`);
-        
+
         // Track fuel delivered in session for billing
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          updateRescueSession(bot.username, { fuelDelivered });
+          await updateRescueSession(bot.username, { fuelDelivered });
         }
 
         // Skip faction chat here - billing code will send it after delay
@@ -4483,7 +4650,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             });
             // Track fuel cells delivered (estimate: 10 fuel per cell)
             if (recoveredSession || getActiveRescueSession(bot.username)) {
-              updateRescueSession(bot.username, { fuelDelivered: fuelItem.quantity * 10 });
+              await updateRescueSession(bot.username, { fuelDelivered: fuelItem.quantity * 10 });
             }
           }
         }
@@ -4521,7 +4688,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             ctx.log(logCategory, `Fuel cells jettisoned at ${target.poi || bot.poi} — ${target.username} should scavenge them`);
             // Track fuel cells delivered (estimate: 10 fuel per cell)
             if (recoveredSession || getActiveRescueSession(bot.username)) {
-              updateRescueSession(bot.username, { fuelDelivered: fuelItem.quantity * 10 });
+              await updateRescueSession(bot.username, { fuelDelivered: fuelItem.quantity * 10 });
             }
           }
         }
@@ -4584,7 +4751,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         );
 
         // Update session with billing info
-        updateRescueSession(bot.username, {
+        await updateRescueSession(bot.username, {
           jumpsCompleted: jumpsToTarget,
           totalJumps: jumpsToTarget * 2,
           fuelDelivered: fuelDeliveredBill,
@@ -4695,7 +4862,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       // Update session state for return home
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "returning_home" });
+        await updateRescueSession(bot.username, { state: "returning_home" });
       }
     } else if (!homeSystem) {
       ctx.log("warn", "No home system set — skipping return home");
@@ -4743,8 +4910,8 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      completeRescueSession(bot.username);
-      
+      await completeRescueSession(bot.username);
+
       // Also mark the queue entry as completed if this was our own bot
       if (isOwnBot(target.username)) {
         const queue = getRescueQueue();

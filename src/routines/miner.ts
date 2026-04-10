@@ -1218,18 +1218,18 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const hasEquipment = await hasEquipmentForMiningType(ctx, sessionMiningType, cachedModules || undefined);
         if (!hasEquipment) {
           ctx.log("error", `Session invalid: no equipment for ${sessionMiningType} mining (${activeSession.targetResourceName}) — abandoning`);
-          failMiningSession(bot.username, "No equipment for resource type");
+          await failMiningSession(bot.username, "No equipment for resource type");
         } else {
           ctx.log("mining", `Session validated: ${activeSession.targetResourceName} still available in map`);
           recoveredSession = activeSession;
         }
       } else {
         ctx.log("error", `Session invalid: ${activeSession.targetResourceName} no longer in map - abandoning`);
-        failMiningSession(bot.username, "Target resource no longer in map");
+        await failMiningSession(bot.username, "Target resource no longer in map");
       }
     } else {
       ctx.log("error", "Session invalid: no target resource - abandoning");
-      failMiningSession(bot.username, "No target resource");
+      await failMiningSession(bot.username, "No target resource");
     }
   }
 
@@ -1446,7 +1446,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const sessionMiningType = getMiningTypeForResource(recoveredSession.targetResourceId);
       if (sessionMiningType !== miningType) {
         ctx.log("warn", `Recovered session target (${recoveredSession.targetResourceName}) incompatible with detected equipment (${miningType}) — discarding session`);
-        failMiningSession(bot.username, "Equipment mismatch");
+        await failMiningSession(bot.username, "Equipment mismatch");
         recoveredSession = null;
       } else {
         // Check if recovered session target matches current priorities
@@ -1462,7 +1462,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
         if (shouldAbandon) {
           ctx.log("mining", `Abandoning recovered session: ${reason}`);
-          failMiningSession(bot.username, reason);
+          await failMiningSession(bot.username, reason);
           recoveredSession = null;
         } else {
           ctx.log("mining", `Resuming recovered session: ${recoveredSession.targetResourceName} @ ${recoveredSession.targetPoiName}`);
@@ -1474,7 +1474,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           } else {
             recoveredSession.state = "traveling_to_ore";
           }
-          updateMiningSession(bot.username, { state: recoveredSession.state });
+          await updateMiningSession(bot.username, { state: recoveredSession.state });
         }
       }
     }
@@ -1502,7 +1502,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         effectiveTarget = "";
         if (recoveredSession) {
           ctx.log("mining", "Abandoning recovered session: not a deep core ore");
-          failMiningSession(bot.username, "Not a deep core ore");
+          await failMiningSession(bot.username, "Not a deep core ore");
           recoveredSession = null;
         }
       }
@@ -1594,7 +1594,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         effectiveTarget = "";
         if (recoveredSession) {
           ctx.log("mining", "Abandoning recovered session due to equipment mismatch");
-          failMiningSession(bot.username, "Deep core ore — missing equipment");
+          await failMiningSession(bot.username, "Deep core ore — missing equipment");
           recoveredSession = null;
         }
       } else {
@@ -1713,7 +1713,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         targetSystemId = bot.system;
         // Clear session if target not found
         if (recoveredSession) {
-          failMiningSession(bot.username, "Target resource not found in map");
+          await failMiningSession(bot.username, "Target resource not found in map");
           recoveredSession = null;
         }
       } else {
@@ -1781,7 +1781,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
               if (shouldUpgrade) {
                 ctx.log("mining", `Upgrading mining location: ${upgradeReason} — abandoning old session`);
-                failMiningSession(bot.username, `Location upgrade: ${upgradeReason}`);
+                await failMiningSession(bot.username, `Location upgrade: ${upgradeReason}`);
                 recoveredSession = null;
               } else {
                 ctx.log("mining", `Keeping recovered session at ${sessionPoiName} (no significant upgrade available)`);
@@ -1836,7 +1836,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               isQuotaDriven,
               quotaTarget: isQuotaDriven ? (quotas[effectiveTarget] || 0) : undefined,
             });
-            startMiningSession(session);
+            await startMiningSession(session);
             recoveredSession = session;
             ctx.log("mining", `Started mining session: ${session.targetResourceName} @ ${session.targetPoiName}`);
           }
@@ -1870,7 +1870,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       // Clear any active session since we're mining without a specific target
       if (recoveredSession) {
-        completeMiningSession(bot.username);
+        await completeMiningSession(bot.username);
         recoveredSession = null;
       }
     }
@@ -1898,7 +1898,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (targetSystemId && targetSystemId !== bot.system) {
       yield "navigate_to_target";
       if (recoveredSession) {
-        updateMiningSession(bot.username, { state: "traveling_to_ore" });
+        await updateMiningSession(bot.username, { state: "traveling_to_ore" });
       }
 
       // Flock followers wait for leader to arrive first (optional synchronization)
@@ -1973,7 +1973,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             effectiveTarget = "";
             if (recoveredSession) {
               ctx.log("mining", "Abandoning recovered session: equipment lost after jump timeout");
-              failMiningSession(bot.username, "Deep core equipment lost after jump timeout");
+              await failMiningSession(bot.username, "Deep core equipment lost after jump timeout");
               recoveredSession = null;
             }
           } else {
@@ -1982,7 +1982,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
         
         if (recoveredSession) {
-          updateMiningSession(bot.username, { state: "mining" });
+          await updateMiningSession(bot.username, { state: "mining" });
         }
       } else {
         // MAP UPDATE: Record successful system arrival and update connections
@@ -2346,7 +2346,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Update session state to mining
     if (recoveredSession) {
-      updateMiningSession(bot.username, {
+      await updateMiningSession(bot.username, {
         state: "mining",
         targetPoiId: miningPoi.id,
         targetPoiName: miningPoi.name,
@@ -2545,7 +2545,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
                   // Update session if active
                   if (recoveredSession) {
-                    updateMiningSession(bot.username, {
+                    await updateMiningSession(bot.username, {
                       targetPoiId: bestLoc.poiId,
                       targetPoiName: bestLoc.poiName,
                       targetSystemId: bestLoc.systemId,
@@ -2699,7 +2699,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 
                 stopReason = `${effectiveTarget} depleted at this POI`;
                 if (recoveredSession) {
-                  failMiningSession(bot.username, "Resource depleted");
+                  await failMiningSession(bot.username, "Resource depleted");
                   recoveredSession = null;
                 }
                 break;
@@ -3241,7 +3241,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
             // Update session if active
             if (recoveredSession) {
-              updateMiningSession(bot.username, {
+              await updateMiningSession(bot.username, {
                 targetResourceId: newTarget,
                 targetResourceName: newTarget,
                 targetPoiId: newPoiId,
@@ -3368,7 +3368,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         // Update session with mined resources
         if (recoveredSession) {
           const currentMined = recoveredSession.resourcesMined[oreName] || 0;
-          updateMiningSession(bot.username, {
+          await updateMiningSession(bot.username, {
             resourcesMined: { ...recoveredSession.resourcesMined, [oreName]: currentMined + 1 },
             cyclesMined: recoveredSession.cyclesMined + 1,
           });
@@ -3427,7 +3427,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       yield "pre_return_fuel";
       // Update session state
       if (recoveredSession) {
-        updateMiningSession(bot.username, { state: "returning_home" });
+        await updateMiningSession(bot.username, { state: "returning_home" });
       }
       const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!returnFueled && stationPoi) {
@@ -3555,7 +3555,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Update session state after depositing
       if (recoveredSession) {
-        updateMiningSession(bot.username, { state: "depositing" });
+        await updateMiningSession(bot.username, { state: "depositing" });
       }
     }
 
@@ -3567,7 +3567,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Complete mining session after successful deposit
     if (recoveredSession) {
-      completeMiningSession(bot.username);
+      await completeMiningSession(bot.username);
       ctx.log("mining", `Mining session completed: ${recoveredSession.cyclesMined} cycles, ${Object.entries(recoveredSession.resourcesMined).map(([k, v]) => `${v}x ${k}`).join(", ")}`);
       recoveredSession = null;
     }

@@ -283,11 +283,12 @@ async function recoverTradeSession(
     
     if (cargoQty < session.quantityBought) {
       ctx.log("trade", `Recovered with partial cargo: ${cargoQty}/${session.quantityBought}x ${session.itemName}`);
-      session = updateTradeSession(session.botUsername, { 
+      const updated = await updateTradeSession(session.botUsername, {
         quantityBought: cargoQty,
         sellQuantity: cargoQty,
         notes: (session.notes || "") + ` | Partial recovery: ${cargoQty}/${session.quantityBought}x remaining`,
-      })!;
+      });
+      if (updated) session = updated;
     }
   }
   
@@ -323,7 +324,7 @@ async function recoverTradeSession(
 
       const bestAlt = alternativeBuyers[0].buyer;
       ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
-      session = updateTradeSession(session.botUsername, {
+      const updated = await updateTradeSession(session.botUsername, {
         destSystem: bestAlt.systemId,
         destPoi: bestAlt.poiId,
         destPoiName: bestAlt.poiName,
@@ -331,7 +332,8 @@ async function recoverTradeSession(
         sellQuantity: Math.min(session.sellQuantity, bestAlt.quantity),
         totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, bestAlt.systemId, settings.fuelCostPerJump).jumps,
         notes: (session.notes || "") + ` | Rerouted to ${bestAlt.poiName}`,
-      })!;
+      });
+      if (updated) session = updated;
     } else if (destBuyer.price < session.buyPricePerUnit) {
       ctx.log("error", `Price dropped to ${destBuyer.price}cr (below cost ${session.buyPricePerUnit}cr) — abandoning`);
       await failTradeSessionWithLockRelease(session.botUsername, "Price below cost");
@@ -365,7 +367,7 @@ async function recoverTradeSession(
 
       const bestAlt = alternativeBuyers[0].buyer;
       ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
-      session = updateTradeSession(session.botUsername, {
+      const updated = await updateTradeSession(session.botUsername, {
         destSystem: bestAlt.systemId,
         destPoi: bestAlt.poiId,
         destPoiName: bestAlt.poiName,
@@ -374,7 +376,8 @@ async function recoverTradeSession(
         totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, bestAlt.systemId, settings.fuelCostPerJump).jumps,
         state: "in_transit" as const,
         notes: (session.notes || "") + ` | Rerouted from ${session.destPoiName} (no station) to ${bestAlt.poiName}`,
-      })!;
+      });
+      if (updated) session = updated;
     }
   }
   
@@ -909,7 +912,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         onJump: async (jumpNum) => {
           const session = getActiveSession(bot.username);
           if (session) {
-            updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
+            await updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
           }
           return true;
         },
@@ -923,7 +926,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // Arrived at destination - update session state and continue to sell phase
-      updateTradeSession(bot.username, { state: "at_destination" });
+      await updateTradeSession(bot.username, { state: "at_destination" });
       bot.system = recoveredSession.destSystem;
 
       // Travel to destination POI and dock
@@ -970,7 +973,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
         const bestAlt = alternativeBuyers[0].buyer;
         ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
-        updateTradeSession(bot.username, {
+        await updateTradeSession(bot.username, {
           destSystem: bestAlt.systemId,
           destPoi: bestAlt.poiId,
           destPoiName: bestAlt.poiName,
@@ -1348,9 +1351,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       
       // Update session state based on current position
       if (bot.system === recoveredSession.destSystem) {
-        updateTradeSession(bot.username, { state: "at_destination" });
+        await updateTradeSession(bot.username, { state: "at_destination" });
       } else if (recoveredSession.jumpsCompleted > 0) {
-        updateTradeSession(bot.username, { state: "in_transit" });
+        await updateTradeSession(bot.username, { state: "in_transit" });
       }
     }
 
@@ -1725,7 +1728,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           isCargoRoute: candidate.sourcePoi === "cargo",
           investedCredits: actualSpent,
         });
-        startTradeSession(session);
+        await startTradeSession(session);
         ctx.log("trade", `Trade session started: ${session.sessionId}`);
 
         // Update the lock with the real session ID and actual quantity
@@ -1847,7 +1850,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       // Update session state to in_transit
       const activeSession = getActiveSession(bot.username);
       if (activeSession) {
-        updateTradeSession(bot.username, { 
+        await updateTradeSession(bot.username, {
           state: "in_transit",
           jumpsCompleted: 0,
         });
@@ -1861,7 +1864,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           // Update session jump progress
           const session = getActiveSession(bot.username);
           if (session) {
-            updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
+            await updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
           }
 
           try {
@@ -1896,7 +1899,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   bot.system,
                   settings,
                 );
-                
+
                 if (alternatives.length > 0) {
                   const best = alternatives[0];
                   ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found alternative buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
@@ -1910,7 +1913,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                     jumps: best.jumps,
                     totalProfit: best.profit,
                   };
-                  updateTradeSession(bot.username, {
+                  await updateTradeSession(bot.username, {
                     destSystem: best.buyer.systemId,
                     destPoi: best.buyer.poiId,
                     destPoiName: best.buyer.poiName,
@@ -1935,7 +1938,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   bot.system,
                   settings,
                 );
-                
+
                 if (alternatives.length > 0) {
                   const best = alternatives[0];
                   ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found better buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
@@ -1949,7 +1952,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                     jumps: best.jumps,
                     totalProfit: best.profit,
                   };
-                  updateTradeSession(bot.username, {
+                  await updateTradeSession(bot.username, {
                     destSystem: best.buyer.systemId,
                     destPoi: best.buyer.poiId,
                     destPoiName: best.buyer.poiName,
@@ -1958,7 +1961,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   });
                   return true;
                 }
-                
+
                 ctx.log("warn", `Mid-route check (jump ${jumpNum}): No profitable alternative — will incur loss of ${investedCredits - refreshedBuyer.price * buyQty}cr`);
                 return true;
               }
@@ -1977,7 +1980,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   bot.system,
                   settings,
                 );
-                
+
                 if (alternatives.length > 0) {
                   const best = alternatives[0];
                   ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found alternative buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
@@ -1991,7 +1994,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                     jumps: best.jumps,
                     totalProfit: best.profit,
                   };
-                  updateTradeSession(bot.username, {
+                  await updateTradeSession(bot.username, {
                     destSystem: best.buyer.systemId,
                     destPoi: best.buyer.poiId,
                     destPoiName: best.buyer.poiName,
@@ -2000,7 +2003,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   });
                   return true;
                 }
-                
+
                 ctx.log("trade", `Mid-route check (jump ${jumpNum}): No profitable alternative found — will deposit at destination`);
                 return true;
               }
@@ -2016,7 +2019,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   bot.system,
                   settings,
                 );
-                
+
                 if (alternatives.length > 0) {
                   const best = alternatives[0];
                   ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found better buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
@@ -2030,7 +2033,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                     jumps: best.jumps,
                     totalProfit: best.profit,
                   };
-                  updateTradeSession(bot.username, {
+                  await updateTradeSession(bot.username, {
                     destSystem: best.buyer.systemId,
                     destPoi: best.buyer.poiId,
                     destPoiName: best.buyer.poiName,
@@ -2039,7 +2042,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   });
                   return true;
                 }
-                
+
                 ctx.log("warn", `Mid-route check (jump ${jumpNum}): No profitable alternative — will incur loss of ${investedCredits - destBuyer.price * buyQty}cr`);
                 return true;
               }
@@ -2066,7 +2069,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         // Update session state to reflect we're still in transit
         const session = getActiveSession(bot.username);
         if (session) {
-          updateTradeSession(bot.username, {
+          await updateTradeSession(bot.username, {
             state: "in_transit",
             notes: (session.notes || "") + " | Network interruption - will retry",
           });
@@ -2436,7 +2439,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     
     // Complete trade session
     const actualRevenue = sellRevenue;
-    const completedSession = completeTradeSession(bot.username, actualRevenue, actualProfit);
+    const completedSession = await completeTradeSession(bot.username, actualRevenue, actualProfit);
     if (completedSession) {
       ctx.log("trade", `Session completed: ${completedSession.sessionId}`);
       

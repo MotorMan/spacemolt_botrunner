@@ -2,11 +2,20 @@
  * Trade session persistence for the trader routine.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
-import { join } from "path";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "fs";
+import { join, dirname } from "path";
 
 const DATA_DIR = join(process.cwd(), "data");
 const ACTIVITY_FILE = join(DATA_DIR, "traderActivity.json");
+const ACTIVITY_FILE_BACKUP = join(DATA_DIR, "traderActivity.json.bak");
+const ACTIVITY_FILE_TEMP = join(DATA_DIR, "traderActivity.json.tmp");
+
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 100;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
 
 export type TradeSessionState = "buying" | "in_transit" | "at_destination" | "selling" | "completed" | "abandoned" | "failed";
 
@@ -51,22 +60,92 @@ export interface TraderActivityData {
 }
 
 export function loadTraderActivity(): TraderActivityData {
-  try {
-    if (existsSync(ACTIVITY_FILE)) {
-      return JSON.parse(readFileSync(ACTIVITY_FILE, "utf-8"));
+  // Try main file first, then fallback to backup
+  const filesToTry = [ACTIVITY_FILE, ACTIVITY_FILE_BACKUP];
+  
+  for (const file of filesToTry) {
+    try {
+      if (existsSync(file)) {
+        const content = readFileSync(file, "utf-8").trim();
+        if (!content) {
+          console.warn(`Empty trader activity file: ${file}`);
+          continue;
+        }
+        const parsed = JSON.parse(content);
+        // Basic validation
+        if (typeof parsed !== "object" || parsed === null) {
+          console.warn(`Invalid trader activity data structure from ${file}`);
+          continue;
+        }
+        console.log(`Loaded trader activity from ${file}`);
+        return parsed;
+      }
+    } catch (err) {
+      console.warn(`Could not load ${file}:`, err);
     }
-  } catch (err) {
-    console.warn("Could not load traderActivity.json:", err);
   }
+  
+  console.warn("No valid trader activity file found. Starting with empty data.");
   return {};
 }
 
-export function saveTraderActivity(data: TraderActivityData): void {
+async function saveWithRetry(data: string): Promise<boolean> {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      // Step 1: Create backup of existing file if it exists
+      if (existsSync(ACTIVITY_FILE)) {
+        try {
+          // Copy current to backup (read + write to avoid rename issues during crash)
+          const content = readFileSync(ACTIVITY_FILE, "utf-8");
+          writeFileSync(ACTIVITY_FILE_BACKUP, content, "utf-8");
+        } catch (backupErr) {
+          console.warn("Could not create backup file:", backupErr);
+        }
+      }
+      
+      // Step 2: Write to temp file first
+      writeFileSync(ACTIVITY_FILE_TEMP, data, "utf-8");
+      
+      // Step 3: Atomic rename from temp to actual file
+      renameSync(ACTIVITY_FILE_TEMP, ACTIVITY_FILE);
+      
+      // Step 4: Clean up temp file if it still exists (rename should remove it)
+      if (existsSync(ACTIVITY_FILE_TEMP)) {
+        try {
+          unlinkSync(ACTIVITY_FILE_TEMP);
+        } catch (_) {
+          // Ignore cleanup errors
+        }
+      }
+      
+      return true;
+    } catch (err: any) {
+      console.warn(`Save attempt ${attempt}/${MAX_RETRIES} failed:`, err?.message || err);
+      
+      if (attempt < MAX_RETRIES) {
+        // Exponential backoff
+        const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
+        await sleep(delay);
+      }
+    }
+  }
+  
+  return false;
+}
+
+export async function saveTraderActivity(data: TraderActivityData): Promise<void> {
   try {
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    writeFileSync(ACTIVITY_FILE, JSON.stringify(data, null, 2) + "\n");
+    
+    const jsonData = JSON.stringify(data, null, 2) + "\n";
+    const success = await saveWithRetry(jsonData);
+    
+    if (!success) {
+      console.error("FAILED to save traderActivity.json after all retries! Data may be lost.");
+      console.error("Last known data structure keys:", Object.keys(data).join(", "));
+    }
   } catch (err) {
-    console.error("Error saving traderActivity.json:", err);
+    console.error("Unexpected error in saveTraderActivity:", err);
   }
 }
 
@@ -78,13 +157,13 @@ function getBotActivity(botUsername: string) {
   return data[botUsername]!;
 }
 
-function saveBotActivity(botUsername: string, activity: ReturnType<typeof getBotActivity>): void {
+async function saveBotActivity(botUsername: string, activity: ReturnType<typeof getBotActivity>): Promise<void> {
   const data = loadTraderActivity();
   data[botUsername] = activity;
-  saveTraderActivity(data);
+  await saveTraderActivity(data);
 }
 
-export function startTradeSession(session: TradeSession): void {
+export async function startTradeSession(session: TradeSession): Promise<void> {
   const activity = getBotActivity(session.botUsername);
   if (activity.activeSession) {
     activity.activeSession.state = "abandoned";
@@ -94,18 +173,18 @@ export function startTradeSession(session: TradeSession): void {
     if (activity.sessionHistory.length > 50) activity.sessionHistory = activity.sessionHistory.slice(0, 50);
   }
   activity.activeSession = session;
-  saveBotActivity(session.botUsername, activity);
+  await saveBotActivity(session.botUsername, activity);
 }
 
-export function updateTradeSession(botUsername: string, updates: Partial<TradeSession>): TradeSession | null {
+export async function updateTradeSession(botUsername: string, updates: Partial<TradeSession>): Promise<TradeSession | null> {
   const activity = getBotActivity(botUsername);
   if (!activity.activeSession) return null;
   activity.activeSession = { ...activity.activeSession, ...updates, lastUpdatedAt: new Date().toISOString() };
-  saveBotActivity(botUsername, activity);
+  await saveBotActivity(botUsername, activity);
   return activity.activeSession;
 }
 
-export function completeTradeSession(botUsername: string, actualRevenue?: number, actualProfit?: number): TradeSession | null {
+export async function completeTradeSession(botUsername: string, actualRevenue?: number, actualProfit?: number): Promise<TradeSession | null> {
   const activity = getBotActivity(botUsername);
   if (!activity.activeSession) return null;
   const session = activity.activeSession;
@@ -119,11 +198,11 @@ export function completeTradeSession(botUsername: string, actualRevenue?: number
   activity.sessionHistory.unshift(session);
   if (activity.sessionHistory.length > 50) activity.sessionHistory = activity.sessionHistory.slice(0, 50);
   activity.activeSession = undefined;
-  saveBotActivity(botUsername, activity);
+  await saveBotActivity(botUsername, activity);
   return session;
 }
 
-export function failTradeSession(botUsername: string, reason: string): TradeSession | null {
+export async function failTradeSession(botUsername: string, reason: string): Promise<TradeSession | null> {
   const activity = getBotActivity(botUsername);
   if (!activity.activeSession) return null;
   const session = activity.activeSession;
@@ -134,7 +213,7 @@ export function failTradeSession(botUsername: string, reason: string): TradeSess
   activity.sessionHistory.unshift(session);
   if (activity.sessionHistory.length > 50) activity.sessionHistory = activity.sessionHistory.slice(0, 50);
   activity.activeSession = undefined;
-  saveBotActivity(botUsername, activity);
+  await saveBotActivity(botUsername, activity);
   return session;
 }
 

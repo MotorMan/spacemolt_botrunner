@@ -1341,6 +1341,7 @@ export async function navigateToSystem(
         jumpResp.error.code === "timeout" || // Our custom timeout from execWithTimeout
         errorMsg.includes("timeout") ||
         errorMsg.includes("524") || // HTTP 524 Request Timeout
+        errorMsg.includes("520") || // HTTP 520 Web Server Returned An Unknown Error (server-side issue)
         errorMsg.includes("502") || // HTTP 502 Bad Gateway (server-side issue)
         errorMsg.includes("bad gateway") ||
         errorMsg.includes("connection") ||

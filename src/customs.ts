@@ -11,7 +11,7 @@
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from "fs";
 import { join } from "path";
-import type { Bot } from "../bot.js";
+import type { Bot } from "./bot.js";
 
 // Simple sleep helper to avoid circular dependency with common.ts
 function sleep(ms: number): Promise<void> {

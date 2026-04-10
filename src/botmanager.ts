@@ -29,6 +29,7 @@ import { reconnectQueue } from "./reconnectqueue.js";
 import { AiChatService } from "./aichat_service.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
 import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
+import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_chat_channel.js";
 
 interface BotState {
   wasRunning: boolean;
@@ -50,6 +51,28 @@ export function getDiscoveredBots(): string[] {
 /** Get a bot by name (for API use). */
 export function getBot(name: string): Bot | undefined {
   return bots.get(name);
+}
+
+/** Get the bot-to-bot chat channel service (for routines to use). */
+export function getBotChatChannel() {
+  return botChatChannel;
+}
+
+/** Send a chat message from a bot to other bots. */
+export function sendBotChatMessage(
+  sender: string,
+  content: string,
+  channel: BotChatChannel,
+  recipients: string[] = [],
+  metadata?: Record<string, unknown>
+): void {
+  botChatChannel.send({
+    sender,
+    recipients,
+    channel,
+    content,
+    metadata,
+  });
 }
 
 const ROUTINES: Record<string, { name: string; fn: Routine }> = {
@@ -230,7 +253,16 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
     ? { getFleetStatus: () => [...bots.values()].map(b => b.status()) }
     : undefined;
 
-  bot.start(routineKey, routine.fn, startOpts).then(() => {
+  // Add bot chat functions to all routines
+  const chatStartOpts = {
+    ...startOpts,
+    sendBotChat: (content: string, channel: string, recipients?: string[], metadata?: Record<string, unknown>) => {
+      sendBotChatMessage(botName, content, channel as BotChatChannel, recipients, metadata);
+    },
+    getAllBotNames: () => [...bots.keys()],
+  };
+
+  bot.start(routineKey, routine.fn, chatStartOpts).then(() => {
     server.logSystem(`Bot ${bot.username} routine finished.`);
     server.clearBotAssignment(botName);
     // Clear params after routine completes
@@ -305,10 +337,18 @@ async function handleEmergencyReturn(): Promise<WebActionResult> {
   for (const bot of runningBots) {
     const routineKey = "return_home";
     const routine = ROUTINES[routineKey];
-    
+
     server.logSystem(`Starting ${bot.username} with ${routine.name} routine...`);
-    
-    bot.start(routineKey, routine.fn, undefined).then(() => {
+
+    const botName = bot.username;
+    const chatStartOpts = {
+      sendBotChat: (content: string, channel: string, recipients?: string[], metadata?: Record<string, unknown>) => {
+        sendBotChatMessage(botName, content, channel as BotChatChannel, recipients, metadata);
+      },
+      getAllBotNames: () => [...bots.keys()],
+    };
+
+    bot.start(routineKey, routine.fn, chatStartOpts).then(() => {
       server.logSystem(`Bot ${bot.username} return_home routine finished.`);
       server.clearBotAssignment(bot.username);
     }).catch((err: unknown) => {
@@ -576,6 +616,17 @@ async function main(): Promise<void> {
   // Expose on globalThis for bot.ts to access
   (globalThis as any).aiChatService = aiChatService;
   server.logSystem("AI Chat service initialized");
+
+  // Set up bot-to-bot chat channel logging
+  botChatChannel.onGlobalMessage((msg: BotChatMessage) => {
+    const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+    const recipientInfo = msg.recipients.length > 0 
+      ? ` -> ${msg.recipients.join(", ")}` 
+      : " -> [broadcast]";
+    const line = `${timestamp} [BOT_CHAT] [${msg.channel}] ${msg.sender}${recipientInfo}: ${msg.content}`;
+    server.logSystem(line);
+  });
+  server.logSystem("Bot-to-bot chat channel initialized");
 
   // Set up mass disconnect detector callback
   massDisconnectDetector.setTriggerCallback((affectedBots) => {

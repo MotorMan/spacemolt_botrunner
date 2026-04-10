@@ -56,6 +56,15 @@ export interface RoutineContext {
   log: (category: string, message: string) => void;
   /** Optional: get status of all bots in the fleet (used by rescue routine). */
   getFleetStatus?: () => BotStatus[];
+  /** Optional: send a chat message to other bots. */
+  sendBotChat?: (
+    content: string,
+    channel: string,
+    recipients?: string[],
+    metadata?: Record<string, unknown>
+  ) => void;
+  /** Optional: get all bot usernames. */
+  getAllBotNames?: () => string[];
 }
 
 /** A routine is an async generator that yields state names as it progresses. */
@@ -698,7 +707,11 @@ export class Bot {
   async start(
     routineName: string,
     routine: Routine,
-    opts?: { getFleetStatus?: () => BotStatus[] },
+    opts?: {
+      getFleetStatus?: () => BotStatus[];
+      sendBotChat?: (content: string, channel: string, recipients?: string[], metadata?: Record<string, unknown>) => void;
+      getAllBotNames?: () => string[];
+    },
   ): Promise<void> {
     if (this._state === "running") {
       this.log("error", "Bot is already running");
@@ -749,6 +762,8 @@ export class Bot {
       bot: this,
       log: (cat, msg) => this.log(cat, msg),
       getFleetStatus: opts?.getFleetStatus,
+      sendBotChat: opts?.sendBotChat,
+      getAllBotNames: opts?.getAllBotNames,
     };
 
     try {

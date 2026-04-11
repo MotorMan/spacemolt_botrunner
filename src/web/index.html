@@ -7002,6 +7002,7 @@ function renderAiChatSettings(panel) {
   const lockDurationSec = ac.lockDurationSec ?? 60;
   const conversationCooldownSec = ac.conversationCooldownSec ?? 15;
   const factionChatRoundsLimit = ac.factionChatRoundsLimit ?? 5;
+  const llmTimeoutSec = ac.llmTimeoutSec ?? 30;
 
   const inputStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box"`;
   const textareaStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box;min-height:150px;font-family:monospace;font-size:12px;white-space:pre-wrap"`;
@@ -7043,6 +7044,14 @@ function renderAiChatSettings(panel) {
         <div class="setting-hint">Model name to use, e.g. llama3.2, mistral, gpt-4o-mini</div>
       </div>
       <input type="text" id="set-aichat-model" value="${esc(model)}" placeholder="llama3.2" ${inputStyle}>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">LLM Timeout (seconds)</div>
+        <div class="setting-hint">Timeout for LLM API calls. Increase this when running on CPU/RAM as models respond much slower.</div>
+      </div>
+      <input type="number" id="set-aichat-llmTimeoutSec" min="10" max="600" value="${llmTimeoutSec}">
     </div>
 
     <div class="setting-row">
@@ -7159,6 +7168,7 @@ function saveAiChatSettings() {
     lockDurationSec: parseInt(document.getElementById('set-aichat-lockDurationSec').value) || 60,
     conversationCooldownSec: parseInt(document.getElementById('set-aichat-conversationCooldownSec').value) || 15,
     factionChatRoundsLimit: parseInt(document.getElementById('set-aichat-factionChatRoundsLimit').value) ?? 5,
+    llmTimeoutSec: parseInt(document.getElementById('set-aichat-llmTimeoutSec').value) || 30,
   };
   send({ type: 'saveSettings', routine: 'ai_chat', settings: s });
   settings.ai_chat = s;

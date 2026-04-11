@@ -174,6 +174,7 @@ function getAiChatSettings(): {
   lockDurationSec: number;
   conversationCooldownSec: number;
   factionChatRoundsLimit: number; // Max rounds of AI responses in faction chat (0 = unlimited)
+  llmTimeoutSec: number; // Timeout for LLM API calls in seconds
 } {
   const all = readSettings();
   const s = (all.ai_chat || {}) as Record<string, unknown>;
@@ -211,6 +212,7 @@ function getAiChatSettings(): {
     lockDurationSec: (s.lockDurationSec as number) || 60,
     conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
     factionChatRoundsLimit: (s.factionChatRoundsLimit as number) ?? 5,
+    llmTimeoutSec: (s.llmTimeoutSec as number) ?? 30,
   };
 }
 
@@ -369,7 +371,7 @@ async function callLlm(
       "Authorization": `Bearer ${settings.apiKey}`,
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(settings.llmTimeoutSec * 1000),
   });
 
   if (!resp.ok) {

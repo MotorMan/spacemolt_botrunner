@@ -1335,7 +1335,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
               if (settings.homeStation) {
                 const [expectedSystem, stationId] = settings.homeStation.split('|');
                 ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
-                
+
                 if (expectedSystem === homeSystem && stationId) {
                   ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
                   const travelResp = await bot.exec("travel", { target_poi: stationId });
@@ -1372,6 +1372,60 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           } else {
             ctx.log("rescue", `⏱️ Idle for ${Math.round(elapsedMs / 1000)}s (away from home)`);
           }
+        } else if (isAwayFromHome && idleStartTime === 0) {
+          // FIX: When first starting away from home, immediately return home instead of waiting for idle timeout
+          ctx.log("rescue", `🏠 Bot activated away from home (${bot.system} vs ${homeSystem}) — returning home immediately to refuel and enable credit top-offs...`);
+          isReturningIdle = true;
+
+          yield "return_home";
+          await ensureUndocked(ctx);
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+          const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (!arrived) {
+            ctx.log("error", `Failed to return to home system ${homeSystem}`);
+          } else {
+            // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+            await bot.refreshStatus();
+            ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+
+            // If home station is configured, travel there and dock
+            if (settings.homeStation) {
+              const [expectedSystem, stationId] = settings.homeStation.split('|');
+              ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
+
+              if (expectedSystem === homeSystem && stationId) {
+                ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
+                const travelResp = await bot.exec("travel", { target_poi: stationId });
+                if (travelResp.error) {
+                  ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+                } else {
+                  ctx.log("rescue", `⚓ Docking at home station...`);
+                  const dockResp = await bot.exec("dock");
+                  if (dockResp.error) {
+                    ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+                  } else {
+                    ctx.log("rescue", `✓ Docked at home station`);
+                    // Refuel after docking
+                    ctx.log("rescue", `⛽ Refueling at home station...`);
+                    const refuelResp = await bot.exec("refuel");
+                    if (refuelResp.error) {
+                      ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                    } else {
+                      await bot.refreshStatus();
+                      ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                    }
+                  }
+                }
+              } else {
+                ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
+              }
+            } else {
+              ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
+            }
+          }
+          isReturningIdle = false;
+          idleStartTime = 0;
+          continue; // Restart loop after returning home
         } else {
           // Reset idle timer if we're not away from home or already returning
           idleStartTime = 0;
@@ -3763,7 +3817,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
               if (settings.homeStation) {
                 const [expectedSystem, stationId] = settings.homeStation.split('|');
                 ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
-                
+
                 if (expectedSystem === homeSystem && stationId) {
                   ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
                   const travelResp = await bot.exec("travel", { target_poi: stationId });
@@ -3800,6 +3854,60 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           } else {
             ctx.log("rescue", `⏱️ Idle for ${Math.round(elapsedMs / 1000)}s (away from home)`);
           }
+        } else if (isAwayFromHome && idleStartTime === 0) {
+          // FIX: When first starting away from home, immediately return home instead of waiting for idle timeout
+          ctx.log("rescue", `🏠 Bot activated away from home (${bot.system} vs ${homeSystem}) — returning home immediately to refuel and enable credit top-offs...`);
+          isReturningIdle = true;
+
+          yield "return_home";
+          await ensureUndocked(ctx);
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+          const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (!arrived) {
+            ctx.log("error", `Failed to return to home system ${homeSystem}`);
+          } else {
+            // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+            await bot.refreshStatus();
+            ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+
+            // If home station is configured, travel there and dock
+            if (settings.homeStation) {
+              const [expectedSystem, stationId] = settings.homeStation.split('|');
+              ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
+
+              if (expectedSystem === homeSystem && stationId) {
+                ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
+                const travelResp = await bot.exec("travel", { target_poi: stationId });
+                if (travelResp.error) {
+                  ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+                } else {
+                  ctx.log("rescue", `⚓ Docking at home station...`);
+                  const dockResp = await bot.exec("dock");
+                  if (dockResp.error) {
+                    ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+                  } else {
+                    ctx.log("rescue", `✓ Docked at home station`);
+                    // Refuel after docking
+                    ctx.log("rescue", `⛽ Refueling at home station...`);
+                    const refuelResp = await bot.exec("refuel");
+                    if (refuelResp.error) {
+                      ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                    } else {
+                      await bot.refreshStatus();
+                      ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                    }
+                  }
+                }
+              } else {
+                ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
+              }
+            } else {
+              ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
+            }
+          }
+          isReturningIdle = false;
+          idleStartTime = 0;
+          continue; // Restart loop after returning home
         } else {
           // Reset idle timer if we're not away from home or already returning
           idleStartTime = 0;

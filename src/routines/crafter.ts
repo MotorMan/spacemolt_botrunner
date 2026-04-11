@@ -1355,7 +1355,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("craft", `════════════════════════════════════════`);
 
     const plans = calculateMultiGoalPlan(
-      goalItems.map(g => ({ itemId: g.itemId, quantity: g.quantity })),
+      goalItems.map(g => ({ itemId: g.itemId, quantity: g.quantity, recipe: g.recipe })),
       recipes,
       (itemId) => countItem(ctx, itemId, personalMode),
     );

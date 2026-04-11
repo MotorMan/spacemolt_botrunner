@@ -211,39 +211,62 @@ export function calculateCraftingPlan(
  * Calculate crafting plans for multiple goal items.
  * Plans are calculated in order (FIFO), and inventory is updated
  * after each plan to account for items that will be crafted.
+ * 
+ * Each goal can specify either a specific recipe or just an item ID.
+ * When a recipe is specified, that exact recipe will be used.
  */
 export function calculateMultiGoalPlan(
-  goals: Array<{ itemId: string; quantity: number }>,
+  goals: Array<{ itemId: string; quantity: number; recipe?: Recipe }>,
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
 ): CraftingPlan[] {
   const plans: CraftingPlan[] = [];
-  
+
   // Create a mutable inventory counter that updates as we plan
   const inventory = new Map<string, number>();
   const baseCount = countItemFn;
-  
+
   // Initialize inventory
   const allItemIds = new Set<string>();
   recipes.forEach(r => {
     allItemIds.add(r.output_item_id);
     r.components.forEach(c => allItemIds.add(c.item_id));
   });
-  
+
   allItemIds.forEach(id => {
     inventory.set(id, baseCount(id));
   });
 
   // Calculate plans in order
   for (const goal of goals) {
-    const plan = calculateCraftingPlan(
-      goal.itemId,
-      goal.quantity,
+    // Use the specified recipe if provided, otherwise find any recipe for the item
+    const goalRecipe = goal.recipe || findRecipeForItem(goal.itemId, recipes);
+    
+    if (!goalRecipe) continue;
+    
+    const quantityHave = inventory.get(goal.itemId) || 0;
+    const quantityNeeded = goal.quantity;
+    const quantityToCraft = Math.max(0, quantityNeeded - quantityHave);
+    
+    if (quantityToCraft <= 0) continue;
+
+    const tree = buildCraftingTree(
+      goalRecipe,
+      quantityToCraft,
+      0,  // quantityToCraft is already the deficit
       recipes,
       (itemId) => inventory.get(itemId) || 0,
     );
 
-    if (plan && plan.flatOrder.length > 0) {
+    if (tree) {
+      const flatOrder = flattenTree(tree);
+      const plan: CraftingPlan = {
+        goalItem: goalRecipe.output_name,
+        goalQuantity: goal.quantity,
+        nodes: [tree],
+        flatOrder,
+        totalSteps: flatOrder.length,
+      };
       plans.push(plan);
 
       // Update inventory as if we crafted everything in this plan

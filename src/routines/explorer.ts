@@ -478,11 +478,20 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             ctx.log("combat", `Fleeing back to ${lastSystem} (the way we came)...`);
             await ensureUndocked(ctx);
             const fleeJump = await bot.exec("jump", { target_system: lastSystem });
+            
+            // Check for battle interrupt on flee jump
             if (fleeJump.error) {
-              ctx.log("error", `Failed to flee to ${lastSystem}: ${fleeJump.error.message}`);
-              // Try emergency flee if jump fails
-              const { emergencyFleeFromPirates } = await import("./common.js");
-              await emergencyFleeFromPirates(ctx, pirateResult);
+              const fleeMsg = fleeJump.error.message.toLowerCase();
+              if (fleeJump.error.code === "battle_interrupt" || fleeMsg.includes("interrupted by battle") || fleeMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Flee jump interrupted by battle! ${fleeJump.error.message} - using emergency flee!`);
+                const { emergencyFleeFromPirates } = await import("./common.js");
+                await emergencyFleeFromPirates(ctx, pirateResult);
+              } else {
+                ctx.log("error", `Failed to flee to ${lastSystem}: ${fleeJump.error.message}`);
+                // Try emergency flee if jump fails
+                const { emergencyFleeFromPirates } = await import("./common.js");
+                await emergencyFleeFromPirates(ctx, pirateResult);
+              }
             } else {
               ctx.log("combat", `Successfully fled to ${lastSystem}`);
               bot.stats.totalSystems++;
@@ -841,6 +850,13 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         const jumpResp = await bot.exec("jump", { target_system: random.id });
         if (jumpResp.error) {
           const msg = jumpResp.error.message.toLowerCase();
+          // CRITICAL: Check for battle interrupt error
+          if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+            ctx.log("combat", `Jump interrupted by battle! ${jumpResp.error.message} - fleeing!`);
+            await fleeFromBattle(ctx);
+            await sleep(5000);
+            continue;
+          }
           // Check if we're in battle - need to flee immediately
           if (msg.includes("battle") || msg.includes("in battle")) {
             ctx.log("combat", "Cannot jump - in battle! Attempting to flee...");
@@ -896,6 +912,13 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const jumpResp = await bot.exec("jump", { target_system: nextSystem.id });
     if (jumpResp.error) {
       const msg = jumpResp.error.message.toLowerCase();
+      // CRITICAL: Check for battle interrupt error
+      if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+        ctx.log("combat", `Jump interrupted by battle! ${jumpResp.error.message} - fleeing!`);
+        await fleeFromBattle(ctx);
+        await sleep(5000);
+        continue;
+      }
       // Check if we're in battle - need to flee immediately
       if (msg.includes("battle") || msg.includes("in battle")) {
         ctx.log("combat", "Cannot jump - in battle! Attempting to flee...");
@@ -1374,6 +1397,13 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
       }
 
       if (tResp.error) {
+        const errMsg = tResp.error.message.toLowerCase();
+        // CRITICAL: Check for battle interrupt error
+        if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+          ctx.log("combat", `Travel to hidden POI interrupted by battle! ${tResp.error.message} - fleeing!`);
+          await sleep(5000);
+          continue;
+        }
         ctx.log("error", `Travel to ${hiddenPoi.poiName} failed: ${tResp.error.message}`);
         continue;
       }
@@ -2201,9 +2231,17 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
       return false;
     }
 
-    if (travelResp.error && !travelResp.error.message.includes("already")) {
-      log("error", `Could not reach station: ${travelResp.error.message}`);
-      return false;
+    if (travelResp.error) {
+      const errMsg = travelResp.error.message.toLowerCase();
+      // CRITICAL: Check for battle interrupt error
+      if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+        log("combat", `Travel to station interrupted by battle! ${travelResp.error.message} - fleeing!`);
+        return false;
+      }
+      if (!errMsg.includes("already")) {
+        log("error", `Could not reach station: ${travelResp.error.message}`);
+        return false;
+      }
     }
 
     const dockResp = await bot.exec("dock");

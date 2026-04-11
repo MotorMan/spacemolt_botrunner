@@ -294,7 +294,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
 
   // For stations with bases, use base_id for travel (game API expects base_id for faction stations)
   const targetPoiId = targetStation.base_id && targetStation.has_base ? targetStation.base_id : targetStation.id;
-  
+
   if (bot.poi !== targetPoiId) {
     ctx.log("travel", `Traveling to home station...`);
     const tResp = await bot.exec("travel", { target_poi: targetPoiId });
@@ -306,9 +306,17 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
       return;
     }
 
-    if (tResp.error && !tResp.error.message.includes("already")) {
-      ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
-      return;
+    if (tResp.error) {
+      const errMsg = tResp.error.message.toLowerCase();
+      // CRITICAL: Check for battle interrupt error
+      if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+        ctx.log("combat", `Travel to home station interrupted by battle! ${tResp.error.message} - fleeing!`);
+        return;
+      }
+      if (!errMsg.includes("already")) {
+        ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
+        return;
+      }
     }
     bot.poi = targetPoiId;
   }
@@ -573,9 +581,18 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
 
-        if (tResp.error && !tResp.error.message.includes("already")) {
-          ctx.log("error", `Travel to ${station.poiName} failed: ${tResp.error.message} — skipping`);
-          continue;
+        if (tResp.error) {
+          const errMsg = tResp.error.message.toLowerCase();
+          // CRITICAL: Check for battle interrupt error
+          if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+            ctx.log("combat", `Travel to station interrupted by battle! ${tResp.error.message} - fleeing!`);
+            await sleep(5000);
+            continue;
+          }
+          if (!errMsg.includes("already")) {
+            ctx.log("error", `Travel to ${station.poiName} failed: ${tResp.error.message} — skipping`);
+            continue;
+          }
         }
         bot.poi = station.poiId;
       }

@@ -543,6 +543,55 @@ export class WebServer {
           }
         }
 
+        // Crafting Loadouts endpoints
+        const LOADOUTS_FILE = join(DATA_DIR, "craftingLoadouts.json");
+
+        function loadCraftingLoadouts(): Record<string, Record<string, number>> {
+          if (existsSync(LOADOUTS_FILE)) {
+            try {
+              return JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+            } catch (err) {
+              console.warn(`Warning: corrupt craftingLoadouts.json, starting fresh —`, err);
+            }
+          }
+          return {};
+        }
+
+        function saveCraftingLoadouts(loadouts: Record<string, Record<string, number>>): void {
+          if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+          writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+        }
+
+        // GET /api/crafting-loadouts - Load all loadouts
+        if (url.pathname === "/api/crafting-loadouts" && req.method === "GET") {
+          const loadouts = loadCraftingLoadouts();
+          return Response.json({ loadouts });
+        }
+
+        // POST /api/crafting-loadouts - Save a loadout
+        if (url.pathname === "/api/crafting-loadouts" && req.method === "POST") {
+          const body = await req.json() as { name: string; craftLimits: Record<string, number> };
+          if (!body?.name || !body?.craftLimits) {
+            return Response.json({ error: "Missing name or craftLimits" }, { status: 400 });
+          }
+          const loadouts = loadCraftingLoadouts();
+          loadouts[body.name] = body.craftLimits;
+          saveCraftingLoadouts(loadouts);
+          return Response.json({ ok: true, name: body.name });
+        }
+
+        // DELETE /api/crafting-loadouts/:name - Delete a loadout
+        if (url.pathname.startsWith("/api/crafting-loadouts/") && req.method === "DELETE") {
+          const name = decodeURIComponent(url.pathname.slice("/api/crafting-loadouts/".length));
+          const loadouts = loadCraftingLoadouts();
+          if (!(name in loadouts)) {
+            return Response.json({ error: "Loadout not found" }, { status: 404 });
+          }
+          delete loadouts[name];
+          saveCraftingLoadouts(loadouts);
+          return Response.json({ ok: true, name });
+        }
+
         // Serve index.css
         if (url.pathname === "/index.css") {
           const cssPath = join(import.meta.dir, "index.css");

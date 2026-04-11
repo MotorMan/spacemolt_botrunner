@@ -1083,8 +1083,9 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
             break;
           }
 
-          // Pre-fight ammo check
-          if (bot.ammo === 0) {
+          // Pre-fight ammo check - use ensureAmmoLoaded since bot.ammo may not reflect module-level ammo
+          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          if (!hasAmmo) {
             ctx.log("combat", "Out of ammo — docking to resupply");
             break;
           }

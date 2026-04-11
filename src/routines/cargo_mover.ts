@@ -833,10 +833,23 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           await sleep(5000);
           continue;
         }
-        if (tResp.error && !tResp.error.message.includes("already")) {
-          ctx.log("error", `Travel to destination failed: ${tResp.error.message}`);
-          await sleep(30000);
-          continue;
+        if (tResp.error) {
+          const errMsg = tResp.error.message.toLowerCase();
+          // CRITICAL: Check for battle interrupt error
+          if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+            ctx.log("combat", `Travel to destination interrupted by battle! ${tResp.error.message} - fleeing!`);
+            logCargoActivity(bot.username, "battle_encounter", "Travel interrupted by battle during cargo recovery", {
+              location: `${bot.system}/${bot.poi}`,
+              error: tResp.error.message,
+            });
+            await sleep(5000);
+            continue;
+          }
+          if (!errMsg.includes("already")) {
+            ctx.log("error", `Travel to destination failed: ${tResp.error.message}`);
+            await sleep(30000);
+            continue;
+          }
         }
         bot.poi = settings.destinationStation;
       }
@@ -1002,13 +1015,26 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           await sleep(5000);
           continue;
         }
-        if (tResp.error && !tResp.error.message.includes("already")) {
-          ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
-          logCargoActivity(bot.username, "error", `Travel to source station failed: ${tResp.error.message}`, {
-            location: `${bot.system}/${bot.poi}`,
-          });
-          await sleep(30000);
-          continue;
+        if (tResp.error) {
+          const errMsg = tResp.error.message.toLowerCase();
+          // CRITICAL: Check for battle interrupt error
+          if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+            ctx.log("combat", `Travel to source interrupted by battle! ${tResp.error.message} - fleeing!`);
+            logCargoActivity(bot.username, "battle_encounter", "Travel interrupted by battle during travel to source station", {
+              location: `${bot.system}/${bot.poi}`,
+              error: tResp.error.message,
+            });
+            await sleep(5000);
+            continue;
+          }
+          if (!errMsg.includes("already")) {
+            ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
+            logCargoActivity(bot.username, "error", `Travel to source station failed: ${tResp.error.message}`, {
+              location: `${bot.system}/${bot.poi}`,
+            });
+            await sleep(30000);
+            continue;
+          }
         }
         bot.poi = settings.sourceStation;
       }
@@ -1334,13 +1360,27 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         await sleep(5000);
         continue;
       }
-      if (tResp.error && !tResp.error.message.includes("already")) {
-        ctx.log("error", `Travel to dest failed: ${tResp.error.message}`);
-        logCargoActivity(bot.username, "error", `Travel to destination failed: ${tResp.error.message}`, {
-          location: `${bot.system}/${bot.poi}`,
-        });
-        allJobsCompleted = false;
-        break;
+      if (tResp.error) {
+        const errMsg = tResp.error.message.toLowerCase();
+        // CRITICAL: Check for battle interrupt error
+        if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+          ctx.log("combat", `Travel to destination interrupted by battle! ${tResp.error.message} - fleeing!`);
+          logCargoActivity(bot.username, "battle_encounter", "Travel interrupted by battle during cargo delivery", {
+            location: `${bot.system}/${bot.poi}`,
+            error: tResp.error.message,
+          });
+          allJobsCompleted = false;
+          await sleep(5000);
+          continue;
+        }
+        if (!errMsg.includes("already")) {
+          ctx.log("error", `Travel to dest failed: ${tResp.error.message}`);
+          logCargoActivity(bot.username, "error", `Travel to destination failed: ${tResp.error.message}`, {
+            location: `${bot.system}/${bot.poi}`,
+          });
+          allJobsCompleted = false;
+          break;
+        }
       }
       bot.poi = settings.destinationStation;
     }
@@ -1525,13 +1565,26 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         await sleep(5000);
         continue;
       }
-      if (tResp.error && !tResp.error.message.includes("already")) {
-        ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
-        logCargoActivity(bot.username, "error", `Failed to travel back to source station: ${tResp.error.message}`, {
-          location: `${bot.system}/${bot.poi}`,
-        });
-        await sleep(30000);
-        continue;
+      if (tResp.error) {
+        const errMsg = tResp.error.message.toLowerCase();
+        // CRITICAL: Check for battle interrupt error
+        if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+          ctx.log("combat", `Return travel to source interrupted by battle! ${tResp.error.message} - fleeing!`);
+          logCargoActivity(bot.username, "battle_encounter", "Return travel interrupted by battle to source station", {
+            location: `${bot.system}/${bot.poi}`,
+            error: tResp.error.message,
+          });
+          await sleep(5000);
+          continue;
+        }
+        if (!errMsg.includes("already")) {
+          ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
+          logCargoActivity(bot.username, "error", `Failed to travel back to source station: ${tResp.error.message}`, {
+            location: `${bot.system}/${bot.poi}`,
+          });
+          await sleep(30000);
+          continue;
+        }
       }
       bot.poi = settings.sourceStation;
     }

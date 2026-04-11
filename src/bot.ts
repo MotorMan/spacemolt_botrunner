@@ -371,6 +371,12 @@ export class Bot {
     if (resp.error && resp.error.message && resp.error.message.includes("502")) {
       const MAX_502_RETRIES = 3;
       for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
+        // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+        if (this.currentBattle.inBattle) {
+          this.log("combat", `HTTP 502 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+          break;
+        }
+        
         const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
         this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1}/${MAX_502_RETRIES} after ${waitTime/1000}s...`);
         await sleep(waitTime);
@@ -387,6 +393,12 @@ export class Bot {
     if (resp.error && resp.error.message && resp.error.message.includes("524")) {
       const MAX_524_RETRIES = 3;
       for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
+        // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+        if (this.currentBattle.inBattle) {
+          this.log("combat", `HTTP 524 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+          break;
+        }
+        
         const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
         this.log("warn", `HTTP 524 Timeout — retry ${retry + 1}/${MAX_524_RETRIES} after ${waitTime/1000}s...`);
         await sleep(waitTime);
@@ -594,7 +606,28 @@ export class Bot {
         this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
         this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
         this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
-        this.ammo = (ship.ammo as number) ?? this.ammo;
+        
+        // Ammo is stored per-weapon-module, not at ship level.
+        // get_status may return modules as full objects or just IDs.
+        // Check both the ship.modules array and root-level modules array.
+        const modulesArray = (
+          Array.isArray(r.modules) ? r.modules :
+          Array.isArray(ship.modules) ? ship.modules :
+          []
+        ) as Array<Record<string, unknown>>;
+        
+        let totalAmmo = 0;
+        for (const mod of modulesArray) {
+          if (mod && typeof mod === "object" && mod.current_ammo != null && typeof mod.current_ammo === "number") {
+            totalAmmo += mod.current_ammo as number;
+          }
+        }
+        // Update ammo count: prefer calculated from modules, fall back to ship.ammo if it exists
+        if (totalAmmo > 0) {
+          this.ammo = totalAmmo;
+        } else if (ship.ammo != null) {
+          this.ammo = ship.ammo as number;
+        }
       }
 
       // Cloak detection

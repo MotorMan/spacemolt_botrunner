@@ -1679,6 +1679,11 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
 
       if (lootResp.error) {
         const errMsg = lootResp.error.message.toLowerCase();
+        // CRITICAL: Check for battle interrupt - stop scavenging immediately
+        if (lootResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+          ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
+          return totalLooted;
+        }
         if (errMsg.includes("no_space") || errMsg.includes("not enough cargo") || errMsg.includes("cargo space")) {
           break; // cargo full — stop looting this wreck
         }
@@ -1776,6 +1781,11 @@ export async function fullSalvageWrecks(
 
         if (lootResp.error) {
           const msg = lootResp.error.message.toLowerCase();
+          // CRITICAL: Check for battle interrupt - stop scavenging immediately
+          if (lootResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+            ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
+            return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
+          }
           if (msg.includes("empty") || msg.includes("not found")) break;
           continue;
         }
@@ -1838,6 +1848,11 @@ export async function fullSalvageWrecks(
         }
       } else if (towResp.error) {
         const msg = towResp.error.message.toLowerCase();
+        // CRITICAL: Check for battle interrupt - stop scavenging immediately
+        if (towResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+          ctx.log("combat", `Tow interrupted by battle! ${towResp.error.message} - stopping salvage!`);
+          return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
+        }
         if (msg.includes("already")) {
           // Check if it's "already_towing" (we're towing) vs "already_towed" (someone else has it)
           if (msg.includes("already_towing") || msg.includes("already towing")) {
@@ -1964,6 +1979,11 @@ export async function processTowedWrecks(
 
     if (lootResp.error) {
       const msg = lootResp.error.message.toLowerCase();
+      // CRITICAL: Check for battle interrupt - stop immediately
+      if (lootResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+        ctx.log("combat", `Module loot interrupted by battle! ${lootResp.error.message} - stopping!`);
+        return 0;
+      }
       if (msg.includes("no_space") || msg.includes("not enough cargo")) {
         ctx.log("scavenge", "Still no cargo space — depositing ALL current items and retrying...");
         // Deposit all non-fuel items to make space
@@ -1982,6 +2002,12 @@ export async function processTowedWrecks(
           modulesLooted = wreck.modules.length;
           ctx.log("scavenge", `✓ Looted all modules from wreck`);
         } else {
+          const retryMsg = retryResp.error.message.toLowerCase();
+          // Check for battle interrupt on retry as well
+          if (retryResp.error.code === "battle_interrupt" || retryMsg.includes("interrupted by battle") || retryMsg.includes("interrupted by combat")) {
+            ctx.log("combat", `Module loot retry interrupted by battle! ${retryResp.error.message} - stopping!`);
+            return 0;
+          }
           ctx.log("error", `Failed to loot modules after deposit: ${retryResp.error.message}`);
         }
       } else if (msg.includes("empty") || msg.includes("not found")) {

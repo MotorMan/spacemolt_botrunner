@@ -582,7 +582,7 @@ async function travelToPoiWithSurvey(
   
   // First attempt to travel
   const travelResp = await bot.exec("travel", { target_poi: poiId });
-  
+
   // Check for battle notifications
   if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
     const battleState: BattleState = {
@@ -598,13 +598,21 @@ async function travelToPoiWithSurvey(
       return { success: false, error: "battle detected" };
     }
   }
-  
+
   // Check if travel was successful
   if (!travelResp.error || travelResp.error.message.includes("already")) {
     bot.poi = poiId;
     return { success: true };
   }
-  
+
+  // CRITICAL: Check for battle interrupt error
+  if (travelResp.error.code === "battle_interrupt" || 
+      travelResp.error.message.toLowerCase().includes("interrupted by battle") || 
+      travelResp.error.message.toLowerCase().includes("interrupted by combat")) {
+    ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+    return { success: false, error: "battle detected" };
+  }
+
   // Travel failed - check if it's because the POI is unknown (hidden, not yet discovered)
   if (isUnknownDestinationError(travelResp.error)) {
     ctx.log("error", `Travel failed: Unknown destination ${poiId} — hidden POI not yet discovered`);
@@ -624,7 +632,7 @@ async function travelToPoiWithSurvey(
     // Retry travel after survey
     ctx.log("mining", `Retrying travel to hidden POI ${poiName} after survey...`);
     const retryResp = await bot.exec("travel", { target_poi: poiId });
-    
+
     // Check for battle notifications on retry
     if (retryResp.notifications && Array.isArray(retryResp.notifications)) {
       const battleState: BattleState = {
@@ -640,7 +648,15 @@ async function travelToPoiWithSurvey(
         return { success: false, error: "battle detected" };
       }
     }
-    
+
+    // CRITICAL: Check for battle interrupt error on retry
+    if (retryResp.error && (retryResp.error.code === "battle_interrupt" || 
+        retryResp.error.message.toLowerCase().includes("interrupted by battle") || 
+        retryResp.error.message.toLowerCase().includes("interrupted by combat"))) {
+      ctx.log("combat", `Travel retry interrupted by battle! ${retryResp.error.message} - fleeing!`);
+      return { success: false, error: "battle detected" };
+    }
+
     if (!retryResp.error || retryResp.error.message.includes("already")) {
       bot.poi = poiId;
       ctx.log("mining", `Successfully traveled to hidden POI ${poiName} after survey`);
@@ -2754,6 +2770,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       if (mineResp.error) {
         const msg = mineResp.error.message.toLowerCase();
+        // CRITICAL: Check for battle interrupt - stop mining immediately
+        if (mineResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+          ctx.log("combat", `Mine interrupted by battle! ${mineResp.error.message} - fleeing!`);
+          battleState.inBattle = true;
+          battleState.isFleeing = false;
+          stopReason = "battle detected";
+          break;
+        }
         if (msg.includes("depleted") || msg.includes("no resources") || msg.includes("no gas") || msg.includes("no ice") || msg.includes("no minable")) {
           // VERIFY actual remaining resources before marking as depleted
           // This prevents false positives from transient errors that mention "depleted"
@@ -3269,7 +3293,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             if (newPoiId !== bot.poi) {
               ctx.log("mining", `Traveling to new target: ${newTarget} @ ${newPoiName}`);
               const travelResp = await bot.exec("travel", { target_poi: newPoiId });
-              
+
               // Check for battle notifications
               if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
                 const battleDetected = await handleBattleNotifications(ctx, travelResp.notifications, battleState);
@@ -3279,7 +3303,16 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                   break;
                 }
               }
-              
+
+              // CRITICAL: Check for battle interrupt error
+              if (travelResp.error && (travelResp.error.code === "battle_interrupt" || 
+                  travelResp.error.message.toLowerCase().includes("interrupted by battle") || 
+                  travelResp.error.message.toLowerCase().includes("interrupted by combat"))) {
+                ctx.log("combat", `Travel to new target interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                stopReason = "battle detected";
+                break;
+              }
+
               if (travelResp.error && !travelResp.error.message.includes("already")) {
                 ctx.log("error", `Travel to new target failed: ${travelResp.error.message}`);
                 stopReason = `${resourceLabel} field depleted (travel failed)`;
@@ -3376,6 +3409,26 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             if (altPoi) {
               ctx.log("mining", `Found correct POI type: ${altPoi.name}`);
               const travelResp = await bot.exec("travel", { target_poi: altPoi.id });
+              
+              // Check for battle notifications
+              if (travelResp.notifications && Array.isArray(travelResp.notifications)) {
+                const battleDetected = await handleBattleNotifications(ctx, travelResp.notifications, battleState);
+                if (battleDetected) {
+                  ctx.log("error", "Battle detected while traveling to alternative POI - fleeing!");
+                  stopReason = "battle detected";
+                  break;
+                }
+              }
+
+              // CRITICAL: Check for battle interrupt error
+              if (travelResp.error && (travelResp.error.code === "battle_interrupt" || 
+                  travelResp.error.message.toLowerCase().includes("interrupted by battle") || 
+                  travelResp.error.message.toLowerCase().includes("interrupted by combat"))) {
+                ctx.log("combat", `Travel to alternative POI interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                stopReason = "battle detected";
+                break;
+              }
+
               if (!travelResp.error || travelResp.error.message.includes("already")) {
                 bot.poi = altPoi.id;
                 miningPoi = { id: altPoi.id, name: altPoi.name };
@@ -3558,8 +3611,27 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "travel_to_station";
     if (stationPoi) {
       const travelStationResp = await bot.exec("travel", { target_poi: stationPoi.id });
-      if (travelStationResp.error && !travelStationResp.error.message.includes("already")) {
+      
+      // Check for battle notifications
+      if (travelStationResp.notifications && Array.isArray(travelStationResp.notifications)) {
+        const battleDetected = await handleBattleNotifications(ctx, travelStationResp.notifications, battleState);
+        if (battleDetected) {
+          ctx.log("error", "Battle detected while traveling to station - fleeing!");
+          // Don't dock - handle battle first
+          stationPoi = null;
+        }
+      }
+
+      // CRITICAL: Check for battle interrupt error
+      if (travelStationResp.error && (travelStationResp.error.code === "battle_interrupt" || 
+          travelStationResp.error.message.toLowerCase().includes("interrupted by battle") || 
+          travelStationResp.error.message.toLowerCase().includes("interrupted by combat"))) {
+        ctx.log("combat", `Travel to station interrupted by battle! ${travelStationResp.error.message} - fleeing!`);
+        // Don't dock - handle battle first
+        stationPoi = null;
+      } else if (travelStationResp.error && !travelStationResp.error.message.includes("already")) {
         ctx.log("error", `Travel to station failed: ${travelStationResp.error.message}`);
+        stationPoi = null;
       }
     }
 

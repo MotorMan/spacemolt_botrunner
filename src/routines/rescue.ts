@@ -1339,7 +1339,14 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
                 if (expectedSystem === homeSystem && stationId) {
                   ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
                   const travelResp = await bot.exec("travel", { target_poi: stationId });
+                  // CRITICAL: Check for battle interrupt error
                   if (travelResp.error) {
+                    const errMsg = travelResp.error.message.toLowerCase();
+                    if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                      ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                      await sleep(5000);
+                      continue;
+                    }
                     ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
                   } else {
                     ctx.log("rescue", `⚓ Docking at home station...`);
@@ -1396,7 +1403,14 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
               if (expectedSystem === homeSystem && stationId) {
                 ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
                 const travelResp = await bot.exec("travel", { target_poi: stationId });
+                // CRITICAL: Check for battle interrupt error
                 if (travelResp.error) {
+                  const errMsg = travelResp.error.message.toLowerCase();
+                  if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                    ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                    await sleep(5000);
+                    continue;
+                  }
                   ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
                 } else {
                   ctx.log("rescue", `⚓ Docking at home station...`);
@@ -2012,7 +2026,14 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
               ctx.log("combat", "Battle detected while traveling to home station - fleeing!");
               continue;
             }
+            // CRITICAL: Check for battle interrupt error
             if (travelResp.error) {
+              const errMsg = travelResp.error.message.toLowerCase();
+              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
             } else {
               ctx.log(logCategory, `⚓ Docking at home station...`);
@@ -2066,7 +2087,16 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             ctx.log("combat", "Battle detected while traveling to home station - fleeing!");
             continue;
           }
-          if (!travelResp.error) {
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+            ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
+          } else {
             ctx.log(logCategory, `⚓ Docking at home station...`);
             const dockResp = await bot.exec("dock");
             // Check for battle notifications after dock
@@ -2088,8 +2118,6 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             } else {
               ctx.log("error", `Dock failed: ${dockResp.error.message}`);
             }
-          } else {
-            ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
           }
         } else {
           ctx.log("warn", `homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
@@ -2553,7 +2581,14 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
           if (expectedSystem === homeSystem && stationId) {
             ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
             const travelResp = await bot.exec("travel", { target_poi: stationId });
+            // CRITICAL: Check for battle interrupt error
             if (travelResp.error) {
+              const errMsg = travelResp.error.message.toLowerCase();
+              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
             } else {
               ctx.log("rescue", `⚓ Docking at home station...`);
@@ -2587,6 +2622,15 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         if (expectedSystem === homeSystem && stationId) {
           ctx.log("rescue", `🚀 Traveling to home station...`);
           const travelResp = await bot.exec("travel", { target_poi: stationId });
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+          }
           if (!travelResp.error) {
             ctx.log("rescue", `⚓ Docking at home station...`);
             const dockResp = await bot.exec("dock");
@@ -3100,7 +3144,14 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
           if (expectedSystem === homeSystem && stationId) {
             ctx.log("mayday", `🚀 Traveling to home station (${stationId})...`);
             const travelResp = await bot.exec("travel", { target_poi: stationId });
+            // CRITICAL: Check for battle interrupt error
             if (travelResp.error) {
+              const errMsg = travelResp.error.message.toLowerCase();
+              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
             } else {
               ctx.log("mayday", `⚓ Docking at home station...`);
@@ -3138,6 +3189,15 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         if (expectedSystem === homeSystem && stationId) {
           ctx.log("mayday", `🚀 Traveling to home station...`);
           const travelResp = await bot.exec("travel", { target_poi: stationId });
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+          }
           if (!travelResp.error) {
             ctx.log("mayday", `⚓ Docking at home station...`);
             const dockResp = await bot.exec("dock");
@@ -3821,7 +3881,14 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
                 if (expectedSystem === homeSystem && stationId) {
                   ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
                   const travelResp = await bot.exec("travel", { target_poi: stationId });
+                  // CRITICAL: Check for battle interrupt error
                   if (travelResp.error) {
+                    const errMsg = travelResp.error.message.toLowerCase();
+                    if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                      ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                      await sleep(5000);
+                      continue;
+                    }
                     ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
                   } else {
                     ctx.log("rescue", `⚓ Docking at home station...`);
@@ -3878,7 +3945,14 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
               if (expectedSystem === homeSystem && stationId) {
                 ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
                 const travelResp = await bot.exec("travel", { target_poi: stationId });
+                // CRITICAL: Check for battle interrupt error
                 if (travelResp.error) {
+                  const errMsg = travelResp.error.message.toLowerCase();
+                  if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                    ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                    await sleep(5000);
+                    continue;
+                  }
                   ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
                 } else {
                   ctx.log("rescue", `⚓ Docking at home station...`);
@@ -4329,6 +4403,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
         ctx.log(logCategory, `Traveling to ${target.username}'s location (${targetPoiName})... (attempt ${travelAttempts}/${maxTravelAttempts})`);
         const travelResp = await bot.exec("travel", { target_poi: travelTarget });
+        // CRITICAL: Check for battle interrupt error
+        if (travelResp.error) {
+          const errMsg = travelResp.error.message.toLowerCase();
+          if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+            ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+            await sleep(5000);
+            continue;
+          }
+        }
         if (travelResp.error && !travelResp.error.message.includes("already")) {
           ctx.log("error", `Travel failed: ${travelResp.error.message}`);
 
@@ -4560,7 +4643,16 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             const { pois } = await getSystemInfo(ctx);
             const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
             if (matchedPoi) {
-              await bot.exec("travel", { target_poi: matchedPoi.id });
+              const travelResp = await bot.exec("travel", { target_poi: matchedPoi.id });
+              // CRITICAL: Check for battle interrupt error
+              if (travelResp.error) {
+                const errMsg = travelResp.error.message.toLowerCase();
+                if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                  ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                  await sleep(5000);
+                  continue;
+                }
+              }
               bot.poi = target.poi;
             }
           }
@@ -4673,6 +4765,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
                 if (expectedSystem === homeSystem && stationId) {
                   ctx.log("rescue", `🚀 Traveling to home station...`);
                   const travelResp = await bot.exec("travel", { target_poi: stationId });
+                  // CRITICAL: Check for battle interrupt error
+                  if (travelResp.error) {
+                    const errMsg = travelResp.error.message.toLowerCase();
+                    if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                      ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                      await sleep(5000);
+                      continue;
+                    }
+                  }
                   if (!travelResp.error) {
                     ctx.log("rescue", `⚓ Docking at home station...`);
                     const dockResp = await bot.exec("dock");
@@ -4807,7 +4908,16 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         const station = findStation(pois);
         if (station) {
           ctx.log(logCategory, `Docking at ${station.name} to send credits...`);
-          await bot.exec("travel", { target_poi: station.id });
+          const travelResp = await bot.exec("travel", { target_poi: station.id });
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+          }
           await bot.exec("dock");
           bot.docked = true;
           await collectFromStorage(ctx);
@@ -4945,7 +5055,14 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           if (expectedSystem === homeSystem && stationId) {
             ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
             const travelResp = await bot.exec("travel", { target_poi: stationId });
+            // CRITICAL: Check for battle interrupt error
             if (travelResp.error) {
+              const errMsg = travelResp.error.message.toLowerCase();
+              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
             } else {
               ctx.log("rescue", `⚓ Docking at home station...`);
@@ -4983,6 +5100,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         if (expectedSystem === homeSystem && stationId) {
           ctx.log("rescue", `🚀 Traveling to home station...`);
           const travelResp = await bot.exec("travel", { target_poi: stationId });
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+          }
           if (!travelResp.error) {
             ctx.log("rescue", `⚓ Docking at home station...`);
             const dockResp = await bot.exec("dock");

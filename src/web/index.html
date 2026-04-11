@@ -798,6 +798,8 @@ async function fetchInitialData() {
     updateBulkStartDropdown();
     renderSettingsPanel();
     updateAiChatToggleButton();
+    // Load crafting loadouts
+    loadCraftingLoadouts();
     // Load persisted main logs
     if (mainLogsRes) {
       appendLines(activityEl, 'activity', mainLogsRes.activity || []);
@@ -882,6 +884,8 @@ function connect() {
           appendLines(broadcastEl, 'broadcast', msg.logs.broadcast || []);
           appendLines(systemEl, 'system', msg.logs.system || []);
         }
+        // Load crafting loadouts
+        loadCraftingLoadouts();
         // Load per-bot logs
         if (msg.botLogs) {
           botLogBuffers = msg.botLogs;
@@ -899,7 +903,33 @@ function connect() {
         renderStats();
         updateChatBotSelect();
         // Update profile if open
-        if (profileBot) renderProfileSidebar();
+        if (profileBot) {
+          const bot = bots.find(b => b.username === profileBot);
+          const prevBot = window._profilePrevBot;
+          window._profilePrevBot = bot;
+          
+          renderProfileSidebar();
+          // Re-render manual controls to update station/system-dependent dropdowns
+          // (travel targets, jump targets, cargo withdraw/deposit options, etc.)
+          renderManualControls();
+          
+          // If bot changed systems or docked status, refresh relevant data
+          if (bot && prevBot && (bot.system !== prevBot.system || bot.docked !== prevBot.docked)) {
+            // System changed or docked/undocked - refresh system data
+            profileSystemData = null;
+            fetchSystemData(profileBot);
+            
+            // If now docked, refresh station-specific data
+            if (bot.docked) {
+              profileMarket = null;
+              profileRecipes = null;
+              profileFactionStorage = null;
+              fetchMarket(profileBot);
+              fetchRecipes(profileBot);
+              fetchFactionStorage(profileBot);
+            }
+          }
+        }
         // Update stats tab bot list if visible
         if (document.getElementById('page-stats')?.classList.contains('active')) renderStatsTab();
         // Update Fleet Combat controls if visible (refresh commander dropdown only)
@@ -5728,12 +5758,37 @@ function renderCrafterSettings(panel) {
     return `<label class="craft-cat-check"><input type="checkbox" data-category="${esc(cat)}" ${checked}> ${esc(cat)} (${count})</label>`;
   }).join('');
 
+  // Build loadout options
+  const loadouts = window._craftingLoadouts || {};
+  const loadoutOptions = Object.keys(loadouts).sort().map(name => 
+    `<option value="${esc(name)}">${esc(name)}</option>`
+  ).join('');
+  const hasLoadouts = Object.keys(loadouts).length > 0;
+
   panel.innerHTML = `
     <h3>Crafter Settings</h3>
     <div class="settings-desc">Add recipes and set stock limits. The crafter bot will craft each item up to its limit, then stop.</div>
 
+    <!-- Loadout Management Section -->
+    <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🎯 Crafting Loadouts</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="loadout-select" style="flex:1;min-width:150px;max-width:250px">
+          <option value="">-- Select Loadout --</option>
+          ${loadoutOptions}
+        </select>
+        <button class="sm primary" onclick="loadLoadout()" ${!hasLoadouts ? 'disabled' : ''}>Load</button>
+        <button class="sm" onclick="saveLoadoutPrompt()">💾 Save</button>
+        <button class="sm danger" onclick="deleteLoadout()" ${!hasLoadouts ? 'disabled' : ''}>🗑 Delete</button>
+        <button class="sm" onclick="clearAllRecipes()" style="margin-left:auto">🧹 Clear All Recipes</button>
+      </div>
+      <div style="font-size:11px;color:var(--dim);margin-top:6px">
+        ${hasLoadouts ? `${Object.keys(loadouts).length} loadout(s) saved` : 'No loadouts saved yet. Configure recipes and click Save to create one.'}
+      </div>
+    </div>
+
     <div class="craft-limits-list" id="craftLimitsList">
-      ${configuredRows || '<div style="color:var(--dim);padding:8px">No recipes configured. Add one below.</div>'}
+      ${configuredRows || '<div style="color:var(--dim);padding:8px">No recipes configured. Add one below or load a saved loadout.</div>'}
     </div>
 
     <div style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
@@ -5996,6 +6051,125 @@ function saveCrafterSettings() {
   settings.crafter = s;
 
   // Re-render to show updated values
+  renderCrafterSettings(document.getElementById('settingsContent'));
+}
+
+// ── Crafting Loadouts ───────────────────────────────────────
+
+// Load loadouts from server on page init
+async function loadCraftingLoadouts() {
+  try {
+    const response = await fetch('/api/crafting-loadouts');
+    if (response.ok) {
+      const data = await response.json();
+      window._craftingLoadouts = data.loadouts || {};
+    }
+  } catch (e) {
+    console.warn('Failed to load crafting loadouts:', e);
+    window._craftingLoadouts = {};
+  }
+}
+
+function saveLoadoutPrompt() {
+  const name = prompt('Enter a name for this loadout:');
+  if (!name || !name.trim()) return;
+  saveLoadout(name.trim());
+}
+
+async function saveLoadout(name) {
+  // Collect current craftLimits from the UI
+  const craftLimits = {};
+  document.querySelectorAll('.craft-limit-val').forEach(el => {
+    const id = el.getAttribute('data-recipe');
+    const val = parseInt(el.value) || 0;
+    if (id && val > 0) craftLimits[id] = val;
+  });
+
+  // Also merge from settings object
+  if (settings.crafter?.craftLimits) {
+    for (const [id, val] of Object.entries(settings.crafter.craftLimits)) {
+      if (val > 0 && !(id in craftLimits)) craftLimits[id] = val;
+    }
+  }
+
+  if (Object.keys(craftLimits).length === 0) {
+    alert('No recipes configured to save. Add some recipes first!');
+    return;
+  }
+
+  try {
+    const response = await fetch('/api/crafting-loadouts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, craftLimits }),
+    });
+
+    if (response.ok) {
+      await loadCraftingLoadouts();
+      renderCrafterSettings(document.getElementById('settingsContent'));
+      alert(`Loadout "${name}" saved successfully!`);
+    } else {
+      const error = await response.json();
+      alert(`Failed to save loadout: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to save loadout: ${e.message}`);
+  }
+}
+
+function loadLoadout() {
+  const select = document.getElementById('loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to load.');
+    return;
+  }
+
+  const loadouts = window._craftingLoadouts || {};
+  const loadout = loadouts[name];
+  if (!loadout) {
+    alert(`Loadout "${name}" not found!`);
+    return;
+  }
+
+  if (!settings.crafter) settings.crafter = {};
+  settings.crafter.craftLimits = JSON.parse(JSON.stringify(loadout));
+  renderCrafterSettings(document.getElementById('settingsContent'));
+}
+
+async function deleteLoadout() {
+  const select = document.getElementById('loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to delete.');
+    return;
+  }
+
+  if (!confirm(`Are you sure you want to delete the loadout "${name}"?`)) return;
+
+  try {
+    const response = await fetch(`/api/crafting-loadouts/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+
+    if (response.ok) {
+      await loadCraftingLoadouts();
+      renderCrafterSettings(document.getElementById('settingsContent'));
+      alert(`Loadout "${name}" deleted.`);
+    } else {
+      const error = await response.json();
+      alert(`Failed to delete loadout: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to delete loadout: ${e.message}`);
+  }
+}
+
+function clearAllRecipes() {
+  if (!confirm('Clear all configured recipes? This will remove all recipes from the current list.')) return;
+
+  if (!settings.crafter) settings.crafter = {};
+  settings.crafter.craftLimits = {};
   renderCrafterSettings(document.getElementById('settingsContent'));
 }
 

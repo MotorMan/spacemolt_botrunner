@@ -680,8 +680,10 @@ async function fightFreshBattle(
 ): Promise<boolean> {
   const { bot } = ctx;
 
-  // ── STEP 1: Advance to engaged zone (3 ticks) ─────────────
-  // Each advance costs 1 tick — we get attacked while advancing
+  // ── STEP 1: Advance to engaged zone (3 ticks, 1 action per tick) ─────
+  // Each advance costs 1 tick — we get attacked while advancing.
+  // High-reach weapons (missiles, reach 3) fire from outer/mid zones.
+  // Low-reach weapons (lasers, reach 1) only fire once we're in inner/engaged.
   for (let zone = 0; zone < 3; zone++) {
     if (bot.state !== "running") return false;
 
@@ -711,6 +713,7 @@ async function fightFreshBattle(
   // Combat is AUTO-RESOLVED — we just monitor and react
   const MAX_COMBAT_TICKS = 50;
   let consecutiveBraceTicks = 0;
+  let lastKnownEnemyZone = "outer"; // Start tracking from outer zone
 
   for (let tick = 0; tick < MAX_COMBAT_TICKS; tick++) {
     if (bot.state !== "running") return false;
@@ -729,14 +732,36 @@ async function fightFreshBattle(
     );
 
     if (!targetStillAlive) {
-      ctx.log("combat", `✅ ${target.name} destroyed — victory!`);
-      return true;
+      // Target is marked destroyed but battle is still active.
+      // The server may keep the battle running (auto-attacks, downed state, etc).
+      // Stay in the combat loop — keep fire stance until the battle actually clears.
+      ctx.log("combat", `⚠️ ${target.name} marked destroyed but battle still active — continuing to fight`);
     }
 
     // Check hull/shield from status (refresh our own status too)
     await bot.refreshStatus();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+
+    // ── Track opponent zone — detect if pirate is fleeing or closing ──
+    const targetParticipant = status.participants.find(
+      p => p.player_id === target.id || p.username === target.name
+    );
+    if (targetParticipant && targetParticipant.zone) {
+      if (targetParticipant.zone !== lastKnownEnemyZone) {
+        const zoneDir = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+        const prevDir = zoneDir[lastKnownEnemyZone as keyof typeof zoneDir] ?? 0;
+        const newDir = zoneDir[targetParticipant.zone as keyof typeof zoneDir] ?? 0;
+        if (newDir > prevDir) {
+          ctx.log("combat", `   ${target.name} moving closer: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+        } else if (newDir < prevDir) {
+          ctx.log("combat", `   ⚠️ ${target.name} retreating: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+        } else {
+          ctx.log("combat", `   ${target.name} zone: ${targetParticipant.zone}`);
+        }
+        lastKnownEnemyZone = targetParticipant.zone;
+      }
+    }
 
     // ── Emergency flee check ────────────────────────────────
     if (hullPct <= fleeThreshold) {
@@ -824,6 +849,7 @@ async function fightJoinedBattle(
   // Reuse the same tactical combat loop
   const MAX_COMBAT_TICKS = 50;
   let consecutiveBraceTicks = 0;
+  let lastKnownEnemyZone = "outer";
 
   for (let tick = 0; tick < MAX_COMBAT_TICKS; tick++) {
     if (bot.state !== "running") return false;
@@ -839,13 +865,34 @@ async function fightJoinedBattle(
     );
 
     if (!targetStillAlive) {
-      ctx.log("combat", `✅ ${target.name} destroyed — victory!`);
-      return true;
+      // Target is marked destroyed but battle is still active.
+      // Stay in the combat loop — keep fire stance until the battle actually clears.
+      ctx.log("combat", `⚠️ ${target.name} marked destroyed but battle still active — continuing to fight`);
     }
 
     await bot.refreshStatus();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+
+    // ── Track opponent zone — detect if pirate is fleeing or closing ──
+    const targetParticipant = status.participants.find(
+      p => p.player_id === target.id || p.username === target.name
+    );
+    if (targetParticipant && targetParticipant.zone) {
+      if (targetParticipant.zone !== lastKnownEnemyZone) {
+        const zoneDir = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+        const prevDir = zoneDir[lastKnownEnemyZone as keyof typeof zoneDir] ?? 0;
+        const newDir = zoneDir[targetParticipant.zone as keyof typeof zoneDir] ?? 0;
+        if (newDir > prevDir) {
+          ctx.log("combat", `   ${target.name} moving closer: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+        } else if (newDir < prevDir) {
+          ctx.log("combat", `   ⚠️ ${target.name} retreating: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+        } else {
+          ctx.log("combat", `   ${target.name} zone: ${targetParticipant.zone}`);
+        }
+        lastKnownEnemyZone = targetParticipant.zone;
+      }
+    }
 
     if (hullPct <= fleeThreshold) {
       ctx.log("combat", `💀 Hull critical (${hullPct}%) — FLEEING!`);
@@ -1255,8 +1302,9 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
           break;
         }
 
-        // Pre-fight ammo check
-        if (bot.ammo === 0) {
+        // Pre-fight ammo check - use ensureAmmoLoaded since bot.ammo may not reflect module-level ammo
+        const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+        if (!hasAmmo) {
           ctx.log("combat", "Out of ammo — aborting patrol to resupply");
           abortPatrol = true;
           break;

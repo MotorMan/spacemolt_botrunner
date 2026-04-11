@@ -51,10 +51,9 @@ function findRecipeForItem(itemId: string, recipes: Recipe[]): Recipe | null {
 
 /**
  * Recursively build a crafting tree for a goal item.
- * 
+ *
  * @param goalRecipe - The recipe for the final goal item
- * @param quantityNeeded - How many of the goal item we need
- * @param quantityHave - How many we already have in inventory
+ * @param quantityToCraftInItems - How many output items we need to craft (already net deficit)
  * @param recipes - All available recipes
  * @param countItemFn - Function to count items in inventory
  * @param depth - Current recursion depth (for cycle detection)
@@ -62,8 +61,7 @@ function findRecipeForItem(itemId: string, recipes: Recipe[]): Recipe | null {
  */
 function buildCraftingTree(
   goalRecipe: Recipe,
-  quantityNeeded: number,
-  quantityHave: number,
+  quantityToCraftInItems: number,
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
   depth: number = 0,
@@ -74,10 +72,12 @@ function buildCraftingTree(
     return null;
   }
 
-  const quantityToCraft = Math.max(0, quantityNeeded - quantityHave);
-  
-  // If we don't need to craft any, skip this branch
-  if (quantityToCraft <= 0) {
+  // Convert items needed to recipe batches
+  const outputQty = goalRecipe.output_quantity || 1;
+  const batchesToCraft = Math.ceil(quantityToCraftInItems / outputQty);
+
+  // If we don't need to craft any batches, skip this branch
+  if (batchesToCraft <= 0) {
     return null;
   }
 
@@ -85,16 +85,17 @@ function buildCraftingTree(
 
   const node: CraftingNode = {
     recipe: goalRecipe,
-    quantityNeeded,
-    quantityHave,
-    quantityToCraft,
+    quantityNeeded: quantityToCraftInItems,
+    quantityHave: 0,
+    quantityToCraft: batchesToCraft,
     children: [],
     depth,
   };
 
   // Find prerequisites for each component
+  // Calculate total components needed for all batches
   for (const comp of goalRecipe.components) {
-    const totalCompNeeded = comp.quantity * quantityToCraft;
+    const totalCompNeeded = comp.quantity * batchesToCraft;
     const compHave = countItemFn(comp.item_id);
     const compToCraft = Math.max(0, totalCompNeeded - compHave);
 
@@ -102,19 +103,17 @@ function buildCraftingTree(
 
     // Find recipe for this component
     const prereqRecipe = findRecipeForItem(comp.item_id, recipes);
-    
+
     if (!prereqRecipe) {
       // No recipe to craft this - it's a base material
-      // We'll handle it as a missing material in the plan
       continue;
     }
 
     // Recursively build tree for prerequisite
-    // compToCraft is already the deficit, so pass 0 as quantityHave to avoid double-counting
+    // compToCraft is already the deficit in items
     const childNode = buildCraftingTree(
       prereqRecipe,
-      Math.ceil(compToCraft / (prereqRecipe.output_quantity || 1)),
-      0,  // compToCraft is already the net amount needed, don't subtract compHave again
+      compToCraft,
       recipes,
       countItemFn,
       depth + 1,
@@ -175,12 +174,10 @@ export function calculateCraftingPlan(
     return null;
   }
 
-  // goalQuantity is already the deficit (limit - currentStock), so we don't subtract quantityHave again
-  // Pass 0 as quantityHave to avoid double-counting
+  // goalQuantity is already the deficit (limit - currentStock), so we pass it directly as items to craft
   const tree = buildCraftingTree(
     goalRecipe,
     goalQuantity,
-    0,  // quantityHave is already accounted for in goalQuantity (the deficit)
     recipes,
     countItemFn,
   );
@@ -244,16 +241,15 @@ export function calculateMultiGoalPlan(
     
     if (!goalRecipe) continue;
     
-    const quantityHave = inventory.get(goal.itemId) || 0;
-    const quantityNeeded = goal.quantity;
-    const quantityToCraft = Math.max(0, quantityNeeded - quantityHave);
+    // goal.quantity is already the deficit (limit - currentStock),
+    // so use it directly without subtracting quantityHave again
+    const quantityToCraft = goal.quantity;
     
     if (quantityToCraft <= 0) continue;
 
     const tree = buildCraftingTree(
       goalRecipe,
       quantityToCraft,
-      0,  // quantityToCraft is already the deficit
       recipes,
       (itemId) => inventory.get(itemId) || 0,
     );

@@ -5861,6 +5861,35 @@ function renderCrafterSettings(panel) {
       <div id="craft-add-detail" style="font-size:0.75em;color:var(--dim);margin-top:4px"></div>
     </div>
 
+    <!-- Ship Loadout Management Section -->
+    <div style="margin-top:16px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🚀 Ship Commission Loadouts</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
+        Complete materials and modules needed to commission a ship from the shipyard.
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="ship-loadout-select" style="flex:1;min-width:150px;max-width:250px">
+          <option value="">-- Select Ship Loadout --</option>
+        </select>
+        <button class="sm primary" onclick="loadShipLoadout()" id="ship-load-load-btn" disabled>Load</button>
+        <button class="sm" onclick="saveShipLoadoutPrompt()">💾 Save</button>
+        <button class="sm danger" onclick="deleteShipLoadout()" id="ship-load-delete-btn" disabled>🗑 Delete</button>
+      </div>
+      <div style="font-size:11px;color:var(--dim);margin-top:6px" id="ship-loadout-count">
+        No ship loadouts saved yet. Select a ship and click Save to create one.
+      </div>
+    </div>
+
+    <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🛸 Select Ship to Commission</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+        <select id="ship-select" onchange="onShipSelect()" style="flex:1;min-width:150px">
+          <option value="">-- Select Ship --</option>
+        </select>
+      </div>
+      <div id="ship-details-panel"></div>
+    </div>
+
     <div class="setting-row" style="margin-top:16px">
       <div>
         <div class="setting-label">Enabled Categories</div>
@@ -5953,6 +5982,10 @@ function renderCrafterSettings(panel) {
 
   // Populate item dropdown for initially selected category
   updateCraftItemSelect();
+  
+  // Populate ship dropdown and load ship loadouts
+  populateShipDropdown();
+  updateShipLoadoutSelect();
 }
 
 function updateCraftItemSelect() {
@@ -6219,6 +6252,279 @@ async function deleteLoadout() {
     }
   } catch (e) {
     alert(`Failed to delete loadout: ${e.message}`);
+  }
+}
+
+// ── Ship Loadouts ───────────────────────────────────────
+
+// Initialize ship dropdown from catalog
+function populateShipDropdown() {
+  const shipSelect = document.getElementById('ship-select');
+  if (!shipSelect || !catalog.ships) return;
+  
+  const ships = Object.values(catalog.ships).sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''));
+  shipSelect.innerHTML = '<option value="">-- Select Ship --</option>' + 
+    ships.map(ship => {
+      const id = ship.id || '';
+      const name = ship.name || id;
+      const faction = ship.faction ? ` [${ship.faction}]` : '';
+      const category = ship.category ? ` - ${ship.category}` : '';
+      const shipClass = ship.class ? ` (${ship.class})` : '';
+      return `<option value="${esc(id)}">${esc(name)}${esc(faction)}${esc(category)}${esc(shipClass)}</option>`;
+    }).join('');
+}
+
+// Handle ship selection change
+function onShipSelect() {
+  const shipSelect = document.getElementById('ship-select');
+  const detailsPanel = document.getElementById('ship-details-panel');
+  if (!shipSelect || !detailsPanel) return;
+  
+  const shipId = shipSelect.value;
+  if (!shipId || !catalog.ships?.[shipId]) {
+    detailsPanel.innerHTML = '';
+    return;
+  }
+  
+  const ship = catalog.ships[shipId];
+  detailsPanel.innerHTML = renderShipDetails(ship);
+}
+
+// Render ship details (materials + modules)
+function renderShipDetails(ship) {
+  const buildMaterials = ship.build_materials || [];
+  const defaultModules = ship.default_modules || [];
+  
+  // Build materials list
+  const materialsHtml = buildMaterials.length > 0 
+    ? buildMaterials.map(mat => {
+        const item = catalog.items?.[mat.item_id];
+        const itemName = item?.name || mat.item_id;
+        const itemSize = item?.size ?? 1;
+        const baseValue = item?.base_value || 0;
+        const totalValue = baseValue * mat.quantity;
+        return `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;border-bottom:1px solid var(--border);font-size:12px">
+            <div style="flex:1">
+              <span style="color:var(--text-bright)">${esc(itemName)}</span>
+              <span style="color:var(--dim);margin-left:6px">(${mat.quantity}x)</span>
+            </div>
+            <div style="color:var(--dim);font-size:11px">
+              Size: ${itemSize * mat.quantity} | Value: ~${totalValue.toLocaleString()}cr
+            </div>
+          </div>`;
+      }).join('')
+    : '<div style="padding:8px;color:var(--dim)">No build materials required</div>';
+  
+  // Modules list
+  const modulesHtml = defaultModules.length > 0
+    ? defaultModules.map(mod => {
+        const item = catalog.items?.[mod];
+        const itemName = item?.name || mod;
+        const baseValue = item?.base_value || 0;
+        const category = item?.category ? `<span style="color:var(--dim);font-size:10px;margin-left:6px">[${esc(item.category)}]</span>` : '';
+        return `
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;border-bottom:1px solid var(--border);font-size:12px">
+            <div style="flex:1">
+              <span style="color:var(--text-bright)">${esc(itemName)}</span>
+              ${category}
+            </div>
+            <div style="color:var(--dim);font-size:11px">
+              Value: ~${baseValue.toLocaleString()}cr
+            </div>
+          </div>`;
+      }).join('')
+    : '<div style="padding:8px;color:var(--dim)">No default modules</div>';
+  
+  // Calculate totals
+  const totalMaterials = buildMaterials.reduce((sum, mat) => {
+    const item = catalog.items?.[mat.item_id];
+    return sum + ((item?.size ?? 1) * mat.quantity);
+  }, 0);
+  
+  const totalModules = defaultModules.reduce((sum, mod) => {
+    const item = catalog.items?.[mod];
+    return sum + (item?.size ?? 0);
+  }, 0);
+  
+  const totalValue = [
+    ...buildMaterials.map(mat => (catalog.items?.[mat.item_id]?.base_value || 0) * mat.quantity),
+    ...defaultModules.map(mod => catalog.items?.[mod]?.base_value || 0)
+  ].reduce((sum, val) => sum + val, 0);
+  
+  return `
+    <div style="margin-top:8px">
+      <div style="font-weight:600;margin-bottom:6px;color:var(--text-bright)">${esc(ship.name || ship.id)}</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">${esc(ship.description || '')}</div>
+      
+      <div style="margin-bottom:8px">
+        <div style="font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:4px">📦 Build Materials (${buildMaterials.length} items, Size: ${totalMaterials})</div>
+        <div style="border:1px solid var(--border);border-radius:4px;background:var(--bg-input);max-height:150px;overflow-y:auto">
+          ${materialsHtml}
+        </div>
+      </div>
+      
+      <div style="margin-bottom:8px">
+        <div style="font-size:11px;font-weight:600;color:var(--text-dim);margin-bottom:4px">🔧 Default Modules (${defaultModules.length} items, Size: ${totalModules})</div>
+        <div style="border:1px solid var(--border);border-radius:4px;background:var(--bg-input);max-height:150px;overflow-y:auto">
+          ${modulesHtml}
+        </div>
+      </div>
+      
+      <div style="padding:6px 8px;border:1px solid var(--border);border-radius:4px;background:var(--card-bg);font-size:11px;display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <span style="color:var(--text-bright)">Total Materials:</span>
+          <span style="margin-left:8px">${buildMaterials.length} types</span>
+          <span style="margin-left:12px">Modules:</span>
+          <span style="margin-left:8px">${defaultModules.length} items</span>
+        </div>
+        <div style="color:var(--text-bright)">
+          Est. Value: ~${totalValue.toLocaleString()}cr
+        </div>
+      </div>
+    </div>`;
+}
+
+// Ship loadout storage (localStorage)
+function getShipLoadouts() {
+  try {
+    const data = localStorage.getItem('spacemolt_ship_loadouts');
+    return data ? JSON.parse(data) : {};
+  } catch (e) {
+    console.warn('Failed to load ship loadouts:', e);
+    return {};
+  }
+}
+
+function saveShipLoadoutToStorage(name, data) {
+  try {
+    const loadouts = getShipLoadouts();
+    loadouts[name] = data;
+    localStorage.setItem('spacemolt_ship_loadouts', JSON.stringify(loadouts));
+    return true;
+  } catch (e) {
+    console.warn('Failed to save ship loadout:', e);
+    return false;
+  }
+}
+
+function deleteShipLoadoutFromStorage(name) {
+  try {
+    const loadouts = getShipLoadouts();
+    delete loadouts[name];
+    localStorage.setItem('spacemolt_ship_loadouts', JSON.stringify(loadouts));
+    return true;
+  } catch (e) {
+    console.warn('Failed to delete ship loadout:', e);
+    return false;
+  }
+}
+
+// Update ship loadout dropdown
+function updateShipLoadoutSelect() {
+  const select = document.getElementById('ship-loadout-select');
+  const countEl = document.getElementById('ship-loadout-count');
+  const loadBtn = document.getElementById('ship-load-load-btn');
+  const deleteBtn = document.getElementById('ship-load-delete-btn');
+  if (!select) return;
+  
+  const loadouts = getShipLoadouts();
+  const loadoutNames = Object.keys(loadouts).sort();
+  
+  select.innerHTML = '<option value="">-- Select Ship Loadout --</option>' +
+    loadoutNames.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('');
+  
+  if (countEl) {
+    countEl.textContent = loadoutNames.length > 0 
+      ? `${loadoutNames.length} ship loadout(s) saved`
+      : 'No ship loadouts saved yet. Select a ship and click Save to create one.';
+  }
+  
+  if (loadBtn) loadBtn.disabled = loadoutNames.length === 0;
+  if (deleteBtn) deleteBtn.disabled = loadoutNames.length === 0;
+}
+
+// Save ship loadout
+function saveShipLoadoutPrompt() {
+  const shipSelect = document.getElementById('ship-select');
+  const shipId = shipSelect?.value;
+  if (!shipId) {
+    alert('Please select a ship first before saving a loadout.');
+    return;
+  }
+  
+  const name = prompt('Enter a name for this ship loadout:');
+  if (!name || !name.trim()) return;
+  saveShipLoadout(name.trim());
+}
+
+function saveShipLoadout(name) {
+  const shipSelect = document.getElementById('ship-select');
+  const shipId = shipSelect?.value;
+  if (!shipId || !catalog.ships?.[shipId]) {
+    alert('No ship selected or ship not found in catalog.');
+    return;
+  }
+  
+  const ship = catalog.ships[shipId];
+  const loadoutData = {
+    shipId: shipId,
+    shipName: ship.name || shipId,
+    buildMaterials: ship.build_materials || [],
+    defaultModules: ship.default_modules || [],
+    savedAt: new Date().toISOString()
+  };
+  
+  const success = saveShipLoadoutToStorage(name, loadoutData);
+  if (success) {
+    updateShipLoadoutSelect();
+    alert(`Ship loadout "${name}" saved successfully!`);
+  } else {
+    alert('Failed to save ship loadout.');
+  }
+}
+
+// Load ship loadout
+function loadShipLoadout() {
+  const select = document.getElementById('ship-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a ship loadout to load.');
+    return;
+  }
+  
+  const loadouts = getShipLoadouts();
+  const loadout = loadouts[name];
+  if (!loadout) {
+    alert(`Ship loadout "${name}" not found!`);
+    return;
+  }
+  
+  // Select the ship in the dropdown
+  const shipSelect = document.getElementById('ship-select');
+  if (shipSelect && loadout.shipId) {
+    shipSelect.value = loadout.shipId;
+    onShipSelect(); // Trigger ship details display
+  }
+}
+
+// Delete ship loadout
+async function deleteShipLoadout() {
+  const select = document.getElementById('ship-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a ship loadout to delete.');
+    return;
+  }
+  
+  if (!confirm(`Are you sure you want to delete the ship loadout "${name}"?`)) return;
+  
+  const success = deleteShipLoadoutFromStorage(name);
+  if (success) {
+    updateShipLoadoutSelect();
+    alert(`Ship loadout "${name}" deleted.`);
+  } else {
+    alert('Failed to delete ship loadout.');
   }
 }
 

@@ -747,6 +747,40 @@ function pickTargetFromQuotas(
   return entries[0].resourceId;
 }
 
+/**
+ * Enhanced quota picker that always returns a target, even when all quotas are met.
+ * When all quotas are met, picks the resource closest to deficit (smallest surplus).
+ * This ensures the miner keeps cycling through ores based on quota priorities.
+ */
+function pickTargetFromQuotasOrClosest(
+  quotas: Record<string, number>,
+  factionStorage: Array<{ itemId: string; quantity: number }>,
+  miningType: "ore" | "gas" | "ice"
+): { target: string; hasDeficit: boolean } {
+  const entries: Array<{ resourceId: string; deficit: number; current: number; target: number }> = [];
+
+  for (const [resourceId, target] of Object.entries(quotas)) {
+    if (target <= 0) continue;
+    const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
+    const deficit = target - current;
+    entries.push({ resourceId, deficit, current, target });
+  }
+
+  if (entries.length === 0) return { target: "", hasDeficit: false };
+
+  // Check if any have deficit
+  const withDeficit = entries.filter(e => e.deficit > 0);
+  if (withDeficit.length > 0) {
+    // Sort: biggest deficit first
+    withDeficit.sort((a, b) => b.deficit - a.deficit);
+    return { target: withDeficit[0].resourceId, hasDeficit: true };
+  }
+
+  // All quotas met - pick the one with smallest surplus (closest to needing more)
+  entries.sort((a, b) => a.deficit - b.deficit); // smallest surplus first (most negative deficit)
+  return { target: entries[0].resourceId, hasDeficit: false };
+}
+
 /** Find appropriate POI based on mining type. */
 function findMiningPoi(
   pois: Array<{ id: string; name: string; type: string }>,
@@ -1279,6 +1313,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     };
     const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
 
+    // ── CRITICAL FIX: Always refresh faction storage when docked at home ──
+    // This ensures quota decisions are based on fresh data, not cached state
+    if (bot.docked && bot.system === homeSystem) {
+      await bot.refreshFactionStorage();
+      ctx.log("mining", "Refreshed faction storage at home (quota re-evaluation)");
+    }
+
     // ── Check for field_test mission (early game mining mission) ──
     const fieldTestActive = await hasFieldTestMission(ctx);
     if (fieldTestActive) {
@@ -1442,21 +1483,42 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("mining", `Global ${resourceLabel} target configured: ${targetResource} — overriding quotas`);
     }
 
+    // CRITICAL FIX: Always refresh faction storage before quota evaluation
+    // (also refreshed above when docked at home, but ensure it's fresh here too)
     let quotaTargetResource = "";
+    let quotaHasDeficit = false;
     if (!hasGlobalTarget && Object.keys(quotas).length > 0) {
       await bot.refreshFactionStorage();
-      quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
-      if (quotaTargetResource) {
-        ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
+      
+      // When docked at home, use enhanced selection that always picks a target
+      // This ensures the miner keeps cycling through ores even when all quotas are met
+      if (bot.docked && bot.system === homeSystem) {
+        const quotaResult = pickTargetFromQuotasOrClosest(quotas, bot.factionStorage, miningType);
+        quotaTargetResource = quotaResult.target;
+        quotaHasDeficit = quotaResult.hasDeficit;
+        if (quotaTargetResource) {
+          if (quotaHasDeficit) {
+            ctx.log("mining", `Quota pick: ${quotaTargetResource} (has deficit)`);
+          } else {
+            ctx.log("mining", `Quota cycling: ${quotaTargetResource} (all met, smallest surplus)`);
+          }
+        }
       } else {
-        ctx.log("mining", "All quotas met — mining locally");
+        // Original behavior when not at home
+        quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
+        if (quotaTargetResource) {
+          ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
+        } else {
+          ctx.log("mining", "All quotas met — no quota target selected");
+        }
       }
     }
 
     const priorityTarget = hasGlobalTarget ? targetResource : quotaTargetResource;
 
     // ── Recovered session handling ──
-    // Validate recovered session against current priorities (global target and quotas)
+    // CRITICAL FIX: Always validate recovered session against current quotas
+    // This prevents the miner from continuing to mine an ore whose quota is now met
     if (recoveredSession) {
       // Validate that the recovered session's target is compatible with currently detected mining type
       const sessionMiningType = getMiningTypeForResource(recoveredSession.targetResourceId);
@@ -1473,7 +1535,20 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         // If there's a priority target (global or quota) that differs from session target, abandon session
         if (priorityTarget && sessionTarget !== priorityTarget) {
           shouldAbandon = true;
-          reason = hasGlobalTarget ? `global target override (${targetResource})` : `quota priority (${quotaTargetResource})`;
+          reason = hasGlobalTarget ? `global target override (${targetResource})` : `quota priority changed (${quotaTargetResource})`;
+        }
+
+        // CRITICAL FIX: If quotas are now all met (no quota target), but session target's quota is now met,
+        // abandon the session so the miner can switch to the next ore with a deficit
+        if (!shouldAbandon && !hasGlobalTarget && Object.keys(quotas).length > 0) {
+          const sessionQuota = quotas[sessionTarget];
+          if (sessionQuota !== undefined) {
+            const sessionCurrent = bot.factionStorage.find(i => i.itemId === sessionTarget)?.quantity || 0;
+            if (sessionCurrent >= sessionQuota) {
+              shouldAbandon = true;
+              reason = `quota met for ${sessionTarget} (${sessionCurrent}/${sessionQuota}) — switching to next deficit`;
+            }
+          }
         }
 
         if (shouldAbandon) {

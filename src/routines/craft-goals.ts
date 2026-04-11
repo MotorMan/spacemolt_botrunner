@@ -110,10 +110,11 @@ function buildCraftingTree(
     }
 
     // Recursively build tree for prerequisite
+    // compToCraft is already the deficit, so pass 0 as quantityHave to avoid double-counting
     const childNode = buildCraftingTree(
       prereqRecipe,
       Math.ceil(compToCraft / (prereqRecipe.output_quantity || 1)),
-      compHave,
+      0,  // compToCraft is already the net amount needed, don't subtract compHave again
       recipes,
       countItemFn,
       depth + 1,
@@ -169,17 +170,17 @@ export function calculateCraftingPlan(
   countItemFn: (itemId: string) => number,
 ): CraftingPlan | null {
   const goalRecipe = findRecipeForItem(goalItemId, recipes);
-  
+
   if (!goalRecipe) {
     return null;
   }
 
-  const quantityHave = countItemFn(goalItemId);
-  
+  // goalQuantity is already the deficit (limit - currentStock), so we don't subtract quantityHave again
+  // Pass 0 as quantityHave to avoid double-counting
   const tree = buildCraftingTree(
     goalRecipe,
     goalQuantity,
-    quantityHave,
+    0,  // quantityHave is already accounted for in goalQuantity (the deficit)
     recipes,
     countItemFn,
   );

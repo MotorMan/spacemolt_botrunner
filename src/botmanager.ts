@@ -24,7 +24,7 @@ import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
 import { setLogSink } from "./ui.js";
-import { debugLogForBot } from "./debug.js";
+import { debugLogForBot, logBotActivity } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { AiChatService } from "./aichat_service.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
@@ -122,6 +122,7 @@ function setupBotLogging(bot: Bot): void {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
     const line = `${timestamp} [${username}] [${category}] ${message}`;
     debugLogForBot(username, "bot:onLog", `${username} cat=${category}`, message);
+    logBotActivity(username, category, message);
     if (category === "system" || category === "error") {
       server.logSystem(line);
     }

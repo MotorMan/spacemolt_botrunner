@@ -902,18 +902,16 @@ function connect() {
         renderBots();
         renderStats();
         updateChatBotSelect();
-        // Update profile if open
+        // Update profile sidebar if open (location, credits, cargo, etc.)
         if (profileBot) {
+          updateProfileSidebar();
+          
+          // If bot changed systems or docked status, refresh relevant data
+          // (renderManualControls will be called when the data fetches complete)
           const bot = bots.find(b => b.username === profileBot);
           const prevBot = window._profilePrevBot;
           window._profilePrevBot = bot;
           
-          renderProfileSidebar();
-          // Re-render manual controls to update station/system-dependent dropdowns
-          // (travel targets, jump targets, cargo withdraw/deposit options, etc.)
-          renderManualControls();
-          
-          // If bot changed systems or docked status, refresh relevant data
           if (bot && prevBot && (bot.system !== prevBot.system || bot.docked !== prevBot.docked)) {
             // System changed or docked/undocked - refresh system data
             profileSystemData = null;
@@ -1875,11 +1873,18 @@ function renderProfileTopbar() {
     return;
   }
   pendingBotRender = false;
-  
+
+  // Also skip actions re-render if ANY element in profile page is focused (e.g., manual controls)
+  const profilePage = document.getElementById('page-profile');
+  const shouldUpdateActions = !profilePage || !profilePage.contains(active);
+
   const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
   document.getElementById('profileName').textContent = bot.username;
   document.getElementById('profileShip').textContent = bot.shipName || 'No ship';
   document.getElementById('profileBadge').innerHTML = `<span class="state-badge state-${bot.state}">${esc(stateLabel)}</span>`;
+
+  // Only update actions if nothing is focused in the profile page
+  if (!shouldUpdateActions) return;
 
   let actions = '';
   if (bot.state !== 'running' && bot.state !== 'stopping') {
@@ -2382,6 +2387,58 @@ function renderProfileSidebar() {
 
     ${renderPerBotSettings(bot)}
   `;
+}
+
+/** Update profile sidebar without rebuilding the entire DOM (preserves focus/selection) */
+function updateProfileSidebar() {
+  const bot = getProfileBot();
+  if (!bot) return;
+
+  const sidebar = document.getElementById('profileSidebar');
+  if (!sidebar) return;
+
+  const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
+  const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
+
+  // Update status card values individually (always safe - these are read-only text)
+  const statGrid = sidebar.querySelector('.stat-grid');
+  if (statGrid) {
+    const values = statGrid.querySelectorAll('.sv');
+    if (values.length >= 8) {
+      values[0].textContent = `${num(bot.credits)}cr`; // Credits
+      values[1].textContent = `${bot.fuel} / ${bot.maxFuel} (${fuelPct}%)`; // Fuel
+      values[2].textContent = `${bot.hull} / ${bot.maxHull}`; // Hull
+      values[3].textContent = `${bot.shield} / ${bot.maxShield}`; // Shield
+      values[4].textContent = `${bot.cargo} / ${bot.cargoMax}`; // Cargo
+      values[5].textContent = `${bot.ammo}`; // Ammo
+      values[6].textContent = loc; // Location
+      values[7].textContent = bot.docked ? 'Yes' : 'No'; // Docked
+    }
+  }
+
+  // Only update cargo/storage/skills cards if sidebar doesn't have focus
+  if (!sidebar.contains(document.activeElement)) {
+    // Update cargo hold
+    const invItems = bot.inventory && bot.inventory.length > 0
+      ? bot.inventory.map(i => `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`).join('')
+      : '<div class="inv-empty">Empty</div>';
+    const cargoCard = sidebar.querySelector('.profile-card:nth-child(2) .inv-list');
+    if (cargoCard) cargoCard.innerHTML = invItems;
+
+    // Update station storage
+    const storItems = bot.storage && bot.storage.length > 0
+      ? bot.storage.map(i => `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`).join('')
+      : '<div class="inv-empty">Empty</div>';
+    const storageCard = sidebar.querySelector('.profile-card:nth-child(3) .inv-list');
+    if (storageCard) storageCard.innerHTML = storItems;
+
+    // Update skills card if skills are loaded
+    const skillsCard = sidebar.querySelector('.profile-card:nth-child(4) .inv-list');
+    if (skillsCard) skillsCard.innerHTML = renderSkillsList();
+
+    // Update topbar (safe when sidebar not focused)
+    renderProfileTopbar();
+  }
 }
 
 function renderSkillsList() {

@@ -3,6 +3,7 @@ import { join } from "path";
 
 const DATA_DIR = join(process.cwd(), "data");
 const LOGS_DIR = join(DATA_DIR, "logs");
+const ACTIVITY_LOGS_DIR = join(LOGS_DIR, "activity");
 const GLOBAL_LOG_FILE = join(LOGS_DIR, "debug.log");
 
 // Ensure directories exist once at module load
@@ -11,6 +12,9 @@ if (!existsSync(DATA_DIR)) {
 }
 if (!existsSync(LOGS_DIR)) {
   mkdirSync(LOGS_DIR, { recursive: true });
+}
+if (!existsSync(ACTIVITY_LOGS_DIR)) {
+  mkdirSync(ACTIVITY_LOGS_DIR, { recursive: true });
 }
 
 let enabled = true;
@@ -60,6 +64,23 @@ export function debugLogForBot(botName: string, source: string, message: string,
   line += "\n";
   try {
     const botLogFile = join(LOGS_DIR, `${botName}_debug.log`);
+    appendFileSync(botLogFile, line);
+  } catch {
+    // ignore write errors
+  }
+}
+
+/**
+ * Write to a specific bot's activity log file.
+ * This creates compact, human/LLM-readable activity logs in data/logs/activity/{botName}_activity.log
+ * Designed for song lyric generation - contains only the essential activity information.
+ */
+export function logBotActivity(botName: string, category: string, message: string): void {
+  if (!enabled) return;
+  const timestamp = new Date().toISOString();
+  const line = `${timestamp} [${botName}] [${category}] ${message}\n`;
+  try {
+    const botLogFile = join(ACTIVITY_LOGS_DIR, `${botName}_activity.log`);
     appendFileSync(botLogFile, line);
   } catch {
     // ignore write errors

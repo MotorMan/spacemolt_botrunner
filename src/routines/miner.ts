@@ -2370,6 +2370,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     const resourcesMinedMap = new Map<string, number>();
     let lastPoiCheck = 0;
     let lastBattleCheck = 0;
+    let miningErrorCount = 0; // Track consecutive mining errors for retry logic
     const POI_CHECK_INTERVAL_MS = 600_000; // Check POI remaining every 10 minutes
     const BATTLE_CHECK_INTERVAL_MS = 8_000; // Check battle status every 8 seconds (< 1 game tick)
 
@@ -3300,14 +3301,114 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           stopReason = "cargo full"; break;
         }
         if (msg.includes("harvester") || msg.includes("equipment") || msg.includes("mining")) {
-          ctx.log("error", `Missing ${resourceLabel} harvesting module: ${mineResp.error.message}`);
-          await sleep(30000);
-          return;
+          // EQUIPMENT ERROR: Verify POI resources before treating as fatal
+          // This prevents false positives from server timeouts that cause state confusion
+          ctx.log("warn", `Mining equipment error: ${mineResp.error.message}`);
+          
+          // Verify what resources are actually available at this POI
+          let poiHasTargetResource = false;
+          let poiResourceTypes: string[] = [];
+          
+          try {
+            const verifyResp = await bot.exec("get_poi", { poi_id: bot.poi });
+            if (!verifyResp.error && verifyResp.result) {
+              const result = verifyResp.result as Record<string, unknown>;
+              const poiData = result?.poi as Record<string, unknown> | undefined;
+              const resources = Array.isArray(result.resources)
+                ? (result.resources as Array<Record<string, unknown>>)
+                : Array.isArray(poiData?.resources)
+                ? (poiData.resources as Array<Record<string, unknown>>)
+                : [];
+
+              for (const res of resources) {
+                const resId = (res.resource_id as string) || (res.id as string) || "";
+                const remaining = (res.remaining as number) ?? (res.quantity as number) ?? 0;
+                if (resId) {
+                  poiResourceTypes.push(resId);
+                  if (resId === effectiveTarget && remaining > 0) {
+                    poiHasTargetResource = true;
+                  }
+                }
+              }
+              
+              ctx.log("mining", `POI resource check at ${miningPoi?.name || 'unknown'}: ${poiResourceTypes.length > 0 ? poiResourceTypes.join(', ') : 'none detected'}`);
+              if (effectiveTarget) {
+                ctx.log("mining", `Target resource ${effectiveTarget}: ${poiHasTargetResource ? 'AVAILABLE' : 'NOT FOUND'}`);
+              }
+            }
+          } catch (e) {
+            ctx.log("warn", `Failed to verify POI resources: ${e}`);
+          }
+
+          // If the target resource is confirmed available, this is likely a transient error
+          // Retry instead of exiting the routine
+          if (poiHasTargetResource) {
+            ctx.log("warn", `Equipment error but target resource is available — likely transient error, will retry`);
+            await sleep(5000);
+            continue; // Retry mining
+          }
+          
+          // Resource not available - check if POI type mismatch
+          const hasGasResources = poiResourceTypes.some(r => r.includes('gas') || getMiningTypeForResource(r) === 'gas');
+          const hasIceResources = poiResourceTypes.some(r => r.includes('ice') || getMiningTypeForResource(r) === 'ice');
+          const hasOreResources = poiResourceTypes.some(r => !r.includes('gas') && !r.includes('ice') && getMiningTypeForResource(r) === 'ore');
+          
+          // Determine actual POI type from resources
+          let actualPoiType: "ore" | "gas" | "ice" | "unknown" = "unknown";
+          if (hasGasResources && !hasOreResources && !hasIceResources) actualPoiType = "gas";
+          else if (hasIceResources && !hasOreResources && !hasGasResources) actualPoiType = "ice";
+          else if (hasOreResources || (hasGasResources && hasIceResources)) actualPoiType = "ore"; // Mixed = likely ore belt
+          
+          // Check if there's a type mismatch
+          if (actualPoiType !== "unknown" && actualPoiType !== miningType) {
+            ctx.log("error", `POI type mismatch: mining ${miningType} but POI has ${actualPoiType} resources — searching for correct POI type`);
+            // Mark current POI as wrong type and search for alternative
+            miningPoi = null;
+            
+            // Search for correct POI type in current system
+            const altPoi = pois.find(p => {
+              if (miningType === "ore") return isOreBeltPoi(p.type);
+              if (miningType === "gas") return isGasCloudPoi(p.type);
+              if (miningType === "ice") return isIceFieldPoi(p.type);
+              return false;
+            });
+            
+            if (altPoi) {
+              ctx.log("mining", `Found correct POI type: ${altPoi.name}`);
+              const travelResp = await bot.exec("travel", { target_poi: altPoi.id });
+              if (!travelResp.error || travelResp.error.message.includes("already")) {
+                bot.poi = altPoi.id;
+                miningPoi = { id: altPoi.id, name: altPoi.name };
+                continue; // Continue mining at correct POI
+              }
+            }
+            
+            // No alternative found - return to station
+            ctx.log("error", `No correct POI type found — returning to station`);
+            stopReason = "POI type mismatch (no alternatives)";
+            break;
+          }
+          
+          // GENUINE EQUIPMENT ERROR: No resources at all or truly missing equipment
+          // Only exit after multiple retries to handle transient issues
+          miningErrorCount = (miningErrorCount || 0) + 1;
+          if (miningErrorCount >= 3) {
+            ctx.log("error", `Missing ${resourceLabel} harvesting module after ${miningErrorCount} retries: ${mineResp.error.message}`);
+            ctx.log("error", `Genuine equipment issue detected — returning to station`);
+            stopReason = "missing harvesting module";
+            break;
+          }
+          
+          ctx.log("warn", `Equipment error (${miningErrorCount}/3) — retrying in 10s...`);
+          await sleep(10000);
+          continue; // Retry mining
         }
         ctx.log("error", `Harvest error: ${mineResp.error.message}`);
         break;
       }
 
+      // Successful mining - reset error counter
+      miningErrorCount = 0;
       harvestCycles++;
 
       const { oreId, oreName } = parseOreFromMineResult(mineResp.result);

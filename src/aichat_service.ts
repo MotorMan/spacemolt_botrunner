@@ -1623,6 +1623,12 @@ Context:
 - Stranded pilot is in: ${context.targetSystem}${context.jumps ? ` (${context.jumps} jumps away)` : ""}
 - ${context.situation}
 
+IMPORTANT NOTES ABOUT FUEL:
+${context.playerFuelPct !== undefined ? `- The STRANDED PILOT'S fuel level is ${context.playerFuelPct}% (this is THEIR fuel, NOT yours)` : `- Fuel levels are not specified - focus on the situation described`}
+${context.fuelRefueled !== undefined ? `- You transferred ${context.fuelRefueled} fuel units to the stranded pilot` : ''}
+- NEVER confuse the stranded pilot's fuel level with your own fuel level
+- When referring to fuel, always clarify whose fuel you're talking about
+
 Task:
 Generate a brief radio transmission message (max 2 sentences) to send via private chat to the stranded pilot.
 

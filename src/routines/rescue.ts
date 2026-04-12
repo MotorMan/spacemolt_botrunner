@@ -38,6 +38,7 @@ import {
   completeRescueSession,
   failRescueSession,
   isMaydayDuplicate,
+  markMaydayReceived,
   type RescueSession,
 } from "./rescueActivity.js";
 import { isKnownPlayer } from "../playernames.js";
@@ -1091,6 +1092,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           }
           ctx.log("mayday_debug", `✓ Not a duplicate MAYDAY`);
 
+          // Mark this MAYDAY as recently received to prevent processing duplicates
+          // This must be done BEFORE any other processing to catch rapid-fire duplicates
+          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
+          ctx.log("mayday_debug", `📝 Marked MAYDAY from ${mayday.sender} as recently received (5min cooldown)`);
+
           // ── PIRATE BASE PROXIMITY CHECK: Decline MAYDAYs too close to pirate bases ──
           // This prevents the bot from getting stuck in loops trying to rescue players
           // in systems that are blacklisted due to pirate base proximity
@@ -1107,29 +1113,35 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             const pirateProximity = await checkPirateBaseProximity(ctx, mayday.system, pirateProximityThreshold);
             if (pirateProximity) {
               ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - too close to pirate base ${pirateProximity.pirateSystem} (${pirateProximity.jumps} jumps away)`);
-              
+
               // Add lockout to prevent repeated MAYDAY processing
               const lockoutMinutes = settings.maydayPirateLockoutMinutes;
               addMaydayPirateLockout(mayday.sender, lockoutMinutes);
-              
+
               // Send decline message to the player via private message
               const aiChatService = (globalThis as any).aiChatService;
               if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
                 try {
                   await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                    situation: `You are declining their MAYDAY rescue request because their location is too close to a pirate base (${pirateProximity.pirateSystem}, only ${pirateProximity.jumps} jumps away). This is a safety measure as your bots cannot safely navigate through blacklisted pirate systems. The MAYDAY will be locked out for ${lockoutMinutes} minutes to prevent repeated requests.`,
+                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: Their location (${mayday.system}/${mayday.poi}) is too close to a pirate base (${pirateProximity.pirateSystem}, only ${pirateProximity.jumps} jumps away). Your ships cannot safely navigate through blacklisted pirate systems due to safety restrictions.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a restricted zone near pirate territory. Tell them you're sorry but you physically cannot reach them. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
                     currentSystem: ctx.bot.system,
                     targetSystem: mayday.system,
                     jumps: pirateProximity.jumps,
                     fuelRefueled: undefined,
-                    playerFuelPct: mayday.fuelPct,
+                    playerFuelPct: undefined,
                   });
                   ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender}`);
                 } catch (e) {
                   ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
                 }
               }
-              
+
               markMaydayHandled(mayday);
               continue;
             }
@@ -1176,9 +1188,15 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
               try {
                 await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                  situation: `Declining MAYDAY - your location (${mayday.system}) is in a blacklisted system we cannot navigate to.`,
+                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: Their location (${mayday.system}) is in a blacklisted system that your ships cannot navigate to. This is a hard restriction - you physically cannot reach them.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a system you cannot access. Apologize and tell them they'll need to find alternative help. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
                   currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
-                  fuelRefueled: undefined, playerFuelPct: mayday.fuelPct,
+                  fuelRefueled: undefined, playerFuelPct: undefined,
                 });
               } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
             }
@@ -1214,9 +1232,15 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
               try {
                 await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                  situation: `Declining MAYDAY - no safe route to your location (${mayday.system}).`,
+                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: There is no safe route to their location (${mayday.system}). All possible paths are blocked or too dangerous for your ships to navigate.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because there's no safe way to reach their location. Apologize and suggest they'll need to find help from someone closer or in a different system. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
                   currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
-                  fuelRefueled: undefined, playerFuelPct: mayday.fuelPct,
+                  fuelRefueled: undefined, playerFuelPct: undefined,
                 });
               } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
             }
@@ -2923,11 +2947,14 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
       try {
         const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
-          situation: `You are responding to their MAYDAY distress call. You are coming to rescue them with fuel.`,
+          situation: `You are responding to their MAYDAY distress call. You are coming to rescue them with fuel. You have accepted their MAYDAY and are en route to their location.
+
+IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a decline. The player's fuel level is ${mayday.fuelPct}% - they are in critical condition and need immediate help.`,
           currentSystem: bot.system,
           targetSystem: mayday.system,
           jumps: jumpsToTarget > 0 ? jumpsToTarget : undefined,
           playerFuelPct: mayday.fuelPct,
+          fuelRefueled: undefined,
         });
         if (result.ok) {
           ctx.log("mayday", `✓ Sent "on my way" private message to ${mayday.sender}`);
@@ -3097,12 +3124,12 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       try {
         const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
           situation: fuelTransferred > 0
-            ? `You have successfully refueled the stranded pilot. They are now safe and can continue their journey.`
+            ? `You have successfully refueled the stranded pilot. They are now safe and can continue their journey. You transferred ${fuelTransferred} fuel units to them.`
             : `You arrived to help but couldn't provide fuel. You did your best to assist.`,
-          currentSystem: mayday.system, // Now at same system
+          currentSystem: mayday.system,
           targetSystem: mayday.system,
           fuelRefueled: fuelTransferred > 0 ? fuelTransferred : undefined,
-          playerFuelPct: targetFuelBefore,
+          playerFuelPct: undefined, // Don't pass player fuel - confuses LLM about whose fuel it is
         });
         if (result.ok) {
           ctx.log("mayday", `✓ Sent "rescue complete" private message to ${mayday.sender}`);
@@ -3635,6 +3662,11 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           }
           ctx.log("mayday_debug", `✓ Not a duplicate MAYDAY`);
 
+          // Mark this MAYDAY as recently received to prevent processing duplicates
+          // This must be done BEFORE any other processing to catch rapid-fire duplicates
+          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
+          ctx.log("mayday_debug", `📝 Marked MAYDAY from ${mayday.sender} as recently received (5min cooldown)`);
+
           // ── PIRATE BASE PROXIMITY CHECK: Decline MAYDAYs too close to pirate bases ──
           // This prevents the bot from getting stuck in loops trying to rescue players
           // in systems that are blacklisted due to pirate base proximity
@@ -3651,29 +3683,35 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             const pirateProximity = await checkPirateBaseProximity(ctx, mayday.system, pirateProximityThreshold);
             if (pirateProximity) {
               ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - too close to pirate base ${pirateProximity.pirateSystem} (${pirateProximity.jumps} jumps away)`);
-              
+
               // Add lockout to prevent repeated MAYDAY processing
               const lockoutMinutes = settings.maydayPirateLockoutMinutes;
               addMaydayPirateLockout(mayday.sender, lockoutMinutes);
-              
+
               // Send decline message to the player via private message
               const aiChatService = (globalThis as any).aiChatService;
               if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
                 try {
                   await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                    situation: `You are declining their MAYDAY rescue request because their location is too close to a pirate base (${pirateProximity.pirateSystem}, only ${pirateProximity.jumps} jumps away). This is a safety measure as your bots cannot safely navigate through blacklisted pirate systems. The MAYDAY will be locked out for ${lockoutMinutes} minutes to prevent repeated requests.`,
+                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: Their location (${mayday.system}/${mayday.poi}) is too close to a pirate base (${pirateProximity.pirateSystem}, only ${pirateProximity.jumps} jumps away). Your ships cannot safely navigate through blacklisted pirate systems due to safety restrictions.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a restricted zone near pirate territory. Tell them you're sorry but you physically cannot reach them. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
                     currentSystem: ctx.bot.system,
                     targetSystem: mayday.system,
                     jumps: pirateProximity.jumps,
                     fuelRefueled: undefined,
-                    playerFuelPct: mayday.fuelPct,
+                    playerFuelPct: undefined,
                   });
                   ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender}`);
                 } catch (e) {
                   ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
                 }
               }
-              
+
               markMaydayHandled(mayday);
               continue;
             }
@@ -3720,9 +3758,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
               try {
                 await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                  situation: `Declining MAYDAY - your location (${mayday.system}) is in a blacklisted system we cannot navigate to.`,
+                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: Their location (${mayday.system}) is in a blacklisted system that your ships cannot navigate to. This is a hard restriction - you physically cannot reach them.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a system you cannot access. Apologize and tell them they'll need to find alternative help. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
                   currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
-                  fuelRefueled: undefined, playerFuelPct: mayday.fuelPct,
+                  fuelRefueled: undefined, playerFuelPct: undefined,
                 });
               } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
             }
@@ -3758,9 +3802,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
               try {
                 await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                  situation: `Declining MAYDAY - no safe route to your location (${mayday.system}).`,
+                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: There is no safe route to their location (${mayday.system}). All possible paths are blocked or too dangerous for your ships to navigate.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because there's no safe way to reach their location. Apologize and suggest they'll need to find help from someone closer or in a different system. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
                   currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
-                  fuelRefueled: undefined, playerFuelPct: mayday.fuelPct,
+                  fuelRefueled: undefined, playerFuelPct: undefined,
                 });
               } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
             }

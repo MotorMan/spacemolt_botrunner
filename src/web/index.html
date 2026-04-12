@@ -5886,6 +5886,7 @@ function renderCrafterSettings(panel) {
         <select id="ship-select" onchange="onShipSelect()" style="flex:1;min-width:150px">
           <option value="">-- Select Ship --</option>
         </select>
+        <button class="sm primary" onclick="addShipToCraftingList()" id="ship-add-btn" disabled>+ Add to Crafting List</button>
       </div>
       <div id="ship-details-panel"></div>
     </div>
@@ -6278,35 +6279,42 @@ function populateShipDropdown() {
 function onShipSelect() {
   const shipSelect = document.getElementById('ship-select');
   const detailsPanel = document.getElementById('ship-details-panel');
+  const addBtn = document.getElementById('ship-add-btn');
   if (!shipSelect || !detailsPanel) return;
-  
+
   const shipId = shipSelect.value;
   if (!shipId || !catalog.ships?.[shipId]) {
     detailsPanel.innerHTML = '';
+    if (addBtn) addBtn.disabled = true;
     return;
   }
-  
+
   const ship = catalog.ships[shipId];
   detailsPanel.innerHTML = renderShipDetails(ship);
+  if (addBtn) addBtn.disabled = false;
 }
 
 // Render ship details (materials + modules)
 function renderShipDetails(ship) {
   const buildMaterials = ship.build_materials || [];
   const defaultModules = ship.default_modules || [];
-  
+  const craftLimits = settings.crafter?.craftLimits || {};
+
   // Build materials list
-  const materialsHtml = buildMaterials.length > 0 
+  const materialsHtml = buildMaterials.length > 0
     ? buildMaterials.map(mat => {
         const item = catalog.items?.[mat.item_id];
         const itemName = item?.name || mat.item_id;
         const itemSize = item?.size ?? 1;
         const baseValue = item?.base_value || 0;
         const totalValue = baseValue * mat.quantity;
+        const alreadyInList = craftLimits[mat.item_id] && craftLimits[mat.item_id] > 0;
+        const statusBadge = alreadyInList ? '<span style="color:#4caf50;margin-left:6px" title="Already in crafting list">✓</span>' : '';
         return `
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;border-bottom:1px solid var(--border);font-size:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;border-bottom:1px solid var(--border);font-size:12px${alreadyInList ? ';background:rgba(76,175,80,0.1)' : ''}">
             <div style="flex:1">
               <span style="color:var(--text-bright)">${esc(itemName)}</span>
+              ${statusBadge}
               <span style="color:var(--dim);margin-left:6px">(${mat.quantity}x)</span>
             </div>
             <div style="color:var(--dim);font-size:11px">
@@ -6315,7 +6323,7 @@ function renderShipDetails(ship) {
           </div>`;
       }).join('')
     : '<div style="padding:8px;color:var(--dim)">No build materials required</div>';
-  
+
   // Modules list
   const modulesHtml = defaultModules.length > 0
     ? defaultModules.map(mod => {
@@ -6323,10 +6331,13 @@ function renderShipDetails(ship) {
         const itemName = item?.name || mod;
         const baseValue = item?.base_value || 0;
         const category = item?.category ? `<span style="color:var(--dim);font-size:10px;margin-left:6px">[${esc(item.category)}]</span>` : '';
+        const alreadyInList = craftLimits[mod] && craftLimits[mod] > 0;
+        const statusBadge = alreadyInList ? '<span style="color:#4caf50;margin-left:6px" title="Already in crafting list">✓</span>' : '';
         return `
-          <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;border-bottom:1px solid var(--border);font-size:12px">
+          <div style="display:flex;justify-content:space-between;align-items:center;padding:4px 8px;border-bottom:1px solid var(--border);font-size:12px${alreadyInList ? ';background:rgba(76,175,80,0.1)' : ''}">
             <div style="flex:1">
               <span style="color:var(--text-bright)">${esc(itemName)}</span>
+              ${statusBadge}
               ${category}
             </div>
             <div style="color:var(--dim);font-size:11px">
@@ -6484,7 +6495,52 @@ function saveShipLoadout(name) {
   }
 }
 
-// Load ship loadout
+// Add currently selected ship's materials and modules to crafting list
+function addShipToCraftingList() {
+  const shipSelect = document.getElementById('ship-select');
+  const shipId = shipSelect?.value;
+  if (!shipId || !catalog.ships?.[shipId]) {
+    alert('Please select a ship first.');
+    return;
+  }
+
+  const ship = catalog.ships[shipId];
+
+  // Initialize crafter settings if needed
+  if (!settings.crafter) settings.crafter = {};
+  if (!settings.crafter.craftLimits) settings.crafter.craftLimits = {};
+
+  // Add build materials to craftLimits
+  let addedCount = 0;
+  for (const mat of ship.build_materials || []) {
+    const itemId = mat.item_id;
+    const quantity = mat.quantity;
+    if (itemId && quantity > 0) {
+      settings.crafter.craftLimits[itemId] = quantity;
+      addedCount++;
+    }
+  }
+
+  // Add default modules to craftLimits
+  for (const mod of ship.default_modules || []) {
+    const item = catalog.items?.[mod];
+    if (item) {
+      settings.crafter.craftLimits[mod] = 1; // 1 of each module
+      addedCount++;
+    }
+  }
+
+  // Re-render the crafter settings to show the new recipes
+  renderCrafterSettings(document.getElementById('settingsContent'));
+
+  if (addedCount > 0) {
+    alert(`Added "${ship.name || shipId}" to crafting list:\n${addedCount} items total (materials + modules).\nClick "Save Settings" to persist.`);
+  } else {
+    alert('No items were added to the crafting list.');
+  }
+}
+
+// Load ship loadout - adds all materials and modules to the crafting recipe list
 function loadShipLoadout() {
   const select = document.getElementById('ship-loadout-select');
   const name = select?.value;
@@ -6492,19 +6548,52 @@ function loadShipLoadout() {
     alert('Please select a ship loadout to load.');
     return;
   }
-  
+
   const loadouts = getShipLoadouts();
   const loadout = loadouts[name];
   if (!loadout) {
     alert(`Ship loadout "${name}" not found!`);
     return;
   }
-  
+
+  // Initialize crafter settings if needed
+  if (!settings.crafter) settings.crafter = {};
+  if (!settings.crafter.craftLimits) settings.crafter.craftLimits = {};
+
+  // Add build materials to craftLimits
+  let addedCount = 0;
+  for (const mat of loadout.buildMaterials) {
+    const itemId = mat.item_id;
+    const quantity = mat.quantity;
+    if (itemId && quantity > 0) {
+      settings.crafter.craftLimits[itemId] = quantity;
+      addedCount++;
+    }
+  }
+
+  // Add default modules to craftLimits
+  for (const mod of loadout.defaultModules) {
+    const item = catalog.items?.[mod];
+    if (item) {
+      settings.crafter.craftLimits[mod] = 1; // 1 of each module
+      addedCount++;
+    }
+  }
+
   // Select the ship in the dropdown
   const shipSelect = document.getElementById('ship-select');
   if (shipSelect && loadout.shipId) {
     shipSelect.value = loadout.shipId;
     onShipSelect(); // Trigger ship details display
+  }
+
+  // Re-render the crafter settings to show the new recipes
+  renderCrafterSettings(document.getElementById('settingsContent'));
+
+  if (addedCount > 0) {
+    alert(`Loaded "${name}": Added ${addedCount} items to crafting list (${loadout.buildMaterials.length} materials, ${loadout.defaultModules.length} modules). Click "Save Settings" to persist.`);
+  } else {
+    alert(`Loaded "${name}" but no items were added.`);
   }
 }
 

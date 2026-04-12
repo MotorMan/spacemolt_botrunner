@@ -223,8 +223,30 @@ export async function clearActiveRescueSession(botUsername: string): Promise<voi
 }
 
 /**
- * Check if a MAYDAY matches the last completed rescue for this bot.
- * This prevents re-triggering the same rescue due to chat caching/duplicates.
+ * Track recently received MAYDAYs to prevent processing duplicates.
+ * This is separate from completed session tracking - it prevents
+ * the same MAYDAY from being processed multiple times while a rescue is in progress.
+ * 
+ * Key: normalized "playername|system|poi" 
+ * Value: timestamp when MAYDAY was first received
+ * 
+ * Entries expire after 5 minutes.
+ */
+const recentMaydayReceived = new Map<string, number>();
+
+/**
+ * Normalize a MAYDAY identifier for deduplication.
+ */
+function normalizeMaydayKey(player: string, system: string, poi?: string): string {
+  const normalize = (s: string) => s.toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+  return `${normalize(player)}|${normalize(system)}|${normalize(poi || '')}`;
+}
+
+/**
+ * Check if a MAYDAY was recently received (within the last 5 minutes).
+ * This prevents processing duplicate MAYDAY messages from the server.
+ * 
+ * @returns true if this MAYDAY was recently processed, false if it's new
  */
 export function isMaydayDuplicate(
   botUsername: string,
@@ -232,29 +254,77 @@ export function isMaydayDuplicate(
   system: string,
   poi?: string
 ): boolean {
+  const maydayKey = normalizeMaydayKey(player, system, poi);
+  const now = Date.now();
+  const fiveMinutes = 5 * 60 * 1000;
+
+  // Check if we recently received this MAYDAY (regardless of completion status)
+  const receivedAt = recentMaydayReceived.get(maydayKey);
+  if (receivedAt) {
+    const timeSinceReceived = now - receivedAt;
+    
+    if (timeSinceReceived < fiveMinutes) {
+      // Still within the cooldown window - this is a duplicate
+      return true;
+    } else {
+      // Expired - remove from tracking
+      recentMaydayReceived.delete(maydayKey);
+    }
+  }
+
+  // Also check against last completed session (existing logic)
   const activity = getBotActivity(botUsername);
   const lastCompleted = activity.lastCompletedSession;
-  
-  if (!lastCompleted) {
-    return false;
+
+  if (lastCompleted) {
+    // Check if completed within last 5 minutes (prevent stale matches)
+    const completedAt = new Date(lastCompleted.completedAt || lastCompleted.lastUpdatedAt).getTime();
+    const timeSinceCompleted = now - completedAt;
+
+    if (timeSinceCompleted < fiveMinutes) {
+      // Normalize for comparison (case-insensitive, handle spaces/underscores)
+      const normalize = (s: string) => s.toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
+
+      const playerMatch = normalize(lastCompleted.targetUsername) === normalize(player);
+      const systemMatch = normalize(lastCompleted.targetSystem) === normalize(system);
+      const poiMatch = !poi || !lastCompleted.targetPoi ||
+                       normalize(lastCompleted.targetPoi) === normalize(poi);
+
+      if (playerMatch && systemMatch && poiMatch) {
+        return true;
+      }
+    }
   }
+
+  return false;
+}
+
+/**
+ * Mark a MAYDAY as recently received. This should be called when a MAYDAY
+ * is first processed (after validation passes).
+ */
+export function markMaydayReceived(
+  player: string,
+  system: string,
+  poi?: string
+): void {
+  const maydayKey = normalizeMaydayKey(player, system, poi);
+  recentMaydayReceived.set(maydayKey, Date.now());
   
-  // Check if completed within last 5 minutes (prevent stale matches)
-  const completedAt = new Date(lastCompleted.completedAt || lastCompleted.lastUpdatedAt).getTime();
+  // Clean up expired entries (keep map small)
+  cleanupExpiredMaydayReceived();
+}
+
+/**
+ * Clean up expired entries from the recent MAYDAY tracking map.
+ */
+function cleanupExpiredMaydayReceived(): void {
   const now = Date.now();
   const fiveMinutes = 5 * 60 * 1000;
   
-  if (now - completedAt > fiveMinutes) {
-    return false;
+  for (const [key, timestamp] of recentMaydayReceived.entries()) {
+    if (now - timestamp >= fiveMinutes) {
+      recentMaydayReceived.delete(key);
+    }
   }
-  
-  // Normalize for comparison (case-insensitive, handle spaces/underscores)
-  const normalize = (s: string) => s.toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
-  
-  const playerMatch = normalize(lastCompleted.targetUsername) === normalize(player);
-  const systemMatch = normalize(lastCompleted.targetSystem) === normalize(system);
-  const poiMatch = !poi || !lastCompleted.targetPoi || 
-                   normalize(lastCompleted.targetPoi) === normalize(poi);
-  
-  return playerMatch && systemMatch && poiMatch;
 }

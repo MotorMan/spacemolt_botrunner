@@ -43,10 +43,58 @@ interface CraftingPlan {
 }
 
 /**
- * Find the recipe that produces a given item.
+ * Score a recipe based on material availability.
+ * Returns a score from 0-100 where higher means more materials are available.
  */
-function findRecipeForItem(itemId: string, recipes: Recipe[]): Recipe | null {
-  return recipes.find(r => r.output_item_id === itemId) || null;
+function scoreRecipeAvailability(
+  recipe: Recipe,
+  countItemFn: (itemId: string) => number,
+): number {
+  if (recipe.components.length === 0) return 50; // No ingredients needed
+
+  let totalAvailability = 0;
+  let totalNeeded = 0;
+
+  for (const comp of recipe.components) {
+    const have = countItemFn(comp.item_id);
+    const needed = comp.quantity;
+    totalNeeded += needed;
+    // Count available materials (capped at what's needed)
+    totalAvailability += Math.min(have, needed);
+  }
+
+  if (totalNeeded === 0) return 50;
+  
+  // Return percentage of materials available (0-100)
+  return Math.round((totalAvailability / totalNeeded) * 100);
+}
+
+/**
+ * Find the best recipe that produces a given item.
+ * Prefers recipes with materials already available in storage.
+ */
+function findRecipeForItem(
+  itemId: string,
+  recipes: Recipe[],
+  countItemFn: (itemId: string) => number,
+): Recipe | null {
+  // Find all recipes that produce this item
+  const candidates = recipes.filter(r => r.output_item_id === itemId);
+  
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+  
+  // Score each recipe by material availability
+  const scored = candidates.map(recipe => ({
+    recipe,
+    score: scoreRecipeAvailability(recipe, countItemFn),
+  }));
+  
+  // Sort by score descending - prefer recipes with more materials available
+  scored.sort((a, b) => b.score - a.score);
+  
+  // Return the recipe with highest material availability score
+  return scored[0].recipe;
 }
 
 /**
@@ -101,8 +149,8 @@ function buildCraftingTree(
 
     if (compToCraft <= 0) continue;
 
-    // Find recipe for this component
-    const prereqRecipe = findRecipeForItem(comp.item_id, recipes);
+    // Find recipe for this component, preferring recipes with available materials
+    const prereqRecipe = findRecipeForItem(comp.item_id, recipes, countItemFn);
 
     if (!prereqRecipe) {
       // No recipe to craft this - it's a base material
@@ -168,7 +216,7 @@ export function calculateCraftingPlan(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
 ): CraftingPlan | null {
-  const goalRecipe = findRecipeForItem(goalItemId, recipes);
+  const goalRecipe = findRecipeForItem(goalItemId, recipes, countItemFn);
 
   if (!goalRecipe) {
     return null;
@@ -236,8 +284,8 @@ export function calculateMultiGoalPlan(
 
   // Calculate plans in order
   for (const goal of goals) {
-    // Use the specified recipe if provided, otherwise find any recipe for the item
-    const goalRecipe = goal.recipe || findRecipeForItem(goal.itemId, recipes);
+    // Use the specified recipe if provided, otherwise find best recipe for the item
+    const goalRecipe = goal.recipe || findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0);
     
     if (!goalRecipe) continue;
     

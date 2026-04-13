@@ -1031,20 +1031,14 @@ function connect() {
 }
 
 // ── Bot table rendering ────────────────────────────────────
-let pendingBotRender = false;
 
 function renderBots() {
-  // Defer re-render if a routine dropdown is focused (prevents closing mid-selection)
-  const active = document.activeElement;
-  if (active && active.tagName === 'SELECT' && (active.id?.startsWith('routine-') || active.id === 'profile-routine')) {
-    if (!pendingBotRender) {
-      pendingBotRender = true;
-      active.addEventListener('change', () => { pendingBotRender = false; renderBots(); }, { once: true });
-      active.addEventListener('blur', () => { if (pendingBotRender) { pendingBotRender = false; renderBots(); } }, { once: true });
-    }
+  // If a routine dropdown in the dashboard table is focused/open, skip re-rendering
+  // The browser's native dropdown closes when the element is removed from DOM
+  if (window._botTableDropdownOpen) {
+    updateBotTableBadges();
     return;
   }
-  pendingBotRender = false;
 
   // Grid view rendering
   if (gridView) {
@@ -1079,6 +1073,23 @@ function renderBots() {
     tbody.innerHTML = '<tr class="empty-row"><td colspan="9">No bots configured</td></tr>';
     return;
   }
+
+  // Set up focus tracking for dashboard table dropdowns (one-time setup)
+  if (!tbody._focusTrackingSetup) {
+    tbody._focusTrackingSetup = true;
+    tbody.addEventListener('focusin', (e) => {
+      if (e.target.tagName === 'SELECT' && e.target.id?.startsWith('routine-')) {
+        window._botTableDropdownOpen = true;
+      }
+    });
+    tbody.addEventListener('focusout', (e) => {
+      const relatedTarget = e.relatedTarget;
+      if (!relatedTarget || relatedTarget.tagName !== 'SELECT' || !relatedTarget.id?.startsWith('routine-')) {
+        window._botTableDropdownOpen = false;
+      }
+    });
+  }
+
   tbody.innerHTML = bots.map(bot => {
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 0;
     const fuelDisplay = bot.maxFuel > 0 ? `${bot.fuel}/${bot.maxFuel}` : `${bot.fuel}`;
@@ -1105,10 +1116,10 @@ function renderBots() {
     } else if (bot.state === 'running') {
       actions = `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
     }
-    return `<tr>
+    return `<tr data-bot="${esc(bot.username)}">
       <td class="bot-name-cell" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}</td>
       <td class="ship-cell">${esc(bot.shipName || '-')}</td>
-      <td><span class="state-badge state-${bot.state}">${esc(stateLabel)}</span></td>
+      <td><span class="state-badge state-${bot.state}" data-bot="${esc(bot.username)}">${esc(stateLabel)}</span></td>
       <td>${num(bot.credits)}cr</td>
       <td class="fuel-cell ${fuelClass}">
         <div class="cell-bar-wrapper">
@@ -1127,6 +1138,20 @@ function renderBots() {
       <td><div class="row-actions">${actions}</div></td>
     </tr>`;
   }).join('');
+}
+
+/** Update badge/state text in existing table rows without replacing DOM (preserves focus) */
+function updateBotTableBadges() {
+  bots.forEach(bot => {
+    const row = document.querySelector(`tr[data-bot="${bot.username}"]`);
+    if (!row) return;
+    const badge = row.querySelector(`.state-badge[data-bot="${bot.username}"]`);
+    if (badge) {
+      const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+      badge.textContent = esc(stateLabel);
+      badge.className = `state-badge state-${bot.state}`;
+    }
+  });
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1816,6 +1841,26 @@ function openProfile(username) {
   profileSkillsList = null;
   profileFactionStorage = null;
   nearbyPlayersCache = [];
+  window._profileActionsOpen = false;
+
+  // Set up focus tracking for profile actions dropdowns
+  // Uses event delegation on the profileActions container
+  const actionsEl = document.getElementById('profileActions');
+  if (actionsEl && !actionsEl._focusTrackingSetup) {
+    actionsEl._focusTrackingSetup = true;
+    actionsEl.addEventListener('focusin', (e) => {
+      if (e.target.tagName === 'SELECT' && e.target.id?.startsWith('profile-')) {
+        window._profileActionsOpen = true;
+      }
+    });
+    actionsEl.addEventListener('focusout', (e) => {
+      // Check if focus moved to another profile dropdown
+      const relatedTarget = e.relatedTarget;
+      if (!relatedTarget || relatedTarget.tagName !== 'SELECT' || !relatedTarget.id?.startsWith('profile-')) {
+        window._profileActionsOpen = false;
+      }
+    });
+  }
 
   // Hide all tabs, show profile
   document.querySelectorAll('.top-tab').forEach(t => t.classList.remove('active'));
@@ -1861,37 +1906,24 @@ function renderProfileTopbar() {
   const bot = getProfileBot();
   if (!bot) return;
 
-  // Defer re-render if any profile dropdown is focused (prevents closing mid-selection)
-  const active = document.activeElement;
-  const profileDropdowns = ['profile-routine', 'profile-targetOre', 'profile-homeSystem', 'profile-explorerMode', 'profile-directToUnknown', 'profile-groupUnknowns', 'profile-focusAreaSystem', 'profile-focusStation'];
-  if (active && active.tagName === 'SELECT' && profileDropdowns.includes(active.id)) {
-    if (!pendingBotRender) {
-      pendingBotRender = true;
-      active.addEventListener('change', () => { pendingBotRender = false; renderProfileTopbar(); }, { once: true });
-      active.addEventListener('blur', () => { if (pendingBotRender) { pendingBotRender = false; renderProfileTopbar(); } }, { once: true });
-    }
-    return;
-  }
-  pendingBotRender = false;
-
-  // Also skip actions re-render if ANY element in profile page is focused (e.g., manual controls)
-  const profilePage = document.getElementById('page-profile');
-  const shouldUpdateActions = !profilePage || !profilePage.contains(active);
-
   const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
   document.getElementById('profileName').textContent = bot.username;
   document.getElementById('profileShip').textContent = bot.shipName || 'No ship';
   document.getElementById('profileBadge').innerHTML = `<span class="state-badge state-${bot.state}">${esc(stateLabel)}</span>`;
 
-  // Only update actions if nothing is focused in the profile page
-  if (!shouldUpdateActions) return;
+  const actionsEl = document.getElementById('profileActions');
+  if (!actionsEl) return;
+
+  // If a dropdown in this profile's actions is focused/open, skip replacing the HTML
+  // (native select dropdowns close when their element is removed from DOM)
+  if (window._profileActionsOpen) return;
 
   let actions = '';
   if (bot.state !== 'running' && bot.state !== 'stopping') {
     const prevProfileSel = document.getElementById('profile-routine');
     const prevProfileRoutine = prevProfileSel ? prevProfileSel.value : (bot.routine || 'miner');
     actions = `
-      <select id="profile-routine" onchange="pendingBotRender=false;renderProfileSidebar()">
+      <select id="profile-routine" onchange="renderProfileSidebar()">
         ${routines.map(r => `<option value="${esc(r)}"${r === prevProfileRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
       </select>
       <button class="primary sm" onclick="startBotFromProfile()">Start</button>
@@ -2321,18 +2353,11 @@ function renderProfileSidebar() {
   const bot = getProfileBot();
   if (!bot) return;
 
-  // Defer re-render if any profile dropdown is focused (prevents closing mid-selection)
-  const active = document.activeElement;
-  const profileDropdowns = ['profile-routine', 'profile-targetOre', 'profile-homeSystem', 'profile-explorerMode', 'profile-directToUnknown', 'profile-groupUnknowns', 'profile-focusAreaSystem', 'profile-focusStation'];
-  if (active && active.tagName === 'SELECT' && profileDropdowns.includes(active.id)) {
-    if (!pendingBotRender) {
-      pendingBotRender = true;
-      active.addEventListener('change', () => { pendingBotRender = false; renderProfileSidebar(); }, { once: true });
-      active.addEventListener('blur', () => { if (pendingBotRender) { pendingBotRender = false; renderProfileSidebar(); } }, { once: true });
-    }
+  // Skip sidebar rebuild if a topbar dropdown is open
+  if (window._profileActionsOpen) {
+    renderProfileTopbar();
     return;
   }
-  pendingBotRender = false;
 
   renderProfileTopbar();
 
@@ -2436,8 +2461,19 @@ function updateProfileSidebar() {
     const skillsCard = sidebar.querySelector('.profile-card:nth-child(4) .inv-list');
     if (skillsCard) skillsCard.innerHTML = renderSkillsList();
 
-    // Update topbar (safe when sidebar not focused)
-    renderProfileTopbar();
+    // Update topbar (skip if a profile actions dropdown is open)
+    if (!window._profileActionsOpen) {
+      renderProfileTopbar();
+    } else {
+      // Still update badge/name since those are separate elements
+      const bot = getProfileBot();
+      if (bot) {
+        const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+        document.getElementById('profileName').textContent = bot.username;
+        document.getElementById('profileShip').textContent = bot.shipName || 'No ship';
+        document.getElementById('profileBadge').innerHTML = `<span class="state-badge state-${bot.state}">${esc(stateLabel)}</span>`;
+      }
+    }
   }
 }
 
@@ -4101,6 +4137,38 @@ function mcSurveySystem() {
       const alreadyRevealed = Array.isArray(surveyData.already_revealed) ? surveyData.already_revealed : [];
       const allDiscovered = [...newlyRevealed, ...alreadyRevealed];
 
+      // Check for wormhole data in survey response
+      const wormholePoi = surveyData.poi;
+      const wormholeDestination = surveyData.wormhole_destination;
+      const wormholeDestinationId = surveyData.wormhole_destination_id;
+      const wormholeExpiresIn = surveyData.wormhole_expires_in;
+
+      if (wormholePoi && wormholePoi.type === 'wormhole_exit' && wormholeDestinationId) {
+        logResponse(`<span class="resp-info">🌌 Wormhole detected: ${esc(wormholePoi.name)} -> ${esc(wormholeDestination)}</span>`);
+        
+        // Register wormhole via API
+        fetch('/api/map/register-wormhole', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            system_id: systemId,
+            wormhole: {
+              id: wormholePoi.id,
+              name: wormholePoi.name,
+              exit_system_id: systemId,
+              exit_system_name: bot.system || systemId,
+              exit_poi_id: wormholePoi.id,
+              exit_poi_name: wormholePoi.name,
+              destination_system_id: wormholeDestinationId,
+              destination_system_name: wormholeDestination || wormholeDestinationId,
+              expires_in_text: wormholeExpiresIn,
+            },
+          }),
+        }).catch(() => {});
+        
+        logResponse(`<span class="resp-info">🌌 Wormhole registered: ${esc(wormholePoi.name)} -> ${esc(wormholeDestination)}${wormholeExpiresIn ? ` (expires in ${esc(wormholeExpiresIn)})` : ''}</span>`);
+      }
+
       if (allDiscovered.length > 0 && systemId) {
         // Register each discovered POI to the map
         for (const poi of allDiscovered) {
@@ -5003,6 +5071,7 @@ function poiIcon(type) {
   if (t.includes('planet')) return '&#9679;'; // circle
   if (t.includes('gate') || t.includes('jump')) return '&#10140;'; // arrow
   if (t.includes('anomaly')) return '&#10038;'; // star
+  if (t.includes('wormhole')) return '&#127754;'; // wormhole emoji
   return '&#8226;'; // bullet
 }
 
@@ -5119,6 +5188,35 @@ function renderMap() {
       html += `<span class="poi-type-badge">${esc(poi.type)}</span>`;
       if (poi.hidden) html += `<span class="poi-hidden-badge" title="Hidden POI (revealed via survey)">🔒</span>`;
       if (poi.has_base) html += `<span class="poi-base-name">${esc(poi.base_name || 'Station')}</span>`;
+      
+      // Show wormhole expiry info if this is a wormhole exit
+      if ((poi.type || '').toLowerCase().includes('wormhole') && sys.wormhole_exits) {
+        const whExit = sys.wormhole_exits.find(w => w.exit_poi_id === poi.id);
+        if (whExit && whExit.expires_at) {
+          const expiryTime = new Date(whExit.expires_at).getTime();
+          const diff = expiryTime - Date.now();
+          let expiryText = '';
+          if (diff <= 0) {
+            expiryText = '<span class="poi-hidden-badge" style="background:#f44336" title="Wormhole has expired">⚠ EXPIRED</span>';
+          } else {
+            const mins = Math.floor(diff / 60000);
+            if (mins < 60) {
+              expiryText = `<span class="poi-hidden-badge" style="background:#ff9800" title="Wormhole expires soon">⏰ ${mins}m left</span>`;
+            } else {
+              const hrs = Math.floor(mins / 60);
+              if (hrs < 24) {
+                expiryText = `<span class="poi-hidden-badge" style="background:#ff9800" title="Wormhole expires in ${hrs}h ${mins % 60}m">⏰ ${hrs}h left</span>`;
+              } else {
+                const days = Math.floor(hrs / 24);
+                const remainingHours = hrs % 24;
+                expiryText = `<span class="poi-hidden-badge" style="background:#4caf50" title="Wormhole expires in ${days}d ${remainingHours}h">⏰ ${days}d ${remainingHours}h</span>`;
+              }
+            }
+          }
+          html += expiryText;
+        }
+      }
+      
       if (poi.hidden) {
         // Hidden POIs show their scan status differently
         if (poi.last_explored) {
@@ -10230,13 +10328,18 @@ function renderMinerSettings(panel) {
   const systemOre = m.systemOre || '';
   const systemGas = m.systemGas || '';
   const systemIce = m.systemIce || '';
+  const systemRadioactive = m.systemRadioactive || '';
+  const systemDeepCore = m.systemDeepCore || '';
   const homeSystem = m.homeSystem || '';
   const depositBot = m.depositBot || '';
   const targetOre = m.targetOre || '';
   const targetGas = m.targetGas || '';
   const targetIce = m.targetIce || '';
+  const targetRadioactive = m.targetRadioactive || '';
+  const targetDeepCore = m.targetDeepCore || '';
   const jettisonOres = m.jettisonOres || [];
   const deepCoreJettisonOres = m.deepCoreJettisonOres || [];
+  const radioactiveJettisonOres = m.radioactiveJettisonOres || [];
   const depletionTimeoutHours = m.depletionTimeoutHours ?? 3;
   const ignoreDepletion = m.ignoreDepletion ?? false;
   const maxJumps = m.maxJumps ?? 10;
@@ -10295,10 +10398,30 @@ function renderMinerSettings(panel) {
     systemIceOpts.push(`<option value="${esc(systemIce)}" selected>${esc(systemIce)}</option>`);
   }
 
+  const systemRadioactiveOpts = ['<option value="">(use legacy system setting)</option>'];
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+    const sel = sys.id === systemRadioactive ? ' selected' : '';
+    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+    systemRadioactiveOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+  }
+  if (systemRadioactive && !knownSystems.find(s => s.id === systemRadioactive)) {
+    systemRadioactiveOpts.push(`<option value="${esc(systemRadioactive)}" selected>${esc(systemRadioactive)}</option>`);
+  }
+
+  const systemDeepCoreOpts = ['<option value="">(use legacy system setting)</option>'];
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+    const sel = sys.id === systemDeepCore ? ' selected' : '';
+    const label = sys.name ? `${sys.name} (${sys.id})` : sys.id;
+    systemDeepCoreOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(label)}</option>`);
+  }
+  if (systemDeepCore && !knownSystems.find(s => s.id === systemDeepCore)) {
+    systemDeepCoreOpts.push(`<option value="${esc(systemDeepCore)}" selected>${esc(systemDeepCore)}</option>`);
+  }
+
   // Build ore filter lists
   const oreOres = knownOres.filter(o => {
     const n = o.name.toLowerCase();
-    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo');
+    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo') && !n.includes('polonium') && !n.includes('radium') && !n.includes('uranium') && !n.includes('thorium');
   });
   const gasOres = knownOres.filter(o => {
     const n = o.name.toLowerCase();
@@ -10308,6 +10431,20 @@ function renderMinerSettings(panel) {
     const n = o.name.toLowerCase();
     return n.includes('ice') || n.includes('frost') || n.includes('cryo') || n.includes('water');
   });
+  const radioactiveOres = [
+    { item_id: 'polonium_ore', name: 'Polonium Ore' },
+    { item_id: 'radium_ore', name: 'Radium Ore' },
+    { item_id: 'uranium_ore', name: 'Uranium Ore' },
+    { item_id: 'thorium_ore', name: 'Thorium Ore' },
+  ];
+  const deepCoreOres = [
+    { item_id: 'void_essence', name: 'Void Essence' },
+    { item_id: 'fury_crystal', name: 'Fury Crystal' },
+    { item_id: 'legacy_ore', name: 'Legacy Ore' },
+    { item_id: 'prismatic_nebulite', name: 'Prismatic Nebulite' },
+    { item_id: 'exotic_matter', name: 'Exotic Matter' },
+    { item_id: 'dark_matter_residue', name: 'Dark Matter Residue' },
+  ];
 
   const oreOpts = ['<option value="">(any ore — harvest whatever is available)</option>'];
   for (const ore of [...oreOres].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
@@ -10334,6 +10471,15 @@ function renderMinerSettings(panel) {
   }
   if (targetIce && !iceOres.find(o => o.item_id === targetIce)) {
     iceOpts.push(`<option value="${esc(targetIce)}" selected>${esc(targetIce)}</option>`);
+  }
+
+  const deepCoreOpts = ['<option value="">(any deep core — harvest whatever is available)</option>'];
+  for (const ore of [...deepCoreOres].sort((a, b) => (a.name || '').localeCompare(b.name || ''))) {
+    const sel = ore.item_id === targetDeepCore ? ' selected' : '';
+    deepCoreOpts.push(`<option value="${esc(ore.item_id)}"${sel}>${esc(ore.name)}</option>`);
+  }
+  if (targetDeepCore && !deepCoreOres.find(o => o.item_id === targetDeepCore)) {
+    deepCoreOpts.push(`<option value="${esc(targetDeepCore)}" selected>${esc(targetDeepCore)}</option>`);
   }
 
   // Jettison ores table
@@ -10416,6 +10562,30 @@ function renderMinerSettings(panel) {
       <select id="set-miner-targetIce">${iceOpts.join('')}</select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Target Radioactive Ore</div>
+        <div class="setting-hint">Seek a specific radioactive ore type. Bot will look for asteroid belts with this radioactive resource.</div>
+      </div>
+      <select id="set-miner-targetRadioactive">
+        <option value="">(any radioactive ore — harvest whatever is available)</option>
+        ${radioactiveOres.map(ore => `<option value="${esc(ore.item_id)}"${ore.item_id === targetRadioactive ? ' selected' : ''}>${esc(ore.name)}</option>`).join('')}
+        ${targetRadioactive && !radioactiveOres.find(o => o.item_id === targetRadioactive) ? `<option value="${esc(targetRadioactive)}" selected>${esc(targetRadioactive)}</option>` : ''}
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Target Deep Core Ore</div>
+        <div class="setting-hint">Seek a specific deep core ore type. Bot will look for hidden POIs with this resource. Overrides deep core quota cycling.</div>
+      </div>
+      <select id="set-miner-targetDeepCore">
+        <option value="">(any deep core — harvest whatever is available)</option>
+        ${deepCoreOres.map(ore => `<option value="${esc(ore.item_id)}"${ore.item_id === targetDeepCore ? ' selected' : ''}>${esc(ore.name)}</option>`).join('')}
+        ${targetDeepCore && !deepCoreOres.find(o => o.item_id === targetDeepCore) ? `<option value="${esc(targetDeepCore)}" selected>${esc(targetDeepCore)}</option>` : ''}
+      </select>
+    </div>
+
     <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
       <div class="setting-label" style="margin-bottom:8px">⛏️ Mining Target Systems</div>
       <div class="setting-hint" style="margin-bottom:12px">Configure separate target systems for each mining type. This allows miners to travel to optimized systems for each resource type instead of using a single system for all mining.</div>
@@ -10442,6 +10612,22 @@ function renderMinerSettings(panel) {
           <div class="setting-hint">Target system for ice mining. Falls back to legacy "System" setting if not specified.</div>
         </div>
         <select id="set-miner-systemIce">${systemIceOpts.join('')}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Radioactive Mining System</div>
+          <div class="setting-hint">Target system for radioactive ore mining. Falls back to legacy "System" setting if not specified.</div>
+        </div>
+        <select id="set-miner-systemRadioactive">${systemRadioactiveOpts.join('')}</select>
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Deep Core Mining System</div>
+          <div class="setting-hint">Target system for deep core ore mining. Falls back to legacy "System" setting if not specified.</div>
+        </div>
+        <select id="set-miner-systemDeepCore">${systemDeepCoreOpts.join('')}</select>
       </div>
     </div>
 
@@ -10479,6 +10665,22 @@ function renderMinerSettings(panel) {
       <div style="display:flex;gap:8px;align-items:center">
         <select id="deep-core-jettison-add-ore" style="flex:1">${deepCoreJettisonOreOpts}</select>
         <button class="secondary" onclick="addDeepCoreJettisonOre()">Add</button>
+      </div>
+    </div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">☢️ Radioactive Jettison Ores</div>
+      <div class="setting-hint" style="margin-bottom:12px">Radioactive ores listed here will be jettisoned when mining radioactive resources. Use this to filter out unwanted radioactive byproducts while keeping the valuable target ore.</div>
+      <table id="radioactive-jettison-ore-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Radioactive Ore to Jettison</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${buildJettisonRows(radioactiveJettisonOres, radioactiveOres)}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="radioactive-jettison-add-ore" style="flex:1">${buildJettisonOreOpts(radioactiveOres)}</select>
+        <button class="secondary" onclick="addRadioactiveJettisonOre()">Add</button>
       </div>
     </div>
 
@@ -10793,6 +10995,33 @@ function addDeepCoreJettisonOre() {
   oreSelect.value = '';
 }
 
+function addRadioactiveJettisonOre() {
+  const oreSelect = document.getElementById('radioactive-jettison-add-ore');
+  if (!oreSelect) return;
+  const oreId = oreSelect.value;
+  if (!oreId) return;
+
+  // Check if ore already in table
+  const existing = document.querySelector(`#radioactive-jettison-ore-table tr[data-ore-id="${oreId}"]`);
+  if (existing) return;
+
+  const radioactiveOresList = [
+    { item_id: 'polonium_ore', name: 'Polonium Ore' },
+    { item_id: 'radium_ore', name: 'Radium Ore' },
+    { item_id: 'uranium_ore', name: 'Uranium Ore' },
+    { item_id: 'thorium_ore', name: 'Thorium Ore' },
+  ];
+  const oreName = radioactiveOresList.find(o => o.item_id === oreId)?.name || oreId;
+  const tbody = document.querySelector('#radioactive-jettison-ore-table tbody');
+  const tr = document.createElement('tr');
+  tr.dataset.oreId = oreId;
+  tr.innerHTML = `
+    <td style="padding:4px 8px">${esc(oreName)}</td>
+    <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>`;
+  tbody.appendChild(tr);
+  oreSelect.value = '';
+}
+
 function saveMinerSettings() {
   const collectJettisonOres = () => {
     const ores = [];
@@ -10806,6 +11035,15 @@ function saveMinerSettings() {
   const collectDeepCoreJettisonOres = () => {
     const ores = [];
     for (const row of document.querySelectorAll('#deep-core-jettison-ore-table tbody tr')) {
+      const oreId = row.dataset.oreId;
+      if (oreId) ores.push(oreId);
+    }
+    return ores;
+  };
+
+  const collectRadioactiveJettisonOres = () => {
+    const ores = [];
+    for (const row of document.querySelectorAll('#radioactive-jettison-ore-table tbody tr')) {
       const oreId = row.dataset.oreId;
       if (oreId) ores.push(oreId);
     }
@@ -10836,10 +11074,14 @@ function saveMinerSettings() {
     targetOre: document.getElementById('set-miner-targetOre').value,
     targetGas: document.getElementById('set-miner-targetGas').value,
     targetIce: document.getElementById('set-miner-targetIce').value,
+    targetRadioactive: document.getElementById('set-miner-targetRadioactive').value,
+    targetDeepCore: document.getElementById('set-miner-targetDeepCore').value,
     system: document.getElementById('set-miner-system').value,
     systemOre: document.getElementById('set-miner-systemOre').value,
     systemGas: document.getElementById('set-miner-systemGas').value,
     systemIce: document.getElementById('set-miner-systemIce').value,
+    systemRadioactive: document.getElementById('set-miner-systemRadioactive').value,
+    systemDeepCore: document.getElementById('set-miner-systemDeepCore').value,
     homeSystem: document.getElementById('set-miner-homeSystem').value,
     depositBot: (function() { const v = document.getElementById('set-miner-depositPrimary').value; return v.startsWith('bot:') ? v.slice(4) : ''; })(),
     depositMode: (function() { const v = document.getElementById('set-miner-depositPrimary').value; return v.startsWith('bot:') ? 'gift' : v; })(),
@@ -10853,24 +11095,26 @@ function saveMinerSettings() {
     maxJumps: parseInt(document.getElementById('set-miner-maxJumps').value) || 10,
     escortName: document.getElementById('set-miner-escortName').value,
     escortSignalChannel: document.getElementById('set-miner-escortSignalChannel').value,
-    // Note: oreQuotas, gasQuotas, iceQuotas, deepCoreQuotas are managed in Miner Quotas settings page
+    // Note: oreQuotas, gasQuotas, iceQuotas, deepCoreQuotas, radioactiveQuotas are managed in Miner Quotas settings page
     // They are preserved from existing settings when saving from this page
     jettisonOres: collectJettisonOres(),
     deepCoreJettisonOres: collectDeepCoreJettisonOres(),
+    radioactiveJettisonOres: collectRadioactiveJettisonOres(),
     // Flock mining settings
     flockEnabled: document.getElementById('set-miner-flockEnabled').checked,
     flockName: document.getElementById('set-miner-flockGroup').value,
     flockRole: document.getElementById('set-miner-flockRole').value,
     flockGroups: collectFlockGroups(),
   };
-  
+
   // Preserve existing quotas when saving from main miner settings
   const existingMiner = settings.miner || {};
   if (existingMiner.oreQuotas) s.oreQuotas = existingMiner.oreQuotas;
   if (existingMiner.gasQuotas) s.gasQuotas = existingMiner.gasQuotas;
   if (existingMiner.iceQuotas) s.iceQuotas = existingMiner.iceQuotas;
   if (existingMiner.deepCoreQuotas) s.deepCoreQuotas = existingMiner.deepCoreQuotas;
-  
+  if (existingMiner.radioactiveQuotas) s.radioactiveQuotas = existingMiner.radioactiveQuotas;
+
   send({ type: 'saveSettings', routine: 'miner', settings: s });
   settings.miner = s;
 }
@@ -10883,11 +11127,12 @@ function renderMinerQuotasSettings(panel) {
   const gasQuotas = m.gasQuotas || {};
   const iceQuotas = m.iceQuotas || {};
   const deepCoreQuotas = m.deepCoreQuotas || {};
+  const radioactiveQuotas = m.radioactiveQuotas || {};
 
   // Build ore filter lists
   const oreOres = knownOres.filter(o => {
     const n = o.name.toLowerCase();
-    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo');
+    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo') && !n.includes('polonium') && !n.includes('radium') && !n.includes('uranium') && !n.includes('thorium');
   });
   const gasOres = knownOres.filter(o => {
     const n = o.name.toLowerCase();
@@ -10905,6 +11150,13 @@ function renderMinerQuotasSettings(panel) {
     { item_id: 'prismatic_nebulite', name: 'Prismatic Nebulite' },
     { item_id: 'exotic_matter', name: 'Exotic Matter' },
     { item_id: 'dark_matter_residue', name: 'Dark Matter Residue' },
+  ];
+  // Radioactive ores
+  const radioactiveOresList = [
+    { item_id: 'polonium_ore', name: 'Polonium Ore' },
+    { item_id: 'radium_ore', name: 'Radium Ore' },
+    { item_id: 'uranium_ore', name: 'Uranium Ore' },
+    { item_id: 'thorium_ore', name: 'Thorium Ore' },
   ];
 
   // Quota table rows builder
@@ -10926,6 +11178,7 @@ function renderMinerQuotasSettings(panel) {
   const gasQuotaRows = buildQuotaRows(gasQuotas, gasOres);
   const iceQuotaRows = buildQuotaRows(iceQuotas, iceOres);
   const deepCoreQuotaRows = buildQuotaRows(deepCoreQuotas, deepCoreOresList);
+  const radioactiveQuotaRows = buildQuotaRows(radioactiveQuotas, radioactiveOresList);
 
   // Ore options for quota add dropdowns
   function buildQuotaOreOpts(ores) {
@@ -10940,6 +11193,7 @@ function renderMinerQuotasSettings(panel) {
   const quotaGasOpts = buildQuotaOreOpts(gasOres);
   const quotaIceOpts = buildQuotaOreOpts(iceOres);
   const quotaDeepCoreOpts = buildQuotaOreOpts(deepCoreOresList);
+  const quotaRadioactiveOpts = buildQuotaOreOpts(radioactiveOresList);
 
   panel.innerHTML = `
     <h3>Miner Quotas Settings</h3>
@@ -11017,6 +11271,24 @@ function renderMinerQuotasSettings(panel) {
       </div>
     </div>
 
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">☢️ Radioactive Quotas</div>
+      <div class="setting-hint" style="margin-bottom:12px">Target stock levels for radioactive resources. These ores require lead-lined cargo and rad harvesters to mine.</div>
+      <table id="radioactive-quota-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Radioactive Ore</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Qty</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody>${radioactiveQuotaRows}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="radioactive-quota-add-ore" style="flex:1">${quotaRadioactiveOpts}</select>
+        <input type="number" id="radioactive-quota-add-qty" min="1" max="999999" value="1000" style="width:80px" placeholder="Qty" />
+        <button class="secondary" onclick="addOreQuotaRow('radioactive')">Add</button>
+      </div>
+    </div>
+
     <div style="margin-top:24px;padding-top:16px;border-top:1px solid var(--border)">
       <button class="primary" onclick="saveMinerQuotasSettings()">💾 Save Quotas</button>
     </div>
@@ -11039,6 +11311,7 @@ function saveMinerQuotasSettings() {
     gasQuotas: collectQuotas('gas-quota-table'),
     iceQuotas: collectQuotas('ice-quota-table'),
     deepCoreQuotas: collectQuotas('deepcore-quota-table'),
+    radioactiveQuotas: collectQuotas('radioactive-quota-table'),
   };
 
   // Merge with existing miner settings

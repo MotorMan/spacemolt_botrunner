@@ -235,6 +235,44 @@ class CatalogStore {
     return false;
   }
 
+  /**
+   * Build a lookup map: ammo_type -> [item_ids that provide that ammo].
+   * E.g., { "autocannon": ["armor_piercing_rounds_box", "high_explosive_box"], "missile": [...] }
+   * Cached after first build to avoid repeated scanning.
+   */
+  private _ammoTypeIndex: Record<string, string[]> | null = null;
+
+  getAmmoTypeIndex(): Record<string, string[]> {
+    if (this._ammoTypeIndex) return this._ammoTypeIndex;
+
+    const index: Record<string, string[]> = {};
+
+    for (const [itemId, item] of Object.entries(this.data.items)) {
+      const effect = item.effect as Record<string, unknown> | undefined;
+      if (effect?.type === "ammo" && typeof effect.subtype === "string") {
+        const ammoType = effect.subtype;
+        if (!index[ammoType]) {
+          index[ammoType] = [];
+        }
+        index[ammoType].push(itemId);
+      }
+    }
+
+    this._ammoTypeIndex = index;
+    return index;
+  }
+
+  /**
+   * Find ammo items in cargo that match a weapon's ammo_type.
+   * Returns matching cargo item IDs.
+   */
+  findMatchingAmmoInCargo(cargoItems: Array<{ itemId: string; quantity: number }>, weaponAmmoType: string): Array<{ itemId: string; quantity: number }> {
+    const ammoIndex = this.getAmmoTypeIndex();
+    const validAmmoIds = new Set(ammoIndex[weaponAmmoType] || []);
+
+    return cargoItems.filter(item => validAmmoIds.has(item.itemId));
+  }
+
   /** Summary string for logging. */
   getSummary(): string {
     return `${Object.keys(this.data.items).length} items, ${Object.keys(this.data.ships).length} ships, ${Object.keys(this.data.skills).length} skills, ${Object.keys(this.data.recipes).length} recipes`;

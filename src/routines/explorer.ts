@@ -529,6 +529,35 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       if (!surveyResp.error) {
         ctx.log("info", `Surveyed ${bot.system} — checking for newly revealed POIs...`);
+        
+        // Parse wormhole data from survey response if present
+        const surveyResult = surveyResp.result as Record<string, unknown> | undefined;
+        if (surveyResult && typeof surveyResult === "object") {
+          const wormholeExit = surveyResult.poi as Record<string, unknown> | undefined;
+          const wormholeDestination = surveyResult.wormhole_destination as string | undefined;
+          const wormholeDestinationId = surveyResult.wormhole_destination_id as string | undefined;
+          const wormholeExpiresIn = surveyResult.wormhole_expires_in as string | undefined;
+
+          if (wormholeExit && wormholeExit.type === "wormhole_exit" && wormholeDestinationId) {
+            ctx.log("info", `🌌 Wormhole detected: ${wormholeExit.name} -> ${wormholeDestination}`);
+            
+            // Register wormhole in mapStore
+            mapStore.registerWormhole(systemId, {
+              id: wormholeExit.id as string,
+              name: wormholeExit.name as string,
+              exit_system_id: systemId,
+              exit_system_name: bot.system || systemId,
+              exit_poi_id: wormholeExit.id as string,
+              exit_poi_name: wormholeExit.name as string,
+              destination_system_id: wormholeDestinationId,
+              destination_system_name: wormholeDestination || wormholeDestinationId,
+              expires_in_text: wormholeExpiresIn,
+            });
+            
+            ctx.log("info", `🌌 Wormhole registered: ${wormholeExit.name} -> ${wormholeDestination}${wormholeExpiresIn ? ` (expires in ${wormholeExpiresIn})` : ""}`);
+          }
+        }
+        
         // Re-fetch system info to pick up any hidden POIs that were revealed
         const refreshed = await getSystemInfo(ctx);
         if (refreshed.pois.length > pois.length) {

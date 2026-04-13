@@ -856,11 +856,25 @@ export async function ensureFueled(
   }
 
   // Step 2: No local station — try fuel cells already in cargo
+  // Loop to consume multiple fuel cells if needed (e.g. low-tier cells only give +20 fuel each)
   if (!bot.docked) {
-    const refuelResp = await bot.exec("refuel");
-    if (!refuelResp.error) {
+    let cargoRefuelAttempts = 0;
+    while (fuelPct < thresholdPct && cargoRefuelAttempts < 20) {
+      const refuelResp = await bot.exec("refuel");
+      if (refuelResp.error) {
+        const msg = refuelResp.error.message.toLowerCase();
+        if (msg.includes("no fuel") || msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
+          ctx.log("system", "No fuel cells in cargo — skipping cargo refuel");
+        }
+        break; // error or no fuel cells
+      }
+      cargoRefuelAttempts++;
       await bot.refreshStatus();
-      fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      const newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (newFuelPct > fuelPct) {
+        ctx.log("system", `Refueled from cargo fuel cell — fuel now ${newFuelPct}%`);
+        fuelPct = newFuelPct;
+      }
       if (fuelPct >= thresholdPct) {
         ctx.log("system", `Refueled from cargo — fuel now ${fuelPct}%`);
         return true;
@@ -1667,6 +1681,9 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
       return aPri - bPri;
     });
 
+    // Track what we loot from this specific wreck
+    const wreckLoot: string[] = [];
+
     for (const item of candidates) {
       if (bot.state !== "running") break;
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) break;
@@ -1695,6 +1712,12 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
 
       totalLooted++;
       lootedItems.push(`${item.quantity}x ${item.name}`);
+      wreckLoot.push(`${item.quantity}x ${item.name}`);
+    }
+
+    // Log what we got from this wreck
+    if (wreckLoot.length > 0) {
+      ctx.log("scavenge", `Wreck ${wreck.wreck_id.substring(0, 8)}...: ${wreckLoot.join(", ")}`);
     }
   }
 

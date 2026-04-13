@@ -45,6 +45,40 @@ export function isDepletionExpired(depletedAt: string | undefined, timeoutMs: nu
   return (now - depletedTime) > timeoutMs;
 }
 
+/** Parse expiry text like "36477d 20h" into an ISO timestamp. */
+function calculateExpiryFromText(text: string): string {
+  const match = text.match(/(\d+)\s*d\s*(\d+)\s*h/i);
+  if (!match) return new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // Default 1 day if parsing fails
+
+  const days = parseInt(match[1], 10);
+  const hours = parseInt(match[2], 10);
+  const msFromNow = (days * 24 * 60 * 60 + hours * 60 * 60) * 1000;
+  return new Date(Date.now() + msFromNow).toISOString();
+}
+
+/** Check if a wormhole is still active (not expired). */
+function isWormholeActive(wormhole: { expires_at: string | null }): boolean {
+  if (!wormhole.expires_at) return true; // No expiry = always active
+  const expiryTime = new Date(wormhole.expires_at).getTime();
+  return Date.now() < expiryTime;
+}
+
+/** Calculate human-readable time remaining until expiry. */
+function calculateTimeRemaining(expiryIso: string): string {
+  const expiryTime = new Date(expiryIso).getTime();
+  const diff = expiryTime - Date.now();
+
+  if (diff <= 0) return "expired";
+
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ${mins % 60}m`;
+  const days = Math.floor(hrs / 24);
+  const remainingHours = hrs % 24;
+  return `${days}d ${remainingHours}h`;
+}
+
 export interface MarketRecord {
   item_id: string;
   item_name: string;
@@ -107,6 +141,45 @@ export interface PirateSighting {
   last_seen: string;
 }
 
+/** Wormhole exit POI data from survey */
+export interface WormholeExitPOI {
+  id: string;
+  system_id: string;
+  type: string; // "wormhole_exit"
+  name: string;
+  description: string;
+  position?: { x: number; y: number };
+  hidden: boolean;
+  reveal_difficulty: number;
+}
+
+/** Wormhole record stored in map - tracks both entrance and exit */
+export interface WormholeRecord {
+  /** Unique wormhole identifier */
+  id: string;
+  /** Wormhole name (usually from exit POI) */
+  name: string;
+  /** System where the wormhole entrance is located */
+  entrance_system_id: string;
+  entrance_system_name: string;
+  /** System where the wormhole exit is located */
+  exit_system_id: string;
+  exit_system_name: string;
+  /** Exit POI ID in the exit system */
+  exit_poi_id: string;
+  /** Exit POI name */
+  exit_poi_name: string;
+  /** System ID that the wormhole leads TO (from exit POI perspective) */
+  destination_system_id: string;
+  destination_system_name: string;
+  /** When the wormhole was discovered/recorded */
+  discovered_at: string;
+  /** When the wormhole expires (ISO timestamp) */
+  expires_at: string | null;
+  /** Whether this wormhole is still active */
+  is_active: boolean;
+}
+
 export interface WreckRecord {
   id: string;
   ship_type: string;
@@ -122,6 +195,8 @@ export interface StoredSystem {
   security_level?: string;
   connections: StoredConnection[];
   pois: StoredPOI[];
+  /** Wormholes that have an exit in this system */
+  wormhole_exits: WormholeRecord[];
   pirate_sightings: PirateSighting[];
   wrecks: WreckRecord[];
   last_updated: string;
@@ -232,6 +307,7 @@ class MapStore {
       name: "",
       connections: [],
       pois: [],
+      wormhole_exits: [],
       pirate_sightings: [],
       wrecks: [],
       last_updated: now(),
@@ -731,6 +807,140 @@ class MapStore {
     this.scheduleSave();
   }
 
+  /**
+   * Register a wormhole discovered via survey_system.
+   * @param exitSystemId - The system where the wormhole exit is located
+   * @param wormholeData - The wormhole data from survey response
+   */
+  registerWormhole(exitSystemId: string, wormholeData: {
+    id: string;
+    name: string;
+    exit_system_id: string;
+    exit_system_name: string;
+    exit_poi_id: string;
+    exit_poi_name: string;
+    destination_system_id: string;
+    destination_system_name: string;
+    expires_in_text?: string; // e.g., "36477d 20h"
+    expires_at?: string; // ISO timestamp if provided directly
+  }): void {
+    // Get or create the exit system
+    let exitSys = this.data.systems[exitSystemId];
+    if (!exitSys) {
+      exitSys = {
+        id: exitSystemId,
+        name: wormholeData.exit_system_name || exitSystemId,
+        connections: [],
+        pois: [],
+        wormhole_exits: [],
+        pirate_sightings: [],
+        wrecks: [],
+        last_updated: now(),
+      };
+      this.data.systems[exitSystemId] = exitSys;
+    }
+
+    // Calculate expiry from expires_in_text or expires_at
+    let expiresAt: string | null = null;
+    if (wormholeData.expires_at) {
+      expiresAt = wormholeData.expires_at;
+    } else if (wormholeData.expires_in_text) {
+      // Parse "36477d 20h" format
+      expiresAt = calculateExpiryFromText(wormholeData.expires_in_text);
+    }
+
+    // Create wormhole record
+    const wormhole: WormholeRecord = {
+      id: wormholeData.id,
+      name: wormholeData.name,
+      entrance_system_id: wormholeData.destination_system_id, // Entrance is in the destination system
+      entrance_system_name: wormholeData.destination_system_name,
+      exit_system_id: exitSystemId,
+      exit_system_name: exitSys.name || exitSystemId,
+      exit_poi_id: wormholeData.exit_poi_id,
+      exit_poi_name: wormholeData.exit_poi_name,
+      destination_system_id: wormholeData.destination_system_id,
+      destination_system_name: wormholeData.destination_system_name,
+      discovered_at: now(),
+      expires_at: expiresAt,
+      is_active: true,
+    };
+
+    // Check if wormhole already exists
+    const existingIndex = exitSys.wormhole_exits.findIndex((w) => w.id === wormholeData.id);
+    if (existingIndex >= 0) {
+      // Update existing wormhole
+      exitSys.wormhole_exits[existingIndex] = {
+        ...exitSys.wormhole_exits[existingIndex],
+        ...wormhole,
+        discovered_at: exitSys.wormhole_exits[existingIndex].discovered_at, // Preserve original discovery time
+      };
+    } else {
+      // Add new wormhole
+      exitSys.wormhole_exits.push(wormhole);
+    }
+
+    // Also ensure the entrance (destination) system exists
+    const entranceSystemId = wormholeData.destination_system_id;
+    let entranceSys = this.data.systems[entranceSystemId];
+    if (!entranceSys) {
+      entranceSys = {
+        id: entranceSystemId,
+        name: wormholeData.destination_system_name || entranceSystemId,
+        connections: [],
+        pois: [],
+        wormhole_exits: [],
+        pirate_sightings: [],
+        wrecks: [],
+        last_updated: now(),
+      };
+      this.data.systems[entranceSystemId] = entranceSys;
+    }
+
+    this.scheduleSave();
+  }
+
+  /**
+   * Get all active (non-expired) wormholes.
+   */
+  getActiveWormholes(): WormholeRecord[] {
+    const wormholes: WormholeRecord[] = [];
+    for (const sys of Object.values(this.data.systems)) {
+      for (const wh of sys.wormhole_exits || []) {
+        if (isWormholeActive(wh)) {
+          wormholes.push(wh);
+        }
+      }
+    }
+    return wormholes;
+  }
+
+  /**
+   * Get remaining time on a wormhole as a human-readable string.
+   * Returns null if wormhole doesn't exist or has no expiry.
+   */
+  getWormholeRemainingTime(wormholeId: string, systemId?: string): string | null {
+    let wormhole: WormholeRecord | null = null;
+
+    if (systemId) {
+      const sys = this.data.systems[systemId];
+      wormhole = sys?.wormhole_exits?.find((w) => w.id === wormholeId) || null;
+    } else {
+      // Search all systems
+      for (const sys of Object.values(this.data.systems)) {
+        const found = sys.wormhole_exits?.find((w) => w.id === wormholeId);
+        if (found) {
+          wormhole = found;
+          break;
+        }
+      }
+    }
+
+    if (!wormhole || !wormhole.expires_at) return null;
+
+    return calculateTimeRemaining(wormhole.expires_at);
+  }
+
   // ── Query methods ───────────────────────────────────────
 
   /** Get stored system data by ID. */
@@ -1032,6 +1242,14 @@ class MapStore {
 
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+    
+    // First, check if we can use a wormhole as a shortcut
+    const wormholeRoute = this.tryFindWormholeRoute(fromSystemId, toSystemId, blacklistArr);
+    if (wormholeRoute) {
+      return wormholeRoute;
+    }
+    
+    // Fall back to regular BFS
     const visited = new Set<string>([fromSystemId]);
     const queue: Array<{ id: string; path: string[] }> = [
       { id: fromSystemId, path: [fromSystemId] },
@@ -1056,6 +1274,97 @@ class MapStore {
     }
 
     return null; // No path found in known map
+  }
+
+  /**
+   * Try to find a route using wormholes as shortcuts.
+   * Strategy: Check if we can reach a wormhole entrance, jump through, then reach the destination.
+   */
+  private tryFindWormholeRoute(fromSystemId: string, toSystemId: string, blacklist: string[]): string[] | null {
+    const blacklistSet = new Set(blacklist.map(s => s.toLowerCase()));
+    
+    // Get all active wormholes
+    const activeWormholes = this.getActiveWormholes();
+    
+    // Find the best wormhole route (shortest total path)
+    let bestRoute: string[] | null = null;
+    let bestRouteLength = Infinity;
+    
+    for (const wormhole of activeWormholes) {
+      // Check if wormhole is expired
+      if (!isWormholeActive(wormhole)) continue;
+      
+      // Strategy 1: Can we use this wormhole to get closer to destination?
+      // Route: fromSystem -> wormhole entrance (destination_system_id) -> wormhole exit (exit_system_id) -> toSystemId
+      
+      const entranceSystem = wormhole.destination_system_id;
+      const exitSystem = wormhole.exit_system_id;
+      
+      // Check if entrance system is accessible
+      if (blacklistSet.has(entranceSystem.toLowerCase())) continue;
+      if (blacklistSet.has(exitSystem.toLowerCase())) continue;
+      
+      // Calculate path segments
+      const toEntrance = this.findRegularBfsRoute(fromSystemId, entranceSystem, blacklist);
+      const fromExitToDest = this.findRegularBfsRoute(exitSystem, toSystemId, blacklist);
+      
+      if (toEntrance && fromExitToDest) {
+        // Valid wormhole route
+        // Full route: [...toEntrance (excluding last), exitSystem, ...fromExitToDest]
+        const fullRoute = [
+          ...toEntrance.slice(0, -1), // Exclude entrance system itself
+          exitSystem, // Jump through wormhole
+          ...fromExitToDest,
+        ];
+        
+        if (fullRoute.length < bestRouteLength) {
+          bestRoute = fullRoute;
+          bestRouteLength = fullRoute.length;
+        }
+      }
+      
+      // Strategy 2: Maybe the destination IS the entrance system
+      // Route: fromSystem -> entrance -> (wormhole) -> exit (= destination)
+      if (toSystemId === entranceSystem) {
+        const toEntrance = this.findRegularBfsRoute(fromSystemId, entranceSystem, blacklist);
+        if (toEntrance && toEntrance.length < bestRouteLength) {
+          // Actually, no wormhole needed - just go directly
+          // But we could still use the wormhole if it creates a shortcut
+        }
+      }
+    }
+    
+    return bestRoute;
+  }
+
+  /** Regular BFS route finding (without wormholes) - used internally by tryFindWormholeRoute */
+  private findRegularBfsRoute(fromSystemId: string, toSystemId: string, blacklist: string[]): string[] | null {
+    if (fromSystemId === toSystemId) return [fromSystemId];
+    
+    const blacklistSet = new Set(blacklist.map(s => s.toLowerCase()));
+    const visited = new Set<string>([fromSystemId]);
+    const queue: Array<{ id: string; path: string[] }> = [
+      { id: fromSystemId, path: [fromSystemId] },
+    ];
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      const conns = this.data.systems[current.id]?.connections ?? [];
+
+      for (const conn of conns) {
+        const nextId = conn.system_id;
+        if (!nextId || visited.has(nextId)) continue;
+        if (blacklistSet.has(nextId.toLowerCase())) continue;
+
+        const newPath = [...current.path, nextId];
+        if (nextId === toSystemId) return newPath;
+
+        visited.add(nextId);
+        queue.push({ id: nextId, path: newPath });
+      }
+    }
+
+    return null;
   }
 
   /** Get all unique ores found across all systems. Returns [{item_id, name}]. */

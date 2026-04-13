@@ -334,6 +334,28 @@ export class WebServer {
           }
           return Response.json({ ok: false, error: "Missing system_id or poi.id" }, { status: 400 });
         }
+        if (url.pathname === "/api/map/register-wormhole" && req.method === "POST") {
+          const body = await req.json() as {
+            system_id: string;
+            wormhole: {
+              id: string;
+              name: string;
+              exit_system_id: string;
+              exit_system_name: string;
+              exit_poi_id: string;
+              exit_poi_name: string;
+              destination_system_id: string;
+              destination_system_name: string;
+              expires_in_text?: string;
+              expires_at?: string;
+            };
+          };
+          if (body?.system_id && body?.wormhole?.id) {
+            mapStore.registerWormhole(body.system_id, body.wormhole);
+            return Response.json({ ok: true });
+          }
+          return Response.json({ ok: false, error: "Missing system_id or wormhole.id" }, { status: 400 });
+        }
         if (url.pathname === "/api/map/register-system" && req.method === "POST") {
           const body = await req.json() as { system_data: Record<string, unknown> };
           if (body?.system_data) {

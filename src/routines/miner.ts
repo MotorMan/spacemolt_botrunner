@@ -23,6 +23,12 @@ import {
   sleep,
 } from "./common.js";
 import {
+  getRadioactiveCapability,
+  hasRadioactiveEquipmentCached,
+  logRadioactiveCapability,
+  isRadioactiveOre,
+} from "./miner_radioactive.js";
+import {
   getActiveMiningSession,
   startMiningSession,
   updateMiningSession,
@@ -251,7 +257,7 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
 // ── Settings ─────────────────────────────────────────────────
 
 type DepositMode = "storage" | "faction" | "sell";
-type MiningType = "auto" | "ore" | "gas" | "ice";
+type MiningType = "auto" | "ore" | "gas" | "ice" | "radioactive";
 type FlockRole = "leader" | "follower";
 
 interface FlockGroupConfig {
@@ -280,15 +286,22 @@ function getMinerSettings(username?: string): {
   systemOre: string; // Ore mining target system
   systemGas: string; // Gas mining target system
   systemIce: string; // Ice mining target system
+  systemRadioactive: string; // Radioactive mining target system
+  systemDeepCore: string; // Deep core mining target system
   depositBot: string;
   targetOre: string;
   targetGas: string;
   targetIce: string;
+  targetRadioactive: string;
+  targetDeepCore: string; // Deep core ore global target override
   oreQuotas: Record<string, number>;
   gasQuotas: Record<string, number>;
   iceQuotas: Record<string, number>;
+  radioactiveQuotas: Record<string, number>;
+  deepCoreQuotas: Record<string, number>;
   jettisonOres: string[]; // Ore IDs to jettison when found in cargo during mining
   deepCoreJettisonOres: string[]; // Ore IDs to jettison when mining deep core (hidden POIs)
+  radioactiveJettisonOres: string[]; // Ore IDs to jettison when mining radioactive ores
   depletionTimeoutHours: number;
   ignoreDepletion: boolean;
   stayOutUntilFull: boolean;
@@ -311,7 +324,7 @@ function getMinerSettings(username?: string): {
   }
 
   function parseMiningType(val: unknown): MiningType | null {
-    if (val === "auto" || val === "ore" || val === "gas" || val === "ice") return val;
+    if (val === "auto" || val === "ore" || val === "gas" || val === "ice" || val === "radioactive") return val;
     return null;
   }
 
@@ -358,15 +371,22 @@ function getMinerSettings(username?: string): {
     systemOre: (botOverrides.systemOre as string) || (m.systemOre as string) || (m.system as string) || "",
     systemGas: (botOverrides.systemGas as string) || (m.systemGas as string) || (m.system as string) || "",
     systemIce: (botOverrides.systemIce as string) || (m.systemIce as string) || (m.system as string) || "",
+    systemRadioactive: (botOverrides.systemRadioactive as string) || (m.systemRadioactive as string) || (m.system as string) || "",
+    systemDeepCore: (botOverrides.systemDeepCore as string) || (m.systemDeepCore as string) || (m.system as string) || "",
     depositBot: (botOverrides.depositBot as string) || (m.depositBot as string) || "",
     targetOre: (botOverrides.targetOre as string) || (m.targetOre as string) || "",
     targetGas: (botOverrides.targetGas as string) || (m.targetGas as string) || "",
     targetIce: (botOverrides.targetIce as string) || (m.targetIce as string) || "",
+    targetRadioactive: (botOverrides.targetRadioactive as string) || (m.targetRadioactive as string) || "",
+    targetDeepCore: (botOverrides.targetDeepCore as string) || (m.targetDeepCore as string) || "",
     oreQuotas: (m.oreQuotas as Record<string, number>) || {},
     gasQuotas: (m.gasQuotas as Record<string, number>) || {},
     iceQuotas: (m.iceQuotas as Record<string, number>) || {},
+    radioactiveQuotas: (m.radioactiveQuotas as Record<string, number>) || {},
+    deepCoreQuotas: (m.deepCoreQuotas as Record<string, number>) || {},
     jettisonOres: (m.jettisonOres as string[]) || [],
     deepCoreJettisonOres: (m.deepCoreJettisonOres as string[]) || [],
+    radioactiveJettisonOres: (m.radioactiveJettisonOres as string[]) || [],
     depletionTimeoutHours: (m.depletionTimeoutHours as number) || 3,
     ignoreDepletion: (m.ignoreDepletion as boolean) ?? false,
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
@@ -386,7 +406,7 @@ function getMinerSettings(username?: string): {
 }
 
 /** Detect mining type from ship modules. Uses cached modules if provided for resilience. */
-async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]): Promise<"ore" | "gas" | "ice" | null> {
+async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]): Promise<"ore" | "gas" | "ice" | "radioactive" | null> {
   const { bot } = ctx;
   let shipData: Record<string, unknown>;
 
@@ -406,6 +426,7 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   let hasMiningLaser = false;
   let hasGasHarvester = false;
   let hasIceHarvester = false;
+  let hasRadioactiveEquipment = false;
 
   for (const mod of modules) {
     const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
@@ -424,17 +445,26 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
     if (checkStr.includes("ice_harvester") || checkStr.includes("ice harvester")) {
       hasIceHarvester = true;
     }
+    if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo") ||
+        checkStr.includes("rad_harvester") || checkStr.includes("rad harvester")) {
+      hasRadioactiveEquipment = true;
+    }
   }
 
-  // Priority: ice > gas > ore (if multiple types present, use settings preference)
+  // Priority: radioactive > ice > gas > ore (if multiple types present, use settings preference)
   const detectedTypes: string[] = [];
   if (hasMiningLaser) detectedTypes.push("ore");
   if (hasGasHarvester) detectedTypes.push("gas");
   if (hasIceHarvester) detectedTypes.push("ice");
+  if (hasRadioactiveEquipment) detectedTypes.push("radioactive");
 
   if (detectedTypes.length > 1) {
     ctx.log("info", `Multiple mining modules detected (${detectedTypes.join(", ")}) — using settings preference`);
     return "ore"; // Default to ore if multiple present
+  }
+  if (hasRadioactiveEquipment) {
+    ctx.log("info", "Radioactive mining equipment detected — radioactive mining mode");
+    return "radioactive";
   }
   if (hasIceHarvester) {
     ctx.log("info", "Ice harvester detected — ice mining mode");
@@ -467,7 +497,7 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
 }
 
 /** Quick check: does the ship have equipment for a specific mining type? */
-async function hasEquipmentForMiningType(ctx: RoutineContext, miningType: "ore" | "gas" | "ice", cachedModules?: unknown[]): Promise<boolean> {
+async function hasEquipmentForMiningType(ctx: RoutineContext, miningType: "ore" | "gas" | "ice" | "radioactive", cachedModules?: unknown[]): Promise<boolean> {
   const { bot } = ctx;
   let modules: unknown[];
 
@@ -491,6 +521,7 @@ async function hasEquipmentForMiningType(ctx: RoutineContext, miningType: "ore" 
              moduleStr.includes("deep_core_survey_scanner") || moduleStr.includes("deep core survey scanner");
     case "gas": return moduleStr.includes("gas_harvester") || moduleStr.includes("gas harvester");
     case "ice": return moduleStr.includes("ice_harvester") || moduleStr.includes("ice harvester");
+    case "radioactive": return hasRadioactiveEquipmentCached(modules);
   }
 }
 
@@ -698,27 +729,35 @@ async function logDeepCoreCapability(ctx: RoutineContext, fieldTestActive: boole
 }
 
 /** Get expected mining type for a resource ID. */
-function getMiningTypeForResource(resourceId: string): "ore" | "gas" | "ice" {
+function getMiningTypeForResource(resourceId: string): "ore" | "gas" | "ice" | "radioactive" {
   const lower = resourceId.toLowerCase();
+
+  // Radioactive resources
+  if (lower.includes("polonium") || 
+      lower.includes("radium") || 
+      lower.includes("uranium") || 
+      lower.includes("thorium")) {
+    return "radioactive";
+  }
 
   // Gas resources (including legacy names like compressed_hydrogen)
   if (lower.includes("gas") ||
-      lower.includes("hydrogen") || 
-      lower.includes("helium") || 
-      lower.includes("argon") || 
-      lower.includes("neon") || 
-      lower.includes("chlorine") || 
-      lower.includes("nitrogen") || 
+      lower.includes("hydrogen") ||
+      lower.includes("helium") ||
+      lower.includes("argon") ||
+      lower.includes("neon") ||
+      lower.includes("chlorine") ||
+      lower.includes("nitrogen") ||
       lower.includes("oxygen") ||
       lower.includes("compressed_")) {
     return "gas";
   }
-  
+
   // Ice resources
   if (lower.includes("ice") || lower.includes("frost") || lower.includes("cryo") || lower.includes("water_ice")) {
     return "ice";
   }
-  
+
   // Default to ore
   return "ore";
 }
@@ -727,7 +766,7 @@ function getMiningTypeForResource(resourceId: string): "ore" | "gas" | "ice" {
 function pickTargetFromQuotas(
   quotas: Record<string, number>,
   factionStorage: Array<{ itemId: string; quantity: number }>,
-  miningType: "ore" | "gas" | "ice"
+  miningType: "ore" | "gas" | "ice" | "radioactive"
 ): string {
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number }> = [];
 
@@ -755,7 +794,7 @@ function pickTargetFromQuotas(
 function pickTargetFromQuotasOrClosest(
   quotas: Record<string, number>,
   factionStorage: Array<{ itemId: string; quantity: number }>,
-  miningType: "ore" | "gas" | "ice"
+  miningType: "ore" | "gas" | "ice" | "radioactive"
 ): { target: string; hasDeficit: boolean } {
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number }> = [];
 
@@ -784,7 +823,7 @@ function pickTargetFromQuotasOrClosest(
 /** Find appropriate POI based on mining type. */
 function findMiningPoi(
   pois: Array<{ id: string; name: string; type: string }>,
-  miningType: "ore" | "gas" | "ice",
+  miningType: "ore" | "gas" | "ice" | "radioactive",
   targetResource?: string
 ): { id: string; name: string } | null {
   if (miningType === "ice") {
@@ -803,6 +842,22 @@ function findMiningPoi(
     // Fallback: any ice field
     const iceField = pois.find(p => isIceFieldPoi(p.type));
     return iceField ? { id: iceField.id, name: iceField.name } : null;
+  } else if (miningType === "radioactive") {
+    // Radioactive mining - uses ore belts
+    if (targetResource) {
+      for (const poi of pois) {
+        if (isOreBeltPoi(poi.type)) {
+          const sysData = mapStore.getSystem(poi.id.split("-")[0] || "");
+          const storedPoi = sysData?.pois.find(p => p.id === poi.id);
+          if (storedPoi?.ores_found.some(o => o.item_id === targetResource)) {
+            return { id: poi.id, name: poi.name };
+          }
+        }
+      }
+    }
+    // Fallback: any ore belt
+    const oreBelt = pois.find(p => isOreBeltPoi(p.type));
+    return oreBelt ? { id: oreBelt.id, name: oreBelt.name } : null;
   } else if (miningType === "ore") {
     // Ore mining
     if (targetResource) {
@@ -850,7 +905,7 @@ interface FlockState {
   targetPoiId: string;
   targetPoiName: string;
   targetResourceId: string;
-  miningType: "ore" | "gas" | "ice";
+  miningType: "ore" | "gas" | "ice" | "radioactive";
   phase: "gathering" | "traveling" | "mining" | "returning" | "docked";
   members: string[];
   lastUpdate: number;
@@ -998,7 +1053,7 @@ async function announceFlockTarget(
   targetPoiId: string,
   targetPoiName: string,
   targetResourceId: string,
-  miningType: "ore" | "gas" | "ice",
+  miningType: "ore" | "gas" | "ice" | "radioactive",
   rallySystem?: string,
 ): Promise<void> {
   const existingState = await readFlockState(flockName);
@@ -1333,7 +1388,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let flockTargetSystemId = "";
     let flockTargetPoiId = "";
     let flockTargetPoiName = "";
-    let flockMiningType: "ore" | "gas" | "ice" = "ore";
+    let flockMiningType: "ore" | "gas" | "ice" | "radioactive" = "ore";
     let flockPhase: FlockState["phase"] = "gathering";
     let flockGroup: FlockGroupConfig | undefined;
 
@@ -1350,8 +1405,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         
         // Determine target from flock group config or personal settings
         const groupMiningType = flockGroup?.miningType ?? settings.miningType;
-        let actualMiningType: "ore" | "gas" | "ice" = "ore";
-        
+        let actualMiningType: "ore" | "gas" | "ice" | "radioactive" = "ore";
+
         if (groupMiningType === "auto") {
           const detected = await detectMiningType(ctx, cachedModules || undefined);
           if (!detected) {
@@ -1429,7 +1484,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Re-evaluate mining type and target from settings each cycle ──
-    let miningType: "ore" | "gas" | "ice" = "ore";
+    let miningType: "ore" | "gas" | "ice" | "radioactive" = "ore";
     if (settings.miningType === "auto") {
       const detected = await detectMiningType(ctx, cachedModules || undefined);
       if (!detected) {
@@ -1602,6 +1657,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (fieldTestActive) {
           ctx.log("mining", "Field test mission active - targeting exotic_matter for mission completion");
           effectiveTarget = "exotic_matter";
+        } else if (settings.targetDeepCore) {
+          // Global deep core target override - use this instead of quota cycling
+          ctx.log("mining", `Deep core global target override: ${settings.targetDeepCore} — bypassing quota search`);
+          effectiveTarget = settings.targetDeepCore;
         } else {
           ctx.log("mining", "Searching for available deep core ore targets...");
           const blacklist = getSystemBlacklist();
@@ -1634,19 +1693,21 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               oresToCheck = quotaEntries.map(e => e.oreId);
               ctx.log("mining", `Deep core quota priority: ${oresToCheck.map((oreId, i) => `${oreId} (deficit: ${quotaEntries[i].deficit.toLocaleString()})`).join(", ")}`);
             } else {
-              // All deep core quotas met - cycle through by smallest surplus
-              const allEntries: Array<{ oreId: string; deficit: number }> = [];
-              for (const [oreId, quotaTarget] of Object.entries(deepCoreQuotas)) {
+              // All deep core quotas met - STOP MINING (do not cycle)
+              ctx.log("mining", `All deep core quotas met - no deficit found. Waiting for quota increase or manual override.`);
+              ctx.log("mining", `Current storage: ${Object.entries(deepCoreQuotas).map(([oreId, quotaTarget]) => {
                 const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
-                allEntries.push({ oreId, deficit: quotaTarget - current });
-              }
-              allEntries.sort((a, b) => a.deficit - b.deficit); // smallest surplus first
-              oresToCheck = allEntries.map(e => e.oreId);
-              ctx.log("mining", `All deep core quotas met - cycling: ${oresToCheck.map((oreId, i) => `${oreId} (surplus: ${Math.abs(allEntries[i].deficit).toLocaleString()})`).join(", ")}`);
+                return `${oreId}: ${current.toLocaleString()}/${quotaTarget.toLocaleString()}`;
+              }).join(", ")}`);
+              await sleep(60000);
+              continue;
             }
           } else {
-            // No quotas configured - use default order
-            oresToCheck = Array.from(DEEP_CORE_ORES);
+            // No deep core quotas configured - don't mine anything
+            ctx.log("mining", "No deep core ore quotas configured - waiting for quota setup");
+            ctx.log("mining", "Configure oreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue)");
+            await sleep(60000);
+            continue;
           }
 
           // Try each deep core ore to find an available target
@@ -1801,7 +1862,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (miningType === "ice") {
       configuredSystem = settings.systemIce || settings.systemOre || settings.systemGas || settings.system || "";
     } else if (miningType === "ore") {
-      configuredSystem = settings.systemOre || settings.systemGas || settings.systemIce || settings.system || "";
+      // Check if mining deep core ore - use systemDeepCore if set
+      if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
+        configuredSystem = settings.systemDeepCore || settings.systemOre || settings.system || "";
+      } else {
+        configuredSystem = settings.systemOre || settings.systemGas || settings.systemIce || settings.system || "";
+      }
     } else {
       // gas
       configuredSystem = settings.systemGas || settings.systemOre || settings.systemIce || settings.system || "";

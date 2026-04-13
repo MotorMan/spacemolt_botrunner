@@ -231,6 +231,167 @@ function cleanupExpiredPirateLockouts(): void {
 }
 
 /**
+ * Check if a rescue target is a potential pirate trap by validating
+ * co-op claims against our fleet membership and bot status.
+ * 
+ * This detects false flag operations where pirates use our own bot names
+ * to lure rescuers into traps.
+ * 
+ * Returns { isTrap: boolean, reason: string } with trap detection details.
+ */
+async function checkForPirateTrap(
+  ctx: RoutineContext,
+  targetUsername: string,
+  targetSystem: string,
+  isMaydayTarget: boolean,
+  settings: { partnerBotName: string; maydayMaxJumps: number }
+): Promise<{ isTrap: boolean; reason: string; details: Record<string, unknown> }> {
+  const { bot } = ctx;
+  const fleet = ctx.getFleetStatus?.() || [];
+  
+  // Get all our bot names from fleet
+  const ourBotNames = new Set(fleet.map(b => b.username.toLowerCase()));
+  
+  // Check if the target username matches one of our own bot names
+  const targetIsOurBot = ourBotNames.has(targetUsername.toLowerCase());
+  
+  if (targetIsOurBot) {
+    ctx.log("rescue", `🚨 PIRATE TRAP DETECTION: Target "${targetUsername}" is one of OUR bots!`);
+    
+    // Find this bot in our fleet to check its actual status
+    const ourBot = fleet.find(b => b.username.toLowerCase() === targetUsername.toLowerCase());
+    
+    if (ourBot) {
+      // Check if our bot actually needs rescue
+      const actualFuelPct = ourBot.maxFuel > 0 ? Math.round((ourBot.fuel / ourBot.maxFuel) * 100) : 100;
+      const actualSystem = ourBot.system;
+      const actualDocked = ourBot.docked;
+      
+      ctx.log("rescue", `🔍 Our bot "${targetUsername}" actual status:`);
+      ctx.log("rescue", `   - Fuel: ${actualFuelPct}% (reported: varies)`);
+      ctx.log("rescue", `   - System: ${actualSystem} (reported: ${targetSystem})`);
+      ctx.log("rescue", `   - Docked: ${actualDocked}`);
+      
+      // If our bot is docked or has good fuel, this is definitely a false flag
+      if (actualDocked) {
+        return {
+          isTrap: true,
+          reason: `Our bot "${targetUsername}" is DOCKED - this is a FALSE FLAG pirate trap using our bot's name`,
+          details: {
+            botName: targetUsername,
+            actualFuel: actualFuelPct,
+            actualSystem,
+            actualDocked: true,
+            reportedSystem: targetSystem,
+          }
+        };
+      }
+      
+      if (actualFuelPct > 25) {
+        return {
+          isTrap: true,
+          reason: `Our bot "${targetUsername}" has ${actualFuelPct}% fuel (>25%) - this is a FALSE FLAG pirate trap`,
+          details: {
+            botName: targetUsername,
+            actualFuel: actualFuelPct,
+            actualSystem,
+            actualDocked: actualDocked,
+            reportedSystem: targetSystem,
+          }
+        };
+      }
+      
+      // If our bot is in a different system than reported, this is suspicious
+      if (actualSystem && normalizeSystemName(actualSystem) !== normalizeSystemName(targetSystem)) {
+        ctx.log("rescue", `⚠️ Our bot "${targetUsername}" is in ${actualSystem}, but MAYDAY claims ${targetSystem}`);
+        // This could be a trap OR just stale data - warn but don't block
+        ctx.log("rescue", `⚠️ SYSTEM MISMATCH - could be pirate trap or stale fleet data`);
+      }
+    } else {
+      // Bot not in our fleet - very suspicious if using our naming pattern
+      return {
+        isTrap: true,
+        reason: `Target "${targetUsername}" matches our bot naming pattern but is not in our fleet - potential impersonation`,
+        details: {
+          botName: targetUsername,
+          notInFleet: true,
+        }
+      };
+    }
+  }
+  
+  // Check if we received a co-op claim from our partner about this rescue
+  // If our partner (who IS in the fleet with the target) says they're handling it or can't reach it,
+  // we should trust their judgment
+  const { isRescueClaimedByPartner } = await import("../cooperation/rescueCooperation.js");
+  const partnerClaim = isRescueClaimedByPartner(targetUsername, targetSystem, undefined, bot.username);
+  
+  if (partnerClaim) {
+    ctx.log("coop", `🤝 Partner claim detected: ${partnerClaim.botName} claimed ${partnerClaim.player} at ${partnerClaim.system} (${partnerClaim.jumps} jumps)`);
+    
+    // Check if partner is in our fleet (would have access to accurate fleet status)
+    const partnerInOurFleet = fleet.some(b => 
+      b.username.toLowerCase() === partnerClaim.botName.toLowerCase()
+    );
+    
+    if (partnerInOurFleet) {
+      // Partner is in our fleet and has made a claim about this rescue
+      // Check if target is also in our fleet
+      const targetInOurFleet = fleet.some(b => 
+        b.username.toLowerCase() === targetUsername.toLowerCase()
+      );
+      
+      // If partner is in our fleet but target is NOT, and partner has high jump count,
+      // this suggests partner evaluated but determined it's unreachable or a trap
+      if (!targetInOurFleet && partnerClaim.jumps > settings.maydayMaxJumps) {
+        ctx.log("rescue", `🚨 PIRATE TRAP INDICATOR: Partner ${partnerClaim.botName} (in our fleet) claimed ${targetUsername} (NOT in our fleet) with ${partnerClaim.jumps} jumps`);
+        ctx.log("rescue", `🚨 Target not in our fleet - partner cannot verify legitimacy`);
+        ctx.log("rescue", `🚨 This matches pirate false flag pattern - ABORTING`);
+        
+        return {
+          isTrap: true,
+          reason: `Partner ${partnerClaim.botName} claimed rescue but target ${targetUsername} is not in our fleet and requires ${partnerClaim.jumps} jumps (>${settings.maydayMaxJumps} max) - likely pirate false flag`,
+          details: {
+            partnerBot: partnerClaim.botName,
+            partnerInFleet: true,
+            targetInFleet: false,
+            partnerJumps: partnerClaim.jumps,
+            maxJumps: settings.maydayMaxJumps,
+          }
+        };
+      }
+      
+      // If target IS in our fleet and partner claimed it, verify target actually needs rescue
+      if (targetInOurFleet) {
+        const targetBot = fleet.find(b => 
+          b.username.toLowerCase() === targetUsername.toLowerCase()
+        );
+        
+        if (targetBot) {
+          const actualFuelPct = targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100;
+          
+          // If partner claimed but target has good fuel, something is wrong
+          if (actualFuelPct > 25) {
+            ctx.log("rescue", `⚠️ INCONSISTENT: Partner claimed ${targetUsername} needs rescue but they have ${actualFuelPct}% fuel`);
+          }
+          
+          // If target is docked and partner claimed rescue, suspicious
+          if (targetBot.docked) {
+            ctx.log("rescue", `⚠️ INCONSISTENT: Partner claimed ${targetUsername} needs rescue but they are DOCKED`);
+          }
+        }
+      }
+    }
+  }
+  
+  return {
+    isTrap: false,
+    reason: "",
+    details: {}
+  };
+}
+
+/**
  * Check proximity to pirate strongholds using BFS.
  * This provides early warning when operating near pirate bases.
  * Returns information about nearest pirate stronghold.
@@ -1538,6 +1699,14 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       continue;
     }
 
+    // ── Validate target has a valid system before proceeding ──
+    if (!target.system || target.system.trim() === "") {
+      ctx.log("rescue", `⚠️ Target ${target.username} has no valid system — refreshing status and skipping...`);
+      ctx.log("rescue", `💡 This can happen with stale fleet data or hidden POIs`);
+      await sleep(settings.scanIntervalSec * 1000);
+      continue;
+    }
+
     // ── Create rescue session if starting new mission ──
     if (!recoveredSession && target) {
       const session: RescueSession = {
@@ -1564,6 +1733,34 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       ctx.log("mayday", `RESCUE NEEDED (MAYDAY): ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
     } else {
       ctx.log("rescue", `RESCUE NEEDED: ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
+    }
+
+    // ── RESCUE COOPERATION: Send en-route notification to stranded player (IMMEDIATELY after verification) ──
+    // Only notify if this is a MAYDAY or manual rescue (not fleet rescues)
+    // Calculate jumps to target for the notification
+    let initialJumpsToTarget = 0;
+    if (isMaydayTarget || isManualRescueTarget) {
+      try {
+        const routeResp = await bot.exec("find_route", { target_system: target.system });
+        if (!routeResp.error && routeResp.result) {
+          const route = routeResp.result as Record<string, unknown>;
+          initialJumpsToTarget = (route.total_jumps as number) || 0;
+          ctx.log("rescue", `📍 Route to target: ${initialJumpsToTarget} jump${initialJumpsToTarget !== 1 ? 's' : ''}`);
+        }
+      } catch (e) {
+        ctx.log("warn", `Could not calculate route to ${target.system}: ${e}`);
+      }
+
+      const aiChatService = (globalThis as any).aiChatService;
+      if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
+        aiChatService.sendRescueEnRouteNotification(bot, target.username, initialJumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
+          if (!result.ok) {
+            ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
+          }
+        }).catch((err: Error) => {
+          ctx.log("warn", `Error sending en-route notification: ${err.message}`);
+        });
+      }
     }
 
     // ── Check for Refueling Pump before each mission ──
@@ -1633,6 +1830,91 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       await ensureUndocked(ctx);
 
       if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
+        // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names ──
+        const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
+          partnerBotName: settings.partnerBotName,
+          maydayMaxJumps: settings.maydayMaxJumps
+        });
+        if (trapCheck.isTrap) {
+          ctx.log("rescue", `🚨 ABORTING RESCUE - ${trapCheck.reason}`);
+          ctx.log("rescue", `🚨 This appears to be a PIRATE TRAP using false flag operation`);
+          
+          // Fail the rescue session if one exists
+          const activeSession = getActiveRescueSession(bot.username);
+          if (activeSession) {
+            await failRescueSession(bot.username, `Aborted - pirate trap detected: ${trapCheck.reason}`);
+          }
+          
+          // Mark MAYDAY as handled to prevent re-triggering
+          if (isMaydayTarget) {
+            const mayday = getNextMayday();
+            if (mayday) markMaydayHandled(mayday);
+          }
+          
+          await sleep(settings.scanIntervalSec * 1000);
+          continue;
+        }
+
+        // ── PIRATE BASE PROXIMITY CHECK: Block navigation to systems near pirate bases ──
+        // This is a HARD BLOCK - do not attempt to navigate to blacklisted systems
+        const { getSystemBlacklist } = await import("../web/server.js");
+        const blacklist = getSystemBlacklist();
+        const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+        
+        const isTargetBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
+        if (isTargetBlacklisted) {
+          ctx.log("rescue", `🚫 BLOCKED: Target system ${target.system} is BLACKLISTED (likely near pirate base)`);
+          ctx.log("rescue", `🚫 ABORTING RESCUE - cannot navigate to blacklisted system`);
+          
+          const activeSession = getActiveRescueSession(bot.username);
+          if (activeSession) {
+            await failRescueSession(bot.username, "Aborted - target system is blacklisted");
+          }
+          
+          if (isMaydayTarget) {
+            const mayday = getNextMayday();
+            if (mayday) markMaydayHandled(mayday);
+          }
+          
+          await sleep(settings.scanIntervalSec * 1000);
+          continue;
+        }
+
+        // Also check if route to target passes through blacklisted systems
+        try {
+          const routeResp = await bot.exec("find_route", { target_system: target.system });
+          if (!routeResp.error && routeResp.result) {
+            const route = routeResp.result as Record<string, unknown>;
+            const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+            
+            if (routeData) {
+              const blacklistedOnRoute = routeData.find(r =>
+                blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+              );
+              
+              if (blacklistedOnRoute) {
+                ctx.log("rescue", `🚫 BLOCKED: Route to ${target.system} passes through blacklisted system "${blacklistedOnRoute.system_id}"`);
+                ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available`);
+                
+                const activeSession = getActiveRescueSession(bot.username);
+                if (activeSession) {
+                  await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
+                }
+                
+                if (isMaydayTarget) {
+                  const mayday = getNextMayday();
+                  if (mayday) markMaydayHandled(mayday);
+                }
+                
+                await sleep(settings.scanIntervalSec * 1000);
+                continue;
+              }
+            }
+          }
+        } catch (e) {
+          ctx.log("warn", `Could not validate route to ${target.system}: ${e}`);
+        }
+
         ctx.log(logCategory, `Navigating to ${target.system}...`);
 
         // ── PIRATE AWARENESS: Check if target system is near a pirate stronghold ──
@@ -1715,21 +1997,6 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         await bot.refreshStatus();
         ctx.log("travel", `Arrived in ${bot.system}`);
 
-        // ── RESCUE COOPERATION: Send en-route notification to stranded player (AFTER successful navigation) ──
-        // Only notify if this is a MAYDAY or manual rescue (not fleet rescues)
-        if (isMaydayTarget || isManualRescueTarget) {
-          const aiChatService = (globalThis as any).aiChatService;
-          if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
-            aiChatService.sendRescueEnRouteNotification(bot, target.username, jumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
-              if (!result.ok) {
-                ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
-              }
-            }).catch((err: Error) => {
-              ctx.log("warn", `Error sending en-route notification: ${err.message}`);
-            });
-          }
-        }
-
         // ── PIRATE AWARENESS: Scan for pirates immediately after arrival ──
         const pirateScan = await checkAndFleeFromPiratesRescue(ctx, "arrival scan");
         if (pirateScan) {
@@ -1752,7 +2019,21 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       // ── Travel to stranded bot's POI ──
       if (target.poi) {
         yield "travel_to_target";
-        
+
+        // CRITICAL: Refresh target's current position from fleet status after arriving at system
+        const fleet = ctx.getFleetStatus?.() || [];
+        const targetBot = fleet.find(b => b.username === target.username);
+        if (targetBot) {
+          const oldSystem = target.system;
+          const oldPoi = target.poi;
+          target.system = targetBot.system || target.system;
+          target.poi = targetBot.poi || target.poi;
+          target.docked = targetBot.docked;
+          if (oldSystem !== target.system || oldPoi !== target.poi) {
+            ctx.log("rescue", `📍 Target position updated after arrival: ${oldSystem}/${oldPoi} -> ${target.system}/${target.poi}`);
+          }
+        }
+
         // Resolve POI name to POI ID by querying system info
         let targetPoiId: string | null = null;
         let targetPoiName: string = target.poi;
@@ -2342,7 +2623,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     return;
   }
 
-  const { targetSystem, targetPOI, targetPlayer } = rescueParams;
+  const { targetSystem, targetPlayer } = rescueParams;
+  let targetPOI = rescueParams.targetPOI;
   
   ctx.log("rescue", `🚀 Manual Player Rescue Mission initiated!`);
   ctx.log("rescue", `Target: ${targetPlayer} at ${targetSystem} / ${targetPOI}`);
@@ -2413,6 +2695,24 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
     // ── Travel to target POI ──
     yield "travel_to_target";
+    
+    // CRITICAL: Refresh fleet status to get current target position
+    const fleet = ctx.getFleetStatus?.() || [];
+    const targetBotCheck = fleet.find(b => b.username === targetPlayer);
+    if (targetBotCheck) {
+      const currentSystem = targetBotCheck.system;
+      const currentPoi = targetBotCheck.poi;
+      if (currentSystem && currentSystem !== targetSystem) {
+        ctx.log("rescue", `⚠️ Target moved from ${targetSystem} to ${currentSystem} - aborting manual rescue`);
+        await sleep(5000);
+        return;
+      }
+      if (currentPoi && currentPoi !== targetPOI) {
+        ctx.log("rescue", `📍 Target POI updated: ${targetPOI} -> ${currentPoi}`);
+        targetPOI = currentPoi;
+      }
+    }
+    
     ctx.log("rescue", `Traveling to target location (${targetPOI})...`);
     const travelResp = await bot.exec("travel", { target_poi: targetPOI });
     // Check for battle notifications after travel
@@ -2998,6 +3298,20 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
 
     // ── Travel to target POI ──
     yield "travel_to_target";
+    
+    // CRITICAL: Refresh target's current position from fleet status after arriving at system
+    const fleet = ctx.getFleetStatus?.() || [];
+    const targetBot = fleet.find(b => b.username === mayday.sender);
+    if (targetBot) {
+      const oldSystem = mayday.system;
+      const oldPoi = mayday.poi;
+      mayday.system = targetBot.system || mayday.system;
+      mayday.poi = targetBot.poi || mayday.poi;
+      if (oldSystem !== mayday.system || oldPoi !== mayday.poi) {
+        ctx.log("mayday", `📍 MAYDAY target position updated after arrival: ${oldSystem}/${oldPoi} -> ${mayday.system}/${mayday.poi}`);
+      }
+    }
+    
     ctx.log("mayday", `Traveling to ${mayday.poi}...`);
     const travelResp = await bot.exec("travel", { target_poi: mayday.poi });
     // Check for battle notifications after travel
@@ -4098,6 +4412,14 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       continue;
     }
 
+    // ── Validate target has a valid system before proceeding ──
+    if (!target.system || target.system.trim() === "") {
+      ctx.log("rescue", `⚠️ Target ${target.username} has no valid system — refreshing status and skipping...`);
+      ctx.log("rescue", `💡 This can happen with stale fleet data or hidden POIs`);
+      await sleep(settings.scanIntervalSec * 1000);
+      continue;
+    }
+
     // ── Create rescue session if starting new mission ──
     if (!recoveredSession && target) {
       const session: RescueSession = {
@@ -4156,6 +4478,34 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       ctx.log("mayday", `RESCUE NEEDED (MAYDAY): ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
     } else {
       ctx.log("rescue", `RESCUE NEEDED: ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
+    }
+
+    // ── RESCUE COOPERATION: Send en-route notification to stranded player (IMMEDIATELY after verification) ──
+    // Only notify if this is a MAYDAY or manual rescue (not fleet rescues)
+    // Calculate jumps to target for the notification
+    let initialJumpsToTarget = 0;
+    if (isMaydayTarget || isManualRescueTarget) {
+      try {
+        const routeResp = await bot.exec("find_route", { target_system: target.system });
+        if (!routeResp.error && routeResp.result) {
+          const route = routeResp.result as Record<string, unknown>;
+          initialJumpsToTarget = (route.total_jumps as number) || 0;
+          ctx.log("rescue", `📍 Route to target: ${initialJumpsToTarget} jump${initialJumpsToTarget !== 1 ? 's' : ''}`);
+        }
+      } catch (e) {
+        ctx.log("warn", `Could not calculate route to ${target.system}: ${e}`);
+      }
+
+      const aiChatService = (globalThis as any).aiChatService;
+      if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
+        aiChatService.sendRescueEnRouteNotification(bot, target.username, initialJumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
+          if (!result.ok) {
+            ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
+          }
+        }).catch((err: Error) => {
+          ctx.log("warn", `Error sending en-route notification: ${err.message}`);
+        });
+      }
     }
 
     // ── Ensure we have fuel ourselves ──
@@ -4278,6 +4628,91 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     await ensureUndocked(ctx);
 
     if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
+      // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names ──
+      const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
+        partnerBotName: settings.partnerBotName,
+        maydayMaxJumps: settings.maydayMaxJumps
+      });
+      if (trapCheck.isTrap) {
+        ctx.log("rescue", `🚨 ABORTING RESCUE - ${trapCheck.reason}`);
+        ctx.log("rescue", `🚨 This appears to be a PIRATE TRAP using false flag operation`);
+        
+        // Fail the rescue session if one exists
+        const activeSession = getActiveRescueSession(bot.username);
+        if (activeSession) {
+          await failRescueSession(bot.username, `Aborted - pirate trap detected: ${trapCheck.reason}`);
+        }
+        
+        // Mark MAYDAY as handled to prevent re-triggering
+        if (isMaydayTarget) {
+          const mayday = getNextMayday();
+          if (mayday) markMaydayHandled(mayday);
+        }
+        
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
+      }
+
+      // ── PIRATE BASE PROXIMITY CHECK: Block navigation to systems near pirate bases ──
+      // This is a HARD BLOCK - do not attempt to navigate to blacklisted systems
+      const { getSystemBlacklist } = await import("../web/server.js");
+      const blacklist = getSystemBlacklist();
+      const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+      
+      const isTargetBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
+      if (isTargetBlacklisted) {
+        ctx.log("rescue", `🚫 BLOCKED: Target system ${target.system} is BLACKLISTED (likely near pirate base)`);
+        ctx.log("rescue", `🚫 ABORTING RESCUE - cannot navigate to blacklisted system`);
+        
+        const activeSession = getActiveRescueSession(bot.username);
+        if (activeSession) {
+          await failRescueSession(bot.username, "Aborted - target system is blacklisted");
+        }
+        
+        if (isMaydayTarget) {
+          const mayday = getNextMayday();
+          if (mayday) markMaydayHandled(mayday);
+        }
+        
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
+      }
+
+      // Also check if route to target passes through blacklisted systems
+      try {
+        const routeResp = await bot.exec("find_route", { target_system: target.system });
+        if (!routeResp.error && routeResp.result) {
+          const route = routeResp.result as Record<string, unknown>;
+          const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+          
+          if (routeData) {
+            const blacklistedOnRoute = routeData.find(r =>
+              blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+            );
+            
+            if (blacklistedOnRoute) {
+              ctx.log("rescue", `🚫 BLOCKED: Route to ${target.system} passes through blacklisted system "${blacklistedOnRoute.system_id}"`);
+              ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available`);
+              
+              const activeSession = getActiveRescueSession(bot.username);
+              if (activeSession) {
+                await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
+              }
+              
+              if (isMaydayTarget) {
+                const mayday = getNextMayday();
+                if (mayday) markMaydayHandled(mayday);
+              }
+              
+              await sleep(settings.scanIntervalSec * 1000);
+              continue;
+            }
+          }
+        }
+      } catch (e) {
+        ctx.log("warn", `Could not validate route to ${target.system}: ${e}`);
+      }
+
       ctx.log(logCategory, `Navigating to ${target.system}...`);
 
       // ── PIRATE AWARENESS: Check if target system is near a pirate stronghold ──
@@ -4357,21 +4792,6 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         continue;
       }
 
-      // ── RESCUE COOPERATION: Send en-route notification to stranded player (AFTER successful navigation) ──
-      // Only notify if this is a MAYDAY or manual rescue (not fleet rescues)
-      if (isMaydayTarget || isManualRescueTarget) {
-        const aiChatService = (globalThis as any).aiChatService;
-        if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
-          aiChatService.sendRescueEnRouteNotification(bot, target.username, jumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
-            if (!result.ok) {
-              ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
-            }
-          }).catch((err: Error) => {
-            ctx.log("warn", `Error sending en-route notification: ${err.message}`);
-          });
-        }
-      }
-      
       // Update session state and jumps after successful navigation
       if (recoveredSession || getActiveRescueSession(bot.username)) {
         await updateRescueSession(bot.username, { state: "at_system", jumpsCompleted: jumpsToTarget });
@@ -4384,20 +4804,33 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     if (target.poi) {
       yield "travel_to_target";
 
-      // For our own bots, refresh position from fleet status before traveling
+      // CRITICAL: Refresh target's current position from fleet status after arriving at system
+      // This ensures we have the most up-to-date location, especially for bots that may have moved
+      const fleet = ctx.getFleetStatus?.() || [];
+      const targetBot = fleet.find(b => b.username === target.username);
+      if (targetBot) {
+        const oldSystem = target.system;
+        const oldPoi = target.poi;
+        target.system = targetBot.system || target.system;
+        target.poi = targetBot.poi || target.poi;
+        target.docked = targetBot.docked;
+        if (oldSystem !== target.system || oldPoi !== target.poi) {
+          ctx.log("rescue", `📍 Target position updated after arrival: ${oldSystem}/${oldPoi} -> ${target.system}/${target.poi}`);
+        }
+      } else {
+        ctx.log("rescue", `⚠️ Target ${target.username} not in fleet status - using cached location: ${target.system}/${target.poi}`);
+      }
+
+      // For our own bots, do an additional refresh to handle hidden POI scenarios
       const isOurBot = isOwnBot(target.username);
       if (isOurBot) {
-        ctx.log("rescue", `🔄 Refreshing position for our own bot ${target.username}...`);
-        const fleet = ctx.getFleetStatus?.() || [];
-        const targetBot = fleet.find(b => b.username === target.username);
-        if (targetBot) {
-          const oldPoi = target.poi;
-          target.poi = targetBot.poi || target.poi;
-          target.system = targetBot.system || target.system;
-          target.docked = targetBot.docked;
-          if (oldPoi !== target.poi) {
-            ctx.log("rescue", `📍 Position updated for ${target.username}: ${oldPoi} -> ${target.poi}`);
-          }
+        ctx.log("rescue", `🔄 Additional position refresh for our own bot ${target.username}...`);
+        const fleet2 = ctx.getFleetStatus?.() || [];
+        const targetBot2 = fleet2.find(b => b.username === target.username);
+        if (targetBot2) {
+          target.poi = targetBot2.poi || target.poi;
+          target.system = targetBot2.system || target.system;
+          target.docked = targetBot2.docked;
         }
       }
 

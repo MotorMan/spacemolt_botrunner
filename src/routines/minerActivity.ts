@@ -20,7 +20,7 @@ function sleep(ms: number): Promise<void> {
 
 export type MiningSessionState = "traveling_to_ore" | "mining" | "returning_home" | "depositing" | "completed" | "abandoned" | "failed";
 
-export type MiningType = "ore" | "gas" | "ice";
+export type MiningType = "ore" | "gas" | "ice" | "radioactive";
 
 export interface MiningSession {
   sessionId: string;

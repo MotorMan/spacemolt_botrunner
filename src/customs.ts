@@ -36,32 +36,38 @@ export interface NearbyShip {
 // ── Constants ────────────────────────────────────────────────
 
 const CUSTOMS_STOP_KEYWORDS = [
-  "CUSTOMS",
-  "Confederacy Customs",
-  "Full-spectrum cargo scan",
-  "Remain stationary",
-  "inspection",
-  "cargo scan",
-  "scan underway",
-  "Please wait",
+  "full-spectrum cargo scan",
+  "remain stationary",
+  "cargo scan underway",
+  "please wait",
   "hold contents",
-  "database",
+  "customs i -",
+  "customs ii -",
+  "customs iii -",
 ];
 
 const CUSTOMS_CLEAR_KEYWORDS = [
-  "Scan complete",
+  "scan complete",
   "cargo is compliant",
+  "cargo is federation-compliant",
+  "cargo is solarian-compliant",
+  "cargo is crimson-compliant",
+  "cargo is voidborn-compliant",
+  "cargo is nebula-compliant",
   "cleared to proceed",
-  "Safe travels",
+  "you may proceed",
+  "safe travels",
   "is cleared",
+  "all clear",
   "items verified",
   "verified against",
-  "Carry on",
+  "carry on",
   "hold checks out",
-  "Inspection concluded",
+  "inspection concluded",
   "free to continue",
   "nothing of concern",
   "verification complete",
+  "receipt for this inspection",
 ];
 
 const CUSTOMS_EVASION_KEYWORDS = [

@@ -472,7 +472,8 @@ async function fightSubordinateJoinedBattle(
 
 /**
  * Core tactical combat loop for subordinates.
- * Uses get_battle_status (free), monitors for 3rd parties, manages stances.
+ * Uses server-synced ticks: ONE command per tick, wait for response.
+ * NO arbitrary tick limit - fights until victory or hull critical.
  */
 async function fightSubordinateTacticalLoop(
   ctx: RoutineContext,
@@ -480,34 +481,54 @@ async function fightSubordinateTacticalLoop(
   settings: ReturnType<typeof getFleetHunterSettings>,
 ): Promise<boolean> {
   const { bot } = ctx;
-  const MAX_COMBAT_TICKS = 50;
   let consecutiveBraceTicks = 0;
+  let lastKnownEnemyZone = "outer";
+  let tickCount = 0;
+  let ourCurrentZone = "outer";
 
-  for (let tick = 0; tick < MAX_COMBAT_TICKS; tick++) {
+  while (true) {
     if (bot.state !== "running") return false;
+    tickCount++;
 
     // Use get_battle_status (FREE, no tick cost)
     const status = await getBattleStatus(ctx);
     if (!status) {
-      ctx.log("combat", `✅ ${targetData.name} destroyed — subordinate victory!`);
+      ctx.log("combat", `✅ ${targetData.name} destroyed — subordinate victory! (${tickCount} ticks)`);
       return true;
     }
 
     // Check if target still alive
-    const targetStillAlive = status.participants.some(
-      p => (p.player_id === targetData.id || p.username === targetData.name) && !p.is_destroyed
+    const targetParticipant = status.participants.find(
+      p => p.player_id === targetData.id || p.username === targetData.name
     );
+    const targetStillAlive = targetParticipant && !targetParticipant.is_destroyed;
 
-    if (!targetStillAlive) {
-      ctx.log("combat", `✅ ${targetData.name} eliminated — subordinate victory!`);
-      return true;
+    if (!targetStillAlive && targetParticipant) {
+      ctx.log("combat", `⚠️ ${targetData.name} marked destroyed but battle still active — waiting...`);
+      await sleep(2000);
+      continue;
     }
 
     await bot.refreshStatus();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
 
-    // Emergency flee
+    // Track enemy zone
+    if (targetParticipant && targetParticipant.zone) {
+      if (targetParticipant.zone !== lastKnownEnemyZone) {
+        const zoneDir = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+        const prevDir = zoneDir[lastKnownEnemyZone as keyof typeof zoneDir] ?? 0;
+        const newDir = zoneDir[targetParticipant.zone as keyof typeof zoneDir] ?? 0;
+        if (newDir > prevDir) {
+          ctx.log("combat", `⚠️ ${targetData.name} advancing: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+        } else if (newDir < prevDir) {
+          ctx.log("combat", `${targetData.name} retreating: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+        }
+        lastKnownEnemyZone = targetParticipant.zone;
+      }
+    }
+
+    // Emergency flee (ONLY based on hull)
     if (hullPct <= settings.fleeThreshold) {
       ctx.log("combat", `💀 Hull critical (${hullPct}%) — subordinate fleeing!`);
       await emergencyFleeSpamSubordinate(ctx, `hull at ${hullPct}%`);
@@ -516,46 +537,69 @@ async function fightSubordinateTacticalLoop(
 
     // 3rd party detection
     const ourSideId = status.your_side_id;
-    const hostileThirdParty = status.participants.find(p =>
+    const thirdPartyParticipants = status.participants.filter(p =>
       p.side_id !== ourSideId &&
       p.player_id !== bot.username &&
       p.username !== bot.username &&
       p.player_id !== targetData.id &&
       p.username !== targetData.name &&
-      !p.is_destroyed &&
-      !p.username?.toLowerCase().includes("pirate") &&
-      !p.username?.toLowerCase().includes("drifter")
+      !p.is_destroyed
     );
 
-    if (hostileThirdParty) {
-      ctx.log("combat", `🚨 3RD PARTY: ${hostileThirdParty.username || hostileThirdParty.player_id} — subordinate fleeing!`);
-      await emergencyFleeSpamSubordinate(ctx, `3rd party: ${hostileThirdParty.username || hostileThirdParty.player_id}`);
+    if (thirdPartyParticipants.length >= settings.minPiratesToFlee) {
+      ctx.log("combat", `🚨 ${thirdPartyParticipants.length} third parties — subordinate fleeing!`);
+      await emergencyFleeSpamSubordinate(ctx, `${thirdPartyParticipants.length} third parties`);
       return false;
     }
 
-    // Stance decisions
-    const shieldsCritical = shieldPct < 15 && hullPct < 70;
+    // Log battle state
+    const enemyStance = targetParticipant?.stance || "unknown";
+    const enemyZone = targetParticipant?.zone || "unknown";
+    ctx.log("combat", `Sub Tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Shields=${shieldPct}%`);
+
+    // Decide action - use positional tactics
+    const zoneDirMap = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+    const enemyZoneNum = zoneDirMap[enemyZone as keyof typeof zoneDirMap] ?? 0;
+    const ourZoneNum = zoneDirMap[ourCurrentZone as keyof typeof zoneDirMap] ?? 0;
+
+    // Check if fighting high-damage enemy (boss/capitol/large)
+    // Note: We don't have tier info here, so we use damage-based heuristic
+    const isHighDamageEnemy = false; // Could track damage per tick like hunter.ts
+    const shieldsCritical = isHighDamageEnemy
+      ? (shieldPct < 40 || hullPct < 50)
+      : (shieldPct < 15 && hullPct < 70);
 
     if (shieldsCritical && consecutiveBraceTicks < 3) {
-      ctx.log("combat", `🛡️ Tick ${tick + 1}: BRACE (shields ${shieldPct}%, hull ${hullPct}%)`);
+      ctx.log("combat", `🛡️ BRACE (${isHighDamageEnemy ? 'high-damage' : 'shields critical'})`);
       await bot.exec("battle", { action: "stance", stance: "brace" });
       consecutiveBraceTicks++;
-    } else {
-      if (consecutiveBraceTicks > 0) {
-        ctx.log("combat", `⚔️ Tick ${tick + 1}: FIRE (hull ${hullPct}%, shields ${shieldPct}%)`);
-      } else {
-        ctx.log("combat", `⚔️ Tick ${tick + 1}: FIRE (hull ${hullPct}%, shields ${shieldPct}%)`);
-      }
+    } else if (shieldsCritical && consecutiveBraceTicks >= 3) {
+      ctx.log("combat", `⚔️ FIRE (braced ${consecutiveBraceTicks}, resuming)`);
       await bot.exec("battle", { action: "stance", stance: "fire" });
       consecutiveBraceTicks = 0;
+    } else if (consecutiveBraceTicks > 0) {
+      ctx.log("combat", `⚔️ FIRE (resuming after brace)`);
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      consecutiveBraceTicks = 0;
+    } else {
+      // Positional tactics
+      if (enemyZoneNum > ourZoneNum) {
+        ctx.log("combat", `⚔️ ADVANCING (enemy in ${enemyZone})`);
+        await bot.exec("battle", { action: "advance" });
+        ourCurrentZone = (["outer", "mid", "inner", "engaged"][Math.min(3, ourZoneNum + 1)]) as typeof ourCurrentZone;
+      } else if (enemyZoneNum <= ourZoneNum && ourZoneNum > 0) {
+        ctx.log("combat", `🔄 RETREAT (maintaining position)`);
+        await bot.exec("battle", { action: "retreat" });
+        ourCurrentZone = (["outer", "mid", "inner", "engaged"][Math.max(0, ourZoneNum - 1)]) as typeof ourCurrentZone;
+      } else {
+        ctx.log("combat", `⚔️ ADVANCING to engage`);
+        await bot.exec("battle", { action: "advance" });
+        ourCurrentZone = "mid";
+      }
     }
 
     await sleep(2000);
   }
-
-  ctx.log("combat", `⏱️ Subordinate combat reached max ${MAX_COMBAT_TICKS} ticks — fleeing`);
-  await emergencyFleeSpamSubordinate(ctx, "max combat ticks reached");
-  return false;
 }
 
 /** Execute a FLEE command. */

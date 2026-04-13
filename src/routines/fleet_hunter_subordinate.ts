@@ -231,7 +231,15 @@ function createBotChatMessageHandler(ctx: RoutineContext): (message: BotChatMess
 /** Execute a MOVE command. */
 async function executeMoveCommand(ctx: RoutineContext, params: string): Promise<void> {
   const moveData = parseMoveParams(params);
-  if (!moveData) return;
+  if (!moveData) {
+    ctx.log("error", `MOVE command has invalid params: "${params}"`);
+    return;
+  }
+  
+  if (!moveData.systemId) {
+    ctx.log("error", `MOVE command has no target system! Params: "${params}"`);
+    return;
+  }
 
   const { bot } = ctx;
   const settings = getFleetHunterSettings();
@@ -707,6 +715,29 @@ async function executePatrolCommand(ctx: RoutineContext): Promise<void> {
   fleetState.currentTargetId = null;
 }
 
+/** Execute a DOCK command. */
+async function executeDockCommand(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  
+  ctx.log("fleet", "Executing DOCK — docking at current station");
+  
+  // If already docked, do nothing
+  if (bot.docked) {
+    ctx.log("fleet", "Already docked");
+    return;
+  }
+  
+  // Dock the bot
+  const dockResp = await bot.exec("dock");
+  if (dockResp.error) {
+    ctx.log("error", `Failed to dock: ${dockResp.error.message}`);
+    return;
+  }
+  
+  bot.docked = true;
+  ctx.log("fleet", "Successfully docked");
+}
+
 // ── Fleet Hunter Subordinate Routine ─────────────────────────
 
 export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -782,6 +813,10 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
           yield "exec_patrol";
           await executePatrolCommand(ctx);
           break;
+        case "DOCK":
+          yield "exec_dock";
+          await executeDockCommand(ctx);
+          break;
         default:
           ctx.log("warn", `Unknown fleet command: ${cmd}`);
       }
@@ -845,6 +880,10 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
         case "PATROL":
           yield "exec_patrol";
           await executePatrolCommand(ctx);
+          break;
+        case "DOCK":
+          yield "exec_dock";
+          await executeDockCommand(ctx);
           break;
         default:
           ctx.log("warn", `Unknown fleet command: ${cmd}`);

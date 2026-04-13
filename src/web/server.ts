@@ -503,11 +503,13 @@ export class WebServer {
             return Response.json({ error: { code: "no_commander", message: "No commander assigned to fleet" } });
           }
 
-          // Send via bot chat channel
+          // Send via bot chat channel - include BOTH commander and subordinates
           const commandMsg = `${command} ${params || ""}`.trim();
+          const allRecipients = commanderBot ? [commanderBot, ...subordinates] : subordinates;
+          
           botChatChannel.send({
             sender: "web-ui",
-            recipients: subordinates.length > 0 ? subordinates : [commanderBot],
+            recipients: allRecipients,
             channel: "fleet",
             content: commandMsg,
             metadata: {

@@ -911,6 +911,44 @@ async function fightJoinedBattleFleet(
 
 // ── Fleet Hunter Commander Routine ───────────────────────────
 
+/** Commander state - tracks pending commands from web UI */
+const commanderState = {
+  currentCommand: null as string | null,
+  commandParams: null as string | null,
+  lastCommandTime: 0,
+  targetSystem: null as string | null,
+  targetPoi: null as string | null,
+};
+
+/** Create a bot chat message handler for commander to receive web UI commands. */
+function createCommanderBotChatHandler(ctx: RoutineContext): (message: BotChatMessage) => void {
+  const { bot } = ctx;
+
+  return (message: BotChatMessage) => {
+    // Ignore messages from ourselves
+    if (message.sender === bot.username) return;
+
+    // Only process fleet channel messages
+    if (message.channel !== "fleet") return;
+
+    // Log the message
+    ctx.log("fleet", `[BOT_CHAT] ${message.sender}: ${message.content}`);
+
+    // Handle commands from web UI
+    if (message.metadata?.command && message.metadata?.fromWebUI) {
+      const cmd = message.metadata.command as string;
+      const params = (message.metadata.params as string) || "";
+      
+      ctx.log("fleet", `🎮 Web UI Command: ${cmd} ${params}`);
+      
+      // Store command for execution by main loop
+      commanderState.lastCommandTime = Date.now();
+      commanderState.currentCommand = cmd as any;
+      commanderState.commandParams = params || null;
+    }
+  };
+}
+
 export const fleetHunterCommanderRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
@@ -933,10 +971,15 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
   fleetCommService.setCommander(settings.fleetId, bot.username);
   ctx.log("fleet", `Registered as commander for fleet ${settings.fleetId}`);
 
+  // Register bot chat message handler for web UI commands
+  const botChatHandler = createCommanderBotChatHandler(ctx);
+  getBotChatChannel().onMessage(bot.username, botChatHandler);
+
   ctx.log("fleet", "Fleet Hunter Commander online — waiting for subordinates...");
   await sleep(3000); // Give subordinates time to join
 
-  while (bot.state === "running") {
+  try {
+    while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) {
@@ -946,8 +989,120 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
     }
 
     const currentSettings = getFleetHunterSettings();
-    
-    // Check if hunting is disabled
+
+    // ── Process pending web UI commands (ALWAYS process, even if hunting disabled) ──
+    if (commanderState.currentCommand) {
+      const cmd = commanderState.currentCommand;
+      const params = commanderState.commandParams || "";
+
+      ctx.log("fleet", `🎯 Processing web UI command: ${cmd} ${params}`);
+
+      // Execute command based on type
+      switch (cmd) {
+        case "MOVE": {
+          yield "exec_move";
+          const moveData = params.includes("/") ? params : `${params}`;
+          const parts = moveData.split("/");
+          const targetSystem = parts[0];
+          const targetPoi = parts[1] || null;
+          
+          if (!targetSystem) {
+            ctx.log("error", `MOVE command has no target system! Params: "${params}"`);
+            break;
+          }
+          
+          commanderState.targetSystem = targetSystem;
+          commanderState.targetPoi = targetPoi;
+          
+          ctx.log("fleet", `Executing MOVE to ${targetSystem}${targetPoi ? "/" + targetPoi : ""}`);
+          
+          const safetyOpts = {
+            fuelThresholdPct: currentSettings.refuelThreshold,
+            hullThresholdPct: currentSettings.repairThreshold,
+            autoCloak: currentSettings.autoCloak,
+          };
+          
+          // Navigate to system if different
+          if (bot.system !== targetSystem) {
+            await navigateToSystem(ctx, targetSystem, safetyOpts);
+          }
+          
+          // Travel to POI if specified
+          if (targetPoi && bot.poi !== targetPoi) {
+            await ensureUndocked(ctx);
+            const travelResp = await bot.exec("travel", { target_poi: targetPoi });
+            if (!travelResp.error || travelResp.error.message.includes("already")) {
+              bot.poi = targetPoi;
+            }
+          }
+          break;
+        }
+        case "REGROUP": {
+          yield "exec_regroup";
+          const parts = params.split("/");
+          const regroupSystem = parts[0] || bot.system;
+          const regroupPoi = parts[1] || null;
+          
+          ctx.log("fleet", `Executing REGROUP to ${regroupSystem}${regroupPoi ? "/" + regroupPoi : ""}`);
+          
+          if (bot.system !== regroupSystem) {
+            await navigateToSystem(ctx, regroupSystem, {
+              fuelThresholdPct: currentSettings.refuelThreshold,
+              hullThresholdPct: currentSettings.repairThreshold,
+              autoCloak: currentSettings.autoCloak,
+            });
+          }
+          
+          if (regroupPoi && bot.poi !== regroupPoi) {
+            await ensureUndocked(ctx);
+            const travelResp = await bot.exec("travel", { target_poi: regroupPoi });
+            if (!travelResp.error || travelResp.error.message.includes("already")) {
+              bot.poi = regroupPoi;
+            }
+          }
+          break;
+        }
+        case "HOLD":
+          yield "exec_hold";
+          ctx.log("fleet", "Executing HOLD - staying in position");
+          break;
+        case "PATROL":
+          yield "exec_patrol";
+          ctx.log("fleet", "Executing PATROL - resuming patrol");
+          break;
+        case "DOCK":
+          yield "exec_dock";
+          ctx.log("fleet", "Executing DOCK - docking at current station");
+          if (!bot.docked) {
+            const dockResp = await bot.exec("dock");
+            if (!dockResp.error) {
+              bot.docked = true;
+              ctx.log("fleet", "Successfully docked");
+            } else {
+              ctx.log("error", `Failed to dock: ${dockResp.error.message}`);
+            }
+          } else {
+            ctx.log("fleet", "Already docked");
+          }
+          break;
+        default:
+          ctx.log("warn", `Unknown web UI command: ${cmd}`);
+      }
+
+      // Clear command after execution
+      commanderState.currentCommand = null;
+      commanderState.commandParams = null;
+      
+      // After executing command, check if should wait
+      const updatedSettings = getFleetHunterSettings();
+      if (!updatedSettings.huntingEnabled) {
+        ctx.log("fleet", "Hunting is disabled — executed command, now waiting...");
+        await sleep(2000);
+        continue;
+      }
+    }
+
+    // Check if hunting is disabled (only reaches here if no commands pending)
     if (!currentSettings.huntingEnabled) {
       ctx.log("fleet", "Hunting is disabled — waiting...");
       await sleep(5000);
@@ -1204,5 +1359,10 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
     } else {
       ctx.log("fleet", `Patrol sweep done — ${patrolKills} kill(s). Continuing hunt...`);
     }
+    }
+  } finally {
+    // Clean up bot chat handler
+    getBotChatChannel().offMessage(bot.username, botChatHandler);
+    ctx.log("fleet", "Fleet Hunter Commander offline — cleaned up handlers");
   }
 };

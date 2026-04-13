@@ -933,9 +933,10 @@ function connect() {
         // Update Fleet Combat controls if visible (refresh commander dropdown only)
         if (document.getElementById('page-fleetcombat')?.classList.contains('active')) {
           renderFleetCombatControls(false); // false = don't force full re-render
-          // Also refresh navigation UI if commander is selected
+          // Also refresh navigation UI and fleet status if commander is selected
           if (battleState.commanderBot) {
             updateNavigationUI();
+            updateFleetStatusUI();
           }
         }
         break;
@@ -15281,13 +15282,31 @@ function renderFleetCombatControls(force = false) {
         No commander selected. Select a battle commander to enable navigation.
       </div>
     </div>
+
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">📊 Fleet Status</label>
+      <span id="fc-fleet-status-refresh" style="margin-left:8px;font-size:11px;color:var(--text-dim)">Auto-refresh: ON</span>
+    </div>
+
+    <div id="fc-fleet-status-ui" style="background:var(--panel);border:1px solid var(--border);border-radius:4px;max-height:250px;overflow-y:auto">
+      <div style="text-align:center;color:var(--text-dim);padding:20px">
+        Select a commander to see fleet status
+      </div>
+    </div>
   `;
 }
 
 /** Send a fleet command via bot chat channel (NOT faction chat) */
 function fcSendCommand(command, params = '') {
   const msg = `${command} ${params}`.trim();
-  logFleetCombat(`Sending: ${msg}`);
+  
+  // Validate command has required params
+  if ((command === 'MOVE' || command === 'REGROUP') && !params) {
+    logFleetCombat(`Error: ${command} command requires destination parameter`, 'error');
+    return;
+  }
+  
+  logFleetCombat(`Sending: ${msg}`, 'success');
 
   // Send via new bot chat channel API
   fetch('/api/fleet-command', {
@@ -15303,6 +15322,8 @@ function fcSendCommand(command, params = '') {
       logFleetCombat(`Error: ${data.message || data.error.message}`, 'error');
     } else {
       logFleetCombat(`Sent to ${data.subordinateCount} bot(s)`, 'success');
+      // Refresh fleet status after command sent
+      setTimeout(updateFleetStatusUI, 2000);
     }
   }).catch(err => {
     logFleetCombat(`Error: ${err.message}`, 'error');
@@ -15592,6 +15613,7 @@ function setBattleCommander(botName) {
     battleState.commanderBot = null;
     logFleetCombat('Battle commander cleared');
     updateNavigationUI();
+    updateFleetStatusUI();
     return;
   }
   const bot = bots.find(b => b.username === botName);
@@ -15606,8 +15628,9 @@ function setBattleCommander(botName) {
   battleState.commanderBot = botName;
   logFleetCombat(`Battle commander set to: ${botName} (${bot.shipName || 'unknown ship'})`, 'success');
 
-  // Update navigation UI
+  // Update navigation UI and fleet status
   updateNavigationUI();
+  updateFleetStatusUI();
 
   // If we're already in battle, refresh the UI
   if (battleState.inBattle) {
@@ -15736,20 +15759,64 @@ async function updateNavigationUI(force = false) {
 function renderNavigationPanel(commanderBot, systemData) {
   const navContainer = document.getElementById('fc-navigation-ui');
   if (!navContainer) return;
-  
+
   const currentSystem = commanderBot.system;
   const systemName = systemData.name || currentSystem;
   const pois = systemData.pois || [];
   const connections = systemData.connections || [];
-  
-  // Build POI list
-  const poiHtml = pois.length > 0 ? `
+  const isDocked = commanderBot.docked;
+
+  // Find stations in the system
+  const stations = pois.filter(p => 
+    p.type === 'station' || 
+    p.type === 'base' || 
+    (p.has_base !== undefined && p.has_base) ||
+    p.type?.toLowerCase().includes('station') ||
+    p.type?.toLowerCase().includes('base')
+  );
+
+  // Non-station POIs
+  const otherPois = pois.filter(p => !stations.includes(p));
+
+  // Build station list with dock buttons
+  const stationHtml = stations.length > 0 ? `
     <div style="margin-bottom:12px">
       <div style="font-size:12px;font-weight:600;color:var(--text-bright);margin-bottom:6px">
-        🎯 POIs in ${esc(systemName)}:
+        🏪 Stations in ${esc(systemName)}:
+      </div>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        ${stations.map(station => `
+          <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+            <button 
+              class="sm fc-nav-btn" 
+              onclick="fcTravelToPoi('${esc(currentSystem)}', '${esc(station.id)}')"
+              title="Travel to ${esc(station.name || station.id)}"
+            >
+              🚀 ${esc(station.name || station.id)}
+              <span style="font-size:10px;color:var(--text-dim)">(${esc(station.type || 'station')})</span>
+            </button>
+            <button 
+              class="sm ${isDocked && commanderBot.poi === station.id ? 'primary' : ''}" 
+              onclick="fcDockFleet('${esc(station.id)}')"
+              title="Dock fleet at ${esc(station.name || station.id)}"
+              ${!isDocked && commanderBot.poi === station.id ? '' : ''}
+            >
+              ${isDocked && commanderBot.poi === station.id ? '✓ Docked' : '⚓ Dock'}
+            </button>
+          </div>
+        `).join('')}
+      </div>
+    </div>
+  ` : '<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">No stations known in this system</div>';
+
+  // Build other POI list
+  const poiHtml = otherPois.length > 0 ? `
+    <div style="margin-bottom:12px">
+      <div style="font-size:12px;font-weight:600;color:var(--text-bright);margin-bottom:6px">
+        🎯 Other POIs:
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:6px">
-        ${pois.map(poi => `
+        ${otherPois.map(poi => `
           <button 
             class="sm fc-nav-btn" 
             onclick="fcTravelToPoi('${esc(currentSystem)}', '${esc(poi.id)}')"
@@ -15761,8 +15828,8 @@ function renderNavigationPanel(commanderBot, systemData) {
         `).join('')}
       </div>
     </div>
-  ` : '<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">No POIs known in this system</div>';
-  
+  ` : '';
+
   // Build connections list
   const connectionsHtml = connections.length > 0 ? `
     <div>
@@ -15771,29 +15838,36 @@ function renderNavigationPanel(commanderBot, systemData) {
       </div>
       <div style="display:flex;flex-wrap:wrap;gap:6px">
         ${connections.map(conn => {
-          const connName = conn.system_name || conn.id;
+          const sysId = conn.system_id || conn.id || '';
+          const connName = conn.system_name || conn.name || sysId;
           return `
             <button 
               class="sm fc-nav-btn" 
-              onclick="fcJumpToSystem('${esc(conn.id)}')"
+              onclick="fcJumpToSystem('${esc(sysId)}')"
               title="Jump to ${esc(connName)}"
             >
               ${esc(connName)}
-              <span style="font-size:10px;color:var(--text-dim)">(${esc(conn.id)})</span>
+              <span style="font-size:10px;color:var(--text-dim)">(${esc(sysId)})</span>
             </button>
           `;
         }).join('')}
       </div>
     </div>
   ` : '<div style="font-size:12px;color:var(--text-dim)">No connections known</div>';
-  
+
+  // Dock status indicator
+  const dockStatusHtml = isDocked 
+    ? `<div style="font-size:11px;color:var(--green);margin-bottom:8px">✓ Docked at ${esc(commanderBot.poi || 'unknown station')}</div>`
+    : `<div style="font-size:11px;color:var(--yellow);margin-bottom:8px">⚠ Undocked</div>`;
+
   navContainer.innerHTML = `
+    ${dockStatusHtml}
     <div style="font-size:12px;color:var(--text-bright);margin-bottom:10px;font-weight:600">
       🚩 Commander Location: ${esc(systemName)} (${esc(currentSystem)})
     </div>
-    ${poiHtml}
-    <div style="border-top:1px solid var(--border);margin:10px 0"></div>
-    ${connectionsHtml}
+    ${stationHtml}
+    ${poiHtml ? `<div style="border-top:1px solid var(--border);margin:10px 0"></div>${poiHtml}` : ''}
+    ${connectionsHtml ? `<div style="border-top:1px solid var(--border);margin:10px 0"></div>${connectionsHtml}` : ''}
   `;
 }
 
@@ -15807,6 +15881,129 @@ function fcTravelToPoi(systemId, poiId) {
 function fcJumpToSystem(targetSystemId) {
   logFleetCombat(`Jump to system: ${targetSystemId}`, 'success');
   fcSendCommand('MOVE', targetSystemId);
+}
+
+/** Dock the entire fleet at the specified station */
+function fcDockFleet(stationId) {
+  logFleetCombat(`Docking fleet at station: ${stationId}`, 'success');
+  
+  // First travel to the station POI
+  const commanderBot = bots.find(b => b.username === battleState.commanderBot);
+  if (!commanderBot) {
+    logFleetCombat('No commander selected', 'error');
+    return;
+  }
+  
+  const systemId = commanderBot.system;
+  fcSendCommand('MOVE', `${systemId}/${stationId}`);
+  
+  // Then send dock command
+  setTimeout(() => {
+    fcSendCommand('DOCK', stationId);
+    logFleetCombat(`Dock command sent for station: ${stationId}`);
+  }, 2000); // Wait 2 seconds for travel to complete
+  
+  // Refresh fleet status after sending commands
+  setTimeout(updateFleetStatusUI, 3000);
+}
+
+/** Render fleet status panel showing all bot positions */
+function updateFleetStatusUI() {
+  const statusContainer = document.getElementById('fc-fleet-status-ui');
+  if (!statusContainer) return;
+  
+  // Get all fleet bots (commander + subordinates)
+  const commanderBot = battleState.commanderBot ? bots.find(b => b.username === battleState.commanderBot) : null;
+  
+  if (!commanderBot) {
+    statusContainer.innerHTML = `
+      <div style="text-align:center;color:var(--text-dim);padding:20px">
+        Select a commander to see fleet status
+      </div>
+    `;
+    return;
+  }
+  
+  // Find all bots that could be in this fleet (running fleet_hunter routines)
+  // We'll show all running bots for now, filtered to those likely in the fleet
+  const fleetBots = bots.filter(b => 
+    b.state === 'running' && 
+    (b.routine === 'fleet_hunter_commander' || 
+     b.routine === 'fleet_hunter_subordinate' ||
+     b.system) // Show any running bot with system info
+  );
+  
+  if (fleetBots.length === 0) {
+    statusContainer.innerHTML = `
+      <div style="text-align:center;color:var(--yellow);padding:20px">
+        No fleet bots found. Start commander and subordinates first.
+      </div>
+    `;
+    return;
+  }
+  
+  // Group bots by system for compact display
+  const bySystem = {};
+  fleetBots.forEach(bot => {
+    const sys = bot.system || 'Unknown';
+    if (!bySystem[sys]) bySystem[sys] = [];
+    bySystem[sys].push(bot);
+  });
+  
+  // Build compact status table
+  let html = `
+    <table style="width:100%;font-size:11px;border-collapse:collapse">
+      <thead style="background:var(--bg);position:sticky;top:0">
+        <tr>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid var(--border)">Bot</th>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid var(--border)">System</th>
+          <th style="text-align:left;padding:6px;border-bottom:1px solid var(--border)">POI</th>
+          <th style="text-align:center;padding:6px;border-bottom:1px solid var(--border)">Status</th>
+          <th style="text-align:right;padding:6px;border-bottom:1px solid var(--border)">HP</th>
+        </tr>
+      </thead>
+      <tbody>
+  `;
+  
+  fleetBots.forEach(bot => {
+    const isCommander = bot.username === battleState.commanderBot;
+    const dockedIcon = bot.docked ? '⚓' : '🚀';
+    const statusIcon = isCommander ? '👑' : '';
+    
+    // Color code hull status
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    const hullColor = hullPct > 70 ? 'var(--green)' : hullPct > 40 ? 'var(--yellow)' : 'var(--red)';
+    
+    html += `
+      <tr style="${isCommander ? 'background:rgba(88,166,255,0.1)' : ''}">
+        <td style="padding:4px 6px;border-bottom:1px solid var(--border)">
+          ${statusIcon} ${esc(bot.username)}
+        </td>
+        <td style="padding:4px 6px;border-bottom:1px solid var(--border)">
+          ${esc(bot.system || '?')}
+        </td>
+        <td style="padding:4px 6px;border-bottom:1px solid var(--border);color:var(--text-dim)">
+          ${esc(bot.poi || '-')}
+        </td>
+        <td style="text-align:center;padding:4px 6px;border-bottom:1px solid var(--border)">
+          ${dockedIcon}${bot.docked ? 'Docked' : 'Undocked'}
+        </td>
+        <td style="text-align:right;padding:4px 6px;border-bottom:1px solid var(--border);color:${hullColor}">
+          ${hullPct}%
+        </td>
+      </tr>
+    `;
+  });
+  
+  html += `
+      </tbody>
+    </table>
+    <div style="font-size:10px;color:var(--text-dim);padding:4px;text-align:right">
+      ${fleetBots.length} bot(s) | Last updated: ${new Date().toLocaleTimeString()}
+    </div>
+  `;
+  
+  statusContainer.innerHTML = html;
 }
 
 // ═══════════════════════════════════════════════════════════

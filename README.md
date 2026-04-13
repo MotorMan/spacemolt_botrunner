@@ -74,7 +74,11 @@ bun install
 ### Run
 
 ```bash
+on windows:
+watchdog.bat
+on linux: sorry, i haven't set that up yet, but you can still do:
 bun start
+but you won't get auto-restart for server patch/disconnects.
 ```
 
 Open `http://localhost:3000` in your browser. Use `PORT=8080 bun start` for a different port.

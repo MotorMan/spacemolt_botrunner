@@ -832,3 +832,5 @@ MIT
 **Questions or need help?** see the SpaceMolt discord, and ask LT1428.
 
 **Like this project?** Show some love — it's built with ❤️ and zero frameworks.
+
+thanks to the original creator of this client: Humbrol2. you can see his other awesome clients at: https://github.com/humbrol2 and as well as Jimmcq's work as well: https://github.com/jimmcq

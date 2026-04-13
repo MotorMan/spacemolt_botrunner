@@ -8,12 +8,28 @@ import type { RoutineContext } from "../bot.js";
 import type { BattleStatus, BattleSide, BattleParticipant, BattleZone, BattleStance } from "../types/game.js";
 import { catalogStore } from "../catalogstore.js";
 import { mapStore } from "../mapstore.js";
+import { getSystemBlacklist } from "../web/server.js";
 import {
   waitForCustomsInspection,
   pollForCustomsShip,
   isEmpireSystem,
   getBotCustomsStats,
 } from "../customs.js";
+
+// ── Emergency Warp Stabilizer ────────────────────────────────
+
+/** The exact log message produced when the Emergency Warp Stabilizer activates. */
+export const EMERGENCY_WARP_STABILIZER_MESSAGE =
+  "Emergency Warp Stabilizer activated! Hull critical — warped to Confederacy Central Command. The module has been destroyed.";
+
+/**
+ * Check if the bot's current state indicates it should stop (e.g., due to emergency warp).
+ * This is a convenience helper for routines to check between actions.
+ * The actual detection and stop is handled automatically by bot.ts log method.
+ */
+export function shouldStopForEmergency(ctx: RoutineContext): boolean {
+  return ctx.bot.state !== "running";
+}
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -38,6 +54,8 @@ export interface SystemPOI {
   base_id: string | null;
   /** Station services (refuel, repair, market, etc.) — null if unknown or no base. */
   services: BaseServices | null;
+  /** Hidden POIs (e.g., secret ore belts) */
+  hidden?: boolean;
 }
 
 export interface Connection {
@@ -128,11 +146,11 @@ export function stationHasService(poi: SystemPOI, service: keyof BaseServices): 
 
 /** Known salvage yard station IDs (one per empire). */
 export const SALVAGE_YARD_STATIONS = [
-  "alpha_centauri_colonial_station", // Sol
-  "node_alpha_processing_station",   // Node
-  "the_anvil_arsenal",               // Anvil
-  "mobile_capital",                  // Mobile empire (dynamic - location tracked by mapStore)
-  "cargo_lanes_freight_depot",       // Cargo Lanes
+  "alpha_centauri_colonial_station",   // Sol (legacy name — may not exist in all instances)
+  "node_alpha_processing_station",     // Node
+  "the_anvil_arsenal",                 // Anvil
+  "mobile_capital",                    // Mobile empire (dynamic - location tracked by mapStore)
+  "cargo_lanes_freight_depot",         // Cargo Lanes
 ];
 
 /** Pirate station systems — these are hostile and should be avoided. */
@@ -156,12 +174,17 @@ export function isPirateSystem(systemId: string): boolean {
 
 /** Find a station with a salvage yard service. Returns null if none found. */
 export function findSalvageYardStation(pois: SystemPOI[]): SystemPOI | null {
-  // First try: check services flag
-  const byService = pois.find(p => isStationPoi(p) && p.services?.salvage_yard !== false);
-  if (byService) return byService;
-  
-  // Second try: match known salvage yard station IDs
-  return pois.find(p => isStationPoi(p) && SALVAGE_YARD_STATIONS.includes(p.id)) || null;
+  // First try: match known salvage yard station IDs (explicit list)
+  const known = pois.find(p => isStationPoi(p) && SALVAGE_YARD_STATIONS.includes(p.id));
+  if (known) return known;
+
+  // Second try: explicit salvage_yard === true (not optimistic — must be confirmed)
+  const withService = pois.find(p => isStationPoi(p) && p.services?.salvage_yard === true);
+  if (withService) return withService;
+
+  // Third try: ANY station (salvage yards may not have the service flag set in map data)
+  // This ensures we can still process towed wrecks even if the service flag is missing
+  return pois.find(p => isStationPoi(p)) || null;
 }
 
 /** Get the system ID for a known salvage yard station. */
@@ -171,12 +194,13 @@ export function getSystemForSalvageYard(stationId: string): string | null {
     return getMobileCapitolSystem();
   }
   
-  // Map other salvage yard stations to their systems (update as discovered)
+  // Map other salvage yard stations to their systems
   const stationToSystem: Record<string, string> = {
-    "alpha_centauri_colonial_station": "sol",            // Sol empire
-    "node_alpha_processing_station": "node_alpha",       // Node empire (guess - update if different)
-    "the_anvil_arsenal": "the_anvil",                    // Anvil empire (guess - update if different)
-    "cargo_lanes_freight_depot": "cargo_lanes",          // Cargo Lanes empire (guess - update if different)
+    "alpha_centauri_colonial_station": "alpha_centauri",  // Alpha Centauri empire
+    "node_alpha_processing_station": "node_alpha",        // Node empire
+    "the_anvil_arsenal": "the_anvil",                     // Anvil empire
+    "cargo_lanes_freight_depot": "cargo_lanes",           // Cargo Lanes empire
+    "starfall_salvage_station": "starfall",               // Starfall system
   };
   return stationToSystem[stationId] || null;
 }
@@ -330,30 +354,54 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
   const { bot } = ctx;
   if (bot.docked) return true;
 
+  // Refresh status first to ensure we have the latest docked state
+  await bot.refreshStatus();
+  if (bot.docked) return true;
+
   const { pois } = await getSystemInfo(ctx);
   const station = findStation(pois);
 
   if (station) {
     if (bot.poi !== station.id) {
       ctx.log("travel", `Traveling to ${station.name}...`);
-      await bot.exec("travel", { target_poi: station.id });
-      bot.poi = station.id;
-    }
-    ctx.log("system", "Docking...");
-    const dockResp = await bot.exec("dock");
-    if (!dockResp.error || dockResp.error.message.includes("already")) {
-      bot.docked = true;
-      if (!skipStorageCollection) {
-        await collectFromStorage(ctx, minBalance);
+      const travelResp = await bot.exec("travel", { target_poi: station.id });
+      if (travelResp.error && !travelResp.error.message.includes("already")) {
+        ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
+        // Fall through to search for nearest station
+      } else {
+        bot.poi = station.id;
+        // Refresh status after travel to update position
+        await bot.refreshStatus();
       }
-      await ensureInsured(ctx);
-      return true;
+    }
+    // Only attempt dock if we're at a station POI
+    if (bot.poi && pois.find(p => p.id === bot.poi)) {
+      ctx.log("system", "Docking...");
+      const dockResp = await bot.exec("dock");
+      if (!dockResp.error || dockResp.error.message.includes("already")) {
+        bot.docked = true;
+        if (!skipStorageCollection) {
+          await collectFromStorage(ctx, minBalance);
+        }
+        await ensureInsured(ctx);
+        return true;
+      }
+      // Dock failed at current POI - check if it's "No base at this location"
+      if (dockResp.error?.message?.includes("No base at this location")) {
+        ctx.log("error", `No dockable base at current POI (${bot.poi}) — searching for nearest station...`);
+        // Don't fall through to "No station in current system" - we know we need a different station
+        // Jump directly to the nearest station system
+      } else {
+        ctx.log("error", `Dock failed: ${dockResp.error.message}`);
+        // Fall through to search for nearest station
+      }
     }
   }
 
   // No station in current system — find nearest known station
   ctx.log("system", "No station in current system — searching for nearest station...");
-  const nearest = mapStore.findNearestStationSystem(bot.system);
+  const blacklist = getSystemBlacklist();
+  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
   if (!nearest) {
     ctx.log("error", "No known station in mapped systems — cannot dock");
     return false;
@@ -364,7 +412,7 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
   // Navigate there
   if (nearest.systemId !== bot.system) {
     await ensureUndocked(ctx);
-    const route = mapStore.findRoute(bot.system, nearest.systemId);
+    const route = mapStore.findRoute(bot.system, nearest.systemId, blacklist);
     if (route && route.length > 1) {
       for (let i = 1; i < route.length; i++) {
         if (bot.state !== "running") return false;
@@ -372,21 +420,37 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
         const jumpResp = await bot.exec("jump", { target_system: route[i] });
         if (jumpResp.error) {
           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-          return false;
+          // Check if we actually made the jump despite the error
+          await bot.refreshStatus();
+          if (bot.system.toLowerCase() !== route[i].toLowerCase()) {
+            return false; // Jump truly failed
+          }
+          ctx.log("travel", `Jump succeeded despite error (server confirmed position)`);
         }
       }
     } else {
       const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
       if (jumpResp.error) {
         ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-        return false;
+        // Check if we actually made the jump despite the error
+        await bot.refreshStatus();
+        if (bot.system.toLowerCase() !== nearest.systemId.toLowerCase()) {
+          return false; // Jump truly failed
+        }
+        ctx.log("travel", `Jump succeeded despite error (server confirmed position)`);
       }
     }
+    // Refresh status after navigation
+    await bot.refreshStatus();
   }
 
   // Travel to station POI and dock
   ctx.log("travel", `Traveling to ${nearest.poiName}...`);
-  await bot.exec("travel", { target_poi: nearest.poiId });
+  const travelResp = await bot.exec("travel", { target_poi: nearest.poiId });
+  if (travelResp.error && !travelResp.error.message.includes("already")) {
+    ctx.log("error", `Travel to station POI failed: ${travelResp.error.message}`);
+    return false;
+  }
   bot.poi = nearest.poiId;
 
   ctx.log("system", "Docking...");
@@ -792,11 +856,25 @@ export async function ensureFueled(
   }
 
   // Step 2: No local station — try fuel cells already in cargo
+  // Loop to consume multiple fuel cells if needed (e.g. low-tier cells only give +20 fuel each)
   if (!bot.docked) {
-    const refuelResp = await bot.exec("refuel");
-    if (!refuelResp.error) {
+    let cargoRefuelAttempts = 0;
+    while (fuelPct < thresholdPct && cargoRefuelAttempts < 20) {
+      const refuelResp = await bot.exec("refuel");
+      if (refuelResp.error) {
+        const msg = refuelResp.error.message.toLowerCase();
+        if (msg.includes("no fuel") || msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
+          ctx.log("system", "No fuel cells in cargo — skipping cargo refuel");
+        }
+        break; // error or no fuel cells
+      }
+      cargoRefuelAttempts++;
       await bot.refreshStatus();
-      fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      const newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (newFuelPct > fuelPct) {
+        ctx.log("system", `Refueled from cargo fuel cell — fuel now ${newFuelPct}%`);
+        fuelPct = newFuelPct;
+      }
       if (fuelPct >= thresholdPct) {
         ctx.log("system", `Refueled from cargo — fuel now ${fuelPct}%`);
         return true;
@@ -823,7 +901,8 @@ export async function ensureFueled(
 
   // Step 4: No local station — find nearest known system with one
   ctx.log("system", "No station in current system — searching known map for nearest station...");
-  const nearest = mapStore.findNearestStationSystem(bot.system);
+  const blacklist = getSystemBlacklist();
+  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
   if (!nearest) {
     ctx.log("error", "No known station in mapped systems — emergency recovery...");
     return await emergencyFuelRecovery(ctx);
@@ -844,7 +923,7 @@ export async function ensureFueled(
     await ensureUndocked(ctx);
 
     // Jump system by system toward the station
-    const route = mapStore.findRoute(bot.system, nearest.systemId);
+    const route = mapStore.findRoute(bot.system, nearest.systemId, blacklist);
     if (route && route.length > 1) {
       for (let i = 1; i < route.length; i++) {
         if (bot.state !== "running") return false;
@@ -1044,6 +1123,7 @@ export async function navigateToSystem(
   const { bot } = ctx;
   const MAX_JUMPS = 199;
   const MAX_RETRIES_PER_JUMP = 10;
+  const blacklist = getSystemBlacklist();
 
   // Normalize system names for comparison (replace underscores with spaces, lowercase)
   const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
@@ -1056,8 +1136,8 @@ export async function navigateToSystem(
       return true;
     }
 
-    // Plan route from current position
-    const route = mapStore.findRoute(bot.system, targetSystemId);
+    // Plan route from current position (use blacklist to avoid pirate systems)
+    const route = mapStore.findRoute(bot.system, targetSystemId, blacklist);
     let nextSystem: string | null = null;
 
     if (route && route.length > 1) {
@@ -1067,23 +1147,35 @@ export async function navigateToSystem(
       ctx.log("travel", `No mapped route — querying server for route to ${targetSystemId}`);
       const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
       const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
-      
+
       // Check if server says we're already at target (message field or 0 jumps)
       const alreadyAtTarget = routeData?.found && (
-        routeData.total_jumps === 0 || 
+        routeData.total_jumps === 0 ||
         (routeData.message && routeData.message.toLowerCase().includes('already')) ||
         (routeData.route && routeData.route.length === 1)
       );
-      
+
       if (alreadyAtTarget) {
         ctx.log("travel", `Server confirms we are already at ${targetSystemId}`);
         return true;
       }
-      
+
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
-        nextSystem = routeData.route[1].system_id;
-        ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
-      } else {
+        // Validate server route against blacklist — reject if it passes through blacklisted systems
+        const serverRouteSystemIds = routeData.route.map(r => r.system_id);
+        const blacklistedOnRoute = serverRouteSystemIds.find(
+          sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
+        );
+        if (blacklistedOnRoute) {
+          ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route`);
+        } else {
+          nextSystem = routeData.route[1].system_id;
+          ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
+        }
+      }
+
+      // If server route was rejected or unavailable, try fallback options
+      if (!nextSystem) {
         // Server returned no route - check if we might already be at the target
         // This can happen due to case mismatch or if we're already there
         ctx.log("warn", `Server returned no route to ${targetSystemId} — checking if already arrived...`);
@@ -1137,8 +1229,8 @@ export async function navigateToSystem(
     await bot.refreshStatus();
     if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) return true;
 
-    // Recalculate route from CURRENT position (ensureFueled may have moved us)
-    const postFuelRoute = mapStore.findRoute(bot.system, targetSystemId);
+    // Recalculate route from CURRENT position (ensureFueled may have moved us, use blacklist)
+    const postFuelRoute = mapStore.findRoute(bot.system, targetSystemId, blacklist);
     if (postFuelRoute && postFuelRoute.length > 1) {
       nextSystem = postFuelRoute[1];
       ctx.log("travel", `Route recalculated from ${bot.system}: ${postFuelRoute.length - 1} jump${postFuelRoute.length - 1 !== 1 ? "s" : ""} remaining`);
@@ -1147,23 +1239,34 @@ export async function navigateToSystem(
       ctx.log("travel", `No mapped route from ${bot.system} — querying server for route to ${targetSystemId}`);
       const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
       const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
-      
+
       // Check if server says we're already at target
       const alreadyAtTarget = routeData?.found && (
-        routeData.total_jumps === 0 || 
+        routeData.total_jumps === 0 ||
         (routeData.message && routeData.message.toLowerCase().includes('already')) ||
         (routeData.route && routeData.route.length === 1)
       );
-      
+
       if (alreadyAtTarget) {
         ctx.log("travel", `Server confirms we are already at ${targetSystemId} (post-fuel check)`);
         return true;
       }
-      
+
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
-        nextSystem = routeData.route[1].system_id;
-        ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
-      } else {
+        // Validate server route against blacklist — reject if it passes through blacklisted systems
+        const serverRouteSystemIds = routeData.route.map(r => r.system_id);
+        const blacklistedOnRoute = serverRouteSystemIds.find(
+          sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
+        );
+        if (blacklistedOnRoute) {
+          ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route (post-fuel)`);
+        } else {
+          nextSystem = routeData.route[1].system_id;
+          ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
+        }
+      }
+
+      if (!nextSystem) {
         ctx.log("error", `No route from ${bot.system} to ${targetSystemId} — cannot navigate`);
         return false;
       }
@@ -1174,22 +1277,87 @@ export async function navigateToSystem(
     // Jump with retry logic for transient errors
     let jumpSuccess = false;
     let retries = 0;
+    let inBattleDuringJump = false;
     while (!jumpSuccess && retries < MAX_RETRIES_PER_JUMP && bot.state === "running") {
       retries++;
       ctx.log("travel", `Jumping to ${nextSystem} from ${bot.system}... (attempt ${retries}/${MAX_RETRIES_PER_JUMP})`);
       const jumpResp = await bot.exec("jump", { target_system: nextSystem });
-      
+
+      // Track if we handled a battle interrupt to avoid double error handling
+      let battleInterruptHandled = false;
+
+      // Check for battle notifications after jump
+      if (jumpResp.notifications && Array.isArray(jumpResp.notifications)) {
+        const battleNotifs = parseBattleNotifications(jumpResp.notifications);
+        const hasBattle = battleNotifs.some(n => n.type === "battle_start" || n.type === "battle_hit");
+        if (hasBattle) {
+          ctx.log("combat", "Battle detected during jump - initiating flee!");
+          inBattleDuringJump = true;
+          battleInterruptHandled = true;
+          // Re-issue flee every cycle while in battle
+          const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+          if (fleeResp.error) {
+            ctx.log("error", `Flee command failed: ${fleeResp.error.message}`);
+          }
+          // Check if disengaged
+          const battleStatus = await getBattleStatus(ctx);
+          if (!battleStatus || !battleStatus.is_participant) {
+            ctx.log("combat", "Battle cleared - continuing navigation");
+            inBattleDuringJump = false;
+          } else {
+            // Still in battle - wait and continue to re-flee
+            await sleep(2000);
+            continue;
+          }
+        }
+      }
+
+      // CRITICAL: Check for battle interrupt error (jump timed out due to battle)
+      if (jumpResp.error && jumpResp.error.code === "battle_interrupt") {
+        ctx.log("combat", `Battle interrupt detected! ${jumpResp.error.message} - initiating flee!`);
+        inBattleDuringJump = true;
+        battleInterruptHandled = true;
+        // Re-issue flee every cycle while in battle
+        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (fleeResp.error) {
+          ctx.log("error", `Flee command failed: ${fleeResp.error.message}`);
+        }
+        // Check if disengaged
+        const battleStatus = await getBattleStatus(ctx);
+        if (!battleStatus || !battleStatus.is_participant) {
+          ctx.log("combat", "Battle cleared - continuing navigation");
+          inBattleDuringJump = false;
+          // Battle was cleared, but we still have an error - need to retry the jump
+          // Fall through to error handling below
+        } else {
+          // Still in battle - wait and continue to re-flee
+          await sleep(2000);
+          continue;
+        }
+      }
+
       if (!jumpResp.error) {
         jumpSuccess = true;
         break;
       }
-      
+
+      // If we handled battle interrupt and battle is now cleared, treat as transient and retry
+      if (battleInterruptHandled && !inBattleDuringJump) {
+        ctx.log("travel", "Battle interrupt handled and cleared - retrying jump");
+        // Fall through to retry logic below
+      }
+
       const errorMsg = jumpResp.error.message.toLowerCase();
 
       // Check if error is transient (network timeout, connection issue, etc.)
+      // Note: battle_interrupt is handled separately above, so we don't include it here
       const isTransient =
+        jumpResp.error.code === "timeout" || // Our custom timeout from execWithTimeout
         errorMsg.includes("timeout") ||
         errorMsg.includes("524") || // HTTP 524 Request Timeout
+        errorMsg.includes("520") || // HTTP 520 Web Server Returned An Unknown Error (server-side issue)
+        errorMsg.includes("502") || // HTTP 502 Bad Gateway (server-side issue)
+        errorMsg.includes("bad gateway") ||
         errorMsg.includes("connection") ||
         errorMsg.includes("network") ||
         errorMsg.includes("hiccup") ||
@@ -1197,14 +1365,28 @@ export async function navigateToSystem(
         errorMsg.includes("try again") ||
         errorMsg.includes("pending") ||
         errorMsg.includes("busy") ||
-        errorMsg.includes("systems are not connected"); // Sometimes a temporary state
-      
+        errorMsg.includes("systems are not connected") || // Sometimes a temporary state
+        errorMsg.includes("you are already in"); // Already at destination - treat as success
+
       if (!isTransient) {
         // Permanent error - don't retry
         ctx.log("error", `Jump failed (permanent error): ${jumpResp.error.message}`);
         return false;
       }
-      
+
+      // Special case: "already in" means we're already at the target system
+      if (errorMsg.includes("you are already in")) {
+        ctx.log("travel", `Server says already in system — refreshing status to verify position...`);
+        await bot.refreshStatus();
+        // Check if we're actually at the target system
+        if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
+          ctx.log("travel", `Confirmed: already at target ${targetSystemId}`);
+          return true;
+        }
+        // Not at target - the "already in" error was for a different system
+        // Fall through to retry logic
+      }
+
       ctx.log("error", `Jump failed (transient): ${jumpResp.error.message}`);
       
       if (retries < MAX_RETRIES_PER_JUMP) {
@@ -1217,8 +1399,8 @@ export async function navigateToSystem(
         await bot.refreshStatus();
         if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
 
-        // Recalculate route from CURRENT position (may have changed during wait)
-        const retryRoute = mapStore.findRoute(bot.system, targetSystemId);
+        // Recalculate route from CURRENT position (may have changed during wait, use blacklist)
+        const retryRoute = mapStore.findRoute(bot.system, targetSystemId, blacklist);
         if (retryRoute && retryRoute.length > 1) {
           nextSystem = retryRoute[1];
           ctx.log("travel", `Route recalculated after wait: ${retryRoute.length - 1} jump${retryRoute.length - 1 !== 1 ? "s" : ""} remaining`);
@@ -1235,6 +1417,14 @@ export async function navigateToSystem(
 
     // Check for customs inspection after entering new system
     await checkCustomsInspection(ctx, nextSystem);
+
+    // Check for battle status after jump (in case we jumped into an active battle)
+    const battleStatus = await getBattleStatus(ctx);
+    if (battleStatus && battleStatus.is_participant) {
+      ctx.log("combat", `JUMPED INTO BATTLE! Battle ID: ${battleStatus.battle_id} - initiating emergency flee!`);
+      await fleeFromBattle(ctx, true, 35000);
+      return false; // Aborted navigation due to battle
+    }
 
     // Check for pirates in the new system and flee if detected
     const nearbyResp = await bot.exec("get_nearby");
@@ -1382,10 +1572,18 @@ interface WreckItem {
   quantity: number;
 }
 
+interface WreckModule {
+  id: string;
+  type_id: string;
+  name: string;
+  type: string;
+}
+
 interface Wreck {
   wreck_id: string;
   name: string;
   items: WreckItem[];
+  modules: WreckModule[];
 }
 
 /** Parse wreck list from get_wrecks response. */
@@ -1407,6 +1605,12 @@ function parseWrecks(result: unknown): Wreck[] {
       []
     ) as Array<Record<string, unknown>>;
 
+    // Parse modules array
+    const rawModules = (
+      Array.isArray(w.modules) ? w.modules :
+      []
+    ) as Array<Record<string, unknown>>;
+
     return {
       wreck_id: (w.wreck_id as string) || (w.id as string) || "",
       name: (w.name as string) || (w.type as string) || "wreck",
@@ -1415,6 +1619,12 @@ function parseWrecks(result: unknown): Wreck[] {
         name: (i.name as string) || (i.item_id as string) || "",
         quantity: (i.quantity as number) || 1,
       })).filter(i => i.item_id),
+      modules: rawModules.map(m => ({
+        id: (m.id as string) || "",
+        type_id: (m.type_id as string) || "",
+        name: (m.name as string) || "",
+        type: (m.type as string) || "",
+      })).filter(m => m.id),
     };
   }).filter(w => w.wreck_id);
 }
@@ -1471,6 +1681,9 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
       return aPri - bPri;
     });
 
+    // Track what we loot from this specific wreck
+    const wreckLoot: string[] = [];
+
     for (const item of candidates) {
       if (bot.state !== "running") break;
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) break;
@@ -1483,6 +1696,11 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
 
       if (lootResp.error) {
         const errMsg = lootResp.error.message.toLowerCase();
+        // CRITICAL: Check for battle interrupt - stop scavenging immediately
+        if (lootResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+          ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
+          return totalLooted;
+        }
         if (errMsg.includes("no_space") || errMsg.includes("not enough cargo") || errMsg.includes("cargo space")) {
           break; // cargo full — stop looting this wreck
         }
@@ -1494,6 +1712,12 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
 
       totalLooted++;
       lootedItems.push(`${item.quantity}x ${item.name}`);
+      wreckLoot.push(`${item.quantity}x ${item.name}`);
+    }
+
+    // Log what we got from this wreck
+    if (wreckLoot.length > 0) {
+      ctx.log("scavenge", `Wreck ${wreck.wreck_id.substring(0, 8)}...: ${wreckLoot.join(", ")}`);
     }
   }
 
@@ -1516,7 +1740,7 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
  */
 export async function fullSalvageWrecks(
   ctx: RoutineContext,
-  opts?: { fuelOnly?: boolean; enableTow?: boolean; minTowValue?: number },
+  opts?: { fuelOnly?: boolean; enableTow?: boolean; minTowValue?: number; battleState?: BattleState },
 ): Promise<{ itemsLooted: number; isTowing: boolean }> {
   const { bot } = ctx;
   if (bot.docked) return { itemsLooted: 0, isTowing: false };
@@ -1524,6 +1748,7 @@ export async function fullSalvageWrecks(
   const enableTow = opts?.enableTow ?? false;
   const minTowValue = opts?.minTowValue ?? 500;
   const fuelOnly = opts?.fuelOnly ?? false;
+  const battleState = opts?.battleState;
 
   const wrecksResp = await bot.exec("get_wrecks");
   const wrecks = parseWrecks(wrecksResp.result);
@@ -1568,8 +1793,22 @@ export async function fullSalvageWrecks(
           quantity: item.quantity,
         });
 
+        // Check for battle notifications after loot
+        if (battleState && lootResp.notifications && Array.isArray(lootResp.notifications)) {
+          const battleDetected = await handleBattleNotifications(ctx, lootResp.notifications, battleState);
+          if (battleDetected) {
+            ctx.log("combat", "Battle detected while looting wreck - initiating flee!");
+            battleState.isFleeing = false;
+          }
+        }
+
         if (lootResp.error) {
           const msg = lootResp.error.message.toLowerCase();
+          // CRITICAL: Check for battle interrupt - stop scavenging immediately
+          if (lootResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+            ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
+            return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
+          }
           if (msg.includes("empty") || msg.includes("not found")) break;
           continue;
         }
@@ -1589,6 +1828,14 @@ export async function fullSalvageWrecks(
       }
 
       const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
+      // Check for battle notifications after tow
+      if (battleState && towResp.notifications && Array.isArray(towResp.notifications)) {
+        const battleDetected = await handleBattleNotifications(ctx, towResp.notifications, battleState);
+        if (battleDetected) {
+          ctx.log("combat", "Battle detected while towing wreck - initiating flee!");
+          battleState.isFleeing = false;
+        }
+      }
       if (!towResp.error && towResp.result) {
         const tr = towResp.result as Record<string, unknown>;
         ctx.log("debug", `tow_wreck response: ${JSON.stringify(tr)}`);
@@ -1596,6 +1843,19 @@ export async function fullSalvageWrecks(
         const shipClass = (tr.ship_class as string) || "unknown";
 
         if (salvageValue >= minTowValue) {
+          // Log modules from the wreck's modules array
+          const moduleCount = wreck.modules.length;
+          
+          if (moduleCount > 0) {
+            const moduleList = wreck.modules.map(m => {
+              const name = m.name || m.type || m.type_id || m.id;
+              return name;
+            }).join(", ");
+            ctx.log("scavenge", `📦 Wreck contains ${moduleCount} module(s): ${moduleList}`);
+          } else {
+            ctx.log("scavenge", `📦 Wreck contains no modules`);
+          }
+
           towedWrecks.push({
             wreck_id: wreck.wreck_id,
             name: wreck.name,
@@ -1611,6 +1871,11 @@ export async function fullSalvageWrecks(
         }
       } else if (towResp.error) {
         const msg = towResp.error.message.toLowerCase();
+        // CRITICAL: Check for battle interrupt - stop scavenging immediately
+        if (towResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+          ctx.log("combat", `Tow interrupted by battle! ${towResp.error.message} - stopping salvage!`);
+          return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
+        }
         if (msg.includes("already")) {
           // Check if it's "already_towing" (we're towing) vs "already_towed" (someone else has it)
           if (msg.includes("already_towing") || msg.includes("already towing")) {
@@ -1647,9 +1912,10 @@ export async function fullSalvageWrecks(
 
 /**
  * Process towed wrecks at a salvage yard station.
+ * - First, loot any modules from the towed wreck
  * - If salvaging skill < 2: sell_wreck for credits + XP
  * - If salvaging skill >= 2: scrap_wreck for materials (or sell if preferred)
- * 
+ *
  * Must be docked at a station with salvage_yard service.
  * Returns number of wrecks processed.
  */
@@ -1679,60 +1945,215 @@ export async function processTowedWrecks(
     return 0;
   }
 
-  // Check salvaging skill level
+  // Step 1: Loot modules from the towed wreck before selling/scrapping
+  ctx.log("scavenge", "Checking towed wreck for lootable modules...");
+  const wrecksResp = await bot.exec("get_wrecks");
+  const wrecks = parseWrecks(wrecksResp.result);
+
+  // Find the towed wreck in the list (it should still be accessible)
+  let modulesLooted = 0;
+  for (const wreck of wrecks) {
+    // Check modules array (not items)
+    if (wreck.modules.length === 0) {
+      ctx.log("scavenge", "📦 Towed wreck has no modules to loot");
+      break;
+    }
+
+    ctx.log("scavenge", `📦 Towed wreck ${wreck.name} contains ${wreck.modules.length} module(s): ${wreck.modules.map(m => m.name || m.type || m.type_id || m.id).join(", ")}`);
+
+    // Loot ALL modules and cargo from the wreck (no item_id specified = loots everything to cargo hold)
+    // Check cargo space first
+    await bot.refreshStatus();
+    const moduleCargoCost = wreck.modules.length * 10; // Typical module size is 10 each
+    if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
+      ctx.log("scavenge", `Cargo full while looting modules (${bot.cargo}/${bot.cargoMax}) — depositing items to make space...`);
+
+      // We're already docked, so deposit all non-fuel items from inventory
+      await bot.refreshCargo();
+      let deposited = false;
+      for (const cargoItem of bot.inventory) {
+        const lower = cargoItem.itemId.toLowerCase();
+        if (!lower.includes("fuel") && !lower.includes("energy_cell") && cargoItem.quantity > 0) {
+          const depositResp = await bot.exec("deposit_items", { item_id: cargoItem.itemId, quantity: cargoItem.quantity });
+          if (!depositResp.error) {
+            ctx.log("scavenge", `Deposited ${cargoItem.quantity}x ${cargoItem.name} to storage`);
+            deposited = true;
+          }
+        }
+      }
+
+      if (!deposited) {
+        ctx.log("warn", "No items to deposit — cannot make space for modules");
+        break;
+      }
+      
+      // Re-check cargo after deposit
+      await bot.refreshStatus();
+      if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
+        ctx.log("warn", "Still no cargo space after deposit — skipping module loot");
+        break;
+      }
+    }
+
+    // Loot ALL modules and cargo from wreck (no item_id = loots everything)
+    const lootResp = await bot.exec("loot_wreck", {
+      wreck_id: wreck.wreck_id,
+    });
+
+    if (lootResp.error) {
+      const msg = lootResp.error.message.toLowerCase();
+      // CRITICAL: Check for battle interrupt - stop immediately
+      if (lootResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+        ctx.log("combat", `Module loot interrupted by battle! ${lootResp.error.message} - stopping!`);
+        return 0;
+      }
+      if (msg.includes("no_space") || msg.includes("not enough cargo")) {
+        ctx.log("scavenge", "Still no cargo space — depositing ALL current items and retrying...");
+        // Deposit all non-fuel items to make space
+        await bot.refreshCargo();
+        for (const cargoItem of bot.inventory) {
+          const lower = cargoItem.itemId.toLowerCase();
+          if (!lower.includes("fuel") && !lower.includes("energy_cell") && cargoItem.quantity > 0) {
+            await bot.exec("deposit_items", { item_id: cargoItem.itemId, quantity: cargoItem.quantity });
+          }
+        }
+        // Retry looting everything
+        const retryResp = await bot.exec("loot_wreck", {
+          wreck_id: wreck.wreck_id,
+        });
+        if (!retryResp.error) {
+          modulesLooted = wreck.modules.length;
+          ctx.log("scavenge", `✓ Looted all modules from wreck`);
+        } else {
+          const retryMsg = retryResp.error.message.toLowerCase();
+          // Check for battle interrupt on retry as well
+          if (retryResp.error.code === "battle_interrupt" || retryMsg.includes("interrupted by battle") || retryMsg.includes("interrupted by combat")) {
+            ctx.log("combat", `Module loot retry interrupted by battle! ${retryResp.error.message} - stopping!`);
+            return 0;
+          }
+          ctx.log("error", `Failed to loot modules after deposit: ${retryResp.error.message}`);
+        }
+      } else if (msg.includes("empty") || msg.includes("not found")) {
+        ctx.log("warn", "Wreck is empty or not found — stopping module loot");
+      } else {
+        ctx.log("error", `Failed to loot modules: ${lootResp.error.message}`);
+      }
+    } else {
+      modulesLooted = wreck.modules.length;
+      ctx.log("scavenge", `✓ Looted all modules from wreck`);
+    }
+
+    if (modulesLooted > 0) {
+      ctx.log("scavenge", `✅ Successfully looted ${modulesLooted} module(s) from towed wreck`);
+    }
+    break; // Only process the first wreck (we're only towing one)
+  }
+
+  // Step 2: Check salvaging skill level
   await bot.checkSkills();
   const salvagingLevel = bot.getSkillLevel("salvaging");
   const canScrap = salvagingLevel >= 2;
 
-  let processed = 0;
+  ctx.log("debug", `Salvaging skill level: ${salvagingLevel}, canScrap: ${canScrap}, preferScrap: ${preferScrap}`);
 
-  // Try to scrap if preferred and skill allows, otherwise sell
+  let processed = 0;
+  const MAX_SALVAGE_RETRIES = 3;
+
+  // Try to scrap if preferred and skill allows, with retries
   if (preferScrap && canScrap) {
-    const scrapResp = await bot.exec("scrap_wreck");
-    if (!scrapResp.error && scrapResp.result) {
-      const sr = scrapResp.result as Record<string, unknown>;
-      const items = (sr.items as Array<Record<string, unknown>>) || [];
-      if (items.length > 0) {
-        const names = items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || "material"}`).join(", ");
-        ctx.log("scavenge", `Scrapped wreck for: ${names}`);
-        processed++;
+    let scrapSuccess = false;
+    
+    for (let attempt = 1; attempt <= MAX_SALVAGE_RETRIES; attempt++) {
+      ctx.log("scavenge", `🔄 Scrap attempt ${attempt}/${MAX_SALVAGE_RETRIES}...`);
+      const scrapResp = await bot.exec("scrap_wreck");
+      
+      if (!scrapResp.error && scrapResp.result) {
+        const sr = scrapResp.result as Record<string, unknown>;
+        // Scrap response uses 'materials' field
+        const materials = (sr.materials as Array<Record<string, unknown>>) || [];
+        const totalValue = (sr.total_value as number) || 0;
+        const message = (sr.message as string) || "";
+        
+        if (materials.length > 0) {
+          const names = materials.map(m => `${(m.quantity as number) || 1}x ${(m.name as string) || "material"}`).join(", ");
+          ctx.log("scavenge", `✅ Scrapped wreck for: ${names} (total value: ${totalValue}cr)`);
+          if (message) ctx.log("scavenge", `   ${message}`);
+          processed++;
+          scrapSuccess = true;
+          break; // Success - exit retry loop
+        } else {
+          ctx.log("warn", `Scrap attempt ${attempt} returned no materials — retrying...`);
+        }
+      } else if (scrapResp.error) {
+        const errMsg = scrapResp.error.message.toLowerCase();
+        if (errMsg.includes("not_towing")) {
+          ctx.log("warn", `Server says not towing during scrap (attempt ${attempt}) — clearing tow flag`);
+          bot.towingWreck = false;
+          break; // Stop retrying - we're no longer towing
+        } else {
+          ctx.log("error", `Scrap attempt ${attempt} failed: ${scrapResp.error.message}`);
+        }
       }
-    } else if (scrapResp.error) {
-      const errMsg = scrapResp.error.message.toLowerCase();
-      if (errMsg.includes("not_towing")) {
-        ctx.log("warn", "Server says not towing during scrap — clearing tow flag");
-        bot.towingWreck = false;
-      } else {
-        ctx.log("error", `Scrap failed: ${scrapResp.error.message} - falling back to sell`);
+      
+      // Wait briefly before retry (give server time to process)
+      if (attempt < MAX_SALVAGE_RETRIES) {
+        await sleep(2000);
       }
-      // Fall through to sell
+    }
+    
+    if (!scrapSuccess && bot.towingWreck) {
+      ctx.log("warn", `All ${MAX_SALVAGE_RETRIES} scrap attempts failed — falling back to sell`);
     }
   }
 
-  if (processed === 0) {
-    // Sell the wreck for credits + XP
-    const sellResp = await bot.exec("sell_wreck");
-    if (!sellResp.error && sellResp.result) {
-      const sr = sellResp.result as Record<string, unknown>;
-      const credits = (sr.credits as number) || (sr.earned as number) || 0;
-      const xp = (sr.xp as number) || (sr.experience as number) || 0;
-      if (credits > 0 || xp > 0) {
-        ctx.log("scavenge", `Sold wreck for ${credits}cr + ${xp} XP`);
-        processed++;
+  // If scrap failed or not preferred, sell the wreck (also with retries)
+  if (processed === 0 && bot.towingWreck) {
+    let sellSuccess = false;
+    
+    for (let attempt = 1; attempt <= MAX_SALVAGE_RETRIES; attempt++) {
+      ctx.log("scavenge", `💰 Sell attempt ${attempt}/${MAX_SALVAGE_RETRIES}...`);
+      const sellResp = await bot.exec("sell_wreck");
+      
+      if (!sellResp.error && sellResp.result) {
+        const sr = sellResp.result as Record<string, unknown>;
+        const credits = (sr.credits as number) || (sr.earned as number) || 0;
+        const xp = (sr.xp as number) || (sr.experience as number) || 0;
+        const items = (sr.items as Array<Record<string, unknown>>) || [];
+
+        if (credits > 0 || xp > 0 || items.length > 0) {
+          const itemDetails = items.length > 0 ? ` + ${items.map(i => `${(i.quantity as number) || 1}x ${(i.name as string) || "material"}`).join(", ")}` : "";
+          ctx.log("scavenge", `✅ Sold wreck for ${credits}cr + ${xp} XP${itemDetails}`);
+          processed++;
+          sellSuccess = true;
+          break; // Success - exit retry loop
+        } else {
+          ctx.log("warn", `Sell attempt ${attempt} returned no credits, XP, or items — retrying...`);
+        }
+      } else if (sellResp.error) {
+        const errMsg = sellResp.error.message.toLowerCase();
+        if (errMsg.includes("not_towing")) {
+          ctx.log("warn", `Server says not towing during sell (attempt ${attempt}) — clearing tow flag`);
+          bot.towingWreck = false;
+          break; // Stop retrying - we're no longer towing
+        } else {
+          ctx.log("error", `Sell attempt ${attempt} failed: ${sellResp.error.message}`);
+        }
       }
-    } else if (sellResp.error) {
-      const errMsg = sellResp.error.message.toLowerCase();
-      if (errMsg.includes("not_towing")) {
-        ctx.log("warn", "Server says not towing during sell — clearing tow flag");
-        bot.towingWreck = false;
-      } else {
-        ctx.log("error", `Sell wreck failed: ${sellResp.error.message}`);
+      
+      // Wait briefly before retry (give server time to process)
+      if (attempt < MAX_SALVAGE_RETRIES) {
+        await sleep(2000);
       }
+    }
+    
+    if (!sellSuccess && bot.towingWreck) {
+      ctx.log("error", `All ${MAX_SALVAGE_RETRIES} sell attempts failed — wreck may be lost`);
     }
   }
 
   // Reset towing flag after successful processing
   if (processed > 0) {
+    ctx.log("scavenge", `Successfully processed wreck (processed=${processed}) — clearing tow flag`);
     bot.towingWreck = false;
   }
 
@@ -2039,6 +2460,218 @@ export async function factionDonateProfit(ctx: RoutineContext, profit: number): 
 
 // ── Combat Detection & Flee ─────────────────────────────────
 
+/** Battle notification types detected from notification parsing */
+export interface BattleNotification {
+  type: "battle_start" | "battle_tick" | "battle_hit" | "battle_end" | "battle_disengage" | "battle_flee_success" | "battle_flee_failed";
+  battleId?: string;
+  tick?: number;
+  message?: string;
+  /** Battle participants data - used for pirate detection */
+  participants?: Array<Record<string, unknown>>;
+  sides?: Array<Record<string, unknown>>;
+}
+
+/**
+ * Parse a notification to detect battle-related events.
+ * Based on actual game notification formats.
+ * 
+ * Raw notification structure:
+ * - type: "combat" | "system"
+ * - msg_type: "battle_started" | "battle_joined" | "battle_tick" | etc.
+ * - data: { message: "..." } or structured battle data
+ * 
+ * Message formats (without UI prefixes):
+ * - "Battle started! ID: {battle_id}"
+ * - "Battle tick {tick} - combat continues"
+ * - "{attacker} hit {defender} for {damage} damage"
+ * - "{player} left the battle"
+ * - "Battle ended!"
+ * - "You have disengaged from battle."
+ * 
+ * @param notification - Raw notification object
+ * @returns BattleNotification if battle-related, null otherwise
+ */
+export function parseBattleNotification(notification: unknown): BattleNotification | null {
+  if (!notification || typeof notification !== "object") {
+    return null;
+  }
+
+  const notif = notification as Record<string, unknown>;
+  const type = notif.type as string | undefined;
+  const msgType = notif.msg_type as string | undefined;
+  let data = notif.data as Record<string, unknown> | string | undefined;
+
+  // Parse data if it's a string (json.RawMessage)
+  if (typeof data === "string") {
+    try { data = JSON.parse(data) as Record<string, unknown>; } catch { /* leave as string */ }
+  }
+
+  // Get message text from notification
+  let message = "";
+  if (data && typeof data === "object") {
+    message = (data.message as string) || formatNotificationData(data);
+  } else if (typeof data === "string") {
+    message = data;
+  }
+
+  if (!message) return null;
+
+  const lowerMsg = message.toLowerCase();
+
+  // Check for battle_started msg_type (system notification with structured data)
+  if (msgType === "battle_started" && data && typeof data === "object") {
+    const battleData = data as Record<string, unknown>;
+    const battleId = (battleData.battle_id as string) || "";
+    if (battleId) {
+      return {
+        type: "battle_start",
+        battleId,
+        message: `Battle started! ID: ${battleId}`,
+      };
+    }
+  }
+
+  // Check for battle_joined msg_type (we were pulled into a battle)
+  if (msgType === "battle_joined" && data && typeof data === "object") {
+    const joinData = data as Record<string, unknown>;
+    const battleId = (joinData.battle_id as string) || "";
+    // This notification doesn't include battle_id directly, but indicates we joined a battle
+    return {
+      type: "battle_start",
+      battleId: undefined, // Will be populated by get_battle_status
+      message: "Joined battle",
+    };
+  }
+
+  // Check for battle_update msg_type (periodic battle state updates)
+  // Format from debug log: msg_type: "battle_update", data: { battle_id, tick, your_zone, your_stance, participants, sides, ... }
+  if (msgType === "battle_update" && data && typeof data === "object") {
+    const updateData = data as Record<string, unknown>;
+    const battleId = (updateData.battle_id as string) || "";
+    const tick = (updateData.tick as number) || 0;
+    const participants = Array.isArray(updateData.participants) ? updateData.participants as Array<Record<string, unknown>> : undefined;
+    const sides = Array.isArray(updateData.sides) ? updateData.sides as Array<Record<string, unknown>> : undefined;
+    
+    // If we have a battle_id, this means we're still in battle
+    if (battleId) {
+      return {
+        type: "battle_tick",
+        battleId,
+        tick,
+        participants,
+        sides,
+        message: `Battle update - tick: ${tick}`,
+      };
+    }
+  }
+
+  // Check for battle_damage msg_type (damage events)
+  // Format from debug log: msg_type: "battle_damage", data: { tick, attacker_id, attacker_name, target_id, target_name, total_damage, ... }
+  if (msgType === "battle_damage" && data && typeof data === "object") {
+    const damageData = data as Record<string, unknown>;
+    const attackerName = (damageData.attacker_name as string) || "";
+    const targetName = (damageData.target_name as string) || "";
+    const totalDamage = (damageData.total_damage as number) || 0;
+    const tick = (damageData.tick as number) || 0;
+    
+    return {
+      type: "battle_hit",
+      tick,
+      message: `${attackerName} hit ${targetName} for ${totalDamage} damage (tick: ${tick})`,
+    };
+  }
+
+  // Battle started notification (type: combat)
+  // Format: "Battle started! ID: {battle_id}"
+  if (type === "combat") {
+    const battleStartMatch = message.match(/Battle started!\s*ID:\s*([a-f0-9]+)/i);
+    if (battleStartMatch) {
+      return {
+        type: "battle_start",
+        battleId: battleStartMatch[1],
+        message,
+      };
+    }
+
+    // Battle tick notification
+    // Format: "Battle tick {tick} - combat continues"
+    const battleTickMatch = message.match(/Battle tick\s+(\d+)\s*-\s*combat continues/i);
+    if (battleTickMatch) {
+      return {
+        type: "battle_tick",
+        tick: parseInt(battleTickMatch[1], 10),
+        message,
+      };
+    }
+
+    // Battle hit notification
+    // Format: "{attacker} hit {defender} for {damage} damage"
+    const battleHitMatch = message.match(/(.+?)\s+hit\s+(.+?)\s+for\s+(\d+)\s+damage/i);
+    if (battleHitMatch) {
+      return {
+        type: "battle_hit",
+        message,
+      };
+    }
+
+    // Player left battle notification
+    // Format: "{player} left the battle"
+    const leftBattleMatch = message.match(/(.+?)\s+left the battle/i);
+    if (leftBattleMatch) {
+      return {
+        type: "battle_end",
+        message,
+      };
+    }
+
+    // Battle ended notification
+    if (lowerMsg.includes("battle ended")) {
+      return {
+        type: "battle_end",
+        message,
+      };
+    }
+  }
+
+  // Disengage notification (type: system)
+  // Format: "You have disengaged from battle."
+  if (type === "system" && lowerMsg.includes("disengaged from battle")) {
+    return {
+      type: "battle_disengage",
+      message,
+    };
+  }
+
+  return null;
+}
+
+/** Helper to format notification data object */
+function formatNotificationData(data: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const [key, val] of Object.entries(data)) {
+    if (val === null || val === undefined || val === "") continue;
+    if (typeof val === "object") continue;
+    parts.push(`${key}: ${val}`);
+  }
+  return parts.length > 0 ? parts.join(", ") : JSON.stringify(data);
+}
+
+/**
+ * Parse array of notifications to detect battle events.
+ * @param notifications - Array of raw notifications
+ * @returns Array of parsed battle notifications
+ */
+export function parseBattleNotifications(notifications: unknown[]): BattleNotification[] {
+  const results: BattleNotification[] = [];
+  for (const n of notifications) {
+    const battle = parseBattleNotification(n);
+    if (battle) {
+      results.push(battle);
+    }
+  }
+  return results;
+}
+
 /** Result of pirate detection in nearby entities */
 export interface PirateDetectionResult {
   hasPirates: boolean;
@@ -2229,6 +2862,7 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
     your_stance: (result.your_stance as BattleStance) || undefined,
     your_target_id: (result.your_target_id as string) || undefined,
     auto_pilot: (result.auto_pilot as boolean) || undefined,
+    is_participant: (result.is_participant as boolean) || false,
   };
 
   return status;
@@ -2236,11 +2870,19 @@ export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus
 
 /**
  * Attempt to flee from an active battle.
- * Uses "battle stance flee" command.
+ * Uses "battle stance flee" command which takes 3 ticks to complete.
+ * Optionally waits for disengage confirmation notification.
+ * 
  * @param ctx - Routine context
- * @returns true if flee command was issued successfully, false otherwise
+ * @param waitForDisengage - If true, waits for "You have disengaged from battle" notification (default: true)
+ * @param maxWaitMs - Maximum time to wait for disengage confirmation in ms (default: 35000ms = 3.5 ticks)
+ * @returns true if successfully fled and disengaged, false otherwise
  */
-export async function fleeFromBattle(ctx: RoutineContext): Promise<boolean> {
+export async function fleeFromBattle(
+  ctx: RoutineContext,
+  waitForDisengage: boolean = true,
+  maxWaitMs: number = 35000,
+): Promise<boolean> {
   const { bot } = ctx;
 
   // Check if we're actually in a battle
@@ -2258,8 +2900,216 @@ export async function fleeFromBattle(ctx: RoutineContext): Promise<boolean> {
     return false;
   }
 
-  ctx.log("combat", "Flee stance engaged - escaping battle!");
+  ctx.log("combat", "Flee stance engaged - escaping battle! (takes 3 ticks)");
+
+  // Wait for disengage confirmation if requested
+  if (waitForDisengage) {
+    ctx.log("combat", "Waiting for disengage confirmation...");
+    const startTime = Date.now();
+    let disengaged = false;
+
+    // Poll for disengage notification or battle status change
+    while (!disengaged && Date.now() - startTime < maxWaitMs) {
+      await new Promise(resolve => setTimeout(resolve, 5000)); // Check every 5 seconds
+
+      // Check battle status - if not in battle anymore, we're clear
+      const newStatus = await getBattleStatus(ctx);
+      if (!newStatus) {
+        ctx.log("combat", "Battle status cleared - successfully disengaged!");
+        disengaged = true;
+        break;
+      }
+
+      // Also check if we're still in the battle by ID
+      if (newStatus.battle_id !== status.battle_id) {
+        ctx.log("combat", "Battle ID changed - successfully disengaged!");
+        disengaged = true;
+        break;
+      }
+    }
+
+    if (!disengaged) {
+      ctx.log("warn", "Flee timeout - battle may still be active");
+      return false;
+    }
+  }
+
   return true;
+}
+
+/**
+ * Handle battle detection from notifications and initiate flee.
+ * Call this after any command execution that may return battle notifications.
+ * 
+ * @param ctx - Routine context
+ * @param notifications - Array of notifications to check
+ * @param battleState - Current battle state object to track battle status
+ * @returns true if battle was detected and flee was initiated, false otherwise
+ */
+export interface BattleState {
+  inBattle: boolean;
+  battleId: string | null;
+  battleStartTick: number | null;
+  lastHitTick: number | null;
+  isFleeing: boolean;
+}
+
+export async function handleBattleNotifications(
+  ctx: RoutineContext,
+  notifications: unknown[],
+  battleState: BattleState,
+): Promise<boolean> {
+  const battleNotifications = parseBattleNotifications(notifications);
+
+  if (battleNotifications.length === 0) {
+    return false;
+  }
+
+  ctx.log("combat", `Processing ${battleNotifications.length} battle notification(s)...`);
+
+  for (const battleNotif of battleNotifications) {
+    ctx.log("combat", `Event: ${battleNotif.type} - ${battleNotif.message?.substring(0, 100) || ''}`);
+    
+    switch (battleNotif.type) {
+      case "battle_start":
+        ctx.log("combat", `BATTLE DETECTED! Battle ID: ${battleNotif.battleId}`);
+        battleState.inBattle = true;
+        battleState.battleId = battleNotif.battleId || null;
+        battleState.battleStartTick = Date.now();
+        battleState.isFleeing = false;
+        
+        // Check for pirates in battle participants
+        if (battleNotif.participants) {
+          const pirateResult = parsePiratesFromBattleParticipants(battleNotif.participants);
+          if (pirateResult.hasPirates) {
+            ctx.log("combat", `⚠️ PIRATES DETECTED IN BATTLE! ${pirateResult.pirateCount} pirate(s), highest tier: ${pirateResult.highestTier}`);
+          }
+        }
+        
+        // Immediately initiate flee
+        ctx.log("combat", "Initiating emergency flee!");
+        await fleeFromBattle(ctx, true, 35000);
+        return true;
+
+      case "battle_tick":
+        // Check for pirates in battle participants (from battle_update)
+        if (battleNotif.participants) {
+          const pirateResult = parsePiratesFromBattleParticipants(battleNotif.participants);
+          if (pirateResult.hasPirates && !battleState.isFleeing) {
+            ctx.log("combat", `⚠️ PIRATES DETECTED IN BATTLE UPDATE! ${pirateResult.pirateCount} pirate(s) - fleeing!`);
+            battleState.isFleeing = false; // Reset to trigger flee
+          }
+        }
+        
+        if (battleState.inBattle && !battleState.isFleeing) {
+          ctx.log("combat", `Battle tick ${battleNotif.tick} - combat continues (we're still in battle!)`);
+          // If we somehow missed the battle start, flee now
+          ctx.log("combat", "Initiating late flee!");
+          await fleeFromBattle(ctx, true, 35000);
+          return true;
+        }
+        break;
+
+      case "battle_hit":
+        ctx.log("combat", `Battle hit detected: ${battleNotif.message}`);
+        battleState.lastHitTick = Date.now();
+        // If we're not already fleeing, start fleeing
+        if (battleState.inBattle && !battleState.isFleeing) {
+          ctx.log("combat", "Hit detected - ensuring flee is active!");
+          await fleeFromBattle(ctx, true, 35000);
+          return true;
+        }
+        break;
+
+      case "battle_disengage":
+        ctx.log("combat", "Disengage confirmation received - battle escaped!");
+        battleState.inBattle = false;
+        battleState.battleId = null;
+        battleState.isFleeing = false;
+        break;
+
+      case "battle_end":
+        ctx.log("combat", `Battle ended: ${battleNotif.message}`);
+        // If we were in this battle, clear state
+        if (battleState.inBattle) {
+          battleState.inBattle = false;
+          battleState.battleId = null;
+          battleState.isFleeing = false;
+        }
+        break;
+    }
+  }
+
+  return battleNotifications.some(n => n.type === "battle_start" || n.type === "battle_hit");
+}
+
+/**
+ * Quick battle status check with automatic flee.
+ * Use this in routines that don't need full battle state tracking.
+ * Returns true if battle was detected and flee was initiated.
+ * 
+ * @param ctx - Routine context
+ * @param logPrefix - Optional prefix for log messages (e.g., routine name)
+ * @returns true if battle detected and flee initiated, false otherwise
+ */
+export async function checkAndFleeFromBattle(
+  ctx: RoutineContext,
+  logPrefix?: string,
+): Promise<boolean> {
+  const battleStatus = await getBattleStatus(ctx);
+  if (battleStatus && battleStatus.is_participant) {
+    const prefix = logPrefix ? `[${logPrefix}] ` : "";
+    ctx.log("combat", `${prefix}BATTLE DETECTED! Battle ID: ${battleStatus.battle_id} - fleeing!`);
+    await fleeFromBattle(ctx, true, 35000);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Check battle status and handle notifications after a command.
+ * Use this wrapper pattern in routines: 
+ *   const resp = await bot.exec("command");
+ *   if (await checkBattleAfterCommand(ctx, resp.notifications, "command_name")) {
+ *     // Handle battle - command was interrupted
+ *     return; // or continue/break depending on loop
+ *   }
+ * 
+ * @param ctx - Routine context  
+ * @param notifications - Notifications from the command response
+ * @param commandName - Name of the command (for logging)
+ * @param battleState - Optional battle state for tracking
+ * @returns true if battle detected and flee initiated, false otherwise
+ */
+export async function checkBattleAfterCommand(
+  ctx: RoutineContext,
+  notifications: unknown[] | undefined,
+  commandName: string,
+  battleState?: BattleState,
+): Promise<boolean> {
+  if (!notifications || !Array.isArray(notifications)) {
+    return false;
+  }
+
+  // Check notifications first
+  if (battleState) {
+    const battleDetected = await handleBattleNotifications(ctx, notifications, battleState);
+    if (battleDetected) {
+      return true;
+    }
+  } else {
+    // Simple mode - just check for battle start events
+    const battleNotifs = parseBattleNotifications(notifications);
+    const hasBattleStart = battleNotifs.some(n => n.type === "battle_start" || n.type === "battle_hit");
+    if (hasBattleStart) {
+      ctx.log("combat", `Battle detected during ${commandName} - fleeing!`);
+      await fleeFromBattle(ctx, true, 35000);
+      return true;
+    }
+  }
+
+  // Fallback: check battle status directly
+  return await checkAndFleeFromBattle(ctx, commandName);
 }
 
 /**
@@ -2296,8 +3146,21 @@ export async function emergencyFleeFromPirates(
     return false;
   }
 
-  // Pick a random connection to jump to
-  const randomConnection = connections[Math.floor(Math.random() * connections.length)];
+  // Get blacklist and filter out blacklisted systems
+  const blacklist = getSystemBlacklist();
+  const safeConnections = connections.filter(c => 
+    c.id && !blacklist.some(b => b.toLowerCase() === c.id!.toLowerCase())
+  );
+
+  // If all connections are blacklisted, we have no choice but to use any connection
+  const candidates = safeConnections.length > 0 ? safeConnections : connections;
+  if (candidates.length === 0) {
+    ctx.log("error", "No valid jump targets available - trapped!");
+    return false;
+  }
+
+  // Pick a random connection from valid candidates
+  const randomConnection = candidates[Math.floor(Math.random() * candidates.length)];
   if (!randomConnection || !randomConnection.id) {
     ctx.log("error", "Could not select jump target - trapped!");
     return false;
@@ -2344,6 +3207,99 @@ export async function checkAndFleeFromPirates(
   // Not a jump command - we need to flee NOW
   await emergencyFleeFromPirates(ctx, pirateResult);
   return true;
+}
+
+/**
+ * Detect pirates from battle participant data.
+ * This is a fallback when get_nearby fails or during battle.
+ * @param battleParticipants - Array of battle participants from battle_update
+ * @returns PirateDetectionResult with detected pirates
+ */
+export function parsePiratesFromBattleParticipants(battleParticipants: unknown[]): PirateDetectionResult {
+  if (!Array.isArray(battleParticipants)) {
+    return { hasPirates: false, pirateCount: 0, highestTier: null, pirates: [] };
+  }
+
+  const pirates: NearbyEntity[] = [];
+
+  for (const participant of battleParticipants) {
+    if (!participant || typeof participant !== "object") continue;
+    const p = participant as Record<string, unknown>;
+
+    // Check if this is a pirate participant
+    // Pirates typically have faction_id that doesn't match player factions
+    // Or they might be identified by ship class names like "raider", "eviction_notice", etc.
+    const playerId = (p.player_id as string) || "";
+    const username = (p.username as string) || (p.name as string) || "";
+    const shipClass = (p.ship_class as string) || "";
+    const factionId = (p.faction_id as string) || "";
+
+    // Known pirate ship classes (from game data and logs)
+    const pirateShipClasses = [
+      "raider",
+      "eviction_notice",
+      "buccaneer",
+      "marauder",
+      "freebooter",
+      "corsair",
+      "plunderer",
+      "reaver",
+      "predator",
+      "banshee",
+    ];
+
+    // Check if ship class indicates pirate
+    const isPirateShip = pirateShipClasses.some(cls => 
+      shipClass.toLowerCase().includes(cls) || shipClass.toLowerCase() === cls
+    );
+
+    // Also check for pirate faction IDs (these are faction IDs that belong to pirates)
+    // From the log: Breacher (raider) is attacking - ship_class: eviction_notice
+    const isPirateFaction = factionId && (
+      factionId === "pirate" || 
+      factionId.toLowerCase().includes("pirate") ||
+      // Known pirate faction IDs from game
+      factionId === "d8f3a7b2c1e4f5a6b7c8d9e0f1a2b3c4" || // Example - replace with actual IDs
+      factionId === "pirates"
+    );
+
+    if (isPirateShip || isPirateFaction) {
+      pirates.push({
+        id: playerId || username,
+        name: username || playerId,
+        type: "pirate",
+        faction: "pirate",
+        isNPC: true,
+        isPirate: true,
+        tier: "raider", // Default to raider for battle-detected pirates
+        isBoss: false,
+        hull: p.hull_pct as number,
+        maxHull: 100,
+        shield: p.shield_pct as number,
+        maxShield: 100,
+        status: p.stance as string,
+      });
+    }
+  }
+
+  let highestTier: PirateTier | null = null;
+  let highestThreat = 0;
+  for (const pirate of pirates) {
+    if (pirate.tier) {
+      const threat = getPirateThreatLevel(pirate.tier);
+      if (threat > highestThreat) {
+        highestThreat = threat;
+        highestTier = pirate.tier;
+      }
+    }
+  }
+
+  return {
+    hasPirates: pirates.length > 0,
+    pirateCount: pirates.length,
+    highestTier,
+    pirates,
+  };
 }
 
 // ── Customs Inspection ───────────────────────────────────────

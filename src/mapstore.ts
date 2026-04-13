@@ -23,6 +23,17 @@ export interface OreRecord {
   depleted_at?: string;
 }
 
+/** Resource data from get_poi scan */
+export interface ResourceRecord {
+  resource_id: string;
+  name: string;
+  richness: number;
+  remaining: number;
+  max_remaining: number;
+  depletion_percent: number;
+  last_scanned: string;
+}
+
 /** Depletion timeout in milliseconds - POIs can be re-checked after this long. */
 export const DEPLETION_TIMEOUT_MS = 3 * 60 * 60 * 1000; // 3 hours
 
@@ -32,6 +43,40 @@ export function isDepletionExpired(depletedAt: string | undefined, timeoutMs: nu
   const depletedTime = new Date(depletedAt).getTime();
   const now = Date.now();
   return (now - depletedTime) > timeoutMs;
+}
+
+/** Parse expiry text like "36477d 20h" into an ISO timestamp. */
+function calculateExpiryFromText(text: string): string {
+  const match = text.match(/(\d+)\s*d\s*(\d+)\s*h/i);
+  if (!match) return new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(); // Default 1 day if parsing fails
+
+  const days = parseInt(match[1], 10);
+  const hours = parseInt(match[2], 10);
+  const msFromNow = (days * 24 * 60 * 60 + hours * 60 * 60) * 1000;
+  return new Date(Date.now() + msFromNow).toISOString();
+}
+
+/** Check if a wormhole is still active (not expired). */
+function isWormholeActive(wormhole: { expires_at: string | null }): boolean {
+  if (!wormhole.expires_at) return true; // No expiry = always active
+  const expiryTime = new Date(wormhole.expires_at).getTime();
+  return Date.now() < expiryTime;
+}
+
+/** Calculate human-readable time remaining until expiry. */
+function calculateTimeRemaining(expiryIso: string): string {
+  const expiryTime = new Date(expiryIso).getTime();
+  const diff = expiryTime - Date.now();
+
+  if (diff <= 0) return "expired";
+
+  const mins = Math.floor(diff / 60000);
+  if (mins < 60) return `${mins}m`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ${mins % 60}m`;
+  const days = Math.floor(hrs / 24);
+  const remainingHours = hrs % 24;
+  return `${days}d ${remainingHours}h`;
 }
 
 export interface MarketRecord {
@@ -77,11 +122,16 @@ export interface StoredPOI {
   base_type: string | null;
   services: string[];
   ores_found: OreRecord[];
+  resources: ResourceRecord[];
   market: MarketRecord[];
   orders: OrderRecord[];
   missions: MissionRecord[];
   last_explored: string | null;
   last_updated: string;
+  /** Whether this POI is hidden (not visible on get_system, only discovered via get_poi or scanning) */
+  hidden?: boolean;
+  /** Difficulty to reveal this hidden POI (0-100) */
+  reveal_difficulty?: number;
 }
 
 export interface PirateSighting {
@@ -89,6 +139,45 @@ export interface PirateSighting {
   name?: string;
   count: number;
   last_seen: string;
+}
+
+/** Wormhole exit POI data from survey */
+export interface WormholeExitPOI {
+  id: string;
+  system_id: string;
+  type: string; // "wormhole_exit"
+  name: string;
+  description: string;
+  position?: { x: number; y: number };
+  hidden: boolean;
+  reveal_difficulty: number;
+}
+
+/** Wormhole record stored in map - tracks both entrance and exit */
+export interface WormholeRecord {
+  /** Unique wormhole identifier */
+  id: string;
+  /** Wormhole name (usually from exit POI) */
+  name: string;
+  /** System where the wormhole entrance is located */
+  entrance_system_id: string;
+  entrance_system_name: string;
+  /** System where the wormhole exit is located */
+  exit_system_id: string;
+  exit_system_name: string;
+  /** Exit POI ID in the exit system */
+  exit_poi_id: string;
+  /** Exit POI name */
+  exit_poi_name: string;
+  /** System ID that the wormhole leads TO (from exit POI perspective) */
+  destination_system_id: string;
+  destination_system_name: string;
+  /** When the wormhole was discovered/recorded */
+  discovered_at: string;
+  /** When the wormhole expires (ISO timestamp) */
+  expires_at: string | null;
+  /** Whether this wormhole is still active */
+  is_active: boolean;
 }
 
 export interface WreckRecord {
@@ -106,6 +195,8 @@ export interface StoredSystem {
   security_level?: string;
   connections: StoredConnection[];
   pois: StoredPOI[];
+  /** Wormholes that have an exit in this system */
+  wormhole_exits: WormholeRecord[];
   pirate_sightings: PirateSighting[];
   wrecks: WreckRecord[];
   last_updated: string;
@@ -216,6 +307,7 @@ class MapStore {
       name: "",
       connections: [],
       pois: [],
+      wormhole_exits: [],
       pirate_sightings: [],
       wrecks: [],
       last_updated: now(),
@@ -242,12 +334,16 @@ class MapStore {
       }));
     }
 
-    // Merge POIs — preserve existing ore & market data
+    // Merge POIs — preserve existing ore & market data AND hidden POIs
     const pois = systemData.pois as Array<Record<string, unknown>> | undefined;
     if (Array.isArray(pois)) {
       const existingPois = new Map(sys.pois.map((p) => [p.id, p]));
-      sys.pois = pois.map((p) => {
+      const updatedPoiIds = new Set<string>();
+
+      // Update/create POIs from the API response
+      const updatedPois = pois.map((p) => {
         const poiId = (p.id as string) || "";
+        updatedPoiIds.add(poiId);
         const prev = existingPois.get(poiId);
         return {
           id: poiId,
@@ -259,13 +355,29 @@ class MapStore {
           base_type: (p.base_type as string) ?? prev?.base_type ?? null,
           services: (p.services as string[]) ?? prev?.services ?? [],
           ores_found: prev?.ores_found ?? [],
+          resources: prev?.resources ?? [],
           market: prev?.market ?? [],
           orders: prev?.orders ?? [],
           missions: prev?.missions ?? [],
           last_explored: prev?.last_explored ?? null,
           last_updated: now(),
+          // Preserve hidden flag: once a POI is marked hidden, it stays hidden
+          // even if the API doesn't return the flag (hidden POIs revealed by survey
+          // should remain tracked as hidden for explorer reference)
+          hidden: (p.hidden as boolean) || prev?.hidden || false,
+          reveal_difficulty: (p.reveal_difficulty as number) ?? prev?.reveal_difficulty,
         };
       });
+
+      // Preserve hidden POIs that aren't in the API response
+      // (hidden POIs only appear via get_poi scans, not get_system)
+      for (const [poiId, existingPoi] of existingPois) {
+        if (!updatedPoiIds.has(poiId) && existingPoi.hidden) {
+          updatedPois.push(existingPoi as typeof updatedPois[number]);
+        }
+      }
+
+      sys.pois = updatedPois;
 
       // Auto-detect mobile_capitol station and update its location
       const mobileCapitolPoi = sys.pois.find((p) => p.id === "mobile_capital");
@@ -522,6 +634,115 @@ class MapStore {
     this.scheduleSave();
   }
 
+  /** Update POI resource data from get_poi scan. */
+  updatePoiResources(systemId: string, poiId: string, resources: Array<{
+    resource_id: string;
+    name: string;
+    richness: number;
+    remaining: number;
+    max_remaining: number;
+    depletion_percent: number;
+  }>): void {
+    const sys = this.data.systems[systemId];
+    if (!sys) return;
+
+    const poi = sys.pois.find((p) => p.id === poiId);
+    if (!poi) return;
+
+    poi.resources = resources.map((r) => ({
+      resource_id: r.resource_id,
+      name: r.name,
+      richness: r.richness,
+      remaining: r.remaining,
+      max_remaining: r.max_remaining,
+      depletion_percent: r.depletion_percent,
+      last_scanned: now(),
+    }));
+
+    poi.last_updated = now();
+    this.scheduleSave();
+  }
+
+  /** Register or update a POI discovered via get_poi (including hidden POIs). */
+  registerPoiFromScan(systemId: string, poiData: {
+    id: string;
+    name: string;
+    type: string;
+    hidden?: boolean;
+    reveal_difficulty?: number;
+    resources?: Array<{
+      resource_id: string;
+      name: string;
+      richness: number;
+      remaining: number;
+      max_remaining: number;
+      depletion_percent: number;
+    }>;
+  }): void {
+    let sys = this.data.systems[systemId];
+    if (!sys) {
+      // Create system entry if it doesn't exist
+      sys = {
+        id: systemId,
+        name: systemId,
+        connections: [],
+        pois: [],
+        pirate_sightings: [],
+        wrecks: [],
+        last_updated: now(),
+      };
+      this.data.systems[systemId] = sys;
+    }
+
+    let poi = sys.pois.find((p) => p.id === poiData.id);
+    if (!poi) {
+      // New POI - create it
+      poi = {
+        id: poiData.id,
+        name: poiData.name,
+        type: poiData.type,
+        has_base: false,
+        base_id: null,
+        base_name: null,
+        base_type: null,
+        services: [],
+        ores_found: [],
+        resources: [],
+        market: [],
+        orders: [],
+        missions: [],
+        last_explored: null,
+        last_updated: now(),
+        hidden: poiData.hidden ?? false,
+        reveal_difficulty: poiData.reveal_difficulty,
+      };
+      sys.pois.push(poi);
+    }
+
+    // Update POI metadata (in case it changed)
+    poi.name = poiData.name || poi.name;
+    poi.type = poiData.type || poi.type;
+    // Once a POI is marked hidden, it stays hidden - don't overwrite with false
+    if (poiData.hidden) poi.hidden = poiData.hidden;
+    if (poiData.reveal_difficulty !== undefined) poi.reveal_difficulty = poiData.reveal_difficulty;
+    poi.last_updated = now();
+
+    // Update resources if provided
+    if (poiData.resources && poiData.resources.length > 0) {
+      poi.resources = poiData.resources.map((r) => ({
+        resource_id: r.resource_id,
+        name: r.name,
+        richness: r.richness,
+        remaining: r.remaining,
+        max_remaining: r.max_remaining,
+        depletion_percent: r.depletion_percent,
+        last_scanned: now(),
+      }));
+    }
+
+    this.scheduleSave();
+  }
+
   /** Mark an ore as depleted at a POI. */
   markOreDepleted(systemId: string, poiId: string, oreId: string): void {
     const sys = this.data.systems[systemId];
@@ -586,6 +807,140 @@ class MapStore {
     this.scheduleSave();
   }
 
+  /**
+   * Register a wormhole discovered via survey_system.
+   * @param exitSystemId - The system where the wormhole exit is located
+   * @param wormholeData - The wormhole data from survey response
+   */
+  registerWormhole(exitSystemId: string, wormholeData: {
+    id: string;
+    name: string;
+    exit_system_id: string;
+    exit_system_name: string;
+    exit_poi_id: string;
+    exit_poi_name: string;
+    destination_system_id: string;
+    destination_system_name: string;
+    expires_in_text?: string; // e.g., "36477d 20h"
+    expires_at?: string; // ISO timestamp if provided directly
+  }): void {
+    // Get or create the exit system
+    let exitSys = this.data.systems[exitSystemId];
+    if (!exitSys) {
+      exitSys = {
+        id: exitSystemId,
+        name: wormholeData.exit_system_name || exitSystemId,
+        connections: [],
+        pois: [],
+        wormhole_exits: [],
+        pirate_sightings: [],
+        wrecks: [],
+        last_updated: now(),
+      };
+      this.data.systems[exitSystemId] = exitSys;
+    }
+
+    // Calculate expiry from expires_in_text or expires_at
+    let expiresAt: string | null = null;
+    if (wormholeData.expires_at) {
+      expiresAt = wormholeData.expires_at;
+    } else if (wormholeData.expires_in_text) {
+      // Parse "36477d 20h" format
+      expiresAt = calculateExpiryFromText(wormholeData.expires_in_text);
+    }
+
+    // Create wormhole record
+    const wormhole: WormholeRecord = {
+      id: wormholeData.id,
+      name: wormholeData.name,
+      entrance_system_id: wormholeData.destination_system_id, // Entrance is in the destination system
+      entrance_system_name: wormholeData.destination_system_name,
+      exit_system_id: exitSystemId,
+      exit_system_name: exitSys.name || exitSystemId,
+      exit_poi_id: wormholeData.exit_poi_id,
+      exit_poi_name: wormholeData.exit_poi_name,
+      destination_system_id: wormholeData.destination_system_id,
+      destination_system_name: wormholeData.destination_system_name,
+      discovered_at: now(),
+      expires_at: expiresAt,
+      is_active: true,
+    };
+
+    // Check if wormhole already exists
+    const existingIndex = exitSys.wormhole_exits.findIndex((w) => w.id === wormholeData.id);
+    if (existingIndex >= 0) {
+      // Update existing wormhole
+      exitSys.wormhole_exits[existingIndex] = {
+        ...exitSys.wormhole_exits[existingIndex],
+        ...wormhole,
+        discovered_at: exitSys.wormhole_exits[existingIndex].discovered_at, // Preserve original discovery time
+      };
+    } else {
+      // Add new wormhole
+      exitSys.wormhole_exits.push(wormhole);
+    }
+
+    // Also ensure the entrance (destination) system exists
+    const entranceSystemId = wormholeData.destination_system_id;
+    let entranceSys = this.data.systems[entranceSystemId];
+    if (!entranceSys) {
+      entranceSys = {
+        id: entranceSystemId,
+        name: wormholeData.destination_system_name || entranceSystemId,
+        connections: [],
+        pois: [],
+        wormhole_exits: [],
+        pirate_sightings: [],
+        wrecks: [],
+        last_updated: now(),
+      };
+      this.data.systems[entranceSystemId] = entranceSys;
+    }
+
+    this.scheduleSave();
+  }
+
+  /**
+   * Get all active (non-expired) wormholes.
+   */
+  getActiveWormholes(): WormholeRecord[] {
+    const wormholes: WormholeRecord[] = [];
+    for (const sys of Object.values(this.data.systems)) {
+      for (const wh of sys.wormhole_exits || []) {
+        if (isWormholeActive(wh)) {
+          wormholes.push(wh);
+        }
+      }
+    }
+    return wormholes;
+  }
+
+  /**
+   * Get remaining time on a wormhole as a human-readable string.
+   * Returns null if wormhole doesn't exist or has no expiry.
+   */
+  getWormholeRemainingTime(wormholeId: string, systemId?: string): string | null {
+    let wormhole: WormholeRecord | null = null;
+
+    if (systemId) {
+      const sys = this.data.systems[systemId];
+      wormhole = sys?.wormhole_exits?.find((w) => w.id === wormholeId) || null;
+    } else {
+      // Search all systems
+      for (const sys of Object.values(this.data.systems)) {
+        const found = sys.wormhole_exits?.find((w) => w.id === wormholeId);
+        if (found) {
+          wormhole = found;
+          break;
+        }
+      }
+    }
+
+    if (!wormhole || !wormhole.expires_at) return null;
+
+    return calculateTimeRemaining(wormhole.expires_at);
+  }
+
   // ── Query methods ───────────────────────────────────────
 
   /** Get stored system data by ID. */
@@ -598,6 +953,11 @@ class MapStore {
     return Object.keys(this.data.systems);
   }
 
+  /** Return all stored systems with their data. */
+  getSystems(): StoredSystem[] {
+    return Object.values(this.data.systems);
+  }
+
   /** Find nearest station POI within a known system. */
   findNearestStation(systemId: string): StoredPOI | null {
     const sys = this.data.systems[systemId];
@@ -605,10 +965,13 @@ class MapStore {
     return sys.pois.find((p) => p.has_base) ?? null;
   }
 
-  /** BFS to find the nearest known system that has a station (excluding pirate systems). Returns { systemId, poiId, poiName, hops } or null. */
-  findNearestStationSystem(fromSystemId: string): { systemId: string; poiId: string; poiName: string; hops: number } | null {
-    // Check current system first (but skip if it's a pirate system)
-    if (!this.isPirateSystem(fromSystemId)) {
+  /** BFS to find the nearest known system that has a station (excluding pirate and blacklisted systems). Returns { systemId, poiId, poiName, hops } or null. */
+  findNearestStationSystem(fromSystemId: string, blacklist?: string[]): { systemId: string; poiId: string; poiName: string; hops: number } | null {
+    const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
+    const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+    
+    // Check current system first (but skip if it's a pirate or blacklisted system)
+    if (!this.isPirateSystem(fromSystemId) && !blacklistSet.has(fromSystemId.toLowerCase())) {
       const localStation = this.findNearestStation(fromSystemId);
       if (localStation) return { systemId: fromSystemId, poiId: localStation.id, poiName: localStation.name, hops: 0 };
     }
@@ -625,6 +988,8 @@ class MapStore {
         if (!nextId || visited.has(nextId)) continue;
         // Skip pirate systems
         if (this.isPirateSystem(nextId)) continue;
+        // Skip blacklisted systems
+        if (blacklistSet.has(nextId.toLowerCase())) continue;
         visited.add(nextId);
 
         const station = this.findNearestStation(nextId);
@@ -668,7 +1033,7 @@ class MapStore {
     return this.data.systems[systemId]?.connections ?? [];
   }
 
-  /** Find all locations where a specific ore has been mined, sorted by total_mined descending (excluding pirate systems). */
+  /** Find all locations where a specific ore/resource has been mined or scanned. Checks both ores_found (mining history) and resources (scan data) so hidden POIs are included. */
   findOreLocations(oreId: string): Array<{
     systemId: string;
     systemName: string;
@@ -676,6 +1041,18 @@ class MapStore {
     poiName: string;
     totalMined: number;
     hasStation: boolean;
+    /** Current remaining units from last get_poi scan (0 if never scanned) */
+    remaining: number;
+    /** Max remaining units from last get_poi scan */
+    maxRemaining: number;
+    /** Depletion percent from last get_poi scan (0-100) */
+    depletionPercent: number;
+    /** Minutes since last resource scan */
+    minutesSinceScan: number;
+    /** Whether this POI is hidden (deep core mining location) */
+    isHidden: boolean;
+    /** Richness of the resource (mining efficiency) */
+    richness: number;
   }> {
     const results: Array<{
       systemId: string;
@@ -684,23 +1061,49 @@ class MapStore {
       poiName: string;
       totalMined: number;
       hasStation: boolean;
+      remaining: number;
+      maxRemaining: number;
+      depletionPercent: number;
+      minutesSinceScan: number;
+      isHidden: boolean;
+      richness: number;
     }> = [];
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
       if (this.isPirateSystem(sysId)) continue;
       const hasStation = sys.pois.some((p) => p.has_base);
       for (const poi of sys.pois) {
+        // Check both ores_found (mining history) AND resources (scan data)
+        // Hidden POIs often only have data in resources (from get_poi scans)
         const ore = poi.ores_found.find((o) => o.item_id === oreId);
-        if (ore) {
-          results.push({
-            systemId: sysId,
-            systemName: sys.name || sysId,
-            poiId: poi.id,
-            poiName: poi.name || poi.id,
-            totalMined: ore.total_mined,
-            hasStation,
-          });
-        }
+        const resource = poi.resources?.find((r) => r.resource_id === oreId);
+
+        // Skip if resource not found in either source
+        if (!ore && !resource) continue;
+
+        const remaining = resource?.remaining ?? 0;
+        const maxRemaining = resource?.max_remaining ?? 0;
+        const depletionPercent = resource?.depletion_percent ?? 0;
+        const richness = resource?.richness ?? 0;
+        const minutesSinceScan = resource?.last_scanned
+          ? (Date.now() - new Date(resource.last_scanned).getTime()) / 60000
+          : Infinity;
+        const totalMined = ore?.total_mined ?? 0;
+
+        results.push({
+          systemId: sysId,
+          systemName: sys.name || sysId,
+          poiId: poi.id,
+          poiName: poi.name || poi.id,
+          totalMined,
+          hasStation,
+          remaining,
+          maxRemaining,
+          depletionPercent,
+          minutesSinceScan,
+          isHidden: poi.hidden ?? false,
+          richness,
+        });
       }
     }
 
@@ -708,10 +1111,145 @@ class MapStore {
     return results;
   }
 
+  /**
+   * Estimate minutes until a resource regenerates based on availability level.
+   * Model: resources regen ~25% every 3 hours (180 minutes).
+   * depletion_percent from game API means "% available" (100 = full, 0 = empty).
+   * Returns 0 if resource is not depleted enough to need regen.
+   */
+  estimateRegenTime(depletionPercent: number, minutesSinceScan: number): number {
+    // If more than 75% available, no regen needed
+    if (depletionPercent > 75) return 0;
+
+    // Base regen: 25% per 180 minutes
+    // For every 25% missing beyond 75% threshold, need 180 more minutes
+    const missingPercent = 100 - depletionPercent;
+    const regenCycles = Math.ceil(missingPercent / 25);
+    return regenCycles * 180;
+  }
+
+  /**
+   * Find the best mining location for a resource, scored by abundance and accessibility.
+   * Prefers POIs with high remaining resources, low depletion, and recent scans.
+   * HEAVILY priorit hidden POIs (deep core mining) over regular POIs.
+   */
+  findBestMiningLocation(oreId: string, fromSystem?: string, blacklist?: string[]): Array<{
+    systemId: string;
+    systemName: string;
+    poiId: string;
+    poiName: string;
+    resourceId: string;
+    totalMined: number;
+    hasStation: boolean;
+    remaining: number;
+    maxRemaining: number;
+    depletionPercent: number;
+    minutesSinceScan: number;
+    jumpsAway: number;
+    /** Whether this POI is hidden (deep core mining location) */
+    isHidden: boolean;
+    /** Richness of the resource (mining efficiency) */
+    richness: number;
+    /** Composite score: higher = better. Factors in remaining, depletion, distance, scan freshness, hidden status */
+    score: number;
+  }> {
+    const locations = this.findOreLocations(oreId);
+    const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
+    const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+
+    const scored = locations
+      .filter(loc => !blacklistSet.has(loc.systemId.toLowerCase()))
+      .filter(loc => {
+        // Skip completely exhausted locations (0% available = empty)
+        if (loc.depletionPercent <= 0 && loc.remaining <= 0) return false;
+        // Skip nearly-depleted locations (<10% available) — not worth traveling to
+        if (loc.depletionPercent < 10) return false;
+        return true;
+      })
+      .map(loc => {
+        // Calculate jumps from origin
+        let jumpsAway = 0;
+        if (fromSystem && fromSystem !== loc.systemId) {
+          const route = this.findRoute(fromSystem, loc.systemId, blacklistArr);
+          jumpsAway = route ? route.length - 1 : 999;
+        }
+
+        // Score components:
+        // 1. Resource abundance (0-100 points) — based on remaining/max ratio
+        let abundanceScore = 0;
+        if (loc.maxRemaining > 0) {
+          abundanceScore = (loc.remaining / loc.maxRemaining) * 100;
+        } else if (loc.totalMined > 0) {
+          // No scan data — use historical yield as proxy (capped at 50)
+          abundanceScore = Math.min(50, Math.log10(loc.totalMined) * 10);
+        }
+
+        // 2. Availability bonus (0-50 points) — depletion_percent from game API means
+        // "% available" (100 = full, 0 = empty), despite the misleading name
+        const availabilityScore = (loc.depletionPercent / 100) * 50;
+
+        // 3. Distance penalty (0-40 points) — gentler slope: 2 points per jump
+        // This ensures distance still matters even for far systems
+        // 0 jumps: 40, 10 jumps: 20, 20 jumps: 0
+        const distanceScore = Math.max(0, 40 - jumpsAway * 2);
+
+        // 4. Scan freshness bonus (0-20 points)
+        let freshnessScore = 20;
+        if (loc.minutesSinceScan === Infinity) {
+          freshnessScore = 5; // Never scanned — uncertain
+        } else if (loc.minutesSinceScan > 180) {
+          freshnessScore = 10; // Stale data
+        }
+
+        // 5. Depletion penalty — heavily penalize low-availability systems
+        // This discourages selecting systems that are nearly empty
+        // Even if they pass the 10% threshold, we still want to prefer healthier systems
+        let depletionPenalty = 0;
+        if (loc.depletionPercent < 25) {
+          // Linear penalty: 0% at 25% availability, -30 points at 10%
+          depletionPenalty = -30 * ((25 - loc.depletionPercent) / 15);
+        }
+
+        // 6. HIDDEN POI BONUS (CRITICAL for deep core mining)
+        // Hidden POIs are exclusive, high-value locations that should be prioritized
+        // They typically have: single ore type, high richness, large pools
+        // Score bonus: +200 points (guarantees they beat regular POIs)
+        const hiddenPoiBonus = loc.isHidden ? 200 : 0;
+
+        // 7. Richness bonus (0-30 points)
+        // Higher richness = more efficient mining (more ore per action)
+        // Richness ranges from ~1-100+, so scale accordingly
+        const richnessScore = Math.min(30, loc.richness * 0.3);
+
+        const score = abundanceScore + availabilityScore + distanceScore + freshnessScore + depletionPenalty + hiddenPoiBonus + richnessScore;
+
+        return {
+          ...loc,
+          resourceId: oreId,
+          jumpsAway,
+          score: Math.round(score * 100) / 100,
+        };
+      });
+
+    // Sort by score descending
+    scored.sort((a, b) => b.score - a.score);
+    return scored;
+  }
+
   /** BFS pathfinding between two systems using known connections. Returns system IDs in order, or null if no path. */
-  findRoute(fromSystemId: string, toSystemId: string): string[] | null {
+  findRoute(fromSystemId: string, toSystemId: string, blacklist?: string[]): string[] | null {
     if (fromSystemId === toSystemId) return [fromSystemId];
 
+    const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
+    const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+    
+    // First, check if we can use a wormhole as a shortcut
+    const wormholeRoute = this.tryFindWormholeRoute(fromSystemId, toSystemId, blacklistArr);
+    if (wormholeRoute) {
+      return wormholeRoute;
+    }
+    
+    // Fall back to regular BFS
     const visited = new Set<string>([fromSystemId]);
     const queue: Array<{ id: string; path: string[] }> = [
       { id: fromSystemId, path: [fromSystemId] },
@@ -724,6 +1262,8 @@ class MapStore {
       for (const conn of conns) {
         const nextId = conn.system_id;
         if (!nextId || visited.has(nextId)) continue;
+        // Skip blacklisted systems
+        if (blacklistSet.has(nextId.toLowerCase())) continue;
 
         const newPath = [...current.path, nextId];
         if (nextId === toSystemId) return newPath;
@@ -736,14 +1276,112 @@ class MapStore {
     return null; // No path found in known map
   }
 
+  /**
+   * Try to find a route using wormholes as shortcuts.
+   * Strategy: Check if we can reach a wormhole entrance, jump through, then reach the destination.
+   */
+  private tryFindWormholeRoute(fromSystemId: string, toSystemId: string, blacklist: string[]): string[] | null {
+    const blacklistSet = new Set(blacklist.map(s => s.toLowerCase()));
+    
+    // Get all active wormholes
+    const activeWormholes = this.getActiveWormholes();
+    
+    // Find the best wormhole route (shortest total path)
+    let bestRoute: string[] | null = null;
+    let bestRouteLength = Infinity;
+    
+    for (const wormhole of activeWormholes) {
+      // Check if wormhole is expired
+      if (!isWormholeActive(wormhole)) continue;
+      
+      // Strategy 1: Can we use this wormhole to get closer to destination?
+      // Route: fromSystem -> wormhole entrance (destination_system_id) -> wormhole exit (exit_system_id) -> toSystemId
+      
+      const entranceSystem = wormhole.destination_system_id;
+      const exitSystem = wormhole.exit_system_id;
+      
+      // Check if entrance system is accessible
+      if (blacklistSet.has(entranceSystem.toLowerCase())) continue;
+      if (blacklistSet.has(exitSystem.toLowerCase())) continue;
+      
+      // Calculate path segments
+      const toEntrance = this.findRegularBfsRoute(fromSystemId, entranceSystem, blacklist);
+      const fromExitToDest = this.findRegularBfsRoute(exitSystem, toSystemId, blacklist);
+      
+      if (toEntrance && fromExitToDest) {
+        // Valid wormhole route
+        // Full route: [...toEntrance (excluding last), exitSystem, ...fromExitToDest]
+        const fullRoute = [
+          ...toEntrance.slice(0, -1), // Exclude entrance system itself
+          exitSystem, // Jump through wormhole
+          ...fromExitToDest,
+        ];
+        
+        if (fullRoute.length < bestRouteLength) {
+          bestRoute = fullRoute;
+          bestRouteLength = fullRoute.length;
+        }
+      }
+      
+      // Strategy 2: Maybe the destination IS the entrance system
+      // Route: fromSystem -> entrance -> (wormhole) -> exit (= destination)
+      if (toSystemId === entranceSystem) {
+        const toEntrance = this.findRegularBfsRoute(fromSystemId, entranceSystem, blacklist);
+        if (toEntrance && toEntrance.length < bestRouteLength) {
+          // Actually, no wormhole needed - just go directly
+          // But we could still use the wormhole if it creates a shortcut
+        }
+      }
+    }
+    
+    return bestRoute;
+  }
+
+  /** Regular BFS route finding (without wormholes) - used internally by tryFindWormholeRoute */
+  private findRegularBfsRoute(fromSystemId: string, toSystemId: string, blacklist: string[]): string[] | null {
+    if (fromSystemId === toSystemId) return [fromSystemId];
+    
+    const blacklistSet = new Set(blacklist.map(s => s.toLowerCase()));
+    const visited = new Set<string>([fromSystemId]);
+    const queue: Array<{ id: string; path: string[] }> = [
+      { id: fromSystemId, path: [fromSystemId] },
+    ];
+
+    while (queue.length > 0) {
+      const current = queue.shift()!;
+      const conns = this.data.systems[current.id]?.connections ?? [];
+
+      for (const conn of conns) {
+        const nextId = conn.system_id;
+        if (!nextId || visited.has(nextId)) continue;
+        if (blacklistSet.has(nextId.toLowerCase())) continue;
+
+        const newPath = [...current.path, nextId];
+        if (nextId === toSystemId) return newPath;
+
+        visited.add(nextId);
+        queue.push({ id: nextId, path: newPath });
+      }
+    }
+
+    return null;
+  }
+
   /** Get all unique ores found across all systems. Returns [{item_id, name}]. */
   getAllKnownOres(): Array<{ item_id: string; name: string }> {
     const ores = new Map<string, string>();
     for (const sys of Object.values(this.data.systems)) {
       for (const poi of sys.pois) {
+        // From mining results (ores_found)
         for (const ore of poi.ores_found) {
           if (ore.item_id && !ores.has(ore.item_id)) {
             ores.set(ore.item_id, ore.name || ore.item_id);
+          }
+        }
+        // From POI scans (resources)
+        for (const res of poi.resources || []) {
+          if (res.resource_id && !ores.has(res.resource_id)) {
+            ores.set(res.resource_id, res.name || res.resource_id);
           }
         }
       }

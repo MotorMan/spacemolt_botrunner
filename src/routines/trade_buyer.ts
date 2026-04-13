@@ -1,6 +1,7 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
+import { getSystemBlacklist } from "../web/server.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -23,6 +24,12 @@ import {
   logFactionActivity,
   isPirateSystem,
   type BaseServices,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
+  getBattleStatus,
+  type BattleState,
+  handleBattleNotifications,
+  fleeFromBattle,
 } from "./common.js";
 import {
   getActiveSession,
@@ -106,11 +113,12 @@ async function recoverBuySession(
 
       if (cargoQty < session.quantityBought) {
         ctx.log("trade", `Recovered with partial cargo: ${cargoQty}/${session.quantityBought}x ${session.itemName}`);
-        session = updateTradeSession(session.botUsername, {
+        const updated = await updateTradeSession(session.botUsername, {
           quantityBought: cargoQty,
           sellQuantity: cargoQty,
           notes: (session.notes || "") + ` | Partial recovery: ${cargoQty}/${session.quantityBought}x remaining`,
-        })!;
+        });
+        if (updated) session = updated;
       }
     }
   }
@@ -127,10 +135,11 @@ async function recoverBuySession(
 
     if (session.destSystem !== homeSystem) {
       ctx.log("trade", `Correcting destination to home system ${homeSystem}`);
-      session = updateTradeSession(session.botUsername, {
+      const updated = await updateTradeSession(session.botUsername, {
         destSystem: homeSystem,
         notes: (session.notes || "") + ` | Destination corrected to home system ${homeSystem}`,
-      })!;
+      });
+      if (updated) session = updated;
     }
   }
 
@@ -159,8 +168,9 @@ interface BuyRoute {
 
 /** Estimate fuel cost between two systems using mapStore route data. */
 function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: number): { jumps: number; cost: number } {
+  const blacklist = getSystemBlacklist();
   if (fromSystem === toSystem) return { jumps: 0, cost: 0 };
-  const route = mapStore.findRoute(fromSystem, toSystem);
+  const route = mapStore.findRoute(fromSystem, toSystem, blacklist);
   if (!route) return { jumps: 999, cost: 999 * costPerJump };
   const jumps = route.length - 1;
   return { jumps, cost: jumps * costPerJump };
@@ -436,6 +446,12 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "trade_buyer")) {
+      await sleep(5000);
+      continue;
+    }
+
     // ── Trade session recovery ──
     const activeSession = getActiveSession(bot.username);
     let recoveredSession: TradeSession | null = null;
@@ -497,7 +513,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         onJump: async (jumpNum) => {
           const session = getActiveSession(bot.username);
           if (session) {
-            updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
+            await updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
           }
           return true;
         },
@@ -510,7 +526,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         continue;
       }
 
-      updateTradeSession(bot.username, { state: "at_destination" });
+      await updateTradeSession(bot.username, { state: "at_destination" });
       bot.system = settings.homeSystem;
 
       if (bot.poi !== homeStation.id) {
@@ -618,6 +634,15 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     const failedSources = new Set<string>();
     let attempts = 0;
 
+    // Battle state tracking for buy route loop
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
+
     // If we have a recovered session, execute it
     if (recoveredSession) {
       ctx.log("trade", `Executing recovered buy session: ${recoveredSession.itemName} (${recoveredSession.quantityBought}x @ ${recoveredSession.buyPricePerUnit}cr)`);
@@ -641,9 +666,9 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       totalSpent = recoveredSession.investedCredits;
 
       if (bot.system === settings.homeSystem) {
-        updateTradeSession(bot.username, { state: "at_destination" });
+        await updateTradeSession(bot.username, { state: "at_destination" });
       } else if (recoveredSession.jumpsCompleted > 0) {
-        updateTradeSession(bot.username, { state: "in_transit" });
+        await updateTradeSession(bot.username, { state: "in_transit" });
       }
     }
 
@@ -652,6 +677,27 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       for (let ri = 0; ri < routes.length && attempts < 3; ri++) {
         if (bot.state !== "running") break;
         const candidate = routes[ri];
+
+        // If we're in battle, re-issue flee command every cycle
+        if (battleState.inBattle) {
+          ctx.log("combat", "Re-issuing flee stance during trade operations (ensuring we stay in flee mode)...");
+          const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+          if (fleeResp.error) {
+            ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+          }
+          // Check if we've successfully disengaged
+          const currentBattleStatus = await getBattleStatus(ctx);
+          if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+            ctx.log("combat", "Battle cleared - no longer in combat! Resuming trade operations...");
+            battleState.inBattle = false;
+            battleState.battleId = null;
+            battleState.isFleeing = false;
+          } else {
+            // Still in battle - wait briefly and continue to next cycle to re-flee
+            await sleep(2000);
+            continue;
+          }
+        }
 
         const sourceKey = `${candidate.sourceSystem}:${candidate.sourcePoi}:${candidate.itemId}`;
         if (failedSources.has(sourceKey)) continue;
@@ -664,6 +710,18 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
         if (bot.system !== candidate.sourceSystem) {
           await ensureUndocked(ctx);
+          
+          // Pre-travel battle check - prevents travel from being interrupted
+          const preTravelBattleCheck = await getBattleStatus(ctx);
+          if (preTravelBattleCheck && preTravelBattleCheck.is_participant) {
+            ctx.log("combat", `PRE-TRAVEL CHECK: IN BATTLE! Battle ID: ${preTravelBattleCheck.battle_id} - initiating flee!`);
+            battleState.inBattle = true;
+            battleState.battleId = preTravelBattleCheck.battle_id;
+            battleState.isFleeing = false;
+            await fleeFromBattle(ctx, false, 5000);
+            continue;
+          }
+          
           const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
           if (!fueled) {
             ctx.log("error", "Cannot refuel for buy run — waiting 30s");
@@ -681,8 +739,38 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
         if (bot.poi !== candidate.sourcePoi) {
           await ensureUndocked(ctx);
+          
+          // Check battle after undock
+          const undockBattleCheck = await getBattleStatus(ctx);
+          if (undockBattleCheck && undockBattleCheck.is_participant) {
+            ctx.log("combat", `POST-UNDOCK CHECK: IN BATTLE! Battle ID: ${undockBattleCheck.battle_id} - initiating flee!`);
+            battleState.inBattle = true;
+            battleState.battleId = undockBattleCheck.battle_id;
+            battleState.isFleeing = false;
+            await fleeFromBattle(ctx, false, 5000);
+            continue;
+          }
+          
           ctx.log("travel", `Traveling to ${candidate.sourcePoiName}...`);
           const tResp = await bot.exec("travel", { target_poi: candidate.sourcePoi });
+          // Check for battle notifications after travel
+          if (tResp.notifications && Array.isArray(tResp.notifications)) {
+            const battleDetected = await handleBattleNotifications(ctx, tResp.notifications, battleState);
+            if (battleDetected) {
+              ctx.log("combat", "Battle detected during travel - initiating flee!");
+              battleState.isFleeing = false;
+            }
+          }
+          // Also check battle status directly (in case we missed notifications)
+          const directBattleCheck = await getBattleStatus(ctx);
+          if (directBattleCheck && directBattleCheck.is_participant) {
+            ctx.log("combat", `DIRECT CHECK: IN BATTLE after travel! Battle ID: ${directBattleCheck.battle_id} - fleeing!`);
+            battleState.inBattle = true;
+            battleState.battleId = directBattleCheck.battle_id;
+            await fleeFromBattle(ctx, true, 35000);
+            ctx.log("error", "Battle detected - fled, will retry route");
+            continue;
+          }
           if (tResp.error && !tResp.error.message.includes("already")) {
             ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
             continue;
@@ -825,6 +913,24 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
         const creditsBefore = bot.credits;
         ctx.log("trade", `Buying ${qty}x ${candidate.itemName} at ${candidate.buyPrice}cr/ea...`);
         const buyResp = await bot.exec("buy", { item_id: candidate.itemId, quantity: qty });
+        // Check for battle notifications after buy
+        if (buyResp.notifications && Array.isArray(buyResp.notifications)) {
+          const battleDetected = await handleBattleNotifications(ctx, buyResp.notifications, battleState);
+          if (battleDetected) {
+            ctx.log("combat", "Battle detected during buy - initiating flee!");
+            battleState.isFleeing = false;
+          }
+        }
+        // Also check battle status directly after buy (in case we missed notifications)
+        const postBuyBattleCheck = await getBattleStatus(ctx);
+        if (postBuyBattleCheck && postBuyBattleCheck.is_participant) {
+          ctx.log("combat", `POST-BUY CHECK: IN BATTLE! Battle ID: ${postBuyBattleCheck.battle_id} - fleeing!`);
+          battleState.inBattle = true;
+          battleState.battleId = postBuyBattleCheck.battle_id;
+          await fleeFromBattle(ctx, true, 35000);
+          ctx.log("error", "Battle detected after buy - fled, will continue to home with cargo");
+          // Don't continue - we have items in cargo, need to proceed to home
+        }
         if (buyResp.error) {
           failedSources.add(sourceKey);
           if (buyResp.error.message.includes("item_not_available") || buyResp.error.message.includes("not_available")) {
@@ -857,7 +963,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
           isCargoRoute: false,
           investedCredits: actualSpent,
         });
-        startTradeSession(session);
+        await startTradeSession(session);
         ctx.log("trade", `Buy session started: ${session.sessionId}`);
 
         mapStore.reserveTradeQuantity(
@@ -873,7 +979,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     if (!route || buyQty <= 0) {
       const activeSession = getActiveSession(bot.username);
       if (activeSession) {
-        failTradeSession(bot.username, "No valid route found");
+        await failTradeSession(bot.username, "No valid route found");
       }
 
       ctx.log("trade", "All routes failed — waiting 60s before re-scanning");
@@ -884,6 +990,19 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     // ── Phase 2: Travel to home and deposit ──
     yield "travel_to_home";
     await ensureUndocked(ctx);
+
+    // Post-undock battle check
+    const postUndockBattleCheck = await getBattleStatus(ctx);
+    if (postUndockBattleCheck && postUndockBattleCheck.is_participant) {
+      ctx.log("combat", `POST-UNDOCK (HOME): IN BATTLE! Battle ID: ${postUndockBattleCheck.battle_id} - initiating flee!`);
+      battleState.inBattle = true;
+      battleState.battleId = postUndockBattleCheck.battle_id;
+      battleState.isFleeing = false;
+      await fleeFromBattle(ctx, false, 5000);
+      await ensureDocked(ctx);
+      await sleep(30000);
+      continue;
+    }
 
     const cargoSafetyOpts = { ...safetyOpts, noJettison: true };
     const fueled2 = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { noJettison: true });
@@ -899,7 +1018,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
       const activeSession = getActiveSession(bot.username);
       if (activeSession) {
-        updateTradeSession(bot.username, {
+        await updateTradeSession(bot.username, {
           state: "in_transit",
           jumpsCompleted: 0,
         });
@@ -912,7 +1031,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
           const session = getActiveSession(bot.username);
           if (session) {
-            updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
+            await updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
           }
 
           try {
@@ -930,7 +1049,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
         const session = getActiveSession(bot.username);
         if (session) {
-          updateTradeSession(bot.username, {
+          await updateTradeSession(bot.username, {
             state: "in_transit",
             notes: (session.notes || "") + " | Network interruption - will retry",
           });
@@ -945,9 +1064,40 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     // Travel to home station POI
     await ensureUndocked(ctx);
+    
+    // Pre-travel to home station battle check
+    const preHomeStationBattleCheck = await getBattleStatus(ctx);
+    if (preHomeStationBattleCheck && preHomeStationBattleCheck.is_participant) {
+      ctx.log("combat", `PRE-HOME-STATION: IN BATTLE! Battle ID: ${preHomeStationBattleCheck.battle_id} - initiating flee!`);
+      battleState.inBattle = true;
+      battleState.battleId = preHomeStationBattleCheck.battle_id;
+      battleState.isFleeing = false;
+      await fleeFromBattle(ctx, false, 5000);
+      await sleep(5000);
+      continue;
+    }
+    
     if (bot.poi !== homeStation.id) {
       ctx.log("travel", `Traveling to ${homeStation.name}...`);
       const t2Resp = await bot.exec("travel", { target_poi: homeStation.id });
+      // Check for battle notifications after travel
+      if (t2Resp.notifications && Array.isArray(t2Resp.notifications)) {
+        const battleDetected = await handleBattleNotifications(ctx, t2Resp.notifications, battleState);
+        if (battleDetected) {
+          ctx.log("combat", "Battle detected during travel to home station - initiating flee!");
+          battleState.isFleeing = false;
+        }
+      }
+      // Direct battle check after travel
+      const travelHomeBattleCheck = await getBattleStatus(ctx);
+      if (travelHomeBattleCheck && travelHomeBattleCheck.is_participant) {
+        ctx.log("combat", `TRAVEL HOME: IN BATTLE! Battle ID: ${travelHomeBattleCheck.battle_id} - fleeing!`);
+        battleState.inBattle = true;
+        battleState.battleId = travelHomeBattleCheck.battle_id;
+        await fleeFromBattle(ctx, true, 35000);
+        ctx.log("trade", "Battle detected during travel home - fled, will retry");
+        continue;
+      }
       if (t2Resp.error && !t2Resp.error.message.includes("already")) {
         ctx.log("error", `Travel to home station failed: ${t2Resp.error.message}`);
       } else {
@@ -1002,7 +1152,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     ctx.log("trade", `Buy run complete: ${depositedLabel}x ${route.itemName} — spent ${totalSpent}cr (${route.jumps} jumps)`);
 
     const actualRevenue = 0;
-    const completedSession = completeTradeSession(bot.username, actualRevenue, actualProfit);
+    const completedSession = await completeTradeSession(bot.username, actualRevenue, actualProfit);
     if (completedSession) {
       ctx.log("trade", `Session completed: ${completedSession.sessionId}`);
     }

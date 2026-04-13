@@ -1,14 +1,16 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
 import { join } from "path";
 import type { BotStatus } from "../bot.js";
+import { getBot } from "../botmanager.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
+import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
 
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn";
+  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request";
   bot?: string;
   routine?: string;
   username?: string;
@@ -79,6 +81,24 @@ function loadSettings(): RoutineSettings {
 }
 
 export { loadSettings };
+
+/** Get the global system blacklist from settings. */
+export function getSystemBlacklist(): string[] {
+  const settings = loadSettings();
+  // Support multiple storage formats for backward compatibility
+  const raw = (settings.system_blacklist as any) 
+           || (settings.systemBlacklist as any) 
+           || [];
+  // Handle both direct array storage and nested object storage
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === 'object' && Array.isArray(raw.system_blacklist)) {
+    return raw.system_blacklist;
+  }
+  if (raw && typeof raw === 'object' && Array.isArray(raw.systemBlacklist)) {
+    return raw.systemBlacklist;
+  }
+  return [];
+}
 
 function saveSettings(s: RoutineSettings): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
@@ -211,6 +231,27 @@ export class WebServer {
     saveSettings(this.settings);
   }
 
+  /** Reload settings from disk and broadcast to all connected clients.
+   *  Called periodically to catch external writes (e.g., from bot routines). */
+  reloadSettingsFromDisk(): void {
+    const diskSettings = loadSettings();
+    // Check if settings actually changed
+    const diskJson = JSON.stringify(diskSettings);
+    const memJson = JSON.stringify(this.settings);
+    if (diskJson !== memJson) {
+      this.settings = diskSettings;
+      // Broadcast settings update to all connected clients
+      for (const ws of this.clients) {
+        try {
+          ws.send(JSON.stringify({
+            type: "settings_updated",
+            settings: this.settings,
+          }));
+        } catch { /* ignore dead connections */ }
+      }
+    }
+  }
+
   // ── Bot assignment persistence (auto-resume on restart) ───
 
   saveBotAssignment(username: string, routine: string): void {
@@ -269,11 +310,84 @@ export class WebServer {
         if (url.pathname === "/api/map") {
           return Response.json({ systems: mapStore.getAllSystems() });
         }
+        if (url.pathname === "/api/map/register-poi" && req.method === "POST") {
+          const body = await req.json() as {
+            system_id: string;
+            poi: {
+              id: string;
+              name: string;
+              type: string;
+              hidden?: boolean;
+              reveal_difficulty?: number;
+              resources?: Array<{
+                resource_id: string;
+                name: string;
+                richness: number;
+                remaining: number;
+                max_remaining: number;
+                depletion_percent: number;
+              }>;
+            };
+          };
+          if (body?.system_id && body?.poi?.id) {
+            mapStore.registerPoiFromScan(body.system_id, body.poi);
+            return Response.json({ ok: true });
+          }
+          return Response.json({ ok: false, error: "Missing system_id or poi.id" }, { status: 400 });
+        }
+        if (url.pathname === "/api/map/register-wormhole" && req.method === "POST") {
+          const body = await req.json() as {
+            system_id: string;
+            wormhole: {
+              id: string;
+              name: string;
+              exit_system_id: string;
+              exit_system_name: string;
+              exit_poi_id: string;
+              exit_poi_name: string;
+              destination_system_id: string;
+              destination_system_name: string;
+              expires_in_text?: string;
+              expires_at?: string;
+            };
+          };
+          if (body?.system_id && body?.wormhole?.id) {
+            mapStore.registerWormhole(body.system_id, body.wormhole);
+            return Response.json({ ok: true });
+          }
+          return Response.json({ ok: false, error: "Missing system_id or wormhole.id" }, { status: 400 });
+        }
+        if (url.pathname === "/api/map/register-system" && req.method === "POST") {
+          const body = await req.json() as { system_data: Record<string, unknown> };
+          if (body?.system_data) {
+            mapStore.updateSystem(body.system_data);
+            return Response.json({ ok: true });
+          }
+          return Response.json({ ok: false, error: "Missing system_data" }, { status: 400 });
+        }
         if (url.pathname === "/api/routines") {
           return Response.json(this.routines);
         }
         if (url.pathname === "/api/settings") {
-          return Response.json(this.settings);
+          // GET: Return current settings
+          if (req.method === "GET") {
+            return Response.json(this.settings);
+          }
+          // POST: Save settings
+          if (req.method === "POST") {
+            const updates = await req.json() as Record<string, unknown>;
+            // Merge updates into this.settings (deep merge for nested objects)
+            for (const [key, value] of Object.entries(updates)) {
+              if (typeof value === 'object' && value !== null && !Array.isArray(value) && key in this.settings && typeof this.settings[key] === 'object' && this.settings[key] !== null) {
+                // Deep merge nested objects
+                this.settings[key] = { ...this.settings[key], ...value };
+              } else {
+                this.settings[key] = value as Record<string, unknown>;
+              }
+            }
+            saveSettings(this.settings);
+            return Response.json(this.settings);
+          }
         }
         if (url.pathname === "/api/stats") {
           return Response.json(this.statsData.daily);
@@ -300,18 +414,36 @@ export class WebServer {
           return Response.json({ ok: false, error: "No shutdown handler" });
         }
 
-        // Per-bot persistent log files
+        // Per-bot persistent log files (debug logs with [bot:onLog] entries)
         if (url.pathname.startsWith("/api/logs/")) {
           const botName = decodeURIComponent(url.pathname.slice("/api/logs/".length));
           const tail = parseInt(url.searchParams.get("tail") || "200");
-          const logPath = join(process.cwd(), "data", "logs", `${botName}.log`);
+          const logPath = join(process.cwd(), "data", "logs", `${botName}_debug.log`);
           if (!existsSync(logPath)) {
             return Response.json({ lines: [] });
           }
           const content = readFileSync(logPath, "utf-8");
           const allLines = content.split("\n").filter(l => l);
-          const lines = allLines.slice(-tail);
-          return Response.json({ lines, total: allLines.length });
+          // Filter only [bot:onLog] lines (activity log entries)
+          const botOnLogLines = allLines.filter(line => line.includes("[bot:onLog]"));
+          const lines = botOnLogLines.slice(-tail);
+          return Response.json({ lines, total: botOnLogLines.length });
+        }
+
+        // Flock state endpoint
+        if (url.pathname.startsWith("/api/flock/") && req.method === "GET") {
+          const flockName = decodeURIComponent(url.pathname.slice("/api/flock/".length));
+          const flockPath = join(process.cwd(), "data", "flock_signals", `${flockName}.json`);
+          if (!existsSync(flockPath)) {
+            return new Response("Flock not found", { status: 404 });
+          }
+          try {
+            const raw = readFileSync(flockPath, "utf-8");
+            const state = JSON.parse(raw);
+            return Response.json(state);
+          } catch (e) {
+            return new Response("Invalid flock state", { status: 500 });
+          }
         }
 
         // POST actions (fallback for non-WS clients)
@@ -322,6 +454,222 @@ export class WebServer {
             return Response.json(result);
           }
           return Response.json({ ok: false, error: "No action handler" });
+        }
+
+        // POST chat endpoint (for fleet commands via faction chat)
+        if (url.pathname === "/api/chat" && req.method === "POST") {
+          const body = await req.json();
+          const { bot, channel, content } = body as { bot: string; channel: string; content: string };
+          if (!bot || !channel || !content) {
+            return Response.json({ error: { code: "invalid_request", message: "Missing bot, channel, or content" } });
+          }
+          const botInstance = getBot(bot);
+          if (!botInstance) {
+            return Response.json({ error: { code: "not_found", message: `Bot ${bot} not found` } });
+          }
+          try {
+            const result = await botInstance.exec("chat", { channel, content });
+            return Response.json(result);
+          } catch (err) {
+            return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
+          }
+        }
+
+        // POST fleet command via bot chat channel (replaces faction chat)
+        if (url.pathname === "/api/fleet-command" && req.method === "POST") {
+          const body = await req.json();
+          const { command, params, fleetId, metadata } = body as { 
+            command: string; 
+            params?: string; 
+            fleetId?: string;
+            metadata?: Record<string, unknown>;
+          };
+          
+          if (!command) {
+            return Response.json({ error: { code: "invalid_request", message: "Missing command" } });
+          }
+
+          // Get fleet settings to find subordinate bots
+          const fleetHunterSettings = (this.settings as Record<string, unknown>).fleet_hunter as Record<string, unknown> || {};
+          const resolvedFleetId = (fleetId || (fleetHunterSettings.fleetId as string) || "default") as string;
+          
+          // Get fleet state to find subordinate bots
+          const { fleetCommService } = await import("../fleet_comm.js");
+          const fleetState = fleetCommService.getFleetState(resolvedFleetId);
+          const subordinates = fleetState ? [...fleetState.subordinateBots] : [];
+          const commanderBot = fleetState?.commanderBot;
+          
+          if (!commanderBot) {
+            return Response.json({ error: { code: "no_commander", message: "No commander assigned to fleet" } });
+          }
+
+          // Send via bot chat channel - include BOTH commander and subordinates
+          const commandMsg = `${command} ${params || ""}`.trim();
+          const allRecipients = commanderBot ? [commanderBot, ...subordinates] : subordinates;
+          
+          botChatChannel.send({
+            sender: "web-ui",
+            recipients: allRecipients,
+            channel: "fleet",
+            content: commandMsg,
+            metadata: {
+              command,
+              params: params || undefined,
+              fleetId: resolvedFleetId,
+              fromWebUI: true,
+              ...metadata,
+            },
+          });
+
+          // Also send via fleet comm service for command processing
+          await fleetCommService.broadcast(resolvedFleetId, command as any, params || undefined, commanderBot);
+
+          return Response.json({ 
+            ok: true, 
+            message: `Fleet command ${command} sent to ${subordinates.length} subordinate(s)`,
+            fleetId: resolvedFleetId,
+            subordinateCount: subordinates.length,
+          });
+        }
+
+        // Per-bot battle status endpoint
+        if (url.pathname.startsWith("/api/bot/") && url.pathname.endsWith("/battle-status") && req.method === "GET") {
+          const botName = decodeURIComponent(url.pathname.slice("/api/bot/".length, -"/battle-status".length));
+          const bot = getBot(botName);
+          if (!bot) {
+            return Response.json({ error: { code: "not_found", message: `Bot ${botName} not found` } });
+          }
+          try {
+            const result = await bot.exec("get_battle_status");
+            if (result.error) {
+              // Not in battle is OK - return null battle
+              if ((result.error as Record<string, unknown>).code === "not_in_battle") {
+                return Response.json({ battle: null });
+              }
+              return Response.json({ error: result.error });
+            }
+            return Response.json({ battle: result.result });
+          } catch (err) {
+            return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
+          }
+        }
+
+        // Per-bot reload endpoint
+        if (url.pathname.startsWith("/api/bot/") && url.pathname.endsWith("/reload") && req.method === "POST") {
+          const botName = decodeURIComponent(url.pathname.slice("/api/bot/".length, -"/reload".length));
+          const body = await req.json();
+          const bot = getBot(botName);
+          if (!bot) {
+            return Response.json({ error: { code: "not_found", message: `Bot ${botName} not found` } });
+          }
+          try {
+            const result = await bot.exec("reload", {
+              weapon_instance_id: body.weapon_instance_id,
+              ammo_item_id: body.ammo_item_id
+            });
+            return Response.json(result);
+          } catch (err) {
+            return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
+          }
+        }
+
+        // Per-bot action endpoint (for battle commands)
+        if (url.pathname.startsWith("/api/bot/") && url.pathname.endsWith("/action") && req.method === "POST") {
+          const botName = decodeURIComponent(url.pathname.slice("/api/bot/".length, -"/action".length));
+          const body = await req.json();
+          const bot = getBot(botName);
+          if (!bot) {
+            return Response.json({ error: { code: "not_found", message: `Bot ${botName} not found` } });
+          }
+          try {
+            // Map battle actions to game commands
+            const { type, action, ...params } = body;
+            let command: string;
+            let cmdParams: Record<string, unknown> = {};
+            
+            if (type === "battle") {
+              switch (action) {
+                case "advance":
+                  command = "battle";
+                  cmdParams = { action: "advance" };
+                  break;
+                case "retreat":
+                  command = "battle";
+                  cmdParams = { action: "retreat" };
+                  break;
+                case "stance":
+                  command = "battle";
+                  cmdParams = { action: "stance", stance: params.stance };
+                  break;
+                case "target":
+                  command = "battle";
+                  cmdParams = { action: "target", target_id: params.target_id };
+                  break;
+                case "engage":
+                  command = "battle";
+                  cmdParams = { action: "engage", ...(params.side_id ? { side_id: params.side_id } : {}) };
+                  break;
+                default:
+                  return Response.json({ error: { code: "invalid_action", message: `Unknown battle action: ${action}` } });
+              }
+            } else {
+              return Response.json({ error: { code: "invalid_type", message: `Unknown action type: ${type}` } });
+            }
+            
+            const result = await bot.exec(command, cmdParams);
+            return Response.json(result);
+          } catch (err) {
+            return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
+          }
+        }
+
+        // Crafting Loadouts endpoints
+        const LOADOUTS_FILE = join(DATA_DIR, "craftingLoadouts.json");
+
+        function loadCraftingLoadouts(): Record<string, Record<string, number>> {
+          if (existsSync(LOADOUTS_FILE)) {
+            try {
+              return JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+            } catch (err) {
+              console.warn(`Warning: corrupt craftingLoadouts.json, starting fresh —`, err);
+            }
+          }
+          return {};
+        }
+
+        function saveCraftingLoadouts(loadouts: Record<string, Record<string, number>>): void {
+          if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+          writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+        }
+
+        // GET /api/crafting-loadouts - Load all loadouts
+        if (url.pathname === "/api/crafting-loadouts" && req.method === "GET") {
+          const loadouts = loadCraftingLoadouts();
+          return Response.json({ loadouts });
+        }
+
+        // POST /api/crafting-loadouts - Save a loadout
+        if (url.pathname === "/api/crafting-loadouts" && req.method === "POST") {
+          const body = await req.json() as { name: string; craftLimits: Record<string, number> };
+          if (!body?.name || !body?.craftLimits) {
+            return Response.json({ error: "Missing name or craftLimits" }, { status: 400 });
+          }
+          const loadouts = loadCraftingLoadouts();
+          loadouts[body.name] = body.craftLimits;
+          saveCraftingLoadouts(loadouts);
+          return Response.json({ ok: true, name: body.name });
+        }
+
+        // DELETE /api/crafting-loadouts/:name - Delete a loadout
+        if (url.pathname.startsWith("/api/crafting-loadouts/") && req.method === "DELETE") {
+          const name = decodeURIComponent(url.pathname.slice("/api/crafting-loadouts/".length));
+          const loadouts = loadCraftingLoadouts();
+          if (!(name in loadouts)) {
+            return Response.json({ error: "Loadout not found" }, { status: 404 });
+          }
+          delete loadouts[name];
+          saveCraftingLoadouts(loadouts);
+          return Response.json({ ok: true, name });
         }
 
         // Serve index.css
@@ -419,6 +767,11 @@ export class WebServer {
         },
       },
     });
+
+    // Periodically reload settings from disk to catch external writes (e.g., from bot routines)
+    setInterval(() => {
+      this.reloadSettingsFromDisk();
+    }, 10000); // Check every 10 seconds
 
     console.log(`Dashboard: http://localhost:${this.port}`);
   }

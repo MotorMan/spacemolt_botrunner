@@ -13,6 +13,15 @@ import {
   readSettings,
   sleep,
   logStatus,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
+  type BattleState,
+  PIRATE_SYSTEMS,
+  isPirateSystem,
+  checkAndFleeFromPirates,
+  parseNearbyForPirates,
+  type PirateDetectionResult,
+  type NearbyEntity,
 } from "./common.js";
 import { getNextMayday, markMaydayHandled, clearMaydayQueue, type MaydayRequest } from "../mayday.js";
 import { getNextManualRescue, markManualRescueHandled, type ManualRescueRequest } from "../manualrescue.js";
@@ -29,6 +38,7 @@ import {
   completeRescueSession,
   failRescueSession,
   isMaydayDuplicate,
+  markMaydayReceived,
   type RescueSession,
 } from "./rescueActivity.js";
 import { isKnownPlayer } from "../playernames.js";
@@ -38,7 +48,24 @@ import {
   recordGhost,
   recordSuccessfulRescue,
   getPlayerRecord,
+  markAsOwnBot,
+  isOwnBot,
 } from "../rescueBlackBook.js";
+import {
+  addToRescueQueue,
+  getNextRescue,
+  markRescueCompleted,
+  incrementRescueAttempt,
+  optimizeRescueRoute,
+  setCurrentRoute,
+  getCurrentRoute,
+  advanceRoute,
+  getCurrentRouteSystem,
+  getRescuesInSystem,
+  getQueueStats,
+  cleanupStaleQueue,
+  getRescueQueue,
+} from "../rescueQueue.js";
 import {
   getCooperationSettings,
   isCooperationEnabled,
@@ -67,6 +94,10 @@ function getRescueSettings(): {
   cooperationEnabled: boolean;
   partnerBotName: string;
   cooperationMaxDelaySeconds: number;
+  creditTopOffAmount: number;
+  creditTopOffMinThreshold: number;
+  maydayPirateProximityThreshold: number;
+  maydayPirateLockoutMinutes: number;
 } {
   const all = readSettings();
   const r = all.rescue || {};
@@ -102,7 +133,426 @@ function getRescueSettings(): {
     partnerBotName: (r.partnerBotName as string) || '',
     /** Max acceptable delay for cooperation messages */
     cooperationMaxDelaySeconds: (r.cooperationMaxDelaySeconds as number) || 30,
+    /** Credits threshold for topping off bots (0 = disabled) */
+    creditTopOffAmount: (r.creditTopOffAmount as number) || 10000,
+    /** Minimum credits a bot must have before topping off (prevents constant top-offs) */
+    creditTopOffMinThreshold: (r.creditTopOffMinThreshold as number) || 10000,
+    /** Maximum jumps from pirate base to decline MAYDAY (0 = disabled) */
+    maydayPirateProximityThreshold: (r.maydayPirateProximityThreshold as number) || 5,
+    /** Minutes to lockout MAYDAYs from players near pirate bases */
+    maydayPirateLockoutMinutes: (r.maydayPirateLockoutMinutes as number) || 30,
   };
+}
+
+// ── Pirate Base Proximity & MAYDAY Lockout ──────────────────────────────────────────────────
+
+/** Track MAYDAY lockouts for players near pirate bases */
+const maydayPirateLockouts = new Map<string, number>(); // playerName -> expiresAt timestamp
+
+/**
+ * Check if a system is within N jumps of any pirate base.
+ * Returns the closest pirate system and jump count, or null if not within range.
+ */
+async function checkPirateBaseProximity(
+  ctx: RoutineContext,
+  system: string,
+  maxJumps: number
+): Promise<{ pirateSystem: string; jumps: number } | null> {
+  const { bot } = ctx;
+
+  // If the system itself is a pirate system, return 0 jumps
+  if (isPirateSystem(system)) {
+    ctx.log("mayday", `⚠️ Target system ${system} IS a pirate system`);
+    return { pirateSystem: system, jumps: 0 };
+  }
+
+  let closestPirate: { pirateSystem: string; jumps: number } | null = null;
+
+  // Check distance to each pirate system
+  for (const pirateSystem of PIRATE_SYSTEMS) {
+    try {
+      const routeResp = await bot.exec("find_route", { target_system: pirateSystem });
+      if (!routeResp.error && routeResp.result) {
+        const route = routeResp.result as Record<string, unknown>;
+        const jumps = (route.total_jumps as number) || 999;
+
+        if (jumps <= maxJumps) {
+          if (!closestPirate || jumps < closestPirate.jumps) {
+            closestPirate = { pirateSystem, jumps };
+          }
+        }
+      }
+    } catch (e) {
+      // Ignore errors for individual route calculations
+      ctx.log("warn", `Could not calculate route to pirate system ${pirateSystem}: ${e}`);
+    }
+  }
+
+  return closestPirate;
+}
+
+/**
+ * Check if a player's MAYDAY is currently locked out due to pirate base proximity.
+ */
+function isMaydayPirateLocked(playerName: string): boolean {
+  const expiresAt = maydayPirateLockouts.get(playerName);
+  if (!expiresAt) return false;
+
+  const now = Date.now();
+  if (now >= expiresAt) {
+    // Lockout expired - remove it
+    maydayPirateLockouts.delete(playerName);
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Add a MAYDAY lockout for a player due to pirate base proximity.
+ */
+function addMaydayPirateLockout(playerName: string, durationMinutes: number): void {
+  const expiresAt = Date.now() + (durationMinutes * 60 * 1000);
+  maydayPirateLockouts.set(playerName, expiresAt);
+  console.log(`[mayday] 🔒 Locked MAYDAY from ${playerName} for ${durationMinutes} minutes (pirate base proximity)`);
+}
+
+/**
+ * Clean up expired MAYDAY lockouts (call periodically).
+ */
+function cleanupExpiredPirateLockouts(): void {
+  const now = Date.now();
+  for (const [playerName, expiresAt] of maydayPirateLockouts.entries()) {
+    if (now >= expiresAt) {
+      maydayPirateLockouts.delete(playerName);
+      console.log(`[mayday] 🔓 Expired MAYDAY lockout for ${playerName}`);
+    }
+  }
+}
+
+/**
+ * Check if a rescue target is a potential pirate trap by validating
+ * co-op claims against our fleet membership and bot status.
+ * 
+ * This detects false flag operations where pirates use our own bot names
+ * to lure rescuers into traps.
+ * 
+ * Returns { isTrap: boolean, reason: string } with trap detection details.
+ */
+async function checkForPirateTrap(
+  ctx: RoutineContext,
+  targetUsername: string,
+  targetSystem: string,
+  isMaydayTarget: boolean,
+  settings: { partnerBotName: string; maydayMaxJumps: number }
+): Promise<{ isTrap: boolean; reason: string; details: Record<string, unknown> }> {
+  const { bot } = ctx;
+  const fleet = ctx.getFleetStatus?.() || [];
+  
+  // Get all our bot names from fleet
+  const ourBotNames = new Set(fleet.map(b => b.username.toLowerCase()));
+  
+  // Check if the target username matches one of our own bot names
+  const targetIsOurBot = ourBotNames.has(targetUsername.toLowerCase());
+  
+  if (targetIsOurBot) {
+    ctx.log("rescue", `🚨 PIRATE TRAP DETECTION: Target "${targetUsername}" is one of OUR bots!`);
+    
+    // Find this bot in our fleet to check its actual status
+    const ourBot = fleet.find(b => b.username.toLowerCase() === targetUsername.toLowerCase());
+    
+    if (ourBot) {
+      // Check if our bot actually needs rescue
+      const actualFuelPct = ourBot.maxFuel > 0 ? Math.round((ourBot.fuel / ourBot.maxFuel) * 100) : 100;
+      const actualSystem = ourBot.system;
+      const actualDocked = ourBot.docked;
+      
+      ctx.log("rescue", `🔍 Our bot "${targetUsername}" actual status:`);
+      ctx.log("rescue", `   - Fuel: ${actualFuelPct}% (reported: varies)`);
+      ctx.log("rescue", `   - System: ${actualSystem} (reported: ${targetSystem})`);
+      ctx.log("rescue", `   - Docked: ${actualDocked}`);
+      
+      // If our bot is docked or has good fuel, this is definitely a false flag
+      if (actualDocked) {
+        return {
+          isTrap: true,
+          reason: `Our bot "${targetUsername}" is DOCKED - this is a FALSE FLAG pirate trap using our bot's name`,
+          details: {
+            botName: targetUsername,
+            actualFuel: actualFuelPct,
+            actualSystem,
+            actualDocked: true,
+            reportedSystem: targetSystem,
+          }
+        };
+      }
+      
+      if (actualFuelPct > 25) {
+        return {
+          isTrap: true,
+          reason: `Our bot "${targetUsername}" has ${actualFuelPct}% fuel (>25%) - this is a FALSE FLAG pirate trap`,
+          details: {
+            botName: targetUsername,
+            actualFuel: actualFuelPct,
+            actualSystem,
+            actualDocked: actualDocked,
+            reportedSystem: targetSystem,
+          }
+        };
+      }
+      
+      // If our bot is in a different system than reported, this is suspicious
+      if (actualSystem && normalizeSystemName(actualSystem) !== normalizeSystemName(targetSystem)) {
+        ctx.log("rescue", `⚠️ Our bot "${targetUsername}" is in ${actualSystem}, but MAYDAY claims ${targetSystem}`);
+        // This could be a trap OR just stale data - warn but don't block
+        ctx.log("rescue", `⚠️ SYSTEM MISMATCH - could be pirate trap or stale fleet data`);
+      }
+    } else {
+      // Bot not in our fleet - very suspicious if using our naming pattern
+      return {
+        isTrap: true,
+        reason: `Target "${targetUsername}" matches our bot naming pattern but is not in our fleet - potential impersonation`,
+        details: {
+          botName: targetUsername,
+          notInFleet: true,
+        }
+      };
+    }
+  }
+  
+  // Check if we received a co-op claim from our partner about this rescue
+  // If our partner (who IS in the fleet with the target) says they're handling it or can't reach it,
+  // we should trust their judgment
+  const { isRescueClaimedByPartner } = await import("../cooperation/rescueCooperation.js");
+  const partnerClaim = isRescueClaimedByPartner(targetUsername, targetSystem, undefined, bot.username);
+  
+  if (partnerClaim) {
+    ctx.log("coop", `🤝 Partner claim detected: ${partnerClaim.botName} claimed ${partnerClaim.player} at ${partnerClaim.system} (${partnerClaim.jumps} jumps)`);
+    
+    // Check if partner is in our fleet (would have access to accurate fleet status)
+    const partnerInOurFleet = fleet.some(b => 
+      b.username.toLowerCase() === partnerClaim.botName.toLowerCase()
+    );
+    
+    if (partnerInOurFleet) {
+      // Partner is in our fleet and has made a claim about this rescue
+      // Check if target is also in our fleet
+      const targetInOurFleet = fleet.some(b => 
+        b.username.toLowerCase() === targetUsername.toLowerCase()
+      );
+      
+      // If partner is in our fleet but target is NOT, and partner has high jump count,
+      // this suggests partner evaluated but determined it's unreachable or a trap
+      if (!targetInOurFleet && partnerClaim.jumps > settings.maydayMaxJumps) {
+        ctx.log("rescue", `🚨 PIRATE TRAP INDICATOR: Partner ${partnerClaim.botName} (in our fleet) claimed ${targetUsername} (NOT in our fleet) with ${partnerClaim.jumps} jumps`);
+        ctx.log("rescue", `🚨 Target not in our fleet - partner cannot verify legitimacy`);
+        ctx.log("rescue", `🚨 This matches pirate false flag pattern - ABORTING`);
+        
+        return {
+          isTrap: true,
+          reason: `Partner ${partnerClaim.botName} claimed rescue but target ${targetUsername} is not in our fleet and requires ${partnerClaim.jumps} jumps (>${settings.maydayMaxJumps} max) - likely pirate false flag`,
+          details: {
+            partnerBot: partnerClaim.botName,
+            partnerInFleet: true,
+            targetInFleet: false,
+            partnerJumps: partnerClaim.jumps,
+            maxJumps: settings.maydayMaxJumps,
+          }
+        };
+      }
+      
+      // If target IS in our fleet and partner claimed it, verify target actually needs rescue
+      if (targetInOurFleet) {
+        const targetBot = fleet.find(b => 
+          b.username.toLowerCase() === targetUsername.toLowerCase()
+        );
+        
+        if (targetBot) {
+          const actualFuelPct = targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100;
+          
+          // If partner claimed but target has good fuel, something is wrong
+          if (actualFuelPct > 25) {
+            ctx.log("rescue", `⚠️ INCONSISTENT: Partner claimed ${targetUsername} needs rescue but they have ${actualFuelPct}% fuel`);
+          }
+          
+          // If target is docked and partner claimed rescue, suspicious
+          if (targetBot.docked) {
+            ctx.log("rescue", `⚠️ INCONSISTENT: Partner claimed ${targetUsername} needs rescue but they are DOCKED`);
+          }
+        }
+      }
+    }
+  }
+  
+  return {
+    isTrap: false,
+    reason: "",
+    details: {}
+  };
+}
+
+/**
+ * Check proximity to pirate strongholds using BFS.
+ * This provides early warning when operating near pirate bases.
+ * Returns information about nearest pirate stronghold.
+ */
+async function checkPirateStrongholdProximity(
+  ctx: RoutineContext,
+  currentSystem: string,
+  maxJumps: number,
+): Promise<{
+  nearStronghold: boolean;
+  jumpsToStronghold: number;
+  nearestStronghold: string;
+}> {
+  const { mapStore } = await import("../mapstore.js");
+
+  // BFS from current system to find nearest pirate stronghold
+  const visited = new Set<string>();
+  const queue: Array<{ systemId: string; distance: number }> = [
+    { systemId: currentSystem, distance: 0 }
+  ];
+  visited.add(currentSystem);
+
+  while (queue.length > 0) {
+    const { systemId, distance } = queue.shift()!;
+
+    // Check if this is a pirate system
+    if (PIRATE_SYSTEMS.some(ps => systemId.toLowerCase() === ps || systemId.toLowerCase().includes(ps))) {
+      return {
+        nearStronghold: true,
+        jumpsToStronghold: distance,
+        nearestStronghold: systemId,
+      };
+    }
+
+    // Stop if we've gone too far
+    if (distance >= maxJumps) continue;
+
+    // Get system from map store
+    const sys = mapStore.getSystem(systemId);
+    if (!sys) continue;
+
+    // Add connections to queue
+    for (const conn of sys.connections) {
+      const connId = conn.system_id;
+      if (!connId) continue;
+      if (visited.has(connId)) continue;
+
+      visited.add(connId);
+      queue.push({ systemId: connId, distance: distance + 1 });
+    }
+  }
+
+  return {
+    nearStronghold: false,
+    jumpsToStronghold: maxJumps + 1,
+    nearestStronghold: "",
+  };
+}
+
+/**
+ * Enhanced pirate awareness for rescue operations near pirate bases.
+ * Scans for pirates and triggers immediate flee if detected.
+ * Should be called before and after critical operations.
+ */
+async function checkAndFleeFromPiratesRescue(
+  ctx: RoutineContext,
+  operation: string = "rescue operation",
+): Promise<boolean> {
+  const { bot } = ctx;
+
+  try {
+    // Scan for nearby entities
+    const nearbyResp = await bot.exec("get_nearby", { range: 50000 });
+    if (nearbyResp.error || !nearbyResp.result) {
+      return false; // Can't scan, assume safe
+    }
+
+    const pirateResult = parseNearbyForPirates(nearbyResp.result);
+
+    if (pirateResult.hasPirates) {
+      ctx.log("combat", `🚨 PIRATES DETECTED during ${operation}! ${pirateResult.pirateCount} pirate(s) spotted. Fleeing immediately!`);
+      
+      // Log pirate details for awareness
+      for (const pirate of pirateResult.pirates) {
+        ctx.log("combat", `  ⚠️ ${pirate.name || "Unknown"} (${pirate.tier || "unknown tier"}) - hull: ${pirate.hull ?? "?"}%, shield: ${pirate.shield ?? "?"}%`);
+      }
+
+      // Flee immediately
+      await emergencyFleeFromPirates(ctx, pirateResult);
+      return true;
+    }
+
+    return false;
+  } catch (e) {
+    ctx.log("warn", `Failed to scan for pirates during ${operation}: ${e}`);
+    return false;
+  }
+}
+
+/**
+ * Emergency flee from pirates - optimized for rescue ships.
+ * Uses the fastest escape method available.
+ */
+async function emergencyFleeFromPirates(
+  ctx: RoutineContext,
+  pirateResult: PirateDetectionResult,
+): Promise<void> {
+  const { bot } = ctx;
+
+  ctx.log("combat", `🏃 Emergency flee initiated - ${pirateResult.pirateCount} pirate(s) detected`);
+
+  // Try to flee to a random safe connection
+  const { mapStore } = await import("../mapstore.js");
+  const sys = mapStore.getSystem(bot.system);
+
+  if (!sys || sys.connections.length === 0) {
+    ctx.log("error", "❌ No escape routes available - trapped!");
+    return;
+  }
+
+  // Filter out pirate systems and blacklisted systems
+  const { getSystemBlacklist } = await import("../web/server.js");
+  const blacklist = getSystemBlacklist();
+
+  const safeConnections = sys.connections.filter(c => {
+    const connId = c.system_id;
+    if (!connId) return false;
+    if (PIRATE_SYSTEMS.some(ps => connId.toLowerCase() === ps || connId.toLowerCase().includes(ps))) return false;
+    if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) return false;
+    return true;
+  });
+
+  if (safeConnections.length === 0) {
+    ctx.log("error", "❌ All escape routes lead through pirate/blacklisted systems!");
+    // Try to flee anyway - better than staying
+    const randomConn = sys.connections[Math.floor(Math.random() * sys.connections.length)];
+    if (randomConn?.system_id) {
+      ctx.log("combat", `🏃 Fleeing to ${randomConn.system_id} (unsafe but only option)`);
+      await bot.exec("jump", { target: randomConn.system_id });
+    }
+    return;
+  }
+
+  // Pick random safe connection for unpredictability
+  const escapeRoute = safeConnections[Math.floor(Math.random() * safeConnections.length)];
+
+  if (escapeRoute?.system_id) {
+    ctx.log("combat", `🏃 Fleeing to ${escapeRoute.system_id} (safe route)`);
+    await bot.exec("jump", { target: escapeRoute.system_id });
+
+    // After fleeing, scan again to ensure we're safe
+    await sleep(2000);
+    const fled = await checkAndFleeFromPiratesRescue(ctx, "post-flee scan");
+    if (fled) {
+      ctx.log("combat", "⚠️ Pirates followed us! Continuing to flee...");
+      // Try another random escape
+      await emergencyFleeFromPirates(ctx, pirateResult);
+    } else {
+      ctx.log("combat", "✓ Successfully escaped pirates!");
+    }
+  }
 }
 
 // ── Helpers ──────────────────────────────────────────────────
@@ -171,6 +621,101 @@ async function sendRescueBill(
 /** Normalize system name for comparison (handles underscores vs spaces, case) */
 const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
 
+/**
+ * Check if a rescue target still needs rescue by verifying their current fuel and position.
+ * Returns an object with:
+ *   - needsRescue: whether the target still needs rescue
+ *   - currentFuelPct: current fuel percentage (if available)
+ *   - currentSystem: current system (if available)
+ *   - currentDocked: whether currently docked (if available)
+ *   - reason: why rescue is no longer needed (if applicable)
+ */
+async function checkTargetStillNeedsRescue(
+  ctx: RoutineContext,
+  targetUsername: string,
+  originalFuelPct: number,
+  originalSystem: string,
+  originalDocked: boolean,
+): Promise<{
+  needsRescue: boolean;
+  currentFuelPct: number | null;
+  currentSystem: string | null;
+  currentDocked: boolean | null;
+  reason?: string;
+}> {
+  const { bot } = ctx;
+
+  // Get current fleet status to find the target
+  const fleet = ctx.getFleetStatus?.() || [];
+  const targetBot = fleet.find(b => b.username === targetUsername);
+
+  if (!targetBot) {
+    // Target not in fleet - can't verify status
+    // This might mean they logged off or fleet status is unavailable
+    ctx.log("rescue", `⚠️ Cannot verify ${targetUsername} status - not in fleet list`);
+    return {
+      needsRescue: true, // Assume they still need rescue
+      currentFuelPct: null,
+      currentSystem: null,
+      currentDocked: null,
+      reason: "Target not in fleet status",
+    };
+  }
+
+  const currentFuelPct = targetBot.maxFuel > 0 ? Math.round((targetBot.fuel / targetBot.maxFuel) * 100) : 100;
+  const currentSystem = targetBot.system;
+  const currentDocked = targetBot.docked;
+
+  // Check if target has refueled themselves
+  if (currentFuelPct > 25 && originalFuelPct <= 10) {
+    // Significant fuel increase indicates they refueled
+    ctx.log("rescue", `✓ ${targetUsername} no longer needs rescue - fuel increased from ${originalFuelPct}% to ${currentFuelPct}% (self-refueled)`);
+    return {
+      needsRescue: false,
+      currentFuelPct,
+      currentSystem,
+      currentDocked,
+      reason: `Target self-refueled: ${originalFuelPct}% → ${currentFuelPct}%`,
+    };
+  }
+
+  // Check if target has moved to a different system
+  if (currentSystem && normalizeSystemName(currentSystem) !== normalizeSystemName(originalSystem)) {
+    ctx.log("rescue", `✓ ${targetUsername} no longer needs rescue - moved from ${originalSystem} to ${currentSystem}`);
+    return {
+      needsRescue: false,
+      currentFuelPct,
+      currentSystem,
+      currentDocked,
+      reason: `Target moved: ${originalSystem} → ${currentSystem}`,
+    };
+  }
+
+  // Check if target is now docked (might be refueling at station)
+  if (currentDocked && !originalDocked && currentFuelPct > originalFuelPct) {
+    ctx.log("rescue", `✓ ${targetUsername} is now docked and refueling - fuel ${currentFuelPct}% (was ${originalFuelPct}%)`);
+    // Don't cancel rescue yet - they might still need fuel after refueling
+    // Only cancel if fuel is above threshold
+    if (currentFuelPct > 25) {
+      return {
+        needsRescue: false,
+        currentFuelPct,
+        currentSystem,
+        currentDocked,
+        reason: `Target docked and refueled: ${currentFuelPct}%`,
+      };
+    }
+  }
+
+  // Target still needs rescue
+  return {
+    needsRescue: true,
+    currentFuelPct,
+    currentSystem,
+    currentDocked,
+  };
+}
+
 /** Find bots that need fuel rescue. */
 function findStrandedBots(
   fleet: BotStatus[],
@@ -203,35 +748,203 @@ function findStrandedBots(
  */
 async function hasRefuelingPump(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
-  
+
   try {
     const shipResp = await bot.exec("get_ship");
     if (shipResp.error) {
       ctx.log("warn", `Could not get ship info: ${shipResp.error.message}`);
       return false;
     }
-    
+
     const shipData = shipResp.result as Record<string, unknown> | undefined;
     if (!shipData) return false;
-    
+
     const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
-    
+
     for (const mod of modules) {
       const m = mod as Record<string, unknown>;
       const moduleId = (m.type_id as string) || (m.id as string) || "";
       const moduleName = (m.name as string) || "";
-      
+
       if (moduleId.includes("refueling_pump") || moduleName.toLowerCase().includes("refueling pump")) {
         ctx.log("rescue", "✓ Refueling Pump module detected");
         return true;
       }
     }
-    
+
     ctx.log("warn", "Refueling Pump module NOT detected on this ship");
     return false;
   } catch (err) {
     ctx.log("warn", `Error checking for Refueling Pump: ${err}`);
     return false;
+  }
+}
+
+/**
+ * Credit top-off function — redistributes credits from faction treasury
+ * to ONE bot that is running low, including self.
+ * This is designed to be called repeatedly in a background loop,
+ * processing one bot per invocation.
+ *
+ * @returns true if a bot was topped off, false if no bots needed it
+ */
+async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThreshold: number): Promise<boolean> {
+  const { bot } = ctx;
+
+  if (targetAmount <= 0) {
+    ctx.log("rescue", "💰 topOffOneBot: targetAmount is 0, returning false");
+    return false;
+  }
+
+  // Only top off when docked (can't send gifts while undocked)
+  if (!bot.docked) {
+    ctx.log("rescue", "💰 topOffOneBot: bot not docked, returning false");
+    return false;
+  }
+
+  const fleet = ctx.getFleetStatus?.() || [];
+  ctx.log("rescue", `💰 topOffOneBot: checking ${fleet.length} fleet members for credits below ${targetAmount}cr (min threshold: ${minThreshold}cr)`);
+
+  // Find first bot (other than self) that needs topping off
+  for (const member of fleet) {
+    if (member.username === bot.username) continue;
+    if (member.state !== "running" && member.state !== "idle") continue;
+    // Only top off if bot has less than minThreshold credits
+    if (member.credits >= minThreshold) continue;
+    if (member.credits >= targetAmount) continue;
+
+    const needed = targetAmount - member.credits;
+    ctx.log("rescue", `💰 ${member.username} has ${member.credits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
+    // Withdraw from faction treasury
+    ctx.log("rescue", `💰 Withdrawing ${needed}cr from faction treasury for ${member.username}...`);
+    const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+    if (withdrawResp.error) {
+      ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
+      return false; // treasury likely empty, stop trying
+    }
+
+    ctx.log("rescue", `💰 Successfully withdrew ${needed}cr, sending to ${member.username}...`);
+    // Send credits to the bot
+    const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
+    if (giftResp.error) {
+      ctx.log("rescue", `💰 Gift to ${member.username} failed: ${giftResp.error.message}`);
+      // Re-deposit withdrawn credits back
+      await bot.exec("faction_deposit_credits", { amount: needed });
+      return false;
+    } else {
+      ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
+      return true; // Successfully topped off one bot
+    }
+  }
+
+  // Top off self if needed
+  ctx.log("rescue", `💰 No other bots need topping off, checking self...`);
+  await bot.refreshStatus();
+  if (bot.credits < minThreshold) {
+    if (bot.credits >= targetAmount) {
+      ctx.log("rescue", `💰 Self credits OK (${bot.credits}cr >= ${targetAmount}cr), no action needed`);
+      return false;
+    }
+    
+    const needed = targetAmount - bot.credits;
+    ctx.log("rescue", `💰 Self has ${bot.credits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
+    const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+    if (withdrawResp.error) {
+      ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for self: ${withdrawResp.error.message}`);
+      return false;
+    }
+
+    ctx.log("rescue", `💰 Withdrew ${needed}cr from faction treasury for self (now at ${bot.credits + needed}cr)`);
+    return true;
+  }
+
+  ctx.log("rescue", `💰 Self credits OK (${bot.credits}cr >= ${minThreshold}cr min threshold), no action needed`);
+  return false; // No bots needed topping off
+}
+
+// ── Background credit top-off state ──────────────────────────────────────────
+let creditTopOffIntervalId: NodeJS.Timeout | null = null;
+
+/**
+ * Background credit top-off loop — runs independently every 60 seconds,
+ * only when docked at sol_central. Non-blocking to the main rescue loop.
+ */
+function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number): void {
+  if (targetAmount <= 0) {
+    ctx.log("rescue", "💰 Credit top-off disabled (amount is 0)");
+    return;
+  }
+
+  // Prevent multiple intervals from being created
+  if (creditTopOffIntervalId !== null) {
+    ctx.log("rescue", "💰 Credit top-off background loop already running, skipping duplicate start");
+    return;
+  }
+
+  ctx.log("rescue", `💰 Credit top-off background loop started (target: ${targetAmount}cr, interval: 60s)`);
+
+  const intervalMs = 60 * 1000; // 1 minute
+
+  const loop = async () => {
+    try {
+      const { bot } = ctx;
+
+      // Stop if routine is no longer running
+      if (bot.state !== "running" && bot.state !== "idle") {
+        ctx.log("rescue", "💰 Stopping credit top-off background loop — routine is no longer running");
+        stopCreditTopOffBackground();
+        return;
+      }
+
+      // Refresh bot status to get current docked state and system
+      await bot.refreshStatus();
+
+      ctx.log("rescue", `💰 Background credit check - docked: ${bot.docked}, system: ${bot.system}, credits: ${bot.credits}`);
+
+      // Only run when docked
+      if (!bot.docked) {
+        ctx.log("rescue", `💰 Skipping credit top-off — not docked (docked: ${bot.docked})`);
+        return;
+      }
+
+      // Check if we're at sol_central (or home system if configured)
+      const settings = getRescueSettings();
+      const expectedSystem = settings.homeSystem || "sol_central";
+
+      if (normalizeSystemName(bot.system) !== normalizeSystemName(expectedSystem)) {
+        ctx.log("rescue", `💰 Skipping credit top-off — not at ${expectedSystem} (current: ${bot.system})`);
+        return;
+      }
+
+      ctx.log("rescue", `💰 At ${expectedSystem}, checking fleet credits...`);
+      const minThreshold = settings.creditTopOffMinThreshold;
+      const toppedOff = await topOffOneBot(ctx, targetAmount, minThreshold);
+
+      if (toppedOff) {
+        ctx.log("rescue", `💰 Successfully topped off a bot — will check again in ${intervalMs / 1000}s`);
+      } else {
+        ctx.log("rescue", `💰 No bots need topping off this cycle`);
+      }
+    } catch (err) {
+      ctx.log("rescue", `💰 Credit top-off background loop error: ${err}`);
+    }
+  };
+
+  // Run immediately on start, then every minute
+  loop();
+  creditTopOffIntervalId = setInterval(loop, intervalMs);
+}
+
+/**
+ * Stop the background credit top-off loop.
+ */
+function stopCreditTopOffBackground(): void {
+  if (creditTopOffIntervalId !== null) {
+    clearInterval(creditTopOffIntervalId);
+    creditTopOffIntervalId = null;
+    console.log("[rescue] 💰 Credit top-off background loop stopped");
   }
 }
 
@@ -286,13 +999,44 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     ctx.log("rescue", `✓ Bot started at home base (${homeSystem})`);
   }
 
+  // ── Mark all our bots in the blackbook to prevent them from being blacklisted ──
+  // Get fleet status and mark all bots with our username pattern as "own bots"
+  const fleet = ctx.getFleetStatus?.() || [];
+  const ourBotNames = fleet.map(b => b.username).filter(name => name !== bot.username);
+  for (const botName of ourBotNames) {
+    markAsOwnBot(botName);
+    ctx.log("rescue", `🤝 Marked ${botName} as our bot (will not blacklist)`);
+  }
+  ctx.log("rescue", `✓ Marked ${ourBotNames.length} bots as our own (excluded from ghost tracking)`);
+
+  // ── Start background credit top-off loop (non-blocking) ──
+  startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "rescue")) {
+      await sleep(5000);
+      continue;
+    }
+
+    // ── Battle state tracking (per-cycle initialization) ──
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
+
     // ── Clean up expired rescue announcements ──
     cleanupExpiredAnnouncements();
+
+    // ── Clean up expired MAYDAY pirate lockouts ──
+    cleanupExpiredPirateLockouts();
 
     // ── Monitor faction chat for rescue announcements from other bots ──
     // This helps coordinate with other rescue bots to avoid duplicate responses
@@ -371,11 +1115,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           isReturningIdle = false;
         } else {
           ctx.log("rescue", `${activeSession.targetUsername} has been refueled (${fuelPct}%) - clearing session`);
-          failRescueSession(bot.username, "Target no longer needs rescue");
+          await failRescueSession(bot.username, "Target no longer needs rescue");
         }
       } else {
         ctx.log("rescue", `Target ${activeSession.targetUsername} not in fleet - clearing session`);
-        failRescueSession(bot.username, "Target not found in fleet");
+        await failRescueSession(bot.username, "Target not found in fleet");
       }
     }
 
@@ -444,6 +1188,25 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
       const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
 
+      // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
+      for (const target of targets) {
+        if (isOwnBot(target.username)) {
+          const result = addToRescueQueue(
+            target.username,
+            target.system,
+            target.poi,
+            target.fuelPct,
+            target.docked
+          );
+          if (result.added) {
+            ctx.log("rescue", `📋 Added ${target.username} to rescue queue at ${target.system}/${target.poi} (${target.fuelPct}% fuel)`);
+          }
+        }
+      }
+
+      // Clean up stale queue entries
+      cleanupStaleQueue();
+
       // ── Check for MAYDAY requests if no fleet targets ──
       let maydayTarget: RescueTarget | null = null;
       if (targets.length === 0) {
@@ -490,6 +1253,61 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           }
           ctx.log("mayday_debug", `✓ Not a duplicate MAYDAY`);
 
+          // Mark this MAYDAY as recently received to prevent processing duplicates
+          // This must be done BEFORE any other processing to catch rapid-fire duplicates
+          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
+          ctx.log("mayday_debug", `📝 Marked MAYDAY from ${mayday.sender} as recently received (5min cooldown)`);
+
+          // ── PIRATE BASE PROXIMITY CHECK: Decline MAYDAYs too close to pirate bases ──
+          // This prevents the bot from getting stuck in loops trying to rescue players
+          // in systems that are blacklisted due to pirate base proximity
+          const pirateProximityThreshold = settings.maydayPirateProximityThreshold;
+          if (pirateProximityThreshold > 0 && mayday.system) {
+            // First check if this player is already locked out
+            if (isMaydayPirateLocked(mayday.sender)) {
+              ctx.log("mayday", `🔒 Ignoring MAYDAY from ${mayday.sender} - currently locked out (pirate base proximity)`);
+              markMaydayHandled(mayday);
+              continue;
+            }
+
+            // Check proximity to pirate bases
+            const pirateProximity = await checkPirateBaseProximity(ctx, mayday.system, pirateProximityThreshold);
+            if (pirateProximity) {
+              ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - too close to pirate base ${pirateProximity.pirateSystem} (${pirateProximity.jumps} jumps away)`);
+
+              // Add lockout to prevent repeated MAYDAY processing
+              const lockoutMinutes = settings.maydayPirateLockoutMinutes;
+              addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+
+              // Send decline message to the player via private message
+              const aiChatService = (globalThis as any).aiChatService;
+              if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+                try {
+                  await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: Their location (${mayday.system}/${mayday.poi}) is too close to a pirate base (${pirateProximity.pirateSystem}, only ${pirateProximity.jumps} jumps away). Your ships cannot safely navigate through blacklisted pirate systems due to safety restrictions.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a restricted zone near pirate territory. Tell them you're sorry but you physically cannot reach them. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
+                    currentSystem: ctx.bot.system,
+                    targetSystem: mayday.system,
+                    jumps: pirateProximity.jumps,
+                    fuelRefueled: undefined,
+                    playerFuelPct: undefined,
+                  });
+                  ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender}`);
+                } catch (e) {
+                  ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+                }
+              }
+
+              markMaydayHandled(mayday);
+              continue;
+            }
+          }
+
           // Record rescue request for blackbook tracking
           recordRescueRequest(mayday.sender);
 
@@ -514,6 +1332,81 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             } else {
               ctx.log("coop", `🤝 ✗ No partner claim found yet - will proceed and send claim (partner may respond with their claim)`);
             }
+          }
+
+          // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
+          const { getSystemBlacklist } = await import("../web/server.js");
+          const { mapStore } = await import("../mapstore.js");
+          const blacklist = getSystemBlacklist();
+          const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+          
+          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          if (isBlacklisted) {
+            ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
+            const lockoutMinutes = settings.maydayPirateLockoutMinutes;
+            addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+              try {
+                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: Their location (${mayday.system}) is in a blacklisted system that your ships cannot navigate to. This is a hard restriction - you physically cannot reach them.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a system you cannot access. Apologize and tell them they'll need to find alternative help. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
+                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                  fuelRefueled: undefined, playerFuelPct: undefined,
+                });
+              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+            }
+            markMaydayHandled(mayday);
+            continue;
+          }
+          
+          let viableRoute = false;
+          try {
+            const mappedRoute = mapStore.findRoute(bot.system, mayday.system, blacklist);
+            if (mappedRoute && mappedRoute.length > 1) {
+              viableRoute = true;
+            } else {
+              const routeResp = await bot.exec("find_route", { target_system: mayday.system });
+              if (!routeResp.error && routeResp.result) {
+                const routeData = routeResp.result as Record<string, unknown>;
+                const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
+                if (routeData.found && serverRoute && serverRoute.length > 1) {
+                  const blacklistedOnRoute = serverRoute.find(r => 
+                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                  );
+                  if (!blacklistedOnRoute) viableRoute = true;
+                }
+              }
+            }
+          } catch (e) { ctx.log("warn", `Error checking route: ${e}`); }
+          
+          if (!viableRoute) {
+            ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - NO VIABLE ROUTE to ${mayday.system}`);
+            const lockoutMinutes = settings.maydayPirateLockoutMinutes;
+            addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+              try {
+                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: There is no safe route to their location (${mayday.system}). All possible paths are blocked or too dangerous for your ships to navigate.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because there's no safe way to reach their location. Apologize and suggest they'll need to find help from someone closer or in a different system. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
+                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                  fuelRefueled: undefined, playerFuelPct: undefined,
+                });
+              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+            }
+            markMaydayHandled(mayday);
+            continue;
           }
 
           // Check jump range
@@ -619,29 +1512,50 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             if (!arrived) {
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
             } else {
-              ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
-              
+              // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+              await bot.refreshStatus();
+              ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+
               // If home station is configured, travel there and dock
               if (settings.homeStation) {
                 const [expectedSystem, stationId] = settings.homeStation.split('|');
+                ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
+
                 if (expectedSystem === homeSystem && stationId) {
-                  ctx.log("rescue", `🚀 Traveling to home station...`);
+                  ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
                   const travelResp = await bot.exec("travel", { target_poi: stationId });
-                  if (!travelResp.error) {
+                  // CRITICAL: Check for battle interrupt error
+                  if (travelResp.error) {
+                    const errMsg = travelResp.error.message.toLowerCase();
+                    if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                      ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                      await sleep(5000);
+                      continue;
+                    }
+                    ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+                  } else {
                     ctx.log("rescue", `⚓ Docking at home station...`);
                     const dockResp = await bot.exec("dock");
-                    if (!dockResp.error) {
+                    if (dockResp.error) {
+                      ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+                    } else {
                       ctx.log("rescue", `✓ Docked at home station`);
                       // Refuel after docking
                       ctx.log("rescue", `⛽ Refueling at home station...`);
                       const refuelResp = await bot.exec("refuel");
-                      if (!refuelResp.error) {
+                      if (refuelResp.error) {
+                        ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                      } else {
                         await bot.refreshStatus();
                         ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                       }
                     }
                   }
+                } else {
+                  ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
                 }
+              } else {
+                ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
               }
             }
             isReturningIdle = false;
@@ -650,6 +1564,67 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           } else {
             ctx.log("rescue", `⏱️ Idle for ${Math.round(elapsedMs / 1000)}s (away from home)`);
           }
+        } else if (isAwayFromHome && idleStartTime === 0) {
+          // FIX: When first starting away from home, immediately return home instead of waiting for idle timeout
+          ctx.log("rescue", `🏠 Bot activated away from home (${bot.system} vs ${homeSystem}) — returning home immediately to refuel and enable credit top-offs...`);
+          isReturningIdle = true;
+
+          yield "return_home";
+          await ensureUndocked(ctx);
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+          const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (!arrived) {
+            ctx.log("error", `Failed to return to home system ${homeSystem}`);
+          } else {
+            // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+            await bot.refreshStatus();
+            ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+
+            // If home station is configured, travel there and dock
+            if (settings.homeStation) {
+              const [expectedSystem, stationId] = settings.homeStation.split('|');
+              ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
+
+              if (expectedSystem === homeSystem && stationId) {
+                ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
+                const travelResp = await bot.exec("travel", { target_poi: stationId });
+                // CRITICAL: Check for battle interrupt error
+                if (travelResp.error) {
+                  const errMsg = travelResp.error.message.toLowerCase();
+                  if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                    ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                    await sleep(5000);
+                    continue;
+                  }
+                  ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+                } else {
+                  ctx.log("rescue", `⚓ Docking at home station...`);
+                  const dockResp = await bot.exec("dock");
+                  if (dockResp.error) {
+                    ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+                  } else {
+                    ctx.log("rescue", `✓ Docked at home station`);
+                    // Refuel after docking
+                    ctx.log("rescue", `⛽ Refueling at home station...`);
+                    const refuelResp = await bot.exec("refuel");
+                    if (refuelResp.error) {
+                      ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                    } else {
+                      await bot.refreshStatus();
+                      ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                    }
+                  }
+                }
+              } else {
+                ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
+              }
+            } else {
+              ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
+            }
+          }
+          isReturningIdle = false;
+          idleStartTime = 0;
+          continue; // Restart loop after returning home
         } else {
           // Reset idle timer if we're not away from home or already returning
           idleStartTime = 0;
@@ -659,14 +1634,76 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         continue;
       }
 
-      // ── Rescue the most critical bot ──
-      target = maydayTarget || targets[0];
-      isMaydayTarget = !!maydayTarget;
-      logCategory = isMaydayTarget ? "mayday" : "rescue";
+      // ── Select rescue target: Check queue first for optimized routing ──
+      // Priority: Manual rescue > MAYDAY > Queued rescues (optimized) > Fresh scan targets
+      let selectedTarget: RescueTarget | null = null;
+      let selectedFromQueue = false;
+
+      // Check rescue queue for pending rescues
+      const queueStats = getQueueStats();
+      if (queueStats.pending > 0) {
+        ctx.log("rescue", `📋 Rescue queue has ${queueStats.pending} pending rescues — selecting optimal target...`);
+
+        // Optimize route based on current location
+        const optimizedRoute = optimizeRescueRoute(bot.system);
+        if (optimizedRoute.length > 0) {
+          setCurrentRoute(optimizedRoute);
+          ctx.log("rescue", `🗺️ Optimized route: ${optimizedRoute.join(" → ")}`);
+
+          // Get the first system in the optimized route
+          const firstSystem = optimizedRoute[0];
+          const rescuesInSystem = getRescuesInSystem(firstSystem);
+
+          if (rescuesInSystem.length > 0) {
+            // Pick the most critical (lowest fuel) rescue in the closest system
+            rescuesInSystem.sort((a, b) => a.fuelPct - b.fuelPct);
+            const queuedRescue = rescuesInSystem[0];
+
+            ctx.log("rescue", `🎯 Selecting queued rescue: ${queuedRescue.targetUsername} at ${queuedRescue.system}/${queuedRescue.poi} (${queuedRescue.fuelPct}%)`);
+
+            selectedTarget = {
+              username: queuedRescue.targetUsername,
+              system: queuedRescue.system,
+              poi: queuedRescue.poi,
+              fuelPct: queuedRescue.fuelPct,
+              docked: queuedRescue.docked,
+            };
+            selectedFromQueue = true;
+            incrementRescueAttempt(queuedRescue.id);
+          }
+        }
+      }
+
+      // If no queued target selected, fall back to MAYDAY or fresh scan
+      if (!selectedTarget) {
+        if (maydayTarget) {
+          selectedTarget = maydayTarget;
+          isMaydayTarget = true;
+          logCategory = "mayday";
+          ctx.log("mayday", `🚨 Selecting MAYDAY target: ${maydayTarget.username}`);
+        } else if (targets.length > 0) {
+          // Pick most critical from fresh scan, sorted by lowest fuel
+          selectedTarget = targets[0];
+          ctx.log("rescue", `🎯 Selecting from fleet scan: ${selectedTarget.username} at ${selectedTarget.fuelPct}% fuel`);
+        }
+      }
+
+      target = selectedTarget;
+      if (!selectedFromQueue && !isMaydayTarget) {
+        logCategory = "rescue";
+      }
     }
 
     if (!target) {
       await sleep(5000);
+      continue;
+    }
+
+    // ── Validate target has a valid system before proceeding ──
+    if (!target.system || target.system.trim() === "") {
+      ctx.log("rescue", `⚠️ Target ${target.username} has no valid system — refreshing status and skipping...`);
+      ctx.log("rescue", `💡 This can happen with stale fleet data or hidden POIs`);
+      await sleep(settings.scanIntervalSec * 1000);
       continue;
     }
 
@@ -685,7 +1722,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         lastUpdatedAt: new Date().toISOString(),
         state: "navigating",
       };
-      startRescueSession(session);
+      await startRescueSession(session);
       ctx.log("rescue", `Created rescue session for ${target.username}`);
     }
 
@@ -696,6 +1733,34 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       ctx.log("mayday", `RESCUE NEEDED (MAYDAY): ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
     } else {
       ctx.log("rescue", `RESCUE NEEDED: ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
+    }
+
+    // ── RESCUE COOPERATION: Send en-route notification to stranded player (IMMEDIATELY after verification) ──
+    // Only notify if this is a MAYDAY or manual rescue (not fleet rescues)
+    // Calculate jumps to target for the notification
+    let initialJumpsToTarget = 0;
+    if (isMaydayTarget || isManualRescueTarget) {
+      try {
+        const routeResp = await bot.exec("find_route", { target_system: target.system });
+        if (!routeResp.error && routeResp.result) {
+          const route = routeResp.result as Record<string, unknown>;
+          initialJumpsToTarget = (route.total_jumps as number) || 0;
+          ctx.log("rescue", `📍 Route to target: ${initialJumpsToTarget} jump${initialJumpsToTarget !== 1 ? 's' : ''}`);
+        }
+      } catch (e) {
+        ctx.log("warn", `Could not calculate route to ${target.system}: ${e}`);
+      }
+
+      const aiChatService = (globalThis as any).aiChatService;
+      if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
+        aiChatService.sendRescueEnRouteNotification(bot, target.username, initialJumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
+          if (!result.ok) {
+            ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
+          }
+        }).catch((err: Error) => {
+          ctx.log("warn", `Error sending en-route notification: ${err.message}`);
+        });
+      }
     }
 
     // ── Check for Refueling Pump before each mission ──
@@ -765,7 +1830,99 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       await ensureUndocked(ctx);
 
       if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
+        // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names ──
+        const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
+          partnerBotName: settings.partnerBotName,
+          maydayMaxJumps: settings.maydayMaxJumps
+        });
+        if (trapCheck.isTrap) {
+          ctx.log("rescue", `🚨 ABORTING RESCUE - ${trapCheck.reason}`);
+          ctx.log("rescue", `🚨 This appears to be a PIRATE TRAP using false flag operation`);
+          
+          // Fail the rescue session if one exists
+          const activeSession = getActiveRescueSession(bot.username);
+          if (activeSession) {
+            await failRescueSession(bot.username, `Aborted - pirate trap detected: ${trapCheck.reason}`);
+          }
+          
+          // Mark MAYDAY as handled to prevent re-triggering
+          if (isMaydayTarget) {
+            const mayday = getNextMayday();
+            if (mayday) markMaydayHandled(mayday);
+          }
+          
+          await sleep(settings.scanIntervalSec * 1000);
+          continue;
+        }
+
+        // ── PIRATE BASE PROXIMITY CHECK: Block navigation to systems near pirate bases ──
+        // This is a HARD BLOCK - do not attempt to navigate to blacklisted systems
+        const { getSystemBlacklist } = await import("../web/server.js");
+        const blacklist = getSystemBlacklist();
+        const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+        
+        const isTargetBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
+        if (isTargetBlacklisted) {
+          ctx.log("rescue", `🚫 BLOCKED: Target system ${target.system} is BLACKLISTED (likely near pirate base)`);
+          ctx.log("rescue", `🚫 ABORTING RESCUE - cannot navigate to blacklisted system`);
+          
+          const activeSession = getActiveRescueSession(bot.username);
+          if (activeSession) {
+            await failRescueSession(bot.username, "Aborted - target system is blacklisted");
+          }
+          
+          if (isMaydayTarget) {
+            const mayday = getNextMayday();
+            if (mayday) markMaydayHandled(mayday);
+          }
+          
+          await sleep(settings.scanIntervalSec * 1000);
+          continue;
+        }
+
+        // Also check if route to target passes through blacklisted systems
+        try {
+          const routeResp = await bot.exec("find_route", { target_system: target.system });
+          if (!routeResp.error && routeResp.result) {
+            const route = routeResp.result as Record<string, unknown>;
+            const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+            
+            if (routeData) {
+              const blacklistedOnRoute = routeData.find(r =>
+                blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+              );
+              
+              if (blacklistedOnRoute) {
+                ctx.log("rescue", `🚫 BLOCKED: Route to ${target.system} passes through blacklisted system "${blacklistedOnRoute.system_id}"`);
+                ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available`);
+                
+                const activeSession = getActiveRescueSession(bot.username);
+                if (activeSession) {
+                  await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
+                }
+                
+                if (isMaydayTarget) {
+                  const mayday = getNextMayday();
+                  if (mayday) markMaydayHandled(mayday);
+                }
+                
+                await sleep(settings.scanIntervalSec * 1000);
+                continue;
+              }
+            }
+          }
+        } catch (e) {
+          ctx.log("warn", `Could not validate route to ${target.system}: ${e}`);
+        }
+
         ctx.log(logCategory, `Navigating to ${target.system}...`);
+
+        // ── PIRATE AWARENESS: Check if target system is near a pirate stronghold ──
+        const proximityCheck = await checkPirateStrongholdProximity(ctx, target.system, 3);
+        if (proximityCheck.nearStronghold) {
+          ctx.log("combat", `⚠️ PIRATE ALERT: Target system ${target.system} is only ${proximityCheck.jumpsToStronghold} jump(s) from pirate base ${proximityCheck.nearestStronghold}!`);
+          ctx.log("combat", `🚨 Operating with EXTREME pirate awareness - ready to flee at first sight!`);
+        }
 
         // Track jumps for billing - get route before navigating
         let jumpsToTarget = 0;
@@ -780,28 +1937,58 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           ctx.log("warn", `Could not calculate route to ${target.system}: ${e}`);
         }
 
-        // ── RESCUE COOPERATION: Send en-route notification to stranded player ──
-        ctx.log("rescue", `📧 En-route notification check: isMayday=${isMaydayTarget}, isManual=${isManualRescueTarget}`);
-        // Let them know we're on our way (only for MAYDAY rescues, not fleet rescues)
-        if (isMaydayTarget || isManualRescueTarget) {
-          const aiChatService = (globalThis as any).aiChatService;
-          if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
-            aiChatService.sendRescueEnRouteNotification(bot, target.username, jumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
-              if (!result.ok) {
-                ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
-              }
-            }).catch((err: Error) => {
-              ctx.log("warn", `Error sending en-route notification: ${err.message}`);
-            });
-          }
-        }
+        const safetyOpts = {
+          fuelThresholdPct: settings.refuelThreshold,
+          hullThresholdPct: 30,
+          onJump: async (jumpNumber: number) => {
+            // Check if target still needs rescue on every jump
+            const statusCheck = await checkTargetStillNeedsRescue(
+              ctx,
+              target!.username,
+              target!.fuelPct,
+              target!.system,
+              target!.docked,
+            );
 
-        const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+            if (!statusCheck.needsRescue) {
+              ctx.log("rescue", `🛑 ABORTING rescue - ${statusCheck.reason}`);
+              return false; // Abort navigation
+            }
+
+            // Log progress every 5 jumps
+            if (jumpNumber % 5 === 0 && statusCheck.currentFuelPct !== null) {
+              ctx.log("rescue", `📍 Jump ${jumpNumber}: ${target!.username} fuel at ${statusCheck.currentFuelPct}% in ${statusCheck.currentSystem}`);
+            }
+
+            return true; // Continue navigation
+          },
+        };
         const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
         if (!arrived) {
-          ctx.log("error", `Could not reach ${target.system} — will retry next scan`);
-          if (recoveredSession || getActiveRescueSession(bot.username)) {
-            failRescueSession(bot.username, "Could not reach target system");
+          // Track consecutive failures to prevent infinite retry loops
+          const activeSession = getActiveRescueSession(bot.username);
+          const failureReason = `Could not reach ${target.system}`;
+
+          if (activeSession) {
+            const failures = (activeSession.consecutiveFailures || 0) + 1;
+            await updateRescueSession(bot.username, {
+              consecutiveFailures: failures,
+              lastFailureReason: failureReason
+            });
+
+            if (failures >= 3) {
+              ctx.log("error", `❌ ${failureReason} — ABORTING after ${failures} consecutive failures`);
+              await failRescueSession(bot.username, `Aborted after ${failures} consecutive navigation failures`);
+              await sleep(settings.scanIntervalSec * 1000);
+              continue;
+            }
+
+            ctx.log("error", `${failureReason} — failure #${failures}/3, will retry next scan`);
+          } else {
+            ctx.log("error", `${failureReason} — will retry next scan`);
+            if (recoveredSession) {
+              await failRescueSession(bot.username, "Could not reach target system");
+            }
           }
           await sleep(settings.scanIntervalSec * 1000);
           continue;
@@ -809,9 +1996,21 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         // CRITICAL: Refresh status to update bot.system after navigation
         await bot.refreshStatus();
         ctx.log("travel", `Arrived in ${bot.system}`);
+
+        // ── PIRATE AWARENESS: Scan for pirates immediately after arrival ──
+        const pirateScan = await checkAndFleeFromPiratesRescue(ctx, "arrival scan");
+        if (pirateScan) {
+          ctx.log("combat", "🚨 Pirates detected on arrival! Rescue mission aborted - will retry after fleeing.");
+          if (recoveredSession || getActiveRescueSession(bot.username)) {
+            await failRescueSession(bot.username, "Pirates detected on arrival - fleeing");
+          }
+          await sleep(5000);
+          continue;
+        }
+
         // Update session state and jumps after successful navigation
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          updateRescueSession(bot.username, { state: "at_system", jumpsCompleted: jumpsToTarget });
+          await updateRescueSession(bot.username, { state: "at_system", jumpsCompleted: jumpsToTarget });
         }
       }
 
@@ -820,7 +2019,21 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       // ── Travel to stranded bot's POI ──
       if (target.poi) {
         yield "travel_to_target";
-        
+
+        // CRITICAL: Refresh target's current position from fleet status after arriving at system
+        const fleet = ctx.getFleetStatus?.() || [];
+        const targetBot = fleet.find(b => b.username === target.username);
+        if (targetBot) {
+          const oldSystem = target.system;
+          const oldPoi = target.poi;
+          target.system = targetBot.system || target.system;
+          target.poi = targetBot.poi || target.poi;
+          target.docked = targetBot.docked;
+          if (oldSystem !== target.system || oldPoi !== target.poi) {
+            ctx.log("rescue", `📍 Target position updated after arrival: ${oldSystem}/${oldPoi} -> ${target.system}/${target.poi}`);
+          }
+        }
+
         // Resolve POI name to POI ID by querying system info
         let targetPoiId: string | null = null;
         let targetPoiName: string = target.poi;
@@ -851,6 +2064,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         
         ctx.log(logCategory, `Traveling to ${target.username}'s location (${targetPoiName})...`);
         const travelResp = await bot.exec("travel", { target_poi: travelTarget });
+        // Check for battle notifications after travel
+        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+          ctx.log("combat", "Battle detected while traveling to POI - fleeing!");
+          continue;
+        }
         if (travelResp.error && !travelResp.error.message.includes("already")) {
           ctx.log("error", `Travel failed: ${travelResp.error.message}`);
         } else {
@@ -859,7 +2077,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         }
         // Update session state after traveling to POI
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          updateRescueSession(bot.username, { state: "at_poi" });
+          await updateRescueSession(bot.username, { state: "at_poi" });
         }
       }
 
@@ -868,7 +2086,18 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
       // Update session state before fuel delivery
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "delivering_fuel" });
+        await updateRescueSession(bot.username, { state: "delivering_fuel" });
+      }
+
+      // ── PIRATE AWARENESS: Final scan before committing to fuel transfer ──
+      const preRefuelScan = await checkAndFleeFromPiratesRescue(ctx, "pre-refuel scan");
+      if (preRefuelScan) {
+        ctx.log("combat", "🚨 Pirates detected before refuel! Aborting fuel transfer and fleeing!");
+        if (recoveredSession || getActiveRescueSession(bot.username)) {
+          await failRescueSession(bot.username, "Pirates detected before refuel - fleeing");
+        }
+        await sleep(5000);
+        continue;
       }
 
       if (hasPumpNow) {
@@ -890,6 +2119,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
         // Issue the refuel command
         const refuelResp = await bot.exec("refuel", { target: targetPlayerId });
+        // Check for battle notifications after refuel
+        if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
+          ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
+          continue;
+        }
 
         if (refuelResp.error) {
           ctx.log("error", `Refuel command failed: ${refuelResp.error.message}`);
@@ -931,6 +2165,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             item_id: fuelItem.itemId,
             quantity: fuelItem.quantity,
           });
+          // Check for battle notifications after jettison
+          if (await checkBattleAfterCommand(ctx, jetResp.notifications, "jettison", battleState)) {
+            ctx.log("combat", "Battle detected during jettison - fleeing!");
+            continue;
+          }
 
           if (jetResp.error) {
             ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
@@ -947,8 +2186,18 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
           if (station) {
             ctx.log(logCategory, `Traveling to ${station.name} to purchase fuel cells...`);
-            await bot.exec("travel", { target_poi: station.id });
-            await bot.exec("dock");
+            const travelResp = await bot.exec("travel", { target_poi: station.id });
+            // Check for battle notifications after travel
+            if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+              ctx.log("combat", "Battle detected while traveling to station - fleeing!");
+              continue;
+            }
+            const dockResp = await bot.exec("dock");
+            // Check for battle notifications after dock (docking ends battle vulnerability)
+            if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
+              ctx.log("combat", "Battle detected during docking - fleeing!");
+              continue;
+            }
             bot.docked = true;
             await collectFromStorage(ctx);
 
@@ -1004,7 +2253,12 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
                   ctx.log("warn", `Could not query system POIs: ${e}`);
                 }
                 const travelTarget = targetPoiId || target.poi;
-                await bot.exec("travel", { target_poi: travelTarget });
+                const travelResp = await bot.exec("travel", { target_poi: travelTarget });
+                // Check for battle notifications after travel
+                if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+                  ctx.log("combat", "Battle detected while returning to target - fleeing!");
+                  continue;
+                }
                 bot.poi = targetPoiId ? target.poi : target.poi;
               }
 
@@ -1018,6 +2272,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
                   item_id: purchasedItem.itemId,
                   quantity: purchasedItem.quantity,
                 });
+                // Check for battle notifications after jettison
+                if (await checkBattleAfterCommand(ctx, jetResp.notifications, "jettison", battleState)) {
+                  ctx.log("combat", "Battle detected during jettison - fleeing!");
+                  continue;
+                }
 
                 if (jetResp.error) {
                   ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
@@ -1054,7 +2313,9 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       if (!arrived) {
         ctx.log("error", `Failed to return to home system ${homeSystem}`);
       } else {
-        ctx.log(logCategory, `✓ Arrived at home system ${homeSystem}`);
+        // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+        await bot.refreshStatus();
+        ctx.log(logCategory, `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
         // If home station is configured, travel there and dock
         ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", homeSystem: "${homeSystem}"`);
@@ -1065,36 +2326,53 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           if (expectedSystem === homeSystem && stationId) {
             ctx.log(logCategory, `🚀 Traveling to home station (${stationId})...`);
             const travelResp = await bot.exec("travel", { target_poi: stationId });
-            if (!travelResp.error) {
+            // Check for battle notifications after travel
+            if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+              ctx.log("combat", "Battle detected while traveling to home station - fleeing!");
+              continue;
+            }
+            // CRITICAL: Check for battle interrupt error
+            if (travelResp.error) {
+              const errMsg = travelResp.error.message.toLowerCase();
+              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
+              ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+            } else {
               ctx.log(logCategory, `⚓ Docking at home station...`);
               const dockResp = await bot.exec("dock");
-              if (!dockResp.error) {
+              // Check for battle notifications after dock
+              if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
+                ctx.log("combat", "Battle detected during docking - fleeing!");
+                continue;
+              }
+              if (dockResp.error) {
+                ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+              } else {
                 ctx.log(logCategory, `✓ Docked at home station`);
                 // Refuel after docking
                 ctx.log(logCategory, `⛽ Refueling at home station...`);
                 const refuelResp = await bot.exec("refuel");
-                if (!refuelResp.error) {
+                if (refuelResp.error) {
+                  ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                } else {
                   await bot.refreshStatus();
                   ctx.log(logCategory, `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-                } else {
-                  ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
                 }
-              } else {
-                ctx.log("error", `Dock failed: ${dockResp.error.message}`);
               }
-            } else {
-              ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
             }
           } else {
-            ctx.log("warn", `homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
+            ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
           }
         } else {
-          ctx.log("rescue", `⚠️ homeStation not configured - will use ensureFueled to refuel at ${homeSystem}`);
+          ctx.log("warn", `⚠️ homeStation not configured - will use ensureFueled to refuel at ${homeSystem}`);
         }
       }
       // Update session state for return home
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "returning_home" });
+        await updateRescueSession(bot.username, { state: "returning_home" });
       }
     } else if (!homeSystem) {
       ctx.log("warn", "No home system set — skipping return home");
@@ -1109,9 +2387,28 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         if (expectedSystem === homeSystem && stationId) {
           ctx.log(logCategory, `🚀 Traveling to home station (${stationId})...`);
           const travelResp = await bot.exec("travel", { target_poi: stationId });
-          if (!travelResp.error) {
+          // Check for battle notifications after travel
+          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+            ctx.log("combat", "Battle detected while traveling to home station - fleeing!");
+            continue;
+          }
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+            ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
+          } else {
             ctx.log(logCategory, `⚓ Docking at home station...`);
             const dockResp = await bot.exec("dock");
+            // Check for battle notifications after dock
+            if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
+              ctx.log("combat", "Battle detected during docking - fleeing!");
+              continue;
+            }
             if (!dockResp.error) {
               ctx.log(logCategory, `✓ Docked at home station`);
               // Refuel after docking
@@ -1126,8 +2423,6 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
             } else {
               ctx.log("error", `Dock failed: ${dockResp.error.message}`);
             }
-          } else {
-            ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
           }
         } else {
           ctx.log("warn", `homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
@@ -1188,7 +2483,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         );
         
         // Update session with billing info
-        updateRescueSession(bot.username, {
+        await updateRescueSession(bot.username, {
           jumpsCompleted: jumpsToTarget,
           totalJumps: estimatedTotalJumps,
           fuelDelivered,
@@ -1259,7 +2554,17 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      completeRescueSession(bot.username);
+      await completeRescueSession(bot.username);
+
+      // Also mark the queue entry as completed if this was our own bot
+      if (isOwnBot(target.username)) {
+        const queue = getRescueQueue();
+        const queuedRescue = queue.pending.find(r => r.targetUsername === target.username);
+        if (queuedRescue) {
+          markRescueCompleted(queuedRescue.id);
+          ctx.log("rescue", `📋 Marked ${target.username} as completed in rescue queue`);
+        }
+      }
     }
 
     if (isManualRescueTarget) {
@@ -1279,6 +2584,9 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     // Short cooldown before next scan
     await sleep(10000);
   }
+
+  // Cleanup when routine exits
+  stopCreditTopOffBackground();
 };
 
 // ── Manual Player Rescue routine ────────────────────────────
@@ -1315,7 +2623,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     return;
   }
 
-  const { targetSystem, targetPOI, targetPlayer } = rescueParams;
+  const { targetSystem, targetPlayer } = rescueParams;
+  let targetPOI = rescueParams.targetPOI;
   
   ctx.log("rescue", `🚀 Manual Player Rescue Mission initiated!`);
   ctx.log("rescue", `Target: ${targetPlayer} at ${targetSystem} / ${targetPOI}`);
@@ -1326,6 +2635,21 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "manual_rescue")) {
+      await sleep(5000);
+      continue;
+    }
+
+    // ── Battle state tracking (per-cycle initialization) ──
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
 
     // ── Check for Refueling Pump ──
     const hasPump = await hasRefuelingPump(ctx);
@@ -1371,8 +2695,31 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
     // ── Travel to target POI ──
     yield "travel_to_target";
+    
+    // CRITICAL: Refresh fleet status to get current target position
+    const fleet = ctx.getFleetStatus?.() || [];
+    const targetBotCheck = fleet.find(b => b.username === targetPlayer);
+    if (targetBotCheck) {
+      const currentSystem = targetBotCheck.system;
+      const currentPoi = targetBotCheck.poi;
+      if (currentSystem && currentSystem !== targetSystem) {
+        ctx.log("rescue", `⚠️ Target moved from ${targetSystem} to ${currentSystem} - aborting manual rescue`);
+        await sleep(5000);
+        return;
+      }
+      if (currentPoi && currentPoi !== targetPOI) {
+        ctx.log("rescue", `📍 Target POI updated: ${targetPOI} -> ${currentPoi}`);
+        targetPOI = currentPoi;
+      }
+    }
+    
     ctx.log("rescue", `Traveling to target location (${targetPOI})...`);
     const travelResp = await bot.exec("travel", { target_poi: targetPOI });
+    // Check for battle notifications after travel
+    if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+      ctx.log("combat", "Battle detected while traveling to POI - fleeing!");
+      continue;
+    }
     if (travelResp.error && !travelResp.error.message.includes("already")) {
       ctx.log("error", `Travel failed: ${travelResp.error.message}`);
       // Continue anyway, we might already be there
@@ -1384,6 +2731,11 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     ctx.log("rescue", `Scanning for player: ${targetPlayer}...`);
 
     const nearbyResp = await bot.exec("get_nearby");
+    // Check for battle notifications after get_nearby
+    if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby", battleState)) {
+      ctx.log("combat", "Battle detected during scan - fleeing!");
+      continue;
+    }
     let nearbyPlayers: Array<{ playerId: string; username: string; shipType?: string }> = [];
 
     if (!nearbyResp.error && nearbyResp.result) {
@@ -1473,9 +2825,14 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
       if (hasPump) {
         // Direct refuel using refuel command
         ctx.log("rescue", `Refueling ${player.username}${player.shipType ? ` (${player.shipType})` : ''}...`);
-        
+
         const refuelResp = await bot.exec("refuel", { target: player.playerId });
-        
+        // Check for battle notifications after refuel
+        if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
+          ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
+          continue;
+        }
+
         if (refuelResp.error) {
           ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
         } else {
@@ -1503,12 +2860,17 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         
         if (fuelItem && fuelItem.quantity > 0) {
           await ensureUndocked(ctx);
-          
+
           const jetResp = await bot.exec("jettison", {
             item_id: fuelItem.itemId,
             quantity: fuelItem.quantity,
           });
-          
+          // Check for battle notifications after jettison
+          if (await checkBattleAfterCommand(ctx, jetResp.notifications, "jettison", battleState)) {
+            ctx.log("combat", "Battle detected during jettison - fleeing!");
+            continue;
+          }
+
           if (jetResp.error) {
             ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
           } else {
@@ -1522,27 +2884,77 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
     // ── Mission complete — return home ──
     ctx.log("rescue", `=== Rescue mission complete ===`);
-    break;
-  }
 
-  // ── Return to home system ──
-  if (homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
-    yield "return_home";
-    ctx.log("rescue", `Returning to home system ${homeSystem}...`);
-    await ensureUndocked(ctx);
-    const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
-    const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-    if (!arrived) {
-      ctx.log("error", `Failed to return to home system ${homeSystem}`);
+    // ── Return to home system ──
+    if (homeSystem && bot.system.toLowerCase() !== homeSystem.toLowerCase()) {
+      yield "return_home";
+      ctx.log("rescue", `Returning to home system ${homeSystem}...`);
+      await ensureUndocked(ctx);
+      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!arrived) {
+        ctx.log("error", `Failed to return to home system ${homeSystem}`);
+      } else {
+        // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+        await bot.refreshStatus();
+        ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+
+        // If home station is configured, travel there and dock
+        if (settings.homeStation) {
+          const [expectedSystem, stationId] = settings.homeStation.split('|');
+          if (expectedSystem === homeSystem && stationId) {
+            ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
+            const travelResp = await bot.exec("travel", { target_poi: stationId });
+            // CRITICAL: Check for battle interrupt error
+            if (travelResp.error) {
+              const errMsg = travelResp.error.message.toLowerCase();
+              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
+              ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+            } else {
+              ctx.log("rescue", `⚓ Docking at home station...`);
+              const dockResp = await bot.exec("dock");
+              if (dockResp.error) {
+                ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+              } else {
+                ctx.log("rescue", `✓ Docked at home station`);
+                // Refuel after docking
+                ctx.log("rescue", `⛽ Refueling at home station...`);
+                const refuelResp = await bot.exec("refuel");
+                if (refuelResp.error) {
+                  ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                } else {
+                  await bot.refreshStatus();
+                  ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                }
+              }
+            }
+          }
+        }
+      }
+    } else if (!homeSystem) {
+      ctx.log("warn", "No home system set — skipping return home");
     } else {
-      ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+      ctx.log("rescue", `Already at home system ${homeSystem}`);
 
-      // If home station is configured, travel there and dock
+      // Already at home system - still travel to home station and dock if configured
       if (settings.homeStation) {
         const [expectedSystem, stationId] = settings.homeStation.split('|');
         if (expectedSystem === homeSystem && stationId) {
           ctx.log("rescue", `🚀 Traveling to home station...`);
           const travelResp = await bot.exec("travel", { target_poi: stationId });
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+          }
           if (!travelResp.error) {
             ctx.log("rescue", `⚓ Docking at home station...`);
             const dockResp = await bot.exec("dock");
@@ -1560,65 +2972,41 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         }
       }
     }
-  } else if (!homeSystem) {
-    ctx.log("warn", "No home system set — skipping return home");
-  } else {
-    ctx.log("rescue", `Already at home system ${homeSystem}`);
-    
-    // Already at home system - still travel to home station and dock if configured
-    if (settings.homeStation) {
-      const [expectedSystem, stationId] = settings.homeStation.split('|');
-      if (expectedSystem === homeSystem && stationId) {
-        ctx.log("rescue", `🚀 Traveling to home station...`);
-        const travelResp = await bot.exec("travel", { target_poi: stationId });
-        if (!travelResp.error) {
-          ctx.log("rescue", `⚓ Docking at home station...`);
-          const dockResp = await bot.exec("dock");
-          if (!dockResp.error) {
-            ctx.log("rescue", `✓ Docked at home station`);
-            // Refuel after docking
-            ctx.log("rescue", `⛽ Refueling at home station...`);
-            const refuelResp = await bot.exec("refuel");
-            if (!refuelResp.error) {
-              await bot.refreshStatus();
-              ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-            }
-          }
-        }
+
+    // ── Dock and refuel self (fallback if not already docked at station) ──
+    yield "self_refuel";
+    await ensureDocked(ctx);
+
+    // Refuel after mission - but only if below threshold
+    await bot.refreshStatus();
+    const fuelAfterMission = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelAfterMission < settings.refuelThreshold) {
+      ctx.log("rescue", `Fuel at ${fuelAfterMission}% — refueling to threshold (${settings.refuelThreshold}%)...`);
+      const refuelResp = await bot.exec("refuel");
+      if (refuelResp.error) {
+        ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
+        await ensureFueled(ctx, settings.refuelThreshold);
+      } else {
+        await bot.refreshStatus();
+        const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        ctx.log("rescue", `Fuel: ${fuelPct}% (${bot.fuel}/${bot.maxFuel})`);
       }
-    }
-  }
-
-  // ── Dock and refuel self (fallback if not already docked at station) ──
-  yield "self_refuel";
-  await ensureDocked(ctx);
-
-  // Refuel after mission - but only if below threshold
-  await bot.refreshStatus();
-  const fuelAfterMission = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  if (fuelAfterMission < settings.refuelThreshold) {
-    ctx.log("rescue", `Fuel at ${fuelAfterMission}% — refueling to threshold (${settings.refuelThreshold}%)...`);
-    const refuelResp = await bot.exec("refuel");
-    if (refuelResp.error) {
-      ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
-      await ensureFueled(ctx, settings.refuelThreshold);
     } else {
-      await bot.refreshStatus();
-      const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      ctx.log("rescue", `Fuel: ${fuelPct}% (${bot.fuel}/${bot.maxFuel})`);
+      ctx.log("rescue", `Fuel at ${fuelAfterMission}% — above threshold, no need to refuel`);
     }
-  } else {
-    ctx.log("rescue", `Fuel at ${fuelAfterMission}% — above threshold, no need to refuel`);
+
+    await bot.refreshStatus();
+    logStatus(ctx);
+
+    ctx.log("rescue", `✓ Bot is docked and ready for next mission`);
+
+    // Clear routine params after completion
+    (bot as unknown as Record<string, unknown>).routineParams = undefined;
+    
+    // Exit the routine
+    return;
   }
-
-  await bot.refreshStatus();
-  logStatus(ctx);
-
-  ctx.log("rescue", `✓ Bot is docked and ready for next mission`);
-
-  // Clear routine params after completion (also cleared in botmanager, but good to do here too)
-  (bot as unknown as Record<string, unknown>).routineParams = undefined;
-}
+};
 
 // ── MaydayRescue routine ────────────────────────────────────
 
@@ -1662,6 +3050,21 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "mayday_rescue")) {
+      await sleep(5000);
+      continue;
+    }
+
+    // ── Battle state tracking (per-cycle initialization) ──
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
 
     // ── Rescue session recovery ──
     const activeSession = getActiveRescueSession(bot.username);
@@ -1836,7 +3239,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         lastUpdatedAt: new Date().toISOString(),
         state: "navigating",
       };
-      startRescueSession(session);
+      await startRescueSession(session);
       ctx.log("mayday", `Created MAYDAY rescue session for ${mayday.sender}`);
     }
 
@@ -1844,11 +3247,14 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
       try {
         const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
-          situation: `You are responding to their MAYDAY distress call. You are coming to rescue them with fuel.`,
+          situation: `You are responding to their MAYDAY distress call. You are coming to rescue them with fuel. You have accepted their MAYDAY and are en route to their location.
+
+IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a decline. The player's fuel level is ${mayday.fuelPct}% - they are in critical condition and need immediate help.`,
           currentSystem: bot.system,
           targetSystem: mayday.system,
           jumps: jumpsToTarget > 0 ? jumpsToTarget : undefined,
           playerFuelPct: mayday.fuelPct,
+          fuelRefueled: undefined,
         });
         if (result.ok) {
           ctx.log("mayday", `✓ Sent "on my way" private message to ${mayday.sender}`);
@@ -1876,7 +3282,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       if (!arrived) {
         ctx.log("error", `Could not reach ${mayday.system} - MAYDAY response failed`);
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          failRescueSession(bot.username, "Could not reach target system");
+          await failRescueSession(bot.username, "Could not reach target system");
         }
         markMaydayHandled(mayday);
         await sleep(5000);
@@ -1884,7 +3290,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       }
       // Update session state after successful navigation
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "at_system" });
+        await updateRescueSession(bot.username, { state: "at_system" });
       }
     }
 
@@ -1892,15 +3298,34 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
     // ── Travel to target POI ──
     yield "travel_to_target";
+    
+    // CRITICAL: Refresh target's current position from fleet status after arriving at system
+    const fleet = ctx.getFleetStatus?.() || [];
+    const targetBot = fleet.find(b => b.username === mayday.sender);
+    if (targetBot) {
+      const oldSystem = mayday.system;
+      const oldPoi = mayday.poi;
+      mayday.system = targetBot.system || mayday.system;
+      mayday.poi = targetBot.poi || mayday.poi;
+      if (oldSystem !== mayday.system || oldPoi !== mayday.poi) {
+        ctx.log("mayday", `📍 MAYDAY target position updated after arrival: ${oldSystem}/${oldPoi} -> ${mayday.system}/${mayday.poi}`);
+      }
+    }
+    
     ctx.log("mayday", `Traveling to ${mayday.poi}...`);
     const travelResp = await bot.exec("travel", { target_poi: mayday.poi });
+    // Check for battle notifications after travel
+    if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+      ctx.log("combat", "Battle detected while traveling to POI - fleeing!");
+      continue;
+    }
     if (travelResp.error && !travelResp.error.message.includes("already")) {
       ctx.log("error", `Travel failed: ${travelResp.error.message}`);
     }
     bot.poi = mayday.poi;
     // Update session state after traveling to POI
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      updateRescueSession(bot.username, { state: "at_poi" });
+      await updateRescueSession(bot.username, { state: "at_poi" });
     }
 
     // ── Find and refuel target ──
@@ -1909,10 +3334,15 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
     // Update session state before fuel delivery
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      updateRescueSession(bot.username, { state: "delivering_fuel" });
+      await updateRescueSession(bot.username, { state: "delivering_fuel" });
     }
 
     const nearbyResp = await bot.exec("get_nearby");
+    // Check for battle notifications after get_nearby
+    if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby", battleState)) {
+      ctx.log("combat", "Battle detected during scan - fleeing!");
+      return;
+    }
     let targetPlayerId: string | null = null;
     let targetFuelBefore = 0;
 
@@ -1954,6 +3384,11 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         // Direct refuel using refuel command
         ctx.log("mayday", `Refueling ${mayday.sender}...`);
         const refuelResp = await bot.exec("refuel", { target: targetPlayerId });
+        // Check for battle notifications after refuel
+        if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
+          ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
+          continue;
+        }
 
         if (refuelResp.error) {
           ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
@@ -1981,6 +3416,11 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
             item_id: fuelItem.itemId,
             quantity: fuelItem.quantity,
           });
+          // Check for battle notifications after jettison
+          if (await checkBattleAfterCommand(ctx, jetResp.notifications, "jettison", battleState)) {
+            ctx.log("combat", "Battle detected during jettison - fleeing!");
+            continue;
+          }
           if (jetResp.error) {
             ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
           } else {
@@ -1998,12 +3438,12 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       try {
         const result = await aiChatService.sendPrivateMessage(bot, mayday.sender, {
           situation: fuelTransferred > 0
-            ? `You have successfully refueled the stranded pilot. They are now safe and can continue their journey.`
+            ? `You have successfully refueled the stranded pilot. They are now safe and can continue their journey. You transferred ${fuelTransferred} fuel units to them.`
             : `You arrived to help but couldn't provide fuel. You did your best to assist.`,
-          currentSystem: mayday.system, // Now at same system
+          currentSystem: mayday.system,
           targetSystem: mayday.system,
           fuelRefueled: fuelTransferred > 0 ? fuelTransferred : undefined,
-          playerFuelPct: targetFuelBefore,
+          playerFuelPct: undefined, // Don't pass player fuel - confuses LLM about whose fuel it is
         });
         if (result.ok) {
           ctx.log("mayday", `✓ Sent "rescue complete" private message to ${mayday.sender}`);
@@ -2035,23 +3475,38 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       if (!arrived) {
         ctx.log("error", `Failed to return to home system ${homeSystem}`);
       } else {
-        ctx.log("mayday", `✓ Arrived at home system ${homeSystem}`);
+        // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+        await bot.refreshStatus();
+        ctx.log("mayday", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
         // If home station is configured, travel there and dock
         if (settings.homeStation) {
           const [expectedSystem, stationId] = settings.homeStation.split('|');
           if (expectedSystem === homeSystem && stationId) {
-            ctx.log("mayday", `🚀 Traveling to home station...`);
+            ctx.log("mayday", `🚀 Traveling to home station (${stationId})...`);
             const travelResp = await bot.exec("travel", { target_poi: stationId });
-            if (!travelResp.error) {
+            // CRITICAL: Check for battle interrupt error
+            if (travelResp.error) {
+              const errMsg = travelResp.error.message.toLowerCase();
+              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
+              ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+            } else {
               ctx.log("mayday", `⚓ Docking at home station...`);
               const dockResp = await bot.exec("dock");
-              if (!dockResp.error) {
+              if (dockResp.error) {
+                ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+              } else {
                 ctx.log("mayday", `✓ Docked at home station`);
                 // Refuel after docking
                 ctx.log("mayday", `⛽ Refueling at home station...`);
                 const refuelResp = await bot.exec("refuel");
-                if (!refuelResp.error) {
+                if (refuelResp.error) {
+                  ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                } else {
                   await bot.refreshStatus();
                   ctx.log("mayday", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                 }
@@ -2062,7 +3517,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       }
       // Update session state for return home
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "returning_home" });
+        await updateRescueSession(bot.username, { state: "returning_home" });
       }
     } else if (!homeSystem) {
       ctx.log("warn", "No home system set — skipping return home");
@@ -2075,6 +3530,15 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         if (expectedSystem === homeSystem && stationId) {
           ctx.log("mayday", `🚀 Traveling to home station...`);
           const travelResp = await bot.exec("travel", { target_poi: stationId });
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+          }
           if (!travelResp.error) {
             ctx.log("mayday", `⚓ Docking at home station...`);
             const dockResp = await bot.exec("dock");
@@ -2099,7 +3563,17 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      completeRescueSession(bot.username);
+      await completeRescueSession(bot.username);
+
+      // Also mark the queue entry as completed if this was our own bot
+      if (isOwnBot(mayday.sender)) {
+        const queue = getRescueQueue();
+        const queuedRescue = queue.pending.find(r => r.targetUsername === mayday.sender);
+        if (queuedRescue) {
+          markRescueCompleted(queuedRescue.id);
+          ctx.log("rescue", `📋 Marked ${mayday.sender} as completed in rescue queue`);
+        }
+      }
     }
 
     await bot.refreshStatus();
@@ -2126,6 +3600,9 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     // Short cooldown before next scan
     await sleep(5000);
   }
+
+  // Cleanup when routine exits
+  stopCreditTopOffBackground();
 };
 
 /**
@@ -2150,6 +3627,11 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
   // Use get_nearby to find the player at current location
   try {
     const resp = await bot.exec("get_nearby");
+    // Check for battle notifications after get_nearby
+    if (await checkBattleAfterCommand(ctx, resp.notifications, "get_nearby")) {
+      ctx.log("combat", "Battle detected during scan - fleeing!");
+      return null;
+    }
     if (!resp.error && resp.result) {
       // Check for pirates and flee if detected
       const { checkAndFleeFromPirates } = await import("./common.js");
@@ -2240,6 +3722,9 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("rescue", `✓ Bot started at home base (${homeSystem})`);
   }
 
+  // ── Start background credit top-off loop (non-blocking) ──
+  startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+
   // Log category - determined when target is selected
   let logCategory: string = "rescue";
 
@@ -2248,8 +3733,26 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
 
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "rescue")) {
+      await sleep(5000);
+      continue;
+    }
+
+    // ── Battle state tracking (per-cycle initialization) ──
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
+
     // ── Clean up expired rescue announcements ──
     cleanupExpiredAnnouncements();
+
+    // ── Clean up expired MAYDAY pirate lockouts ──
+    cleanupExpiredPirateLockouts();
 
     // ── Monitor faction chat for rescue announcements from other bots ──
     // This helps coordinate with other rescue bots to avoid duplicate responses
@@ -2325,12 +3828,12 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         } else {
           // Target has been refueled - clear the session
           ctx.log("rescue", `${activeSession.targetUsername} has been refueled (${fuelPct}%) - clearing session`);
-          failRescueSession(bot.username, "Target no longer needs rescue");
+          await failRescueSession(bot.username, "Target no longer needs rescue");
         }
       } else {
         // Target not in fleet - they may have logged off or session is stale
         ctx.log("rescue", `Target ${activeSession.targetUsername} not in fleet - clearing session`);
-        failRescueSession(bot.username, "Target not found in fleet");
+        await failRescueSession(bot.username, "Target not found in fleet");
       }
     }
 
@@ -2408,6 +3911,25 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
       const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
 
+      // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
+      for (const target of targets) {
+        if (isOwnBot(target.username)) {
+          const result = addToRescueQueue(
+            target.username,
+            target.system,
+            target.poi,
+            target.fuelPct,
+            target.docked
+          );
+          if (result.added) {
+            ctx.log("rescue", `📋 Added ${target.username} to rescue queue at ${target.system}/${target.poi} (${target.fuelPct}% fuel)`);
+          }
+        }
+      }
+
+      // Clean up stale queue entries
+      cleanupStaleQueue();
+
       // ── Check for MAYDAY requests if no fleet targets ──
       let maydayTarget: RescueTarget | null = null;
       if (targets.length === 0) {
@@ -2454,6 +3976,61 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           }
           ctx.log("mayday_debug", `✓ Not a duplicate MAYDAY`);
 
+          // Mark this MAYDAY as recently received to prevent processing duplicates
+          // This must be done BEFORE any other processing to catch rapid-fire duplicates
+          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
+          ctx.log("mayday_debug", `📝 Marked MAYDAY from ${mayday.sender} as recently received (5min cooldown)`);
+
+          // ── PIRATE BASE PROXIMITY CHECK: Decline MAYDAYs too close to pirate bases ──
+          // This prevents the bot from getting stuck in loops trying to rescue players
+          // in systems that are blacklisted due to pirate base proximity
+          const pirateProximityThreshold = settings.maydayPirateProximityThreshold;
+          if (pirateProximityThreshold > 0 && mayday.system) {
+            // First check if this player is already locked out
+            if (isMaydayPirateLocked(mayday.sender)) {
+              ctx.log("mayday", `🔒 Ignoring MAYDAY from ${mayday.sender} - currently locked out (pirate base proximity)`);
+              markMaydayHandled(mayday);
+              continue;
+            }
+
+            // Check proximity to pirate bases
+            const pirateProximity = await checkPirateBaseProximity(ctx, mayday.system, pirateProximityThreshold);
+            if (pirateProximity) {
+              ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - too close to pirate base ${pirateProximity.pirateSystem} (${pirateProximity.jumps} jumps away)`);
+
+              // Add lockout to prevent repeated MAYDAY processing
+              const lockoutMinutes = settings.maydayPirateLockoutMinutes;
+              addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+
+              // Send decline message to the player via private message
+              const aiChatService = (globalThis as any).aiChatService;
+              if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+                try {
+                  await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: Their location (${mayday.system}/${mayday.poi}) is too close to a pirate base (${pirateProximity.pirateSystem}, only ${pirateProximity.jumps} jumps away). Your ships cannot safely navigate through blacklisted pirate systems due to safety restrictions.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a restricted zone near pirate territory. Tell them you're sorry but you physically cannot reach them. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
+                    currentSystem: ctx.bot.system,
+                    targetSystem: mayday.system,
+                    jumps: pirateProximity.jumps,
+                    fuelRefueled: undefined,
+                    playerFuelPct: undefined,
+                  });
+                  ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender}`);
+                } catch (e) {
+                  ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+                }
+              }
+
+              markMaydayHandled(mayday);
+              continue;
+            }
+          }
+
           // Record rescue request for blackbook tracking
           recordRescueRequest(mayday.sender);
 
@@ -2478,6 +4055,81 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             } else {
               ctx.log("coop", `🤝 ✗ No partner claim found yet - will proceed and send claim (partner may respond with their claim)`);
             }
+          }
+
+          // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
+          const { getSystemBlacklist } = await import("../web/server.js");
+          const { mapStore } = await import("../mapstore.js");
+          const blacklist = getSystemBlacklist();
+          const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+          
+          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          if (isBlacklisted) {
+            ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
+            const lockoutMinutes = settings.maydayPirateLockoutMinutes;
+            addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+              try {
+                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: Their location (${mayday.system}) is in a blacklisted system that your ships cannot navigate to. This is a hard restriction - you physically cannot reach them.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a system you cannot access. Apologize and tell them they'll need to find alternative help. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
+                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                  fuelRefueled: undefined, playerFuelPct: undefined,
+                });
+              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+            }
+            markMaydayHandled(mayday);
+            continue;
+          }
+          
+          let viableRoute = false;
+          try {
+            const mappedRoute = mapStore.findRoute(bot.system, mayday.system, blacklist);
+            if (mappedRoute && mappedRoute.length > 1) {
+              viableRoute = true;
+            } else {
+              const routeResp = await bot.exec("find_route", { target_system: mayday.system });
+              if (!routeResp.error && routeResp.result) {
+                const routeData = routeResp.result as Record<string, unknown>;
+                const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
+                if (routeData.found && serverRoute && serverRoute.length > 1) {
+                  const blacklistedOnRoute = serverRoute.find(r => 
+                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                  );
+                  if (!blacklistedOnRoute) viableRoute = true;
+                }
+              }
+            }
+          } catch (e) { ctx.log("warn", `Error checking route: ${e}`); }
+          
+          if (!viableRoute) {
+            ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - NO VIABLE ROUTE to ${mayday.system}`);
+            const lockoutMinutes = settings.maydayPirateLockoutMinutes;
+            addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+              try {
+                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: There is no safe route to their location (${mayday.system}). All possible paths are blocked or too dangerous for your ships to navigate.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because there's no safe way to reach their location. Apologize and suggest they'll need to find help from someone closer or in a different system. Do NOT promise to come rescue them. Do NOT mention fuel levels at all.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
+                  currentSystem: ctx.bot.system, targetSystem: mayday.system, jumps: undefined,
+                  fuelRefueled: undefined, playerFuelPct: undefined,
+                });
+              } catch (e) { ctx.log("warn", `Failed to send decline message: ${e}`); }
+            }
+            markMaydayHandled(mayday);
+            continue;
           }
 
           // Check jump range
@@ -2571,7 +4223,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           if (elapsedMs >= IDLE_RETURN_THRESHOLD_MS) {
             ctx.log("rescue", `⏱️ Idle for ${Math.round(elapsedMs / 1000)}s — returning home...`);
             isReturningIdle = true;
-            
+
             // Immediately execute return home
             ctx.log("rescue", `🏠 Returning home after idle timeout...`);
             yield "return_home";
@@ -2581,7 +4233,51 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             if (!arrived) {
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
             } else {
-              ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+              // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+              await bot.refreshStatus();
+              ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+
+              // If home station is configured, travel there and dock
+              if (settings.homeStation) {
+                const [expectedSystem, stationId] = settings.homeStation.split('|');
+                ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
+
+                if (expectedSystem === homeSystem && stationId) {
+                  ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
+                  const travelResp = await bot.exec("travel", { target_poi: stationId });
+                  // CRITICAL: Check for battle interrupt error
+                  if (travelResp.error) {
+                    const errMsg = travelResp.error.message.toLowerCase();
+                    if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                      ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                      await sleep(5000);
+                      continue;
+                    }
+                    ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+                  } else {
+                    ctx.log("rescue", `⚓ Docking at home station...`);
+                    const dockResp = await bot.exec("dock");
+                    if (dockResp.error) {
+                      ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+                    } else {
+                      ctx.log("rescue", `✓ Docked at home station`);
+                      // Refuel after docking
+                      ctx.log("rescue", `⛽ Refueling at home station...`);
+                      const refuelResp = await bot.exec("refuel");
+                      if (refuelResp.error) {
+                        ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                      } else {
+                        await bot.refreshStatus();
+                        ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                      }
+                    }
+                  }
+                } else {
+                  ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
+                }
+              } else {
+                ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
+              }
             }
             isReturningIdle = false;
             idleStartTime = 0;
@@ -2589,18 +4285,119 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           } else {
             ctx.log("rescue", `⏱️ Idle for ${Math.round(elapsedMs / 1000)}s (away from home)`);
           }
+        } else if (isAwayFromHome && idleStartTime === 0) {
+          // FIX: When first starting away from home, immediately return home instead of waiting for idle timeout
+          ctx.log("rescue", `🏠 Bot activated away from home (${bot.system} vs ${homeSystem}) — returning home immediately to refuel and enable credit top-offs...`);
+          isReturningIdle = true;
+
+          yield "return_home";
+          await ensureUndocked(ctx);
+          const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+          const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (!arrived) {
+            ctx.log("error", `Failed to return to home system ${homeSystem}`);
+          } else {
+            // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+            await bot.refreshStatus();
+            ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+
+            // If home station is configured, travel there and dock
+            if (settings.homeStation) {
+              const [expectedSystem, stationId] = settings.homeStation.split('|');
+              ctx.log("rescue_debug", `homeStation config: "${settings.homeStation}", parsed: expectedSystem="${expectedSystem}", stationId="${stationId}"`);
+
+              if (expectedSystem === homeSystem && stationId) {
+                ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
+                const travelResp = await bot.exec("travel", { target_poi: stationId });
+                // CRITICAL: Check for battle interrupt error
+                if (travelResp.error) {
+                  const errMsg = travelResp.error.message.toLowerCase();
+                  if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                    ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                    await sleep(5000);
+                    continue;
+                  }
+                  ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+                } else {
+                  ctx.log("rescue", `⚓ Docking at home station...`);
+                  const dockResp = await bot.exec("dock");
+                  if (dockResp.error) {
+                    ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+                  } else {
+                    ctx.log("rescue", `✓ Docked at home station`);
+                    // Refuel after docking
+                    ctx.log("rescue", `⛽ Refueling at home station...`);
+                    const refuelResp = await bot.exec("refuel");
+                    if (refuelResp.error) {
+                      ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                    } else {
+                      await bot.refreshStatus();
+                      ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                    }
+                  }
+                }
+              } else {
+                ctx.log("warn", `⚠️ homeStation config mismatch: expectedSystem "${expectedSystem}" !== homeSystem "${homeSystem}" or stationId is empty`);
+              }
+            } else {
+              ctx.log("warn", `⚠️ No home station configured - bot will remain at POI in ${homeSystem}`);
+            }
+          }
+          isReturningIdle = false;
+          idleStartTime = 0;
+          continue; // Restart loop after returning home
         } else {
           // Reset idle timer if we're not away from home or already returning
           idleStartTime = 0;
         }
 
-        // No one needs help — scavenge where we are and idle
-        yield "idle_scavenge";
-        if (!bot.docked) {
-          await scavengeWrecks(ctx);
+        // ── RESCUE QUEUE: Check if we have queued rescues before idling ──
+        const queueStats = getQueueStats();
+        if (queueStats.pending > 0) {
+          ctx.log("rescue", `📋 Rescue queue has ${queueStats.pending} pending rescues — checking for optimized route...`);
+          
+          // Optimize route based on current location
+          const optimizedRoute = optimizeRescueRoute(bot.system);
+          if (optimizedRoute.length > 0) {
+            setCurrentRoute(optimizedRoute);
+            ctx.log("rescue", `🗺️ Optimized route set: ${optimizedRoute.join(" → ")}`);
+            
+            // Get the first system in the route
+            const firstSystem = optimizedRoute[0];
+            const rescuesInSystem = getRescuesInSystem(firstSystem);
+            
+            if (rescuesInSystem.length > 0) {
+              // Pick the most critical rescue in the first system
+              rescuesInSystem.sort((a, b) => a.fuelPct - b.fuelPct);
+              const queuedRescue = rescuesInSystem[0];
+              
+              ctx.log("rescue", `🎯 Selecting queued rescue: ${queuedRescue.targetUsername} at ${queuedRescue.system}/${queuedRescue.poi} (${queuedRescue.fuelPct}%)`);
+              
+              target = {
+                username: queuedRescue.targetUsername,
+                system: queuedRescue.system,
+                poi: queuedRescue.poi,
+                fuelPct: queuedRescue.fuelPct,
+                docked: queuedRescue.docked,
+              };
+              isMaydayTarget = false;
+              logCategory = "rescue";
+              
+              // Skip the idle/scavenge and go directly to rescue
+              incrementRescueAttempt(queuedRescue.id);
+            }
+          }
         }
-        await sleep(settings.scanIntervalSec * 1000);
-        continue;
+        
+        if (!target) {
+          // No queued rescues or queue is empty — scavenge and idle
+          yield "idle_scavenge";
+          if (!bot.docked) {
+            await scavengeWrecks(ctx);
+          }
+          await sleep(settings.scanIntervalSec * 1000);
+          continue;
+        }
       }
 
       // ── Rescue the most critical bot ──
@@ -2612,6 +4409,14 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     if (!target) {
       // Should not happen, but safety check
       await sleep(5000);
+      continue;
+    }
+
+    // ── Validate target has a valid system before proceeding ──
+    if (!target.system || target.system.trim() === "") {
+      ctx.log("rescue", `⚠️ Target ${target.username} has no valid system — refreshing status and skipping...`);
+      ctx.log("rescue", `💡 This can happen with stale fleet data or hidden POIs`);
+      await sleep(settings.scanIntervalSec * 1000);
       continue;
     }
 
@@ -2630,7 +4435,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         lastUpdatedAt: new Date().toISOString(),
         state: "navigating",
       };
-      startRescueSession(session);
+      await startRescueSession(session);
       ctx.log("rescue", `Created rescue session for ${target.username}`);
 
       // Send faction chat announcement for rescue start
@@ -2673,6 +4478,34 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("mayday", `RESCUE NEEDED (MAYDAY): ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
     } else {
       ctx.log("rescue", `RESCUE NEEDED: ${target.username} at ${target.fuelPct}% fuel in ${target.system} (POI: ${target.poi || "unknown"})`);
+    }
+
+    // ── RESCUE COOPERATION: Send en-route notification to stranded player (IMMEDIATELY after verification) ──
+    // Only notify if this is a MAYDAY or manual rescue (not fleet rescues)
+    // Calculate jumps to target for the notification
+    let initialJumpsToTarget = 0;
+    if (isMaydayTarget || isManualRescueTarget) {
+      try {
+        const routeResp = await bot.exec("find_route", { target_system: target.system });
+        if (!routeResp.error && routeResp.result) {
+          const route = routeResp.result as Record<string, unknown>;
+          initialJumpsToTarget = (route.total_jumps as number) || 0;
+          ctx.log("rescue", `📍 Route to target: ${initialJumpsToTarget} jump${initialJumpsToTarget !== 1 ? 's' : ''}`);
+        }
+      } catch (e) {
+        ctx.log("warn", `Could not calculate route to ${target.system}: ${e}`);
+      }
+
+      const aiChatService = (globalThis as any).aiChatService;
+      if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
+        aiChatService.sendRescueEnRouteNotification(bot, target.username, initialJumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
+          if (!result.ok) {
+            ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
+          }
+        }).catch((err: Error) => {
+          ctx.log("warn", `Error sending en-route notification: ${err.message}`);
+        });
+      }
     }
 
     // ── Ensure we have fuel ourselves ──
@@ -2779,7 +4612,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("error", "No fuel cells available and not enough credits to help — waiting for better situation...");
         // Fail the session if we can't acquire resources
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          failRescueSession(bot.username, "Could not acquire fuel cells or credits");
+          await failRescueSession(bot.username, "Could not acquire fuel cells or credits");
         }
         await sleep(settings.scanIntervalSec * 1000);
         continue;
@@ -2795,7 +4628,99 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     await ensureUndocked(ctx);
 
     if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
+      // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names ──
+      const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
+        partnerBotName: settings.partnerBotName,
+        maydayMaxJumps: settings.maydayMaxJumps
+      });
+      if (trapCheck.isTrap) {
+        ctx.log("rescue", `🚨 ABORTING RESCUE - ${trapCheck.reason}`);
+        ctx.log("rescue", `🚨 This appears to be a PIRATE TRAP using false flag operation`);
+        
+        // Fail the rescue session if one exists
+        const activeSession = getActiveRescueSession(bot.username);
+        if (activeSession) {
+          await failRescueSession(bot.username, `Aborted - pirate trap detected: ${trapCheck.reason}`);
+        }
+        
+        // Mark MAYDAY as handled to prevent re-triggering
+        if (isMaydayTarget) {
+          const mayday = getNextMayday();
+          if (mayday) markMaydayHandled(mayday);
+        }
+        
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
+      }
+
+      // ── PIRATE BASE PROXIMITY CHECK: Block navigation to systems near pirate bases ──
+      // This is a HARD BLOCK - do not attempt to navigate to blacklisted systems
+      const { getSystemBlacklist } = await import("../web/server.js");
+      const blacklist = getSystemBlacklist();
+      const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+      
+      const isTargetBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
+      if (isTargetBlacklisted) {
+        ctx.log("rescue", `🚫 BLOCKED: Target system ${target.system} is BLACKLISTED (likely near pirate base)`);
+        ctx.log("rescue", `🚫 ABORTING RESCUE - cannot navigate to blacklisted system`);
+        
+        const activeSession = getActiveRescueSession(bot.username);
+        if (activeSession) {
+          await failRescueSession(bot.username, "Aborted - target system is blacklisted");
+        }
+        
+        if (isMaydayTarget) {
+          const mayday = getNextMayday();
+          if (mayday) markMaydayHandled(mayday);
+        }
+        
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
+      }
+
+      // Also check if route to target passes through blacklisted systems
+      try {
+        const routeResp = await bot.exec("find_route", { target_system: target.system });
+        if (!routeResp.error && routeResp.result) {
+          const route = routeResp.result as Record<string, unknown>;
+          const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+          
+          if (routeData) {
+            const blacklistedOnRoute = routeData.find(r =>
+              blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+            );
+            
+            if (blacklistedOnRoute) {
+              ctx.log("rescue", `🚫 BLOCKED: Route to ${target.system} passes through blacklisted system "${blacklistedOnRoute.system_id}"`);
+              ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available`);
+              
+              const activeSession = getActiveRescueSession(bot.username);
+              if (activeSession) {
+                await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
+              }
+              
+              if (isMaydayTarget) {
+                const mayday = getNextMayday();
+                if (mayday) markMaydayHandled(mayday);
+              }
+              
+              await sleep(settings.scanIntervalSec * 1000);
+              continue;
+            }
+          }
+        }
+      } catch (e) {
+        ctx.log("warn", `Could not validate route to ${target.system}: ${e}`);
+      }
+
       ctx.log(logCategory, `Navigating to ${target.system}...`);
+
+      // ── PIRATE AWARENESS: Check if target system is near a pirate stronghold ──
+      const proximityCheck = await checkPirateStrongholdProximity(ctx, target.system, 3);
+      if (proximityCheck.nearStronghold) {
+        ctx.log("combat", `⚠️ PIRATE ALERT: Target system ${target.system} is only ${proximityCheck.jumpsToStronghold} jump(s) from pirate base ${proximityCheck.nearestStronghold}!`);
+        ctx.log("combat", `🚨 Operating with EXTREME pirate awareness - ready to flee at first sight!`);
+      }
 
       // Track jumps for billing - get route before navigating
       let jumpsToTarget = 0;
@@ -2810,35 +4735,66 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("warn", `Could not calculate route to ${target.system}: ${e}`);
       }
 
-      // ── RESCUE COOPERATION: Send en-route notification to stranded player ──
-      // Let them know we're on our way (only for MAYDAY rescues, not fleet rescues)
-      if (isMaydayTarget || isManualRescueTarget) {
-        const aiChatService = (globalThis as any).aiChatService;
-        if (aiChatService && typeof aiChatService.sendRescueEnRouteNotification === "function") {
-          aiChatService.sendRescueEnRouteNotification(bot, target.username, jumpsToTarget).then((result: { ok: boolean; message?: string; error?: string }) => {
-            if (!result.ok) {
-              ctx.log("warn", `Failed to send en-route notification: ${result.error}`);
-            }
-          }).catch((err: Error) => {
-            ctx.log("warn", `Error sending en-route notification: ${err.message}`);
-          });
-        }
-      }
+      const safetyOpts = {
+        fuelThresholdPct: settings.refuelThreshold,
+        hullThresholdPct: 30,
+        onJump: async (jumpNumber: number) => {
+          // Check if target still needs rescue on every jump
+          const statusCheck = await checkTargetStillNeedsRescue(
+            ctx,
+            target!.username,
+            target!.fuelPct,
+            target!.system,
+            target!.docked,
+          );
 
-      const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+          if (!statusCheck.needsRescue) {
+            ctx.log("rescue", `🛑 ABORTING rescue - ${statusCheck.reason}`);
+            return false; // Abort navigation
+          }
+
+          // Log progress every 5 jumps
+          if (jumpNumber % 5 === 0 && statusCheck.currentFuelPct !== null) {
+            ctx.log("rescue", `📍 Jump ${jumpNumber}: ${target!.username} fuel at ${statusCheck.currentFuelPct}% in ${statusCheck.currentSystem}`);
+          }
+
+          return true; // Continue navigation
+        },
+      };
       const arrived = await navigateToSystem(ctx, target.system, safetyOpts);
       if (!arrived) {
-        ctx.log("error", `Could not reach ${target.system} — will retry next scan`);
-        // Fail the session if we can't reach the target
-        if (recoveredSession || getActiveRescueSession(bot.username)) {
-          failRescueSession(bot.username, "Could not reach target system");
+        // Track consecutive failures to prevent infinite retry loops
+        const activeSession = getActiveRescueSession(bot.username);
+        const failureReason = `Could not reach ${target.system}`;
+
+        if (activeSession) {
+          const failures = (activeSession.consecutiveFailures || 0) + 1;
+          await updateRescueSession(bot.username, {
+            consecutiveFailures: failures,
+            lastFailureReason: failureReason
+          });
+
+          if (failures >= 3) {
+            ctx.log("error", `❌ ${failureReason} — ABORTING after ${failures} consecutive failures`);
+            await failRescueSession(bot.username, `Aborted after ${failures} consecutive navigation failures`);
+            await sleep(settings.scanIntervalSec * 1000);
+            continue;
+          }
+
+          ctx.log("error", `${failureReason} — failure #${failures}/3, will retry next scan`);
+        } else {
+          ctx.log("error", `${failureReason} — will retry next scan`);
+          if (recoveredSession) {
+            await failRescueSession(bot.username, "Could not reach target system");
+          }
         }
         await sleep(settings.scanIntervalSec * 1000);
         continue;
       }
+
       // Update session state and jumps after successful navigation
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "at_system", jumpsCompleted: jumpsToTarget });
+        await updateRescueSession(bot.username, { state: "at_system", jumpsCompleted: jumpsToTarget });
       }
     }
 
@@ -2847,47 +4803,296 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Travel to stranded bot's POI ──
     if (target.poi) {
       yield "travel_to_target";
-      
-      // Resolve POI name to POI ID by querying system info
-      let targetPoiId: string | null = null;
-      let targetPoiName: string = target.poi;
-      
-      try {
-        const { pois } = await getSystemInfo(ctx);
-        // Find POI by name (case-insensitive match)
-        const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
-        if (matchedPoi) {
-          targetPoiId = matchedPoi.id;
-          targetPoiName = matchedPoi.name;
-          ctx.log(logCategory, `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
-        } else {
-          // Try partial match as fallback
-          const partialMatch = pois.find(p => p.name.toLowerCase().includes(target.poi.toLowerCase()) || target.poi.toLowerCase().includes(p.name.toLowerCase()));
-          if (partialMatch) {
-            targetPoiId = partialMatch.id;
-            targetPoiName = partialMatch.name;
-            ctx.log(logCategory, `Partial POI match: "${target.poi}" -> ID: ${targetPoiId}`);
+
+      // CRITICAL: Refresh target's current position from fleet status after arriving at system
+      // This ensures we have the most up-to-date location, especially for bots that may have moved
+      const fleet = ctx.getFleetStatus?.() || [];
+      const targetBot = fleet.find(b => b.username === target.username);
+      if (targetBot) {
+        const oldSystem = target.system;
+        const oldPoi = target.poi;
+        target.system = targetBot.system || target.system;
+        target.poi = targetBot.poi || target.poi;
+        target.docked = targetBot.docked;
+        if (oldSystem !== target.system || oldPoi !== target.poi) {
+          ctx.log("rescue", `📍 Target position updated after arrival: ${oldSystem}/${oldPoi} -> ${target.system}/${target.poi}`);
+        }
+      } else {
+        ctx.log("rescue", `⚠️ Target ${target.username} not in fleet status - using cached location: ${target.system}/${target.poi}`);
+      }
+
+      // For our own bots, do an additional refresh to handle hidden POI scenarios
+      const isOurBot = isOwnBot(target.username);
+      if (isOurBot) {
+        ctx.log("rescue", `🔄 Additional position refresh for our own bot ${target.username}...`);
+        const fleet2 = ctx.getFleetStatus?.() || [];
+        const targetBot2 = fleet2.find(b => b.username === target.username);
+        if (targetBot2) {
+          target.poi = targetBot2.poi || target.poi;
+          target.system = targetBot2.system || target.system;
+          target.docked = targetBot2.docked;
+        }
+      }
+
+      // Track attempts for hidden POI detection
+      let travelAttempts = 0;
+      const maxTravelAttempts = isOurBot ? 5 : 3; // Retry more for our own bots, but always try search for others
+      let travelSuccess = false;
+      let searchAttempted = false; // Track if we've tried the hidden POI search
+
+      while (travelAttempts < maxTravelAttempts && !travelSuccess) {
+        travelAttempts++;
+
+        // For our own bots, refresh position on each attempt
+        if (isOurBot && travelAttempts > 1) {
+          ctx.log("rescue", `🔄 Re-refreshing position for ${target.username} (attempt ${travelAttempts})...`);
+          const fleet = ctx.getFleetStatus?.() || [];
+          const targetBot = fleet.find(b => b.username === target.username);
+          if (targetBot) {
+            target.poi = targetBot.poi || target.poi;
+            target.system = targetBot.system || target.system;
+            target.docked = targetBot.docked;
+            ctx.log("rescue", `📍 Position refreshed: ${target.system}/${target.poi}`);
           }
         }
-      } catch (e) {
-        ctx.log("warn", `Could not query system POIs: ${e}`);
+
+        // Resolve POI name to POI ID by querying system info
+        let targetPoiId: string | null = null;
+        let targetPoiName: string = target.poi;
+
+        try {
+          const { pois } = await getSystemInfo(ctx);
+          // Find POI by name (case-insensitive match)
+          const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
+          if (matchedPoi) {
+            targetPoiId = matchedPoi.id;
+            targetPoiName = matchedPoi.name;
+            ctx.log(logCategory, `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
+          } else {
+            // Try partial match as fallback
+            const partialMatch = pois.find(p => p.name.toLowerCase().includes(target.poi.toLowerCase()) || target.poi.toLowerCase().includes(p.name.toLowerCase()));
+            if (partialMatch) {
+              targetPoiId = partialMatch.id;
+              targetPoiName = partialMatch.name;
+              ctx.log(logCategory, `Partial POI match: "${target.poi}" -> ID: ${targetPoiId}`);
+            }
+          }
+        } catch (e) {
+          ctx.log("warn", `Could not query system POIs: ${e}`);
+        }
+
+        // Use POI ID if resolved, otherwise fall back to name
+        const travelTarget = targetPoiId || target.poi;
+
+        ctx.log(logCategory, `Traveling to ${target.username}'s location (${targetPoiName})... (attempt ${travelAttempts}/${maxTravelAttempts})`);
+        const travelResp = await bot.exec("travel", { target_poi: travelTarget });
+        // CRITICAL: Check for battle interrupt error
+        if (travelResp.error) {
+          const errMsg = travelResp.error.message.toLowerCase();
+          if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+            ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+            await sleep(5000);
+            continue;
+          }
+        }
+        if (travelResp.error && !travelResp.error.message.includes("already")) {
+          ctx.log("error", `Travel failed: ${travelResp.error.message}`);
+
+          // Check if this might be a hidden POI - try jumping out and back
+          // This can happen for ANY bot (not just our own) when they're in a hidden POI
+          const isUnknownDestination = travelResp.error.message.toLowerCase().includes("unknown");
+          
+          if ((isOurBot || isUnknownDestination) && !searchAttempted && travelAttempts < maxTravelAttempts) {
+            ctx.log("rescue", `🔀 Possible hidden POI detected! Attempting jump-out-and-back to find ${target.username}...`);
+            searchAttempted = true;
+
+            // Find all connected systems (jump gates) to try
+            const { pois } = await getSystemInfo(ctx);
+            const jumpGates = pois.filter(p => p.type === "jump_gate" || p.type === "stargate");
+
+            if (jumpGates.length > 0) {
+              ctx.log("rescue", `📍 Found ${jumpGates.length} connected system(s) to search: ${jumpGates.map(g => g.name).join(', ')}`);
+              
+              // Try each connected system until we find the hidden POI
+              let foundHiddenPoi = false;
+              for (const jumpGate of jumpGates) {
+                if (foundHiddenPoi) break; // Stop if we already found it
+                
+                ctx.log("rescue", `🚀 Trying jump to ${jumpGate.name} to reset entry...`);
+                const jumpResp = await bot.exec("travel", { target_poi: jumpGate.id });
+
+                if (!jumpResp.error || jumpResp.error.message.includes("already")) {
+                  // Now jump back to the target POI
+                  await sleep(2000); // Brief pause for system to update
+
+                  ctx.log("rescue", `🚀 Jumping back to ${targetPoiName} from ${jumpGate.name}...`);
+                  const returnResp = await bot.exec("travel", { target_poi: travelTarget });
+
+                  if (!returnResp.error || returnResp.error.message.includes("already")) {
+                    ctx.log("rescue", `✓ Successfully jumped back in from ${jumpGate.name} - found hidden POI!`);
+                    bot.poi = targetPoiName;
+                    travelSuccess = true;
+                    foundHiddenPoi = true;
+                  } else {
+                    ctx.log("warn", `Return jump from ${jumpGate.name} failed: ${returnResp.error?.message}`);
+                  }
+                } else {
+                  ctx.log("warn", `Jump to ${jumpGate.name} failed: ${jumpResp.error?.message}`);
+                }
+              }
+              
+              if (!foundHiddenPoi) {
+                ctx.log("warn", `Hidden POI search completed - tried all ${jumpGates.length} connected system(s) without success`);
+              }
+            } else {
+              ctx.log("warn", `No jump gates found to reset entry`);
+            }
+          } else if (!isOurBot && !isUnknownDestination) {
+            // Try docking at station to send gift instead
+          }
+        } else {
+          // Success - update bot.poi with the resolved name
+          bot.poi = targetPoiName;
+          travelSuccess = true;
+        }
+
+        // If we haven't succeeded and this is our bot, refresh position again
+        if (!travelSuccess && isOurBot && travelAttempts < maxTravelAttempts) {
+          ctx.log("rescue", `⏳ Waiting before next attempt for ${target.username}...`);
+          await sleep(3000);
+        }
       }
-      
-      // Use POI ID if resolved, otherwise fall back to name
-      const travelTarget = targetPoiId || target.poi;
-      
-      ctx.log(logCategory, `Traveling to ${target.username}'s location (${targetPoiName})...`);
-      const travelResp = await bot.exec("travel", { target_poi: travelTarget });
-      if (travelResp.error && !travelResp.error.message.includes("already")) {
-        ctx.log("error", `Travel failed: ${travelResp.error.message}`);
-        // Try docking at station to send gift instead
-      } else {
-        // Success - update bot.poi with the resolved name
-        bot.poi = targetPoiName;
+
+      if (!travelSuccess) {
+        ctx.log("error", `Failed to reach ${target.username} at ${target.poi} after ${maxTravelAttempts} attempts`);
+        
+        // If we attempted the hidden POI search but still couldn't reach, try one more thing:
+        // Check if the target is actually in the system by looking at fleet status
+        const isOurBot = isOwnBot(target.username);
+        if (isOurBot) {
+          ctx.log("rescue", `🔍 Checking fleet status for ${target.username} after travel failure...`);
+          const fleet = ctx.getFleetStatus?.() || [];
+          const targetBot = fleet.find(b => b.username === target.username);
+          
+          if (targetBot && targetBot.system === target.system) {
+            ctx.log("rescue", `✓ Target ${target.username} is confirmed in ${target.system} (POI: ${targetBot.poi})`);
+            ctx.log("rescue", `🔀 Hidden POI confirmed! Retrying with fresh POI information...`);
+            
+            // Update target info and try one more time with a fresh travel attempt
+            target.poi = targetBot.poi || target.poi;
+            
+            // Try the search function one more time with ALL connected systems
+            const { pois } = await getSystemInfo(ctx);
+            const jumpGates = pois.filter(p => p.type === "jump_gate" || p.type === "stargate");
+            
+            if (jumpGates.length > 0) {
+              ctx.log("rescue", `🚀 Final attempt: Trying all ${jumpGates.length} connected system(s) to find hidden POI...`);
+              let foundInFinalAttempt = false;
+              
+              for (const jumpGate of jumpGates) {
+                if (foundInFinalAttempt) break;
+                
+                ctx.log("rescue", `🚀 Jumping to ${jumpGate.name}...`);
+                const jumpResp = await bot.exec("travel", { target_poi: jumpGate.id });
+                
+                if (!jumpResp.error || jumpResp.error.message.includes("already")) {
+                  await sleep(2000);
+                  ctx.log("rescue", `🚀 Jumping back to ${target.poi} from ${jumpGate.name}...`);
+                  const returnResp = await bot.exec("travel", { target_poi: target.poi });
+                  
+                  if (!returnResp.error || returnResp.error.message.includes("already")) {
+                    ctx.log("rescue", `✓ Successfully found hidden POI on final attempt via ${jumpGate.name}!`);
+                    bot.poi = target.poi;
+                    travelSuccess = true;
+                    foundInFinalAttempt = true;
+                  } else {
+                    ctx.log("warn", `Final return jump from ${jumpGate.name} failed: ${returnResp.error?.message}`);
+                  }
+                } else {
+                  ctx.log("warn", `Final jump to ${jumpGate.name} failed: ${jumpResp.error?.message}`);
+                }
+              }
+              
+              if (!foundInFinalAttempt) {
+                ctx.log("error", `Final search attempt failed - tried all ${jumpGates.length} connected system(s)`);
+              }
+            }
+          }
+        }
+        
+        // If still no success after all attempts, we need to handle the failure
+        if (!travelSuccess) {
+          ctx.log("error", `All rescue attempts failed for ${target.username} at ${target.poi}`);
+          
+          // For our own bots, don't record as ghost - they're just in a hidden POI
+          if (isOurBot) {
+            ctx.log("rescue", `👻 Our bot ${target.username} not reachable - likely in hidden POI`);
+            ctx.log("rescue", `💡 Will retry rescue when bot is in a visible location`);
+            
+            // Return home and retry later
+            if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
+              ctx.log("rescue", `🏠 Returning home before retry...`);
+              await ensureUndocked(ctx);
+              const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+              const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+              if (arrived) {
+                ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+              }
+            }
+            
+            // Don't fail the session permanently - just continue the loop
+            await sleep(10000);
+            continue;
+          }
+          
+          // For non-own bots, record ghost and fail normally
+          recordGhost(target.username);
+          const currentGhosts = getPlayerRecord(target.username).ghostCount;
+          ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
+          
+          // Send grumpy faction chat message about being ghosted
+          const aiChatService = (globalThis as any).aiChatService;
+          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+            try {
+              const result = await aiChatService.sendFactionMessage(bot, {
+                messageType: "rescue_no_show",
+                targetName: target.username,
+                isMayday: isMaydayTarget,
+                isBot: !isMaydayTarget,
+                currentSystem: bot.system,
+                targetSystem: target.system,
+                targetPoi: target.poi || undefined,
+              });
+              if (!result.ok) {
+                ctx.log("ai_chat_debug", `Faction announcement (no_show) skipped: ${result.error}`);
+              }
+            } catch (e) {
+              ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
+            }
+          }
+          
+          if (recoveredSession || getActiveRescueSession(bot.username)) {
+            await failRescueSession(bot.username, "Could not reach target - all attempts failed");
+          }
+          markMaydayHandled({ sender: target.username, system: target.system, poi: target.poi || "", fuelPct: target.fuelPct, timestamp: Date.now(), currentFuel: 0, maxFuel: 0, rawMessage: "" });
+
+          // Return home after failed rescue
+          if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
+            ctx.log("rescue", `🚨 All rescue attempts failed - returning home to safety...`);
+            await ensureUndocked(ctx);
+            const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+            const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+            if (arrived) {
+              ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+            }
+          }
+          continue;
+        }
       }
+
       // Update session state after traveling to POI
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "at_poi" });
+        await updateRescueSession(bot.username, { state: "at_poi" });
       }
 
       // Skip faction chat announcement for arrival - save cooldown for completion message
@@ -2898,14 +5103,52 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Update session state before fuel delivery
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      updateRescueSession(bot.username, { state: "delivering_fuel" });
+      await updateRescueSession(bot.username, { state: "delivering_fuel" });
     }
 
     // Check if target is actually at the location (for non-station targets)
     let targetFound = true;
     if (!target.docked) {
+      // For our own bots, do one final position refresh before checking
+      const isOurBot = isOwnBot(target.username);
+      if (isOurBot) {
+        ctx.log("rescue", `🔄 Final position check for our bot ${target.username}...`);
+        const fleet = ctx.getFleetStatus?.() || [];
+        const targetBot = fleet.find(b => b.username === target.username);
+        if (targetBot) {
+          const oldPoi = target.poi;
+          target.poi = targetBot.poi || target.poi;
+          target.system = targetBot.system || target.system;
+          if (oldPoi !== target.poi) {
+            ctx.log("rescue", `📍 Position updated: ${oldPoi} -> ${target.poi}`);
+            // Try traveling to the new POI immediately
+            ctx.log("rescue", `🚀 Traveling to updated position...`);
+            const { pois } = await getSystemInfo(ctx);
+            const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
+            if (matchedPoi) {
+              const travelResp = await bot.exec("travel", { target_poi: matchedPoi.id });
+              // CRITICAL: Check for battle interrupt error
+              if (travelResp.error) {
+                const errMsg = travelResp.error.message.toLowerCase();
+                if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                  ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                  await sleep(5000);
+                  continue;
+                }
+              }
+              bot.poi = target.poi;
+            }
+          }
+        }
+      }
+
       // Use get_nearby to verify target is present
       const nearbyResp = await bot.exec("get_nearby");
+      // Check for battle notifications after get_nearby
+      if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby", battleState)) {
+        ctx.log("combat", "Battle detected during scan - fleeing!");
+        return;
+      }
       if (!nearbyResp.error && nearbyResp.result) {
         // Check for pirates and flee if detected
         const { checkAndFleeFromPirates } = await import("./common.js");
@@ -2929,9 +5172,39 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           targetFound = false;
           ctx.log("error", `Target ${target.username} not found at ${target.poi} - they may have left or it was a false alarm`);
 
-          // Record ghost incident in BlackBook
+          // For our own bots, NEVER record as ghost - they're just in a hidden POI
+          if (isOurBot) {
+            ctx.log("rescue", `👻 Our bot ${target.username} not found - likely in hidden POI, will keep trying`);
+            ctx.log("rescue", `💡 Hidden POI detected: ${target.poi} in ${target.system}`);
+            
+            // Don't fail the session - keep retrying by not marking mayday as handled
+            // and returning to the start of the loop
+            ctx.log("rescue", `🔄 Will retry rescue for ${target.username}...`);
+            
+            // Return home first
+            if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
+              ctx.log("rescue", `🏠 Returning home before retry...`);
+              await ensureUndocked(ctx);
+              const safetyOpts = { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 };
+              const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+              if (arrived) {
+                ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+              }
+            }
+            
+            // Retry by continuing the loop without failing the session
+            await sleep(5000);
+            continue;
+          }
+
+          // Record ghost incident in BlackBook (skipped for our own bots)
           recordGhost(target.username);
-          ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${getPlayerRecord(target.username).ghostCount})`);
+          const currentGhosts = getPlayerRecord(target.username).ghostCount;
+          if (currentGhosts < 0) {
+            ctx.log("rescue", `👻 Skipped ghost recording for ${target.username} (our own bot)`);
+          } else {
+            ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
+          }
 
           // Send grumpy faction chat message about being ghosted
           const aiChatService = (globalThis as any).aiChatService;
@@ -2956,7 +5229,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
           // Fail the session and return home
           if (recoveredSession || getActiveRescueSession(bot.username)) {
-            failRescueSession(bot.username, "Target not found at location");
+            await failRescueSession(bot.username, "Target not found at location");
           }
           markMaydayHandled({ sender: target.username, system: target.system, poi: target.poi || "", fuelPct: target.fuelPct, timestamp: Date.now(), currentFuel: 0, maxFuel: 0, rawMessage: "" });
 
@@ -2968,6 +5241,38 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
             if (arrived) {
               ctx.log("rescue", `✓ Arrived at home system ${homeSystem}`);
+
+              // If home station is configured, travel there and dock
+              if (settings.homeStation) {
+                const [expectedSystem, stationId] = settings.homeStation.split('|');
+                if (expectedSystem === homeSystem && stationId) {
+                  ctx.log("rescue", `🚀 Traveling to home station...`);
+                  const travelResp = await bot.exec("travel", { target_poi: stationId });
+                  // CRITICAL: Check for battle interrupt error
+                  if (travelResp.error) {
+                    const errMsg = travelResp.error.message.toLowerCase();
+                    if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                      ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                      await sleep(5000);
+                      continue;
+                    }
+                  }
+                  if (!travelResp.error) {
+                    ctx.log("rescue", `⚓ Docking at home station...`);
+                    const dockResp = await bot.exec("dock");
+                    if (!dockResp.error) {
+                      ctx.log("rescue", `✓ Docked at home station`);
+                      // Refuel after docking
+                      ctx.log("rescue", `⛽ Refueling at home station...`);
+                      const refuelResp = await bot.exec("refuel");
+                      if (!refuelResp.error) {
+                        await bot.refreshStatus();
+                        ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                      }
+                    }
+                  }
+                }
+              }
             }
           }
           continue;
@@ -3004,10 +5309,10 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log(logCategory, `  Their fuel: ${targetFuelNow}`);
         }
         ctx.log(logCategory, `Delivery complete for ${target.username}!`);
-        
+
         // Track fuel delivered in session for billing
         if (recoveredSession || getActiveRescueSession(bot.username)) {
-          updateRescueSession(bot.username, { fuelDelivered });
+          await updateRescueSession(bot.username, { fuelDelivered });
         }
 
         // Skip faction chat here - billing code will send it after delay
@@ -3037,7 +5342,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             });
             // Track fuel cells delivered (estimate: 10 fuel per cell)
             if (recoveredSession || getActiveRescueSession(bot.username)) {
-              updateRescueSession(bot.username, { fuelDelivered: fuelItem.quantity * 10 });
+              await updateRescueSession(bot.username, { fuelDelivered: fuelItem.quantity * 10 });
             }
           }
         }
@@ -3075,7 +5380,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
             ctx.log(logCategory, `Fuel cells jettisoned at ${target.poi || bot.poi} — ${target.username} should scavenge them`);
             // Track fuel cells delivered (estimate: 10 fuel per cell)
             if (recoveredSession || getActiveRescueSession(bot.username)) {
-              updateRescueSession(bot.username, { fuelDelivered: fuelItem.quantity * 10 });
+              await updateRescueSession(bot.username, { fuelDelivered: fuelItem.quantity * 10 });
             }
           }
         }
@@ -3086,7 +5391,16 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         const station = findStation(pois);
         if (station) {
           ctx.log(logCategory, `Docking at ${station.name} to send credits...`);
-          await bot.exec("travel", { target_poi: station.id });
+          const travelResp = await bot.exec("travel", { target_poi: station.id });
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+          }
           await bot.exec("dock");
           bot.docked = true;
           await collectFromStorage(ctx);
@@ -3138,7 +5452,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         );
 
         // Update session with billing info
-        updateRescueSession(bot.username, {
+        await updateRescueSession(bot.username, {
           jumpsCompleted: jumpsToTarget,
           totalJumps: jumpsToTarget * 2,
           fuelDelivered: fuelDeliveredBill,
@@ -3214,23 +5528,38 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       if (!arrived) {
         ctx.log("error", `Failed to return to home system ${homeSystem}`);
       } else {
-        ctx.log(logCategory, `✓ Arrived at home system ${homeSystem}`);
-        
+        // CRITICAL: Refresh status after navigation to ensure bot.system is updated
+        await bot.refreshStatus();
+        ctx.log(logCategory, `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
+
         // If home station is configured, travel there and dock
         if (settings.homeStation) {
           const [expectedSystem, stationId] = settings.homeStation.split('|');
           if (expectedSystem === homeSystem && stationId) {
-            ctx.log("rescue", `🚀 Traveling to home station...`);
+            ctx.log("rescue", `🚀 Traveling to home station (${stationId})...`);
             const travelResp = await bot.exec("travel", { target_poi: stationId });
-            if (!travelResp.error) {
+            // CRITICAL: Check for battle interrupt error
+            if (travelResp.error) {
+              const errMsg = travelResp.error.message.toLowerCase();
+              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
+              ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
+            } else {
               ctx.log("rescue", `⚓ Docking at home station...`);
               const dockResp = await bot.exec("dock");
-              if (!dockResp.error) {
+              if (dockResp.error) {
+                ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
+              } else {
                 ctx.log("rescue", `✓ Docked at home station`);
                 // Refuel after docking
                 ctx.log("rescue", `⛽ Refueling at home station...`);
                 const refuelResp = await bot.exec("refuel");
-                if (!refuelResp.error) {
+                if (refuelResp.error) {
+                  ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                } else {
                   await bot.refreshStatus();
                   ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                 }
@@ -3241,7 +5570,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       // Update session state for return home
       if (recoveredSession || getActiveRescueSession(bot.username)) {
-        updateRescueSession(bot.username, { state: "returning_home" });
+        await updateRescueSession(bot.username, { state: "returning_home" });
       }
     } else if (!homeSystem) {
       ctx.log("warn", "No home system set — skipping return home");
@@ -3254,6 +5583,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         if (expectedSystem === homeSystem && stationId) {
           ctx.log("rescue", `🚀 Traveling to home station...`);
           const travelResp = await bot.exec("travel", { target_poi: stationId });
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+          }
           if (!travelResp.error) {
             ctx.log("rescue", `⚓ Docking at home station...`);
             const dockResp = await bot.exec("dock");
@@ -3289,7 +5627,17 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {
-      completeRescueSession(bot.username);
+      await completeRescueSession(bot.username);
+
+      // Also mark the queue entry as completed if this was our own bot
+      if (isOwnBot(target.username)) {
+        const queue = getRescueQueue();
+        const queuedRescue = queue.pending.find(r => r.targetUsername === target.username);
+        if (queuedRescue) {
+          markRescueCompleted(queuedRescue.id);
+          ctx.log("rescue", `📋 Marked ${target.username} as completed in rescue queue`);
+        }
+      }
     }
 
     if (isMaydayTarget) {
@@ -3305,4 +5653,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     // Short cooldown before next scan
     await sleep(10000);
   }
+
+  // Cleanup when routine exits
+  stopCreditTopOffBackground();
 };

@@ -1,6 +1,7 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
+import { getSystemBlacklist } from "../web/server.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -23,6 +24,10 @@ import {
   sleep,
   logFactionActivity,
   isPirateSystem,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
+  getBattleStatus,
+  type BattleState,
 } from "./common.js";
 import {
   getActiveSession,
@@ -55,6 +60,150 @@ const TRADER_WORKING_BALANCE = 200_000;
 /** Buffer above working balance before depositing excess to faction storage. */
 const TRADER_DEPOSIT_THRESHOLD = 210_000;
 
+/**
+ * Check if the bot can afford a trade route, including potential withdrawal from storage.
+ * Returns an object with affordability info and withdrawal recommendation.
+ */
+async function canAffordRoute(
+  ctx: RoutineContext,
+  route: TradeRoute,
+  settings: ReturnType<typeof getTraderSettings>,
+): Promise<{
+  canAfford: boolean;
+  canAffordWithWithdrawal: boolean;
+  withdrawalNeeded: number;
+  maxAffordableQty: number;
+}> {
+  const { bot } = ctx;
+  const totalCost = route.buyPrice * route.buyQty;
+  const canAffordDirectly = bot.credits >= totalCost;
+
+  if (canAffordDirectly) {
+    return {
+      canAfford: true,
+      canAffordWithWithdrawal: true,
+      withdrawalNeeded: 0,
+      maxAffordableQty: route.buyQty,
+    };
+  }
+
+  // Check station storage (personal) and faction storage (if in a faction)
+  let storedCredits = 0;
+
+  // Check personal station storage
+  const storageResp = await bot.exec("view_storage");
+  if (storageResp.result && typeof storageResp.result === "object") {
+    const sr = storageResp.result as Record<string, unknown>;
+    storedCredits = (sr.credits as number) || (sr.stored_credits as number) || 0;
+  }
+
+  // Also check faction storage if bot is in a faction
+  let factionStoredCredits = 0;
+  if (bot.faction) {
+    const factionStorageResp = await bot.exec("view_faction_storage");
+    if (factionStorageResp.result && typeof factionStorageResp.result === "object") {
+      const fsr = factionStorageResp.result as Record<string, unknown>;
+      factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
+    }
+  }
+
+  // Apply maxFactionCreditsToUse limit (0 = unlimited)
+  let usableFactionCredits = factionStoredCredits;
+  if (settings.maxFactionCreditsToUse > 0) {
+    usableFactionCredits = Math.min(factionStoredCredits, settings.maxFactionCreditsToUse);
+  }
+
+  const totalStored = storedCredits + usableFactionCredits;
+  const shortfall = totalCost - bot.credits;
+  const canWithdraw = totalStored >= shortfall;
+
+  // Calculate max affordable quantity with current credits + all storage
+  const totalAvailable = bot.credits + totalStored;
+  const maxAffordableQty = Math.floor(totalAvailable / route.buyPrice);
+
+  return {
+    canAfford: false,
+    canAffordWithWithdrawal: canWithdraw && maxAffordableQty > 0,
+    withdrawalNeeded: canWithdraw ? shortfall : totalStored,
+    maxAffordableQty,
+  };
+}
+
+/**
+ * Withdraw credits from storage to fund a trade route.
+ * Tries station storage first, then faction storage if needed.
+ * Returns true if withdrawal was successful or not needed.
+ */
+async function withdrawCreditsForTrade(
+  ctx: RoutineContext,
+  route: TradeRoute,
+  settings: ReturnType<typeof getTraderSettings>,
+): Promise<boolean> {
+  const { bot } = ctx;
+  const totalCost = route.buyPrice * route.buyQty;
+
+  // Already have enough credits
+  if (bot.credits >= totalCost) {
+    return true;
+  }
+
+  const needed = totalCost - bot.credits;
+
+  // Try personal station storage first
+  let storedCredits = 0;
+  const storageResp = await bot.exec("view_storage");
+  if (storageResp.result && typeof storageResp.result === "object") {
+    const sr = storageResp.result as Record<string, unknown>;
+    storedCredits = (sr.credits as number) || (sr.stored_credits as number) || 0;
+  }
+
+  if (storedCredits > 0) {
+    const withdrawAmount = Math.min(needed, storedCredits);
+    if (withdrawAmount > 0) {
+      const wResp = await bot.exec("withdraw_credits", { amount: withdrawAmount });
+      if (!wResp.error) {
+        await bot.refreshStatus();
+        ctx.log("trade", `Withdrew ${withdrawAmount}cr from station storage for trade (now ${bot.credits}cr)`);
+        return true;
+      }
+    }
+  }
+
+  // Try faction storage if bot is in a faction
+  if (bot.faction) {
+    let factionStoredCredits = 0;
+    const factionStorageResp = await bot.exec("view_faction_storage");
+    if (factionStorageResp.result && typeof factionStorageResp.result === "object") {
+      const fsr = factionStorageResp.result as Record<string, unknown>;
+      factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
+    }
+
+    if (factionStoredCredits > 0) {
+      // Apply maxFactionCreditsToUse limit (0 = unlimited)
+      let usableFactionCredits = factionStoredCredits;
+      if (settings.maxFactionCreditsToUse > 0) {
+        usableFactionCredits = Math.min(factionStoredCredits, settings.maxFactionCreditsToUse);
+      }
+
+      const remainingNeeded = needed - (storedCredits > 0 ? Math.min(needed, storedCredits) : 0);
+      const withdrawAmount = Math.min(remainingNeeded, usableFactionCredits);
+      if (withdrawAmount > 0) {
+        const wResp = await bot.exec("faction_withdraw_credits", { amount: withdrawAmount });
+        if (!wResp.error) {
+          await bot.refreshStatus();
+          ctx.log("trade", `Withdrew ${withdrawAmount}cr from faction storage for trade (now ${bot.credits}cr)`);
+          return true;
+        } else {
+          ctx.log("error", `Failed to withdraw from faction storage: ${wResp.error.message}`);
+        }
+      }
+    }
+  }
+
+  ctx.log("trade", `No storage credits available (need ${needed}cr)`);
+  return false;
+}
+
 // ── Helpers ─────────────────────────────────────────────────
 
 /**
@@ -84,6 +233,7 @@ function getTraderSettings(username?: string): {
   autoInsure: boolean;
   stationPriority: boolean;
   autoCloak: boolean;
+  maxFactionCreditsToUse: number;
 } {
   const all = readSettings();
   const t = all.trader || {};
@@ -99,6 +249,7 @@ function getTraderSettings(username?: string): {
     autoInsure: (t.autoInsure as boolean) !== false,
     stationPriority: (botOverrides.stationPriority as boolean) || false,
     autoCloak: (t.autoCloak as boolean) ?? false,
+    maxFactionCreditsToUse: (t.maxFactionCreditsToUse as number) ?? 0, // 0 = unlimited
   };
 }
 
@@ -132,11 +283,12 @@ async function recoverTradeSession(
     
     if (cargoQty < session.quantityBought) {
       ctx.log("trade", `Recovered with partial cargo: ${cargoQty}/${session.quantityBought}x ${session.itemName}`);
-      session = updateTradeSession(session.botUsername, { 
+      const updated = await updateTradeSession(session.botUsername, {
         quantityBought: cargoQty,
         sellQuantity: cargoQty,
         notes: (session.notes || "") + ` | Partial recovery: ${cargoQty}/${session.quantityBought}x remaining`,
-      })!;
+      });
+      if (updated) session = updated;
     }
   }
   
@@ -172,7 +324,7 @@ async function recoverTradeSession(
 
       const bestAlt = alternativeBuyers[0].buyer;
       ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
-      session = updateTradeSession(session.botUsername, {
+      const updated = await updateTradeSession(session.botUsername, {
         destSystem: bestAlt.systemId,
         destPoi: bestAlt.poiId,
         destPoiName: bestAlt.poiName,
@@ -180,7 +332,8 @@ async function recoverTradeSession(
         sellQuantity: Math.min(session.sellQuantity, bestAlt.quantity),
         totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, bestAlt.systemId, settings.fuelCostPerJump).jumps,
         notes: (session.notes || "") + ` | Rerouted to ${bestAlt.poiName}`,
-      })!;
+      });
+      if (updated) session = updated;
     } else if (destBuyer.price < session.buyPricePerUnit) {
       ctx.log("error", `Price dropped to ${destBuyer.price}cr (below cost ${session.buyPricePerUnit}cr) — abandoning`);
       await failTradeSessionWithLockRelease(session.botUsername, "Price below cost");
@@ -214,7 +367,7 @@ async function recoverTradeSession(
 
       const bestAlt = alternativeBuyers[0].buyer;
       ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
-      session = updateTradeSession(session.botUsername, {
+      const updated = await updateTradeSession(session.botUsername, {
         destSystem: bestAlt.systemId,
         destPoi: bestAlt.poiId,
         destPoiName: bestAlt.poiName,
@@ -223,7 +376,8 @@ async function recoverTradeSession(
         totalJumps: session.jumpsCompleted + estimateFuelCost(bot.system, bestAlt.systemId, settings.fuelCostPerJump).jumps,
         state: "in_transit" as const,
         notes: (session.notes || "") + ` | Rerouted from ${session.destPoiName} (no station) to ${bestAlt.poiName}`,
-      })!;
+      });
+      if (updated) session = updated;
     }
   }
   
@@ -255,8 +409,9 @@ interface TradeRoute {
 
 /** Estimate fuel cost between two systems using mapStore route data. */
 function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: number): { jumps: number; cost: number } {
+  const blacklist = getSystemBlacklist();
   if (fromSystem === toSystem) return { jumps: 0, cost: 0 };
-  const route = mapStore.findRoute(fromSystem, toSystem);
+  const route = mapStore.findRoute(fromSystem, toSystem, blacklist);
   if (!route) return { jumps: 999, cost: 999 * costPerJump };
   const jumps = route.length - 1;
   return { jumps, cost: jumps * costPerJump };
@@ -334,6 +489,86 @@ function getItemMarketCost(itemId: string): number {
   return cheapest === Infinity ? 0 : cheapest;
 }
 
+
+/**
+ * Check market for an item and calculate optimal sell quantity based on actual buy orders.
+ * Returns the quantity to sell at profitable prices and the expected revenue.
+ */
+async function calculateOptimalSellQuantity(
+  ctx: RoutineContext,
+  itemId: string,
+  itemName: string,
+  availableQuantity: number,
+  minPricePerUnit: number,
+): Promise<{ sellQty: number; expectedRevenue: number; priceBreakdown: string }> {
+  const { bot } = ctx;
+
+  // Check the market for this specific item
+  const marketResp = await bot.exec("view_market", { item_id: itemId });
+  if (marketResp.error || !marketResp.result) {
+    ctx.log("trade", `view_market failed for ${itemName} — using cached data`);
+    return { sellQty: availableQuantity, expectedRevenue: availableQuantity * minPricePerUnit, priceBreakdown: "cached" };
+  }
+
+  const marketData = marketResp.result as Record<string, unknown>;
+  const items = (
+    Array.isArray(marketData) ? marketData :
+    Array.isArray((marketData as Record<string, unknown>).items) ? (marketData as Record<string, unknown>).items :
+    []
+  ) as Array<Record<string, unknown>>;
+
+  const itemMarket = items.find(i => (i.item_id as string) === itemId);
+  if (!itemMarket) {
+    ctx.log("trade", `No market data for ${itemName} — using cached data`);
+    return { sellQty: availableQuantity, expectedRevenue: availableQuantity * minPricePerUnit, priceBreakdown: "cached" };
+  }
+
+  const buyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
+  if (buyOrders.length === 0) {
+    ctx.log("trade", `No buy orders for ${itemName} — cannot sell`);
+    return { sellQty: 0, expectedRevenue: 0, priceBreakdown: "no buy orders" };
+  }
+
+  // Calculate how many we can sell at or above minimum price
+  let remainingToSell = availableQuantity;
+  let totalRevenue = 0;
+  let soldAtProfit = 0;
+  const priceDetails: string[] = [];
+
+  for (const order of buyOrders) {
+    if (remainingToSell <= 0) break;
+
+    const priceEach = (order.price_each as number) || 0;
+    const orderQty = (order.quantity as number) || 0;
+
+    if (orderQty <= 0 || priceEach <= 0) continue;
+
+    const qtyAtThisPrice = Math.min(remainingToSell, orderQty);
+    const revenueAtThisPrice = qtyAtThisPrice * priceEach;
+
+    totalRevenue += revenueAtThisPrice;
+    remainingToSell -= qtyAtThisPrice;
+
+    if (priceEach >= minPricePerUnit) {
+      soldAtProfit += qtyAtThisPrice;
+    }
+
+    priceDetails.push(`${qtyAtThisPrice}x @ ${priceEach}cr`);
+  }
+
+  const actualSellQty = availableQuantity - remainingToSell;
+  const priceBreakdown = priceDetails.join(", ");
+
+  if (remainingToSell > 0) {
+    ctx.log("trade", `Market check: can sell ${actualSellQty}/${availableQuantity}x ${itemName} (${priceBreakdown}), holding ${remainingToSell}x`);
+  }
+
+  if (soldAtProfit < actualSellQty && actualSellQty > 0) {
+    ctx.log("warn", `Market check: only ${soldAtProfit}/${actualSellQty}x ${itemName} at target price ${minPricePerUnit}cr — rest at lower prices`);
+  }
+
+  return { sellQty: actualSellQty, expectedRevenue: totalRevenue, priceBreakdown };
+}
 
 /**
  * Find alternative profitable buyers for an item, considering acquisition cost.
@@ -553,10 +788,51 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
   const startSystem = bot.system;
 
+  // Battle state tracking for continuous flee re-issuing
+  const battleState: BattleState = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+  };
+
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
+
+    // ── Battle check ──
+    // If we're already in battle from previous cycle, re-issue flee command
+    if (battleState.inBattle) {
+      ctx.log("combat", "Re-issuing flee stance during trade operations (ensuring we stay in flee mode)...");
+      const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+      if (fleeResp.error) {
+        ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+      }
+
+      // Check battle status to see if we've escaped
+      const currentBattleStatus = await getBattleStatus(ctx);
+      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+        ctx.log("combat", "Battle cleared - no longer in combat! Resuming trade operations...");
+        battleState.inBattle = false;
+        battleState.battleId = null;
+        battleState.isFleeing = false;
+      } else {
+        // Still in battle - wait briefly and continue to next cycle to re-flee
+        await sleep(2000);
+        continue;
+      }
+    } else {
+      // Not in battle - do a fresh check
+      if (await checkAndFleeFromBattle(ctx, "trader")) {
+        // Battle detected - set battle state and flee
+        battleState.inBattle = true;
+        battleState.isFleeing = false;
+        await sleep(2000);
+        continue;
+      }
+    }
 
     // ── Fleet coordination cleanup (periodic stale lock cleanup) ──
     const cleanedLocks = cleanupStaleLocks();
@@ -636,31 +912,50 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         onJump: async (jumpNum) => {
           const session = getActiveSession(bot.username);
           if (session) {
-            updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
+            await updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
           }
           return true;
         },
       });
-      
+
       if (!arrived) {
         ctx.log("error", "Failed to reach destination for recovered session — will retry");
         await ensureDocked(ctx);
         await sleep(60000);
         continue;
       }
-      
+
       // Arrived at destination - update session state and continue to sell phase
-      updateTradeSession(bot.username, { state: "at_destination" });
+      await updateTradeSession(bot.username, { state: "at_destination" });
       bot.system = recoveredSession.destSystem;
-      
+
       // Travel to destination POI and dock
       if (bot.poi !== recoveredSession.destPoi) {
         ctx.log("travel", `Traveling to ${recoveredSession.destPoiName}...`);
-        await bot.exec("travel", { target_poi: recoveredSession.destPoi });
+        const travelResp = await bot.exec("travel", { target_poi: recoveredSession.destPoi });
+        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+          ctx.log("combat", "Battle detected during travel — fleeing!");
+          await sleep(2000);
+          continue;
+        }
+        // CRITICAL: Check for battle interrupt error
+        if (travelResp.error) {
+          const errMsg = travelResp.error.message.toLowerCase();
+          if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+            ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+            await sleep(5000);
+            continue;
+          }
+        }
         bot.poi = recoveredSession.destPoi;
       }
 
       const dockResp = await bot.exec("dock");
+      if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
+        ctx.log("combat", "Battle detected during dock — fleeing!");
+        await sleep(2000);
+        continue;
+      }
       if (dockResp.error && !dockResp.error.message.includes("already")) {
         ctx.log("error", `Dock failed at destination: ${dockResp.error.message} — finding alternative buyer`);
         // Destination has no station - find alternative buyer with a dockable station
@@ -687,7 +982,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
         const bestAlt = alternativeBuyers[0].buyer;
         ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
-        updateTradeSession(bot.username, {
+        await updateTradeSession(bot.username, {
           destSystem: bestAlt.systemId,
           destPoi: bestAlt.poiId,
           destPoiName: bestAlt.poiName,
@@ -833,14 +1128,17 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Deposit items with no good price to faction storage
       if (itemsToDeposit.length > 0) {
-        // Check if we're at home - if not, navigate there first
-        if (bot.system !== homeSystem) {
+        // Check if bot is in a faction
+        if (!bot.faction) {
+          ctx.log("trade", `Not in a faction — keeping ${itemsToDeposit.length} item(s) in cargo for later sale`);
+          // Keep items in cargo - they'll be sold when a profitable route is found
+        } else if (bot.system !== homeSystem) {
           ctx.log("trade", `Depositing ${itemsToDeposit.length} item(s) to faction storage — traveling to home system ${homeSystem}...`);
           await ensureUndocked(ctx);
           const fueled = await ensureFueled(ctx, settings.refuelThreshold);
           if (fueled) {
-            const arrived = await navigateToSystem(ctx, homeSystem, { 
-              fuelThresholdPct: settings.refuelThreshold, 
+            const arrived = await navigateToSystem(ctx, homeSystem, {
+              fuelThresholdPct: settings.refuelThreshold,
               hullThresholdPct: settings.repairThreshold,
               autoCloak: settings.autoCloak,
             });
@@ -849,15 +1147,29 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               const { pois } = await getSystemInfo(ctx);
               const homeStation = findStation(pois);
               if (homeStation) {
-                await bot.exec("travel", { target_poi: homeStation.id });
+                const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
+                if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+                  ctx.log("combat", "Battle detected during travel — fleeing!");
+                  await sleep(2000);
+                  continue;
+                }
+                // CRITICAL: Check for battle interrupt error
+                if (travelResp.error) {
+                  const errMsg = travelResp.error.message.toLowerCase();
+                  if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                    ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                    await sleep(5000);
+                    continue;
+                  }
+                }
                 await ensureDocked(ctx);
               }
             }
           }
         }
 
-        // Deposit items to faction storage
-        if (bot.docked) {
+        // Deposit items to faction storage (only if in a faction and docked)
+        if (bot.faction && bot.docked) {
           const deposited: string[] = [];
           for (const item of itemsToDeposit) {
             const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
@@ -930,7 +1242,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // Skip route finding if we've already handled a recovered session (route is already set)
     yield "find_trades";
     let routes: TradeRoute[] = [];
-    
+    let allRoutesCount = 0;
+    let affordableRoutesCount = 0;
+
     if (!recoveredSessionHandled) {
       await bot.refreshStatus();
       await bot.refreshCargo();
@@ -947,10 +1261,21 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       const marketRoutes = findTradeOpportunities(settings, bot.system, cargoCapacity);
       // Filter out routes that sell items we just sold at the current station (demand already filled)
       const currentPoi = bot.poi;
-      const allRoutes = [...cargoRoutes, ...marketRoutes].filter(r => {
+      let allRoutes = [...cargoRoutes, ...marketRoutes].filter(r => {
         if (soldLocallyIds.has(r.itemId) && r.destSystem === bot.system && r.destPoi === currentPoi) return false;
         return true;
       });
+      allRoutesCount = allRoutes.length;
+
+      // Filter out routes where bot can't afford even 1 unit (will try again with cheaper items next scan)
+      const affordableRoutes = allRoutes.filter(r => bot.credits >= r.buyPrice);
+      affordableRoutesCount = affordableRoutes.length;
+      if (affordableRoutes.length < allRoutes.length) {
+        const skipped = allRoutes.length - affordableRoutes.length;
+        ctx.log("trade", `Skipping ${skipped} route(s) — item(s) too expensive for current budget (${bot.credits}cr)`);
+      }
+      allRoutes = affordableRoutes;
+      
       // Cargo routes first (already have the goods), then by profit
       routes = allRoutes.sort((a, b) => {
         // Cargo routes get priority — sort them first, then by profit
@@ -1002,7 +1327,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (routes.length === 0 && !recoveredSessionHandled) {
       // No routes found and no recovered session to handle
-      ctx.log("trade", "No profitable trade routes found — waiting 60s before re-scanning");
+      if (allRoutesCount > 0 && affordableRoutesCount === 0) {
+        ctx.log("trade", `No affordable routes found (budget: ${bot.credits}cr) — waiting 60s for more market data or consider earning credits via missions`);
+      } else {
+        ctx.log("trade", "No profitable trade routes found — waiting 60s before re-scanning");
+      }
       await sleep(60000);
       continue;
     }
@@ -1040,9 +1369,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       
       // Update session state based on current position
       if (bot.system === recoveredSession.destSystem) {
-        updateTradeSession(bot.username, { state: "at_destination" });
+        await updateTradeSession(bot.username, { state: "at_destination" });
       } else if (recoveredSession.jumpsCompleted > 0) {
-        updateTradeSession(bot.username, { state: "in_transit" });
+        await updateTradeSession(bot.username, { state: "in_transit" });
       }
     }
 
@@ -1103,8 +1432,80 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       // Track the lock so we can release it if route fails
       pendingLockItemId = candidate.itemId;
       pendingLockReleased = false; // Reset for this route attempt
-      
+
       ctx.log("trade", `Fleet lock acquired: ${candidate.itemName} (${candidate.sourceSystem} → ${candidate.destSystem})`);
+
+      // Check affordability BEFORE traveling — include faction withdrawal fallback
+      const affordability = await canAffordRoute(ctx, candidate, settings);
+
+      const totalCost = candidate.buyPrice * candidate.buyQty;
+      const maxAffordableWithStorage = affordability.maxAffordableQty;
+      const maxAffordableOwnCredits = Math.floor(bot.credits / candidate.buyPrice);
+
+      // Can't afford even a single unit with all available credits — skip
+      if (maxAffordableWithStorage <= 0) {
+        ctx.log("trade", `Cannot afford route: need ${totalCost}cr for ${candidate.buyQty}x, have ${bot.credits}cr (storage: ${affordability.withdrawalNeeded > 0 ? 'insufficient' : 'empty'}) — skipping`);
+        releaseTradeLock(bot.username, candidate.itemId, "skipped:cannot_afford");
+        pendingLockItemId = null;
+        pendingLockReleased = true;
+        failedSources.add(sourceKey);
+        continue;
+      }
+
+      // Determine the actual quantity we can afford and should buy
+      let targetQty = candidate.buyQty;
+      let needsWithdrawal = false;
+
+      if (maxAffordableOwnCredits <= 0) {
+        // Can't afford any with own credits — need withdrawal
+        if (!affordability.canAffordWithWithdrawal) {
+          // Storage also can't help — skip
+          ctx.log("trade", `Cannot afford route: need ${totalCost}cr for ${candidate.buyQty}x, have ${bot.credits}cr (storage empty) — skipping`);
+          releaseTradeLock(bot.username, candidate.itemId, "skipped:cannot_afford");
+          pendingLockItemId = null;
+          pendingLockReleased = true;
+          failedSources.add(sourceKey);
+          continue;
+        }
+        // Use storage to fund the route
+        targetQty = Math.min(maxAffordableWithStorage, candidate.buyQty);
+        needsWithdrawal = true;
+      } else if (maxAffordableOwnCredits < candidate.buyQty) {
+        // Can afford some with own credits — adjust quantity (no withdrawal needed)
+        targetQty = maxAffordableOwnCredits;
+        ctx.log("trade", `Can only afford ${targetQty}/${candidate.buyQty}x with current credits — adjusting route`);
+      } else if (!affordability.canAfford && affordability.canAffordWithWithdrawal) {
+        // Can afford with storage help — use storage to get full quantity
+        targetQty = Math.min(maxAffordableWithStorage, candidate.buyQty);
+        needsWithdrawal = true;
+      }
+
+      // Adjust the route quantity if needed
+      if (targetQty < candidate.buyQty) {
+        ctx.log("trade", `Adjusted route: ${targetQty}/${candidate.buyQty}x ${candidate.itemName} (affordable quantity)`);
+        const adjustedProfitPerUnit = candidate.profitPerUnit;
+        candidate.buyQty = targetQty;
+        candidate.sellQty = targetQty;
+        candidate.totalProfit = adjustedProfitPerUnit * targetQty;
+      }
+
+      // Withdraw from storage if needed
+      if (needsWithdrawal) {
+        const adjustedCost = candidate.buyPrice * candidate.buyQty;
+        const withdrawalNeeded = Math.max(0, adjustedCost - bot.credits);
+        if (withdrawalNeeded > 0) {
+          ctx.log("trade", `Need ${withdrawalNeeded}cr from faction storage`);
+          const withdrew = await withdrawCreditsForTrade(ctx, candidate, settings);
+          if (!withdrew) {
+            ctx.log("error", "Failed to withdraw credits from faction storage — skipping route");
+            releaseTradeLock(bot.username, candidate.itemId, "aborted:withdraw_failed");
+            pendingLockItemId = null;
+            pendingLockReleased = true;
+            failedSources.add(sourceKey);
+            continue;
+          }
+        }
+      }
 
       yield "travel_to_source";
 
@@ -1136,6 +1537,20 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         await ensureUndocked(ctx);
         ctx.log("travel", `Traveling to ${candidate.sourcePoiName}...`);
         const tResp = await bot.exec("travel", { target_poi: candidate.sourcePoi });
+        if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
+          ctx.log("combat", "Battle detected during travel — fleeing!");
+          await sleep(2000);
+          continue;
+        }
+        // CRITICAL: Check for battle interrupt error
+        if (tResp.error) {
+          const errMsg = tResp.error.message.toLowerCase();
+          if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+            ctx.log("combat", `Travel interrupted by battle! ${tResp.error.message} - fleeing!`);
+            await sleep(5000);
+            continue;
+          }
+        }
         if (tResp.error && !tResp.error.message.includes("already")) {
           ctx.log("error", `Travel to source failed: ${tResp.error.message}`);
           releaseTradeLock(bot.username, candidate.itemId, "aborted:travel_failed");
@@ -1340,7 +1755,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           isCargoRoute: candidate.sourcePoi === "cargo",
           investedCredits: actualSpent,
         });
-        startTradeSession(session);
+        await startTradeSession(session);
         ctx.log("trade", `Trade session started: ${session.sessionId}`);
 
         // Update the lock with the real session ID and actual quantity
@@ -1462,7 +1877,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       // Update session state to in_transit
       const activeSession = getActiveSession(bot.username);
       if (activeSession) {
-        updateTradeSession(bot.username, { 
+        await updateTradeSession(bot.username, {
           state: "in_transit",
           jumpsCompleted: 0,
         });
@@ -1476,7 +1891,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           // Update session jump progress
           const session = getActiveSession(bot.username);
           if (session) {
-            updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
+            await updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
           }
 
           try {
@@ -1511,7 +1926,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   bot.system,
                   settings,
                 );
-                
+
                 if (alternatives.length > 0) {
                   const best = alternatives[0];
                   ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found alternative buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
@@ -1525,7 +1940,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                     jumps: best.jumps,
                     totalProfit: best.profit,
                   };
-                  updateTradeSession(bot.username, {
+                  await updateTradeSession(bot.username, {
                     destSystem: best.buyer.systemId,
                     destPoi: best.buyer.poiId,
                     destPoiName: best.buyer.poiName,
@@ -1550,7 +1965,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   bot.system,
                   settings,
                 );
-                
+
                 if (alternatives.length > 0) {
                   const best = alternatives[0];
                   ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found better buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
@@ -1564,7 +1979,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                     jumps: best.jumps,
                     totalProfit: best.profit,
                   };
-                  updateTradeSession(bot.username, {
+                  await updateTradeSession(bot.username, {
                     destSystem: best.buyer.systemId,
                     destPoi: best.buyer.poiId,
                     destPoiName: best.buyer.poiName,
@@ -1573,7 +1988,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   });
                   return true;
                 }
-                
+
                 ctx.log("warn", `Mid-route check (jump ${jumpNum}): No profitable alternative — will incur loss of ${investedCredits - refreshedBuyer.price * buyQty}cr`);
                 return true;
               }
@@ -1592,7 +2007,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   bot.system,
                   settings,
                 );
-                
+
                 if (alternatives.length > 0) {
                   const best = alternatives[0];
                   ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found alternative buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
@@ -1606,7 +2021,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                     jumps: best.jumps,
                     totalProfit: best.profit,
                   };
-                  updateTradeSession(bot.username, {
+                  await updateTradeSession(bot.username, {
                     destSystem: best.buyer.systemId,
                     destPoi: best.buyer.poiId,
                     destPoiName: best.buyer.poiName,
@@ -1615,7 +2030,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   });
                   return true;
                 }
-                
+
                 ctx.log("trade", `Mid-route check (jump ${jumpNum}): No profitable alternative found — will deposit at destination`);
                 return true;
               }
@@ -1631,7 +2046,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   bot.system,
                   settings,
                 );
-                
+
                 if (alternatives.length > 0) {
                   const best = alternatives[0];
                   ctx.log("trade", `Mid-route check (jump ${jumpNum}): Found better buyer at ${best.buyer.poiName} (${best.buyer.price}cr/ea, ${best.jumps} jumps) — est. profit ${Math.round(best.profit)}cr`);
@@ -1645,7 +2060,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                     jumps: best.jumps,
                     totalProfit: best.profit,
                   };
-                  updateTradeSession(bot.username, {
+                  await updateTradeSession(bot.username, {
                     destSystem: best.buyer.systemId,
                     destPoi: best.buyer.poiId,
                     destPoiName: best.buyer.poiName,
@@ -1654,7 +2069,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   });
                   return true;
                 }
-                
+
                 ctx.log("warn", `Mid-route check (jump ${jumpNum}): No profitable alternative — will incur loss of ${investedCredits - destBuyer.price * buyQty}cr`);
                 return true;
               }
@@ -1681,7 +2096,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         // Update session state to reflect we're still in transit
         const session = getActiveSession(bot.username);
         if (session) {
-          updateTradeSession(bot.username, {
+          await updateTradeSession(bot.username, {
             state: "in_transit",
             notes: (session.notes || "") + " | Network interruption - will retry",
           });
@@ -1703,13 +2118,41 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     if (bot.poi !== route.destPoi) {
       ctx.log("travel", `Traveling to ${route.destPoiName}...`);
       const t2Resp = await bot.exec("travel", { target_poi: route.destPoi });
+      if (await checkBattleAfterCommand(ctx, t2Resp.notifications, "travel", battleState)) {
+        ctx.log("combat", "Battle detected during travel — fleeing!");
+        await sleep(2000);
+        continue;
+      }
+      // CRITICAL: Check for battle interrupt error
+      if (t2Resp.error) {
+        const errMsg = t2Resp.error.message.toLowerCase();
+        if (t2Resp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+          ctx.log("combat", `Travel interrupted by battle! ${t2Resp.error.message} - fleeing!`);
+          await sleep(5000);
+          continue;
+        }
+      }
       if (t2Resp.error && !t2Resp.error.message.includes("already")) {
         ctx.log("error", `Travel to dest failed: ${t2Resp.error.message}`);
         // Try to sell wherever we are
         const { pois } = await getSystemInfo(ctx);
         const station = findStation(pois);
         if (station) {
-          await bot.exec("travel", { target_poi: station.id });
+          const travelResp = await bot.exec("travel", { target_poi: station.id });
+          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+            ctx.log("combat", "Battle detected during travel — fleeing!");
+            await sleep(2000);
+            continue;
+          }
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+          }
           bot.poi = station.id;
         }
       } else {
@@ -1733,6 +2176,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // Dock at destination
     yield "dock_dest";
     const d2Resp = await bot.exec("dock");
+    if (await checkBattleAfterCommand(ctx, d2Resp.notifications, "dock", battleState)) {
+      ctx.log("combat", "Battle detected during dock — fleeing!");
+      await sleep(2000);
+      continue;
+    }
     if (d2Resp.error && !d2Resp.error.message.includes("already")) {
       ctx.log("error", `Dock failed at dest: ${d2Resp.error.message}`);
       continue;
@@ -1755,25 +2203,43 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       if (remaining < buyQty) {
         ctx.log("trade", `Only ${remaining}/${buyQty}x ${route!.itemName} left (${buyQty - remaining} consumed during travel)`);
       }
-      ctx.log("trade", `Selling ${remaining}x ${route!.itemName} at ${route!.sellPrice}cr/ea...`);
-      const sellResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
-      if (!sellResp.error) {
-        const sr = sellResp.result as Record<string, unknown> | undefined;
-        const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
-        // Check how many actually sold
-        await bot.refreshCargo();
-        const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-        const sold = remaining - afterSell;
-        totalSold += sold;
-        sellRevenue += earned > 0 ? earned : sold * route!.sellPrice;
-        remaining = afterSell;
-        if (remaining > 0) {
-          ctx.log("trade", `Sold ${sold}x but ${remaining}x ${route!.itemName} still unsold — buyer demand exhausted`);
-        }
-        // Refresh dest market cache with real post-sale data
-        await recordMarketData(ctx);
+
+      // Check actual market conditions before selling
+      const minAcceptablePrice = Math.floor(investedCredits / buyQty); // Break-even price per unit
+      const marketCheck = await calculateOptimalSellQuantity(
+        ctx,
+        route!.itemId,
+        route!.itemName,
+        remaining,
+        minAcceptablePrice,
+      );
+
+      if (marketCheck.sellQty <= 0) {
+        ctx.log("trade", `No viable buy orders for ${route!.itemName} — holding items for better prices`);
+        remaining = marketCheck.sellQty; // Will trigger deposit logic below
       } else {
-        ctx.log("error", `Sell failed: ${sellResp.error.message}`);
+        // Sell only what the market can absorb at reasonable prices
+        const actualSellQty = marketCheck.sellQty;
+        ctx.log("trade", `Selling ${actualSellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
+        const sellResp = await bot.exec("sell", { item_id: route!.itemId, quantity: actualSellQty });
+        if (!sellResp.error) {
+          const sr = sellResp.result as Record<string, unknown> | undefined;
+          const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+          // Check how many actually sold
+          await bot.refreshCargo();
+          const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+          const sold = actualSellQty - afterSell;
+          totalSold += sold;
+          sellRevenue += earned > 0 ? earned : sold * route!.sellPrice;
+          remaining = afterSell;
+          if (remaining > 0) {
+            ctx.log("trade", `Sold ${sold}x but ${remaining}x ${route!.itemName} still unsold — buyer demand exhausted`);
+          }
+          // Refresh dest market cache with real post-sale data
+          await recordMarketData(ctx);
+        } else {
+          ctx.log("error", `Sell failed: ${sellResp.error.message}`);
+        }
       }
     }
 
@@ -1813,10 +2279,24 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               }
             }
           }
-          
+
           if (bot.poi !== best.buyer.poiId) {
             await ensureUndocked(ctx);
             const tResp = await bot.exec("travel", { target_poi: best.buyer.poiId });
+            if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
+              ctx.log("combat", "Battle detected during travel — fleeing!");
+              await sleep(2000);
+              continue;
+            }
+            // CRITICAL: Check for battle interrupt error
+            if (tResp.error) {
+              const errMsg = tResp.error.message.toLowerCase();
+              if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${tResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
+            }
             if (!tResp.error || tResp.error.message.includes("already")) {
               bot.poi = best.buyer.poiId;
             }
@@ -1879,6 +2359,20 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           if (bot.poi !== buyer.poiId) {
             await ensureUndocked(ctx);
             const tResp = await bot.exec("travel", { target_poi: buyer.poiId });
+            if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
+              ctx.log("combat", "Battle detected during travel — fleeing!");
+              await sleep(2000);
+              continue;
+            }
+            // CRITICAL: Check for battle interrupt error
+            if (tResp.error) {
+              const errMsg = tResp.error.message.toLowerCase();
+              if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${tResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
+            }
             if (tResp.error && !tResp.error.message.includes("already")) continue;
             bot.poi = buyer.poiId;
           }
@@ -1936,11 +2430,25 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         if (homeStation) {
           if (bot.poi !== homeStation.id) {
             await ensureUndocked(ctx);
-            await bot.exec("travel", { target_poi: homeStation.id });
+            const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
+            if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+              ctx.log("combat", "Battle detected during travel — fleeing!");
+              await sleep(2000);
+              continue;
+            }
+            // CRITICAL: Check for battle interrupt error
+            if (travelResp.error) {
+              const errMsg = travelResp.error.message.toLowerCase();
+              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
+            }
             bot.poi = homeStation.id;
           }
           await ensureDocked(ctx);
-          
+
           // Deposit unsold items
           await bot.refreshCargo();
           remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
@@ -1967,7 +2475,21 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
         if (bot.poi !== SOL_CENTRAL) {
           await ensureUndocked(ctx);
-          await bot.exec("travel", { target_poi: SOL_CENTRAL });
+          const travelResp = await bot.exec("travel", { target_poi: SOL_CENTRAL });
+          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+            ctx.log("combat", "Battle detected during travel — fleeing!");
+            await sleep(2000);
+            continue;
+          }
+          // CRITICAL: Check for battle interrupt error
+          if (travelResp.error) {
+            const errMsg = travelResp.error.message.toLowerCase();
+            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await sleep(5000);
+              continue;
+            }
+          }
           bot.poi = SOL_CENTRAL;
         }
 
@@ -1998,7 +2520,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     
     // Complete trade session
     const actualRevenue = sellRevenue;
-    const completedSession = completeTradeSession(bot.username, actualRevenue, actualProfit);
+    const completedSession = await completeTradeSession(bot.username, actualRevenue, actualProfit);
     if (completedSession) {
       ctx.log("trade", `Session completed: ${completedSession.sessionId}`);
       
@@ -2012,59 +2534,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Faction donation (10% of profit) ──
     await factionDonateProfit(ctx, actualProfit);
 
-    // ── Deposit excess credits to faction storage at home base ──
-    await bot.refreshStatus();
-    if (bot.credits > TRADER_DEPOSIT_THRESHOLD) {
-      const excessCredits = bot.credits - TRADER_WORKING_BALANCE;
-      const homeSystemForDeposit = settings.homeSystem || startSystem;
-      
-      if (homeSystemForDeposit && bot.system !== homeSystemForDeposit) {
-        ctx.log("trade", `Excess credits detected (${bot.credits}cr) — returning to home system ${homeSystemForDeposit} to deposit ${excessCredits}cr`);
-        await ensureUndocked(ctx);
-        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-        if (fueled) {
-          const arrived = await navigateToSystem(ctx, homeSystemForDeposit, safetyOpts);
-          if (arrived) {
-            // Dock at home station
-            const { pois: homePois } = await getSystemInfo(ctx);
-            const homeStation = findStation(homePois);
-            if (homeStation) {
-              await bot.exec("travel", { target_poi: homeStation.id });
-              await ensureDocked(ctx, true);
-              
-              // Deposit excess credits to faction storage
-              const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
-              if (!depositResp.error) {
-                ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
-                logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);
-              } else {
-                ctx.log("error", `Failed to deposit credits: ${depositResp.error.message}`);
-              }
-            }
-          }
-        }
-      } else if (bot.docked) {
-        // Already at home and docked - deposit immediately
-        const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
-        if (!depositResp.error) {
-          ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
-          logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);
-        } else {
-          ctx.log("error", `Failed to deposit credits: ${depositResp.error.message}`);
-        }
-      }
-    }
-
-    // ── Maintenance ──
-    yield "post_trade_maintenance";
-    await tryRefuel(ctx);
-    await repairShip(ctx);
-
-    // ── Check skills ──
-    yield "check_skills";
-    await bot.checkSkills();
-
-    // ── Check for next trade from current location before returning home ──
+    // ── Check for next trade before considering excess credit deposit ──
     const homeSystem = settings.homeSystem || startSystem;
     yield "seek_next_trade";
     await bot.refreshStatus();
@@ -2081,6 +2551,82 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const nextMarketRoutes = findTradeOpportunities(settings, bot.system, nextCargoCapacity);
     const nextRoutes = [...nextCargoRoutes, ...nextMarketRoutes].sort((a, b) => b.totalProfit - a.totalProfit);
 
+    // ── Deposit excess credits to faction storage ──
+    // Only deposit if:
+    // 1. We're currently at the home station (convenient opportunity), OR
+    // 2. There are no more profitable trades to do
+    await bot.refreshStatus();
+    const hasProfitableTrades = nextRoutes.length > 0;
+    const isAtHomeStation = homeSystem && bot.system === homeSystem && bot.docked;
+    const noTradesAndHasExcess = !hasProfitableTrades && bot.credits > TRADER_DEPOSIT_THRESHOLD;
+
+    if (bot.credits > TRADER_WORKING_BALANCE && (isAtHomeStation || noTradesAndHasExcess)) {
+      const excessCredits = bot.credits - TRADER_WORKING_BALANCE;
+      const homeSystemForDeposit = homeSystem;
+
+      if (isAtHomeStation) {
+        // We're at home station - deposit immediately
+        ctx.log("trade", `At home station with ${bot.credits}cr — depositing ${excessCredits}cr to faction storage`);
+        const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+        if (!depositResp.error) {
+          ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
+          logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);
+        } else {
+          ctx.log("error", `Failed to deposit credits: ${depositResp.error.message}`);
+        }
+      } else if (noTradesAndHasExcess && homeSystemForDeposit && bot.system !== homeSystemForDeposit) {
+        // No trades available and we have excess - return home to deposit
+        ctx.log("trade", `No profitable trades and excess credits detected (${bot.credits}cr) — returning to home system ${homeSystemForDeposit} to deposit ${excessCredits}cr`);
+        await ensureUndocked(ctx);
+        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (fueled) {
+          const arrived = await navigateToSystem(ctx, homeSystemForDeposit, safetyOpts);
+          if (arrived) {
+            // Dock at home station
+            const { pois: homePois } = await getSystemInfo(ctx);
+            const homeStation = findStation(homePois);
+            if (homeStation) {
+              const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
+              if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+                ctx.log("combat", "Battle detected during travel — fleeing!");
+                await sleep(2000);
+                continue;
+              }
+              // CRITICAL: Check for battle interrupt error
+              if (travelResp.error) {
+                const errMsg = travelResp.error.message.toLowerCase();
+                if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                  ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                  await sleep(5000);
+                  continue;
+                }
+              }
+              await ensureDocked(ctx, true);
+
+              // Deposit excess credits to faction storage
+              const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+              if (!depositResp.error) {
+                ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
+                logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);
+              } else {
+                ctx.log("error", `Failed to deposit credits: ${depositResp.error.message}`);
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // ── Maintenance ──
+    yield "post_trade_maintenance";
+    await tryRefuel(ctx);
+    await repairShip(ctx);
+
+    // ── Check skills ──
+    yield "check_skills";
+    await bot.checkSkills();
+
+    // ── Continue with next trade or return home ──
     if (nextRoutes.length > 0) {
       ctx.log("trade", `Found ${nextRoutes.length} routes from current location — continuing trading`);
       // Skip the return home — the main loop will pick up these routes
@@ -2098,8 +2644,27 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           const { pois: homePois } = await getSystemInfo(ctx);
           const homeStation = findStation(homePois);
           if (homeStation) {
-            await bot.exec("travel", { target_poi: homeStation.id });
-            await bot.exec("dock");
+            const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
+            if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+              ctx.log("combat", "Battle detected during travel — fleeing!");
+              await sleep(2000);
+              continue;
+            }
+            // CRITICAL: Check for battle interrupt error
+            if (travelResp.error) {
+              const errMsg = travelResp.error.message.toLowerCase();
+              if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await sleep(5000);
+                continue;
+              }
+            }
+            const dockResp = await bot.exec("dock");
+            if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
+              ctx.log("combat", "Battle detected during dock — fleeing!");
+              await sleep(2000);
+              continue;
+            }
             bot.docked = true;
             bot.poi = homeStation.id;
             ctx.log("travel", `Docked at home station ${homeStation.name}`);

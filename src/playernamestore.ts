@@ -1,4 +1,4 @@
-import { debugLog } from "./debug.js";
+import { debugLogForBot } from "./debug.js";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 
@@ -30,7 +30,7 @@ export class PlayerNameStore {
       // Synchronous load using Node fs module for reliability
       try {
         if (!existsSync(PLAYER_NAMES_FILE)) {
-          debugLog("playernames:load", `${this._botName || "unknown"}`, "No existing file, starting fresh");
+          debugLogForBot(this._botName || "unknown", "playernames:load", `${this._botName || "unknown"}`, "No existing file, starting fresh");
           return;
         }
 
@@ -48,7 +48,7 @@ export class PlayerNameStore {
               this.normalizedMap.set(normalized, name);
             }
           }
-          debugLog("playernames:load", `${this._botName || "unknown"}`, `Loaded ${this.names.size} player names`);
+          debugLogForBot(this._botName || "unknown", "playernames:load", `${this._botName || "unknown"}`, `Loaded ${this.names.size} player names`);
         }
 
         // Load pirate names
@@ -62,7 +62,7 @@ export class PlayerNameStore {
               this.pirateNormalizedMap.set(normalized, name);
             }
           }
-          debugLog("playernames:load", `${this._botName || "unknown"}`, `Loaded ${this.pirates.size} pirate names`);
+          debugLogForBot(this._botName || "unknown", "playernames:load", `${this._botName || "unknown"}`, `Loaded ${this.pirates.size} pirate names`);
         }
 
         // Load empire NPC names
@@ -76,11 +76,11 @@ export class PlayerNameStore {
               this.empireNpcNormalizedMap.set(normalized, name);
             }
           }
-          debugLog("playernames:load", `${this._botName || "unknown"}`, `Loaded ${this.empireNpcs.size} empire NPC names`);
+          debugLogForBot(this._botName || "unknown", "playernames:load", `${this._botName || "unknown"}`, `Loaded ${this.empireNpcs.size} empire NPC names`);
         }
 
         if (!data.names?.length && !data.pirates?.length && !data.empire_npcs?.length) {
-          debugLog("playernames:load", `${this._botName || "unknown"}`, "File exists but no names, starting fresh");
+          debugLogForBot(this._botName || "unknown", "playernames:load", `${this._botName || "unknown"}`, "File exists but no names, starting fresh");
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
@@ -128,7 +128,7 @@ export class PlayerNameStore {
 
     // Check if we already have this name (case-insensitive, normalized)
     if (this.normalizedMap.has(normalized)) {
-      debugLog("playernames:add", `${this._botName || "unknown"}`, `Duplicate ignored: "${name}"`);
+      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Duplicate ignored: "${name}"`);
       return false;
     }
 
@@ -136,7 +136,7 @@ export class PlayerNameStore {
     this.names.add(name);
     this.normalizedMap.set(normalized, name);
 
-    debugLog("playernames:add", `${this._botName || "unknown"}`, `Added: "${name}" (total: ${this.names.size})`);
+    debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added: "${name}" (total: ${this.names.size})`);
 
     // Persist to disk
     this.save();
@@ -161,7 +161,7 @@ export class PlayerNameStore {
 
     // Check if we already have this name (case-insensitive, normalized)
     if (this.pirateNormalizedMap.has(normalized)) {
-      debugLog("playernames:add", `${this._botName || "unknown"}`, `Pirate duplicate ignored: "${name}"`);
+      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Pirate duplicate ignored: "${name}"`);
       return false;
     }
 
@@ -169,7 +169,7 @@ export class PlayerNameStore {
     this.pirates.add(name);
     this.pirateNormalizedMap.set(normalized, name);
 
-    debugLog("playernames:add", `${this._botName || "unknown"}`, `Added pirate: "${name}" (total: ${this.pirates.size})`);
+    debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added pirate: "${name}" (total: ${this.pirates.size})`);
 
     // Persist to disk
     this.save();
@@ -194,7 +194,7 @@ export class PlayerNameStore {
 
     // Check if we already have this name (case-insensitive, normalized)
     if (this.empireNpcNormalizedMap.has(normalized)) {
-      debugLog("playernames:add", `${this._botName || "unknown"}`, `Empire NPC duplicate ignored: "${name}"`);
+      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Empire NPC duplicate ignored: "${name}"`);
       return false;
     }
 
@@ -202,7 +202,7 @@ export class PlayerNameStore {
     this.empireNpcs.add(name);
     this.empireNpcNormalizedMap.set(normalized, name);
 
-    debugLog("playernames:add", `${this._botName || "unknown"}`, `Added empire NPC: "${name}" (total: ${this.empireNpcs.size})`);
+    debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added empire NPC: "${name}" (total: ${this.empireNpcs.size})`);
 
     // Persist to disk
     this.save();
@@ -299,7 +299,7 @@ export class PlayerNameStore {
         empire_npc_count: this.empireNpcs.size,
       };
       writeFileSync(PLAYER_NAMES_FILE, JSON.stringify(data, null, 2), "utf-8");
-      debugLog("playernames:save", `${this._botName || "unknown"}`, `Saved ${this.names.size} players, ${this.pirates.size} pirates, ${this.empireNpcs.size} empire NPCs`);
+      debugLogForBot(this._botName || "unknown", "playernames:save", `${this._botName || "unknown"}`, `Saved ${this.names.size} players, ${this.pirates.size} pirates, ${this.empireNpcs.size} empire NPCs`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[PlayerNameStore] Save failed: ${msg}`);

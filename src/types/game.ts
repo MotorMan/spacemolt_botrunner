@@ -453,6 +453,7 @@ export interface BattleStatus {
   your_stance?: BattleStance;
   your_target_id?: string;
   auto_pilot?: boolean;
+  is_participant?: boolean;
 }
 
 // ── Faction ──────────────────────────────────────────────────

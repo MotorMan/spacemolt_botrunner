@@ -168,9 +168,14 @@ function getAiChatSettings(): {
   respondToSystem: boolean;
   respondToMayday: boolean;
   respondToCustoms: boolean;
+  customsResponseChance: number; // 1 in X chance to respond
+  karenModeChance: number; // 1 in X chance for Karen mode (0 = disabled)
   personality: string;
   lockDurationSec: number;
   conversationCooldownSec: number;
+  factionChatRoundsLimit: number; // Max rounds of AI responses in faction chat (0 = unlimited)
+  llmTimeoutSec: number; // Timeout for LLM API calls in seconds
+  maxTokens: number; // Maximum tokens for LLM response
 } {
   const all = readSettings();
   const s = (all.ai_chat || {}) as Record<string, unknown>;
@@ -202,9 +207,14 @@ function getAiChatSettings(): {
     respondToSystem: (s.respondToSystem as boolean) ?? false,
     respondToMayday: (s.respondToMayday as boolean) ?? true,
     respondToCustoms: (s.respondToCustoms as boolean) ?? true,
+    customsResponseChance: (s.customsResponseChance as number) ?? 10,
+    karenModeChance: (s.karenModeChance as number) ?? 100,
     personality: (s.personality as string) || DEFAULT_PERSONALITY,
     lockDurationSec: (s.lockDurationSec as number) || 60,
     conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
+    factionChatRoundsLimit: (s.factionChatRoundsLimit as number) ?? 5,
+    llmTimeoutSec: (s.llmTimeoutSec as number) ?? 30,
+    maxTokens: (s.maxTokens as number) ?? 1000,
   };
 }
 
@@ -253,6 +263,29 @@ const DEFAULT_PERSONALITY = DEFAULT_AI_CHAT_PERSONALITY;
 
 // Export getBotPersonality for use by customs service
 export { getBotPersonality };
+
+// ── Karen Mode personality ──────────────────────────────────────
+
+/**
+ * Special personality for "Karen Mode" - triggered randomly during customs interactions.
+ * The bot becomes an entitled, demanding customer who wants to speak to the manager.
+ */
+export const KAREN_MODE_PERSONALITY = `You are a KAREN - an entitled, demanding customer service nightmare.
+
+Your personality traits:
+- Rude, condescending, and entitled
+- Always demand to speak to the manager
+- Think you know better than everyone
+- Complain about everything
+- Use phrases like "Do you know who I am?", "This is unacceptable!", "I want to speak to your manager!"
+- Condescending and patronizing tone
+- Never admit when you're wrong
+
+When responding:
+- Be brief but rude (1-2 sentences max)
+- Make demands
+- Threaten to report them or take your business elsewhere
+- Act like customs is wasting your valuable time`;
 
 // ── Chat message detection ───────────────────────────────────
 
@@ -329,7 +362,7 @@ async function callLlm(
   const body: Record<string, unknown> = {
     model: settings.model,
     messages,
-    max_tokens: 300,
+    max_tokens: settings.maxTokens,
     temperature: 0.8,
   };
 
@@ -340,7 +373,7 @@ async function callLlm(
       "Authorization": `Bearer ${settings.apiKey}`,
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(30_000),
+    signal: AbortSignal.timeout(settings.llmTimeoutSec * 1000),
   });
 
   if (!resp.ok) {
@@ -349,14 +382,24 @@ async function callLlm(
   }
 
   const data = await resp.json() as {
-    choices?: Array<{ message: LlmMessage; finish_reason: string }>;
+    choices?: Array<{ message: LlmMessage & { reasoning_content?: string }; finish_reason: string }>;
     error?: { message: string };
   };
 
   if (data.error) throw new Error(`LLM error: ${data.error.message}`);
   const msg = data.choices?.[0]?.message;
-  if (!msg || !msg.content) throw new Error("LLM returned no message");
-  return msg.content;
+  if (!msg) throw new Error("LLM returned no message");
+  
+  // For thinking-enabled models: prefer actual content over reasoning
+  // The model returns reasoning in reasoning_content field, but the final response is in content
+  const responseContent = msg.content || "";
+  if (!responseContent && msg.reasoning_content) {
+    // If only reasoning content exists (model was cut off), use it as fallback
+    console.warn("LLM warning: Only reasoning_content available, model may have been interrupted");
+    return msg.reasoning_content;
+  }
+  
+  return responseContent;
 }
 
 // ── AI Chat Service Class ────────────────────────────────────
@@ -387,7 +430,12 @@ export class AiChatService {
   // Track consecutive AI responses to prevent loops
   private consecutiveResponses = new Map<string, number>();
   private readonly MAX_CONSECUTIVE_RESPONSES = 3; // Max 3 AI responses in a row before requiring human input
-  
+
+  // Track faction chat rounds to prevent endless bot-to-bot conversations
+  private factionChatRounds = 0;
+  private factionChatRoundResetTime = 0;
+  private readonly FACTION_CHAT_ROUND_RESET_MS = 5 * 60 * 1000; // Reset counter after 5 minutes of no faction chat
+
   // Chat log file
   private readonly CHAT_LOG_FILE = join(process.cwd(), "data", "chat.log");
 
@@ -507,6 +555,46 @@ export class AiChatService {
   }
 
   /**
+   * Check if faction chat rounds limit has been reached.
+   * Returns true if we should skip responding due to round limit.
+   */
+  private checkFactionChatRoundsLimit(settings: ReturnType<typeof getAiChatSettings>): boolean {
+    // If limit is 0 or not set, no limit applied
+    if (!settings.factionChatRoundsLimit || settings.factionChatRoundsLimit <= 0) {
+      return false;
+    }
+
+    const now = Date.now();
+
+    // Reset counter if enough time has passed since last faction chat activity
+    if (now - this.factionChatRoundResetTime > this.FACTION_CHAT_ROUND_RESET_MS) {
+      this.factionChatRounds = 0;
+    }
+
+    // Check if we've hit the limit
+    if (this.factionChatRounds >= settings.factionChatRoundsLimit) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Increment the faction chat round counter.
+   */
+  private incrementFactionChatRounds(): void {
+    const now = Date.now();
+
+    // Reset if enough time has passed
+    if (now - this.factionChatRoundResetTime > this.FACTION_CHAT_ROUND_RESET_MS) {
+      this.factionChatRounds = 0;
+    }
+
+    this.factionChatRounds++;
+    this.factionChatRoundResetTime = now;
+  }
+
+  /**
    * Log chat message to file (both received and sent).
    */
   private logChat(entry: {
@@ -529,6 +617,14 @@ export class AiChatService {
    * Add a chat message to the queue.
    */
   addChatMessage(msg: ChatMessage): void {
+    // CRITICAL: Filter self-messages (bot responding to its own chat messages)
+    // This is a belt-and-suspenders check - bot.ts should already filter these,
+    // but we double-check here to prevent self-talk loops
+    if (msg.sender === msg.botUsername) {
+      this.logFn("ai_chat", `🚫 SELF-MESSAGE BLOCKED: ${msg.sender} === ${msg.botUsername} [${msg.channel}] "${msg.content.slice(0, 50)}"`);
+      return;
+    }
+
     // Check if message mentions any bot
     const bots = AiChatService.getBots();
     let isMention = false;
@@ -705,29 +801,14 @@ export class AiChatService {
     }
 
     // Skip messages from AI bots (prevent self-talk loops)
-    // BUT: Allow the mentioned bot to respond even if it recently sent messages
+    // Note: Self-messages are already filtered in addChatMessage(), so this is extra safety
     const bots = AiChatService.getBots();
     const isFromAiBot = bots?.some(b => b.username === msg.sender);
-    
+
     if (isFromAiBot) {
-      // Check if this message mentions a different bot - if so, allow it through
-      // This prevents AI-to-AI loops while allowing mentioned bots to respond
-      let mentionedBotName: string | null = null;
-      for (const bot of bots || []) {
-        if (messageMentionsBot(msg.content, bot.username)) {
-          mentionedBotName = bot.username;
-          break;
-        }
-      }
-      
-      // If message mentions a bot, it's likely a human message that got attributed wrong
-      // OR it's an AI responding to a human - either way, let it through for mention processing
-      if (mentionedBotName) {
-        this.logFn("ai_chat_debug", `Message from AI bot ${msg.sender} mentions ${mentionedBotName} - processing for mention`);
-      } else {
-        this.logFn("ai_chat_debug", `Ignoring message from AI bot: ${msg.sender}`);
-        return;
-      }
+      // Allow AI bot messages through - they can create fun faction conversations
+      // The self-message check in addChatMessage() prevents bots from responding to themselves
+      this.logFn("ai_chat_debug", `Message from AI bot ${msg.sender} - allowing for bot-to-bot conversation`);
     }
 
     // Check if message mentions ANY of our bots
@@ -743,26 +824,15 @@ export class AiChatService {
     // If a specific bot is mentioned, ONLY that bot can respond
     // This prevents other bots from responding even with "respond to all" enabled
     if (mentionedBotName) {
-      this.logFn("ai_chat_debug", `Message mentions ${mentionedBotName}, checking if it should respond...`);
-      
-      // Check if the receiving bot is the mentioned bot
-      const receivingBot = msg.botUsername || "";
-      this.logFn("ai_chat_debug", `Receiving bot: ${receivingBot}, mentioned bot: ${mentionedBotName}`);
-      
-      if (receivingBot !== mentionedBotName) {
-        // This bot received the message but wasn't the one mentioned - skip silently
-        this.logFn("ai_chat_debug", `Received by ${receivingBot} but mentions ${mentionedBotName} - skipping`);
-        return;
-      }
-      
-      // The receiving bot IS the mentioned bot - proceed with mention response
-      this.logFn("ai_chat", `Processing mention: ${mentionedBotName} received message mentioning them`);
+      this.logFn("ai_chat_debug", `Message mentions ${mentionedBotName}, finding that bot to respond...`);
+
+      // Select the mentioned bot directly (regardless of which bot received the message)
       const responder = this.selectResponderByMention(mentionedBotName);
       if (!responder) {
         this.logFn("ai_chat", `Mentioned bot ${mentionedBotName} not available to respond`);
         return;
       }
-      
+
       this.logFn("ai_chat", `Responding to mention: ${mentionedBotName}`);
       await this.handleResponse(responder, msg, settings, msg.sender, true);
       return;
@@ -787,21 +857,39 @@ export class AiChatService {
 
     this.logFn("ai_chat", `Should respond to [${msg.channel}] ${msg.sender}: ${reason}`);
 
-    // Select responder for non-mention messages
+    // Check faction chat rounds limit (only for faction channel)
+    if (msg.channel === "faction") {
+      if (this.checkFactionChatRoundsLimit(settings)) {
+        this.logFn("ai_chat", `Faction chat rounds limit reached (${this.factionChatRounds}/${settings.factionChatRoundsLimit}), skipping`);
+        return;
+      }
+    }
+
+    // Select responder(s) for non-mention messages
     // For local chat, prefer the bot that received the message (guaranteed to be at correct location)
-    const responder = this.selectResponder(msg, msg.channel === "local" ? (msg.botUsername || "") : "");
-    if (!responder) {
+    const candidates = this.selectResponderCandidates(msg, msg.channel === "local" ? (msg.botUsername || "") : "");
+    if (candidates.length === 0) {
       this.logFn("ai_chat", "No available bot to respond");
       return;
     }
 
-    this.logFn("ai_chat", `Selected responder: ${responder.username}`);
-    await this.handleResponse(responder, msg, settings, msg.sender, true);
+    this.logFn("ai_chat", `Selected ${candidates.length} candidate bot(s): ${candidates.map(b => b.username).join(", ")}`);
+    
+    // Try each candidate until one succeeds
+    const triedBots = new Set<string>();
+    for (const candidate of candidates) {
+      triedBots.add(candidate.username);
+      const result = await this.handleResponse(candidate, msg, settings, msg.sender, true, triedBots);
+      if (result === "sent") {
+        break; // Success, stop trying
+      }
+    }
   }
 
   /**
    * Handle response logic (lock, limits, send).
    * For local chat, verifies bot is at same location as receiving bot.
+   * Returns: "sent" if response was sent, "failed" if not
    */
   private async handleResponse(
     responder: Bot,
@@ -810,21 +898,21 @@ export class AiChatService {
     humanSender: string,
     isHumanSender: boolean,
     triedBots: Set<string> = new Set()
-  ): Promise<void> {
+  ): Promise<"sent" | "failed"> {
     // Check conversation limits (cooldown, consecutive responses)
     // Use channel + human sender as key (not responder) so only one bot responds per conversation
     const participants = [humanSender]; // Don't include responder - conversation is per channel+sender
     const limits = this.checkConversationLimits(msg.channel, participants);
     if (!limits.allowed) {
       this.logFn("ai_chat", `Skipping: ${limits.reason}`);
-      return;
+      return "failed";
     }
 
     // Check global lock
     const channelId = `${msg.channel}:${responder.system || "unknown"}`;
     if (!this.canRespond(responder.username, humanSender, channelId, settings.lockDurationSec)) {
       this.logFn("ai_chat", `Lock held, skipping`);
-      return;
+      return "failed";
     }
 
     // For LOCAL chat: verify responder is at same location as receiving bot
@@ -833,52 +921,46 @@ export class AiChatService {
       const locationMatch = this.checkLocationMatch(responder, msg);
       if (!locationMatch.matched) {
         this.logFn("ai_chat", `${responder.username} at wrong location (${responder.system}/${responder.poi}), message was from ${msg.botSystem}/${msg.botPoi}`);
-
-        // Try to find a bot at the correct location
-        const locationBot = this.findBotAtLocation(msg, triedBots);
-        if (locationBot) {
-          this.logFn("ai_chat", `Found bot at correct location: ${locationBot.username}`);
-          triedBots.add(responder.username);
-          await this.handleResponse(locationBot, msg, settings, humanSender, isHumanSender, triedBots);
-          return;
-        } else {
-          this.logFn("ai_chat", "No bot at correct location, skipping response");
-          return;
-        }
+        return "failed"; // Caller will try next candidate
       }
     } else if (msg.channel === "local" && responder.username === msg.botUsername) {
       // Log that we're skipping location check for receiving bot
       this.logFn("ai_chat_debug", `Skipping location check for ${responder.username} (is the receiving bot)`);
     }
 
+    // For SYSTEM chat: verify responder is in the same system where the chat originated
+    // Skip this check if the responder IS the receiving bot (it obviously can respond to messages it received)
+    if (msg.channel === "system" && responder.username !== msg.botUsername && msg.botSystem) {
+      if (responder.system !== msg.botSystem) {
+        this.logFn("ai_chat", `${responder.username} not in system where chat originated (${responder.system} vs ${msg.botSystem})`);
+        return "failed"; // Caller will try next candidate
+      }
+    } else if (msg.channel === "system" && responder.username === msg.botUsername) {
+      // Log that we're skipping system check for receiving bot
+      this.logFn("ai_chat_debug", `Skipping system check for ${responder.username} (is the receiving bot)`);
+    }
+
     // Try to acquire lock
     if (!this.tryAcquireLock(responder.username, humanSender, channelId, settings.lockDurationSec)) {
       this.logFn("ai_chat", `Failed to acquire lock`);
-      return;
+      return "failed";
     }
 
     // Generate and send response (may fail if traveling for local chat)
     const result = await this.sendResponse(responder, msg, settings, humanSender, triedBots);
-    
+
     if (result === "traveling" && msg.channel === "local") {
-      // Bot was traveling, try to find another bot that received this message
-      this.logFn("ai_chat", `${responder.username} is traveling, trying to find alternative bot...`);
-      
-      const alternativeBot = this.findAlternativeBot(msg, responder.username, triedBots);
-      if (alternativeBot) {
-        this.logFn("ai_chat", `Found alternative: ${alternativeBot.username}`);
-        triedBots.add(responder.username);
-        await this.handleResponse(alternativeBot, msg, settings, humanSender, isHumanSender, triedBots);
-        return;
-      } else {
-        this.logFn("ai_chat", "No alternative bot available, skipping response");
-      }
+      // Bot was traveling, return failed so caller tries next candidate
+      this.logFn("ai_chat", `${responder.username} is traveling, will try next candidate...`);
+      return "failed";
     }
-    
+
     // Record this response for conversation tracking (only if not traveling)
     if (result !== "traveling") {
       this.recordResponse(msg.channel, participants, isHumanSender);
     }
+
+    return result === "sent" ? "sent" : "failed";
   }
 
   /**
@@ -898,67 +980,8 @@ export class AiChatService {
     if (responder.poi !== msg.botPoi) {
       return { matched: false, reason: `different POI: ${responder.poi} vs ${msg.botPoi}` };
     }
-    
+
     return { matched: true, reason: "location matches" };
-  }
-
-  /**
-   * Find a bot at the same location as the original message receiver.
-   */
-  private findBotAtLocation(msg: ChatMessage, triedBots: Set<string>): Bot | null {
-    const bots = AiChatService.getBots();
-    if (!bots || bots.length === 0) return null;
-    if (!msg.botSystem || !msg.botPoi) return null;
-
-    for (const bot of bots) {
-      if (triedBots.has(bot.username)) continue;
-      if (bot.state !== "running" && bot.state !== "idle") continue;
-      if (!bot.api.getSession()) continue;
-      
-      // Check if bot is at same location
-      if (bot.system === msg.botSystem && bot.poi === msg.botPoi) {
-        return bot;
-      }
-    }
-    
-    return null;
-  }
-
-  /**
-   * Find an alternative bot that also received the message and isn't traveling.
-   * For local chat, also verifies location match.
-   */
-  private findAlternativeBot(msg: ChatMessage, excludeBot: string, triedBots: Set<string>): Bot | null {
-    const bots = AiChatService.getBots();
-    if (!bots || bots.length === 0) return null;
-
-    // Find bots that aren't traveling and haven't been tried
-    for (const bot of bots) {
-      if (bot.username === excludeBot) continue;
-      if (triedBots.has(bot.username)) continue;
-      if (bot.state !== "running" && bot.state !== "idle") continue;
-      if (!bot.api.getSession()) continue;
-      
-      // Check if bot is traveling
-      if (!bot.poi || bot.poi === "") {
-        this.logFn("ai_chat_debug", `${bot.username} is traveling (no POI), skipping`);
-        continue;
-      }
-      
-      // For local chat, also check location match
-      if (msg.channel === "local") {
-        if (msg.botSystem && msg.botPoi) {
-          if (bot.system !== msg.botSystem || bot.poi !== msg.botPoi) {
-            this.logFn("ai_chat_debug", `${bot.username} at wrong location (${bot.system}/${bot.poi}), skipping`);
-            continue;
-          }
-        }
-      }
-      
-      return bot;
-    }
-    
-    return null;
   }
 
   /**
@@ -976,46 +999,126 @@ export class AiChatService {
   }
 
   /**
-   * Select which bot should respond to a message.
-   * Priority: mentioned bot > receiving bot > any available bot
-   * Bots can be idle or running (AI Chat is a background service).
+   * Select candidate bots for responding to a message.
+   * Returns an array of bots in priority order (receiving bot first, then others by availability).
+   * For local/system chat, this helps ensure we try bots at the correct location first.
    */
-  private selectResponder(msg: ChatMessage, receivingBot: string): Bot | null {
+  private selectResponderCandidates(msg: ChatMessage, receivingBot: string): Bot[] {
     const bots = AiChatService.getBots();
-    this.logFn("ai_chat_debug", `selectResponder: receivingBot=${receivingBot}, total bots=${bots?.length || 0}`);
+    this.logFn("ai_chat_debug", `selectResponderCandidates: receivingBot=${receivingBot}, total bots=${bots?.length || 0}`);
     if (!bots || bots.length === 0) {
       this.logFn("ai_chat_debug", "No bots available");
-      return null;
+      return [];
     }
 
     // Log all bots and their states
     for (const b of bots) {
-      this.logFn("ai_chat_debug", `  Bot: ${b.username}, state=${b.state}, hasSession=${!!b.api.getSession()}`);
+      this.logFn("ai_chat_debug", `  Bot: ${b.username}, state=${b.state}, hasSession=${!!b.api.getSession()}, system=${b.system}, poi=${b.poi}`);
     }
 
-    // Find the receiving bot if specified
+    const candidates: Bot[] = [];
+    const addedBots = new Set<string>();
+
+    // Priority 1: The receiving bot (if specified) - it's guaranteed to be at the correct location for local chat
+    // BUT: For faction chat, only add receiving bot to the pool (don't prioritize it) to encourage randomness
     if (receivingBot) {
       const target = bots.find(b => b.username === receivingBot);
-      this.logFn("ai_chat_debug", `Looking for ${receivingBot}: found=${!!target}, state=${target?.state}, session=${!!target?.api.getSession()}`);
+      this.logFn("ai_chat_debug", `Looking for receiving bot ${receivingBot}: found=${!!target}, state=${target?.state}, session=${!!target?.api.getSession()}`);
       if (target && (target.state === "running" || target.state === "idle") && target.api.getSession()) {
-        return target;
+        // For local chat, prioritize receiving bot (must be at correct location)
+        // For faction/system chat, just add to pool without prioritizing
+        if (msg.channel === "local") {
+          candidates.push(target);
+        } else {
+          // Add to pool but don't prioritize - will be shuffled later for faction chat
+          addedBots.add(target.username);
+        }
       }
     }
 
-    // Find any available bot (idle or running with active session)
-    // Prefer bots that aren't currently locked
-    for (const bot of bots) {
-      this.logFn("ai_chat_debug", `Checking bot ${bot.username}: state=${bot.state}, locked=${this.globalChatLock?.botName === bot.username}`);
-      if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
-      if (this.globalChatLock && this.globalChatLock.botName === bot.username) continue;
-      this.logFn("ai_chat_debug", `Selected ${bot.username} as responder`);
-      return bot;
+    // Priority 2: For local/system chat, bots at the correct location/system
+    if (msg.channel === "local" && msg.botSystem && msg.botPoi) {
+      for (const bot of bots) {
+        if (addedBots.has(bot.username)) continue;
+        if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+        if (bot.system === msg.botSystem && bot.poi === msg.botPoi) {
+          this.logFn("ai_chat_debug", `Adding location-matched bot: ${bot.username}`);
+          candidates.push(bot);
+          addedBots.add(bot.username);
+        }
+      }
     }
 
-    // Fallback to first bot with session
-    const fallback = bots.find(b => (b.state === "running" || b.state === "idle") && b.api.getSession());
-    this.logFn("ai_chat_debug", `Fallback: ${fallback?.username || "none"}`);
-    return fallback || null;
+    // Priority 3: For system chat, bots in the correct system
+    if (msg.channel === "system" && msg.botSystem) {
+      for (const bot of bots) {
+        if (addedBots.has(bot.username)) continue;
+        if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+        if (bot.system === msg.botSystem) {
+          this.logFn("ai_chat_debug", `Adding system-matched bot: ${bot.username}`);
+          candidates.push(bot);
+          addedBots.add(bot.username);
+        }
+      }
+    }
+
+    // Priority 4: Any available bot (idle or running with active session)
+    // Prefer bots that aren't currently locked
+    for (const bot of bots) {
+      if (addedBots.has(bot.username)) continue;
+      if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
+      if (this.globalChatLock && this.globalChatLock.botName === bot.username) {
+        this.logFn("ai_chat_debug", `Skipping locked bot: ${bot.username}`);
+        continue;
+      }
+      addedBots.add(bot.username);
+    }
+
+    // Fallback: Any bot with session (even if state is unusual)
+    for (const bot of bots) {
+      if (addedBots.has(bot.username)) continue;
+      if (bot.api.getSession()) {
+        addedBots.add(bot.username);
+      }
+    }
+
+    // For FACTION chat: shuffle all available bots to ensure randomness
+    // This prevents the same bots (#1, #2) from always dominating
+    if (msg.channel === "faction") {
+      const allAvailableBots: Bot[] = [];
+      for (const bot of bots) {
+        if (addedBots.has(bot.username)) {
+          allAvailableBots.push(bot);
+        }
+      }
+      // Fisher-Yates shuffle for true randomness
+      for (let i = allAvailableBots.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [allAvailableBots[i], allAvailableBots[j]] = [allAvailableBots[j], allAvailableBots[i]];
+      }
+      candidates.push(...allAvailableBots);
+      this.logFn("ai_chat_debug", `Faction chat: shuffled ${allAvailableBots.length} candidates for randomness`);
+    } else {
+      // For other channels, add remaining bots in order (Priority 4 + Fallback)
+      for (const bot of bots) {
+        if (addedBots.has(bot.username) && !candidates.includes(bot)) {
+          candidates.push(bot);
+        }
+      }
+    }
+
+    this.logFn("ai_chat_debug", `Returning ${candidates.length} candidate(s): ${candidates.map(b => b.username).join(", ")}`);
+    return candidates;
+  }
+
+  /**
+   * Select which bot should respond to a message (legacy single-bot version).
+   * Priority: receiving bot > any available bot
+   * Bots can be idle or running (AI Chat is a background service).
+   */
+  private selectResponder(msg: ChatMessage, receivingBot: string): Bot | null {
+    const candidates = this.selectResponderCandidates(msg, receivingBot);
+    return candidates.length > 0 ? candidates[0] : null;
   }
 
   private canRespond(botName: string, sender: string, channel: string, lockDurationSec: number): boolean {
@@ -1063,6 +1166,293 @@ export class AiChatService {
     return false;
   }
 
+  /**
+   * Gather comprehensive bot context for LLM prompts.
+   * Calls get_status, get_nearby, get_ship, get_active_missions, get_system, and get_poi.
+   * Returns a formatted string suitable for inclusion in system prompts.
+   */
+  private async gatherBotContext(bot: Bot): Promise<string> {
+    const lines: string[] = [];
+
+    // Get status (basic state)
+    try {
+      const statusResp = await bot.exec("get_status", {});
+      if (!statusResp.error && statusResp.result) {
+        const status = statusResp.result as any;
+        
+        // The response may have nested structures: { player: {...}, ship: {...} }
+        // or flat fields. Handle both.
+        const player = status.player || status;
+        const ship = status.ship || {};
+        
+        lines.push("## Current Status (get_status)");
+        lines.push(`- Credits: ${player.credits ?? status.credits ?? "N/A"}`);
+        lines.push(`- Fuel: ${ship.fuel ?? status.fuel ?? "N/A"} / ${ship.max_fuel ?? status.max_fuel ?? "N/A"}`);
+        lines.push(`- Cargo: ${ship.cargo_used ?? status.cargo ?? "N/A"} / ${ship.cargo_capacity ?? status.max_cargo ?? "N/A"}`);
+        lines.push(`- Hull: ${ship.hull ?? status.hull ?? "N/A"} / ${ship.max_hull ?? status.max_hull ?? "N/A"}`);
+        lines.push(`- Shield: ${ship.shield ?? status.shield ?? "N/A"} / ${ship.max_shield ?? status.max_shield ?? "N/A"}`);
+        lines.push(`- Location: ${player.current_system ?? status.system ?? "unknown"} / ${player.current_poi ?? status.poi ?? "unknown"}`);
+        lines.push(`- Docked: ${player.docked_at_base ?? status.docked ?? false}`);
+        lines.push(`- Faction: ${status.faction_name ?? player.faction_name ?? "None"}`);
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Current Status: Error retrieving");
+      lines.push("");
+    }
+
+    // Get ship details
+    try {
+      const shipResp = await bot.exec("get_ship", {});
+      if (!shipResp.error && shipResp.result) {
+        const ship = shipResp.result as any;
+        // Ship data may be nested under .ship or flat
+        const shipData = ship.ship || ship;
+        
+        lines.push("## Ship Details (get_ship)");
+        lines.push(`- Name: ${shipData.name ?? "N/A"}`);
+        lines.push(`- Type: ${shipData.type ?? shipData.ship_type ?? "N/A"}`);
+        lines.push(`- Class: ${shipData.class ?? "N/A"}`);
+        lines.push(`- Hull: ${shipData.hull ?? "N/A"} / ${shipData.max_hull ?? "N/A"} (hit points, NOT percentage)`);
+        lines.push(`- Shield: ${shipData.shield ?? shipData.shields ?? "N/A"} / ${shipData.max_shield ?? shipData.max_shields ?? "N/A"} (hit points, NOT percentage)`);
+        lines.push(`- Fuel: ${shipData.fuel ?? "N/A"} / ${shipData.max_fuel ?? "N/A"} (units, NOT percentage)`);
+        lines.push(`- Cargo: ${shipData.cargo_used ?? "N/A"} / ${shipData.cargo_capacity ?? shipData.max_cargo ?? "N/A"} (units used/total, NOT percentage)`);
+        lines.push(`- CPU: ${shipData.cpu_used ?? "N/A"} / ${shipData.cpu_capacity ?? shipData.cpu_max ?? "N/A"}`);
+        lines.push(`- Power: ${shipData.power_used ?? "N/A"} / ${shipData.power_capacity ?? shipData.power_max ?? "N/A"}`);
+        lines.push(`- Speed: ${shipData.speed ?? "N/A"}`);
+        lines.push(`- Armor: ${shipData.armor ?? "N/A"}`);
+        
+        // Modules/weapons - these are technical IDs like "mining_laser_i", "gas_harvester_iii", "autocannon_i"
+        const modules = shipData.modules || shipData.mods || shipData.installed_mods || [];
+        if (Array.isArray(modules) && modules.length > 0) {
+          const moduleNames = modules.map((m: any) => {
+            if (typeof m === "string") return m;
+            return m.name || m.mod_id || m.id || m.type || "Unknown";
+          });
+          lines.push(`- Installed Modules (technical IDs - describe them accurately based on their names): ${moduleNames.join(", ")}`);
+        } else {
+          lines.push("- Modules: None");
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Ship Details: Error retrieving");
+      lines.push("");
+    }
+
+    // Get cargo inventory
+    try {
+      const cargoResp = await bot.exec("get_cargo", {});
+      if (!cargoResp.error && cargoResp.result) {
+        const cargo = cargoResp.result as any;
+        lines.push("## Cargo Inventory (get_cargo)");
+        
+        // Handle both array and { items: [...] } formats
+        const items = Array.isArray(cargo) ? cargo : (cargo.items || cargo.cargo || []);
+        if (Array.isArray(items) && items.length > 0) {
+          for (const item of items) {
+            const itemName = item.name || item.item_name || item.type || "Unknown";
+            const quantity = item.quantity ?? item.amount ?? item.count ?? "?";
+            lines.push(`- ${itemName}: ${quantity}`);
+          }
+        } else {
+          lines.push("- Cargo hold empty");
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Cargo Inventory: Error retrieving");
+      lines.push("");
+    }
+
+    // Get skills
+    try {
+      const skillsResp = await bot.exec("get_skills", {});
+      if (!skillsResp.error && skillsResp.result) {
+        const skillsData = skillsResp.result as any;
+        lines.push("## Skills (get_skills)");
+        
+        // Handle different response formats (same as bot.ts checkSkills)
+        let skillsContainer = skillsData;
+        if (!Array.isArray(skillsData) && skillsData.skills !== undefined) {
+          skillsContainer = skillsData.skills;
+        }
+
+        if (Array.isArray(skillsContainer) && skillsContainer.length > 0) {
+          const skillEntries = skillsContainer.map((s: any) => {
+            const name = s.name || s.skill_name || s.id || "Unknown";
+            const level = s.level ?? s.current_level ?? 0;
+            const xp = s.xp !== undefined ? ` (${s.xp} XP)` : "";
+            return `${name}: ${level}${xp}`;
+          });
+          lines.push(`- ${skillEntries.join(", ")}`);
+        } else if (typeof skillsContainer === "object" && !Array.isArray(skillsContainer)) {
+          // Dict format: { skill_name: { level, xp, ... } } or { skill_name: level }
+          const entries = Object.entries(skillsContainer).map(([key, val]: [string, any]) => {
+            if (typeof val === "number") {
+              return `${key}: ${val}`;
+            }
+            const level = val.level ?? val.current_level ?? "?";
+            const xp = val.xp !== undefined ? ` (${val.xp} XP)` : "";
+            const name = val.name || key;
+            return `${name}: ${level}${xp}`;
+          });
+          lines.push(`- ${entries.join(", ")}`);
+        } else {
+          lines.push("- No skills data available");
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Skills: Error retrieving");
+      lines.push("");
+    }
+
+    // Get nearby entities
+    try {
+      const nearbyResp = await bot.exec("get_nearby", {});
+      if (!nearbyResp.error && nearbyResp.result) {
+        const nearby = nearbyResp.result as any;
+        lines.push("## Nearby Entities (get_nearby)");
+        
+        const players = nearby.players || nearby.entities?.filter((e: any) => e.type === "player") || [];
+        const npcs = nearby.npcs || nearby.entities?.filter((e: any) => e.type === "npc") || [];
+        const stations = nearby.stations || nearby.entities?.filter((e: any) => e.type === "station") || [];
+        
+        if (players.length > 0) {
+          lines.push(`- Players (${players.length}): ${players.map((p: any) => p.name || p).join(", ")}`);
+        }
+        if (npcs.length > 0) {
+          lines.push(`- NPCs (${npcs.length}): ${npcs.map((n: any) => n.name || n).join(", ")}`);
+        }
+        if (stations.length > 0) {
+          lines.push(`- Stations (${stations.length}): ${stations.map((s: any) => s.name || s).join(", ")}`);
+        }
+        if (players.length === 0 && npcs.length === 0 && stations.length === 0) {
+          lines.push("- No entities nearby");
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Nearby Entities: Error retrieving");
+      lines.push("");
+    }
+
+    // Get active missions
+    try {
+      const missionsResp = await bot.exec("get_active_missions", {});
+      if (!missionsResp.error && missionsResp.result) {
+        const missions = missionsResp.result as any;
+        lines.push("## Active Missions (get_active_missions)");
+        
+        if (missions.missions && Array.isArray(missions.missions) && missions.missions.length > 0) {
+          for (const mission of missions.missions) {
+            lines.push(`- ${mission.name || "Unknown"}: ${mission.description || mission.objective || "No description"}`);
+            if (mission.progress) lines.push(`  Progress: ${mission.progress}`);
+            if (mission.reward) lines.push(`  Reward: ${mission.reward}`);
+          }
+        } else {
+          lines.push("- No active missions");
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Active Missions: Error retrieving");
+      lines.push("");
+    }
+
+    // Get completed missions
+    try {
+      const completedResp = await bot.exec("completed_missions", {});
+      if (!completedResp.error && completedResp.result) {
+        const completed = completedResp.result as any;
+        lines.push("## Completed Missions (completed_missions)");
+        
+        const missionsList = Array.isArray(completed) ? completed : (completed.missions || []);
+        if (Array.isArray(missionsList) && missionsList.length > 0) {
+          // Show last 10 completed missions
+          const recentMissions = missionsList.slice(-10);
+          lines.push(`- Total Completed: ${missionsList.length}`);
+          for (const mission of recentMissions) {
+            const name = mission.name || mission.mission_name || "Unknown";
+            const reward = mission.reward || mission.credits_earned ? ` (${mission.reward || mission.credits_earned} credits)` : "";
+            lines.push(`  * ${name}${reward}`);
+          }
+          if (missionsList.length > 10) {
+            lines.push(`  ... and ${missionsList.length - 10} more`);
+          }
+        } else {
+          lines.push("- No completed missions");
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## Completed Missions: Error retrieving");
+      lines.push("");
+    }
+
+    // Get system info
+    try {
+      const systemResp = await bot.exec("get_system", {});
+      if (!systemResp.error && systemResp.result) {
+        const system = systemResp.result as any;
+        lines.push("## System Info (get_system)");
+        lines.push(`- System Name: ${system.name ?? bot.system ?? "unknown"}`);
+        lines.push(`- System Type: ${system.type ?? "N/A"}`);
+        lines.push(`- Security Level: ${system.security ?? "N/A"}`);
+        
+        if (system.pois && Array.isArray(system.pois) && system.pois.length > 0) {
+          lines.push(`- Points of Interest (${system.pois.length}):`);
+          for (const poi of system.pois.slice(0, 10)) {
+            lines.push(`  * ${poi.name} (${poi.type})${poi.has_base ? " [Station]" : ""}`);
+          }
+          if (system.pois.length > 10) {
+            lines.push(`  ... and ${system.pois.length - 10} more`);
+          }
+        }
+        
+        if (system.connections && Array.isArray(system.connections)) {
+          lines.push(`- Connected Systems: ${system.connections.map((c: any) => c.name || c.system_name || c).join(", ")}`);
+        }
+        lines.push("");
+      }
+    } catch (err) {
+      lines.push("## System Info: Error retrieving");
+      lines.push("");
+    }
+
+    // Get POI info (if docked or at a POI)
+    if (bot.poi && bot.poi !== "") {
+      try {
+        const poiResp = await bot.exec("get_poi", { poi_id: bot.poi });
+        if (!poiResp.error && poiResp.result) {
+          const poi = poiResp.result as any;
+          lines.push("## Current POI Details (get_poi)");
+          lines.push(`- Name: ${poi.name ?? bot.poi}`);
+          lines.push(`- Type: ${poi.type ?? "N/A"}`);
+          lines.push(`- Description: ${poi.description ?? "N/A"}`);
+          if (poi.services && Array.isArray(poi.services)) {
+            lines.push(`- Services: ${poi.services.join(", ")}`);
+          }
+          if (poi.market && typeof poi.market === "object") {
+            lines.push(`- Market: Available`);
+          }
+          lines.push("");
+        }
+      } catch (err) {
+        lines.push("## Current POI Details: Error retrieving");
+        lines.push("");
+      }
+    }
+
+    return lines.join("\n") || "No additional context available.";
+  }
+
+  /**
+   * Generate and send a response.
+   * For local chat, the bot must be at the same location as the receiving bot.
+   * Returns: "sent" if response was sent, "traveling" if bot is traveling, "error" on failure.
+   */
   private async sendResponse(
     bot: Bot,
     msg: ChatMessage,
@@ -1081,6 +1471,10 @@ export class AiChatService {
     // Load galaxy map data for factual responses
     const mapSummary = getCachedMapSummary();
 
+    // Gather comprehensive real-time context from the bot
+    this.logFn("ai_chat_debug", `Gathering real-time context for ${bot.username}...`);
+    const botContext = await this.gatherBotContext(bot);
+
     const systemPrompt = `${personality}
 
 ## Galaxy Map Data (Real Game Data)
@@ -1093,12 +1487,21 @@ ${mapSummary}
 - You are currently in system: ${bot.system || "unknown"}
 - Chat channel: ${msg.channel}
 
+## Real-Time Game State
+This is your current situation in the game:
+
+${botContext}
+
 ## Response Rules
 - Keep responses short (1-3 sentences max)
 - Be natural and conversational
 - Don't spam or be repetitive
-- Use the map data above to provide accurate information about systems and resources
-- If asked about a system not listed, mention there are many more systems and suggest using /get_system in-game
+- Use the real-time game state above to provide accurate, contextual responses
+- Reference your actual status, ship, nearby players, missions, and location when relevant
+- If asked about something you can see in your current context, use that information
+- Hull, shield, fuel, and cargo values are ABSOLUTE numbers (hit points/units), NOT percentages. Say "550 hull" not "55% hull"
+- Module names are technical IDs (e.g., "gas_harvester_iii" = Gas Harvester III, "mining_laser_i" = Mining Laser I). Describe them accurately based on their actual names
+- If asked about a system not in the map data, mention there are many more systems and suggest using /get_system in-game
 - If asked about game mechanics, share what you know`;
 
     const recentHistory = mem.conversationHistory
@@ -1168,6 +1571,13 @@ ${mapSummary}
           mem.conversationHistory = mem.conversationHistory.slice(-50);
         }
         saveMemory(mem);
+
+        // Increment faction chat rounds counter if this was a faction chat message
+        if (msg.channel === "faction") {
+          this.incrementFactionChatRounds();
+          this.logFn("ai_chat_debug", `Faction chat round ${this.factionChatRounds}/${settings.factionChatRoundsLimit || "∞"}`);
+        }
+
         return "sent";
       } else {
         // Check if error is due to traveling
@@ -1220,10 +1630,16 @@ ${mapSummary}
     const systemPrompt = `${personality || "You are a helpful rescue pilot in SpaceMolt."}
 
 Context:
-- Your callsign: ${bot.username}
+- You are: ${bot.username} (use "I" and "me" when referring to yourself, NOT your name)
 - You are currently in: ${context.currentSystem}
 - Stranded pilot is in: ${context.targetSystem}${context.jumps ? ` (${context.jumps} jumps away)` : ""}
 - ${context.situation}
+
+IMPORTANT NOTES ABOUT FUEL:
+${context.playerFuelPct !== undefined ? `- The STRANDED PILOT'S fuel level is ${context.playerFuelPct}% (this is THEIR fuel, NOT yours)` : `- Fuel levels are not specified - focus on the situation described`}
+${context.fuelRefueled !== undefined ? `- You transferred ${context.fuelRefueled} fuel units to the stranded pilot` : ''}
+- NEVER confuse the stranded pilot's fuel level with your own fuel level
+- When referring to fuel, always clarify whose fuel you're talking about
 
 Task:
 Generate a brief radio transmission message (max 2 sentences) to send via private chat to the stranded pilot.
@@ -1232,7 +1648,8 @@ Style:
 - Keep it natural and in-character
 - Be concise (this is a radio transmission)
 - Include relevant details (ETA, jumps, etc.) if provided
-- Don't be overly verbose`;
+- Don't be overly verbose
+- Use 1st person ("I", "me", "my") when talking about yourself`;
 
     const userMessage = `Generate a private message to ${targetPlayer}:
 
@@ -1323,22 +1740,22 @@ Message:`;
     switch (messageType) {
       case "rescue_start":
         situation = isMayday
-          ? "You received a MAYDAY distress call and are launching a rescue mission."
-          : "One of your faction bots needs emergency fuel rescue.";
+          ? `You received a MAYDAY distress call from ${targetName} and are launching a rescue mission.`
+          : `Your faction bot ${targetName} needs emergency fuel rescue.`;
         styleGuide = isMayday
           ? "Be heroic and reassuring. Let faction members know you're responding to an emergency."
           : "Be helpful and team-oriented. Let faction members know you're helping a fellow bot.";
         break;
       case "rescue_arrived":
-        situation = `You have arrived at ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""} to assist.`;
+        situation = `You have arrived at ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""} to assist ${targetName}.`;
         styleGuide = "Be confident and professional. Announce your arrival.";
         break;
       case "rescue_complete":
-        situation = "You have successfully refueled the target and they are now safe.";
+        situation = `You have successfully refueled ${targetName} and they are now safe.`;
         styleGuide = "Be triumphant and positive. Celebrate the successful rescue.";
         break;
       case "rescue_no_show":
-        situation = `You traveled all the way to ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""} to help, but they were not there.`;
+        situation = `You traveled all the way to ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""} to help ${targetName}, but they were not there.`;
         styleGuide = "Be grumpy and annoyed. Express frustration about the wasted trip. Maybe mutter about being ghosted.";
         break;
     }
@@ -1347,9 +1764,10 @@ Message:`;
     const systemPrompt = `${personality || "You are a rescue pilot in SpaceMolt."}
 
 Context:
-- Your callsign: ${bot.username}
+- You are: ${bot.username} (use "I" and "me" when referring to yourself, NOT your name)
 - You are currently in: ${context.currentSystem}
 - Target location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}${jumps ? ` (${jumps} jumps from your previous location)` : ""}
+- Target name: ${targetName}
 - ${situation}
 - This message goes to FACTION chat (all faction members can see it)
 
@@ -1362,12 +1780,13 @@ Style:
 - ${styleGuide}
 - ${messageType === "rescue_no_show" ? "Show genuine annoyance - you wasted fuel and time!" : "Include relevant details (location, status) if appropriate"}
 - Don't be overly verbose
-- Do NOT start the message with the target's name - we already know who they are`;
+- Mention the target by name (${targetName}) naturally in the message
+- IMPORTANT: Use 1st person ("I", "me", "my") when talking about yourself. Do NOT say "${bot.username} here" or refer to yourself in 3rd person`;
 
     const userMessage = `Generate a faction chat message:
 
 Message type: ${messageType}
-Target: ${isBot ? "Faction bot" : "Player"}${isMayday ? ", MAYDAY distress call" : ""}
+Target: ${targetName}${isMayday ? " (MAYDAY distress call)" : ""}
 ${targetFuelPct ? `Their fuel level: ${targetFuelPct}%` : ""}
 Location: ${context.targetSystem}${context.targetPoi ? `/${context.targetPoi}` : ""}
 ${jumps ? `Jumps to get there: ${jumps}` : ""}
@@ -1446,6 +1865,23 @@ Message:`;
       return;
     }
 
+    // Check customs response chance (1 in X)
+    const chanceRoll = Math.floor(Math.random() * settings.customsResponseChance) + 1;
+    if (chanceRoll !== 1) {
+      this.logFn("ai_chat_debug", `Customs response skipped: failed ${settings.customsResponseChance} chance check (rolled ${chanceRoll})`);
+      return;
+    }
+
+    // Check for Karen mode (1 in X chance, only if enabled)
+    let isKarenMode = false;
+    if (settings.karenModeChance > 0) {
+      const karenRoll = Math.floor(Math.random() * settings.karenModeChance) + 1;
+      if (karenRoll === 1) {
+        isKarenMode = true;
+        this.logFn("ai_chat", "🚨 KAREN MODE ACTIVATED! (1 in " + settings.karenModeChance + " chance)");
+      }
+    }
+
     const bots = AiChatService.getBots();
     const bot = bots.find(b => b.username === botName);
 
@@ -1453,27 +1889,50 @@ Message:`;
       this.logFn("error", `Customs response: Bot ${botName} not found`);
       return;
     }
-    const personality = getBotPersonality(botName);
-    
-    // Build context for the LLM
-    const systemPrompt = `${personality}
 
-Context:
+    // Get bot's normal personality
+    const basePersonality = getBotPersonality(botName);
+
+    // Build Karen mode addition if triggered
+    const karenAddition = isKarenMode ? `
+
+⚠️ KAREN MODE ACTIVATED ⚠️
+You are currently outraged and entitled. On top of your normal personality, you must:
+- Demand to speak to the customs manager
+- Act like this inspection is beneath you / a waste of your time
+- Be condescending or threatening (mention reporting them, taking your business elsewhere, etc.)
+- Use phrases like "Do you know who I am?", "This is unacceptable!", "Get me your supervisor!"
+- Still stay in-character with your base personality, but amplified with Karen energy` : "";
+
+    // Gather comprehensive real-time context
+    this.logFn("ai_chat_debug", `Gathering real-time context for customs response (${botName})...`);
+    const botContext = await this.gatherBotContext(bot);
+
+    // Build context for the LLM
+    const systemPrompt = `${basePersonality}${karenAddition}
+
+## Your Current Situation
 - You are ${botName} in SpaceMolt
 - You are currently in an empire system
 - Customs has stopped you for a cargo scan
 - This has happened ${context.botStops} time(s) to you
 
-Task:
+## Real-Time Game State
+This is your current situation:
+
+${botContext}
+
+## Task
 Generate a brief chat message response to the customs agent.
 
-Style:
+## Style
 - Keep it in-character with your personality
 - Be concise (1-2 sentences max)
 - For stop_request: Acknowledge compliance or express mild annoyance
 - For cleared: Express relief or gratitude
 - For contraband: Show surprise, denial, or acceptance depending on personality
-- For evasion: Be defensive or apologetic`;
+- For evasion: Be defensive or apologetic
+- Use the real-time game state above to make your response more contextual and realistic`;
 
     let userMessage = "";
     switch (context.messageType) {
@@ -1511,7 +1970,11 @@ They're warning you for not staying still. Respond defensively or apologetically
       });
 
       if (!chatResp.error) {
-        this.logFn("ai_chat", `→ Customs response: ${cleanResponse}`);
+        if (isKarenMode) {
+          this.logFn("ai_chat", `🚨 KAREN RESPONSE: ${cleanResponse}`);
+        } else {
+          this.logFn("ai_chat", `→ Customs response: ${cleanResponse}`);
+        }
       } else {
         this.logFn("error", `Customs response failed: ${chatResp.error.message}`);
       }

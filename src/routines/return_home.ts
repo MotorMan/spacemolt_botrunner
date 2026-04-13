@@ -9,6 +9,7 @@ import {
   isStationPoi,
   readSettings,
   sleep,
+  checkAndFleeFromBattle,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -137,7 +138,13 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   yield "navigate";
   if (bot.system !== homeSystem) {
     ctx.log("travel", `Navigating to ${homeSystem}...`);
-    
+
+    // Pre-navigation battle check
+    if (await checkAndFleeFromBattle(ctx, "return_home")) {
+      ctx.log("error", "Battle detected before navigation - cannot continue");
+      return; // Cancel routine
+    }
+
     const MAX_NAV_ATTEMPTS = 3;
     let navAttempts = 0;
     let arrived = false;
@@ -160,15 +167,15 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         const isTimeout = msg.includes("524") || msg.includes("timeout") || msg.includes("Timeout");
-        
+
         ctx.log("error", `Navigation error (attempt ${navAttempts}/${MAX_NAV_ATTEMPTS}): ${msg}`);
-        
+
         if (!isTimeout) {
           // Non-timeout error - don't retry
           ctx.log("error", `Failed to reach ${homeSystem} — routine cancelled`);
           return;
         }
-        
+
         // Timeout error - wait and retry
         if (navAttempts < MAX_NAV_ATTEMPTS) {
           const waitTime = 10000 * navAttempts; // 10s, 20s, 30s
@@ -222,7 +229,9 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   }
 
   // Dock at station (skip storage collection - return home doesn't need to manage items)
+  // Refresh status first to ensure bot.docked is current before calling ensureDocked
   yield "dock";
+  await bot.refreshStatus();
   const docked = await ensureDocked(ctx, true);
   if (!docked) {
     ctx.log("error", "Failed to dock at home station — routine cancelled");

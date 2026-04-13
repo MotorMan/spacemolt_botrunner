@@ -8,6 +8,7 @@
  */
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { getSystemBlacklist } from "../web/server.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -25,6 +26,11 @@ import {
   findStation,
   isStationPoi,
   type SystemPOI,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
+  type BattleState,
+  handleBattleNotifications,
+  getBattleStatus,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -288,19 +294,41 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
 
   // For stations with bases, use base_id for travel (game API expects base_id for faction stations)
   const targetPoiId = targetStation.base_id && targetStation.has_base ? targetStation.base_id : targetStation.id;
-  
+
   if (bot.poi !== targetPoiId) {
     ctx.log("travel", `Traveling to home station...`);
     const tResp = await bot.exec("travel", { target_poi: targetPoiId });
-    if (tResp.error && !tResp.error.message.includes("already")) {
-      ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
+
+    // Check for battle after travel
+    if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+      ctx.log("combat", "Battle detected during travel to home station - fleeing!");
+      await sleep(5000);
       return;
+    }
+
+    if (tResp.error) {
+      const errMsg = tResp.error.message.toLowerCase();
+      // CRITICAL: Check for battle interrupt error
+      if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+        ctx.log("combat", `Travel to home station interrupted by battle! ${tResp.error.message} - fleeing!`);
+        return;
+      }
+      if (!errMsg.includes("already")) {
+        ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
+        return;
+      }
     }
     bot.poi = targetPoiId;
   }
 
   // Dock
   await ensureDocked(ctx);
+
+  // Check for battle after dock
+  if (await checkAndFleeFromBattle(ctx, "dock")) {
+    await sleep(5000);
+    return;
+  }
 
   // Deposit all non-fuel cargo to faction storage
   await bot.refreshCargo();
@@ -338,6 +366,21 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(10000); continue; }
+
+    // ── Battle state tracking (per-cycle initialization) ──
+    const battleState: BattleState = {
+      inBattle: false,
+      battleId: null,
+      battleStartTick: null,
+      lastHitTick: null,
+      isFleeing: false,
+    };
+
+    // ── Battle check ──
+    if (await checkAndFleeFromBattle(ctx, "cleanup")) {
+      await sleep(5000);
+      continue;
+    }
 
     const settings = getCleanupSettings(bot.username);
     const safetyOpts = {
@@ -493,13 +536,14 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
     let totalCredits = 0;
     let totalItems = 0;
 
-    // Sort by distance (same-system first, then by jump count)
+    // Sort by distance (same-system first, then by jump count, avoiding blacklisted systems)
+    const blacklist = getSystemBlacklist();
     stationsWithStorage.sort((a, b) => {
       const aLocal = a.systemId === bot.system ? 0 : 1;
       const bLocal = b.systemId === bot.system ? 0 : 1;
       if (aLocal !== bLocal) return aLocal - bLocal;
-      const aRoute = mapStore.findRoute(bot.system, a.systemId);
-      const bRoute = mapStore.findRoute(bot.system, b.systemId);
+      const aRoute = mapStore.findRoute(bot.system, a.systemId, blacklist);
+      const bRoute = mapStore.findRoute(bot.system, b.systemId, blacklist);
       const aJumps = aRoute ? aRoute.length - 1 : 999;
       const bJumps = bRoute ? bRoute.length - 1 : 999;
       return aJumps - bJumps;
@@ -529,15 +573,39 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       await ensureUndocked(ctx);
       if (bot.poi !== station.poiId) {
         const tResp = await bot.exec("travel", { target_poi: station.poiId });
-        if (tResp.error && !tResp.error.message.includes("already")) {
-          ctx.log("error", `Travel to ${station.poiName} failed: ${tResp.error.message} — skipping`);
+
+        // Check for battle after travel
+        if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+          ctx.log("combat", "Battle detected during travel - fleeing!");
+          await sleep(5000);
           continue;
+        }
+
+        if (tResp.error) {
+          const errMsg = tResp.error.message.toLowerCase();
+          // CRITICAL: Check for battle interrupt error
+          if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+            ctx.log("combat", `Travel to station interrupted by battle! ${tResp.error.message} - fleeing!`);
+            await sleep(5000);
+            continue;
+          }
+          if (!errMsg.includes("already")) {
+            ctx.log("error", `Travel to ${station.poiName} failed: ${tResp.error.message} — skipping`);
+            continue;
+          }
         }
         bot.poi = station.poiId;
       }
 
       // Dock
       await ensureDocked(ctx);
+
+      // Check for battle after dock
+      if (await checkAndFleeFromBattle(ctx, "dock")) {
+        await sleep(5000);
+        continue;
+      }
+
       if (!bot.docked) {
         ctx.log("error", `Could not dock at ${station.poiName} — skipping`);
         continue;

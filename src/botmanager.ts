@@ -5,7 +5,7 @@ import { SessionManager } from "./session.js";
 import { minerRoutine } from "./routines/miner.js";
 import { explorerRoutine } from "./routines/explorer.js";
 import { crafterRoutine } from "./routines/crafter.js";
-import { rescueRoutine, fuelTransferRoutine, manualPlayerRescueRoutine, maydayRescueRoutine } from "./routines/rescue.js";
+import { rescueRoutine } from "./routines/rescue.js";
 import { coordinatorRoutine } from "./routines/coordinator.js";
 import { traderRoutine } from "./routines/trader.js";
 import { salvagerRoutine } from "./routines/salvager.js";
@@ -19,15 +19,17 @@ import { returnHomeRoutine } from "./routines/return_home.js";
 import { commandReceiverRoutine } from "./routines/command_receiver.js";
 import { fleetHunterCommanderRoutine } from "./routines/fleet_hunter_commander.js";
 import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordinate.js";
+import { escortRoutine } from "./routines/escort.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
 import { setLogSink } from "./ui.js";
-import { debugLog } from "./debug.js";
+import { debugLogForBot, logBotActivity } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { AiChatService } from "./aichat_service.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
 import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
+import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_chat_channel.js";
 
 interface BotState {
   wasRunning: boolean;
@@ -46,14 +48,38 @@ export function getDiscoveredBots(): string[] {
   return [...bots.keys()];
 }
 
+/** Get a bot by name (for API use). */
+export function getBot(name: string): Bot | undefined {
+  return bots.get(name);
+}
+
+/** Get the bot-to-bot chat channel service (for routines to use). */
+export function getBotChatChannel() {
+  return botChatChannel;
+}
+
+/** Send a chat message from a bot to other bots. */
+export function sendBotChatMessage(
+  sender: string,
+  content: string,
+  channel: BotChatChannel,
+  recipients: string[] = [],
+  metadata?: Record<string, unknown>
+): void {
+  botChatChannel.send({
+    sender,
+    recipients,
+    channel,
+    content,
+    metadata,
+  });
+}
+
 const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   miner: { name: "Miner", fn: minerRoutine },
   explorer: { name: "Explorer", fn: explorerRoutine },
   crafter: { name: "Crafter", fn: crafterRoutine },
   rescue: { name: "FuelRescue", fn: rescueRoutine },
-  fuel_transfer: { name: "FuelTransfer", fn: fuelTransferRoutine },
-  manual_rescue: { name: "ManualRescue", fn: manualPlayerRescueRoutine },
-  mayday: { name: "MaydayRescue", fn: maydayRescueRoutine },
   coordinator: { name: "Coordinator", fn: coordinatorRoutine },
   trader: { name: "Trader", fn: traderRoutine },
   salvager: { name: "Salvager", fn: salvagerRoutine },
@@ -67,6 +93,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },
   return_home: { name: "ReturnHome", fn: returnHomeRoutine },
   command_receiver: { name: "CommandReceiver", fn: commandReceiverRoutine },
+  escort: { name: "Escort", fn: escortRoutine },
 };
 
 // ── Auto-discover existing sessions ─────────────────────────
@@ -90,22 +117,12 @@ function discoverBots(): void {
 /** Categories that go to the broadcast panel instead of bot log. */
 const BROADCAST_CATEGORIES = new Set(["broadcast", "chat", "dm"]);
 
-const LOGS_DIR = join(BASE_DIR, "data", "logs");
-
-/** Append a line to a bot's persistent log file (data/logs/{username}.log). */
-function appendBotLog(username: string, line: string): void {
-  try {
-    if (!existsSync(LOGS_DIR)) mkdirSync(LOGS_DIR, { recursive: true });
-    appendFileSync(join(LOGS_DIR, `${username}.log`), line + "\n");
-  } catch { /* ignore write errors */ }
-}
-
 function setupBotLogging(bot: Bot): void {
   bot.onLog = (username, category, message) => {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
-    const datestamp = new Date().toISOString().slice(0, 10);
     const line = `${timestamp} [${username}] [${category}] ${message}`;
-    debugLog("bot:onLog", `${username} cat=${category}`, message);
+    debugLogForBot(username, "bot:onLog", `${username} cat=${category}`, message);
+    logBotActivity(username, category, message);
     if (category === "system" || category === "error") {
       server.logSystem(line);
     }
@@ -113,8 +130,6 @@ function setupBotLogging(bot: Bot): void {
     // Per-bot log for profile page activity log
     const botLine = `${timestamp} [${category}] ${message}`;
     server.logBot(username, botLine);
-    // Persistent per-bot log file
-    appendBotLog(username, `${datestamp} ${botLine}`);
   };
   bot.onFactionLog = (_username, line) => {
     server.logFaction(line);
@@ -235,11 +250,21 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
     (bot as unknown as Record<string, unknown>).routineParams = action.params;
   }
 
-  const startOpts = (routineKey === "rescue" || routineKey === "coordinator")
+  const startOpts = (routineKey === "rescue" || routineKey === "coordinator" || routineKey === "escort")
     ? { getFleetStatus: () => [...bots.values()].map(b => b.status()) }
     : undefined;
 
-  bot.start(routineKey, routine.fn, startOpts).then(() => {
+  // Add bot chat functions to all routines
+  const chatStartOpts = {
+    ...startOpts,
+    sendBotChat: (content: string, channel: string, recipients?: string[], metadata?: Record<string, unknown>) => {
+      sendBotChatMessage(botName, content, channel as BotChatChannel, recipients, metadata);
+    },
+    getAllBotNames: () => [...bots.keys()],
+    getBotAssignments: () => server.getBotAssignments(),
+  };
+
+  bot.start(routineKey, routine.fn, chatStartOpts).then(() => {
     server.logSystem(`Bot ${bot.username} routine finished.`);
     server.clearBotAssignment(botName);
     // Clear params after routine completes
@@ -314,10 +339,19 @@ async function handleEmergencyReturn(): Promise<WebActionResult> {
   for (const bot of runningBots) {
     const routineKey = "return_home";
     const routine = ROUTINES[routineKey];
-    
+
     server.logSystem(`Starting ${bot.username} with ${routine.name} routine...`);
-    
-    bot.start(routineKey, routine.fn, undefined).then(() => {
+
+    const botName = bot.username;
+    const chatStartOpts = {
+      sendBotChat: (content: string, channel: string, recipients?: string[], metadata?: Record<string, unknown>) => {
+        sendBotChatMessage(botName, content, channel as BotChatChannel, recipients, metadata);
+      },
+      getAllBotNames: () => [...bots.keys()],
+      getBotAssignments: () => server.getBotAssignments(),
+    };
+
+    bot.start(routineKey, routine.fn, chatStartOpts).then(() => {
       server.logSystem(`Bot ${bot.username} return_home routine finished.`);
       server.clearBotAssignment(bot.username);
     }).catch((err: unknown) => {
@@ -457,7 +491,7 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
     await bot.login();
   }
 
-  debugLog("exec:handler", `${botName} > ${command}`, params);
+  debugLogForBot(botName, "exec:handler", `${botName} > ${command}`, params);
   let resp = await bot.exec(command, params);
 
   // Track player names from get_nearby responses
@@ -527,11 +561,11 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   }
 
   if (resp.error) {
-    debugLog("exec:result", `${botName} > ${command} ERROR`, { error: resp.error.message, hasResult: resp.result !== undefined });
+    debugLogForBot(botName, "exec:result", `${botName} > ${command} ERROR`, { error: resp.error.message, hasResult: resp.result !== undefined });
     return { ok: false, error: resp.error.message, data: resp.result };
   }
 
-  debugLog("exec:result", `${botName} > ${command} OK`, { hasResult: resp.result !== undefined, resultType: typeof resp.result });
+  debugLogForBot(botName, "exec:result", `${botName} > ${command} OK`, { hasResult: resp.result !== undefined, resultType: typeof resp.result });
   return { ok: true, message: `${command} executed`, data: resp.result };
 }
 
@@ -551,12 +585,12 @@ async function main(): Promise<void> {
   // Route global ui.log() calls through the web server
   setLogSink((category, message) => {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
-    debugLog("sink:route", `category=${category}`, message);
+    debugLogForBot("SYSTEM", "sink:route", `category=${category}`, message);
     if (BROADCAST_CATEGORIES.has(category)) {
       const tagMatch = message.match(/^\[([^\]]+)\]\s*(.*)/s);
       if (tagMatch) {
         const [, tag, content] = tagMatch;
-        debugLog("sink:broadcast", `tag=${tag}`, content);
+        debugLogForBot("SYSTEM", "sink:broadcast", `tag=${tag}`, content);
         server.logBroadcast(`${tag} ${timestamp}`);
         server.logBroadcast(content);
         server.logBroadcast("");
@@ -567,10 +601,10 @@ async function main(): Promise<void> {
     }
     const line = `${timestamp} [${category}] ${message}`;
     if (category === "error") {
-      debugLog("sink:system", "error routed to system panel", line);
+      debugLogForBot("SYSTEM", "sink:system", "error routed to system panel", line);
       server.logSystem(line);
     }
-    debugLog("sink:activity", "routed to bot log", line);
+    debugLogForBot("SYSTEM", "sink:activity", "routed to bot log", line);
     server.logActivity(line);
   });
 
@@ -585,6 +619,17 @@ async function main(): Promise<void> {
   // Expose on globalThis for bot.ts to access
   (globalThis as any).aiChatService = aiChatService;
   server.logSystem("AI Chat service initialized");
+
+  // Set up bot-to-bot chat channel logging
+  botChatChannel.onGlobalMessage((msg: BotChatMessage) => {
+    const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+    const recipientInfo = msg.recipients.length > 0 
+      ? ` -> ${msg.recipients.join(", ")}` 
+      : " -> [broadcast]";
+    const line = `${timestamp} [BOT_CHAT] [${msg.channel}] ${msg.sender}${recipientInfo}: ${msg.content}`;
+    server.logSystem(line);
+  });
+  server.logSystem("Bot-to-bot chat channel initialized");
 
   // Set up mass disconnect detector callback
   massDisconnectDetector.setTriggerCallback((affectedBots) => {
@@ -784,7 +829,7 @@ async function main(): Promise<void> {
           if (existsSync(sessionFile)) {
             try {
               rmSync(sessionFile);
-              debugLog("shutdown", `Deleted session file for ${botName}`);
+              debugLogForBot(botName, "shutdown", `Deleted session file for ${botName}`);
             } catch (err) {
               server.logSystem(`Warning: Failed to delete session file for ${botName}: ${err}`);
             }

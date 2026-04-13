@@ -2,19 +2,18 @@
  * Fleet Hunter Subordinate routine — follows a fleet commander's orders.
  *
  * Responsibilities:
- * - Listen for fleet commands via faction chat
+ * - Listen for fleet commands via local fleet communication
  * - Follow commander's movement orders
  * - Engage targets called by commander
  * - Auto-flee if overwhelmed, then regroup
  * - Report status to commander (optional)
  *
  * Communication:
- * - Listens to faction chat for commands
- * - Format: [FLEET <fleetId>] <COMMAND> <params>
+ * - Listens to local fleet comm service (no faction chat monitoring)
  * - Commands: MOVE, ATTACK, FLEE, REGROUP, HOLD, PATROL
  *
  * Settings (data/settings.json under "fleet_hunter"):
- *   fleetId           — unique identifier for this fleet (for chat filtering)
+ *   fleetId           — unique identifier for this fleet (for filtering)
  *   refuelThreshold   — fuel % to trigger refuel stop (default: 40)
  *   repairThreshold   — hull % to abort and dock (default: 30)
  *   fleeThreshold     — hull % to flee active fight (default: 20)
@@ -26,6 +25,9 @@
 
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { fleetCommService, parseMoveParams, parseAttackTarget, type FleetCommand } from "../fleet_comm.js";
+import { getBotChatChannel } from "../botmanager.js";
+import type { BotChatMessage } from "../bot_chat_channel.js";
 import {
   findStation,
   isStationPoi,
@@ -43,6 +45,7 @@ import {
   sleep,
   logStatus,
   ensureFueled,
+  getBattleStatus,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -116,6 +119,8 @@ function getFleetHunterSettings(): {
   autoCloak: boolean;
   ammoThreshold: number;
   maxReloadAttempts: number;
+  huntingEnabled: boolean;
+  manualMode: boolean;
 } {
   const all = readSettings();
   const h = all.fleet_hunter || {};
@@ -131,59 +136,16 @@ function getFleetHunterSettings(): {
     autoCloak: (h.autoCloak as boolean) ?? false,
     ammoThreshold: (h.ammoThreshold as number) || 5,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
-  };
-}
-
-// ── Fleet command parsing ─────────────────────────────────────
-
-interface FleetCommand {
-  command: string;
-  params: string;
-  fleetId: string;
-}
-
-/** Parse a faction chat message for fleet commands. */
-function parseFleetCommand(content: string): FleetCommand | null {
-  // Format: [FLEET <fleetId>] <COMMAND> <params>
-  const match = content.match(/\[FLEET\s+([^\]]+)\]\s+(\w+)\s*(.*)/i);
-  if (!match) return null;
-
-  return {
-    fleetId: match[1].trim(),
-    command: match[2].trim().toUpperCase(),
-    params: match[3]?.trim() || "",
-  };
-}
-
-/** Check if a command is for our fleet. */
-function isCommandForUs(command: FleetCommand, ourFleetId: string): boolean {
-  return command.fleetId.toLowerCase() === ourFleetId.toLowerCase();
-}
-
-/** Parse target from ATTACK command params (format: "targetId:targetName"). */
-function parseAttackTarget(params: string): { id: string; name: string } | null {
-  const parts = params.split(":");
-  if (parts.length < 1 || !parts[0]) return null;
-  return {
-    id: parts[0],
-    name: parts[1] || parts[0],
-  };
-}
-
-/** Parse MOVE/REGROUP params (format: "systemId" or "systemId/poiId"). */
-function parseMoveParams(params: string): { systemId: string; poiId?: string } | null {
-  if (!params) return null;
-  const parts = params.split("/");
-  return {
-    systemId: parts[0],
-    poiId: parts[1] || undefined,
+    huntingEnabled: (h.huntingEnabled as boolean) ?? true,
+    manualMode: (h.manualMode as boolean) ?? false,
   };
 }
 
 // ── Fleet command state ──────────────────────────────────────
 
 interface FleetState {
-  currentCommand: FleetCommand | null;
+  currentCommand: string | null;
+  commandParams: string | null;
   lastCommandTime: number;
   targetSystem: string | null;
   targetPoi: string | null;
@@ -194,6 +156,7 @@ interface FleetState {
 
 const fleetState: FleetState = {
   currentCommand: null,
+  commandParams: null,
   lastCommandTime: 0,
   targetSystem: null,
   targetPoi: null,
@@ -202,45 +165,65 @@ const fleetState: FleetState = {
   regroupPoint: null,
 };
 
-// ── Faction chat monitoring ───────────────────────────────────
+// ── Local fleet command listener ─────────────────────────────
 
 const COMMAND_TIMEOUT_MS = 30000; // Commands expire after 30s
 
-/** Check faction chat for new fleet commands. */
-async function checkFleetCommands(ctx: RoutineContext): Promise<FleetCommand | null> {
+/** Create a command listener for the fleet comm service. */
+function createFleetCommandListener(ctx: RoutineContext): (command: FleetCommand) => Promise<void> {
   const { bot } = ctx;
   const settings = getFleetHunterSettings();
 
-  const chatResp = await bot.exec("get_chat_history", { channel: "faction", limit: 20 });
-  if (chatResp.error || !chatResp.result) return null;
+  return async (command: FleetCommand) => {
+    // Ignore if not for our fleet
+    if (command.fleetId !== settings.fleetId) return;
 
-  const r = chatResp.result as Record<string, unknown>;
-  const msgs = (
-    Array.isArray(chatResp.result) ? chatResp.result :
-    Array.isArray(r.messages) ? r.messages :
-    Array.isArray(r.history) ? r.history :
-    []
-  ) as Array<Record<string, unknown>>;
+    // Ignore if hunting is disabled (except for enable command)
+    if (!settings.huntingEnabled && command.type !== "HUNTING_ENABLED") return;
 
-  // Walk from newest to oldest
-  for (const msg of [...msgs].reverse()) {
-    const content = (msg.content as string) || (msg.message as string) || (msg.text as string) || "";
-    const fleetCmd = parseFleetCommand(content);
-    
-    if (!fleetCmd) continue;
-    if (!isCommandForUs(fleetCmd, settings.fleetId)) continue;
+    ctx.log("fleet", `Received command: ${command.type} ${command.params || ""}`);
+    fleetState.lastCommandTime = Date.now();
+    fleetState.currentCommand = command.type;
+    fleetState.commandParams = command.params || null;
 
-    // Check if this is a newer command than what we have
-    const ts = (msg.timestamp as number) || (msg.created_at as number) || 0;
-    const msgTimeMs = ts > 1000000000 ? ts * 1000 : ts; // Convert if Unix seconds
-    
-    if (msgTimeMs > fleetState.lastCommandTime) {
-      fleetState.lastCommandTime = msgTimeMs;
-      return fleetCmd;
+    // Commands are executed by the main routine loop
+  };
+}
+
+/** Create a bot chat message handler for fleet coordination. */
+function createBotChatMessageHandler(ctx: RoutineContext): (message: BotChatMessage) => void {
+  const { bot } = ctx;
+  const settings = getFleetHunterSettings();
+
+  return (message: BotChatMessage) => {
+    // Ignore messages from ourselves
+    if (message.sender === bot.username) return;
+
+    // Only process fleet channel messages
+    if (message.channel !== "fleet") return;
+
+    // Log the message
+    ctx.log("fleet", `[BOT_CHAT] ${message.sender}: ${message.content}`);
+
+    // Handle metadata if present
+    if (message.metadata?.type === "status_update") {
+      const { hull, shield, fuel, system, inBattle } = message.metadata;
+      ctx.log("fleet", `📊 Commander Status: Hull=${hull}% | Shield=${shield}% | Fuel=${fuel}% | System=${system} | Battle=${inBattle ? "YES" : "NO"}`);
     }
-  }
-
-  return null;
+    
+    // Handle commands from web UI or commander
+    if (message.metadata?.command && message.metadata?.fromWebUI) {
+      const cmd = message.metadata.command as string;
+      const params = (message.metadata.params as string) || "";
+      
+      ctx.log("fleet", `🎮 Web UI Command: ${cmd} ${params}`);
+      
+      // Update fleet state for command execution
+      fleetState.lastCommandTime = Date.now();
+      fleetState.currentCommand = cmd as any;
+      fleetState.commandParams = params || null;
+    }
+  };
 }
 
 // ── Command execution ─────────────────────────────────────────
@@ -248,7 +231,15 @@ async function checkFleetCommands(ctx: RoutineContext): Promise<FleetCommand | n
 /** Execute a MOVE command. */
 async function executeMoveCommand(ctx: RoutineContext, params: string): Promise<void> {
   const moveData = parseMoveParams(params);
-  if (!moveData) return;
+  if (!moveData) {
+    ctx.log("error", `MOVE command has invalid params: "${params}"`);
+    return;
+  }
+  
+  if (!moveData.systemId) {
+    ctx.log("error", `MOVE command has no target system! Params: "${params}"`);
+    return;
+  }
 
   const { bot } = ctx;
   const settings = getFleetHunterSettings();
@@ -279,7 +270,136 @@ async function executeMoveCommand(ctx: RoutineContext, params: string): Promise<
   }
 }
 
-/** Execute an ATTACK command. */
+// ── Combat — Tactical Fleet Subordinate Battle System ───────
+
+/**
+ * Emergency flee spam for subordinate — sends flee commands rapidly.
+ */
+async function emergencyFleeSpamSubordinate(ctx: RoutineContext, reason: string): Promise<void> {
+  const { bot } = ctx;
+  ctx.log("combat", `🚨 Subordinate EMERGENCY FLEE — ${reason}`);
+
+  for (let i = 0; i < 5; i++) {
+    await bot.exec("battle", { action: "stance", stance: "flee" });
+    await bot.exec("battle", { action: "retreat" });
+  }
+
+  await sleep(5000);
+  const status = await getBattleStatus(ctx);
+  if (status) {
+    ctx.log("combat", `⚠️ Still in battle after flee spam — trying again...`);
+    for (let i = 0; i < 5; i++) {
+      await bot.exec("battle", { action: "stance", stance: "flee" });
+      await bot.exec("battle", { action: "retreat" });
+    }
+  } else {
+    ctx.log("combat", `✅ Subordinate successfully disengaged`);
+  }
+}
+
+/**
+ * Analyze existing battle to determine if we should join and on which side.
+ * Subordinate version — mirrors commander's logic.
+ */
+async function analyzeBattleForSubordinate(
+  ctx: RoutineContext,
+  minPiratesToFlee: number,
+): Promise<{ shouldJoin: boolean; sideId?: number; reason: string; pirateCount: number }> {
+  const { bot } = ctx;
+
+  const battleStatus = await getBattleStatus(ctx);
+  if (!battleStatus) {
+    return { shouldJoin: false, reason: "No active battle detected", pirateCount: 0 };
+  }
+
+  interface SideInfo {
+    sideId: number;
+    playerCount: number;
+    pirateCount: number;
+    playerNames: string[];
+    pirateNames: string[];
+  }
+
+  const sideInfo: SideInfo[] = battleStatus.sides.map(side => {
+    const members = battleStatus.participants.filter(p => p.side_id === side.side_id);
+    const players = members.filter(p => {
+      const u = (p.username || "").toLowerCase();
+      return !u.includes("pirate") && !u.includes("drifter") &&
+             !u.includes("executioner") && !u.includes("sentinel") &&
+             !u.includes("prowler") && !u.includes("apex") &&
+             !u.includes("razor") && !u.includes("striker") &&
+             !u.includes("rampart") && !u.includes("stalwart") &&
+             !u.includes("bastion") && !u.includes("onslaught") &&
+             !u.includes("iron") && !u.includes("strike") &&
+             !p.username?.startsWith("[POLICE]");
+    });
+    const pirates = members.filter(p => {
+      const u = (p.username || "").toLowerCase();
+      return u.includes("pirate") || u.includes("drifter") ||
+             u.includes("executioner") || u.includes("sentinel") ||
+             u.includes("prowler") || u.includes("apex") ||
+             u.includes("razor") || u.includes("striker") ||
+             u.includes("rampart") || u.includes("stalwart") ||
+             u.includes("bastion") || u.includes("onslaught") ||
+             u.includes("iron") || u.includes("strike");
+    });
+
+    return {
+      sideId: side.side_id,
+      playerCount: players.length,
+      pirateCount: pirates.length,
+      playerNames: players.map(p => p.username || p.player_id),
+      pirateNames: pirates.map(p => p.username || p.player_id),
+    };
+  });
+
+  ctx.log("combat", `📊 Sub battle analysis: ${sideInfo.map(s =>
+    `Side ${s.sideId}: ${s.playerCount}p [${s.playerNames.join(",")}] vs ${s.pirateCount}pir [${s.pirateNames.join(",")}]`
+  ).join(" | ")}`);
+
+  // POLICE check
+  const hasPolice = battleStatus.participants.some(p => p.username?.startsWith("[POLICE]"));
+  if (hasPolice) {
+    return { shouldJoin: false, reason: "POLICE involved — staying out", pirateCount: 0 };
+  }
+
+  // Find player vs pirate sides
+  const playerVsPirateSides = sideInfo.filter(s => s.playerCount > 0 && s.pirateCount > 0);
+
+  if (playerVsPirateSides.length === 0) {
+    const nonPirateParticipants = battleStatus.participants.filter(p => {
+      const u = (p.username || "").toLowerCase();
+      return !u.includes("pirate") && !u.includes("drifter") && !p.username?.startsWith("[POLICE]");
+    });
+    if (nonPirateParticipants.length >= 2 && battleStatus.sides.length >= 2) {
+      return { shouldJoin: false, reason: "PvP battle — staying out", pirateCount: 0 };
+    }
+    return { shouldJoin: false, reason: "Pirate vs pirate — not engaging", pirateCount: 0 };
+  }
+
+  const sideToJoin = playerVsPirateSides.find(s => s.playerCount > 0);
+  if (!sideToJoin) {
+    return { shouldJoin: false, reason: "Could not determine side", pirateCount: 0 };
+  }
+
+  const opposingSide = sideInfo.find(s => s.sideId !== sideToJoin.sideId);
+  const opposingPirateCount = opposingSide?.pirateCount || 0;
+
+  if (opposingPirateCount >= minPiratesToFlee) {
+    return { shouldJoin: false, reason: `Too many pirates (${opposingPirateCount}) — too dangerous`, pirateCount: opposingPirateCount };
+  }
+
+  return {
+    shouldJoin: true,
+    sideId: sideToJoin.sideId,
+    reason: `Joining side ${sideToJoin.sideId} vs ${opposingPirateCount} pirate(s)`,
+    pirateCount: opposingPirateCount,
+  };
+}
+
+/**
+ * Execute an ATTACK command from the commander — uses proper tactical combat.
+ */
 async function executeAttackCommand(ctx: RoutineContext, params: string): Promise<void> {
   const targetData = parseAttackTarget(params);
   if (!targetData) return;
@@ -289,76 +409,243 @@ async function executeAttackCommand(ctx: RoutineContext, params: string): Promis
 
   fleetState.currentTargetId = targetData.id;
 
-  ctx.log("fleet", `Executing ATTACK on ${targetData.name} (${targetData.id})`);
+  // ── STEP 1: Check for existing battles ────────────────────
+  const battleStatus = await getBattleStatus(ctx);
+
+  if (battleStatus) {
+    ctx.log("combat", `⚔️ Subordinate: existing battle detected — analyzing...`);
+    const analysis = await analyzeBattleForSubordinate(ctx, settings.minPiratesToFlee);
+
+    if (!analysis.shouldJoin) {
+      ctx.log("combat", `⏭️ Subordinate skipping battle: ${analysis.reason}`);
+      fleetState.currentTargetId = null;
+      return;
+    }
+
+    // Join battle on player's side
+    ctx.log("combat", `✅ Subordinate joining battle side ${analysis.sideId}: ${analysis.reason}`);
+    const engageResp = await bot.exec("battle", { action: "engage", side_id: analysis.sideId!.toString() });
+
+    if (engageResp.error) {
+      ctx.log("error", `Subordinate failed to join battle: ${engageResp.error.message}`);
+      fleetState.currentTargetId = null;
+      return;
+    }
+
+    // Fight in joined battle
+    await fightSubordinateJoinedBattle(ctx, targetData, settings);
+    fleetState.currentTargetId = null;
+    return;
+  }
+
+  // ── STEP 2: No existing battle — start fresh fight ────────
+  ctx.log("combat", `🎯 Subordinate engaging ${targetData.name}...`);
 
   // Attack the target
   const attackResp = await bot.exec("attack", { target_id: targetData.id });
   if (attackResp.error) {
-    ctx.log("combat", `Attack on ${targetData.name}: ${attackResp.error.message}`);
+    const msg = attackResp.error.message.toLowerCase();
+    if (msg.includes("not found") || msg.includes("invalid") ||
+        msg.includes("no target") || msg.includes("already")) {
+      ctx.log("combat", `${targetData.name} unavailable — subordinate standing down`);
+      fleetState.currentTargetId = null;
+      return;
+    }
+    ctx.log("error", `Subordinate attack failed: ${attackResp.error.message}`);
+    fleetState.currentTargetId = null;
+    return;
   }
 
-  // Advance to close range
+  ctx.log("combat", `⚔️ Subordinate battle started with ${targetData.name} — advancing`);
+
+  // Advance to engaged (3 ticks)
   for (let zone = 0; zone < 3; zone++) {
+    if (bot.state !== "running") return;
+
     await bot.refreshStatus();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+
     if (hullPct <= settings.fleeThreshold) {
-      ctx.log("combat", `Hull critical (${hullPct}%) — fleeing!`);
-      fleetState.isFleeing = true;
-      await bot.exec("stance", { stance: "flee" });
+      ctx.log("combat", `💀 Hull critical (${hullPct}%) while advancing — subordinate fleeing!`);
+      await emergencyFleeSpamSubordinate(ctx, "hull critical while advancing");
+      fleetState.currentTargetId = null;
       return;
     }
 
-    const advResp = await bot.exec("advance");
-    if (advResp.error) break;
+    const advResp = await bot.exec("battle", { action: "advance" });
+    if (advResp.error) {
+      ctx.log("error", `Subordinate advance failed: ${advResp.error.message}`);
+      break;
+    }
+
+    const zoneNames = ["mid", "inner", "engaged"];
+    ctx.log("combat", `   Advanced to ${zoneNames[zone]} zone (${zone + 1}/3)`);
   }
 
-  // Combat loop
-  const MAX_COMBAT_TICKS = 30;
-  for (let tick = 0; tick < MAX_COMBAT_TICKS; tick++) {
-    if (bot.state !== "running") return;
+  // Set fire stance
+  await bot.exec("battle", { action: "stance", stance: "fire" });
+
+  // Tactical combat loop
+  const won = await fightSubordinateTacticalLoop(ctx, targetData, settings);
+  if (!won) {
+    ctx.log("combat", `Subordinate retreated from ${targetData.name}`);
+  }
+
+  fleetState.currentTargetId = null;
+}
+
+/**
+ * Fight in a battle the subordinate joined via engage.
+ */
+async function fightSubordinateJoinedBattle(
+  ctx: RoutineContext,
+  targetData: { id: string; name: string },
+  settings: ReturnType<typeof getFleetHunterSettings>,
+): Promise<void> {
+  const { bot } = ctx;
+
+  ctx.log("combat", `🎯 Subordinate fighting in joined battle — targeting ${targetData.name}`);
+
+  // Set target and fire stance
+  await bot.exec("battle", { action: "target", target_id: targetData.id });
+  await bot.exec("battle", { action: "stance", stance: "fire" });
+
+  const won = await fightSubordinateTacticalLoop(ctx, targetData, settings);
+  if (!won) {
+    ctx.log("combat", `Subordinate retreated from joined battle`);
+  }
+}
+
+/**
+ * Core tactical combat loop for subordinates.
+ * Uses server-synced ticks: ONE command per tick, wait for response.
+ * NO arbitrary tick limit - fights until victory or hull critical.
+ */
+async function fightSubordinateTacticalLoop(
+  ctx: RoutineContext,
+  targetData: { id: string; name: string },
+  settings: ReturnType<typeof getFleetHunterSettings>,
+): Promise<boolean> {
+  const { bot } = ctx;
+  let consecutiveBraceTicks = 0;
+  let lastKnownEnemyZone = "outer";
+  let tickCount = 0;
+  let ourCurrentZone = "outer";
+
+  while (true) {
+    if (bot.state !== "running") return false;
+    tickCount++;
+
+    // Use get_battle_status (FREE, no tick cost)
+    const status = await getBattleStatus(ctx);
+    if (!status) {
+      ctx.log("combat", `✅ ${targetData.name} destroyed — subordinate victory! (${tickCount} ticks)`);
+      return true;
+    }
+
+    // Check if target still alive
+    const targetParticipant = status.participants.find(
+      p => p.player_id === targetData.id || p.username === targetData.name
+    );
+    const targetStillAlive = targetParticipant && !targetParticipant.is_destroyed;
+
+    if (!targetStillAlive && targetParticipant) {
+      ctx.log("combat", `⚠️ ${targetData.name} marked destroyed but battle still active — waiting...`);
+      await sleep(2000);
+      continue;
+    }
 
     await bot.refreshStatus();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
 
-    // Emergency flee
-    if (hullPct <= settings.fleeThreshold) {
-      ctx.log("combat", `Hull critical (${hullPct}%) — fleeing!`);
-      fleetState.isFleeing = true;
-      await bot.exec("stance", { stance: "flee" });
-      await bot.exec("retreat");
-      return;
-    }
-
-    // Brace when shields critical
-    const shieldsCritical = shieldPct < 15 && hullPct < 70;
-    if (shieldsCritical) {
-      await bot.exec("stance", { stance: "brace" });
-    } else {
-      await bot.exec("stance", { stance: "fire" });
-    }
-
-    ctx.log("combat", `Tick ${tick + 1}: hull ${hullPct}% | shields ${shieldPct}% — attacking ${targetData.name}`);
-
-    // Continue attacking
-    const atkResp = await bot.exec("attack", { target_id: targetData.id });
-    if (atkResp.error) {
-      const msg = atkResp.error.message.toLowerCase();
-      if (
-        msg.includes("not in battle") || msg.includes("no battle") ||
-        msg.includes("battle_over") || msg.includes("destroyed") ||
-        msg.includes("dead") || msg.includes("not found")
-      ) {
-        ctx.log("combat", `${targetData.name} eliminated`);
-        fleetState.currentTargetId = null;
-        return;
+    // Track enemy zone
+    if (targetParticipant && targetParticipant.zone) {
+      if (targetParticipant.zone !== lastKnownEnemyZone) {
+        const zoneDir = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+        const prevDir = zoneDir[lastKnownEnemyZone as keyof typeof zoneDir] ?? 0;
+        const newDir = zoneDir[targetParticipant.zone as keyof typeof zoneDir] ?? 0;
+        if (newDir > prevDir) {
+          ctx.log("combat", `⚠️ ${targetData.name} advancing: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+        } else if (newDir < prevDir) {
+          ctx.log("combat", `${targetData.name} retreating: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+        }
+        lastKnownEnemyZone = targetParticipant.zone;
       }
     }
 
-    await sleep(1000);
-  }
+    // Emergency flee (ONLY based on hull)
+    if (hullPct <= settings.fleeThreshold) {
+      ctx.log("combat", `💀 Hull critical (${hullPct}%) — subordinate fleeing!`);
+      await emergencyFleeSpamSubordinate(ctx, `hull at ${hullPct}%`);
+      return false;
+    }
 
-  fleetState.currentTargetId = null;
+    // 3rd party detection
+    const ourSideId = status.your_side_id;
+    const thirdPartyParticipants = status.participants.filter(p =>
+      p.side_id !== ourSideId &&
+      p.player_id !== bot.username &&
+      p.username !== bot.username &&
+      p.player_id !== targetData.id &&
+      p.username !== targetData.name &&
+      !p.is_destroyed
+    );
+
+    if (thirdPartyParticipants.length >= settings.minPiratesToFlee) {
+      ctx.log("combat", `🚨 ${thirdPartyParticipants.length} third parties — subordinate fleeing!`);
+      await emergencyFleeSpamSubordinate(ctx, `${thirdPartyParticipants.length} third parties`);
+      return false;
+    }
+
+    // Log battle state
+    const enemyStance = targetParticipant?.stance || "unknown";
+    const enemyZone = targetParticipant?.zone || "unknown";
+    ctx.log("combat", `Sub Tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Shields=${shieldPct}%`);
+
+    // Decide action - use positional tactics
+    const zoneDirMap = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+    const enemyZoneNum = zoneDirMap[enemyZone as keyof typeof zoneDirMap] ?? 0;
+    const ourZoneNum = zoneDirMap[ourCurrentZone as keyof typeof zoneDirMap] ?? 0;
+
+    // Check if fighting high-damage enemy (boss/capitol/large)
+    // Note: We don't have tier info here, so we use damage-based heuristic
+    const isHighDamageEnemy = false; // Could track damage per tick like hunter.ts
+    const shieldsCritical = isHighDamageEnemy
+      ? (shieldPct < 40 || hullPct < 50)
+      : (shieldPct < 15 && hullPct < 70);
+
+    if (shieldsCritical && consecutiveBraceTicks < 3) {
+      ctx.log("combat", `🛡️ BRACE (${isHighDamageEnemy ? 'high-damage' : 'shields critical'})`);
+      await bot.exec("battle", { action: "stance", stance: "brace" });
+      consecutiveBraceTicks++;
+    } else if (shieldsCritical && consecutiveBraceTicks >= 3) {
+      ctx.log("combat", `⚔️ FIRE (braced ${consecutiveBraceTicks}, resuming)`);
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      consecutiveBraceTicks = 0;
+    } else if (consecutiveBraceTicks > 0) {
+      ctx.log("combat", `⚔️ FIRE (resuming after brace)`);
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      consecutiveBraceTicks = 0;
+    } else {
+      // Positional tactics
+      if (enemyZoneNum > ourZoneNum) {
+        ctx.log("combat", `⚔️ ADVANCING (enemy in ${enemyZone})`);
+        await bot.exec("battle", { action: "advance" });
+        ourCurrentZone = (["outer", "mid", "inner", "engaged"][Math.min(3, ourZoneNum + 1)]) as typeof ourCurrentZone;
+      } else if (enemyZoneNum <= ourZoneNum && ourZoneNum > 0) {
+        ctx.log("combat", `🔄 RETREAT (maintaining position)`);
+        await bot.exec("battle", { action: "retreat" });
+        ourCurrentZone = (["outer", "mid", "inner", "engaged"][Math.max(0, ourZoneNum - 1)]) as typeof ourCurrentZone;
+      } else {
+        ctx.log("combat", `⚔️ ADVANCING to engage`);
+        await bot.exec("battle", { action: "advance" });
+        ourCurrentZone = "mid";
+      }
+    }
+
+    await sleep(2000);
+  }
 }
 
 /** Execute a FLEE command. */
@@ -368,8 +655,7 @@ async function executeFleeCommand(ctx: RoutineContext): Promise<void> {
   ctx.log("fleet", "Executing FLEE — retreating immediately!");
   fleetState.isFleeing = true;
 
-  await bot.exec("stance", { stance: "flee" });
-  await bot.exec("retreat");
+  await emergencyFleeSpamSubordinate(ctx, "fleet FLEE command received");
 
   // After fleeing, set regroup point
   await bot.refreshStatus();
@@ -429,6 +715,29 @@ async function executePatrolCommand(ctx: RoutineContext): Promise<void> {
   fleetState.currentTargetId = null;
 }
 
+/** Execute a DOCK command. */
+async function executeDockCommand(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  
+  ctx.log("fleet", "Executing DOCK — docking at current station");
+  
+  // If already docked, do nothing
+  if (bot.docked) {
+    ctx.log("fleet", "Already docked");
+    return;
+  }
+  
+  // Dock the bot
+  const dockResp = await bot.exec("dock");
+  if (dockResp.error) {
+    ctx.log("error", `Failed to dock: ${dockResp.error.message}`);
+    return;
+  }
+  
+  bot.docked = true;
+  ctx.log("fleet", "Successfully docked");
+}
+
 // ── Fleet Hunter Subordinate Routine ─────────────────────────
 
 export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -436,21 +745,33 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
 
   await bot.refreshStatus();
 
-  ctx.log("fleet", "Fleet Hunter Subordinate online — awaiting commander's orders...");
   const settings = getFleetHunterSettings();
 
-  while (bot.state === "running") {
+  // Register with fleet comm service
+  const commandListener = createFleetCommandListener(ctx);
+  fleetCommService.subscribe(settings.fleetId, bot.username, commandListener);
+  fleetCommService.addSubordinate(settings.fleetId, bot.username);
+
+  // Register bot chat message handler
+  const botChatHandler = createBotChatMessageHandler(ctx);
+  getBotChatChannel().onMessage(bot.username, botChatHandler);
+
+  ctx.log("fleet", `Fleet Hunter Subordinate online — awaiting commander's orders (fleet: ${settings.fleetId})...`);
+
+  try {
+    while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { 
-      await sleep(30000); 
-      continue; 
+    if (!alive) {
+      await sleep(30000);
+      continue;
     }
 
+    const currentSettings = getFleetHunterSettings();
     const safetyOpts = {
-      fuelThresholdPct: settings.refuelThreshold,
-      hullThresholdPct: settings.repairThreshold,
-      autoCloak: settings.autoCloak,
+      fuelThresholdPct: currentSettings.refuelThreshold,
+      hullThresholdPct: currentSettings.repairThreshold,
+      autoCloak: currentSettings.autoCloak,
     };
 
     // ── Status ──
@@ -458,23 +779,23 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
     await bot.refreshStatus();
     logStatus(ctx);
 
-    // ── Check for fleet commands ──
+    // ── Process pending fleet commands (ALWAYS process commands, even if hunting disabled) ──
     yield "check_commands";
-    const newCommand = await checkFleetCommands(ctx);
-    
-    if (newCommand) {
-      ctx.log("fleet", `Received command: ${newCommand.command} ${newCommand.params}`);
-      fleetState.currentCommand = newCommand;
+    if (fleetState.currentCommand) {
+      const cmd = fleetState.currentCommand;
+      const params = fleetState.commandParams || "";
+
+      ctx.log("fleet", `🎯 Processing command: ${cmd} ${params}`);
 
       // Execute command based on type
-      switch (newCommand.command) {
+      switch (cmd) {
         case "MOVE":
           yield "exec_move";
-          await executeMoveCommand(ctx, newCommand.params);
+          await executeMoveCommand(ctx, params);
           break;
         case "ATTACK":
           yield "exec_attack";
-          await executeAttackCommand(ctx, newCommand.params);
+          await executeAttackCommand(ctx, params);
           break;
         case "FLEE":
           yield "exec_flee";
@@ -482,7 +803,7 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
           break;
         case "REGROUP":
           yield "exec_regroup";
-          await executeRegroupCommand(ctx, newCommand.params);
+          await executeRegroupCommand(ctx, params);
           break;
         case "HOLD":
           yield "exec_hold";
@@ -492,14 +813,89 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
           yield "exec_patrol";
           await executePatrolCommand(ctx);
           break;
+        case "DOCK":
+          yield "exec_dock";
+          await executeDockCommand(ctx);
+          break;
         default:
-          ctx.log("warn", `Unknown fleet command: ${newCommand.command}`);
+          ctx.log("warn", `Unknown fleet command: ${cmd}`);
       }
+
+      fleetState.currentCommand = null;
+      fleetState.commandParams = null;
+      
+      // After executing command, check if we should continue or wait
+      // If hunting is disabled and no more commands, just wait
+      const updatedSettings = getFleetHunterSettings();
+      if (!updatedSettings.huntingEnabled) {
+        ctx.log("fleet", "Hunting is disabled — executed command, now waiting...");
+        await sleep(2000);
+        continue;
+      }
+    }
+
+    // ── Check if hunting is disabled (only reaches here if no commands were pending) ──
+    if (!currentSettings.huntingEnabled) {
+      ctx.log("fleet", "Hunting is disabled — waiting for commands...");
+      await sleep(5000);
+      continue;
+    }
+
+    // ── In manual mode, just wait for commands ──
+    if (currentSettings.manualMode) {
+      ctx.log("fleet", "Manual mode active — awaiting commands");
+      await sleep(2000);
+    }
+
+    // ── Process pending fleet commands ──
+    yield "check_commands";
+    if (fleetState.currentCommand) {
+      const cmd = fleetState.currentCommand;
+      const params = fleetState.commandParams || "";
+      
+      ctx.log("fleet", `Processing command: ${cmd} ${params}`);
+
+      // Execute command based on type
+      switch (cmd) {
+        case "MOVE":
+          yield "exec_move";
+          await executeMoveCommand(ctx, params);
+          break;
+        case "ATTACK":
+          yield "exec_attack";
+          await executeAttackCommand(ctx, params);
+          break;
+        case "FLEE":
+          yield "exec_flee";
+          await executeFleeCommand(ctx);
+          break;
+        case "REGROUP":
+          yield "exec_regroup";
+          await executeRegroupCommand(ctx, params);
+          break;
+        case "HOLD":
+          yield "exec_hold";
+          await executeHoldCommand(ctx);
+          break;
+        case "PATROL":
+          yield "exec_patrol";
+          await executePatrolCommand(ctx);
+          break;
+        case "DOCK":
+          yield "exec_dock";
+          await executeDockCommand(ctx);
+          break;
+        default:
+          ctx.log("warn", `Unknown fleet command: ${cmd}`);
+      }
+      
+      fleetState.currentCommand = null;
+      fleetState.commandParams = null;
     }
 
     // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    const fueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await sleep(30000);
@@ -509,10 +905,10 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
     // ── Hull check ──
     await bot.refreshStatus();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-    if (hullPct <= settings.repairThreshold) {
+    if (hullPct <= currentSettings.repairThreshold) {
       ctx.log("system", `Hull at ${hullPct}% — docking for repairs`);
       yield "emergency_repair";
-      
+
       const docked = await ensureDocked(ctx);
       if (docked) {
         await repairShip(ctx);
@@ -554,5 +950,12 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
     // ── Idle wait ──
     yield "wait_idle";
     await sleep(2000);
+    }
+  } finally {
+    // Clean up bot chat handler
+    getBotChatChannel().offMessage(bot.username, botChatHandler);
+    // Unsubscribe from fleet commands
+    fleetCommService.unsubscribe(settings.fleetId, bot.username, commandListener);
+    ctx.log("fleet", "Fleet Hunter Subordinate offline — cleaned up handlers");
   }
 };

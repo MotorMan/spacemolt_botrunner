@@ -1,7 +1,7 @@
 import { SpaceMoltAPI, type ApiResponse } from "./api.js";
 import { SessionManager, type Credentials } from "./session.js";
 import { log, logError, logNotifications } from "./ui.js";
-import { debugLog } from "./debug.js";
+import { debugLogForBot } from "./debug.js";
 import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
@@ -9,11 +9,6 @@ import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsCh
 import { processPrivateMessage as processCooperationPrivateMessage } from "./cooperation/rescueCooperation.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
-
-// Simple sleep helper to avoid circular dependency with common.ts
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
 
 export interface CargoItem {
   itemId: string;
@@ -61,6 +56,17 @@ export interface RoutineContext {
   log: (category: string, message: string) => void;
   /** Optional: get status of all bots in the fleet (used by rescue routine). */
   getFleetStatus?: () => BotStatus[];
+  /** Optional: send a chat message to other bots. */
+  sendBotChat?: (
+    content: string,
+    channel: string,
+    recipients?: string[],
+    metadata?: Record<string, unknown>
+  ) => void;
+  /** Optional: get all bot usernames. */
+  getAllBotNames?: () => string[];
+  /** Optional: get bot assignments (maps bot name to routine key). */
+  getBotAssignments?: () => Record<string, string>;
 }
 
 /** A routine is an async generator that yields state names as it progresses. */
@@ -115,6 +121,9 @@ export class Bot {
   /** Cached faction storage items from last view_faction_storage. */
   factionStorage: CargoItem[] = [];
 
+  /** Cached faction ID from last get_status (null if not in a faction). */
+  faction: string | null = null;
+
   /** Whether the bot's ship is currently cloaked. */
   isCloaked = false;
 
@@ -143,6 +152,14 @@ export class Bot {
     outcome: "pending" | "cleared" | "contraband" | "evasion" | null;
     aiResponseSent: boolean; // Track if AI response was already sent
   } = { active: false, since: 0, system: "", poi: "", outcome: null, aiResponseSent: false };
+
+  /** Global battle state - updated by WebSocket notifications even when HTTP is hanging */
+  currentBattle: {
+    inBattle: boolean;
+    battleId: string | null;
+    lastUpdate: number; // Timestamp of last battle update
+    participants: Array<Record<string, unknown>>;
+  } = { inBattle: false, battleId: null, lastUpdate: 0, participants: [] };
 
   /** Timestamp when customs hold was last cleared (prevents rapid re-triggering). */
   private customsClearedAt: number = 0;
@@ -202,6 +219,83 @@ export class Bot {
     return creds?.empire || "";
   }
 
+  /**
+   * Execute an API command with a timeout. If the timeout fires, check if we
+   * arrived at the target (success) or not (return timeout error for retry).
+   */
+  private async execWithTimeout(
+    command: string,
+    payload: Record<string, unknown> | undefined,
+    timeoutMs: number,
+    targetId: string,
+  ): Promise<ApiResponse> {
+    // Race the API call against a timeout
+    const apiPromise = this.api.execute(command, payload);
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => reject(new Error(`TIMEOUT`)), timeoutMs);
+    });
+
+    try {
+      return await Promise.race([apiPromise, timeoutPromise]);
+    } catch (err) {
+      if (err instanceof Error && err.message === "TIMEOUT") {
+        this.log("warn", `${command} timed out after ${timeoutMs / 1000}s — checking position...`);
+        // Refresh status to see where we actually are
+        await this.refreshStatus();
+
+        // For jump: check if we're in the target system
+        if (command === "jump" && targetId) {
+          const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+          if (normalizeSystemName(this.system) === normalizeSystemName(targetId)) {
+            this.log("travel", `✓ Timeout check: confirmed at target ${targetId} — treating as success`);
+            return { error: undefined, result: { message: "Jump completed (timeout recovery)" }, notifications: [] };
+          }
+          
+          // CRITICAL: Check if we're in battle (jump was interrupted by combat)
+          // The battle state is tracked via WebSocket even when HTTP hangs
+          if (this.currentBattle.inBattle) {
+            this.log("combat", `Jump interrupted by battle! Battle ID: ${this.currentBattle.battleId} — we're in ${this.system}, not ${targetId}`);
+            return {
+              error: { code: "battle_interrupt", message: `Jump interrupted by battle ${this.currentBattle.battleId}` },
+              result: undefined,
+              notifications: [],
+            };
+          }
+        }
+
+        // For travel: check if we're at the target POI or system
+        if (command === "travel" && targetId) {
+          const normalize = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
+          // Target could be a POI ID or system ID
+          if (normalize(this.poi) === normalize(targetId) || normalize(this.system) === normalize(targetId)) {
+            this.log("travel", `✓ Timeout check: confirmed at target ${targetId} — treating as success`);
+            return { error: undefined, result: { message: "Travel completed (timeout recovery)" }, notifications: [] };
+          }
+          
+          // CRITICAL: Check if we're in battle (travel was interrupted by combat)
+          if (this.currentBattle.inBattle) {
+            this.log("combat", `Travel interrupted by battle! Battle ID: ${this.currentBattle.battleId} — we're in ${this.system}, not ${targetId}`);
+            return {
+              error: { code: "battle_interrupt", message: `Travel interrupted by battle ${this.currentBattle.battleId}` },
+              result: undefined,
+              notifications: [],
+            };
+          }
+        }
+
+        // Not at target — return timeout error so caller can retry
+        this.log("error", `${command} timed out — not at target ${targetId} (currently at ${this.system}/${this.poi})`);
+        return {
+          error: { code: "timeout", message: `${command} timed out after ${timeoutMs / 1000}s` },
+          result: undefined,
+          notifications: [],
+        };
+      }
+      // Re-throw other errors
+      throw err;
+    }
+  }
+
   log(category: string, message: string): void {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
     const line = `${timestamp} [${category}] ${message}`;
@@ -209,6 +303,38 @@ export class Bot {
     if (this.actionLog.length > this.maxLogEntries) {
       this.actionLog.shift();
     }
+
+    // Emergency Warp Stabilizer detection — monitor ALL log lines
+    // Check BEFORE logging to avoid recursion issues
+    if (message.includes("Emergency Warp Stabilizer activated")) {
+      // Log the emergency message directly without triggering another detection
+      const emergencyLine = `${timestamp} [emergency] ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`;
+      this.actionLog.push(emergencyLine);
+      const stopLine = `${timestamp} [system] ⛔ Routine stopped — please install a new stabilizer before resuming.`;
+      this.actionLog.push(stopLine);
+
+      if (this.onLog) {
+        this.onLog(this.username, "emergency", "⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.");
+        this.onLog(this.username, "system", "⛔ Routine stopped — please install a new stabilizer before resuming.");
+      } else {
+        console.log(
+          `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
+            `\x1b[91m[emergency]${RESET} ⚠️ Emergency Warp Stabilizer triggered! Ship warped to safety.`
+        );
+        console.log(
+          `\x1b[2m${timestamp}${RESET} ${this.color}[${this.username}]${RESET} ` +
+            `\x1b[93m[system]${RESET} ⛔ Routine stopped — please install a new stabilizer before resuming.`
+        );
+      }
+
+      // Stop the routine immediately
+      if (this._state === "running") {
+        this._state = "stopping";
+        this._abortController?.abort();
+      }
+      return; // Don't log the original message again, we've already handled it
+    }
+
     if (this.onLog) {
       this.onLog(this.username, category, message);
     } else {
@@ -230,8 +356,61 @@ export class Bot {
     }
 
     this._lastAction = command;
-    debugLog("bot:exec", `${this.username} > ${command}`, payload);
-    let resp = await this.api.execute(command, payload);
+    debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
+
+    // Apply 120s timeout to jump/travel commands to detect hangs
+    // Max normal jump time is 110s (without towing), so 120s is safe threshold
+    let resp: ApiResponse;
+    if (command === "jump" || command === "travel") {
+      const targetSystem = (payload?.target_system as string) || (payload?.target_poi as string) || "";
+      resp = await this.execWithTimeout(command, payload, 120_000, targetSystem);
+    } else {
+      resp = await this.api.execute(command, payload);
+    }
+
+    // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
+    // This prevents 502 errors from breaking routines mid-operation
+    if (resp.error && resp.error.message && resp.error.message.includes("502")) {
+      const MAX_502_RETRIES = 3;
+      for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
+        // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+        if (this.currentBattle.inBattle) {
+          this.log("combat", `HTTP 502 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+          break;
+        }
+        
+        const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
+        this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1}/${MAX_502_RETRIES} after ${waitTime/1000}s...`);
+        await sleep(waitTime);
+        resp = await this.api.execute(command, payload);
+        if (!resp.error || !resp.error.message?.includes("502")) break;
+      }
+      if (resp.error && resp.error.message?.includes("502")) {
+        this.log("error", `HTTP 502: Bad Gateway (after ${MAX_502_RETRIES} retries)`);
+      }
+    }
+
+    // Handle HTTP 524 Timeout — server took too long to respond (common during battles)
+    // Retry with backoff since battle notifications may still be flowing via WebSocket
+    if (resp.error && resp.error.message && resp.error.message.includes("524")) {
+      const MAX_524_RETRIES = 3;
+      for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
+        // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+        if (this.currentBattle.inBattle) {
+          this.log("combat", `HTTP 524 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+          break;
+        }
+        
+        const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
+        this.log("warn", `HTTP 524 Timeout — retry ${retry + 1}/${MAX_524_RETRIES} after ${waitTime/1000}s...`);
+        await sleep(waitTime);
+        resp = await this.api.execute(command, payload);
+        if (!resp.error || !resp.error.message?.includes("524")) break;
+      }
+      if (resp.error && resp.error.message?.includes("524")) {
+        this.log("error", `HTTP 524: Timeout (after ${MAX_524_RETRIES} retries)`);
+      }
+    }
 
     // Handle full login required (after too many session recovery failures)
     if (resp.error && resp.error.code === "full_login_required") {
@@ -262,10 +441,21 @@ export class Bot {
     // Wait for the tick to complete then retry once.
     if (resp.error) {
       const msg = resp.error.message || "";
-      if (resp.error.code === "action_pending" || msg.includes("action is already pending")) {
-        debugLog("bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
+      if (resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress")) {
+        debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
+        this.log("system", "Action pending — waiting for server to process...");
         await sleep(10_000);
+        // Refresh status before retry to ensure we're in a valid state
+        await this.refreshStatus();
         resp = await this.api.execute(command, payload);
+        
+        // If still pending, wait a bit longer and try one more time
+        if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
+          this.log("system", "Action still pending — waiting additional 5s...");
+          await sleep(5_000);
+          await this.refreshStatus();
+          resp = await this.api.execute(command, payload);
+        }
       }
     }
 
@@ -279,6 +469,7 @@ export class Bot {
       const code = resp.error.code || "";
       const quiet =
         code === "mission_incomplete" ||
+        code === "not_in_battle" ||
         (command === "view_faction_storage" && code !== "session_invalid") ||
         (command === "get_missions" && code !== "session_invalid") ||
         (command === "complete_mission" && code === "mission_incomplete") ||
@@ -378,17 +569,17 @@ export class Bot {
   /** Fetch current game state and cache it. */
   async refreshStatus(): Promise<ApiResponse> {
     const resp = await this.exec("get_status");
-    debugLog("bot:refreshStatus", `${this.username} get_status response`, resp.result);
+    debugLogForBot(this.username, "bot:refreshStatus", `${this.username} get_status response`, resp.result);
     if (resp.result && typeof resp.result === "object") {
       const r = resp.result as Record<string, unknown>;
-      debugLog("bot:refreshStatus", `${this.username} top-level keys`, Object.keys(r));
+      debugLogForBot(this.username, "bot:refreshStatus", `${this.username} top-level keys`, Object.keys(r));
 
       // Player data may be nested under r.player or flat at top level
       const player = r.player as Record<string, unknown> | undefined;
       const p = player || r;
 
       this.credits = (p.credits as number) ?? this.credits;
-      debugLog("bot:credits", `${this.username} credits=${this.credits} raw=${p.credits}`);
+      debugLogForBot(this.username, "bot:credits", `${this.username} credits=${this.credits} raw=${p.credits}`);
       this.system = (p.current_system as string) ?? this.system;
       this.poi = (p.current_poi as string) ?? (p.poi_id as string) ?? this.poi;
       this.docked = p.docked_at_base != null
@@ -399,9 +590,12 @@ export class Bot {
         (p.location as string) ||
         this.location;
 
+      // Faction membership
+      this.faction = (p.faction_id as string) ?? (p.faction as string) ?? null;
+
       // Ship fields
       const ship = r.ship as Record<string, unknown> | undefined;
-      debugLog("bot:ship", `${this.username} ship object`, ship);
+      debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
       if (ship) {
         const rawName = (ship.name as string) || "";
         const shipType = (ship.ship_type as string) || (ship.type as string) || "";
@@ -414,7 +608,28 @@ export class Bot {
         this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
         this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
         this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
-        this.ammo = (ship.ammo as number) ?? this.ammo;
+        
+        // Ammo is stored per-weapon-module, not at ship level.
+        // get_status may return modules as full objects or just IDs.
+        // Check both the ship.modules array and root-level modules array.
+        const modulesArray = (
+          Array.isArray(r.modules) ? r.modules :
+          Array.isArray(ship.modules) ? ship.modules :
+          []
+        ) as Array<Record<string, unknown>>;
+        
+        let totalAmmo = 0;
+        for (const mod of modulesArray) {
+          if (mod && typeof mod === "object" && mod.current_ammo != null && typeof mod.current_ammo === "number") {
+            totalAmmo += mod.current_ammo as number;
+          }
+        }
+        // Update ammo count: prefer calculated from modules, fall back to ship.ammo if it exists
+        if (totalAmmo > 0) {
+          this.ammo = totalAmmo;
+        } else if (ship.ammo != null) {
+          this.ammo = ship.ammo as number;
+        }
       }
 
       // Cloak detection
@@ -527,7 +742,11 @@ export class Bot {
   async start(
     routineName: string,
     routine: Routine,
-    opts?: { getFleetStatus?: () => BotStatus[] },
+    opts?: {
+      getFleetStatus?: () => BotStatus[];
+      sendBotChat?: (content: string, channel: string, recipients?: string[], metadata?: Record<string, unknown>) => void;
+      getAllBotNames?: () => string[];
+    },
   ): Promise<void> {
     if (this._state === "running") {
       this.log("error", "Bot is already running");
@@ -578,6 +797,8 @@ export class Bot {
       bot: this,
       log: (cat, msg) => this.log(cat, msg),
       getFleetStatus: opts?.getFleetStatus,
+      sendBotChat: opts?.sendBotChat,
+      getAllBotNames: opts?.getAllBotNames,
     };
 
     try {
@@ -721,13 +942,34 @@ export class Bot {
    */
   isCustomsHold(): boolean {
     if (!this.customsHold.active) return false;
-    
+
     // Auto-timeout after 30 seconds (customs ship should have arrived by then)
     const elapsed = Date.now() - this.customsHold.since;
     if (elapsed > 30000) {
       this.log("customs", "⏰ CUSTOMS TIMEOUT: Proceeding after 30s wait");
       this.customsHold.active = false;
       this.customsHold.outcome = "cleared";
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Check if we're currently in a battle based on global WebSocket state.
+   * This works even when HTTP requests are hanging (524 timeouts).
+   * @returns true if in battle, false otherwise
+   */
+  isInBattle(): boolean {
+    // Check if we're in battle and the last update was recent (within 60 seconds)
+    if (!this.currentBattle.inBattle) return false;
+    
+    const timeSinceUpdate = Date.now() - this.currentBattle.lastUpdate;
+    if (timeSinceUpdate > 60000) {
+      // Battle state is stale - clear it
+      this.currentBattle.inBattle = false;
+      this.currentBattle.battleId = null;
+      this.currentBattle.participants = [];
       return false;
     }
     
@@ -757,8 +999,10 @@ export class Bot {
       this.log("customs", "⏰ Customs scan timeout - proceeding");
       return "timeout";
     }
-    
-    return this.customsHold.outcome || "cleared";
+
+    const outcome = this.customsHold.outcome;
+    if (outcome === "pending") return "cleared";
+    return outcome || "cleared";
   }
 
   /**
@@ -793,14 +1037,34 @@ export class Bot {
           }
 
           this.log("chat", `Received [${channel}] ${sender}: ${content}`);
-          
+
           // Track player name from chat (but NOT from MAYDAY messages - those can be fake/pirate names)
+          // Also skip empire NPCs like customs agents and police
           if (sender && sender !== "Unknown" && sender !== this.username) {
             const contentLower = content.toLowerCase();
-            if (!contentLower.includes("mayday")) {
+            const senderLower = sender.toLowerCase();
+            
+            // Check if sender is an empire NPC (customs, police, etc.)
+            const isEmpireNpc = 
+              senderLower.startsWith("[customs]") ||
+              senderLower.startsWith("[police]") ||
+              senderLower.startsWith("confederacy customs") ||
+              senderLower.includes("customs i -") ||
+              senderLower.includes("customs ii -") ||
+              senderLower.includes("customs iii -") ||
+              senderLower.includes("confederacy customs i -") ||
+              senderLower.includes("confederacy customs ii -") ||
+              senderLower.includes("pact border") ||
+              senderLower.includes("pact enforcer") ||
+              senderLower.includes("federation patrol") ||
+              senderLower.includes("rim ranger");
+            
+            if (!contentLower.includes("mayday") && !isEmpireNpc) {
               playerNameStore.add(sender);
+            } else if (isEmpireNpc) {
+              debugLogForBot(this.username, "playernames:skip", `${this.username}`, `Ignored empire NPC sender: "${sender}"`);
             } else {
-              debugLog("playernames:skip", `${this.username}`, `Ignored MAYDAY sender: "${sender}"`);
+              debugLogForBot(this.username, "playernames:skip", `${this.username}`, `Ignored MAYDAY sender: "${sender}"`);
             }
           }
 
@@ -884,7 +1148,7 @@ export class Bot {
                   // Start customs hold - this will block travel/jump actions
                   this.startCustomsHold();
                   this.log("customs", "📋 Scan in progress - waiting for clearance...");
-                  logCustomsStop(this.username, this.system, this.poi, "pending");
+                  logCustomsStop(this.username, this.system, "pending");
 
                   // Send AI chat response to customs (only once per entire customs encounter)
                   // Check both aiResponseSent flag AND if we're still in the same hold session
@@ -902,19 +1166,19 @@ export class Bot {
                 } else if (customsDetection.type === "cleared") {
                   // Clear the hold - scan complete, all good
                   this.clearCustomsHold("cleared");
-                  logCustomsStop(this.username, this.system, this.poi, "cleared");
+                  logCustomsStop(this.username, this.system, "cleared");
                   // No AI response for clearance - just log and continue
                 } else if (customsDetection.type === "contraband") {
                   // Clear hold - contraband found, penalty process complete
                   this.clearCustomsHold("contraband");
                   this.log("customs", "⚠️ Contraband detected - penalty process complete");
-                  logCustomsStop(this.username, this.system, this.poi, "contraband");
+                  logCustomsStop(this.username, this.system, "contraband");
                   // No AI response for contraband - just log and continue
                 } else if (customsDetection.type === "evasion_warning") {
                   // Clear hold - evasion noted, process complete
                   this.clearCustomsHold("evasion");
                   this.log("customs", "⚠️ Evasion warning - process complete");
-                  logCustomsStop(this.username, this.system, this.poi, "evasion");
+                  logCustomsStop(this.username, this.system, "evasion");
                   // No AI response for evasion - just log and continue
                 }
               }
@@ -968,6 +1232,65 @@ export class Bot {
       let data = notif.data as Record<string, unknown> | string | undefined;
       if (typeof data === "string") {
         try { data = JSON.parse(data) as Record<string, unknown>; } catch { /* leave as string */ }
+      }
+
+      // ── BATTLE STATE TRACKING: Update global battle state from WebSocket notifications ──
+      // This allows battle detection even when HTTP requests are hanging (524 timeouts)
+      if (msgType === "battle_update" && data && typeof data === "object") {
+        const battleId = (data.battle_id as string) || "";
+        const tick = (data.tick as number) || 0;
+        const participants = Array.isArray(data.participants) ? data.participants : [];
+        
+        if (battleId) {
+          // We're in battle - update global state
+          this.currentBattle.inBattle = true;
+          this.currentBattle.battleId = battleId;
+          this.currentBattle.lastUpdate = Date.now();
+          this.currentBattle.participants = participants as Array<Record<string, unknown>>;
+
+          debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
+        }
+      } else if (msgType === "battle_damage" && data && typeof data === "object") {
+        // Battle damage also indicates we're in battle
+        const attackerName = (data.attacker_name as string) || "";
+        const targetName = (data.target_name as string) || "";
+        const totalDamage = (data.total_damage as number) || 0;
+
+        // CRITICAL: Set battle state on damage too (battle_update might not arrive first)
+        const battleId = (data.battle_id as string) || this.currentBattle.battleId || "";
+        if (battleId || attackerName) {
+          this.currentBattle.inBattle = true;
+          if (battleId) {
+            this.currentBattle.battleId = battleId;
+          }
+          this.currentBattle.lastUpdate = Date.now();
+        }
+
+        debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
+      } else if (type === "system" && data && typeof data === "object") {
+        const message = (data.message as string) || "";
+        const msgLower = message.toLowerCase();
+
+        // Check for disengage/battle end messages
+        if (msgLower.includes("disengaged from battle") || msgLower.includes("battle ended")) {
+          this.currentBattle.inBattle = false;
+          this.currentBattle.battleId = null;
+          this.currentBattle.participants = [];
+          debugLogForBot(this.username, "bot:battle", `${this.username} battle ended`);
+        }
+        
+        // CRITICAL: Detect battle interruption messages
+        // These come when a jump/travel action is interrupted by combat
+        if (msgLower.includes("interrupted by combat") || msgLower.includes("attacking you")) {
+          this.currentBattle.inBattle = true;
+          this.currentBattle.lastUpdate = Date.now();
+          // Try to extract battle ID if present in the message
+          const battleIdMatch = message.match(/Battle ID:\s*([a-f0-9]+)/i);
+          if (battleIdMatch && !this.currentBattle.battleId) {
+            this.currentBattle.battleId = battleIdMatch[1];
+          }
+          debugLogForBot(this.username, "bot:battle", `${this.username} battle detected via system message: ${message}`);
+        }
       }
 
       if (type === "system" && data && typeof data === "object") {
@@ -1110,6 +1433,7 @@ export class Bot {
   /**
    * Extract and track player names, pirates, and empire NPCs from a get_nearby response.
    * Players, pirates, and empire NPCs are tracked in separate categories.
+   * Empire NPCs are excluded from player tracking even if they appear in player arrays.
    */
   trackNearbyPlayers(nearbyResult: unknown): void {
     if (!nearbyResult || typeof nearbyResult !== "object") {
@@ -1120,7 +1444,17 @@ export class Bot {
     const data = nearbyResult as Record<string, unknown>;
 
     // Debug: log what keys we have
-    debugLog("playernames:track", `${this.username}`, `get_nearby result keys: ${Object.keys(data).join(", ")}`);
+    debugLogForBot(this.username, "playernames:track", `${this.username}`, `get_nearby result keys: ${Object.keys(data).join(", ")}`);
+
+    // First, collect all empire NPC names to exclude them from player tracking
+    const empireNpcNames = new Set<string>();
+    const empireNpcsArray = Array.isArray(data.empire_npcs) ? data.empire_npcs : [];
+    for (const npc of empireNpcsArray as Array<Record<string, unknown>>) {
+      const name = npc.name as string;
+      if (name && name.trim()) {
+        empireNpcNames.add(name.trim());
+      }
+    }
 
     // Track actual players (exclude pirates and empire_npcs)
     const playerArraysToCheck = [
@@ -1143,7 +1477,12 @@ export class Bot {
                      (entity.ship_name as string);
 
         if (name && name.trim()) {
-          if (playerNameStore.add(name)) {
+          const trimmedName = name.trim();
+          // Skip if this is an empire NPC (even if it appeared in player arrays)
+          if (empireNpcNames.has(trimmedName)) {
+            continue;
+          }
+          if (playerNameStore.add(trimmedName)) {
             playerCount++;
           }
         }
@@ -1164,7 +1503,6 @@ export class Bot {
 
     // Track empire NPCs separately
     let empireNpcCount = 0;
-    const empireNpcsArray = Array.isArray(data.empire_npcs) ? data.empire_npcs : [];
     for (const npc of empireNpcsArray as Array<Record<string, unknown>>) {
       const name = npc.name as string;
       if (name && name.trim()) {
@@ -1175,7 +1513,7 @@ export class Bot {
     }
 
     const totalFound = totalPlayersFound + piratesArray.length + empireNpcsArray.length;
-    debugLog("playernames:track", `${this.username}`, `Found ${totalFound} entities: ${totalPlayersFound} players, ${piratesArray.length} pirates, ${empireNpcsArray.length} empire NPCs. Added ${playerCount} new players, ${pirateCount} new pirates, ${empireNpcCount} new empire NPCs`);
+    debugLogForBot(this.username, "playernames:track", `${this.username}`, `Found ${totalFound} entities: ${totalPlayersFound} players, ${piratesArray.length} pirates, ${empireNpcsArray.length} empire NPCs. Added ${playerCount} new players, ${pirateCount} new pirates, ${empireNpcCount} new empire NPCs`);
 
     if (playerCount > 0 || pirateCount > 0 || empireNpcCount > 0) {
       this.log("playernames", `Discovered ${playerCount} new player(s), ${pirateCount} new pirate(s), ${empireNpcCount} new empire NPC(s) from nearby scan`);
@@ -1212,6 +1550,7 @@ export class Bot {
   /**
    * Track player names from battle/scan results.
    * Handles battle participants, scan targets, and similar arrays.
+   * Empire NPCs are excluded from tracking.
    */
   trackBattleParticipants(resultData: unknown): void {
     if (!resultData || typeof resultData !== "object") {
@@ -1219,7 +1558,7 @@ export class Bot {
     }
 
     const data = resultData as Record<string, unknown>;
-    
+
     // Extract from various possible array formats
     const arraysToCheck = [
       Array.isArray(data.participants) ? data.participants : [],
@@ -1230,12 +1569,20 @@ export class Bot {
     let count = 0;
     for (const arr of arraysToCheck) {
       for (const entity of arr as Array<Record<string, unknown>>) {
-        const name = (entity.username as string) || 
-                     (entity.player_name as string) || 
+        const name = (entity.username as string) ||
+                     (entity.player_name as string) ||
                      (entity.name as string);
-        
+
         if (name && name.trim()) {
-          if (playerNameStore.add(name)) {
+          const trimmedName = name.trim();
+          const nameLower = trimmedName.toLowerCase();
+          
+          // Skip empire NPCs (customs, police, etc.)
+          const isEmpireNpc = 
+            nameLower.startsWith("[customs]") ||
+            nameLower.startsWith("[police]");
+          
+          if (!isEmpireNpc && playerNameStore.add(trimmedName)) {
             count++;
           }
         }

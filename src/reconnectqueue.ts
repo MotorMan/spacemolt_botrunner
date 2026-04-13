@@ -1,5 +1,5 @@
 import { log } from "./ui.js";
-import { debugLog } from "./debug.js";
+import { debugLogForBot } from "./debug.js";
 
 /**
  * Global reconnection queue - ensures only ONE bot attempts to reconnect at a time.
@@ -34,7 +34,7 @@ class ReconnectQueue {
   async enqueue(task: Omit<ReconnectTask, "resolve" | "reject">): Promise<boolean> {
     return new Promise((resolve, reject) => {
       this.queue.push({ ...task, resolve, reject });
-      debugLog("reconnect:queue", `Added ${task.botName} to queue (position: ${this.queue.length})`);
+      debugLogForBot(task.botName, "reconnect:queue", `Added ${task.botName} to queue (position: ${this.queue.length})`);
       log("system", `${task.botName} added to reconnection queue (position: ${this.queue.length})`);
 
       // Process queue if not already running
@@ -63,7 +63,7 @@ class ReconnectQueue {
       log("system", `Waiting ${RECONNECT_DELAY_MS / 1000}s before reconnection attempt...`);
       await sleep(RECONNECT_DELAY_MS);
 
-      debugLog("reconnect:process", `Processing ${task.botName} (queue: ${this.queue.length})`);
+      debugLogForBot(task.botName, "reconnect:process", `Processing ${task.botName} (queue: ${this.queue.length})`);
 
       try {
         const success = await this.attemptReconnect(task);
@@ -102,7 +102,7 @@ class ReconnectQueue {
     }
 
     this.processing = false;
-    debugLog("reconnect:process", "Queue empty, processing complete");
+    debugLogForBot("SYSTEM", "reconnect:process", "Queue empty, processing complete");
   }
 
   /**

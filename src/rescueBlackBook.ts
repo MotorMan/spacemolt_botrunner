@@ -105,10 +105,34 @@ export function recordRescueRequest(playerName: string): void {
 
 /**
  * Record a ghost incident (player was not where they said).
+ * Skips if player is marked as one of our bots (ghostCount < 0).
  */
 export function recordGhost(playerName: string): void {
   const record = getPlayerRecord(playerName);
+  // Skip if this is one of our bots (marked with negative ghostCount)
+  if (record.ghostCount < 0) {
+    return;
+  }
   updatePlayerRecord(playerName, { ghostCount: record.ghostCount + 1 });
+}
+
+/**
+ * Mark a player as one of our own bots by setting ghostCount to -1.
+ * This prevents our bots from being blacklisted due to "ghost" incidents.
+ */
+export function markAsOwnBot(playerName: string): void {
+  const record = getPlayerRecord(playerName);
+  if (record.ghostCount >= 0) {
+    updatePlayerRecord(playerName, { ghostCount: -1 });
+  }
+}
+
+/**
+ * Check if a player is marked as one of our own bots.
+ */
+export function isOwnBot(playerName: string): boolean {
+  const record = getPlayerRecord(playerName);
+  return record.ghostCount < 0;
 }
 
 /**

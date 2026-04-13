@@ -109,6 +109,7 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   jump: [...INV_STATUS, ...INV_LOCATION],
   dock: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION],
   switch_ship: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION, ...INV_CARGO, ...INV_SHIP],
+  reload: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION, ...INV_CARGO, ...INV_SHIP],
   undock: INV_STATUS,
   mine: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
   sell: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET],

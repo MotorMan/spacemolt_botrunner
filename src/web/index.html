@@ -73,7 +73,7 @@
       <div style="margin-left:auto;display:flex;gap:6px;">
         <span class="filter-chip active" onclick="toggleShowDetails()">📄 Details: <span id="detailsToggleText">Off</span></span>
         <span class="filter-chip" onclick="toggleCollapseAll()">📌 Collapse All</span>
-        <button class="sm" onclick="toggleCompactMode()" id="compactModeBtn" title="Toggle compact mode">📐 Compact: Off</button>
+        <button class="sm" onclick="toggleCompactMode()" id="compactModeBtn" title="Toggle compact mode">📐 Compact: On</button>
         <button class="sm" onclick="toggleGridView()" id="gridViewBtn" title="Toggle grid view">🔲 Grid: Off</button>
         <button class="sm" onclick="toggleRoutineGroupsLayout()" title="Switch back to Table view">📊 Groups View</button>
       </div>
@@ -933,6 +933,10 @@ function connect() {
         // Update Fleet Combat controls if visible (refresh commander dropdown only)
         if (document.getElementById('page-fleetcombat')?.classList.contains('active')) {
           renderFleetCombatControls(false); // false = don't force full re-render
+          // Also refresh navigation UI if commander is selected
+          if (battleState.commanderBot) {
+            updateNavigationUI();
+          }
         }
         break;
       case 'log':
@@ -1278,8 +1282,13 @@ function toggleRoutineGroupsLayout() {
 }
 
 // ── Compact Mode & Grid View toggles ──────────────────────
-let compactMode = false;
+let compactMode = true;
 let gridView = false;
+
+// Apply compact mode on page load
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('botTable')?.classList.add('compact-mode');
+});
 
 function toggleCompactMode() {
   compactMode = !compactMode;
@@ -2637,6 +2646,86 @@ function renderManualControls() {
     </div>`;
   }
 
+  // Build weapon reload section - show if bot has ammo in cargo or is a hunter
+  let weaponReloadSection = '';
+  
+  // Check if bot has ammo items in cargo
+  const ammoItems = (bot.inventory || []).filter(i => 
+    i.itemId.toLowerCase().includes('ammo') ||
+    i.itemId.toLowerCase().includes('missile') ||
+    i.itemId.toLowerCase().includes('rocket') ||
+    i.itemId.toLowerCase().includes('torpedo')
+  );
+  
+  // Show weapon reload section if:
+  // 1. Bot is a hunter routine, OR
+  // 2. Bot has ammo in cargo (likely has weapons)
+  const isHunterBot = bot.routine === 'hunter';
+  const hasAmmoInCargo = ammoItems.length > 0;
+  const shouldShowWeapons = isHunterBot || hasAmmoInCargo;
+
+  if (shouldShowWeapons) {
+    weaponReloadSection = `
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Weapon Reload</label>
+    </div>
+    
+    <div class="cmd-group">
+      <button class="sm" onclick="mcLoadWeaponData()" id="mc-load-weapons-btn">🔫 Load Weapons</button>
+    </div>
+    
+    <div id="mc-weapon-reload-controls" style="display:none">
+      <div class="cmd-group">
+        <label>Weapon</label>
+        <select id="mc-weapon-select"><option value="">Loading...</option></select>
+      </div>
+      
+      <div class="cmd-group">
+        <label>Ammo</label>
+        <select id="mc-ammo-select">${hasAmmoInCargo ? ammoItems.map(a => `<option value="${esc(a.itemId)}">${esc(a.name)} (${a.quantity})</option>`).join('') : '<option value="">No ammo in cargo</option>'}</select>
+        <button class="primary sm" onclick="mcReloadWeapon()">Reload</button>
+      </div>
+    </div>`;
+  }
+
+  // Build wreck salvage section
+  const wreckSection = `
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Wreck Salvage</label>
+    </div>
+    
+    <div class="cmd-group">
+      <button class="sm" onclick="mcScanWrecks()">🔍 Scan Wrecks</button>
+      <button class="primary sm" onclick="mcLootAllWrecks()">💰 Loot All Wrecks</button>
+    </div>
+    
+    <div class="cmd-group">
+      <label>Wreck</label>
+      <select id="mc-wreck-select" onchange="mcUpdateWreckItems()"><option value="">Scan first...</option></select>
+    </div>
+
+    <div class="cmd-group">
+      <button class="primary sm" onclick="mcLootSingleWreckAll()" title="Loot all items and modules from selected wreck">💰 Loot All from Selected</button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Item</label>
+      <select id="mc-wreck-item-select"><option value="">Select wreck first...</option></select>
+      <input type="number" id="mc-wreck-item-qty" min="1" value="1">
+      <button class="sm" onclick="mcLootWreckItem()">Loot</button>
+    </div>
+
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Modules on Wreck</label>
+    </div>
+
+    <div class="cmd-group">
+      <select id="mc-wreck-module-select"><option value="">Select wreck first...</option></select>
+      <button class="sm" onclick="mcLootWreckModule()">Loot Module</button>
+      <button class="primary sm" onclick="mcLootAllModulesFromWreck()" title="Loot all modules from selected wreck">💰 Loot All Modules</button>
+    </div>
+  `;
+
   document.getElementById('manualControls').innerHTML = `
     <div class="cmd-group">
       <label>Travel</label>
@@ -2701,6 +2790,10 @@ function renderManualControls() {
     </div>
 
     ${craftSection}
+
+    ${weaponReloadSection}
+
+    ${wreckSection}
 
     <div class="cmd-group">
       <label>Sell</label>
@@ -2964,6 +3057,597 @@ function mcJettison() {
   }
   // Jettison command: "jettison item_id quantity"
   mcExec('jettison', { item_id: itemId, quantity: qty });
+}
+
+// ── Weapon Reload Command ───────────────────────────────────
+
+let cachedWeaponData = [];  // Cache weapon data from status
+
+/** Load weapon module data from bot status */
+function mcLoadWeaponData() {
+  if (!profileBot) return;
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > get_ship (load weapons)</span>`);
+
+  sendExec(profileBot, 'get_ship', {}, (result) => {
+    if (result.ok && result.data) {
+      const data = result.data;
+
+      // get_ship returns modules at top level: { ship, modules: [...], cargo_used, cargo_max, class }
+      const modules = Array.isArray(data.modules) ? data.modules : [];
+      
+      // Also get cargo from the ship data
+      const shipCargo = (data.ship && data.ship.cargo) || [];
+
+      if (modules.length === 0) {
+        logResponse('<span class="resp-warn">No modules found on ship</span>');
+        return;
+      }
+
+      // Filter to weapon modules
+      const weapons = modules.filter(mod => {
+        const modType = ((mod.type || mod.slot || '') + '').toLowerCase();
+        return modType.includes('weapon');
+      }).map(mod => ({
+        instanceId: mod.id || '',
+        typeId: mod.type_id || '',
+        name: mod.name || mod.type_id || 'Unknown Weapon',
+        currentAmmo: mod.current_ammo || 0,
+        maxAmmo: mod.magazine_size || 0,
+        ammoType: mod.ammo_type || null
+      })).filter(w => w.instanceId);
+
+      cachedWeaponData = weapons;
+
+      // Get ammo items from ship cargo
+      const ammoItems = shipCargo.filter(i => 
+        i.item_id && (
+          i.item_id.toLowerCase().includes('ammo') ||
+          i.item_id.toLowerCase().includes('missile') ||
+          i.item_id.toLowerCase().includes('rocket') ||
+          i.item_id.toLowerCase().includes('torpedo')
+        )
+      );
+
+      // Update weapon dropdown
+      const weaponSelect = document.getElementById('mc-weapon-select');
+      if (weaponSelect) {
+        if (weapons.length === 0) {
+          weaponSelect.innerHTML = '<option value="">No weapon modules found</option>';
+          logResponse('<span class="resp-warn">No weapon modules detected on ship</span>');
+        } else {
+          weaponSelect.innerHTML = weapons.map(w => {
+            const ammoStatus = w.maxAmmo > 0 ? ` [${w.currentAmmo}/${w.maxAmmo}]` : '';
+            const ammoType = w.ammoType ? ` (${w.ammoType})` : ' (no ammo type)';
+            return `<option value="${esc(w.instanceId)}">${esc(w.name)}${esc(ammoStatus)}${esc(ammoType)}</option>`;
+          }).join('');
+
+          // Update ammo dropdown
+          const ammoSelect = document.getElementById('mc-ammo-select');
+          if (ammoSelect) {
+            if (ammoItems.length === 0) {
+              ammoSelect.innerHTML = '<option value="">No ammo in cargo</option>';
+            } else {
+              ammoSelect.innerHTML = ammoItems.map(a =>
+                `<option value="${esc(a.item_id)}" data-max="${a.quantity}">${esc(a.item_id.replace(/_/g, ' '))} (${a.quantity})</option>`
+              ).join('');
+            }
+          }
+
+          // Show the reload controls
+          const controls = document.getElementById('mc-weapon-reload-controls');
+          if (controls) controls.style.display = 'block';
+
+          // Hide the load button
+          const loadBtn = document.getElementById('mc-load-weapons-btn');
+          if (loadBtn) loadBtn.style.display = 'none';
+
+          logResponse(`<span class="resp-ok">Loaded ${weapons.length} weapon module(s) and ${ammoItems.length} ammo type(s)</span>`);
+        }
+      }
+    } else {
+      logResponse(`<span class="resp-err">Failed to load weapon data: ${esc(result.error || 'unknown error')}</span>`);
+    }
+  });
+}
+
+/** Reload weapon with selected ammo */
+function mcReloadWeapon() {
+  if (!profileBot) return;
+
+  const weaponSelect = document.getElementById('mc-weapon-select');
+  const ammoSelect = document.getElementById('mc-ammo-select');
+  
+  if (!weaponSelect || !ammoSelect) {
+    logResponse('<span class="resp-err">Weapon reload controls not available</span>');
+    return;
+  }
+
+  const weaponId = weaponSelect.value;
+  const ammoId = ammoSelect.value;
+
+  if (!weaponId) {
+    logResponse('<span class="resp-err">Select a weapon to reload</span>');
+    return;
+  }
+
+  if (!ammoId) {
+    logResponse('<span class="resp-err">Select ammo to reload with</span>');
+    return;
+  }
+
+  // Execute reload command with weapon instance ID and ammo item ID
+  // 1 ammo box = full reload, so no quantity needed
+  mcExec('reload', { 
+    weapon_instance_id: weaponId, 
+    ammo_item_id: ammoId
+  });
+}
+
+// ── Wreck Salvage Commands ──────────────────────────────────
+
+let cachedWrecks = [];  // Cache scanned wrecks
+
+/** Scan for wrecks at current location */
+function mcScanWrecks() {
+  if (!profileBot) return;
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > get_wrecks</span>`);
+
+  sendExec(profileBot, 'get_wrecks', {}, (result) => {
+    if (result.ok && result.data) {
+      // Parse wrecks from the result
+      const data = result.data;
+      const wrecks = data.wrecks || data.containers || data || [];
+      
+      if (!Array.isArray(wrecks)) {
+        logResponse('<span class="resp-warn">No wrecks found at current location</span>');
+        cachedWrecks = [];
+        const select = document.getElementById('mc-wreck-select');
+        if (select) select.innerHTML = '<option value="">No wrecks found</option>';
+        return;
+      }
+
+      cachedWrecks = wrecks.filter(w => w.wreck_id || w.id);
+      
+      const select = document.getElementById('mc-wreck-select');
+      if (select) {
+        if (cachedWrecks.length === 0) {
+          select.innerHTML = '<option value="">No wrecks found</option>';
+          logResponse('<span class="resp-warn">No wrecks found at current location</span>');
+        } else {
+          select.innerHTML = cachedWrecks.map((w, idx) => {
+            const wreckId = w.wreck_id || w.id;
+            const name = w.name || w.type || 'Wreck';
+            const itemCount = (w.items || w.cargo || []).length;
+            const moduleCount = (w.modules || []).length;
+            const totalLoot = itemCount + moduleCount;
+            const moduleText = moduleCount > 0 ? ` + ${moduleCount} module(s)` : '';
+            return `<option value="${idx}">${esc(name)} (${esc(wreckId.substring(0, 8))}...) - ${totalLoot} item(s)${esc(moduleText)}</option>`;
+          }).join('');
+          logResponse(`<span class="resp-ok">Found ${cachedWrecks.length} wreck(s) at current location</span>`);
+          
+          // Auto-update items for first wreck
+          mcUpdateWreckItems();
+        }
+      }
+    } else {
+      logResponse(`<span class="resp-err">Failed to scan wrecks: ${esc(result.error || 'unknown error')}</span>`);
+    }
+  });
+}
+
+/** Update item and module dropdowns when wreck selection changes */
+function mcUpdateWreckItems() {
+  const select = document.getElementById('mc-wreck-select');
+  const itemSelect = document.getElementById('mc-wreck-item-select');
+  const moduleSelect = document.getElementById('mc-wreck-module-select');
+
+  if (!select) return;
+
+  const wreckIdx = parseInt(select.value);
+  if (isNaN(wreckIdx) || !cachedWrecks[wreckIdx]) {
+    if (itemSelect) itemSelect.innerHTML = '<option value="">Select wreck first...</option>';
+    if (moduleSelect) moduleSelect.innerHTML = '<option value="">Select wreck first...</option>';
+    return;
+  }
+
+  const wreck = cachedWrecks[wreckIdx];
+  const items = wreck.items || wreck.cargo || wreck.contents || [];
+  const modules = wreck.modules || [];
+
+  // Update items dropdown
+  if (itemSelect) {
+    if (items.length === 0) {
+      itemSelect.innerHTML = '<option value="">Wreck has no cargo items</option>';
+    } else {
+      itemSelect.innerHTML = items.map((item, idx) => {
+        const itemId = item.item_id || item.id || '';
+        const name = item.name || item.item_id || 'Unknown';
+        const quantity = item.quantity || 1;
+        return `<option value="${idx}" data-item-id="${esc(itemId)}" data-max="${quantity}">${esc(name)} (${quantity})</option>`;
+      }).join('');
+    }
+  }
+
+  // Update modules dropdown
+  if (moduleSelect) {
+    if (modules.length === 0) {
+      moduleSelect.innerHTML = '<option value="">No modules on this wreck</option>';
+    } else {
+      moduleSelect.innerHTML = modules.map((mod, idx) => {
+        const modId = mod.module_id || mod.id || mod.type_id || '';
+        const name = mod.name || mod.module_name || mod.type_name || modId || 'Unknown Module';
+        const condition = mod.condition ? ` (${mod.condition}%)` : '';
+        return `<option value="${idx}" data-module-id="${esc(modId)}">${esc(name)}${esc(condition)}</option>`;
+      }).join('');
+    }
+  }
+}
+
+/** Loot specific item from selected wreck */
+function mcLootWreckItem() {
+  if (!profileBot) return;
+
+  const wreckSelect = document.getElementById('mc-wreck-select');
+  const itemSelect = document.getElementById('mc-wreck-item-select');
+  const qtyInput = document.getElementById('mc-wreck-item-qty');
+  
+  if (!wreckSelect || !itemSelect) {
+    logResponse('<span class="resp-err">Wreck salvage controls not available</span>');
+    return;
+  }
+
+  const wreckIdx = parseInt(wreckSelect.value);
+  const itemIdx = parseInt(itemSelect.value);
+  const qty = parseInt(qtyInput?.value || '1');
+
+  if (isNaN(wreckIdx) || !cachedWrecks[wreckIdx]) {
+    logResponse('<span class="resp-err">Select a wreck first</span>');
+    return;
+  }
+
+  if (isNaN(itemIdx)) {
+    logResponse('<span class="resp-err">Select an item to loot</span>');
+    return;
+  }
+
+  const wreck = cachedWrecks[wreckIdx];
+  const wreckId = wreck.wreck_id || wreck.id;
+  const items = wreck.items || wreck.cargo || wreck.contents || [];
+  const item = items[itemIdx];
+
+  if (!item) {
+    logResponse('<span class="resp-err">Item not found in wreck</span>');
+    return;
+  }
+
+  const itemId = item.item_id || item.id;
+  const lootQty = Math.min(qty, item.quantity || 1);
+
+  // Execute loot command
+  mcExec('loot_wreck', {
+    wreck_id: wreckId,
+    item_id: itemId,
+    quantity: lootQty
+  });
+}
+
+/** Loot all items and modules from a single selected wreck */
+function mcLootSingleWreckAll() {
+  if (!profileBot) return;
+
+  const wreckSelect = document.getElementById('mc-wreck-select');
+  if (!wreckSelect) {
+    logResponse('<span class="resp-err">Wreck salvage controls not available</span>');
+    return;
+  }
+
+  const wreckIdx = parseInt(wreckSelect.value);
+  if (isNaN(wreckIdx) || !cachedWrecks[wreckIdx]) {
+    logResponse('<span class="resp-err">Select a wreck first (scan wrecks to see available wrecks)</span>');
+    return;
+  }
+
+  const wreck = cachedWrecks[wreckIdx];
+  const wreckId = wreck.wreck_id || wreck.id;
+  const wreckName = wreck.name || wreck.type || 'Wreck';
+  const items = wreck.items || wreck.cargo || wreck.contents || [];
+  const modules = wreck.modules || [];
+
+  const totalItems = items.length + modules.length;
+  if (totalItems === 0) {
+    logResponse(`<span class="resp-warn">Selected wreck is empty: ${esc(wreckName)}</span>`);
+    return;
+  }
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > Looting all from ${esc(wreckName)}...</span>`);
+  logResponse(`<span class="resp-ok">Found ${items.length} cargo item(s) and ${modules.length} module(s)</span>`);
+
+  let totalLooted = 0;
+  let itemIdx = 0;
+  let modIdx = 0;
+
+  const lootNext = () => {
+    // First loot all cargo items
+    if (itemIdx < items.length) {
+      const item = items[itemIdx];
+      const itemId = item.item_id || item.id;
+      const quantity = item.quantity || 1;
+      const itemName = item.name || itemId || 'Unknown';
+      itemIdx++;
+
+      sendExec(profileBot, 'loot_wreck', {
+        wreck_id: wreckId,
+        item_id: itemId,
+        quantity: quantity
+      }, (lootResult) => {
+        if (lootResult.ok) {
+          totalLooted++;
+          logResponse(`<span class="resp-ok">✓ Looted ${quantity}x ${esc(itemName)}</span>`);
+        } else {
+          logResponse(`<span class="resp-err">✗ Failed to loot ${esc(itemName)}: ${esc(lootResult.error || 'unknown')}</span>`);
+        }
+        lootNext();
+      });
+      return;
+    }
+
+    // Then loot all modules
+    if (modIdx < modules.length) {
+      const mod = modules[modIdx];
+      const modId = mod.module_id || mod.id || mod.type_id;
+      const modName = mod.name || mod.module_name || mod.type_name || modId || 'Unknown Module';
+      modIdx++;
+
+      // Use loot_wreck with module_id to loot (not equip) the module
+      sendExec(profileBot, 'loot_wreck', {
+        wreck_id: wreckId,
+        module_id: modId
+      }, (lootResult) => {
+        if (lootResult.ok) {
+          totalLooted++;
+          logResponse(`<span class="resp-ok">✓ Looted module: ${esc(modName)}</span>`);
+        } else {
+          logResponse(`<span class="resp-err">✗ Failed to loot module ${esc(modName)}: ${esc(lootResult.error || 'unknown')}</span>`);
+        }
+        lootNext();
+      });
+      return;
+    }
+
+    // All done
+    logResponse(`<span class="resp-ok">✅ Finished looting from ${esc(wreckName)} - ${totalLooted} total items/modules looted</span>`);
+    mcExec('get_status', {}); // Refresh status to update cargo
+  };
+
+  lootNext();
+}
+
+/** Loot a specific module from selected wreck */
+function mcLootWreckModule() {
+  if (!profileBot) return;
+
+  const wreckSelect = document.getElementById('mc-wreck-select');
+  const moduleSelect = document.getElementById('mc-wreck-module-select');
+
+  if (!wreckSelect || !moduleSelect) {
+    logResponse('<span class="resp-err">Wreck salvage controls not available</span>');
+    return;
+  }
+
+  const wreckIdx = parseInt(wreckSelect.value);
+  const modIdx = parseInt(moduleSelect.value);
+
+  if (isNaN(wreckIdx) || !cachedWrecks[wreckIdx]) {
+    logResponse('<span class="resp-err">Select a wreck first</span>');
+    return;
+  }
+
+  if (isNaN(modIdx)) {
+    logResponse('<span class="resp-err">Select a module to loot</span>');
+    return;
+  }
+
+  const wreck = cachedWrecks[wreckIdx];
+  const wreckId = wreck.wreck_id || wreck.id;
+  const modules = wreck.modules || [];
+  const mod = modules[modIdx];
+
+  if (!mod) {
+    logResponse('<span class="resp-err">Module not found in wreck</span>');
+    return;
+  }
+
+  const modId = mod.module_id || mod.id || mod.type_id;
+  const modName = mod.name || mod.module_name || mod.type_name || modId || 'Unknown Module';
+
+  // Use loot_wreck with module_id to loot (not equip) the module
+  mcExec('loot_wreck', {
+    wreck_id: wreckId,
+    module_id: modId
+  });
+}
+
+/** Loot all modules from the selected wreck */
+function mcLootAllModulesFromWreck() {
+  if (!profileBot) return;
+
+  const wreckSelect = document.getElementById('mc-wreck-select');
+  if (!wreckSelect) {
+    logResponse('<span class="resp-err">Wreck salvage controls not available</span>');
+    return;
+  }
+
+  const wreckIdx = parseInt(wreckSelect.value);
+  if (isNaN(wreckIdx) || !cachedWrecks[wreckIdx]) {
+    logResponse('<span class="resp-err">Select a wreck first</span>');
+    return;
+  }
+
+  const wreck = cachedWrecks[wreckIdx];
+  const wreckId = wreck.wreck_id || wreck.id;
+  const wreckName = wreck.name || wreck.type || 'Wreck';
+  const modules = wreck.modules || [];
+
+  if (modules.length === 0) {
+    logResponse(`<span class="resp-warn">Selected wreck has no modules: ${esc(wreckName)}</span>`);
+    return;
+  }
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > Looting all ${modules.length} module(s) from ${esc(wreckName)}...</span>`);
+
+  let totalLooted = 0;
+  let modIdx = 0;
+
+  const lootNextModule = () => {
+    if (modIdx >= modules.length) {
+      logResponse(`<span class="resp-ok">✅ Finished looting ${totalLooted} module(s) from ${esc(wreckName)}</span>`);
+      mcExec('get_status', {}); // Refresh status
+      return;
+    }
+
+    const mod = modules[modIdx];
+    const modId = mod.module_id || mod.id || mod.type_id;
+    const modName = mod.name || mod.module_name || mod.type_name || modId || 'Unknown Module';
+    modIdx++;
+
+    sendExec(profileBot, 'loot_wreck', {
+      wreck_id: wreckId,
+      module_id: modId
+    }, (lootResult) => {
+      if (lootResult.ok) {
+        totalLooted++;
+        logResponse(`<span class="resp-ok">✓ Looted module: ${esc(modName)}</span>`);
+      } else {
+        logResponse(`<span class="resp-err">✗ Failed to loot module ${esc(modName)}: ${esc(lootResult.error || 'unknown')}</span>`);
+      }
+      lootNextModule();
+    });
+  };
+
+  lootNextModule();
+}
+
+/** Loot all items from all wrecks */
+function mcLootAllWrecks() {
+  if (!profileBot) return;
+
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > get_wrecks (scan for loot all)</span>`);
+
+  // First scan for wrecks
+  sendExec(profileBot, 'get_wrecks', {}, (result) => {
+    if (result.ok && result.data) {
+      const data = result.data;
+      const wrecks = data.wrecks || data.containers || data || [];
+      
+      if (!Array.isArray(wrecks) || wrecks.length === 0) {
+        logResponse('<span class="resp-warn">No wrecks found to loot</span>');
+        return;
+      }
+
+      const validWrecks = wrecks.filter(w => 
+        (w.wreck_id || w.id) && 
+        ((w.items || w.cargo || []).length > 0 || (w.modules || []).length > 0)
+      );
+
+      if (validWrecks.length === 0) {
+        logResponse('<span class="resp-warn">All wrecks are empty</span>');
+        return;
+      }
+
+      logResponse(`<span class="resp-ok">Found ${validWrecks.length} wreck(s) with loot - starting mass salvage...</span>`);
+
+      // Process each wreck and loot all items and modules
+      let totalLooted = 0;
+      let processedWrecks = 0;
+
+      const lootNextWreck = () => {
+        if (processedWrecks >= validWrecks.length) {
+          logResponse(`<span class="resp-ok">Looted all items from ${processedWrecks} wreck(s) - ${totalLooted} total items/modules</span>`);
+          // Refresh status to update cargo
+          mcExec('get_status', {});
+          return;
+        }
+
+        const wreck = validWrecks[processedWrecks];
+        const wreckId = wreck.wreck_id || wreck.id;
+        const items = wreck.items || wreck.cargo || wreck.contents || [];
+        const modules = wreck.modules || [];
+
+        processedWrecks++;
+
+        // Loot each item from this wreck
+        let itemIdx = 0;
+        const lootNextItem = () => {
+          if (itemIdx >= items.length) {
+            // After items, loot modules
+            lootNextModule();
+            return;
+          }
+
+          const item = items[itemIdx];
+          const itemId = item.item_id || item.id;
+          const quantity = item.quantity || 1;
+          itemIdx++;
+
+          sendExec(profileBot, 'loot_wreck', {
+            wreck_id: wreckId,
+            item_id: itemId,
+            quantity: quantity
+          }, (lootResult) => {
+            if (lootResult.ok) {
+              totalLooted++;
+              logResponse(`<span class="resp-ok">Looted ${quantity}x ${esc(item.name || itemId)} from wreck</span>`);
+            } else {
+              logResponse(`<span class="resp-err">Failed to loot ${esc(item.name || itemId)}: ${esc(lootResult.error || 'unknown')}</span>`);
+            }
+            // Continue with next item
+            lootNextItem();
+          });
+        };
+
+        // Loot each module from this wreck
+        let modIdx = 0;
+        const lootNextModule = () => {
+          if (modIdx >= modules.length) {
+            // Move to next wreck
+            lootNextWreck();
+            return;
+          }
+
+          const mod = modules[modIdx];
+          const modId = mod.module_id || mod.id || mod.type_id;
+          const modName = mod.name || mod.module_name || mod.type_name || modId || 'Unknown Module';
+          modIdx++;
+
+          sendExec(profileBot, 'loot_wreck', {
+            wreck_id: wreckId,
+            module_id: modId
+          }, (lootResult) => {
+            if (lootResult.ok) {
+              totalLooted++;
+              logResponse(`<span class="resp-ok">Looted module: ${esc(modName)}</span>`);
+            } else {
+              logResponse(`<span class="resp-err">Failed to loot module ${esc(modName)}: ${esc(lootResult.error || 'unknown')}</span>`);
+            }
+            lootNextModule();
+          });
+        };
+
+        lootNextItem();
+      };
+
+      lootNextWreck();
+    } else {
+      logResponse(`<span class="resp-err">Failed to scan wrecks: ${esc(result.error || 'unknown error')}</span>`);
+    }
+  });
 }
 
 // ── Refuel Player Command ───────────────────────────────────
@@ -4024,6 +4708,14 @@ function mcExec(command, params) {
     // Refresh profile after commands that change state
     setTimeout(() => {
       renderProfileSidebar();
+      // Refresh weapon data after reload to update ammo counts
+      if (command === 'reload' && result.ok) {
+        cachedWeaponData = [];
+        const loadBtn = document.getElementById('mc-load-weapons-btn');
+        const controls = document.getElementById('mc-weapon-reload-controls');
+        if (loadBtn) loadBtn.style.display = 'inline-block';
+        if (controls) controls.style.display = 'none';
+      }
       renderManualControls();
     }, 500);
 
@@ -7727,6 +8419,7 @@ function renderAiChatSettings(panel) {
   const conversationCooldownSec = ac.conversationCooldownSec ?? 15;
   const factionChatRoundsLimit = ac.factionChatRoundsLimit ?? 5;
   const llmTimeoutSec = ac.llmTimeoutSec ?? 30;
+  const maxTokens = ac.maxTokens ?? 1000;
 
   const inputStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box"`;
   const textareaStyle = `style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box;min-height:150px;font-family:monospace;font-size:12px;white-space:pre-wrap"`;
@@ -7776,6 +8469,14 @@ function renderAiChatSettings(panel) {
         <div class="setting-hint">Timeout for LLM API calls. Increase this when running on CPU/RAM as models respond much slower.</div>
       </div>
       <input type="number" id="set-aichat-llmTimeoutSec" min="10" max="600" value="${llmTimeoutSec}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Tokens</div>
+        <div class="setting-hint">Maximum tokens for LLM response. Higher values allow thinking-enabled models to complete both reasoning and final response. Default: 1000</div>
+      </div>
+      <input type="number" id="set-aichat-maxTokens" min="100" max="8000" value="${maxTokens}">
     </div>
 
     <div class="setting-row">
@@ -7893,6 +8594,7 @@ function saveAiChatSettings() {
     conversationCooldownSec: parseInt(document.getElementById('set-aichat-conversationCooldownSec').value) || 15,
     factionChatRoundsLimit: parseInt(document.getElementById('set-aichat-factionChatRoundsLimit').value) ?? 5,
     llmTimeoutSec: parseInt(document.getElementById('set-aichat-llmTimeoutSec').value) || 30,
+    maxTokens: parseInt(document.getElementById('set-aichat-maxTokens').value) || 1000,
   };
   send({ type: 'saveSettings', routine: 'ai_chat', settings: s });
   settings.ai_chat = s;
@@ -14570,49 +15272,37 @@ function renderFleetCombatControls(force = false) {
     </div>
 
     <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
-      <label style="color:var(--text-bright);font-weight:600">Quick Start</label>
+      <label style="color:var(--text-bright);font-weight:600">🧭 Fleet Navigation</label>
+      <span id="fc-nav-status" style="margin-left:8px;font-size:11px;color:var(--text-dim)">Loading...</span>
     </div>
 
-    <div class="cmd-group">
-      <label>Start Commander</label>
-      <select id="fc-commander-bot">${botOpts}</select>
-      <button class="primary sm" onclick="fcStartCommander()">Start Commander</button>
-    </div>
-
-    <div class="cmd-group">
-      <label>Start Subordinates (selected bots)</label>
-      <div id="fc-subordinate-list" style="max-height:150px;overflow-y:auto;background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:8px;margin:8px 0">
-        ${bots.map(b => `
-          <label style="display:flex;align-items:center;gap:6px;font-size:12px;margin:4px 0">
-            <input type="checkbox" class="fc-sub-check" value="${esc(b.username)}">
-            ${esc(b.username)}
-          </label>
-        `).join('')}
+    <div id="fc-navigation-ui" style="background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:10px;margin:8px 0">
+      <div style="text-align:center;color:var(--text-dim);padding:20px">
+        No commander selected. Select a battle commander to enable navigation.
       </div>
-      <button class="primary sm" onclick="fcStartSubordinates()">Start Subordinates</button>
     </div>
   `;
 }
 
-/** Send a fleet command via faction chat */
+/** Send a fleet command via bot chat channel (NOT faction chat) */
 function fcSendCommand(command, params = '') {
-  const msg = `[FLEET ${fleetCombatFleetId}] ${command} ${params}`.trim();
+  const msg = `${command} ${params}`.trim();
   logFleetCombat(`Sending: ${msg}`);
 
-  // Send via API
-  fetch('/api/chat', {
+  // Send via new bot chat channel API
+  fetch('/api/fleet-command', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      bot: bots[0]?.username || '',
-      channel: 'faction',
-      content: msg,
+      command,
+      params,
+      fleetId: fleetCombatFleetId,
     }),
   }).then(r => r.json()).then(data => {
     if (data.error) {
-      logFleetCombat(`Error: ${data.error.message}`, 'error');
+      logFleetCombat(`Error: ${data.message || data.error.message}`, 'error');
     } else {
-      logFleetCombat(`Sent successfully`);
+      logFleetCombat(`Sent to ${data.subordinateCount} bot(s)`, 'success');
     }
   }).catch(err => {
     logFleetCombat(`Error: ${err.message}`, 'error');
@@ -14738,12 +15428,17 @@ function fcMove() {
     logFleetCombat('Select a POI first', 'error');
     return;
   }
-  const firstBot = bots[0];
-  if (!firstBot) {
-    logFleetCombat('No bots available', 'error');
+  
+  // Use the commander bot's system, or fall back to first running bot
+  const commanderBot = battleState.commanderBot ? bots.find(b => b.username === battleState.commanderBot) : null;
+  const refBot = commanderBot || bots.find(b => b.state === 'running');
+  
+  if (!refBot) {
+    logFleetCombat('No running bots available', 'error');
     return;
   }
-  fcSendCommand('MOVE', `${firstBot.system}/${poiId}`);
+  
+  fcSendCommand('MOVE', `${refBot.system}/${poiId}`);
 }
 
 function fcJump() {
@@ -14756,13 +15451,17 @@ function fcJump() {
 }
 
 function fcRegroup() {
-  const firstBot = bots[0];
-  if (!firstBot) {
-    logFleetCombat('No bots available', 'error');
+  // Use the commander bot's system, or fall back to first running bot
+  const commanderBot = battleState.commanderBot ? bots.find(b => b.username === battleState.commanderBot) : null;
+  const refBot = commanderBot || bots.find(b => b.state === 'running');
+  
+  if (!refBot) {
+    logFleetCombat('No running bots available', 'error');
     return;
   }
-  const poi = firstBot.poi || '';
-  fcSendCommand('REGROUP', poi ? `${firstBot.system}/${poi}` : firstBot.system);
+  
+  const poi = refBot.poi || '';
+  fcSendCommand('REGROUP', poi ? `${refBot.system}/${poi}` : refBot.system);
 }
 
 function fcHold() {
@@ -14892,6 +15591,7 @@ function setBattleCommander(botName) {
   if (!botName) {
     battleState.commanderBot = null;
     logFleetCombat('Battle commander cleared');
+    updateNavigationUI();
     return;
   }
   const bot = bots.find(b => b.username === botName);
@@ -14905,11 +15605,208 @@ function setBattleCommander(botName) {
   }
   battleState.commanderBot = botName;
   logFleetCombat(`Battle commander set to: ${botName} (${bot.shipName || 'unknown ship'})`, 'success');
-  
+
+  // Update navigation UI
+  updateNavigationUI();
+
   // If we're already in battle, refresh the UI
   if (battleState.inBattle) {
     renderBattleInterface();
   }
+}
+
+// ═══════════════════════════════════════════════════════════
+// FLEET NAVIGATION UI
+// ═══════════════════════════════════════════════════════════
+
+/** Cache for system data to avoid excessive API calls */
+const systemDataCache = new Map();
+
+/** Throttle navigation UI updates to avoid spam */
+let navUpdateTimeout = null;
+const NAV_UPDATE_THROTTLE_MS = 3000; // Only update navigation every 3 seconds max
+let lastNavSystem = null; // Track last system to avoid redundant updates
+
+/** Update the navigation UI based on commander status */
+async function updateNavigationUI(force = false) {
+  const navContainer = document.getElementById('fc-navigation-ui');
+  const statusEl = document.getElementById('fc-nav-status');
+  
+  if (!navContainer) return;
+  
+  if (!battleState.commanderBot) {
+    navContainer.innerHTML = `
+      <div style="text-align:center;color:var(--text-dim);padding:20px">
+        No commander selected. Select a battle commander to enable navigation.
+      </div>
+    `;
+    if (statusEl) statusEl.textContent = 'No commander';
+    lastNavSystem = null;
+    return;
+  }
+  
+  const commanderBot = bots.find(b => b.username === battleState.commanderBot);
+  if (!commanderBot) {
+    navContainer.innerHTML = `
+      <div style="text-align:center;color:var(--red);padding:20px">
+        Commander bot not found
+      </div>
+    `;
+    if (statusEl) statusEl.textContent = 'Bot not found';
+    lastNavSystem = null;
+    return;
+  }
+  
+  // Get commander's current system
+  const currentSystem = commanderBot.system;
+  if (!currentSystem) {
+    navContainer.innerHTML = `
+      <div style="text-align:center;color:var(--red);padding:10px">
+        Commander has no system data
+      </div>
+    `;
+    if (statusEl) statusEl.textContent = 'No system data';
+    lastNavSystem = null;
+    return;
+  }
+  
+  // Throttle updates unless forced or system changed
+  if (!force && navUpdateTimeout && currentSystem === lastNavSystem) {
+    return; // Skip this update, wait for timeout to clear
+  }
+  
+  // Set throttle timer
+  if (navUpdateTimeout) clearTimeout(navUpdateTimeout);
+  navUpdateTimeout = setTimeout(() => { navUpdateTimeout = null; }, NAV_UPDATE_THROTTLE_MS);
+  
+  // Check if system changed
+  const systemChanged = currentSystem !== lastNavSystem;
+  lastNavSystem = currentSystem;
+  
+  // Show loading state only if forcing or system changed
+  if (force || systemChanged) {
+    if (statusEl) statusEl.textContent = 'Loading...';
+    navContainer.innerHTML = `
+      <div style="text-align:center;color:var(--text-dim);padding:10px">
+        <div class="battle-loading">Loading navigation data...</div>
+      </div>
+    `;
+  }
+  
+  try {
+    // Use local mapData (no API call needed!)
+    const mapSystemData = mapData[currentSystem] || null;
+    
+    if (!mapSystemData) {
+      navContainer.innerHTML = `
+        <div style="text-align:center;color:var(--yellow);padding:10px">
+          ⚠️ System "${esc(currentSystem)}" not mapped yet.<br>
+          <span style="font-size:11px">Explore this system to enable navigation.</span>
+        </div>
+      `;
+      if (statusEl) statusEl.textContent = 'Not mapped';
+      return;
+    }
+    
+    // Build system data object from map
+    const systemData = {
+      id: currentSystem,
+      name: mapSystemData.name || currentSystem,
+      pois: mapSystemData.pois || [],
+      connections: mapSystemData.connections || [],
+    };
+    
+    // Render navigation UI
+    renderNavigationPanel(commanderBot, systemData);
+    
+    if (statusEl) statusEl.textContent = `📍 ${systemData.name}`;
+    
+  } catch (error) {
+    console.error('Navigation UI error:', error);
+    navContainer.innerHTML = `
+      <div style="text-align:center;color:var(--red);padding:10px">
+        Error loading navigation: ${esc(error.message)}
+      </div>
+    `;
+    if (statusEl) statusEl.textContent = 'Error';
+  }
+}
+
+/** Render the navigation panel with systems and POIs */
+function renderNavigationPanel(commanderBot, systemData) {
+  const navContainer = document.getElementById('fc-navigation-ui');
+  if (!navContainer) return;
+  
+  const currentSystem = commanderBot.system;
+  const systemName = systemData.name || currentSystem;
+  const pois = systemData.pois || [];
+  const connections = systemData.connections || [];
+  
+  // Build POI list
+  const poiHtml = pois.length > 0 ? `
+    <div style="margin-bottom:12px">
+      <div style="font-size:12px;font-weight:600;color:var(--text-bright);margin-bottom:6px">
+        🎯 POIs in ${esc(systemName)}:
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${pois.map(poi => `
+          <button 
+            class="sm fc-nav-btn" 
+            onclick="fcTravelToPoi('${esc(currentSystem)}', '${esc(poi.id)}')"
+            title="${esc(poi.type || 'Unknown type')}"
+          >
+            ${esc(poi.name || poi.id)}
+            <span style="font-size:10px;color:var(--text-dim)">(${esc(poi.type || '?')})</span>
+          </button>
+        `).join('')}
+      </div>
+    </div>
+  ` : '<div style="font-size:12px;color:var(--text-dim);margin-bottom:12px">No POIs known in this system</div>';
+  
+  // Build connections list
+  const connectionsHtml = connections.length > 0 ? `
+    <div>
+      <div style="font-size:12px;font-weight:600;color:var(--text-bright);margin-bottom:6px">
+        🔗 Connected Systems:
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:6px">
+        ${connections.map(conn => {
+          const connName = conn.system_name || conn.id;
+          return `
+            <button 
+              class="sm fc-nav-btn" 
+              onclick="fcJumpToSystem('${esc(conn.id)}')"
+              title="Jump to ${esc(connName)}"
+            >
+              ${esc(connName)}
+              <span style="font-size:10px;color:var(--text-dim)">(${esc(conn.id)})</span>
+            </button>
+          `;
+        }).join('')}
+      </div>
+    </div>
+  ` : '<div style="font-size:12px;color:var(--text-dim)">No connections known</div>';
+  
+  navContainer.innerHTML = `
+    <div style="font-size:12px;color:var(--text-bright);margin-bottom:10px;font-weight:600">
+      🚩 Commander Location: ${esc(systemName)} (${esc(currentSystem)})
+    </div>
+    ${poiHtml}
+    <div style="border-top:1px solid var(--border);margin:10px 0"></div>
+    ${connectionsHtml}
+  `;
+}
+
+/** Travel to a POI in the current system */
+function fcTravelToPoi(systemId, poiId) {
+  logFleetCombat(`Travel to POI: ${poiId} in ${systemId}`, 'success');
+  fcSendCommand('MOVE', `${systemId}/${poiId}`);
+}
+
+/** Jump to a connected system */
+function fcJumpToSystem(targetSystemId) {
+  logFleetCombat(`Jump to system: ${targetSystemId}`, 'success');
+  fcSendCommand('MOVE', targetSystemId);
 }
 
 // ═══════════════════════════════════════════════════════════

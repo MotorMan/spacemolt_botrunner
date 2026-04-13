@@ -3471,3 +3471,39 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .battle-quick-btn.battle-engage:hover {
   background: #ef5350;
 }
+
+/* ── Fleet Navigation UI ────────────────────────── */
+
+.fc-nav-btn {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 11px;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.fc-nav-btn:hover {
+  background: var(--bg-row-hover);
+  border-color: var(--accent);
+  color: var(--text-bright);
+  transform: translateY(-1px);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+}
+
+.fc-nav-btn:active {
+  transform: translateY(0);
+}
+
+.fc-nav-btn poi {
+  color: var(--green);
+}
+
+.fc-nav-btn system {
+  color: var(--cyan);
+}

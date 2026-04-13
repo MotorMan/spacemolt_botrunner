@@ -65,6 +65,8 @@ export interface RoutineContext {
   ) => void;
   /** Optional: get all bot usernames. */
   getAllBotNames?: () => string[];
+  /** Optional: get bot assignments (maps bot name to routine key). */
+  getBotAssignments?: () => Record<string, string>;
 }
 
 /** A routine is an async generator that yields state names as it progresses. */

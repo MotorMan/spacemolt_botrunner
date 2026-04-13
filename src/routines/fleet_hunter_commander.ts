@@ -33,6 +33,8 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { fleetCommService } from "../fleet_comm.js";
+import { getBotChatChannel } from "../botmanager.js";
+import type { BotChatMessage } from "../bot_chat_channel.js";
 import {
   findStation,
   isStationPoi,
@@ -206,38 +208,42 @@ function getFleetHunterSettings(): {
 
 // ── Fleet command broadcasting ───────────────────────────────
 
-/** Broadcast a command to the fleet via local comm (and optionally faction chat). */
-async function broadcastFleetCommand(ctx: RoutineContext, command: string, params: string): Promise<void> {
+/** Get all subordinate bot names for the current fleet */
+function getSubordinateBots(fleetId: string): string[] {
+  const fleetState = fleetCommService.getFleetState(fleetId);
+  if (!fleetState) return [];
+  return [...fleetState.subordinateBots];
+}
+
+/** Broadcast a command to the fleet via bot chat channel (replaces faction chat). */
+async function broadcastFleetCommand(ctx: RoutineContext, command: string, params: string, metadata?: Record<string, unknown>): Promise<void> {
   const settings = getFleetHunterSettings();
-  const msg = `[FLEET ${settings.fleetId}] ${command} ${params}`;
+  const subordinates = getSubordinateBots(settings.fleetId);
 
-  // Always send via local fleet comm service
+  // Send via local fleet comm service (for in-memory command routing)
   await fleetCommService.broadcast(settings.fleetId, command as any, params || undefined, ctx.bot.username);
-  ctx.log("fleet", `Broadcast (local): ${command} ${params || ""}`);
-
-  // Optionally also send via faction chat (for compatibility with old subordinates or debugging)
-  if (settings.enableFactionBroadcast) {
-    try {
-      await ctx.bot.exec("chat", {
-        channel: "faction",
-        content: msg,
-      });
-      ctx.log("fleet", `Broadcast (faction): ${msg}`);
-    } catch (e) {
-      ctx.log("error", `Failed to broadcast fleet command to faction: ${e}`);
-    }
-  }
+  
+  // Also send via bot chat channel for coordination, logging, and structured data
+  const commandMsg = `${command} ${params || ""}`.trim();
+  ctx.sendBotChat?.(commandMsg, "fleet", subordinates.length > 0 ? subordinates : undefined, {
+    command,
+    params: params || undefined,
+    commander: ctx.bot.username,
+    fleetId: settings.fleetId,
+    ...metadata,
+  });
+  ctx.log("fleet", `Broadcast (bot chat): ${command} ${params || ""}`);
 }
 
 /** Send a MOVE command to the fleet. */
 async function orderFleetMove(ctx: RoutineContext, systemId: string, poiId?: string): Promise<void> {
   const params = poiId ? `${systemId}/${poiId}` : systemId;
-  await broadcastFleetCommand(ctx, "MOVE", params);
+  await broadcastFleetCommand(ctx, "MOVE", params, { targetSystem: systemId, targetPoi: poiId });
 }
 
 /** Send an ATTACK command with target ID. */
 async function orderFleetAttack(ctx: RoutineContext, targetId: string, targetName: string): Promise<void> {
-  await broadcastFleetCommand(ctx, "ATTACK", `${targetId}:${targetName}`);
+  await broadcastFleetCommand(ctx, "ATTACK", `${targetId}:${targetName}`, { targetId, targetName });
 }
 
 /** Send a FLEE command to the fleet. */
@@ -248,7 +254,7 @@ async function orderFleetFlee(ctx: RoutineContext): Promise<void> {
 /** Send a REGROUP command. */
 async function orderFleetRegroup(ctx: RoutineContext, systemId: string, poiId?: string): Promise<void> {
   const params = poiId ? `${systemId}/${poiId}` : systemId;
-  await broadcastFleetCommand(ctx, "REGROUP", params);
+  await broadcastFleetCommand(ctx, "REGROUP", params, { targetSystem: systemId, targetPoi: poiId });
 }
 
 /** Send a HOLD command (stay in position). */
@@ -259,6 +265,30 @@ async function orderFleetHold(ctx: RoutineContext): Promise<void> {
 /** Send a PATROL command (resume patrol pattern). */
 async function orderFleetPatrol(ctx: RoutineContext): Promise<void> {
   await broadcastFleetCommand(ctx, "PATROL", "");
+}
+
+/** Broadcast fleet status update with hull/shield info for all members. */
+async function broadcastFleetStatus(ctx: RoutineContext): Promise<void> {
+  const settings = getFleetHunterSettings();
+  const subordinates = getSubordinateBots(settings.fleetId);
+  const { bot } = ctx;
+  
+  await bot.refreshStatus();
+  const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+  const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
+  const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  
+  const statusMsg = `Commander Status: Hull=${hullPct}% | Shield=${shieldPct}% | Fuel=${fuelPct}% | System=${bot.system || "unknown"}`;
+  
+  ctx.sendBotChat?.(statusMsg, "fleet", subordinates.length > 0 ? subordinates : undefined, {
+    type: "status_update",
+    hull: hullPct,
+    shield: shieldPct,
+    fuel: fuelPct,
+    system: bot.system || "unknown",
+    poi: bot.poi || null,
+    inBattle: !!(await getBattleStatus(ctx)),
+  });
 }
 
 // ── Nearby entity parsing ─────────────────────────────────────
@@ -884,6 +914,17 @@ async function fightJoinedBattleFleet(
 export const fleetHunterCommanderRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
+  // Verify this bot is assigned as the fleet commander
+  const assignments = ctx.getBotAssignments?.() || {};
+  const assignedCommander = Object.entries(assignments).find(
+    ([_, routine]) => routine === "fleet_hunter_commander"
+  )?.[0];
+
+  if (assignedCommander && assignedCommander !== bot.username) {
+    ctx.log("fleet", `❌ This bot is not the assigned fleet commander. Assigned: ${assignedCommander}, Current: ${bot.username}. Exiting.`);
+    return;
+  }
+
   await bot.refreshStatus();
   let totalKills = 0;
 
@@ -931,6 +972,9 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
     yield "get_status";
     await bot.refreshStatus();
     logStatus(ctx);
+    
+    // Broadcast status to fleet
+    await broadcastFleetStatus(ctx);
 
     // ── Fuel check ──
     yield "fuel_check";
@@ -1100,6 +1144,8 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
             ctx.log("combat", `Kill #${totalKills} — looting...`);
             yield "loot";
             await scavengeWrecks(ctx);
+            // Broadcast status after combat
+            await broadcastFleetStatus(ctx);
           } else {
             ctx.log("combat", "Retreated — aborting patrol");
             abortPatrol = true;
@@ -1126,6 +1172,8 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
             totalKills++;
             patrolKills++;
             await scavengeWrecks(ctx);
+            // Broadcast status after combat
+            await broadcastFleetStatus(ctx);
           }
         }
       }

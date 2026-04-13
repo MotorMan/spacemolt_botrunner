@@ -26,6 +26,8 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { fleetCommService, parseMoveParams, parseAttackTarget, type FleetCommand } from "../fleet_comm.js";
+import { getBotChatChannel } from "../botmanager.js";
+import type { BotChatMessage } from "../bot_chat_channel.js";
 import {
   findStation,
   isStationPoi,
@@ -185,6 +187,42 @@ function createFleetCommandListener(ctx: RoutineContext): (command: FleetCommand
     fleetState.commandParams = command.params || null;
 
     // Commands are executed by the main routine loop
+  };
+}
+
+/** Create a bot chat message handler for fleet coordination. */
+function createBotChatMessageHandler(ctx: RoutineContext): (message: BotChatMessage) => void {
+  const { bot } = ctx;
+  const settings = getFleetHunterSettings();
+
+  return (message: BotChatMessage) => {
+    // Ignore messages from ourselves
+    if (message.sender === bot.username) return;
+
+    // Only process fleet channel messages
+    if (message.channel !== "fleet") return;
+
+    // Log the message
+    ctx.log("fleet", `[BOT_CHAT] ${message.sender}: ${message.content}`);
+
+    // Handle metadata if present
+    if (message.metadata?.type === "status_update") {
+      const { hull, shield, fuel, system, inBattle } = message.metadata;
+      ctx.log("fleet", `📊 Commander Status: Hull=${hull}% | Shield=${shield}% | Fuel=${fuel}% | System=${system} | Battle=${inBattle ? "YES" : "NO"}`);
+    }
+    
+    // Handle commands from web UI or commander
+    if (message.metadata?.command && message.metadata?.fromWebUI) {
+      const cmd = message.metadata.command as string;
+      const params = (message.metadata.params as string) || "";
+      
+      ctx.log("fleet", `🎮 Web UI Command: ${cmd} ${params}`);
+      
+      // Update fleet state for command execution
+      fleetState.lastCommandTime = Date.now();
+      fleetState.currentCommand = cmd as any;
+      fleetState.commandParams = params || null;
+    }
   };
 }
 
@@ -677,15 +715,20 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
   await bot.refreshStatus();
 
   const settings = getFleetHunterSettings();
-  
+
   // Register with fleet comm service
   const commandListener = createFleetCommandListener(ctx);
   fleetCommService.subscribe(settings.fleetId, bot.username, commandListener);
   fleetCommService.addSubordinate(settings.fleetId, bot.username);
-  
+
+  // Register bot chat message handler
+  const botChatHandler = createBotChatMessageHandler(ctx);
+  getBotChatChannel().onMessage(bot.username, botChatHandler);
+
   ctx.log("fleet", `Fleet Hunter Subordinate online — awaiting commander's orders (fleet: ${settings.fleetId})...`);
 
-  while (bot.state === "running") {
+  try {
+    while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) {
@@ -705,9 +748,60 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
     await bot.refreshStatus();
     logStatus(ctx);
 
-    // ── Check if hunting is disabled ──
+    // ── Process pending fleet commands (ALWAYS process commands, even if hunting disabled) ──
+    yield "check_commands";
+    if (fleetState.currentCommand) {
+      const cmd = fleetState.currentCommand;
+      const params = fleetState.commandParams || "";
+
+      ctx.log("fleet", `🎯 Processing command: ${cmd} ${params}`);
+
+      // Execute command based on type
+      switch (cmd) {
+        case "MOVE":
+          yield "exec_move";
+          await executeMoveCommand(ctx, params);
+          break;
+        case "ATTACK":
+          yield "exec_attack";
+          await executeAttackCommand(ctx, params);
+          break;
+        case "FLEE":
+          yield "exec_flee";
+          await executeFleeCommand(ctx);
+          break;
+        case "REGROUP":
+          yield "exec_regroup";
+          await executeRegroupCommand(ctx, params);
+          break;
+        case "HOLD":
+          yield "exec_hold";
+          await executeHoldCommand(ctx);
+          break;
+        case "PATROL":
+          yield "exec_patrol";
+          await executePatrolCommand(ctx);
+          break;
+        default:
+          ctx.log("warn", `Unknown fleet command: ${cmd}`);
+      }
+
+      fleetState.currentCommand = null;
+      fleetState.commandParams = null;
+      
+      // After executing command, check if we should continue or wait
+      // If hunting is disabled and no more commands, just wait
+      const updatedSettings = getFleetHunterSettings();
+      if (!updatedSettings.huntingEnabled) {
+        ctx.log("fleet", "Hunting is disabled — executed command, now waiting...");
+        await sleep(2000);
+        continue;
+      }
+    }
+
+    // ── Check if hunting is disabled (only reaches here if no commands were pending) ──
     if (!currentSettings.huntingEnabled) {
-      ctx.log("fleet", "Hunting is disabled — waiting...");
+      ctx.log("fleet", "Hunting is disabled — waiting for commands...");
       await sleep(5000);
       continue;
     }
@@ -817,5 +911,12 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
     // ── Idle wait ──
     yield "wait_idle";
     await sleep(2000);
+    }
+  } finally {
+    // Clean up bot chat handler
+    getBotChatChannel().offMessage(bot.username, botChatHandler);
+    // Unsubscribe from fleet commands
+    fleetCommService.unsubscribe(settings.fleetId, bot.username, commandListener);
+    ctx.log("fleet", "Fleet Hunter Subordinate offline — cleaned up handlers");
   }
 };

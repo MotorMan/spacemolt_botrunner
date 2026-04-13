@@ -261,6 +261,7 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
       sendBotChatMessage(botName, content, channel as BotChatChannel, recipients, metadata);
     },
     getAllBotNames: () => [...bots.keys()],
+    getBotAssignments: () => server.getBotAssignments(),
   };
 
   bot.start(routineKey, routine.fn, chatStartOpts).then(() => {
@@ -347,6 +348,7 @@ async function handleEmergencyReturn(): Promise<WebActionResult> {
         sendBotChatMessage(botName, content, channel as BotChatChannel, recipients, metadata);
       },
       getAllBotNames: () => [...bots.keys()],
+      getBotAssignments: () => server.getBotAssignments(),
     };
 
     bot.start(routineKey, routine.fn, chatStartOpts).then(() => {

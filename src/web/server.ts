@@ -4,6 +4,7 @@ import type { BotStatus } from "../bot.js";
 import { getBot } from "../botmanager.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
+import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
 
 // ── Types ──────────────────────────────────────────────────
@@ -472,6 +473,61 @@ export class WebServer {
           } catch (err) {
             return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
           }
+        }
+
+        // POST fleet command via bot chat channel (replaces faction chat)
+        if (url.pathname === "/api/fleet-command" && req.method === "POST") {
+          const body = await req.json();
+          const { command, params, fleetId, metadata } = body as { 
+            command: string; 
+            params?: string; 
+            fleetId?: string;
+            metadata?: Record<string, unknown>;
+          };
+          
+          if (!command) {
+            return Response.json({ error: { code: "invalid_request", message: "Missing command" } });
+          }
+
+          // Get fleet settings to find subordinate bots
+          const fleetHunterSettings = (this.settings as Record<string, unknown>).fleet_hunter as Record<string, unknown> || {};
+          const resolvedFleetId = (fleetId || (fleetHunterSettings.fleetId as string) || "default") as string;
+          
+          // Get fleet state to find subordinate bots
+          const { fleetCommService } = await import("../fleet_comm.js");
+          const fleetState = fleetCommService.getFleetState(resolvedFleetId);
+          const subordinates = fleetState ? [...fleetState.subordinateBots] : [];
+          const commanderBot = fleetState?.commanderBot;
+          
+          if (!commanderBot) {
+            return Response.json({ error: { code: "no_commander", message: "No commander assigned to fleet" } });
+          }
+
+          // Send via bot chat channel
+          const commandMsg = `${command} ${params || ""}`.trim();
+          botChatChannel.send({
+            sender: "web-ui",
+            recipients: subordinates.length > 0 ? subordinates : [commanderBot],
+            channel: "fleet",
+            content: commandMsg,
+            metadata: {
+              command,
+              params: params || undefined,
+              fleetId: resolvedFleetId,
+              fromWebUI: true,
+              ...metadata,
+            },
+          });
+
+          // Also send via fleet comm service for command processing
+          await fleetCommService.broadcast(resolvedFleetId, command as any, params || undefined, commanderBot);
+
+          return Response.json({ 
+            ok: true, 
+            message: `Fleet command ${command} sent to ${subordinates.length} subordinate(s)`,
+            fleetId: resolvedFleetId,
+            subordinateCount: subordinates.length,
+          });
         }
 
         // Per-bot battle status endpoint

@@ -175,6 +175,7 @@ function getAiChatSettings(): {
   conversationCooldownSec: number;
   factionChatRoundsLimit: number; // Max rounds of AI responses in faction chat (0 = unlimited)
   llmTimeoutSec: number; // Timeout for LLM API calls in seconds
+  maxTokens: number; // Maximum tokens for LLM response
 } {
   const all = readSettings();
   const s = (all.ai_chat || {}) as Record<string, unknown>;
@@ -213,6 +214,7 @@ function getAiChatSettings(): {
     conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
     factionChatRoundsLimit: (s.factionChatRoundsLimit as number) ?? 5,
     llmTimeoutSec: (s.llmTimeoutSec as number) ?? 30,
+    maxTokens: (s.maxTokens as number) ?? 1000,
   };
 }
 
@@ -360,7 +362,7 @@ async function callLlm(
   const body: Record<string, unknown> = {
     model: settings.model,
     messages,
-    max_tokens: 300,
+    max_tokens: settings.maxTokens,
     temperature: 0.8,
   };
 
@@ -380,14 +382,24 @@ async function callLlm(
   }
 
   const data = await resp.json() as {
-    choices?: Array<{ message: LlmMessage; finish_reason: string }>;
+    choices?: Array<{ message: LlmMessage & { reasoning_content?: string }; finish_reason: string }>;
     error?: { message: string };
   };
 
   if (data.error) throw new Error(`LLM error: ${data.error.message}`);
   const msg = data.choices?.[0]?.message;
-  if (!msg || !msg.content) throw new Error("LLM returned no message");
-  return msg.content;
+  if (!msg) throw new Error("LLM returned no message");
+  
+  // For thinking-enabled models: prefer actual content over reasoning
+  // The model returns reasoning in reasoning_content field, but the final response is in content
+  const responseContent = msg.content || "";
+  if (!responseContent && msg.reasoning_content) {
+    // If only reasoning content exists (model was cut off), use it as fallback
+    console.warn("LLM warning: Only reasoning_content available, model may have been interrupted");
+    return msg.reasoning_content;
+  }
+  
+  return responseContent;
 }
 
 // ── AI Chat Service Class ────────────────────────────────────

@@ -855,30 +855,69 @@ export async function ensureFueled(
     return await emergencyFuelRecovery(ctx);
   }
 
-  // Step 2: No local station — try fuel cells already in cargo
-  // Loop to consume multiple fuel cells if needed (e.g. low-tier cells only give +20 fuel each)
+  // Step 2: No local station — check if fuel cells in cargo can get us above threshold
+  // Only use fuel cells if they can meet the threshold, otherwise go directly to station
   if (!bot.docked) {
-    let cargoRefuelAttempts = 0;
-    while (fuelPct < thresholdPct && cargoRefuelAttempts < 20) {
-      const refuelResp = await bot.exec("refuel");
-      if (refuelResp.error) {
-        const msg = refuelResp.error.message.toLowerCase();
-        if (msg.includes("no fuel") || msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
-          ctx.log("system", "No fuel cells in cargo — skipping cargo refuel");
+    // First, check how many fuel cells we have and if they can get us above threshold
+    const cargoResp = await bot.exec("get_cargo");
+    let totalFuelCells = 0;
+    let hasPremiumFuelCells = false;
+    let hasRegularFuelCells = false;
+    
+    if (cargoResp.result && typeof cargoResp.result === "object") {
+      const cResult = cargoResp.result as Record<string, unknown>;
+      const cargoItems = (
+        Array.isArray(cResult) ? cResult :
+        Array.isArray(cResult.items) ? (cResult.items as Array<Record<string, unknown>>) :
+        Array.isArray(cResult.cargo) ? (cResult.cargo as Array<Record<string, unknown>>) :
+        []
+      );
+      
+      for (const item of cargoItems) {
+        const itemId = (item.item_id as string) || "";
+        const quantity = (item.quantity as number) || 0;
+        if (itemId === "premium_fuel_cell") {
+          totalFuelCells += quantity * 50; // premium gives 50 fuel each
+          hasPremiumFuelCells = true;
+        } else if (itemId.includes("fuel_cell")) {
+          totalFuelCells += quantity * 20; // regular gives ~20 fuel each
+          hasRegularFuelCells = true;
         }
-        break; // error or no fuel cells
       }
-      cargoRefuelAttempts++;
-      await bot.refreshStatus();
-      const newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      if (newFuelPct > fuelPct) {
-        ctx.log("system", `Refueled from cargo fuel cell — fuel now ${newFuelPct}%`);
-        fuelPct = newFuelPct;
+    }
+
+    // Calculate if fuel cells can get us above threshold
+    const fuelNeeded = bot.maxFuel > 0 ? ((thresholdPct / 100) * bot.maxFuel) - bot.fuel : 0;
+    const canReachThresholdWithFuelCells = totalFuelCells >= fuelNeeded;
+
+    if (canReachThresholdWithFuelCells) {
+      ctx.log("system", `Sufficient fuel cells in cargo (${hasPremiumFuelCells ? "premium+" : ""}${hasRegularFuelCells ? "regular" : ""}) — using cargo fuel cells to refuel`);
+      
+      // Use fuel cells from cargo
+      let cargoRefuelAttempts = 0;
+      while (fuelPct < thresholdPct && cargoRefuelAttempts < 20) {
+        const refuelResp = await bot.exec("refuel");
+        if (refuelResp.error) {
+          const msg = refuelResp.error.message.toLowerCase();
+          if (msg.includes("no fuel") || msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
+            ctx.log("system", "No fuel cells in cargo — skipping cargo refuel");
+          }
+          break; // error or no fuel cells
+        }
+        cargoRefuelAttempts++;
+        await bot.refreshStatus();
+        const newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        if (newFuelPct > fuelPct) {
+          ctx.log("system", `Refueled from cargo fuel cell — fuel now ${newFuelPct}%`);
+          fuelPct = newFuelPct;
+        }
+        if (fuelPct >= thresholdPct) {
+          ctx.log("system", `Refueled from cargo — fuel now ${fuelPct}%`);
+          return true;
+        }
       }
-      if (fuelPct >= thresholdPct) {
-        ctx.log("system", `Refueled from cargo — fuel now ${fuelPct}%`);
-        return true;
-      }
+    } else {
+      ctx.log("system", `Insufficient fuel cells in cargo to reach ${thresholdPct}% threshold — going directly to station`);
     }
 
     // Step 3: Nearly out of fuel — scavenge wrecks for fuel as last resort (never jettison cargo)
@@ -3056,6 +3095,15 @@ export async function checkAndFleeFromBattle(
   ctx: RoutineContext,
   logPrefix?: string,
 ): Promise<boolean> {
+  // CRITICAL: Check WebSocket battle state FIRST (fastest, no API call)
+  if (ctx.bot.isInBattle()) {
+    const prefix = logPrefix ? `[${logPrefix}] ` : "";
+    ctx.log("combat", `${prefix}BATTLE DETECTED [WebSocket]! - fleeing immediately!`);
+    await fleeFromBattle(ctx, true, 35000);
+    return true;
+  }
+  
+  // Fallback: check via API
   const battleStatus = await getBattleStatus(ctx);
   if (battleStatus && battleStatus.is_participant) {
     const prefix = logPrefix ? `[${logPrefix}] ` : "";
@@ -3116,6 +3164,13 @@ export async function checkBattleAfterCommand(
  * Emergency flee response when pirates are detected in get_nearby.
  * If not in a battle, immediately jump to a random adjacent system.
  * If already in battle, use flee stance.
+ * 
+ * IMPROVEMENTS:
+ * - Uses get_status to verify actual current system before jumping (fixes system tracking)
+ * - Polls get_battle_status every 5 seconds while jump is pending
+ * - Detects silent battle locks and cancels out to use battle stance flee
+ * - Validates jump target is actually connected to current system
+ * 
  * @param ctx - Routine context
  * @param pirateResult - Result from parseNearbyForPirates
  * @returns true if successfully escaped/fled, false if failed
@@ -3139,8 +3194,17 @@ export async function emergencyFleeFromPirates(
   // We have 20 seconds (2 ticks) to leave before they attack
   ctx.log("combat", "Not in battle - attempting emergency jump!");
 
-  // Get system info to find jump targets
-  const { connections } = await getSystemInfo(ctx);
+  // CRITICAL: Verify actual current system via get_status before selecting jump target
+  // This prevents jumping to non-connected systems when tracking gets mixed up
+  await bot.refreshStatus();
+  const actualCurrentSystem = bot.system;
+  const actualCurrentPoi = bot.poi;
+  ctx.log("travel", `Verified actual position: system=${actualCurrentSystem}, poi=${actualCurrentPoi}`);
+
+  // Get fresh system info for the ACTUAL current system
+  const systemInfo = await getSystemInfo(ctx);
+  const { connections } = systemInfo;
+  
   if (!connections || connections.length === 0) {
     ctx.log("error", "No jump connections available - trapped!");
     return false;
@@ -3148,7 +3212,7 @@ export async function emergencyFleeFromPirates(
 
   // Get blacklist and filter out blacklisted systems
   const blacklist = getSystemBlacklist();
-  const safeConnections = connections.filter(c => 
+  const safeConnections = connections.filter(c =>
     c.id && !blacklist.some(b => b.toLowerCase() === c.id!.toLowerCase())
   );
 
@@ -3167,14 +3231,123 @@ export async function emergencyFleeFromPirates(
   }
 
   ctx.log("travel", `Emergency jump to ${randomConnection.name || randomConnection.id}!`);
-  const jumpResp = await bot.exec("jump", { target_system: randomConnection.id });
+  
+  // Start the jump command
+  const jumpPromise = bot.exec("jump", { target_system: randomConnection.id });
+  
+  // Start battle status polling while jump is pending
+  // This detects silent battle locks (when server regresses and doesn't send interruption message)
+  const battlePollInterval = 5000; // Check every 5 seconds
+  const battlePollTimeout = 25000; // Give up after 25 seconds (slightly more than the 20s window)
+  let pollTimer: NodeJS.Timeout | null = null;
+  let jumpCompleted = false;
+  let battleDetectedDuringJump = false;
+  let fleeIssued = false;
+
+  const battlePoll = async () => {
+    let elapsed = 0;
+    while (elapsed < battlePollTimeout && !jumpCompleted) {
+      await new Promise(resolve => {
+        pollTimer = setTimeout(resolve, battlePollInterval);
+      });
+      elapsed += battlePollInterval;
+
+      if (jumpCompleted) break;
+
+      // CRITICAL: Check WebSocket battle state FIRST (fastest detection, no API call)
+      // This catches battles even when the jump command is hung/slow to respond
+      if (bot.isInBattle()) {
+        ctx.log("combat", `[EMERGENCY] Battle detected via WebSocket during jump polling! Issuing flee immediately!`);
+        battleDetectedDuringJump = true;
+        jumpCompleted = true;
+        // Issue flee IMMEDIATELY - don't wait for jump promise to resolve
+        // The jump command can't be cancelled, but we need to start fleeing NOW
+        fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${err.message}`));
+        fleeIssued = true;
+        return;
+      }
+
+      // Also check battle status via API (fallback for edge cases)
+      const currentBattleStatus = await getBattleStatus(ctx);
+      if (currentBattleStatus && currentBattleStatus.is_participant) {
+        ctx.log("combat", `[EMERGENCY] Battle detected via API during jump polling! Battle ID: ${currentBattleStatus.battle_id} - fleeing immediately!`);
+        battleDetectedDuringJump = true;
+        jumpCompleted = true;
+        // Issue flee IMMEDIATELY
+        fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${err.message}`));
+        fleeIssued = true;
+        return;
+      }
+
+      // Also verify we're still in the same system (jump hasn't silently succeeded)
+      await bot.refreshStatus();
+      if (bot.system !== actualCurrentSystem) {
+        ctx.log("travel", `[EMERGENCY] System changed during poll - jump succeeded to ${bot.system}`);
+        jumpCompleted = true;
+        return;
+      }
+
+      ctx.log("combat", `[EMERGENCY] Battle poll ${Math.floor(elapsed / 1000)}s - still in system ${actualCurrentSystem}, no battle detected`);
+    }
+  };
+
+  // Run both the jump and the battle poll concurrently
+  // Note: Promise.all waits for both, but the poll issues flee immediately if battle detected
+  const [jumpResp] = await Promise.all([
+    jumpPromise,
+    battlePoll(),
+  ]);
+
+  // Clean up timer
+  if (pollTimer) {
+    clearTimeout(pollTimer);
+    pollTimer = null;
+  }
+  jumpCompleted = true;
+
+  // If battle was detected during polling and flee was already issued, check if we survived
+  if (fleeIssued) {
+    // Flee was already issued - check if we're still alive and in battle
+    await bot.refreshStatus();
+    if (bot.isInBattle()) {
+      // Still in battle after flee - try again
+      ctx.log("combat", "Still in battle after emergency flee - retrying flee stance!");
+      return await fleeFromBattle(ctx);
+    }
+    // Flee succeeded or battle ended
+    ctx.log("combat", "Emergency flee completed - checking if we escaped");
+    return bot.system !== actualCurrentSystem;
+  }
 
   if (jumpResp.error) {
     ctx.log("error", `Emergency jump failed: ${jumpResp.error.message}`);
+    
+    // Check if we're now in battle (silent lock detection)
+    const postFailBattleStatus = await getBattleStatus(ctx);
+    if (postFailBattleStatus && postFailBattleStatus.is_participant) {
+      ctx.log("combat", "Battle detected after jump failure - switching to battle flee!");
+      return await fleeFromBattle(ctx);
+    }
+    
     return false;
   }
 
-  ctx.log("combat", `Successfully escaped to ${randomConnection.name || randomConnection.id}!`);
+  // Verify jump succeeded by checking system
+  await bot.refreshStatus();
+  if (bot.system === actualCurrentSystem) {
+    ctx.log("error", `Jump reported success but still in ${actualCurrentSystem} - jump may have silently failed!`);
+    
+    // Check if battle started during the jump
+    const postJumpBattleStatus = await getBattleStatus(ctx);
+    if (postJumpBattleStatus && postJumpBattleStatus.is_participant) {
+      ctx.log("combat", "Battle detected after silent jump failure - switching to battle flee!");
+      return await fleeFromBattle(ctx);
+    }
+    
+    return false;
+  }
+
+  ctx.log("combat", `Successfully escaped to ${bot.system}!`);
   return true;
 }
 

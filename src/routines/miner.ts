@@ -25,6 +25,7 @@ import {
 import {
   getRadioactiveCapability,
   hasRadioactiveEquipmentCached,
+  hasDeepCoreExtractorCached,
   logRadioactiveCapability,
   isRadioactiveOre,
 } from "./miner_radioactive.js";
@@ -637,10 +638,11 @@ async function travelToPoiWithSurvey(
   }
 
   // CRITICAL: Check for battle interrupt error
-  if (travelResp.error.code === "battle_interrupt" || 
-      travelResp.error.message.toLowerCase().includes("interrupted by battle") || 
+  if (travelResp.error.code === "battle_interrupt" ||
+      travelResp.error.message.toLowerCase().includes("interrupted by battle") ||
       travelResp.error.message.toLowerCase().includes("interrupted by combat")) {
     ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+    await fleeFromBattle(ctx);
     return { success: false, error: "battle detected" };
   }
 
@@ -681,10 +683,11 @@ async function travelToPoiWithSurvey(
     }
 
     // CRITICAL: Check for battle interrupt error on retry
-    if (retryResp.error && (retryResp.error.code === "battle_interrupt" || 
-        retryResp.error.message.toLowerCase().includes("interrupted by battle") || 
+    if (retryResp.error && (retryResp.error.code === "battle_interrupt" ||
+        retryResp.error.message.toLowerCase().includes("interrupted by battle") ||
         retryResp.error.message.toLowerCase().includes("interrupted by combat"))) {
       ctx.log("combat", `Travel retry interrupted by battle! ${retryResp.error.message} - fleeing!`);
+      await fleeFromBattle(ctx);
       return { success: false, error: "battle detected" };
     }
 
@@ -822,9 +825,10 @@ function pickTargetFromQuotasOrClosest(
 
 /** Find appropriate POI based on mining type. */
 function findMiningPoi(
-  pois: Array<{ id: string; name: string; type: string }>,
+  pois: Array<{ id: string; name: string; type: string; hidden?: boolean }>,
   miningType: "ore" | "gas" | "ice" | "radioactive",
-  targetResource?: string
+  targetResource?: string,
+  allowHiddenPois?: boolean
 ): { id: string; name: string } | null {
   if (miningType === "ice") {
     // Ice mining
@@ -843,10 +847,11 @@ function findMiningPoi(
     const iceField = pois.find(p => isIceFieldPoi(p.type));
     return iceField ? { id: iceField.id, name: iceField.name } : null;
   } else if (miningType === "radioactive") {
-    // Radioactive mining - uses ore belts
+    // Radioactive mining - uses ore belts (and hidden POIs if has deep core extractor)
     if (targetResource) {
       for (const poi of pois) {
-        if (isOreBeltPoi(poi.type)) {
+        const isMatchingPoi = isOreBeltPoi(poi.type) || (allowHiddenPois && poi.hidden === true);
+        if (isMatchingPoi) {
           const sysData = mapStore.getSystem(poi.id.split("-")[0] || "");
           const storedPoi = sysData?.pois.find(p => p.id === poi.id);
           if (storedPoi?.ores_found.some(o => o.item_id === targetResource)) {
@@ -855,8 +860,8 @@ function findMiningPoi(
         }
       }
     }
-    // Fallback: any ore belt
-    const oreBelt = pois.find(p => isOreBeltPoi(p.type));
+    // Fallback: any ore belt (or hidden POI if available)
+    const oreBelt = pois.find(p => isOreBeltPoi(p.type) || (allowHiddenPois && p.hidden === true));
     return oreBelt ? { id: oreBelt.id, name: oreBelt.name } : null;
   } else if (miningType === "ore") {
     // Ore mining
@@ -1497,6 +1502,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       miningType = settings.miningType;
     }
 
+    // Radioactive mining: check if we can access hidden POIs (requires deep core extractor)
+    // Without extractor, can only mine regular ore belts
+    const canMineHiddenRadioactive = miningType === "radioactive" && hasDeepCoreExtractorCached(cachedModules || []);
+
     // Smart target selection: when mining type is auto-detected, only use the
     // matching target field (no cross-type fallback). A gas harvester should
     // never be forced to mine ore just because targetGas is empty.
@@ -1511,6 +1520,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     } else if (miningType === "ore") {
       targetResource = isAutoDetected ? settings.targetOre : (settings.targetOre || settings.targetGas || settings.targetIce);
       resourceLabel = targetResource === settings.targetGas ? "gas" : (targetResource === settings.targetIce ? "ice" : "ore");
+    } else if (miningType === "radioactive") {
+      targetResource = isAutoDetected ? settings.targetRadioactive : (settings.targetRadioactive || settings.targetOre || settings.targetGas);
+      resourceLabel = "radioactive";
     } else {
       // gas
       targetResource = isAutoDetected ? settings.targetGas : (settings.targetGas || settings.targetOre || settings.targetIce);
@@ -1523,12 +1535,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     } else {
       ctx.log("mining", `Mining any ${resourceLabel} (no specific target configured)`);
       // Debug: Log what settings were loaded to help diagnose targeting issues
-      ctx.log("debug", `Settings loaded: targetOre="${settings.targetOre}", targetGas="${settings.targetGas}", targetIce="${settings.targetIce}"`);
-      ctx.log("debug", `System targets: systemOre="${settings.systemOre}", systemGas="${settings.systemGas}", systemIce="${settings.systemIce}"`);
+      ctx.log("debug", `Settings loaded: targetOre="${settings.targetOre}", targetGas="${settings.targetGas}", targetIce="${settings.targetIce}", targetRadioactive="${settings.targetRadioactive}"`);
+      ctx.log("debug", `System targets: systemOre="${settings.systemOre}", systemGas="${settings.systemGas}", systemIce="${settings.systemIce}", systemRadioactive="${settings.systemRadioactive}"`);
     }
 
     // ── Select quotas based on mining type ──
-    const quotas = miningType === "ice" ? settings.iceQuotas : (miningType === "ore" ? settings.oreQuotas : settings.gasQuotas);
+    const quotas = miningType === "ice" ? settings.iceQuotas : (miningType === "ore" ? settings.oreQuotas : (miningType === "radioactive" ? settings.radioactiveQuotas : settings.gasQuotas));
 
     // ── Determine priority target (global target or quota pick) ──
     const hasGlobalTarget = !!targetResource;
@@ -1627,11 +1639,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let effectiveTarget = recoveredSession ? recoveredSession.targetResourceId : priorityTarget;
     const isQuotaDriven = recoveredSession ? recoveredSession.isQuotaDriven : !!quotaTargetResource;
     const maxJumps = settings.maxJumps || 10;
-    
+
     // Initialize target location variables (may be set by deep core search below)
-    let targetSystemId = "";
-    let targetPoiId = "";
-    let targetPoiName = "";
+    // CRITICAL FIX: Restore target location from recovered session to prevent
+    // deep core miners from losing track of hidden POIs between cycles
+    let targetSystemId = recoveredSession ? recoveredSession.targetSystemId : "";
+    let targetPoiId = recoveredSession ? recoveredSession.targetPoiId : "";
+    let targetPoiName = recoveredSession ? recoveredSession.targetPoiName : "";
 
     // ── Deep core miner restriction ──
     // If the miner has full deep core capability, restrict mining to deep core ores only
@@ -1868,6 +1882,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       } else {
         configuredSystem = settings.systemOre || settings.systemGas || settings.systemIce || settings.system || "";
       }
+    } else if (miningType === "radioactive") {
+      configuredSystem = settings.systemRadioactive || settings.systemOre || settings.systemGas || settings.system || "";
     } else {
       // gas
       configuredSystem = settings.systemGas || settings.systemOre || settings.systemIce || settings.system || "";
@@ -1885,6 +1901,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const poi = sys?.pois.find(p => p.id === loc.poiId);
         if (!poi) return true; // keep if type unknown
         if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+        if (miningType === "radioactive") return isOreBeltPoi(poi.type) || (canMineHiddenRadioactive && poi.hidden === true);
         if (miningType === "gas") return isGasCloudPoi(poi.type);
         if (miningType === "ice") return isIceFieldPoi(poi.type);
         return true;
@@ -2215,7 +2232,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       : settings.jettisonOres;
 
     // ── Find mining POI and station in current system ──
-    yield miningType === "ice" ? "find_ice_field" : (miningType === "ore" ? "find_ore_belt" : "find_gas_cloud");
+    yield (miningType === "ice" ? "find_ice_field" : (miningType === "ore" || miningType === "radioactive" ? "find_ore_belt" : "find_gas_cloud"));
     const { pois: initialPois, systemId } = await getSystemInfo(ctx);
     if (systemId) bot.system = systemId;
 
@@ -2246,6 +2263,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const match = pois.find(p => p.id === targetPoiId);
       if (match) {
         miningPoi = { id: match.id, name: match.name };
+      } else if (canMineHiddenRadioactive) {
+        // Hidden POI not visible in system POI list — use it anyway if map confirms it
+        const sysData = mapStore.getSystem(bot.system);
+        const storedPoi = sysData?.pois.find(p => p.id === targetPoiId);
+        if (storedPoi && storedPoi.hidden) {
+          miningPoi = { id: storedPoi.id, name: storedPoi.name };
+          ctx.log("mining", `Using known hidden POI ${storedPoi.name} (not yet visible in system scan)`);
+        }
+      } else if (effectiveTarget && isDeepCoreOre(effectiveTarget) && deepCoreCap.canMine) {
+        // Deep core ore hidden POI not visible in system POI list — use map store
+        const sysData = mapStore.getSystem(bot.system);
+        const storedPoi = sysData?.pois.find(p => p.id === targetPoiId);
+        if (storedPoi) {
+          miningPoi = { id: storedPoi.id, name: storedPoi.name };
+          ctx.log("mining", `Using known deep core POI from map: ${storedPoi.name} (${storedPoi.hidden ? "hidden" : "visible"})`);
+        }
       }
     }
 
@@ -2255,6 +2288,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const isMatchingType =
           (miningType === "ice" && isIceFieldPoi(poi.type)) ||
           (miningType === "ore" && (isOreBeltPoi(poi.type) || poi.hidden === true)) ||
+          (miningType === "radioactive" && (isOreBeltPoi(poi.type) || (canMineHiddenRadioactive && poi.hidden === true))) ||
           (miningType === "gas" && isGasCloudPoi(poi.type));
 
         if (!isMatchingType) continue;
@@ -2295,9 +2329,45 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       } else if (miningType === "ore") {
         const oreBelt = pois.find(p => isOreBeltPoi(p.type) || p.hidden === true);
         if (oreBelt) miningPoi = { id: oreBelt.id, name: oreBelt.name };
+      } else if (miningType === "radioactive") {
+        const oreBelt = pois.find(p => isOreBeltPoi(p.type) || (canMineHiddenRadioactive && p.hidden === true));
+        if (oreBelt) miningPoi = { id: oreBelt.id, name: oreBelt.name };
       } else if (miningType === "gas") {
         const gasCloud = pois.find(p => isGasCloudPoi(p.type));
         if (gasCloud) miningPoi = { id: gasCloud.id, name: gasCloud.name };
+      }
+    }
+
+    // For radioactive mining with deep core extractor: check map store for known hidden POIs
+    // not yet visible in the system POI list
+    if (!miningPoi && canMineHiddenRadioactive && effectiveTarget) {
+      const sysData = mapStore.getSystem(bot.system);
+      for (const storedPoi of (sysData?.pois || [])) {
+        if (!storedPoi.hidden) continue;
+        const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
+        if (!oreEntry) continue;
+        // Check depletion
+        if (oreEntry.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) continue;
+        // Found a known hidden POI with the target resource
+        miningPoi = { id: storedPoi.id, name: storedPoi.name };
+        ctx.log("mining", `Using known hidden POI from map: ${storedPoi.name} (${effectiveTarget})`);
+        break;
+      }
+    }
+
+    // For deep core ore mining: check map store for known deep core POIs
+    // not yet visible in the system POI list
+    if (!miningPoi && effectiveTarget && isDeepCoreOre(effectiveTarget) && deepCoreCap.canMine) {
+      const sysData = mapStore.getSystem(bot.system);
+      for (const storedPoi of (sysData?.pois || [])) {
+        const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
+        if (!oreEntry) continue;
+        // Check depletion
+        if (oreEntry.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) continue;
+        // Found a known deep core POI with the target resource
+        miningPoi = { id: storedPoi.id, name: storedPoi.name };
+        ctx.log("mining", `Using known deep core POI from map: ${storedPoi.name} (${effectiveTarget})`);
+        break;
       }
     }
 
@@ -2340,6 +2410,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             reveal_difficulty: poiData.reveal_difficulty as number | undefined,
             resources: resourceData,
           });
+
+          // If this is a hidden POI and get_poi succeeded, mark it as discovered
+          // so we can skip the travel step (which would fail for hidden POIs)
+          const isHidden = poiData.hidden as boolean | undefined;
+          if (isHidden && (!bot.poi || bot.poi !== miningPoi.id)) {
+            bot.poi = miningPoi.id;
+            ctx.log("mining", `Hidden POI ${miningPoi.name} discovered via pre-scan — travel step skipped`);
+          }
         } else {
           mapStore.updatePoiResources(bot.system, miningPoi.id, resourceData);
         }
@@ -2382,6 +2460,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
         if (miningType === "ore") return isOreBeltPoi(p.type) || p.hidden === true;
+        if (miningType === "radioactive") return isOreBeltPoi(p.type) || (canMineHiddenRadioactive && p.hidden === true);
         if (miningType === "gas") return isGasCloudPoi(p.type);
         if (miningType === "ice") return isIceFieldPoi(p.type);
         return false;
@@ -2396,6 +2475,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
           if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+          if (miningType === "radioactive") return isOreBeltPoi(poi?.type || "") || (canMineHiddenRadioactive && poi?.hidden === true);
           if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
           return true;
@@ -2440,6 +2520,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               bot.system = chosen.systemId;
               const newMiningPoi = pois.find(p => {
                 if (miningType === "ore") return isOreBeltPoi(p.type) || p.hidden === true;
+                if (miningType === "radioactive") return isOreBeltPoi(p.type) || (canMineHiddenRadioactive && p.hidden === true);
                 if (miningType === "gas") return isGasCloudPoi(p.type);
                 if (miningType === "ice") return isIceFieldPoi(p.type);
                 return false;
@@ -2490,23 +2571,83 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (!miningPoi) continue;
 
     // ── Travel to mining location ──
-    yield miningType === "ice" ? "travel_to_ice_field" : (miningType === "ore" ? "travel_to_belt" : "travel_to_cloud");
+    yield (miningType === "ice" ? "travel_to_ice_field" : (miningType === "ore" || miningType === "radioactive" ? "travel_to_belt" : "travel_to_cloud"));
     
     // Check if this is a hidden POI (need to survey before traveling if not yet discovered)
     const sysData = mapStore.getSystem(bot.system);
     const poiData = sysData?.pois.find(p => p.id === miningPoi!.id);
     const isHiddenPoi = poiData?.hidden ?? false;
-    
-    // Use the new travel function that handles hidden POI discovery
-    const travelResult = await travelToPoiWithSurvey(ctx, miningPoi.id, miningPoi.name, isHiddenPoi);
-    
-    if (!travelResult.success) {
-      ctx.log("error", `Travel to mining location failed: ${travelResult.error}`);
-      await sleep(5000);
-      continue;
+
+    // If we're already in the correct system and the POI is hidden,
+    // try get_poi first to discover it before attempting travel
+    if (isHiddenPoi) {
+      ctx.log("mining", `Attempting to discover hidden POI ${miningPoi.name} via get_poi...`);
+      const discoverResp = await bot.exec("get_poi", { poi_id: miningPoi.id });
+      if (!discoverResp.error && discoverResp.result) {
+        ctx.log("mining", `Discovered hidden POI ${miningPoi.name} via get_poi — no travel needed`);
+        bot.poi = miningPoi.id;
+      } else {
+        ctx.log("mining", `Could not discover hidden POI via get_poi: ${discoverResp.error?.message || "unknown error"} — will try travel`);
+      }
     }
-    
-    // bot.poi is already set by travelToPoiWithSurvey
+
+    // If POI wasn't discovered via get_poi, try travel (handles survey + retry)
+    if (!bot.poi || bot.poi !== miningPoi.id) {
+      // Use the new travel function that handles hidden POI discovery
+      const travelResult = await travelToPoiWithSurvey(ctx, miningPoi.id, miningPoi.name, isHiddenPoi);
+
+      if (!travelResult.success) {
+        ctx.log("error", `Travel to mining location failed: ${travelResult.error}`);
+
+        // For hidden POIs: if we're in the system where the POI should be but can't travel to it,
+        // it may require a directional jump. Try leaving and coming back.
+        if (isHiddenPoi) {
+          ctx.log("mining", `Hidden POI may require directional access — trying to leave and re-enter system`);
+          const homeSys = bot.system; // Save current system before traveling out
+          // Get connected systems to try
+          const currentSysData = mapStore.getSystem(homeSys);
+          const connections = currentSysData?.connections || [];
+          if (connections.length > 0) {
+            // Try traveling to first connected system and back
+            const firstConn = connections[0];
+            const targetSysName = firstConn.system_name || firstConn.system_id || "unknown";
+            ctx.log("mining", `Traveling to connected system ${targetSysName} then back...`);
+            const outResp = await bot.exec("travel", { target_system: firstConn.system_id });
+            if (!outResp.error) {
+              ctx.log("mining", `Traveled to ${targetSysName} — returning to ${homeSys}`);
+              await sleep(3000);
+              const backResp = await bot.exec("travel", { target_system: homeSys });
+              if (!backResp.error) {
+                bot.system = homeSys;
+                ctx.log("mining", `Returned to ${homeSys} — retrying POI discovery`);
+                await sleep(3000);
+                // Try get_poi again after re-entering
+                const retryDiscover = await bot.exec("get_poi", { poi_id: miningPoi.id });
+                if (!retryDiscover.error && retryDiscover.result) {
+                  ctx.log("mining", `Discovered hidden POI ${miningPoi.name} after directional approach`);
+                  bot.poi = miningPoi.id;
+                } else {
+                  ctx.log("error", `Still cannot access hidden POI after directional approach: ${retryDiscover.error?.message || "unknown"}`);
+                }
+              } else {
+                ctx.log("error", `Failed to return to ${homeSys}: ${backResp.error.message}`);
+                // Navigate back using normal navigation
+                await navigateToSystem(ctx, homeSys, safetyOpts);
+              }
+            } else {
+              ctx.log("error", `Failed to travel to ${targetSysName}: ${outResp.error.message}`);
+            }
+          } else {
+            ctx.log("warn", `No connected systems known for ${homeSys} — cannot attempt directional approach`);
+          }
+        }
+
+        if (!bot.poi || bot.poi !== miningPoi.id) {
+          await sleep(5000);
+          continue;
+        }
+      }
+    }
 
     // Check for pirates at mining location
     const nearbyResp = await bot.exec("get_nearby");
@@ -2522,6 +2663,15 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // Also check battle status directly (in case we missed notifications)
+    // CRITICAL: Check WebSocket state FIRST for fastest detection
+    if (bot.isInBattle()) {
+      ctx.log("combat", `Direct battle check [WebSocket]: IN BATTLE! - fleeing immediately!`);
+      await fleeFromBattle(ctx, true, 35000);
+      ctx.log("error", "Battle detected via WebSocket - fled, will retry mining");
+      await sleep(30000);
+      continue;
+    }
+    
     const directBattleStatus = await getBattleStatus(ctx);
     if (directBattleStatus && directBattleStatus.is_participant) {
       ctx.log("combat", `Direct battle status check: IN BATTLE (ID: ${directBattleStatus.battle_id}) - fleeing!`);
@@ -2581,9 +2731,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (midFuel < safetyOpts.fuelThresholdPct) { stopReason = `fuel low (${midFuel}%)`; break; }
 
       // Periodic battle status check (backup detection in case notifications fail)
+      // CRITICAL: Check WebSocket state FIRST for fastest detection (no API call needed)
       const now = Date.now();
       if ((now - lastBattleCheck) > BATTLE_CHECK_INTERVAL_MS) {
         lastBattleCheck = now;
+        
+        // Check WebSocket battle state first (fastest)
+        if (bot.isInBattle()) {
+          ctx.log("combat", `PERIODIC CHECK [WebSocket]: IN BATTLE! - fleeing immediately!`);
+          battleState.inBattle = true;
+          battleState.isFleeing = false;
+          await fleeFromBattle(ctx, true, 35000);
+          stopReason = "battle detected (WebSocket periodic check)";
+          break;
+        }
+        
+        // Also check via API (fallback)
         const battleStatusCheck = await getBattleStatus(ctx);
         if (battleStatusCheck && battleStatusCheck.is_participant) {
           ctx.log("combat", `PERIODIC CHECK: IN BATTLE! Battle ID: ${battleStatusCheck.battle_id} - fleeing!`);
@@ -2666,6 +2829,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             const sys = mapStore.getSystem(loc.systemId);
             const poi = sys?.pois.find(p => p.id === loc.poiId);
             if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+            if (miningType === "radioactive") return isOreBeltPoi(poi?.type || "") || (canMineHiddenRadioactive && poi?.hidden === true);
             if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
             return true;
@@ -2821,6 +2985,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                       const sys = mapStore.getSystem(loc.systemId);
                       const poi = sys?.pois.find(p => p.id === loc.poiId);
                       if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+                      if (miningType === "radioactive") return isOreBeltPoi(poi?.type || "") || (canMineHiddenRadioactive && poi?.hidden === true);
                       if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                       if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                       return true;
@@ -2927,14 +3092,21 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // Pre-mine battle check - prevents mine command from freezing if battle starts
-      const preMineBattleCheck = await getBattleStatus(ctx);
-      if (preMineBattleCheck && preMineBattleCheck.is_participant) {
-        ctx.log("combat", `PRE-MINE CHECK: IN BATTLE! Battle ID: ${preMineBattleCheck.battle_id} - initiating flee!`);
+      // CRITICAL: Check WebSocket state FIRST for fastest detection
+      if (bot.isInBattle()) {
+        ctx.log("combat", `PRE-MINE CHECK [WebSocket]: IN BATTLE! - initiating flee immediately!`);
         battleState.inBattle = true;
-        battleState.battleId = preMineBattleCheck.battle_id;
         battleState.isFleeing = false;
-        // Don't break - let the flee handling below re-issue flee every cycle
         await fleeFromBattle(ctx, false, 5000); // Initial flee, don't wait for disengage
+      } else {
+        const preMineBattleCheck = await getBattleStatus(ctx);
+        if (preMineBattleCheck && preMineBattleCheck.is_participant) {
+          ctx.log("combat", `PRE-MINE CHECK: IN BATTLE! Battle ID: ${preMineBattleCheck.battle_id} - initiating flee!`);
+          battleState.inBattle = true;
+          battleState.battleId = preMineBattleCheck.battle_id;
+          battleState.isFleeing = false;
+          await fleeFromBattle(ctx, false, 5000); // Initial flee, don't wait for disengage
+        }
       }
 
       const mineResp = await bot.exec("mine");
@@ -2954,6 +3126,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         // CRITICAL: Check for battle interrupt - stop mining immediately
         if (mineResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
           ctx.log("combat", `Mine interrupted by battle! ${mineResp.error.message} - fleeing!`);
+          await fleeFromBattle(ctx);
           battleState.inBattle = true;
           battleState.isFleeing = false;
           stopReason = "battle detected";
@@ -3293,6 +3466,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+              if (miningType === "radioactive") return isOreBeltPoi(poi?.type || "") || (canMineHiddenRadioactive && poi?.hidden === true);
               if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
               return true;
@@ -3347,6 +3521,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 const sys = mapStore.getSystem(loc.systemId);
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
                 if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+                if (miningType === "radioactive") return isOreBeltPoi(poi?.type || "") || (canMineHiddenRadioactive && poi?.hidden === true);
                 if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                 if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                 return true;
@@ -3405,6 +3580,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             // First try current system
             const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                            miningType === "ore" ? pois.filter(p => isOreBeltPoi(p.type) || p.hidden === true) :
+                           miningType === "radioactive" ? pois.filter(p => isOreBeltPoi(p.type) || (canMineHiddenRadioactive && p.hidden === true)) :
                            pois.filter(p => isGasCloudPoi(p.type));
 
             for (const poi of allPois) {
@@ -3435,7 +3611,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 ctx.log("mining", "stayOutUntilFull enabled and cargo not full — searching other systems using resource scan data...");
                 // Use the new scoring system to find best available location
                 const blacklist = getSystemBlacklist();
-                const bestLocations = mapStore.findBestMiningLocation(effectiveTarget || (miningType === "ore" ? "iron_ore" : miningType === "gas" ? "argon_gas" : "water_ice"), bot.system, blacklist);
+                const bestLocations = mapStore.findBestMiningLocation(effectiveTarget || (miningType === "ore" ? "iron_ore" : miningType === "gas" ? "argon_gas" : miningType === "radioactive" ? "uranium_ore" : "water_ice"), bot.system, blacklist);
 
                 for (const loc of bestLocations) {
                   if (loc.systemId === bot.system) continue; // Skip current system
@@ -3449,6 +3625,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
                   // Verify POI type matches
                   if (miningType === "ore" && !isOreBeltPoi(poi.type) && !poi.hidden) continue;
+                  if (miningType === "radioactive" && !isOreBeltPoi(poi.type) && !(canMineHiddenRadioactive && poi.hidden)) continue;
                   if (miningType === "gas" && !isGasCloudPoi(poi.type)) continue;
                   if (miningType === "ice" && !isIceFieldPoi(poi.type)) continue;
 
@@ -3523,10 +3700,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               }
 
               // CRITICAL: Check for battle interrupt error
-              if (travelResp.error && (travelResp.error.code === "battle_interrupt" || 
-                  travelResp.error.message.toLowerCase().includes("interrupted by battle") || 
+              if (travelResp.error && (travelResp.error.code === "battle_interrupt" ||
+                  travelResp.error.message.toLowerCase().includes("interrupted by battle") ||
                   travelResp.error.message.toLowerCase().includes("interrupted by combat"))) {
                 ctx.log("combat", `Travel to new target interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await fleeFromBattle(ctx);
                 stopReason = "battle detected";
                 break;
               }
@@ -3619,6 +3797,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             // Search for correct POI type in current system
             const altPoi = pois.find(p => {
               if (miningType === "ore") return isOreBeltPoi(p.type);
+              if (miningType === "radioactive") return isOreBeltPoi(p.type) || (canMineHiddenRadioactive && p.hidden === true);
               if (miningType === "gas") return isGasCloudPoi(p.type);
               if (miningType === "ice") return isIceFieldPoi(p.type);
               return false;
@@ -3639,10 +3818,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               }
 
               // CRITICAL: Check for battle interrupt error
-              if (travelResp.error && (travelResp.error.code === "battle_interrupt" || 
-                  travelResp.error.message.toLowerCase().includes("interrupted by battle") || 
+              if (travelResp.error && (travelResp.error.code === "battle_interrupt" ||
+                  travelResp.error.message.toLowerCase().includes("interrupted by battle") ||
                   travelResp.error.message.toLowerCase().includes("interrupted by combat"))) {
                 ctx.log("combat", `Travel to alternative POI interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await fleeFromBattle(ctx);
                 stopReason = "battle detected";
                 break;
               }
@@ -3841,10 +4021,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // CRITICAL: Check for battle interrupt error
-      if (travelStationResp.error && (travelStationResp.error.code === "battle_interrupt" || 
-          travelStationResp.error.message.toLowerCase().includes("interrupted by battle") || 
+      if (travelStationResp.error && (travelStationResp.error.code === "battle_interrupt" ||
+          travelStationResp.error.message.toLowerCase().includes("interrupted by battle") ||
           travelStationResp.error.message.toLowerCase().includes("interrupted by combat"))) {
         ctx.log("combat", `Travel to station interrupted by battle! ${travelStationResp.error.message} - fleeing!`);
+        await fleeFromBattle(ctx);
         // Don't dock - handle battle first
         stationPoi = null;
       } else if (travelStationResp.error && !travelStationResp.error.message.includes("already")) {

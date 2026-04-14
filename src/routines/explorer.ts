@@ -144,6 +144,7 @@ function getExplorerSettings(username?: string): {
   groupUnknowns: boolean;
   scavengeEnabled: boolean;
   loadFuelCellsAtHome: boolean;
+  returnToHomeOnFuelCellDepletion: boolean;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -202,6 +203,13 @@ function getExplorerSettings(username?: string): {
       ? Boolean(e.loadFuelCellsAtHome)
       : true;
 
+  // Return to home on fuel cell depletion: per-bot > global explorer > default false
+  const returnToHomeOnFuelCellDepletion = botOverrides.returnToHomeOnFuelCellDepletion !== undefined
+    ? Boolean(botOverrides.returnToHomeOnFuelCellDepletion)
+    : e.returnToHomeOnFuelCellDepletion !== undefined
+      ? Boolean(e.returnToHomeOnFuelCellDepletion)
+      : false;
+
   return {
     mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : "explore") as ExplorerMode,
     acceptMissions,
@@ -214,6 +222,7 @@ function getExplorerSettings(username?: string): {
     groupUnknowns,
     scavengeEnabled,
     loadFuelCellsAtHome,
+    returnToHomeOnFuelCellDepletion,
   };
 }
 
@@ -270,6 +279,13 @@ export function setExplorerScavengeEnabled(username: string, scavengeEnabled: bo
 export function setExplorerLoadFuelCellsAtHome(username: string, loadFuelCellsAtHome: boolean): void {
   writeSettings({
     [username]: { loadFuelCellsAtHome },
+  });
+}
+
+/** Persist return to home on fuel cell depletion setting for a specific bot. */
+export function setExplorerReturnToHomeOnFuelCellDepletion(username: string, returnToHomeOnFuelCellDepletion: boolean): void {
+  writeSettings({
+    [username]: { returnToHomeOnFuelCellDepletion },
   });
 }
 
@@ -469,16 +485,24 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           
           // Record pirate sighting with names
           await recordPirateSighting(ctx, systemId, pirateResult.pirates);
-          
+
           // Add temporary blacklist for this system
           addTemporaryPirateBlacklist(systemId, 30); // 30 minutes
+
+          // CRITICAL: Verify actual current system before fleeing
+          // During cascade emergency jumps, lastSystem can get out of sync
+          await bot.refreshStatus();
+          const actualSystemId = bot.system;
+          ctx.log("combat", `Verified actual position before flee: system=${actualSystemId}, lastSystem=${lastSystem}`);
+
+          // Flee back the way we came - BUT only if lastSystem is actually connected
+          const lastSystemConnected = lastSystem && connections.some(c => c.id === lastSystem);
           
-          // Flee back the way we came
-          if (lastSystem) {
+          if (lastSystem && lastSystemConnected) {
             ctx.log("combat", `Fleeing back to ${lastSystem} (the way we came)...`);
             await ensureUndocked(ctx);
             const fleeJump = await bot.exec("jump", { target_system: lastSystem });
-            
+
             // Check for battle interrupt on flee jump
             if (fleeJump.error) {
               const fleeMsg = fleeJump.error.message.toLowerCase();
@@ -495,13 +519,19 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             } else {
               ctx.log("combat", `Successfully fled to ${lastSystem}`);
               bot.stats.totalSystems++;
+              // Update lastSystem to reflect actual position after successful jump
+              lastSystem = actualSystemId;
               // Continue to next iteration to rescan new system
               await sleep(5000);
               continue;
             }
           } else {
-            // No lastSystem to flee to, use emergency flee
-            ctx.log("combat", "No previous system to flee to - using emergency flee");
+            // lastSystem is not connected or not available - use emergency flee
+            if (lastSystem && !lastSystemConnected) {
+              ctx.log("error", `lastSystem (${lastSystem}) is not connected to current system (${actualSystemId}) - cannot flee that way! Using emergency flee.`);
+            } else {
+              ctx.log("combat", "No previous system to flee to - using emergency flee");
+            }
             const { emergencyFleeFromPirates } = await import("./common.js");
             await emergencyFleeFromPirates(ctx, pirateResult);
           }
@@ -721,6 +751,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         // Check if cargo is full of only fuel cells (intentional for exploration)
         const cargoResp = await bot.exec("get_cargo");
         let isOnlyFuelCells = true;
+        let fuelCellCount = 0;
         if (cargoResp.result && typeof cargoResp.result === "object") {
           const cResult = cargoResp.result as Record<string, unknown>;
           const cargoItems = (
@@ -731,13 +762,15 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           );
           for (const item of cargoItems) {
             const itemId = (item.item_id as string) || "";
+            const quantity = (item.quantity as number) || 0;
             if (!itemId.toLowerCase().includes("fuel_cell")) {
               isOnlyFuelCells = false;
               break;
             }
+            fuelCellCount += quantity;
           }
         }
-        
+
         if (!isOnlyFuelCells) {
           yield "deposit_cargo";
           await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
@@ -748,7 +781,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             break;
           }
         } else {
-          ctx.log("info", `Cargo full with fuel cells (${bot.cargo}/${bot.cargoMax}) — continuing exploration`);
+          ctx.log("info", `Cargo full with fuel cells (${fuelCellCount} fuel cells, ${bot.cargo}/${bot.cargoMax} cargo) — continuing exploration`);
         }
       }
     }
@@ -761,6 +794,24 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Re-get settings in case they changed ──
     const currentSettings = getExplorerSettings(bot.username);
+
+    // ── Check fuel cell depletion — return to home base if enabled and no fuel cells left ──
+    if (currentSettings.returnToHomeOnFuelCellDepletion) {
+      const fuelCellCheck = await checkFuelCellInventory(ctx);
+      // Only return if we previously had fuel cells (cargo was full with them) but now they're gone
+      // This prevents unnecessary trips when we never loaded fuel cells in the first place
+      if (fuelCellCheck.totalFuelCells === 0) {
+        ctx.log("system", `Fuel cells depleted (0 remaining) — returning to home base to reload`);
+        yield "return_to_home_fuel_cells";
+        const returned = await returnToHomeBaseForFuelCells(ctx);
+        if (returned) {
+          // After returning, restart the loop to continue exploration
+          await bot.refreshStatus();
+          ctx.log("info", `Returned to home base — continuing exploration`);
+          continue;
+        }
+      }
+    }
 
     // ── Pick next system to explore ──
     yield "pick_next_system";
@@ -1430,6 +1481,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
         // CRITICAL: Check for battle interrupt error
         if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
           ctx.log("combat", `Travel to hidden POI interrupted by battle! ${tResp.error.message} - fleeing!`);
+          await fleeFromBattle(ctx);
           await sleep(5000);
           continue;
         }
@@ -1498,6 +1550,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
         // Check if cargo is full of only fuel cells (intentional for exploration)
         const cargoResp = await bot.exec("get_cargo");
         let isOnlyFuelCells = true;
+        let fuelCellCount = 0;
         if (cargoResp.result && typeof cargoResp.result === "object") {
           const cResult = cargoResp.result as Record<string, unknown>;
           const cargoItems = (
@@ -1508,18 +1561,36 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
           );
           for (const item of cargoItems) {
             const itemId = (item.item_id as string) || "";
+            const quantity = (item.quantity as number) || 0;
             if (!itemId.toLowerCase().includes("fuel_cell")) {
               isOnlyFuelCells = false;
               break;
             }
+            fuelCellCount += quantity;
           }
         }
-        
+
         if (!isOnlyFuelCells) {
           yield "deposit_cargo";
           await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
         } else {
-          ctx.log("info", `Cargo full with fuel cells (${bot.cargo}/${bot.cargoMax}) — continuing exploration`);
+          ctx.log("info", `Cargo full with fuel cells (${fuelCellCount} fuel cells, ${bot.cargo}/${bot.cargoMax} cargo) — continuing exploration`);
+        }
+      }
+
+      // ── Check fuel cell depletion — return to home base if enabled and no fuel cells left ──
+      const deepScanSettings = getExplorerSettings(bot.username);
+      if (deepScanSettings.returnToHomeOnFuelCellDepletion) {
+        const fuelCellCheck = await checkFuelCellInventory(ctx);
+        if (fuelCellCheck.totalFuelCells === 0) {
+          ctx.log("system", `Fuel cells depleted (0 remaining) — returning to home base to reload`);
+          yield "return_to_home_fuel_cells";
+          const returned = await returnToHomeBaseForFuelCells(ctx);
+          if (returned) {
+            await bot.refreshStatus();
+            ctx.log("info", `Returned to home base — continuing deep core scan`);
+            break; // Break to restart the while loop
+          }
         }
       }
     }
@@ -1877,6 +1948,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         // Check if cargo is full of only fuel cells (intentional for exploration)
         const cargoResp = await bot.exec("get_cargo");
         let isOnlyFuelCells = true;
+        let fuelCellCount = 0;
         if (cargoResp.result && typeof cargoResp.result === "object") {
           const cResult = cargoResp.result as Record<string, unknown>;
           const cargoItems = (
@@ -1887,18 +1959,36 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           );
           for (const item of cargoItems) {
             const itemId = (item.item_id as string) || "";
+            const quantity = (item.quantity as number) || 0;
             if (!itemId.toLowerCase().includes("fuel_cell")) {
               isOnlyFuelCells = false;
               break;
             }
+            fuelCellCount += quantity;
           }
         }
-        
+
         if (!isOnlyFuelCells) {
           yield "deposit_cargo";
           await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
         } else {
-          ctx.log("info", `Cargo full with fuel cells (${bot.cargo}/${bot.cargoMax}) — continuing exploration`);
+          ctx.log("info", `Cargo full with fuel cells (${fuelCellCount} fuel cells, ${bot.cargo}/${bot.cargoMax} cargo) — continuing exploration`);
+        }
+      }
+
+      // ── Check fuel cell depletion — return to home base if enabled and no fuel cells left ──
+      const tradeFuelSettings = getExplorerSettings(bot.username);
+      if (tradeFuelSettings.returnToHomeOnFuelCellDepletion) {
+        const fuelCellCheck = await checkFuelCellInventory(ctx);
+        if (fuelCellCheck.totalFuelCells === 0) {
+          ctx.log("system", `Fuel cells depleted (0 remaining) — returning to home base to reload`);
+          yield "return_to_home_fuel_cells";
+          const returned = await returnToHomeBaseForFuelCells(ctx);
+          if (returned) {
+            await bot.refreshStatus();
+            ctx.log("info", `Returned to home base — continuing trade update`);
+            break; // Break to restart the while loop
+          }
         }
       }
 
@@ -2108,7 +2198,7 @@ function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps:
 async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
 
-  // Check current cargo space
+  // Check current cargo space and existing fuel cells
   const cargoResp = await bot.exec("get_cargo");
 
   // Check for battle after get_cargo
@@ -2132,25 +2222,50 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   ) as Array<Record<string, unknown>>;
 
   let currentCargo = 0;
-  let fuelCellCount = 0;
+  let premiumFuelCells = 0;
+  let regularFuelCells = 0;
   for (const item of cargoItems) {
     const itemId = (item.item_id as string) || "";
     const quantity = (item.quantity as number) || 0;
     currentCargo += quantity;
-    if (itemId.toLowerCase().includes("fuel_cell")) {
-      fuelCellCount = quantity;
+    if (itemId === "premium_fuel_cell") {
+      premiumFuelCells = quantity;
+    } else if (itemId === "fuel_cell") {
+      regularFuelCells = quantity;
     }
   }
 
   const availableSpace = bot.cargoMax - currentCargo;
   if (availableSpace <= 0) {
-    ctx.log("info", `Cargo hold full — already loaded with ${fuelCellCount} fuel cells`);
+    ctx.log("info", `Cargo hold full — already loaded with ${premiumFuelCells} premium + ${regularFuelCells} regular fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // Try to withdraw fuel cells from faction storage
-  ctx.log("trade", `Loading ${availableSpace} fuel cells from faction storage for long-range exploration...`);
-  const withdrawResp = await bot.exec("faction_withdraw_items", {
+  // Try to withdraw premium_fuel_cell first (higher priority)
+  ctx.log("trade", `Loading ${availableSpace} premium fuel cells from faction storage for long-range exploration...`);
+  let withdrawResp = await bot.exec("faction_withdraw_items", {
+    item_id: "premium_fuel_cell",
+    quantity: availableSpace
+  });
+
+  // Check for battle after faction_withdraw_items
+  if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
+    ctx.log("combat", "Battle detected during fuel cell withdraw - fleeing!");
+    await sleep(5000);
+    return false;
+  }
+
+  let loadedCount = 0;
+  if (!withdrawResp.error) {
+    loadedCount = availableSpace;
+    const newPremium = premiumFuelCells + loadedCount;
+    ctx.log("trade", `Loaded ${loadedCount} premium fuel cells from faction storage (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    return true;
+  }
+
+  // If premium withdraw failed, try regular fuel_cell
+  ctx.log("warn", `Could not withdraw premium fuel cells: ${withdrawResp.error.message} — trying regular fuel cells...`);
+  withdrawResp = await bot.exec("faction_withdraw_items", {
     item_id: "fuel_cell",
     quantity: availableSpace
   });
@@ -2163,34 +2278,56 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   }
 
   if (!withdrawResp.error) {
-    const newFuelCells = fuelCellCount + availableSpace;
-    ctx.log("trade", `Loaded ${availableSpace} fuel cells from faction storage (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    loadedCount = availableSpace;
+    const newRegular = regularFuelCells + loadedCount;
+    ctx.log("trade", `Loaded ${loadedCount} regular fuel cells from faction storage (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // If faction withdraw failed, try to buy fuel cells from station market as fallback
-  const errorMsg = (withdrawResp.error.message || "").toLowerCase();
-  ctx.log("warn", `Could not withdraw fuel cells: ${withdrawResp.error.message} — trying to buy from market...`);
-  const buyResp = await bot.exec("buy_item", {
-    item_id: "fuel_cell",
+  // If faction withdraw failed, try to buy premium fuel cells from station market as fallback
+  ctx.log("warn", `Could not withdraw regular fuel cells: ${withdrawResp.error.message} — trying to buy premium fuel cells from market...`);
+  const buyResp = await bot.exec("buy", {
+    item_id: "premium_fuel_cell",
     quantity: availableSpace
   });
 
-  // Check for battle after buy_item
-  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy_item")) {
+  // Check for battle after buy
+  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
     ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
     await sleep(5000);
     return false;
   }
 
   if (!buyResp.error) {
-    const newFuelCells = fuelCellCount + availableSpace;
-    ctx.log("trade", `Bought ${availableSpace} fuel cells from market (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    loadedCount = availableSpace;
+    const newPremium = premiumFuelCells + loadedCount;
+    ctx.log("trade", `Bought ${loadedCount} premium fuel cells from market (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // If buy also failed, try to withdraw credits and retry
-  const buyErrorMsg = (buyResp.error.message || "").toLowerCase();
+  // If premium buy failed, try regular fuel_cell
+  ctx.log("warn", `Could not buy premium fuel cells: ${buyResp.error.message} — trying regular fuel cells...`);
+  const buyRegularResp = await bot.exec("buy", {
+    item_id: "fuel_cell",
+    quantity: availableSpace
+  });
+
+  // Check for battle after buy
+  if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
+    ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
+    await sleep(5000);
+    return false;
+  }
+
+  if (!buyRegularResp.error) {
+    loadedCount = availableSpace;
+    const newRegular = regularFuelCells + loadedCount;
+    ctx.log("trade", `Bought ${loadedCount} regular fuel cells from market (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    return true;
+  }
+
+  // If buy also failed, try to withdraw credits and retry with premium
+  const buyErrorMsg = (buyRegularResp.error.message || "").toLowerCase();
   if (buyErrorMsg.includes("credit") || buyErrorMsg.includes("not enough") || buyErrorMsg.includes("insufficient")) {
     ctx.log("trade", "Not enough credits — withdrawing from storage...");
     const withdrawCreditsResp = await bot.exec("withdraw_credits");
@@ -2204,38 +2341,171 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
     if (!withdrawCreditsResp.error) {
       await bot.refreshStatus();
-      ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying fuel cell purchase...`);
-      const retryResp = await bot.exec("buy_item", {
-        item_id: "fuel_cell",
+      ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying premium fuel cell purchase...`);
+      const retryResp = await bot.exec("buy", {
+        item_id: "premium_fuel_cell",
         quantity: availableSpace
       });
 
-      // Check for battle after retry buy_item
-      if (await checkBattleAfterCommand(ctx, retryResp.notifications, "buy_item")) {
+      // Check for battle after retry buy
+      if (await checkBattleAfterCommand(ctx, retryResp.notifications, "buy")) {
         ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
         await sleep(5000);
         return false;
       }
 
       if (!retryResp.error) {
-        const newFuelCells = fuelCellCount + availableSpace;
-        ctx.log("trade", `Loaded ${availableSpace} fuel cells (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
+        loadedCount = availableSpace;
+        const newPremium = premiumFuelCells + loadedCount;
+        ctx.log("trade", `Loaded ${loadedCount} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
         return true;
       }
-      ctx.log("error", `Still could not buy fuel cells: ${retryResp.error.message}`);
+
+      // If premium retry failed, try regular
+      ctx.log("warn", `Could not buy premium fuel cells: ${retryResp.error.message} — trying regular...`);
+      const retryRegularResp = await bot.exec("buy", {
+        item_id: "fuel_cell",
+        quantity: availableSpace
+      });
+
+      // Check for battle after retry buy
+      if (await checkBattleAfterCommand(ctx, retryRegularResp.notifications, "buy")) {
+        ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
+        await sleep(5000);
+        return false;
+      }
+
+      if (!retryRegularResp.error) {
+        loadedCount = availableSpace;
+        const newRegular = regularFuelCells + loadedCount;
+        ctx.log("trade", `Loaded ${loadedCount} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+        return true;
+      }
+      ctx.log("error", `Still could not buy fuel cells: ${retryRegularResp.error.message}`);
     } else {
       ctx.log("error", `Could not withdraw credits: ${withdrawCreditsResp.error.message}`);
     }
   } else {
-    ctx.log("error", `Could not buy fuel cells: ${buyResp.error.message}`);
+    ctx.log("error", `Could not buy fuel cells: ${buyRegularResp.error.message}`);
   }
 
   return false;
 }
 
 /**
+ * Check fuel cell inventory - returns count of fuel cells in cargo and whether we've ever had fuel cells.
+ */
+async function checkFuelCellInventory(ctx: RoutineContext): Promise<{
+  totalFuelCells: number;
+  hasFuelCellsInInventory: boolean;
+}> {
+  const { bot } = ctx;
+  const cargoResp = await bot.exec("get_cargo");
+
+  if (!cargoResp.result || typeof cargoResp.result !== "object") {
+    return { totalFuelCells: 0, hasFuelCellsInInventory: false };
+  }
+
+  const cResult = cargoResp.result as Record<string, unknown>;
+  const cargoItems = (
+    Array.isArray(cResult) ? cResult :
+    Array.isArray(cResult.items) ? (cResult.items as Array<Record<string, unknown>>) :
+    Array.isArray(cResult.cargo) ? (cResult.cargo as Array<Record<string, unknown>>) :
+    []
+  );
+
+  let totalFuelCells = 0;
+  let hasFuelCellsInInventory = false;
+
+  for (const item of cargoItems) {
+    const itemId = (item.item_id as string) || "";
+    const quantity = (item.quantity as number) || 0;
+    if (itemId.toLowerCase().includes("fuel_cell")) {
+      totalFuelCells += quantity;
+      hasFuelCellsInInventory = true;
+    }
+  }
+
+  return { totalFuelCells, hasFuelCellsInInventory };
+}
+
+/**
+ * Return to home base (Sol Central) to reload fuel cells.
+ * Navigates to Sol, docks, and loads fuel cells to max cargo.
+ */
+async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+
+  ctx.log("system", "Returning to home base (Sol Central) to reload fuel cells...");
+
+  // Navigate to Sol system
+  if (bot.system !== "sol") {
+    await ensureUndocked(ctx);
+    const arrived = await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+    if (!arrived) {
+      ctx.log("error", "Could not reach Sol system — aborting fuel cell reload");
+      return false;
+    }
+  }
+
+  // Travel to Sol Central station
+  const stationPoi = "sol_station";
+  if (bot.poi !== stationPoi) {
+    await ensureUndocked(ctx);
+    const tResp = await bot.exec("travel", { target_poi: stationPoi });
+
+    // Check for battle after travel
+    if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
+      ctx.log("combat", "Battle detected during travel - fleeing!");
+      await sleep(5000);
+      return false;
+    }
+
+    if (tResp.error && !tResp.error.message.includes("already")) {
+      ctx.log("error", `Could not reach Sol Central: ${tResp.error.message}`);
+      return false;
+    }
+    bot.poi = stationPoi;
+  }
+
+  // Dock at station
+  if (!bot.docked) {
+    const dResp = await bot.exec("dock");
+
+    // Check for battle after dock
+    if (await checkBattleAfterCommand(ctx, dResp.notifications, "dock")) {
+      ctx.log("combat", "Battle detected during dock - fleeing!");
+      await sleep(5000);
+      return false;
+    }
+
+    if (dResp.error && !dResp.error.message.includes("already")) {
+      ctx.log("error", `Could not dock at Sol Central: ${dResp.error.message}`);
+      return false;
+    }
+    bot.docked = true;
+  }
+
+  // Load fuel cells to max cargo
+  const settings = getExplorerSettings(bot.username);
+  if (settings.loadFuelCellsAtHome) {
+    await loadFuelCellsToMax(ctx);
+  }
+
+  // Refuel while we're here
+  await tryRefuel(ctx);
+
+  // Undock to continue exploration
+  await ensureUndocked(ctx);
+
+  ctx.log("system", "Fuel cell reload complete — returning to exploration");
+  return true;
+}
+
+/**
  * Load cargo hold with fuel cells for long journeys.
  * Fills cargo to max capacity with fuel cells.
+ * Prioritizes premium_fuel_cell over regular fuel_cell.
  */
 async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   const { bot, log } = ctx;
@@ -2265,6 +2535,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
       // CRITICAL: Check for battle interrupt error
       if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
         log("combat", `Travel to station interrupted by battle! ${travelResp.error.message} - fleeing!`);
+        await fleeFromBattle(ctx);
         return false;
       }
       if (!errMsg.includes("already")) {
@@ -2289,7 +2560,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
     bot.docked = true;
   }
 
-  // Check current cargo
+  // Check current cargo and existing fuel cells
   const cargoResp = await bot.exec("get_cargo");
 
   // Check for battle after get_cargo
@@ -2313,37 +2584,66 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   ) as Array<Record<string, unknown>>;
 
   let currentCargo = 0;
+  let premiumFuelCells = 0;
+  let regularFuelCells = 0;
   for (const item of cargoItems) {
+    const itemId = (item.item_id as string) || "";
     const quantity = (item.quantity as number) || 0;
     currentCargo += quantity;
+    if (itemId === "premium_fuel_cell") {
+      premiumFuelCells = quantity;
+    } else if (itemId === "fuel_cell") {
+      regularFuelCells = quantity;
+    }
   }
 
   const availableSpace = bot.cargoMax - currentCargo;
   if (availableSpace <= 0) {
-    log("info", "Cargo hold is full");
+    log("info", `Cargo hold full — already loaded with ${premiumFuelCells} premium + ${regularFuelCells} regular fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // Buy fuel cells
-  log("trade", `Loading ${availableSpace} fuel cells for long journey...`);
-  const buyResp = await bot.exec("buy_item", {
-    item_id: "fuel_cell",
+  // Try to buy premium fuel cells first
+  log("trade", `Loading ${availableSpace} premium fuel cells for long journey...`);
+  const buyResp = await bot.exec("buy", {
+    item_id: "premium_fuel_cell",
     quantity: availableSpace
   });
 
-  // Check for battle after buy_item
-  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy_item")) {
+  // Check for battle after buy
+  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
     log("combat", "Battle detected during fuel cell purchase - fleeing!");
     await sleep(5000);
     return false;
   }
 
-  if (buyResp.error) {
-    log("error", `Could not buy fuel cells: ${buyResp.error.message}`);
+  if (!buyResp.error) {
+    const newPremium = premiumFuelCells + availableSpace;
+    log("trade", `Bought ${availableSpace} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    return true;
+  }
+
+  // If premium buy failed, try regular fuel_cell
+  log("warn", `Could not buy premium fuel cells: ${buyResp.error.message} — trying regular fuel cells...`);
+  const buyRegularResp = await bot.exec("buy", {
+    item_id: "fuel_cell",
+    quantity: availableSpace
+  });
+
+  // Check for battle after buy
+  if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
+    log("combat", "Battle detected during fuel cell purchase - fleeing!");
+    await sleep(5000);
     return false;
   }
 
-  log("trade", `Loaded ${availableSpace} fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
+  if (buyRegularResp.error) {
+    log("error", `Could not buy fuel cells: ${buyRegularResp.error.message}`);
+    return false;
+  }
+
+  const newRegular = regularFuelCells + availableSpace;
+  log("trade", `Bought ${availableSpace} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
   return true;
 }
 

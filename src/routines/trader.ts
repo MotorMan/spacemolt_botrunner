@@ -812,8 +812,16 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // Check battle status to see if we've escaped
-      const currentBattleStatus = await getBattleStatus(ctx);
-      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+      // CRITICAL: Check WebSocket state FIRST (fastest, no API call)
+      let battleCleared = !bot.isInBattle();
+      
+      // If WebSocket still shows in battle, verify via API
+      if (!battleCleared) {
+        const currentBattleStatus = await getBattleStatus(ctx);
+        battleCleared = !currentBattleStatus || !currentBattleStatus.is_participant;
+      }
+      
+      if (battleCleared) {
         ctx.log("combat", "Battle cleared - no longer in combat! Resuming trade operations...");
         battleState.inBattle = false;
         battleState.battleId = null;
@@ -824,7 +832,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
     } else {
-      // Not in battle - do a fresh check
+      // Not in battle - do a fresh check (WebSocket-first via checkAndFleeFromBattle)
       if (await checkAndFleeFromBattle(ctx, "trader")) {
         // Battle detected - set battle state and flee
         battleState.inBattle = true;

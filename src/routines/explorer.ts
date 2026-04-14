@@ -469,16 +469,24 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           
           // Record pirate sighting with names
           await recordPirateSighting(ctx, systemId, pirateResult.pirates);
-          
+
           // Add temporary blacklist for this system
           addTemporaryPirateBlacklist(systemId, 30); // 30 minutes
+
+          // CRITICAL: Verify actual current system before fleeing
+          // During cascade emergency jumps, lastSystem can get out of sync
+          await bot.refreshStatus();
+          const actualSystemId = bot.system;
+          ctx.log("combat", `Verified actual position before flee: system=${actualSystemId}, lastSystem=${lastSystem}`);
+
+          // Flee back the way we came - BUT only if lastSystem is actually connected
+          const lastSystemConnected = lastSystem && connections.some(c => c.id === lastSystem);
           
-          // Flee back the way we came
-          if (lastSystem) {
+          if (lastSystem && lastSystemConnected) {
             ctx.log("combat", `Fleeing back to ${lastSystem} (the way we came)...`);
             await ensureUndocked(ctx);
             const fleeJump = await bot.exec("jump", { target_system: lastSystem });
-            
+
             // Check for battle interrupt on flee jump
             if (fleeJump.error) {
               const fleeMsg = fleeJump.error.message.toLowerCase();
@@ -495,13 +503,19 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             } else {
               ctx.log("combat", `Successfully fled to ${lastSystem}`);
               bot.stats.totalSystems++;
+              // Update lastSystem to reflect actual position after successful jump
+              lastSystem = actualSystemId;
               // Continue to next iteration to rescan new system
               await sleep(5000);
               continue;
             }
           } else {
-            // No lastSystem to flee to, use emergency flee
-            ctx.log("combat", "No previous system to flee to - using emergency flee");
+            // lastSystem is not connected or not available - use emergency flee
+            if (lastSystem && !lastSystemConnected) {
+              ctx.log("error", `lastSystem (${lastSystem}) is not connected to current system (${actualSystemId}) - cannot flee that way! Using emergency flee.`);
+            } else {
+              ctx.log("combat", "No previous system to flee to - using emergency flee");
+            }
             const { emergencyFleeFromPirates } = await import("./common.js");
             await emergencyFleeFromPirates(ctx, pirateResult);
           }

@@ -2522,6 +2522,15 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // Also check battle status directly (in case we missed notifications)
+    // CRITICAL: Check WebSocket state FIRST for fastest detection
+    if (bot.isInBattle()) {
+      ctx.log("combat", `Direct battle check [WebSocket]: IN BATTLE! - fleeing immediately!`);
+      await fleeFromBattle(ctx, true, 35000);
+      ctx.log("error", "Battle detected via WebSocket - fled, will retry mining");
+      await sleep(30000);
+      continue;
+    }
+    
     const directBattleStatus = await getBattleStatus(ctx);
     if (directBattleStatus && directBattleStatus.is_participant) {
       ctx.log("combat", `Direct battle status check: IN BATTLE (ID: ${directBattleStatus.battle_id}) - fleeing!`);
@@ -2581,9 +2590,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (midFuel < safetyOpts.fuelThresholdPct) { stopReason = `fuel low (${midFuel}%)`; break; }
 
       // Periodic battle status check (backup detection in case notifications fail)
+      // CRITICAL: Check WebSocket state FIRST for fastest detection (no API call needed)
       const now = Date.now();
       if ((now - lastBattleCheck) > BATTLE_CHECK_INTERVAL_MS) {
         lastBattleCheck = now;
+        
+        // Check WebSocket battle state first (fastest)
+        if (bot.isInBattle()) {
+          ctx.log("combat", `PERIODIC CHECK [WebSocket]: IN BATTLE! - fleeing immediately!`);
+          battleState.inBattle = true;
+          battleState.isFleeing = false;
+          await fleeFromBattle(ctx, true, 35000);
+          stopReason = "battle detected (WebSocket periodic check)";
+          break;
+        }
+        
+        // Also check via API (fallback)
         const battleStatusCheck = await getBattleStatus(ctx);
         if (battleStatusCheck && battleStatusCheck.is_participant) {
           ctx.log("combat", `PERIODIC CHECK: IN BATTLE! Battle ID: ${battleStatusCheck.battle_id} - fleeing!`);
@@ -2927,14 +2949,21 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // Pre-mine battle check - prevents mine command from freezing if battle starts
-      const preMineBattleCheck = await getBattleStatus(ctx);
-      if (preMineBattleCheck && preMineBattleCheck.is_participant) {
-        ctx.log("combat", `PRE-MINE CHECK: IN BATTLE! Battle ID: ${preMineBattleCheck.battle_id} - initiating flee!`);
+      // CRITICAL: Check WebSocket state FIRST for fastest detection
+      if (bot.isInBattle()) {
+        ctx.log("combat", `PRE-MINE CHECK [WebSocket]: IN BATTLE! - initiating flee immediately!`);
         battleState.inBattle = true;
-        battleState.battleId = preMineBattleCheck.battle_id;
         battleState.isFleeing = false;
-        // Don't break - let the flee handling below re-issue flee every cycle
         await fleeFromBattle(ctx, false, 5000); // Initial flee, don't wait for disengage
+      } else {
+        const preMineBattleCheck = await getBattleStatus(ctx);
+        if (preMineBattleCheck && preMineBattleCheck.is_participant) {
+          ctx.log("combat", `PRE-MINE CHECK: IN BATTLE! Battle ID: ${preMineBattleCheck.battle_id} - initiating flee!`);
+          battleState.inBattle = true;
+          battleState.battleId = preMineBattleCheck.battle_id;
+          battleState.isFleeing = false;
+          await fleeFromBattle(ctx, false, 5000); // Initial flee, don't wait for disengage
+        }
       }
 
       const mineResp = await bot.exec("mine");

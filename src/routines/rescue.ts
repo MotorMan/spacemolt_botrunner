@@ -494,6 +494,13 @@ async function checkAndFleeFromPiratesRescue(
 /**
  * Emergency flee from pirates - optimized for rescue ships.
  * Uses the fastest escape method available.
+ * 
+ * IMPROVEMENTS:
+ * - Verifies actual current system via get_status before selecting jump target
+ * - Polls get_battle_status every 5 seconds while jump is pending
+ * - Detects silent battle locks and switches to battle stance flee
+ * - Validates jump target is actually connected to current system
+ * - Checks WebSocket battle state first for fastest detection
  */
 async function emergencyFleeFromPirates(
   ctx: RoutineContext,
@@ -503,9 +510,13 @@ async function emergencyFleeFromPirates(
 
   ctx.log("combat", `🏃 Emergency flee initiated - ${pirateResult.pirateCount} pirate(s) detected`);
 
-  // Try to flee to a random safe connection
-  const { mapStore } = await import("../mapstore.js");
-  const sys = mapStore.getSystem(bot.system);
+  // CRITICAL: Verify actual current system via get_status before selecting jump target
+  await bot.refreshStatus();
+  const actualCurrentSystem = bot.system;
+  ctx.log("combat", `Verified actual position: system=${actualCurrentSystem}`);
+
+  // Get fresh system info for the ACTUAL current system
+  const sys = await import("../mapstore.js").then(m => m.mapStore.getSystem(actualCurrentSystem));
 
   if (!sys || sys.connections.length === 0) {
     ctx.log("error", "❌ No escape routes available - trapped!");
@@ -524,7 +535,9 @@ async function emergencyFleeFromPirates(
     return true;
   });
 
-  if (safeConnections.length === 0) {
+  // If all connections are blacklisted, we have no choice but to use any connection
+  const candidates = safeConnections.length > 0 ? safeConnections : sys.connections;
+  if (candidates.length === 0) {
     ctx.log("error", "❌ All escape routes lead through pirate/blacklisted systems!");
     // Try to flee anyway - better than staying
     const randomConn = sys.connections[Math.floor(Math.random() * sys.connections.length)];
@@ -536,11 +549,82 @@ async function emergencyFleeFromPirates(
   }
 
   // Pick random safe connection for unpredictability
-  const escapeRoute = safeConnections[Math.floor(Math.random() * safeConnections.length)];
+  const escapeRoute = candidates[Math.floor(Math.random() * candidates.length)];
 
   if (escapeRoute?.system_id) {
     ctx.log("combat", `🏃 Fleeing to ${escapeRoute.system_id} (safe route)`);
-    await bot.exec("jump", { target: escapeRoute.system_id });
+    
+    // Start the jump command
+    const jumpPromise = bot.exec("jump", { target: escapeRoute.system_id });
+    
+    // CRITICAL: Poll battle status while jump is pending to detect silent battle locks
+    const { getBattleStatus } = await import("./common.js");
+    const battlePollInterval = 5000; // Check every 5 seconds
+    const battlePollTimeout = 25000; // Give up after 25 seconds
+    let pollTimer: NodeJS.Timeout | null = null;
+    let jumpCompleted = false;
+    let battleDetectedDuringJump = false;
+
+    const battlePoll = async () => {
+      let elapsed = 0;
+      while (elapsed < battlePollTimeout && !jumpCompleted) {
+        await new Promise(resolve => {
+          pollTimer = setTimeout(resolve, battlePollInterval);
+        });
+        elapsed += battlePollInterval;
+        
+        if (jumpCompleted) break;
+        
+        // CRITICAL: Check WebSocket battle state FIRST (fastest, no API call)
+        if (bot.isInBattle()) {
+          ctx.log("combat", `[EMERGENCY] Battle detected via WebSocket during rescue flee! Issuing flee immediately!`);
+          battleDetectedDuringJump = true;
+          jumpCompleted = true;
+          // Issue flee immediately
+          const { fleeFromBattle } = await import("./common.js");
+          fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${err.message}`));
+          return;
+        }
+        
+        // Also check battle status via API (fallback)
+        const currentBattleStatus = await getBattleStatus(ctx);
+        if (currentBattleStatus && currentBattleStatus.is_participant) {
+          ctx.log("combat", `[EMERGENCY] Battle detected via API during rescue flee! Battle ID: ${currentBattleStatus.battle_id} - fleeing!`);
+          battleDetectedDuringJump = true;
+          jumpCompleted = true;
+          const { fleeFromBattle } = await import("./common.js");
+          fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${err.message}`));
+          return;
+        }
+        
+        // Also verify we're still in the same system
+        await bot.refreshStatus();
+        if (bot.system !== actualCurrentSystem) {
+          ctx.log("combat", `[EMERGENCY] System changed during poll - jump succeeded to ${bot.system}`);
+          jumpCompleted = true;
+          return;
+        }
+        
+        ctx.log("combat", `[EMERGENCY] Rescue flee battle poll ${Math.floor(elapsed / 1000)}s - still in system ${actualCurrentSystem}`);
+      }
+    };
+
+    // Run both the jump and the battle poll concurrently
+    await Promise.all([jumpPromise, battlePoll()]);
+
+    // Clean up timer
+    if (pollTimer) {
+      clearTimeout(pollTimer);
+      pollTimer = null;
+    }
+    jumpCompleted = true;
+
+    // If battle was detected during polling, flee was already issued
+    if (battleDetectedDuringJump) {
+      ctx.log("combat", "Battle detected during rescue flee jump - waiting for flee to complete...");
+      await sleep(3000);
+      return;
+    }
 
     // After fleeing, scan again to ensure we're safe
     await sleep(2000);
@@ -1368,14 +1452,14 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           let viableRoute = false;
           try {
             const mappedRoute = mapStore.findRoute(bot.system, mayday.system, blacklist);
-            if (mappedRoute && mappedRoute.length > 1) {
+            if (mappedRoute && mappedRoute.length >= 1) {
               viableRoute = true;
             } else {
               const routeResp = await bot.exec("find_route", { target_system: mayday.system });
               if (!routeResp.error && routeResp.result) {
                 const routeData = routeResp.result as Record<string, unknown>;
                 const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
-                if (routeData.found && serverRoute && serverRoute.length > 1) {
+                if (routeData.found && serverRoute && serverRoute.length >= 1) {
                   const blacklistedOnRoute = serverRoute.find(r => 
                     blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
                   );
@@ -4091,14 +4175,14 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           let viableRoute = false;
           try {
             const mappedRoute = mapStore.findRoute(bot.system, mayday.system, blacklist);
-            if (mappedRoute && mappedRoute.length > 1) {
+            if (mappedRoute && mappedRoute.length >= 1) {
               viableRoute = true;
             } else {
               const routeResp = await bot.exec("find_route", { target_system: mayday.system });
               if (!routeResp.error && routeResp.result) {
                 const routeData = routeResp.result as Record<string, unknown>;
                 const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
-                if (routeData.found && serverRoute && serverRoute.length > 1) {
+                if (routeData.found && serverRoute && serverRoute.length >= 1) {
                   const blacklistedOnRoute = serverRoute.find(r => 
                     blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
                   );

@@ -855,30 +855,69 @@ export async function ensureFueled(
     return await emergencyFuelRecovery(ctx);
   }
 
-  // Step 2: No local station — try fuel cells already in cargo
-  // Loop to consume multiple fuel cells if needed (e.g. low-tier cells only give +20 fuel each)
+  // Step 2: No local station — check if fuel cells in cargo can get us above threshold
+  // Only use fuel cells if they can meet the threshold, otherwise go directly to station
   if (!bot.docked) {
-    let cargoRefuelAttempts = 0;
-    while (fuelPct < thresholdPct && cargoRefuelAttempts < 20) {
-      const refuelResp = await bot.exec("refuel");
-      if (refuelResp.error) {
-        const msg = refuelResp.error.message.toLowerCase();
-        if (msg.includes("no fuel") || msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
-          ctx.log("system", "No fuel cells in cargo — skipping cargo refuel");
+    // First, check how many fuel cells we have and if they can get us above threshold
+    const cargoResp = await bot.exec("get_cargo");
+    let totalFuelCells = 0;
+    let hasPremiumFuelCells = false;
+    let hasRegularFuelCells = false;
+    
+    if (cargoResp.result && typeof cargoResp.result === "object") {
+      const cResult = cargoResp.result as Record<string, unknown>;
+      const cargoItems = (
+        Array.isArray(cResult) ? cResult :
+        Array.isArray(cResult.items) ? (cResult.items as Array<Record<string, unknown>>) :
+        Array.isArray(cResult.cargo) ? (cResult.cargo as Array<Record<string, unknown>>) :
+        []
+      );
+      
+      for (const item of cargoItems) {
+        const itemId = (item.item_id as string) || "";
+        const quantity = (item.quantity as number) || 0;
+        if (itemId === "premium_fuel_cell") {
+          totalFuelCells += quantity * 50; // premium gives 50 fuel each
+          hasPremiumFuelCells = true;
+        } else if (itemId.includes("fuel_cell")) {
+          totalFuelCells += quantity * 20; // regular gives ~20 fuel each
+          hasRegularFuelCells = true;
         }
-        break; // error or no fuel cells
       }
-      cargoRefuelAttempts++;
-      await bot.refreshStatus();
-      const newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      if (newFuelPct > fuelPct) {
-        ctx.log("system", `Refueled from cargo fuel cell — fuel now ${newFuelPct}%`);
-        fuelPct = newFuelPct;
+    }
+
+    // Calculate if fuel cells can get us above threshold
+    const fuelNeeded = bot.maxFuel > 0 ? ((thresholdPct / 100) * bot.maxFuel) - bot.fuel : 0;
+    const canReachThresholdWithFuelCells = totalFuelCells >= fuelNeeded;
+
+    if (canReachThresholdWithFuelCells) {
+      ctx.log("system", `Sufficient fuel cells in cargo (${hasPremiumFuelCells ? "premium+" : ""}${hasRegularFuelCells ? "regular" : ""}) — using cargo fuel cells to refuel`);
+      
+      // Use fuel cells from cargo
+      let cargoRefuelAttempts = 0;
+      while (fuelPct < thresholdPct && cargoRefuelAttempts < 20) {
+        const refuelResp = await bot.exec("refuel");
+        if (refuelResp.error) {
+          const msg = refuelResp.error.message.toLowerCase();
+          if (msg.includes("no fuel") || msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
+            ctx.log("system", "No fuel cells in cargo — skipping cargo refuel");
+          }
+          break; // error or no fuel cells
+        }
+        cargoRefuelAttempts++;
+        await bot.refreshStatus();
+        const newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        if (newFuelPct > fuelPct) {
+          ctx.log("system", `Refueled from cargo fuel cell — fuel now ${newFuelPct}%`);
+          fuelPct = newFuelPct;
+        }
+        if (fuelPct >= thresholdPct) {
+          ctx.log("system", `Refueled from cargo — fuel now ${fuelPct}%`);
+          return true;
+        }
       }
-      if (fuelPct >= thresholdPct) {
-        ctx.log("system", `Refueled from cargo — fuel now ${fuelPct}%`);
-        return true;
-      }
+    } else {
+      ctx.log("system", `Insufficient fuel cells in cargo to reach ${thresholdPct}% threshold — going directly to station`);
     }
 
     // Step 3: Nearly out of fuel — scavenge wrecks for fuel as last resort (never jettison cargo)

@@ -687,6 +687,7 @@ class MapStore {
         name: systemId,
         connections: [],
         pois: [],
+        wormhole_exits: [],
         pirate_sightings: [],
         wrecks: [],
         last_updated: now(),

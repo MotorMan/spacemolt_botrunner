@@ -10704,6 +10704,7 @@ function renderExplorerSettings(panel) {
   const groupUnknowns = explorer.groupUnknowns ?? true;
   const scavengeEnabled = explorer.scavengeEnabled ?? false;
   const loadFuelCellsAtHome = explorer.loadFuelCellsAtHome ?? true;
+  const returnToHomeOnFuelCellDepletion = explorer.returnToHomeOnFuelCellDepletion ?? false;
 
   // Per-bot focus area overrides for trade_update mode
   const explorerBots = bots.filter(b => {
@@ -10846,6 +10847,17 @@ function renderExplorerSettings(panel) {
       </select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Return to Home on Fuel Cell Depletion</div>
+        <div class="setting-hint">Automatically return to Sol Central to reload fuel cells when they run out. Allows longer exploration sessions without manual intervention.</div>
+      </div>
+      <select id="set-explorer-returnToHomeOnFuelCellDepletion">
+        <option value="false"${!returnToHomeOnFuelCellDepletion ? ' selected' : ''}>No</option>
+        <option value="true"${returnToHomeOnFuelCellDepletion ? ' selected' : ''}>Yes (auto-return)</option>
+      </select>
+    </div>
+
     ${perBotHtml}
 
     <div class="settings-save-bar">
@@ -10866,6 +10878,7 @@ function saveExplorerSettings() {
     groupUnknowns: document.getElementById('set-explorer-groupUnknowns').value === 'true',
     scavengeEnabled: document.getElementById('set-explorer-scavengeEnabled').value === 'true',
     loadFuelCellsAtHome: document.getElementById('set-explorer-loadFuelCellsAtHome').value === 'true',
+    returnToHomeOnFuelCellDepletion: document.getElementById('set-explorer-returnToHomeOnFuelCellDepletion').value === 'true',
   };
   send({ type: 'saveSettings', routine: 'explorer', settings: s });
   settings.explorer = s;
@@ -11609,6 +11622,9 @@ function addOreQuotaRow(type) {
   } else if (type === 'deepcore') {
     oreSelect = document.getElementById('deepcore-quota-add-ore');
     qtyInput = document.getElementById('deepcore-quota-add-qty');
+  } else if (type === 'radioactive') {
+    oreSelect = document.getElementById('radioactive-quota-add-ore');
+    qtyInput = document.getElementById('radioactive-quota-add-qty');
   }
   if (!oreSelect || !qtyInput) return;
 
@@ -11617,7 +11633,7 @@ function addOreQuotaRow(type) {
   if (!oreId) return;
 
   // Check if ore already in table
-  const tableId = type === 'ore' ? 'ore-quota-table' : type === 'gas' ? 'gas-quota-table' : type === 'ice' ? 'ice-quota-table' : 'deepcore-quota-table';
+  const tableId = type === 'ore' ? 'ore-quota-table' : type === 'gas' ? 'gas-quota-table' : type === 'ice' ? 'ice-quota-table' : type === 'radioactive' ? 'radioactive-quota-table' : 'deepcore-quota-table';
   const existing = document.querySelector(`#${tableId} tr[data-ore-id="${oreId}"]`);
   if (existing) {
     existing.querySelector('.quota-qty').value = qty;
@@ -11632,10 +11648,17 @@ function addOreQuotaRow(type) {
     { item_id: 'exotic_matter', name: 'Exotic Matter' },
     { item_id: 'dark_matter_residue', name: 'Dark Matter Residue' },
   ];
+  const radioactiveOresList = [
+    { item_id: 'polonium_ore', name: 'Polonium Ore' },
+    { item_id: 'radium_ore', name: 'Radium Ore' },
+    { item_id: 'uranium_ore', name: 'Uranium Ore' },
+    { item_id: 'thorium_ore', name: 'Thorium Ore' },
+  ];
   const allOres = type === 'ore' ? knownOres.filter(o => !o.name.toLowerCase().includes('gas') && !o.name.toLowerCase().includes('ice'))
     : type === 'gas' ? knownOres.filter(o => o.name.toLowerCase().includes('gas'))
     : type === 'ice' ? knownOres.filter(o => o.name.toLowerCase().includes('ice'))
-    : deepCoreOresList;
+    : type === 'deepcore' ? deepCoreOresList
+    : radioactiveOresList;
   const oreName = allOres.find(o => o.item_id === oreId)?.name || oreId;
   const tbody = document.querySelector(`#${tableId} tbody`);
   const tr = document.createElement('tr');

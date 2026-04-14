@@ -15,6 +15,7 @@ import {
   logStatus,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
+  fleeFromBattle,
   type BattleState,
   PIRATE_SYSTEMS,
   isPirateSystem,
@@ -1613,6 +1614,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     const errMsg = travelResp.error.message.toLowerCase();
                     if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                       ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                      await fleeFromBattle(ctx);
                       await sleep(5000);
                       continue;
                     }
@@ -1677,6 +1679,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                   const errMsg = travelResp.error.message.toLowerCase();
                   if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                     ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                    await fleeFromBattle(ctx);
                     await sleep(5000);
                     continue;
                   }
@@ -2420,6 +2423,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               const errMsg = travelResp.error.message.toLowerCase();
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await fleeFromBattle(ctx);
                 await sleep(5000);
                 continue;
               }
@@ -2481,6 +2485,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             const errMsg = travelResp.error.message.toLowerCase();
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await fleeFromBattle(ctx);
               await sleep(5000);
               continue;
             }
@@ -2994,6 +2999,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
               const errMsg = travelResp.error.message.toLowerCase();
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await fleeFromBattle(ctx);
                 await sleep(5000);
                 continue;
               }
@@ -3035,6 +3041,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
             const errMsg = travelResp.error.message.toLowerCase();
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await fleeFromBattle(ctx);
               await sleep(5000);
               continue;
             }
@@ -3574,6 +3581,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
               const errMsg = travelResp.error.message.toLowerCase();
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await fleeFromBattle(ctx);
                 await sleep(5000);
                 continue;
               }
@@ -3619,6 +3627,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
             const errMsg = travelResp.error.message.toLowerCase();
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await fleeFromBattle(ctx);
               await sleep(5000);
               continue;
             }
@@ -4334,6 +4343,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     const errMsg = travelResp.error.message.toLowerCase();
                     if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                       ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                      await fleeFromBattle(ctx);
                       await sleep(5000);
                       continue;
                     }
@@ -4398,6 +4408,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                   const errMsg = travelResp.error.message.toLowerCase();
                   if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                     ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                    await fleeFromBattle(ctx);
                     await sleep(5000);
                     continue;
                   }
@@ -4975,6 +4986,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           const errMsg = travelResp.error.message.toLowerCase();
           if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
             ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+            await fleeFromBattle(ctx);
             await sleep(5000);
             continue;
           }
@@ -5216,6 +5228,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 const errMsg = travelResp.error.message.toLowerCase();
                 if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                   ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                  await fleeFromBattle(ctx);
                   await sleep(5000);
                   continue;
                 }
@@ -5337,6 +5350,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     const errMsg = travelResp.error.message.toLowerCase();
                     if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                       ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                      await fleeFromBattle(ctx);
                       await sleep(5000);
                       continue;
                     }
@@ -5481,6 +5495,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             const errMsg = travelResp.error.message.toLowerCase();
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await fleeFromBattle(ctx);
               await sleep(5000);
               continue;
             }
@@ -5627,6 +5642,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               const errMsg = travelResp.error.message.toLowerCase();
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await fleeFromBattle(ctx);
                 await sleep(5000);
                 continue;
               }
@@ -5672,6 +5688,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             const errMsg = travelResp.error.message.toLowerCase();
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+              await fleeFromBattle(ctx);
               await sleep(5000);
               continue;
             }

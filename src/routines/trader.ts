@@ -27,6 +27,7 @@ import {
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
   getBattleStatus,
+  fleeFromBattle,
   type BattleState,
 } from "./common.js";
 import {
@@ -951,6 +952,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           const errMsg = travelResp.error.message.toLowerCase();
           if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
             ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+            await fleeFromBattle(ctx);
             await sleep(5000);
             continue;
           }
@@ -1166,6 +1168,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   const errMsg = travelResp.error.message.toLowerCase();
                   if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                     ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                    await fleeFromBattle(ctx);
                     await sleep(5000);
                     continue;
                   }
@@ -1555,6 +1558,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           const errMsg = tResp.error.message.toLowerCase();
           if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
             ctx.log("combat", `Travel interrupted by battle! ${tResp.error.message} - fleeing!`);
+            await fleeFromBattle(ctx);
             await sleep(5000);
             continue;
           }
@@ -2136,6 +2140,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const errMsg = t2Resp.error.message.toLowerCase();
         if (t2Resp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
           ctx.log("combat", `Travel interrupted by battle! ${t2Resp.error.message} - fleeing!`);
+          await fleeFromBattle(ctx);
           await sleep(5000);
           continue;
         }
@@ -2301,6 +2306,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               const errMsg = tResp.error.message.toLowerCase();
               if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${tResp.error.message} - fleeing!`);
+                await fleeFromBattle(ctx);
                 await sleep(5000);
                 continue;
               }
@@ -2377,6 +2383,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               const errMsg = tResp.error.message.toLowerCase();
               if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${tResp.error.message} - fleeing!`);
+                await fleeFromBattle(ctx);
                 await sleep(5000);
                 continue;
               }
@@ -2449,6 +2456,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               const errMsg = travelResp.error.message.toLowerCase();
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await fleeFromBattle(ctx);
                 await sleep(5000);
                 continue;
               }
@@ -2663,6 +2671,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               const errMsg = travelResp.error.message.toLowerCase();
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                await fleeFromBattle(ctx);
                 await sleep(5000);
                 continue;
               }

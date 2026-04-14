@@ -1960,8 +1960,20 @@ function renderProfileTopbar() {
     }
     const globalHome = (settings.miner || {}).homeSystem || '';
     const botHome = botSettings.homeSystem || '';
-    const sysOpts = [`<option value=""${!botHome ? ' selected' : ''}>(global: ${globalHome ? esc(globalHome) : 'start system'})</option>`];
+    const effectiveHome = botHome || globalHome;
+    const sysOpts = [];
+    
+    // Add the global/default option
+    if (effectiveHome) {
+      // When there's a global value, use it as the option value so it doesn't appear blank
+      sysOpts.push(`<option value="${esc(effectiveHome)}"${!botHome ? ' selected' : ''}>(global: ${esc(effectiveHome)})</option>`);
+    } else {
+      sysOpts.push(`<option value=""${!botHome ? ' selected' : ''}>(global: start system)</option>`);
+    }
+    
+    // Add all known systems (skip if it matches the effective home to avoid duplicates)
     for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+      if (sys.id === effectiveHome && !botHome) continue; // Skip duplicate when showing global
       const sel = sys.id === botHome ? ' selected' : '';
       sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
     }
@@ -2043,8 +2055,20 @@ function renderProfileTopbar() {
       ? ((settings.faction_trader || {}).homeSystem || (settings.general || {}).factionStorageSystem || '')
       : ((settings.trader || {}).homeSystem || '');
     const botHome = botSettings.homeSystem || '';
-    const sysOpts = [`<option value=""${!botHome ? ' selected' : ''}>(global: ${globalHome ? esc(globalHome) : 'none'})</option>`];
+    const effectiveHome = botHome || globalHome;
+    const sysOpts = [];
+    
+    // Add the global/default option
+    if (effectiveHome) {
+      // When there's a global value, use it as the option value so it doesn't appear blank
+      sysOpts.push(`<option value="${esc(effectiveHome)}"${!botHome ? ' selected' : ''}>(global: ${esc(effectiveHome)})</option>`);
+    } else {
+      sysOpts.push(`<option value=""${!botHome ? ' selected' : ''}>(global: none)</option>`);
+    }
+    
+    // Add all known systems (skip if it matches the effective home to avoid duplicates)
     for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+      if (sys.id === effectiveHome && !botHome) continue; // Skip duplicate when showing global
       const sel = sys.id === botHome ? ' selected' : '';
       sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
     }
@@ -2096,8 +2120,20 @@ function renderProfileTopbar() {
     const botSettings = settings[bot.username] || {};
     const globalHome = (settings[currentRoutine] || {}).homeSystem || '';
     const botHome = botSettings.homeSystem || '';
-    const sysOpts = [`<option value=""${!botHome ? ' selected' : ''}>(global: ${globalHome ? esc(globalHome) : 'start system'})</option>`];
+    const effectiveHome = botHome || globalHome;
+    const sysOpts = [];
+    
+    // Add the global/default option
+    if (effectiveHome) {
+      // When there's a global value, use it as the option value so it doesn't appear blank
+      sysOpts.push(`<option value="${esc(effectiveHome)}"${!botHome ? ' selected' : ''}>(global: ${esc(effectiveHome)})</option>`);
+    } else {
+      sysOpts.push(`<option value=""${!botHome ? ' selected' : ''}>(global: start system)</option>`);
+    }
+    
+    // Add all known systems (skip if it matches the effective home to avoid duplicates)
     for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+      if (sys.id === effectiveHome && !botHome) continue; // Skip duplicate when showing global
       const sel = sys.id === botHome ? ' selected' : '';
       sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
     }

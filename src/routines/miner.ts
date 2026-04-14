@@ -1639,11 +1639,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let effectiveTarget = recoveredSession ? recoveredSession.targetResourceId : priorityTarget;
     const isQuotaDriven = recoveredSession ? recoveredSession.isQuotaDriven : !!quotaTargetResource;
     const maxJumps = settings.maxJumps || 10;
-    
+
     // Initialize target location variables (may be set by deep core search below)
-    let targetSystemId = "";
-    let targetPoiId = "";
-    let targetPoiName = "";
+    // CRITICAL FIX: Restore target location from recovered session to prevent
+    // deep core miners from losing track of hidden POIs between cycles
+    let targetSystemId = recoveredSession ? recoveredSession.targetSystemId : "";
+    let targetPoiId = recoveredSession ? recoveredSession.targetPoiId : "";
+    let targetPoiName = recoveredSession ? recoveredSession.targetPoiName : "";
 
     // ── Deep core miner restriction ──
     // If the miner has full deep core capability, restrict mining to deep core ores only
@@ -2269,6 +2271,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           miningPoi = { id: storedPoi.id, name: storedPoi.name };
           ctx.log("mining", `Using known hidden POI ${storedPoi.name} (not yet visible in system scan)`);
         }
+      } else if (effectiveTarget && isDeepCoreOre(effectiveTarget) && deepCoreCap.canMine) {
+        // Deep core ore hidden POI not visible in system POI list — use map store
+        const sysData = mapStore.getSystem(bot.system);
+        const storedPoi = sysData?.pois.find(p => p.id === targetPoiId);
+        if (storedPoi) {
+          miningPoi = { id: storedPoi.id, name: storedPoi.name };
+          ctx.log("mining", `Using known deep core POI from map: ${storedPoi.name} (${storedPoi.hidden ? "hidden" : "visible"})`);
+        }
       }
     }
 
@@ -2341,6 +2351,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         // Found a known hidden POI with the target resource
         miningPoi = { id: storedPoi.id, name: storedPoi.name };
         ctx.log("mining", `Using known hidden POI from map: ${storedPoi.name} (${effectiveTarget})`);
+        break;
+      }
+    }
+
+    // For deep core ore mining: check map store for known deep core POIs
+    // not yet visible in the system POI list
+    if (!miningPoi && effectiveTarget && isDeepCoreOre(effectiveTarget) && deepCoreCap.canMine) {
+      const sysData = mapStore.getSystem(bot.system);
+      for (const storedPoi of (sysData?.pois || [])) {
+        const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
+        if (!oreEntry) continue;
+        // Check depletion
+        if (oreEntry.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) continue;
+        // Found a known deep core POI with the target resource
+        miningPoi = { id: storedPoi.id, name: storedPoi.name };
+        ctx.log("mining", `Using known deep core POI from map: ${storedPoi.name} (${effectiveTarget})`);
         break;
       }
     }

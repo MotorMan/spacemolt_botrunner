@@ -2198,7 +2198,7 @@ function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps:
 async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
 
-  // Check current cargo space
+  // Check current cargo space and existing fuel cells
   const cargoResp = await bot.exec("get_cargo");
 
   // Check for battle after get_cargo
@@ -2222,25 +2222,50 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   ) as Array<Record<string, unknown>>;
 
   let currentCargo = 0;
-  let fuelCellCount = 0;
+  let premiumFuelCells = 0;
+  let regularFuelCells = 0;
   for (const item of cargoItems) {
     const itemId = (item.item_id as string) || "";
     const quantity = (item.quantity as number) || 0;
     currentCargo += quantity;
-    if (itemId.toLowerCase().includes("fuel_cell")) {
-      fuelCellCount = quantity;
+    if (itemId === "premium_fuel_cell") {
+      premiumFuelCells = quantity;
+    } else if (itemId === "fuel_cell") {
+      regularFuelCells = quantity;
     }
   }
 
   const availableSpace = bot.cargoMax - currentCargo;
   if (availableSpace <= 0) {
-    ctx.log("info", `Cargo hold full — already loaded with ${fuelCellCount} fuel cells`);
+    ctx.log("info", `Cargo hold full — already loaded with ${premiumFuelCells} premium + ${regularFuelCells} regular fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // Try to withdraw fuel cells from faction storage
-  ctx.log("trade", `Loading ${availableSpace} fuel cells from faction storage for long-range exploration...`);
-  const withdrawResp = await bot.exec("faction_withdraw_items", {
+  // Try to withdraw premium_fuel_cell first (higher priority)
+  ctx.log("trade", `Loading ${availableSpace} premium fuel cells from faction storage for long-range exploration...`);
+  let withdrawResp = await bot.exec("faction_withdraw_items", {
+    item_id: "premium_fuel_cell",
+    quantity: availableSpace
+  });
+
+  // Check for battle after faction_withdraw_items
+  if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
+    ctx.log("combat", "Battle detected during fuel cell withdraw - fleeing!");
+    await sleep(5000);
+    return false;
+  }
+
+  let loadedCount = 0;
+  if (!withdrawResp.error) {
+    loadedCount = availableSpace;
+    const newPremium = premiumFuelCells + loadedCount;
+    ctx.log("trade", `Loaded ${loadedCount} premium fuel cells from faction storage (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    return true;
+  }
+
+  // If premium withdraw failed, try regular fuel_cell
+  ctx.log("warn", `Could not withdraw premium fuel cells: ${withdrawResp.error.message} — trying regular fuel cells...`);
+  withdrawResp = await bot.exec("faction_withdraw_items", {
     item_id: "fuel_cell",
     quantity: availableSpace
   });
@@ -2253,34 +2278,56 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   }
 
   if (!withdrawResp.error) {
-    const newFuelCells = fuelCellCount + availableSpace;
-    ctx.log("trade", `Loaded ${availableSpace} fuel cells from faction storage (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    loadedCount = availableSpace;
+    const newRegular = regularFuelCells + loadedCount;
+    ctx.log("trade", `Loaded ${loadedCount} regular fuel cells from faction storage (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // If faction withdraw failed, try to buy fuel cells from station market as fallback
-  const errorMsg = (withdrawResp.error.message || "").toLowerCase();
-  ctx.log("warn", `Could not withdraw fuel cells: ${withdrawResp.error.message} — trying to buy from market...`);
-  const buyResp = await bot.exec("buy_item", {
-    item_id: "fuel_cell",
+  // If faction withdraw failed, try to buy premium fuel cells from station market as fallback
+  ctx.log("warn", `Could not withdraw regular fuel cells: ${withdrawResp.error.message} — trying to buy premium fuel cells from market...`);
+  const buyResp = await bot.exec("buy", {
+    item_id: "premium_fuel_cell",
     quantity: availableSpace
   });
 
-  // Check for battle after buy_item
-  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy_item")) {
+  // Check for battle after buy
+  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
     ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
     await sleep(5000);
     return false;
   }
 
   if (!buyResp.error) {
-    const newFuelCells = fuelCellCount + availableSpace;
-    ctx.log("trade", `Bought ${availableSpace} fuel cells from market (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    loadedCount = availableSpace;
+    const newPremium = premiumFuelCells + loadedCount;
+    ctx.log("trade", `Bought ${loadedCount} premium fuel cells from market (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // If buy also failed, try to withdraw credits and retry
-  const buyErrorMsg = (buyResp.error.message || "").toLowerCase();
+  // If premium buy failed, try regular fuel_cell
+  ctx.log("warn", `Could not buy premium fuel cells: ${buyResp.error.message} — trying regular fuel cells...`);
+  const buyRegularResp = await bot.exec("buy", {
+    item_id: "fuel_cell",
+    quantity: availableSpace
+  });
+
+  // Check for battle after buy
+  if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
+    ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
+    await sleep(5000);
+    return false;
+  }
+
+  if (!buyRegularResp.error) {
+    loadedCount = availableSpace;
+    const newRegular = regularFuelCells + loadedCount;
+    ctx.log("trade", `Bought ${loadedCount} regular fuel cells from market (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    return true;
+  }
+
+  // If buy also failed, try to withdraw credits and retry with premium
+  const buyErrorMsg = (buyRegularResp.error.message || "").toLowerCase();
   if (buyErrorMsg.includes("credit") || buyErrorMsg.includes("not enough") || buyErrorMsg.includes("insufficient")) {
     ctx.log("trade", "Not enough credits — withdrawing from storage...");
     const withdrawCreditsResp = await bot.exec("withdraw_credits");
@@ -2294,30 +2341,52 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
     if (!withdrawCreditsResp.error) {
       await bot.refreshStatus();
-      ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying fuel cell purchase...`);
-      const retryResp = await bot.exec("buy_item", {
-        item_id: "fuel_cell",
+      ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying premium fuel cell purchase...`);
+      const retryResp = await bot.exec("buy", {
+        item_id: "premium_fuel_cell",
         quantity: availableSpace
       });
 
-      // Check for battle after retry buy_item
-      if (await checkBattleAfterCommand(ctx, retryResp.notifications, "buy_item")) {
+      // Check for battle after retry buy
+      if (await checkBattleAfterCommand(ctx, retryResp.notifications, "buy")) {
         ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
         await sleep(5000);
         return false;
       }
 
       if (!retryResp.error) {
-        const newFuelCells = fuelCellCount + availableSpace;
-        ctx.log("trade", `Loaded ${availableSpace} fuel cells (${newFuelCells} total, ${bot.cargo}/${bot.cargoMax} cargo)`);
+        loadedCount = availableSpace;
+        const newPremium = premiumFuelCells + loadedCount;
+        ctx.log("trade", `Loaded ${loadedCount} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
         return true;
       }
-      ctx.log("error", `Still could not buy fuel cells: ${retryResp.error.message}`);
+
+      // If premium retry failed, try regular
+      ctx.log("warn", `Could not buy premium fuel cells: ${retryResp.error.message} — trying regular...`);
+      const retryRegularResp = await bot.exec("buy", {
+        item_id: "fuel_cell",
+        quantity: availableSpace
+      });
+
+      // Check for battle after retry buy
+      if (await checkBattleAfterCommand(ctx, retryRegularResp.notifications, "buy")) {
+        ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
+        await sleep(5000);
+        return false;
+      }
+
+      if (!retryRegularResp.error) {
+        loadedCount = availableSpace;
+        const newRegular = regularFuelCells + loadedCount;
+        ctx.log("trade", `Loaded ${loadedCount} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+        return true;
+      }
+      ctx.log("error", `Still could not buy fuel cells: ${retryRegularResp.error.message}`);
     } else {
       ctx.log("error", `Could not withdraw credits: ${withdrawCreditsResp.error.message}`);
     }
   } else {
-    ctx.log("error", `Could not buy fuel cells: ${buyResp.error.message}`);
+    ctx.log("error", `Could not buy fuel cells: ${buyRegularResp.error.message}`);
   }
 
   return false;
@@ -2436,6 +2505,7 @@ async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolea
 /**
  * Load cargo hold with fuel cells for long journeys.
  * Fills cargo to max capacity with fuel cells.
+ * Prioritizes premium_fuel_cell over regular fuel_cell.
  */
 async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   const { bot, log } = ctx;
@@ -2490,7 +2560,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
     bot.docked = true;
   }
 
-  // Check current cargo
+  // Check current cargo and existing fuel cells
   const cargoResp = await bot.exec("get_cargo");
 
   // Check for battle after get_cargo
@@ -2514,37 +2584,66 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   ) as Array<Record<string, unknown>>;
 
   let currentCargo = 0;
+  let premiumFuelCells = 0;
+  let regularFuelCells = 0;
   for (const item of cargoItems) {
+    const itemId = (item.item_id as string) || "";
     const quantity = (item.quantity as number) || 0;
     currentCargo += quantity;
+    if (itemId === "premium_fuel_cell") {
+      premiumFuelCells = quantity;
+    } else if (itemId === "fuel_cell") {
+      regularFuelCells = quantity;
+    }
   }
 
   const availableSpace = bot.cargoMax - currentCargo;
   if (availableSpace <= 0) {
-    log("info", "Cargo hold is full");
+    log("info", `Cargo hold full — already loaded with ${premiumFuelCells} premium + ${regularFuelCells} regular fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // Buy fuel cells
-  log("trade", `Loading ${availableSpace} fuel cells for long journey...`);
-  const buyResp = await bot.exec("buy_item", {
-    item_id: "fuel_cell",
+  // Try to buy premium fuel cells first
+  log("trade", `Loading ${availableSpace} premium fuel cells for long journey...`);
+  const buyResp = await bot.exec("buy", {
+    item_id: "premium_fuel_cell",
     quantity: availableSpace
   });
 
-  // Check for battle after buy_item
-  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy_item")) {
+  // Check for battle after buy
+  if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
     log("combat", "Battle detected during fuel cell purchase - fleeing!");
     await sleep(5000);
     return false;
   }
 
-  if (buyResp.error) {
-    log("error", `Could not buy fuel cells: ${buyResp.error.message}`);
+  if (!buyResp.error) {
+    const newPremium = premiumFuelCells + availableSpace;
+    log("trade", `Bought ${availableSpace} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    return true;
+  }
+
+  // If premium buy failed, try regular fuel_cell
+  log("warn", `Could not buy premium fuel cells: ${buyResp.error.message} — trying regular fuel cells...`);
+  const buyRegularResp = await bot.exec("buy", {
+    item_id: "fuel_cell",
+    quantity: availableSpace
+  });
+
+  // Check for battle after buy
+  if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
+    log("combat", "Battle detected during fuel cell purchase - fleeing!");
+    await sleep(5000);
     return false;
   }
 
-  log("trade", `Loaded ${availableSpace} fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
+  if (buyRegularResp.error) {
+    log("error", `Could not buy fuel cells: ${buyRegularResp.error.message}`);
+    return false;
+  }
+
+  const newRegular = regularFuelCells + availableSpace;
+  log("trade", `Bought ${availableSpace} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
   return true;
 }
 

@@ -1973,6 +1973,7 @@ function renderProfileTopbar() {
     
     // Add all known systems (skip if it matches the effective home to avoid duplicates)
     for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+      // Skip duplicate only when botHome is truly falsy (not set), not when it's explicitly set
       if (sys.id === effectiveHome && !botHome) continue; // Skip duplicate when showing global
       const sel = sys.id === botHome ? ' selected' : '';
       sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
@@ -2050,7 +2051,7 @@ function renderProfileTopbar() {
     || (bot.state !== 'running' && bot.state !== 'stopping' && (getProfileSelectedRoutine() === 'trader' || getProfileSelectedRoutine() === 'faction_trader'));
   if (isTrader) {
     const botSettings = settings[bot.username] || {};
-    const stationPriority = botSettings.stationPriority || false;
+const stationPriority = botSettings.stationPriority || false;
     const globalHome = (bot.routine === 'faction_trader' || getProfileSelectedRoutine() === 'faction_trader')
       ? ((settings.faction_trader || {}).homeSystem || (settings.general || {}).factionStorageSystem || '')
       : ((settings.trader || {}).homeSystem || '');
@@ -2063,7 +2064,15 @@ function renderProfileTopbar() {
       // When there's a global value, use it as the option value so it doesn't appear blank
       sysOpts.push(`<option value="${esc(effectiveHome)}"${!botHome ? ' selected' : ''}>(global: ${esc(effectiveHome)})</option>`);
     } else {
-      sysOpts.push(`<option value=""${!botHome ? ' selected' : ''}>(global: none)</option>`);
+      sysOpts.push(`<option value=""${!botHome ? ' selected' : ''}>(global: start system)</option>`);
+    }
+    
+    // Add all known systems (skip if it matches the effective home to avoid duplicates)
+    for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+      // Skip duplicate only when botHome is truly falsy (not set), not when it's explicitly set
+      if (sys.id === effectiveHome && !botHome) continue; // Skip duplicate when showing global
+      const sel = sys.id === botHome ? ' selected' : '';
+      sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
     }
     
     // Add all known systems (skip if it matches the effective home to avoid duplicates)
@@ -2133,6 +2142,7 @@ function renderProfileTopbar() {
     
     // Add all known systems (skip if it matches the effective home to avoid duplicates)
     for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+      // Skip duplicate only when botHome is truly falsy (not set), not when it's explicitly set
       if (sys.id === effectiveHome && !botHome) continue; // Skip duplicate when showing global
       const sel = sys.id === botHome ? ' selected' : '';
       sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);

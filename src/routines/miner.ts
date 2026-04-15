@@ -26,6 +26,7 @@ import {
   getRadioactiveCapability,
   hasRadioactiveEquipmentCached,
   hasDeepCoreExtractorCached,
+  hasFullRadioactiveCapabilityCached,
   logRadioactiveCapability,
   isRadioactiveOre,
 } from "./miner_radioactive.js";
@@ -427,7 +428,8 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   let hasMiningLaser = false;
   let hasGasHarvester = false;
   let hasIceHarvester = false;
-  let hasRadioactiveEquipment = false;
+  let hasLeadLinedCargo = false;
+  let hasRadHarvester = false;
 
   for (const mod of modules) {
     const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
@@ -446,11 +448,15 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
     if (checkStr.includes("ice_harvester") || checkStr.includes("ice harvester")) {
       hasIceHarvester = true;
     }
-    if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo") ||
-        checkStr.includes("rad_harvester") || checkStr.includes("rad harvester")) {
-      hasRadioactiveEquipment = true;
+    if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo")) {
+      hasLeadLinedCargo = true;
+    }
+    if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester")) {
+      hasRadHarvester = true;
     }
   }
+
+  const hasRadioactiveEquipment = hasLeadLinedCargo && hasRadHarvester;
 
   // Priority: radioactive > ice > gas > ore (if multiple types present, use settings preference)
   const detectedTypes: string[] = [];
@@ -1502,9 +1508,21 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       miningType = settings.miningType;
     }
 
+    // Deep core capability check - needed for quota selection below
+    const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
+
     // Radioactive mining: check if we can access hidden POIs (requires deep core extractor)
     // Without extractor, can only mine regular ore belts
-    const canMineHiddenRadioactive = miningType === "radioactive" && hasDeepCoreExtractorCached(cachedModules || []);
+    // Use full capability check (all 3 modules) to avoid false positives from detection
+    const hasFullRadioactiveCap = hasFullRadioactiveCapabilityCached(cachedModules || []);
+    const canMineHiddenRadioactive = miningType === "radioactive" && hasFullRadioactiveCap;
+    
+    // Debug: log the capability check for troubleshooting
+    if (miningType === "radioactive") {
+      const hasBasicRadioactive = hasRadioactiveEquipmentCached(cachedModules || []);
+      const hasDeepCore = hasDeepCoreExtractorCached(cachedModules || []);
+      ctx.log("debug", `Radioactive capability: basic=${hasBasicRadioactive}, deepCore=${hasDeepCore}, fullCap=${hasFullRadioactiveCap}, hiddenPOI=${canMineHiddenRadioactive}`);
+    }
 
     // Smart target selection: when mining type is auto-detected, only use the
     // matching target field (no cross-type fallback). A gas harvester should
@@ -1540,7 +1558,15 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Select quotas based on mining type ──
-    const quotas = miningType === "ice" ? settings.iceQuotas : (miningType === "ore" ? settings.oreQuotas : (miningType === "radioactive" ? settings.radioactiveQuotas : settings.gasQuotas));
+    // CRITICAL FIX: Deep core miners should use deepCoreQuotas, not oreQuotas
+    const useDeepCore = deepCoreCap.canMine;
+    const quotas = useDeepCore 
+      ? settings.deepCoreQuotas 
+      : (miningType === "ice" ? settings.iceQuotas : (miningType === "ore" ? settings.oreQuotas : (miningType === "radioactive" ? settings.radioactiveQuotas : settings.gasQuotas)));
+    
+    if (useDeepCore) {
+      ctx.log("debug", `Deep core mining detected - using deepCoreQuotas: ${JSON.stringify(quotas)}`);
+    }
 
     // ── Determine priority target (global target or quota pick) ──
     const hasGlobalTarget = !!targetResource;
@@ -1651,7 +1677,6 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // If the miner has full deep core capability, restrict mining to deep core ores only
     // This prevents deep core miners from being assigned to mundane regular ores
     // During field_test mission, only extractor is required
-    const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
     if (deepCoreCap.canMine) {
       // If current target is not a deep core ore, search for one
       if (effectiveTarget && !isDeepCoreOre(effectiveTarget)) {
@@ -1719,7 +1744,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           } else {
             // No deep core quotas configured - don't mine anything
             ctx.log("mining", "No deep core ore quotas configured - waiting for quota setup");
-            ctx.log("mining", "Configure oreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue)");
+            ctx.log("mining", "Configure deepCoreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue)");
             await sleep(60000);
             continue;
           }

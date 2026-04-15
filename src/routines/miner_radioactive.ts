@@ -130,6 +130,26 @@ export function hasDeepCoreExtractorCached(
 }
 
 /**
+ * Check if the ship has full radioactive mining equipment including deep core extractor.
+ * This is required to mine radioactive ores from hidden POIs.
+ * Cached version that accepts pre-fetched modules.
+ */
+export function hasFullRadioactiveCapabilityCached(
+  modules: unknown[],
+): boolean {
+  const moduleStr = modules.map(m => {
+    const obj = typeof m === "object" && m !== null ? m as Record<string, unknown> : {};
+    return `${obj.id || ""} ${obj.name || ""} ${obj.type || ""} ${obj.special || ""}`.toLowerCase();
+  }).join(" ");
+
+  const hasLLCargo = moduleStr.includes("lead_lined_cargo") || moduleStr.includes("lead lined cargo");
+  const hasRadHarv = moduleStr.includes("rad_harvester") || moduleStr.includes("rad harvester");
+  const hasDeepCore = moduleStr.includes("deep_core_extractor") || moduleStr.includes("deep core extractor");
+
+  return hasLLCargo && hasRadHarv && hasDeepCore;
+}
+
+/**
  * Log radioactive mining capability.
  */
 export async function logRadioactiveCapability(ctx: RoutineContext): Promise<void> {

@@ -2227,7 +2227,8 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   for (const item of cargoItems) {
     const itemId = (item.item_id as string) || "";
     const quantity = (item.quantity as number) || 0;
-    currentCargo += quantity;
+    const spacePerItem = itemId === "premium_fuel_cell" ? 2 : 1;
+    currentCargo += quantity * spacePerItem;
     if (itemId === "premium_fuel_cell") {
       premiumFuelCells = quantity;
     } else if (itemId === "fuel_cell") {
@@ -2241,11 +2242,18 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
     return true;
   }
 
-  // Try to withdraw premium_fuel_cell first (higher priority)
-  ctx.log("trade", `Loading ${availableSpace} premium fuel cells from faction storage for long-range exploration...`);
+  // Premium fuel cells take 2 cargo space each, regular take 1
+  // Calculate max we can withdraw: premium uses 2 space, so use floor division
+  const maxPremiumWithdraw = Math.floor(availableSpace / 2);
+  // For regular, we can use all available space since they take 1 each
+  const maxRegularWithdraw = availableSpace;
+
+  // Try to withdraw premium_fuel_cell first (higher priority, takes 2 space each)
+  const premiumToWithdraw = Math.min(maxPremiumWithdraw, 402); // Cap at reasonable amount
+  ctx.log("trade", `Loading ${premiumToWithdraw} premium fuel cells from faction storage for long-range exploration...`);
   let withdrawResp = await bot.exec("faction_withdraw_items", {
     item_id: "premium_fuel_cell",
-    quantity: availableSpace
+    quantity: premiumToWithdraw
   });
 
   // Check for battle after faction_withdraw_items
@@ -2257,9 +2265,10 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
   let loadedCount = 0;
   if (!withdrawResp.error) {
-    loadedCount = availableSpace;
+    loadedCount = premiumToWithdraw;
     const newPremium = premiumFuelCells + loadedCount;
-    ctx.log("trade", `Loaded ${loadedCount} premium fuel cells from faction storage (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    const actualCargoUsed = loadedCount * 2;
+    ctx.log("trade", `Loaded ${loadedCount} premium fuel cells from faction storage (${actualCargoUsed} cargo space, ${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
@@ -2267,7 +2276,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   ctx.log("warn", `Could not withdraw premium fuel cells: ${withdrawResp.error.message} — trying regular fuel cells...`);
   withdrawResp = await bot.exec("faction_withdraw_items", {
     item_id: "fuel_cell",
-    quantity: availableSpace
+    quantity: maxRegularWithdraw
   });
 
   // Check for battle after faction_withdraw_items
@@ -2278,7 +2287,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   }
 
   if (!withdrawResp.error) {
-    loadedCount = availableSpace;
+    loadedCount = maxRegularWithdraw;
     const newRegular = regularFuelCells + loadedCount;
     ctx.log("trade", `Loaded ${loadedCount} regular fuel cells from faction storage (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
@@ -2288,7 +2297,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   ctx.log("warn", `Could not withdraw regular fuel cells: ${withdrawResp.error.message} — trying to buy premium fuel cells from market...`);
   const buyResp = await bot.exec("buy", {
     item_id: "premium_fuel_cell",
-    quantity: availableSpace
+    quantity: premiumToWithdraw
   });
 
   // Check for battle after buy
@@ -2299,7 +2308,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   }
 
   if (!buyResp.error) {
-    loadedCount = availableSpace;
+    loadedCount = premiumToWithdraw;
     const newPremium = premiumFuelCells + loadedCount;
     ctx.log("trade", `Bought ${loadedCount} premium fuel cells from market (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
@@ -2309,7 +2318,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   ctx.log("warn", `Could not buy premium fuel cells: ${buyResp.error.message} — trying regular fuel cells...`);
   const buyRegularResp = await bot.exec("buy", {
     item_id: "fuel_cell",
-    quantity: availableSpace
+    quantity: maxRegularWithdraw
   });
 
   // Check for battle after buy
@@ -2320,7 +2329,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   }
 
   if (!buyRegularResp.error) {
-    loadedCount = availableSpace;
+    loadedCount = maxRegularWithdraw;
     const newRegular = regularFuelCells + loadedCount;
     ctx.log("trade", `Bought ${loadedCount} regular fuel cells from market (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
@@ -2344,7 +2353,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
       ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying premium fuel cell purchase...`);
       const retryResp = await bot.exec("buy", {
         item_id: "premium_fuel_cell",
-        quantity: availableSpace
+        quantity: premiumToWithdraw
       });
 
       // Check for battle after retry buy
@@ -2355,7 +2364,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
       }
 
       if (!retryResp.error) {
-        loadedCount = availableSpace;
+        loadedCount = premiumToWithdraw;
         const newPremium = premiumFuelCells + loadedCount;
         ctx.log("trade", `Loaded ${loadedCount} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
         return true;
@@ -2365,7 +2374,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
       ctx.log("warn", `Could not buy premium fuel cells: ${retryResp.error.message} — trying regular...`);
       const retryRegularResp = await bot.exec("buy", {
         item_id: "fuel_cell",
-        quantity: availableSpace
+        quantity: maxRegularWithdraw
       });
 
       // Check for battle after retry buy
@@ -2376,7 +2385,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
       }
 
       if (!retryRegularResp.error) {
-        loadedCount = availableSpace;
+        loadedCount = maxRegularWithdraw;
         const newRegular = regularFuelCells + loadedCount;
         ctx.log("trade", `Loaded ${loadedCount} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
         return true;
@@ -2589,7 +2598,8 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   for (const item of cargoItems) {
     const itemId = (item.item_id as string) || "";
     const quantity = (item.quantity as number) || 0;
-    currentCargo += quantity;
+    const spacePerItem = itemId === "premium_fuel_cell" ? 2 : 1;
+    currentCargo += quantity * spacePerItem;
     if (itemId === "premium_fuel_cell") {
       premiumFuelCells = quantity;
     } else if (itemId === "fuel_cell") {
@@ -2603,11 +2613,15 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
     return true;
   }
 
+  // Premium fuel cells take 2 cargo space each, regular take 1
+  const maxPremiumWithdraw = Math.floor(availableSpace / 2);
+  const maxRegularWithdraw = availableSpace;
+
   // Try to buy premium fuel cells first
-  log("trade", `Loading ${availableSpace} premium fuel cells for long journey...`);
+  log("trade", `Loading ${maxPremiumWithdraw} premium fuel cells for long journey...`);
   const buyResp = await bot.exec("buy", {
     item_id: "premium_fuel_cell",
-    quantity: availableSpace
+    quantity: maxPremiumWithdraw
   });
 
   // Check for battle after buy
@@ -2618,8 +2632,8 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   }
 
   if (!buyResp.error) {
-    const newPremium = premiumFuelCells + availableSpace;
-    log("trade", `Bought ${availableSpace} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    const newPremium = premiumFuelCells + maxPremiumWithdraw;
+    log("trade", `Bought ${maxPremiumWithdraw} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
@@ -2627,7 +2641,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   log("warn", `Could not buy premium fuel cells: ${buyResp.error.message} — trying regular fuel cells...`);
   const buyRegularResp = await bot.exec("buy", {
     item_id: "fuel_cell",
-    quantity: availableSpace
+    quantity: maxRegularWithdraw
   });
 
   // Check for battle after buy
@@ -2642,8 +2656,8 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
     return false;
   }
 
-  const newRegular = regularFuelCells + availableSpace;
-  log("trade", `Bought ${availableSpace} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+  const newRegular = regularFuelCells + maxRegularWithdraw;
+  log("trade", `Bought ${maxRegularWithdraw} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
   return true;
 }
 

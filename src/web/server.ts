@@ -1,11 +1,26 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
 import { join } from "path";
+import os from "os";
 import type { BotStatus } from "../bot.js";
 import { getBot } from "../botmanager.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
+
+function getLocalIp(): string | null {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    const addrs = interfaces[name];
+    if (!addrs) continue;
+    for (const iface of addrs) {
+      if (iface.family === "IPv4" && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return null;
+}
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -285,6 +300,7 @@ export class WebServer {
     const indexPath = join(import.meta.dir, "index.html");
 
     this.server = Bun.serve<WSData>({
+      hostname: "0.0.0.0",
       port: this.port,
       fetch: async (req, server) => {
         const url = new URL(req.url);
@@ -773,7 +789,9 @@ export class WebServer {
       this.reloadSettingsFromDisk();
     }, 10000); // Check every 10 seconds
 
+    const lanIp = getLocalIp() || "localhost";
     console.log(`Dashboard: http://localhost:${this.port}`);
+    console.log(`Dashboard (LAN): http://${lanIp}:${this.port}`);
   }
 
   stop(): void {

@@ -1,4 +1,5 @@
 import type { Routine, RoutineContext, BotStatus } from "../bot.js";
+import type { BotChatMessage } from "../bot_chat_channel.js";
 import {
   findStation,
   getSystemInfo,
@@ -71,10 +72,12 @@ import {
   getCooperationSettings,
   isCooperationEnabled,
   sendRescueClaim,
-  processPrivateMessage,
+  processBotChatMessage,
   calculateJumpsToTarget,
   shouldProceedOrYield,
   isRescueClaimedByPartner,
+  registerCooperationHandler,
+  unregisterCooperationHandler,
   type RescueClaim,
 } from "../cooperation/rescueCooperation.js";
 
@@ -1096,6 +1099,22 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
 
   // ── Start background credit top-off loop (non-blocking) ──
   startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+
+  // ── Register Bot Chat handler for rescue cooperation ──
+  // This replaces the old DM-based coordination system
+  const botChatHandler = (message: BotChatMessage) => {
+    if (message.sender === bot.username) return; // Ignore own messages
+    
+    const result = processBotChatMessage(message);
+    if (result.isClaim && result.claim) {
+      ctx.log("coop", `📥 Received rescue claim from ${result.claim.botName}: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps)`);
+    }
+  };
+
+  if (isCooperationEnabled() && settings.cooperationEnabled) {
+    registerCooperationHandler(bot.username, botChatHandler);
+    ctx.log("coop", `🤝 Registered Bot Chat handler for cooperation with ${settings.partnerBotName}`);
+  }
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -2676,7 +2695,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
   // Cleanup when routine exits
   stopCreditTopOffBackground();
-};
+  if (isCooperationEnabled() && settings.cooperationEnabled) {
+    unregisterCooperationHandler(bot.username, botChatHandler);
+    ctx.log("coop", `🤝 Unregistered Bot Chat handler for cooperation`);
+  }
+}
 
 // ── Manual Player Rescue routine ────────────────────────────
 
@@ -3691,11 +3714,8 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
     ctx.log("mayday", "✓ Bot is docked and ready for next MAYDAY");
 
     // Short cooldown before next scan
-    await sleep(5000);
+    await sleep(10000);
   }
-
-  // Cleanup when routine exits
-  stopCreditTopOffBackground();
 };
 
 /**

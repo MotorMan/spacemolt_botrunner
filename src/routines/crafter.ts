@@ -906,7 +906,8 @@ async function executeCraftingPlan(
   // Log the plan
   for (const item of planItems) {
     const indent = "  ".repeat(item.depth);
-    ctx.log("craft", `${indent}→ ${item.quantityToCraft}x ${item.recipe.name} (${item.reason})`);
+    const itemCount = item.quantityToCraft * (item.recipe.output_quantity || 1);
+    ctx.log("craft", `${indent}→ ${item.quantityToCraft}x batches (${itemCount} items): ${item.recipe.name} (${item.reason})`);
   }
 
   if (processingMode === "batch") {
@@ -959,8 +960,10 @@ async function executeCraftingPlan(
         );
 
         if (result.crafted > 0) {
-          // Subtract whole batches crafted (integer math)
-          const batchesCompleted = Math.floor(result.crafted / (planItem.recipe.output_quantity || 1));
+          // Subtract items crafted, convert back to batches for tracking
+          const itemsCrafted = result.crafted;
+          const itemsPerBatch = planItem.recipe.output_quantity || 1;
+          const batchesCompleted = Math.floor(itemsCrafted / itemsPerBatch);
           planItem.quantityToCraft = Math.max(0, planItem.quantityToCraft - batchesCompleted);
           crafted.push(`${result.crafted}x ${planItem.recipe.output_name}`);
         }
@@ -998,14 +1001,15 @@ async function craftRecipeWithPrereqs(
     return { crafted: 0, prereqsCrafted: [] };
   }
 
-  ctx.log("craft", `Crafting ${quantityToCraft}x ${recipe.name}...`);
+  const targetItems = quantityToCraft * (recipe.output_quantity || 1);
+  ctx.log("craft", `Crafting ${quantityToCraft}x batches (${targetItems} items): ${recipe.name}...`);
 
   let totalCrafted = 0;
   let failedWithdrawals = 0;
   const MAX_FAILED_WITHDRAWALS = 3;
   let totalSpentOnBuys = 0;
 
-  while (totalCrafted < quantityToCraft && bot.state === "running" && failedWithdrawals < MAX_FAILED_WITHDRAWALS) {
+  while (totalCrafted < targetItems && bot.state === "running" && failedWithdrawals < MAX_FAILED_WITHDRAWALS) {
     // Refresh inventories
     await bot.refreshCargo();
     if (bot.docked) {
@@ -1014,7 +1018,7 @@ async function craftRecipeWithPrereqs(
     }
 
     // Calculate remaining to craft and how many we can craft with current materials
-    const remaining = quantityToCraft - totalCrafted;
+    const remaining = targetItems - totalCrafted;
     const maxCraftableNow = calculateMaxCraftable(ctx, recipe, personalMode);
 
     if (maxCraftableNow <= 0) {
@@ -1038,12 +1042,23 @@ async function craftRecipeWithPrereqs(
       break;
     }
 
-    // Determine batch size: min of (remaining, maxCraftableNow, craftingSkillLevel)
+    // Determine batch size: min of (remaining in items, maxCraftableNow, craftingSkillLevel)
     // ALWAYS use integer >= 1
-    const batchSize = Math.max(1, Math.min(Math.floor(remaining), Math.floor(maxCraftableNow), Math.floor(craftingSkillLevel || 1)));
+    const remainingItems = targetItems - totalCrafted;
+    if (remainingItems <= 0) break;  // Goal already met
+    
+    const outputQty = recipe.output_quantity || 1;
+    const maxBatchesByItems = Math.ceil(remainingItems / outputQty);
+    const maxBatchesByMaterials = Math.floor(maxCraftableNow);
+    const maxBatchesBySkill = Math.floor(craftingSkillLevel || 1);
+    const batchSize = Math.max(1, Math.min(
+      maxBatchesByItems,  // Never craft more than needed to hit the goal (in batches)
+      maxBatchesByMaterials,  // Limited by available materials
+      maxBatchesBySkill  // Limited by crafting skill
+    ));
     if (batchSize <= 0) break;
 
-    ctx.log("craft", `  Batch: ${batchSize}x (skill: ${craftingSkillLevel}, remaining: ${remaining}, canCraft: ${maxCraftableNow})`);
+    ctx.log("craft", `  Batch: ${batchSize}x (skill: ${craftingSkillLevel}, remaining: ${remainingItems} items, canCraft: ${maxCraftableNow * (recipe.output_quantity || 1)} items)`);
 
     // Withdraw materials for this batch
     await withdrawFactionMaterials(ctx, recipe, batchSize, personalMode);
@@ -1124,13 +1139,17 @@ async function craftRecipeWithPrereqs(
       actualOutputQty = (recipe.output_quantity || 1) * batchSize;
     }
 
-    const batchesCompleted = Math.ceil(actualOutputQty / (recipe.output_quantity || 1));
-    totalCrafted += batchesCompleted;
+    // Cap at targetItems to avoid exceeding the goal (in case server returns more than expected)
+    const overflowAmount = totalCrafted + actualOutputQty - targetItems;
+    if (overflowAmount > 0) {
+      actualOutputQty -= overflowAmount;
+    }
+    totalCrafted += actualOutputQty;
     bot.stats.totalCrafted += actualOutputQty;
 
     // Progress logging
-    const pct = Math.round((totalCrafted / quantityToCraft) * 100);
-    ctx.log("craft", `${recipe.name}: ${totalCrafted}/${quantityToCraft} (${pct}%) - produced ${actualOutputQty}x`);
+    const pct = Math.round((totalCrafted / targetItems) * 100);
+    ctx.log("craft", `${recipe.name}: ${totalCrafted}/${targetItems} (${pct}%) - produced ${actualOutputQty}x`);
 
     // Refresh after craft
     await bot.refreshCargo();

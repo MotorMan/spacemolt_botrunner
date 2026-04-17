@@ -1,12 +1,13 @@
 // ── Rescue Cooperation Module ───────────────────────────────
 /**
- * Enables coordination between two rescue bots via private messages.
+ * Enables coordination between two rescue bots via Bot Chat Channel.
+ * This replaces the previous DM-based system for better reliability.
  * 
  * Message format (pipe-delimited, easy to parse):
- * RESCUE_CLAIM|<player>|<system>|<timestamp>|<jumps>|<bot_name>
+ * RESCUE_CLAIM|<player>|<system>|<poi>|<timestamp>|<jumps>|<bot_name>
  * 
  * Example:
- * RESCUE_CLAIM|CaptJack|Market Prime Exchange|2026-03-24T17:36:31.666Z|5|BotAlpha
+ * RESCUE_CLAIM|CaptJack|Market Prime Exchange|Station Alpha|2026-03-24T17:36:31.666Z|5|BotAlpha
  * 
  * Priority rules:
  * - Distance-based: closer bot (fewer jumps) takes priority
@@ -17,6 +18,8 @@ import type { Bot } from "../bot.js";
 import { readSettings } from "../routines/common.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { mapStore } from "../mapstore.js";
+import { getBotChatChannel } from "../botmanager.js";
+import type { BotChatMessage, BotChatChannel } from "../bot_chat_channel.js";
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -41,36 +44,12 @@ export interface CooperationSettings {
 const recentClaims: RescueClaim[] = [];
 const CLAIM_EXPIRY_MS = 5 * 60 * 1000; // Claims expire after 5 minutes
 
-// Cache for partner bot's player ID (hex ID used by game API)
-// Key: bot username, Value: player ID (hex string)
-const partnerBotIds = new Map<string, string>();
-
 /**
- * Record a rescue claim (from partner bot).
+ * Record a rescue claim (from partner bot via Bot Chat Channel).
  */
 export function recordRescueClaim(claim: RescueClaim): void {
   recentClaims.push(claim);
   cleanupExpiredClaims();
-}
-
-/**
- * Cache the partner bot's player ID for sending private messages.
- * Called when we receive a private message from the partner.
- */
-export function cachePartnerBotId(botUsername: string, playerId: string): void {
-  const settings = getCooperationSettings();
-  if (botUsername === settings.partnerBotName) {
-    partnerBotIds.set(botUsername, playerId);
-    console.log(`[Cooperation] Cached player ID for ${botUsername}: ${playerId}`);
-  }
-}
-
-/**
- * Get the cached player ID for the partner bot.
- */
-export function getPartnerBotId(): string | undefined {
-  const settings = getCooperationSettings();
-  return partnerBotIds.get(settings.partnerBotName);
 }
 
 /**
@@ -264,8 +243,8 @@ export function isCooperationEnabled(): boolean {
 // ── Bot integration helpers ─────────────────────────────────
 
 /**
- * Send a rescue claim to the partner bot via private message.
- * Uses the bot's exec() method to send a private chat message.
+ * Send a rescue claim to the partner bot via Bot Chat Channel.
+ * Uses the in-memory bot-to-bot chat for coordination (replaces DM system).
  */
 export async function sendRescueClaim(
   bot: Bot,
@@ -279,33 +258,19 @@ export async function sendRescueClaim(
 
   const formattedClaim = formatRescueClaim(claim);
   
-  console.log(`[Cooperation] Sending claim: ${formattedClaim}`);
+  console.log(`[Cooperation] Sending claim via Bot Chat: ${formattedClaim}`);
   
-  // Try to get cached player ID for the partner bot
-  let targetId = getPartnerBotId();
-  
-  if (!targetId) {
-    // No cached ID - try using username as fallback (works sometimes)
-    targetId = settings.partnerBotName;
-    console.log(`[Cooperation] No cached player ID, using username as fallback: ${targetId}`);
-  } else {
-    console.log(`[Cooperation] Using cached player ID: ${targetId}`);
-  }
-
   try {
-    // Send as private message
-    const chatResp = await bot.exec("chat", {
-      channel: "private",
-      target_id: targetId,
+    // Send via Bot Chat Channel (coordination channel)
+    const botChat = getBotChatChannel();
+    botChat.send({
+      sender: bot.username,
+      recipients: [settings.partnerBotName], // Direct to partner
+      channel: "coordination" as BotChatChannel,
       content: formattedClaim,
     });
 
-    if (chatResp.error) {
-      console.log(`[Cooperation] Send failed: ${chatResp.error.message}`);
-      return { ok: false, error: chatResp.error.message };
-    }
-
-    console.log(`[Cooperation] Claim sent successfully to ${settings.partnerBotName}`);
+    console.log(`[Cooperation] Claim sent via Bot Chat to ${settings.partnerBotName}`);
     
     // Also record locally
     recordRescueClaim(claim);
@@ -318,28 +283,41 @@ export async function sendRescueClaim(
 }
 
 /**
- * Result of processing a private message for cooperation.
+ * Register a handler to receive Bot Chat messages for rescue coordination.
+ * Call this in the rescue routine to process incoming coordination messages.
  */
-export interface ProcessPrivateMessageResult {
-  isClaim: boolean;
-  claim: RescueClaim | null;
-  skipReason?: string;
+export function registerCooperationHandler(
+  botUsername: string,
+  handler: (message: BotChatMessage) => void
+): void {
+  const botChat = getBotChatChannel();
+  botChat.onMessage(botUsername, handler);
 }
 
 /**
- * Parse incoming private messages for rescue claims.
- * Call this when processing private messages from the partner bot.
+ * Unregister the cooperation handler.
+ * Call this when the rescue routine stops.
  */
-export function processPrivateMessage(
-  sender: string,
-  content: string,
-  senderId?: string
+export function unregisterCooperationHandler(
+  botUsername: string,
+  handler: (message: BotChatMessage) => void
+): void {
+  const botChat = getBotChatChannel();
+  botChat.offMessage(botUsername, handler);
+}
+
+/**
+ * Process incoming Bot Chat messages for rescue claims.
+ * Call this from the handler registered with registerCooperationHandler.
+ */
+export function processBotChatMessage(
+  message: BotChatMessage
 ): ProcessPrivateMessageResult {
   const settings = getCooperationSettings();
   
   // Normalize names for comparison (case-insensitive, handle spaces/underscores)
   const normalizeName = (name: string) => name.toLowerCase().replace(/[\s_]/g, '').trim();
-  const senderNormalized = normalizeName(sender);
+  const senderNormalized = normalizeName(message.sender);
   const partnerNormalized = normalizeName(settings.partnerBotName);
   
   // Check if cooperation is enabled
@@ -354,17 +332,18 @@ export function processPrivateMessage(
   
   // Only process messages from partner bot (case-insensitive comparison)
   if (senderNormalized !== partnerNormalized) {
-    return { isClaim: false, claim: null, skipReason: `Sender "${sender}" does not match partner "${settings.partnerBotName}"` };
+    return { isClaim: false, claim: null, skipReason: `Sender "${message.sender}" does not match partner "${settings.partnerBotName}"` };
   }
 
-  // Cache the sender's player ID if provided (for sending replies)
-  if (senderId) {
-    cachePartnerBotId(sender, senderId);
+  // Only process coordination channel messages
+  if (message.channel !== "coordination") {
+    return { isClaim: false, claim: null, skipReason: `Wrong channel: ${message.channel}` };
   }
 
-  const claim = parseRescueClaim(content);
+  const claim = parseRescueClaim(message.content);
   if (claim) {
     recordRescueClaim(claim);
+    console.log(`[Cooperation] Processed claim from Bot Chat: ${claim.player} at ${claim.system} (${claim.jumps} jumps) by ${claim.botName}`);
     return { isClaim: true, claim };
   }
 
@@ -417,4 +396,13 @@ export async function calculateJumpsToTarget(
   }
 
   return -1;
+}
+
+/**
+ * Result of processing a private message for cooperation.
+ */
+export interface ProcessPrivateMessageResult {
+  isClaim: boolean;
+  claim: RescueClaim | null;
+  skipReason?: string;
 }

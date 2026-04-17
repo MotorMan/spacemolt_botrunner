@@ -745,7 +745,14 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
 
     // Retry: sell + refuel
     await sellAllCargo(ctx);
-    await bot.exec("refuel");
+    const refuelResp = await bot.exec("refuel");
+    if (refuelResp.error) {
+      const msg = refuelResp.error.message.toLowerCase();
+      if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
+        ctx.log("error", `Cannot refuel: no fuel cells available at station`);
+        break;
+      }
+    }
     await bot.refreshStatus();
     fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelPct >= 50) {
@@ -1021,7 +1028,14 @@ export async function ensureFueled(
     for (let w = 0; w < REFUEL_WAIT_RETRIES && bot.state === "running"; w++) {
       await sleep(REFUEL_WAIT_INTERVAL);
       await bot.refreshStatus();
-      await bot.exec("refuel");
+      const refuelResp = await bot.exec("refuel");
+      if (refuelResp.error) {
+        const msg = refuelResp.error.message.toLowerCase();
+        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
+          ctx.log("error", `Cannot refuel: no fuel cells available at station — will not retry infinitely`);
+          break;
+        }
+      }
       await bot.refreshStatus();
       newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (newFuel >= thresholdPct) {
@@ -1552,7 +1566,14 @@ export async function refuelAtStation(
     for (let w = 0; w < REFUEL_WAIT_RETRIES && bot.state === "running"; w++) {
       await sleep(REFUEL_WAIT_INTERVAL);
       await bot.refreshStatus();
-      await bot.exec("refuel");
+      const refuelResp = await bot.exec("refuel");
+      if (refuelResp.error) {
+        const msg = refuelResp.error.message.toLowerCase();
+        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
+          ctx.log("error", `Cannot refuel: no fuel cells available at station — will not retry infinitely`);
+          break;
+        }
+      }
       await bot.refreshStatus();
       newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (newFuelPct >= thresholdPct) {

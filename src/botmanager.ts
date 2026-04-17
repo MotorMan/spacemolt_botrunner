@@ -22,6 +22,7 @@ import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordina
 import { escortRoutine } from "./routines/escort.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
+import { flushFactionStorageCache } from "./factionStorageCache.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
@@ -812,6 +813,7 @@ async function main(): Promise<void> {
     // Flush persistent data
     mapStore.flush();
     catalogStore.flush();
+    flushFactionStorageCache();
     server.stop();
     
     // If restarting due to mass session loss, clear all session files

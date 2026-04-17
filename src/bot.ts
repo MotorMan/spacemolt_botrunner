@@ -6,7 +6,7 @@ import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
-import { processPrivateMessage as processCooperationPrivateMessage } from "./cooperation/rescueCooperation.js";
+import { getFactionStorageCache, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -730,12 +730,29 @@ export class Bot {
 
   /** Fetch faction storage contents and cache them. Silently returns empty on error. */
   async refreshFactionStorage(): Promise<void> {
-    const resp = await this.exec("view_faction_storage");
-    if (resp.error) {
+    const factionName = this.faction;
+    if (!factionName) {
       this.factionStorage = [];
       return;
     }
-    this.factionStorage = this.parseItemList(resp.result);
+
+    const cached = getFactionStorageCache(factionName);
+    if (cached && !isFactionStorageCacheStale(factionName, 2 * 60 * 1000)) {
+      this.factionStorage = cached.entries as unknown as CargoItem[];
+      return;
+    }
+
+    const resp = await this.exec("view_faction_storage");
+    if (resp.error) {
+      this.factionStorage = [];
+      if (cached) {
+        this.factionStorage = cached.entries as unknown as CargoItem[];
+      }
+      return;
+    }
+    const entries = this.parseItemList(resp.result);
+    this.factionStorage = entries;
+    updateFactionStorageCache(factionName, entries);
   }
 
   /** Start running a routine. */
@@ -1208,21 +1225,8 @@ export class Bot {
             this.log("debug", `AI Chat service not available (service=${!!aiChatService}, addChatMessage=${typeof aiChatService?.addChatMessage === "function"})`);
           }
           
-          // ── RESCUE COOPERATION: Process private messages for cooperation claims ──
-          if (channel === "private") {
-            const senderId = data.sender_id as string | undefined;
-            const result = processCooperationPrivateMessage(sender, content, senderId);
-            
-            if (result.isClaim && result.claim) {
-              this.log("coop", `📧 Processed claim from ${sender}: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps by ${result.claim.botName})`);
-            } else if (result.skipReason) {
-              this.log("coop_debug", `Skipped private message from ${sender}: ${result.skipReason}`);
-            }
-            
-            if (senderId && result.isClaim) {
-              this.log("coop_debug", `Cached player ID for ${sender}: ${senderId}`);
-            }
-          }
+          // Note: Rescue cooperation is now handled via Bot Chat Channel (in rescue.ts)
+          // Private message processing for cooperation claims has been replaced
         } else {
           this.log("debug", `Chat message received but data is not object: ${typeof data}`);
         }

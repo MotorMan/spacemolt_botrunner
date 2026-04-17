@@ -1926,7 +1926,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const poi = sys?.pois.find(p => p.id === loc.poiId);
         if (!poi) return true; // keep if type unknown
         if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
-        if (miningType === "radioactive") return isOreBeltPoi(poi.type) || (canMineHiddenRadioactive && poi.hidden === true);
+        if (miningType === "radioactive") {
+          if (poi.hidden === true && !canMineHiddenRadioactive) {
+            return false;
+          }
+          return isOreBeltPoi(poi.type) || poi.hidden === true;
+        }
         if (miningType === "gas") return isGasCloudPoi(poi.type);
         if (miningType === "ice") return isIceFieldPoi(poi.type);
         return true;
@@ -2199,7 +2204,58 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         targetSystemId = bot.system;
         targetPoiId = "";
         targetPoiName = "";
+      }
+      
+      // CRITICAL FIX: Check cargo after traveling to target system (both success and failure cases)
+      // If cargo is full, return home to deposit before traveling to POI
+      await bot.refreshStatus();
+      const postTravelFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+      if (postTravelFillRatio >= cargoThresholdRatio) {
+        ctx.log("mining", `Cargo full (${Math.round(postTravelFillRatio * 100)}%) after arriving at ${targetSystemId} — returning home to deposit before continuing`);
         
+        // Find current station for refueling if needed (before we return home)
+        const { pois: currentPois } = await getSystemInfo(ctx);
+        const currentStation = findStation(currentPois);
+        const currentStationPoi = currentStation ? { id: currentStation.id, name: currentStation.name } : null;
+        
+        yield "return_home";
+        yield "pre_return_fuel";
+        if (recoveredSession) {
+          await updateMiningSession(bot.username, { state: "returning_home" });
+        }
+        const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (!returnFueled && currentStationPoi) {
+          await refuelAtStation(ctx, currentStationPoi, safetyOpts.fuelThresholdPct);
+        }
+        
+        const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+        if (!homeArrived) {
+          ctx.log("error", "Failed to return to home system — will retry next cycle");
+        }
+        const { pois: homePois } = await getSystemInfo(ctx);
+        const homeStation = findStation(homePois);
+        const homeStationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
+        if (homeStationPoi) {
+          yield "travel_to_station";
+          await bot.exec("travel", { target_poi: homeStationPoi.id });
+        }
+        yield "deposit_cargo";
+        await ensureDocked(ctx);
+        await dumpCargo(ctx, settings);
+        await bot.refreshCargo();
+        const remainingCargo = bot.inventory.filter(i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell"));
+        if (remainingCargo.length > 0) {
+          const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
+          ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
+          await sleep(5000);
+          continue;
+        }
+        ctx.log("mining", "Cargo deposited — restarting mining cycle");
+        continue;
+      }
+
+      // Only do post-arrival processing if we successfully arrived
+      if (arrived) {
         // CRITICAL FIX: Re-validate deep core equipment after jump timeout failure.
         // Jump timeouts can leave the bot in an inconsistent state where equipment
         // detection may have failed. Re-check and re-apply deep core restrictions.
@@ -2223,7 +2279,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (recoveredSession) {
           await updateMiningSession(bot.username, { state: "mining" });
         }
-      } else {
+
         // MAP UPDATE: Record successful system arrival and update connections
         // Get the fresh system info to update the map with current POI data
         const { pois: newPois, systemId: newSystemId, connections: newConnections } = await getSystemInfo(ctx);
@@ -2288,22 +2344,18 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const match = pois.find(p => p.id === targetPoiId);
       if (match) {
         miningPoi = { id: match.id, name: match.name };
-      } else if (canMineHiddenRadioactive) {
-        // Hidden POI not visible in system POI list — use it anyway if map confirms it
-        const sysData = mapStore.getSystem(bot.system);
-        const storedPoi = sysData?.pois.find(p => p.id === targetPoiId);
-        if (storedPoi && storedPoi.hidden) {
-          miningPoi = { id: storedPoi.id, name: storedPoi.name };
-          ctx.log("mining", `Using known hidden POI ${storedPoi.name} (not yet visible in system scan)`);
-        }
       } else if (effectiveTarget && isDeepCoreOre(effectiveTarget) && deepCoreCap.canMine) {
         // Deep core ore hidden POI not visible in system POI list — use map store
+        // (unrelated to radioactive mining - deep core uses separate equipment check)
         const sysData = mapStore.getSystem(bot.system);
         const storedPoi = sysData?.pois.find(p => p.id === targetPoiId);
         if (storedPoi) {
           miningPoi = { id: storedPoi.id, name: storedPoi.name };
           ctx.log("mining", `Using known deep core POI from map: ${storedPoi.name} (${storedPoi.hidden ? "hidden" : "visible"})`);
         }
+      } else if (!canMineHiddenRadioactive) {
+        // Radioactive miner without deep core extractor cannot use hidden POIs
+        // Skip this - radioactive miner doesn't have the required modules
       }
     }
 
@@ -2313,7 +2365,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const isMatchingType =
           (miningType === "ice" && isIceFieldPoi(poi.type)) ||
           (miningType === "ore" && (isOreBeltPoi(poi.type) || poi.hidden === true)) ||
-          (miningType === "radioactive" && (isOreBeltPoi(poi.type) || (canMineHiddenRadioactive && poi.hidden === true))) ||
+          (miningType === "radioactive" && (poi.hidden === true && !canMineHiddenRadioactive ? false : (isOreBeltPoi(poi.type) || poi.hidden === true))) ||
           (miningType === "gas" && isGasCloudPoi(poi.type));
 
         if (!isMatchingType) continue;
@@ -2355,7 +2407,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const oreBelt = pois.find(p => isOreBeltPoi(p.type) || p.hidden === true);
         if (oreBelt) miningPoi = { id: oreBelt.id, name: oreBelt.name };
       } else if (miningType === "radioactive") {
-        const oreBelt = pois.find(p => isOreBeltPoi(p.type) || (canMineHiddenRadioactive && p.hidden === true));
+        const oreBelt = pois.find(p => (p.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(p.type) || p.hidden === true));
         if (oreBelt) miningPoi = { id: oreBelt.id, name: oreBelt.name };
       } else if (miningType === "gas") {
         const gasCloud = pois.find(p => isGasCloudPoi(p.type));
@@ -2485,7 +2537,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
         if (miningType === "ore") return isOreBeltPoi(p.type) || p.hidden === true;
-        if (miningType === "radioactive") return isOreBeltPoi(p.type) || (canMineHiddenRadioactive && p.hidden === true);
+        if (miningType === "radioactive") return (p.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(p.type) || p.hidden === true);
         if (miningType === "gas") return isGasCloudPoi(p.type);
         if (miningType === "ice") return isIceFieldPoi(p.type);
         return false;
@@ -2500,7 +2552,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
           if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-          if (miningType === "radioactive") return isOreBeltPoi(poi?.type || "") || (canMineHiddenRadioactive && poi?.hidden === true);
+          if (miningType === "radioactive") return (poi?.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(poi?.type || "") || poi?.hidden === true);
           if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
           return true;
@@ -2537,6 +2589,47 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           if (scored.length > 0) {
             const chosen = scored[0];
             ctx.log("mining", `Found ${effectiveTarget} at ${chosen.poiName} in ${chosen.systemName} (${chosen.jumps} jumps) — navigating there`);
+            
+            // CRITICAL FIX: Check cargo before traveling to alternative POI after depletion
+            await bot.refreshStatus();
+            const altFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+            if (altFillRatio >= cargoThresholdRatio) {
+              ctx.log("mining", `Cargo full (${Math.round(altFillRatio * 100)}%) — returning home to deposit before traveling to alternative POI`);
+              yield "return_home";
+              yield "pre_return_fuel";
+              if (recoveredSession) {
+                await updateMiningSession(bot.username, { state: "returning_home" });
+              }
+              const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+              if (!returnFueled && stationPoi) {
+                await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+              }
+              const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+              if (!homeArrived) {
+                ctx.log("error", "Failed to return to home system — will retry next cycle");
+              }
+              const { pois: homePois } = await getSystemInfo(ctx);
+              const homeStation = findStation(homePois);
+              stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
+              if (stationPoi) {
+                yield "travel_to_station";
+                await bot.exec("travel", { target_poi: stationPoi.id });
+              }
+              yield "deposit_cargo";
+              await ensureDocked(ctx);
+              await dumpCargo(ctx, settings);
+              await bot.refreshCargo();
+              const remainingCargo = bot.inventory.filter(i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell"));
+              if (remainingCargo.length > 0) {
+                const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
+                ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
+                await sleep(5000);
+                continue;
+              }
+              ctx.log("mining", "Cargo deposited — restarting mining cycle");
+              continue;
+            }
+            
             const arrived = await navigateToSystem(ctx, chosen.systemId, safetyOpts);
             if (arrived) {
               // Refresh pois list for new system and retry travel
@@ -2545,7 +2638,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               bot.system = chosen.systemId;
               const newMiningPoi = pois.find(p => {
                 if (miningType === "ore") return isOreBeltPoi(p.type) || p.hidden === true;
-                if (miningType === "radioactive") return isOreBeltPoi(p.type) || (canMineHiddenRadioactive && p.hidden === true);
+                if (miningType === "radioactive") return (p.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(p.type) || p.hidden === true);
                 if (miningType === "gas") return isGasCloudPoi(p.type);
                 if (miningType === "ice") return isIceFieldPoi(p.type);
                 return false;
@@ -2598,31 +2691,88 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Travel to mining location ──
     yield (miningType === "ice" ? "travel_to_ice_field" : (miningType === "ore" || miningType === "radioactive" ? "travel_to_belt" : "travel_to_cloud"));
     
+    // CRITICAL FIX: Check cargo capacity BEFORE traveling to POI
+    // If cargo is full, return home to deposit first
+    await bot.refreshStatus();
+    const travelFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+    if (travelFillRatio >= cargoThresholdRatio) {
+      ctx.log("mining", `Cargo full (${Math.round(travelFillRatio * 100)}%) — returning home to deposit before traveling to POI`);
+      yield "return_home";
+      yield "pre_return_fuel";
+      if (recoveredSession) {
+        await updateMiningSession(bot.username, { state: "returning_home" });
+      }
+      const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+      if (!returnFueled && stationPoi) {
+        await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+      }
+      const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!homeArrived) {
+        ctx.log("error", "Failed to return to home system — will retry next cycle");
+      }
+      // Get station at home and deposit
+      const { pois: homePois } = await getSystemInfo(ctx);
+      const homeStation = findStation(homePois);
+      stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
+      if (stationPoi) {
+        yield "travel_to_station";
+        await bot.exec("travel", { target_poi: stationPoi.id });
+      }
+      yield "deposit_cargo";
+      await ensureDocked(ctx);
+      await dumpCargo(ctx, settings);
+      await bot.refreshCargo();
+      const remainingCargo = bot.inventory.filter(i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell"));
+      if (remainingCargo.length > 0) {
+        const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
+        ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
+        await sleep(5000);
+        continue;
+      }
+      ctx.log("mining", "Cargo deposited — restarting mining cycle");
+      continue;
+    }
+
     // Check if this is a hidden POI (need to survey before traveling if not yet discovered)
     const sysData = mapStore.getSystem(bot.system);
     const poiData = sysData?.pois.find(p => p.id === miningPoi!.id);
     const isHiddenPoi = poiData?.hidden ?? false;
 
-    // If we're already in the correct system and the POI is hidden,
-    // try get_poi first to discover it before attempting travel
+    // CRITICAL: For DEEP CORE hidden POIs, we MUST use travel command to get there
+    // get_poi alone is NOT sufficient - it may return data from wherever we actually are
+    // Always try travel first for hidden POIs to ensure we're actually at the right location
     if (isHiddenPoi) {
-      ctx.log("mining", `Attempting to discover hidden POI ${miningPoi.name} via get_poi...`);
-      const discoverResp = await bot.exec("get_poi", { poi_id: miningPoi.id });
-      if (!discoverResp.error && discoverResp.result) {
-        ctx.log("mining", `Discovered hidden POI ${miningPoi.name} via get_poi — no travel needed`);
-        bot.poi = miningPoi.id;
-      } else {
-        ctx.log("mining", `Could not discover hidden POI via get_poi: ${discoverResp.error?.message || "unknown error"} — will try travel`);
-      }
+      ctx.log("mining", `Hidden POI ${miningPoi.name} detected — MUST travel to verify actual location`);
     }
 
-    // If POI wasn't discovered via get_poi, try travel (handles survey + retry)
+    // For hidden POIs: ALWAYS use travel command (not just get_poi) to confirm we're actually at the location
+    // CRITICAL: Refresh status FIRST to get actual current location - don't trust cached bot.poi
+    await bot.refreshStatus();
+    const actualPoi = bot.poi || "";
+    ctx.log("mining", `Current actual location before travel: ${actualPoi || "(none)"}`);
     if (!bot.poi || bot.poi !== miningPoi.id) {
       // Use the new travel function that handles hidden POI discovery
       const travelResult = await travelToPoiWithSurvey(ctx, miningPoi.id, miningPoi.name, isHiddenPoi);
 
       if (!travelResult.success) {
         ctx.log("error", `Travel to mining location failed: ${travelResult.error}`);
+
+        // Additional verification for hidden POIs: run a system survey to confirm POI exists
+        if (isHiddenPoi) {
+          ctx.log("mining", `Running system survey to verify hidden POI ${miningPoi.name} exists...`);
+          const surveySuccess = await surveySystemForHiddenPois(ctx);
+          if (surveySuccess) {
+            // After survey, verify we can now travel to the POI
+            ctx.log("mining", `Retrying travel to ${miningPoi.name} after survey...`);
+            const retryResp = await bot.exec("travel", { target_poi: miningPoi.id });
+            if (!retryResp.error || retryResp.error.message.includes("already")) {
+              bot.poi = miningPoi.id;
+              ctx.log("mining", `Successfully traveled to hidden POI ${miningPoi.name} after verification survey`);
+            } else {
+              ctx.log("error", `Still cannot access hidden POI after survey: ${retryResp.error.message}`);
+            }
+          }
+        }
 
         // For hidden POIs: if we're in the system where the POI should be but can't travel to it,
         // it may require a directional jump. Try leaving and coming back.
@@ -2713,6 +2863,87 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("error", "Pirates detected - fled mining location, will retry");
         await sleep(30000);
         continue;
+      }
+    }
+
+    // CRITICAL FIX: Verify we're at the intended hidden POI before mining
+    // This prevents deep core miners from mining at the wrong location (e.g., Ross 128 Belt instead of Rainbow Nebulite Vein)
+    if (effectiveTarget && isDeepCoreOre(effectiveTarget) && targetPoiId) {
+      const currentPoi = bot.poi || "";
+      const intendedPoi = targetPoiId;
+      
+      // CRITICAL: This check runs BEFORE mining - verify actual location, not trust cached bot.poi
+      // We MUST refresh status to get the ACTUAL current POI from the server
+      await bot.refreshStatus();
+      const realCurrentPoi = bot.poi || "";
+      
+      if (realCurrentPoi !== intendedPoi) {
+        ctx.log("mining", `DEEP CORE VERIFICATION FAILURE: actually at ${realCurrentPoi || "none"}, intended: ${intendedPoi} — fixing...`);
+        
+        // MUST travel to the correct hidden POI
+        const verifyTravel = await travelToPoiWithSurvey(ctx, intendedPoi, targetPoiName || intendedPoi, true);
+        
+        // Verify AGAIN after travel - refresh status to get actual location
+        await bot.refreshStatus();
+        const afterTravelPoi = bot.poi || "";
+        
+        if (afterTravelPoi !== intendedPoi) {
+          ctx.log("error", `Travel claimed success but location wrong: at ${afterTravelPoi}, expected ${intendedPoi}`);
+          
+          // Try one more travel as last resort
+          const lastTravel = await bot.exec("travel", { target_poi: intendedPoi });
+          await bot.refreshStatus();
+          const finalPoi = bot.poi || "";
+          
+          if (finalPoi === intendedPoi) {
+            ctx.log("mining", `Deep core verification: CORRECTED via forced travel to ${targetPoiName}`);
+          } else {
+            ctx.log("error", `CRITICAL: Cannot reach hidden POI ${targetPoiName}. At ${finalPoi}, expected ${intendedPoi}`);
+            // Abort mining - we're at the wrong place
+            ctx.log("error", "Aborting deep core mining - cannot reach correct hidden POI");
+            await sleep(30000);
+            continue;
+          }
+        } else {
+          ctx.log("mining", `Deep core verification: FIXED, now at ${targetPoiName}`);
+        }
+      } else {
+        ctx.log("mining", `Deep core verification: confirmed at intended POI ${targetPoiName}`);
+      }
+      
+      // CRITICAL: Verify the POI actually contains the target resource before mining
+      // This prevents mining wrong ores at a mis-identified hidden POI
+      const poiScanResp = await bot.exec("get_poi", { poi_id: targetPoiId });
+      if (!poiScanResp.error && poiScanResp.result) {
+        const scanData = poiScanResp.result as Record<string, unknown>;
+        const poiResources = Array.isArray(scanData.resources) ? scanData.resources : [];
+        const hasTargetResource = poiResources.some((r: any) => r.resource_id === effectiveTarget);
+        
+        if (!hasTargetResource) {
+          ctx.log("error", `Deep core resource mismatch: POI ${targetPoiName} does not contain ${effectiveTarget}! Found: ${poiResources.map((r: any) => r.resource_id).join(", ")}`);
+          ctx.log("error", "Target POI mismatch - re-scanning to find correct hidden POI...");
+          
+          // Re-scan the system to find the correct hidden POI with the target resource
+          const sysData = mapStore.getSystem(bot.system);
+          for (const storedPoi of (sysData?.pois || [])) {
+            if (!storedPoi.hidden) continue;
+            const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
+            if (!oreEntry) continue;
+            
+            // Found a POI with the target resource - try to travel there
+            ctx.log("mining", `Found correct POI: ${storedPoi.name} contains ${effectiveTarget} - traveling...`);
+            const correctTrav = await travelToPoiWithSurvey(ctx, storedPoi.id, storedPoi.name, true);
+            if (correctTrav.success) {
+              targetPoiId = storedPoi.id;
+              targetPoiName = storedPoi.name;
+              miningPoi = { id: storedPoi.id, name: storedPoi.name };
+              ctx.log("mining", `Corrected: now at ${targetPoiName} for ${effectiveTarget}`);
+              break;
+            }
+          }
+        } else {
+          ctx.log("mining", `Resource verified: ${targetPoiName} contains ${effectiveTarget} ✓`);
+        }
       }
     }
 
@@ -2854,7 +3085,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             const sys = mapStore.getSystem(loc.systemId);
             const poi = sys?.pois.find(p => p.id === loc.poiId);
             if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-            if (miningType === "radioactive") return isOreBeltPoi(poi?.type || "") || (canMineHiddenRadioactive && poi?.hidden === true);
+            if (miningType === "radioactive") return (poi?.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(poi?.type || "") || poi?.hidden === true);
             if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
             return true;
@@ -2913,6 +3144,47 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 // Travel to new system if needed
                 if (bestLoc.systemId !== bot.system) {
                   ctx.log("mining", `Traveling to ${bestLoc.systemName} for better POI...`);
+                  
+                  // CRITICAL FIX: Check cargo before traveling to new POI
+                  await bot.refreshStatus();
+                  const upgradeFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+                  if (upgradeFillRatio >= cargoThresholdRatio) {
+                    ctx.log("mining", `Cargo full (${Math.round(upgradeFillRatio * 100)}%) — returning home to deposit before richness upgrade`);
+                    yield "return_home";
+                    yield "pre_return_fuel";
+                    if (recoveredSession) {
+                      await updateMiningSession(bot.username, { state: "returning_home" });
+                    }
+                    const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+                    if (!returnFueled && stationPoi) {
+                      await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+                    }
+                    const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+                    if (!homeArrived) {
+                      ctx.log("error", "Failed to return to home system — will retry next cycle");
+                    }
+                    const { pois: homePois } = await getSystemInfo(ctx);
+                    const homeStation = findStation(homePois);
+                    stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
+                    if (stationPoi) {
+                      yield "travel_to_station";
+                      await bot.exec("travel", { target_poi: stationPoi.id });
+                    }
+                    yield "deposit_cargo";
+                    await ensureDocked(ctx);
+                    await dumpCargo(ctx, settings);
+                    await bot.refreshCargo();
+                    const remainingCargo = bot.inventory.filter(i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell"));
+                    if (remainingCargo.length > 0) {
+                      const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
+                      ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
+                      await sleep(5000);
+                      continue;
+                    }
+                    ctx.log("mining", "Cargo deposited — restarting mining cycle");
+                    continue;
+                  }
+
                   const arrived = await navigateToSystem(ctx, bestLoc.systemId, safetyOpts);
                   if (arrived) {
                     const { pois: newPois } = await getSystemInfo(ctx);
@@ -3010,7 +3282,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                       const sys = mapStore.getSystem(loc.systemId);
                       const poi = sys?.pois.find(p => p.id === loc.poiId);
                       if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-                      if (miningType === "radioactive") return isOreBeltPoi(poi?.type || "") || (canMineHiddenRadioactive && poi?.hidden === true);
+                      if (miningType === "radioactive") return (poi?.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(poi?.type || "") || poi?.hidden === true);
                       if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                       if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                       return true;
@@ -3047,6 +3319,46 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                         const chosen = locsWithDist[0];
                         ctx.log("mining", `Found next target: ${effectiveTarget} @ ${chosen.poiName} in ${chosen.systemId} (${chosen.jumps} jumps)`);
                         
+                        // CRITICAL FIX: Check cargo before traveling to next POI when stayOutUntilFull is enabled
+                        await bot.refreshStatus();
+                        const nextPoiFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+                        if (nextPoiFillRatio >= cargoThresholdRatio) {
+                          ctx.log("mining", `Cargo full (${Math.round(nextPoiFillRatio * 100)}%) — returning home to deposit before switching POIs`);
+                          yield "return_home";
+                          yield "pre_return_fuel";
+                          if (recoveredSession) {
+                            await updateMiningSession(bot.username, { state: "returning_home" });
+                          }
+                          const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+                          if (!returnFueled && stationPoi) {
+                            await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+                          }
+                          const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+                          if (!homeArrived) {
+                            ctx.log("error", "Failed to return to home system — will retry next cycle");
+                          }
+                          const { pois: homePois } = await getSystemInfo(ctx);
+                          const homeStation = findStation(homePois);
+                          stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
+                          if (stationPoi) {
+                            yield "travel_to_station";
+                            await bot.exec("travel", { target_poi: stationPoi.id });
+                          }
+                          yield "deposit_cargo";
+                          await ensureDocked(ctx);
+                          await dumpCargo(ctx, settings);
+                          await bot.refreshCargo();
+                          const remainingCargo = bot.inventory.filter(i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell"));
+                          if (remainingCargo.length > 0) {
+                            const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
+                            ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
+                            await sleep(5000);
+                            continue;
+                          }
+                          ctx.log("mining", "Cargo deposited — restarting mining cycle");
+                          continue;
+                        }
+
                         // Travel to new system if needed
                         if (chosen.systemId !== bot.system) {
                           const arrived = await navigateToSystem(ctx, chosen.systemId, safetyOpts);
@@ -3491,7 +3803,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-              if (miningType === "radioactive") return isOreBeltPoi(poi?.type || "") || (canMineHiddenRadioactive && poi?.hidden === true);
+              if (miningType === "radioactive") return (poi?.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(poi?.type || "") || poi?.hidden === true);
               if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
               return true;
@@ -3546,7 +3858,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 const sys = mapStore.getSystem(loc.systemId);
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
                 if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-                if (miningType === "radioactive") return isOreBeltPoi(poi?.type || "") || (canMineHiddenRadioactive && poi?.hidden === true);
+                if (miningType === "radioactive") return (poi?.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(poi?.type || "") || poi?.hidden === true);
                 if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                 if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                 return true;
@@ -3605,8 +3917,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             // First try current system
             const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                            miningType === "ore" ? pois.filter(p => isOreBeltPoi(p.type) || p.hidden === true) :
-                           miningType === "radioactive" ? pois.filter(p => isOreBeltPoi(p.type) || (canMineHiddenRadioactive && p.hidden === true)) :
-                           pois.filter(p => isGasCloudPoi(p.type));
+miningType === "radioactive" ? pois.filter(p => (p.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(p.type) || p.hidden === true)) :
+                            pois.filter(p => isGasCloudPoi(p.type));
 
             for (const poi of allPois) {
               const sysData = mapStore.getSystem(bot.system);
@@ -3650,7 +3962,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
                   // Verify POI type matches
                   if (miningType === "ore" && !isOreBeltPoi(poi.type) && !poi.hidden) continue;
-                  if (miningType === "radioactive" && !isOreBeltPoi(poi.type) && !(canMineHiddenRadioactive && poi.hidden)) continue;
+                  if (miningType === "radioactive" && (poi.hidden === true && !canMineHiddenRadioactive ? true : (!isOreBeltPoi(poi.type) && !poi.hidden))) continue;
                   if (miningType === "gas" && !isGasCloudPoi(poi.type)) continue;
                   if (miningType === "ice" && !isIceFieldPoi(poi.type)) continue;
 
@@ -3822,7 +4134,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             // Search for correct POI type in current system
             const altPoi = pois.find(p => {
               if (miningType === "ore") return isOreBeltPoi(p.type);
-              if (miningType === "radioactive") return isOreBeltPoi(p.type) || (canMineHiddenRadioactive && p.hidden === true);
+              if (miningType === "radioactive") return (p.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(p.type) || p.hidden === true);
               if (miningType === "gas") return isGasCloudPoi(p.type);
               if (miningType === "ice") return isIceFieldPoi(p.type);
               return false;
@@ -3995,11 +4307,48 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // if we stopped mining due to depletion (no alternative POI found)
     const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
     const isDepleted = stopReason && stopReason.includes("depleted");
+    const isFuelLowStop = stopReason && stopReason.includes("fuel low");
+    
+    // CRITICAL FIX: When stopping due to fuel low mid-mining and stayOutUntilFull is enabled:
+    // - Don't deposit cargo at the refuel station
+    // - Refuel and continue mining instead of returning home
+    // This prevents depositing at random stations during refuel detours
+    const isCargoFull = fillRatio >= cargoThresholdRatio;
+    const shouldStayOutDueToFuel = isFuelLowStop && settings.stayOutUntilFull && !isCargoFull;
+    
     const shouldReturnHome = settings.stayOutUntilFull
       ? ((fillRatio >= cargoThresholdRatio || isDepleted) && bot.system !== homeSystem && homeSystem)
       : (bot.system !== homeSystem && homeSystem);
 
-    if (shouldReturnHome) {
+    if (shouldStayOutDueToFuel) {
+      // CRITICAL FIX: Fuel low stop with stayOutUntilFull enabled - refuel and continue mining
+      // DO NOT deposit cargo at random station, DO NOT return home yet
+      ctx.log("mining", `Fuel low but stayOutUntilFull enabled and cargo not full (${(fillRatio * 100).toFixed(0)}%) — refueling and continuing mining`);
+      
+      // Refuel at local/current station - do NOT deposit cargo here
+      const { pois: currentPois } = await getSystemInfo(ctx);
+      const currentStation = findStation(currentPois);
+      if (currentStation) {
+        // Dock and refuel but do NOT unload cargo
+        const dockResp = await bot.exec("dock");
+        if (!dockResp.error || dockResp.error.message.includes("already")) {
+          bot.docked = true;
+          ctx.log("system", `Refueling at ${currentStation.name} (cargo: ${bot.cargo}/${bot.cargoMax}, will deposit at home)`);
+          const refuelResp = await bot.exec("refuel");
+          if (!refuelResp.error) {
+            ctx.log("system", "Refueled — continuing mining (cargo kept onboard)");
+          }
+        }
+      } else {
+        // No station in current system - use ensureFueled to get fuel
+        await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+      }
+      
+      // Continue the mining cycle instead of returning home to deposit
+      // Reset stopReason so the outer loop continues
+      stopReason = "";
+      continue;
+    } else if (shouldReturnHome) {
       yield "return_home";
       yield "pre_return_fuel";
       // Update session state
@@ -4057,6 +4406,27 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("error", `Travel to station failed: ${travelStationResp.error.message}`);
         stationPoi = null;
       }
+    }
+
+    // ── CRITICAL: Only deposit at HOME system ──
+    // If we're not at home system, either navigate home first or skip deposit entirely
+    // This prevents depositing at random stations during refuel detours
+    const isAtHome = !homeSystem || bot.system === homeSystem;
+    
+    if (!isAtHome) {
+      ctx.log("mining", `Not at home system (${bot.system}) — will navigate home before depositing cargo`);
+      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!arrived) {
+        ctx.log("error", "Failed to reach home system — keeping cargo, will retry next cycle");
+        // Don't deposit - keep cargo and restart mining loop
+        await ensureUndocked(ctx);
+        stopReason = "";
+        continue;
+      }
+      // Refresh station info after arriving home
+      const { pois: homePois } = await getSystemInfo(ctx);
+      const homeStation = findStation(homePois);
+      stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
     }
 
     // ── Dock ──

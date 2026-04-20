@@ -10,6 +10,7 @@ import {
   readSettings,
   sleep,
   checkAndFleeFromBattle,
+  repairShip,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -86,12 +87,67 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   await bot.refreshStatus();
   if (bot.system === homeSystem) {
     if (homeStation && bot.poi === homeStation) {
+      ctx.log("travel", "Already at home station — checking repair status...");
+      // Check and repair if needed before leaving
+      const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      if (hullPct < 95) {
+        ctx.log("system", `Hull at ${hullPct}% — repairing before departure...`);
+        await repairShip(ctx);
+      }
+      // Refuel if needed before journey
+      const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (fuelPct < 50) {
+        ctx.log("system", `Fuel at ${fuelPct}% — refueling before departure...`);
+        const { pois } = await getSystemInfo(ctx);
+        const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+        if (currentStation) {
+          await refuelAtStation(ctx, currentStation, 50);
+          await ensureDocked(ctx, true);
+        }
+      }
       ctx.log("travel", "Already at home station — routine complete");
       return; // Cancel routine
     }
     if (!homeStation && bot.docked) {
+      ctx.log("travel", "Already docked in home system — checking repair status...");
+      // Check and repair if needed before leaving
+      const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+      if (hullPct < 95) {
+        ctx.log("system", `Hull at ${hullPct}% — repairing before departure...`);
+        await repairShip(ctx);
+      }
+      // Refuel if needed before journey
+      const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (fuelPct < 50) {
+        ctx.log("system", `Fuel at ${fuelPct}% — refueling before departure...`);
+        const { pois } = await getSystemInfo(ctx);
+        const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+        if (currentStation) {
+          await refuelAtStation(ctx, currentStation, 50);
+          await ensureDocked(ctx, true);
+        }
+      }
       ctx.log("travel", "Already docked in home system — routine complete");
       return; // Cancel routine
+    }
+  }
+
+  // Check if at any station (not necessarily home) - repair and refuel before long journey
+  if (bot.docked) {
+    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+    if (hullPct < 95) {
+      ctx.log("system", `Hull at ${hullPct}% — repairing before return journey...`);
+      await repairShip(ctx);
+    }
+    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelPct < 50) {
+      ctx.log("system", `Fuel at ${fuelPct}% — refueling before return journey...`);
+      const { pois } = await getSystemInfo(ctx);
+      const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+      if (currentStation) {
+        await refuelAtStation(ctx, currentStation, 50);
+        await ensureDocked(ctx, true);
+      }
     }
   }
 
@@ -111,6 +167,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
           ctx.log("error", "Failed to refuel at current station — cannot continue");
           return; // Cancel routine
         }
+        await ensureDocked(ctx, true);
       }
     } else {
       // Need to dock first to refuel (skip storage collection - just need fuel)
@@ -236,6 +293,24 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   if (!docked) {
     ctx.log("error", "Failed to dock at home station — routine cancelled");
     return; // Cancel routine
+  }
+
+  // After docking at home, repair and refuel if needed
+  await bot.refreshStatus();
+  const dockedHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+  if (dockedHullPct < 95) {
+    ctx.log("system", `Hull at ${dockedHullPct}% — repairing at home station...`);
+    await repairShip(ctx);
+  }
+  const dockedFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (dockedFuelPct < 50) {
+    ctx.log("system", `Fuel at ${dockedFuelPct}% — refueling at home station...`);
+    const { pois } = await getSystemInfo(ctx);
+    const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+    if (currentStation) {
+      await refuelAtStation(ctx, currentStation, 50);
+      await ensureDocked(ctx, true);
+    }
   }
 
   // Final status

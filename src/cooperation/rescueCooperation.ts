@@ -44,6 +44,15 @@ export interface CooperationSettings {
 const recentClaims: RescueClaim[] = [];
 const CLAIM_EXPIRY_MS = 5 * 60 * 1000; // Claims expire after 5 minutes
 
+// Round-robin tracking for same-location rescues
+// Tracks which bot went last for each location
+interface RoundRobinEntry {
+  lastBotName: string;
+  lastTimestamp: number;
+}
+const roundRobinTracker = new Map<string, RoundRobinEntry>();
+const ROUND_ROBIN_TTL_MS = 10 * 60 * 1000; // 10 minutes - forget after this
+
 /**
  * Record a rescue claim (from partner bot via Bot Chat Channel).
  */
@@ -123,19 +132,19 @@ export function shouldProceedOrYield(
   } else if (myClaim.jumps > partnerClaim.jumps) {
     return "yield"; // Partner is closer
   } else {
-    // Same distance - use timestamp as tiebreaker
-    // Earlier claim wins (but account for potential delays)
-    const myTime = new Date(myClaim.timestamp).getTime();
-    const partnerTime = new Date(partnerClaim.timestamp).getTime();
-    const timeDiff = Math.abs(myTime - partnerTime);
+    // Same distance - use round-robin to decide who goes
+    // This ensures both bots get turns when they're at the same location
+    const nextBot = getRoundRobinNext(
+      myClaim.system,
+      myClaim.botName,
+      partnerClaim.botName
+    );
     
-    // If claims are within 5 seconds, consider it a tie - let both decide independently
-    // This prevents both bots from yielding in case of near-simultaneous claims
-    if (timeDiff < 5000) {
-      return "proceed"; // Both go for it, first to arrive wins
+    if (nextBot === myClaim.botName) {
+      return "proceed"; // It's our turn
+    } else {
+      return "yield"; // It's partner's turn
     }
-    
-    return myTime < partnerTime ? "proceed" : "yield";
   }
 }
 
@@ -153,6 +162,58 @@ export function cleanupExpiredClaims(): void {
     recentClaims.length = 0;
     recentClaims.push(...valid);
   }
+  
+  // Also clean up expired round-robin entries
+  for (const [key, entry] of roundRobinTracker.entries()) {
+    if (now - entry.lastTimestamp > ROUND_ROBIN_TTL_MS) {
+      roundRobinTracker.delete(key);
+    }
+  }
+}
+
+/**
+ * Get the bot that should go next when both bots are at the same location.
+ * Uses round-robin: the bot that didn't go last gets priority.
+ * 
+ * @param system - The system/location to check round-robin for
+ * @param bot1Name - First bot name
+ * @param bot2Name - Second bot name
+ * @returns The bot name that should go next
+ */
+export function getRoundRobinNext(
+  system: string,
+  bot1Name: string,
+  bot2Name: string
+): string {
+  const key = system.toLowerCase().replace(/_/g, ' ').trim();
+  const entry = roundRobinTracker.get(key);
+  
+  if (!entry) {
+    // First time - return bot1 (or alphabetically first)
+    return bot1Name < bot2Name ? bot1Name : bot2Name;
+  }
+  
+  // Return the bot that didn't go last
+  if (entry.lastBotName === bot1Name) {
+    return bot2Name;
+  } else if (entry.lastBotName === bot2Name) {
+    return bot1Name;
+  }
+  
+  // Unknown last bot - default to alphabetically first (already handled by first-time case)
+  return bot1Name < bot2Name ? bot1Name : bot2Name;
+}
+
+/**
+ * Record that a bot has completed a rescue at a location.
+ * This updates the round-robin tracker for future same-location decisions.
+ */
+export function recordRoundRobinComplete(system: string, botName: string): void {
+  const key = system.toLowerCase().replace(/_/g, ' ').trim();
+  roundRobinTracker.set(key, {
+    lastBotName: botName,
+    lastTimestamp: Date.now(),
+  });
 }
 
 /**

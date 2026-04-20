@@ -367,6 +367,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('trader')">Trader</div>
         <div class="sidebar-item" onclick="switchSettingsTab('faction_trader')">Faction Trader</div>
         <div class="sidebar-item" onclick="switchSettingsTab('trade_buyer')">Trade Buyer</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('fuel_cell_seller')">Fuel Cell Sell</div>
         <div class="sidebar-item" onclick="switchSettingsTab('miner')">Miner</div>
         <div class="sidebar-item" onclick="switchSettingsTab('miner_quotas')">Miner Quotas</div>
         <div class="sidebar-item" onclick="switchSettingsTab('salvager')">Salvager</div>
@@ -6097,6 +6098,8 @@ function renderSettingsPanel() {
     renderFactionTraderSettings(panel);
   } else if (activeSettingsTab === 'trade_buyer') {
     renderTradeBuyerSettings(panel);
+  } else if (activeSettingsTab === 'fuel_cell_seller') {
+    renderFuelCellSellerSettings(panel);
   } else if (activeSettingsTab === 'salvager') {
     renderSalvagerSettings(panel);
   } else if (activeSettingsTab === 'cleanup') {
@@ -7566,11 +7569,11 @@ function renderRescueSettings(panel) {
   const homeStation = r.homeStation || '';
   const costPerJump = r.costPerJump ?? 50;
   const costPerFuel = r.costPerFuel ?? 2;
-  const cooperationEnabled = r.cooperationEnabled ?? false;
-  const partnerBotName = r.partnerBotName || '';
-  const cooperationMaxDelaySeconds = r.cooperationMaxDelaySeconds ?? 30;
   const creditTopOffAmount = r.creditTopOffAmount ?? 10000;
   const creditTopOffMinThreshold = r.creditTopOffMinThreshold ?? 10000;
+  const creditTopOffBot = r.creditTopOffBot || '';
+  const fleetRescueBot = r.fleetRescueBot || '';
+  const maydayRescueBot = r.maydayRescueBot || '';
 
   // Build system options from mapData
   const systems = Object.keys(mapData || {}).sort();
@@ -7593,11 +7596,27 @@ function renderRescueSettings(panel) {
     }
   }
 
+  // Build bot options for rescue assignments
+  const botOpts = ['<option value="">(none)</option>'];
+  for (const bot of bots) {
+    botOpts.push(`<option value="${esc(bot.username)}">${esc(bot.username)}</option>`);
+  }
+
+  const createSelect = (id, selected, label) => 
+    `<select id="${id}" style="width:100%;max-width:250px">${botOpts.map(o => {
+      const opt = o.replace(`value=""`, `value=""`).replace(/>(.+)</, `>$1</option>`);
+      if (selected) {
+        return o.replace(`value="${esc(selected)}"`, `value="${esc(selected)}" selected`);
+      }
+      return o;
+    }).join('')}</select>`;
+
   panel.innerHTML = `
     <h3 style="margin:0 0 12px;color:var(--text)">FuelRescue Settings</h3>
     <p style="color:var(--dim);font-size:0.85em;margin:0 0 16px">
       Monitors fleet for stranded bots and delivers fuel cells or credits.
       Also responds to MAYDAY emergency calls within jump range.
+      With 2 bots running, assign primary roles - the other joins only if primary is busy.
     </p>
 
     <div class="settings-group">
@@ -7670,36 +7689,34 @@ function renderRescueSettings(panel) {
 
     <hr style="border-color:var(--dim);opacity:0.3;margin:16px 0">
 
-    <div class="settings-group">
-      <label>🤝 Enable Cooperation Mode</label>
-      <label class="toggle" style="display:inline-flex;align-items:center;gap:8px;cursor:pointer">
-        <input type="checkbox" id="set-rescue-cooperationEnabled" ${cooperationEnabled ? 'checked' : ''} style="width:auto">
-        <span>Enable multi-bot coordination</span>
-      </label>
-      <small style="color:var(--dim)">Coordinate with another rescue bot via Bot Chat Channel (not DM) to avoid duplicate responses to MAYDAYs</small>
-    </div>
-
-    <div class="settings-group">
-      <label>Partner Bot Name</label>
-      <input type="text" id="set-rescue-partnerBotName" value="${partnerBotName}" placeholder="e.g., RescueBot_Alpha" style="width:100%;max-width:250px">
-      <small style="color:var(--dim)">Username of the other rescue bot to coordinate with (uses in-memory Bot Chat Channel for coordination)</small>
-    </div>
-
-    <div class="settings-group">
-      <label>Max Message Delay (seconds)</label>
-      <input type="number" id="set-rescue-cooperationMaxDelay" value="${cooperationMaxDelaySeconds}" min="10" max="120" style="width:80px">
-      <small style="color:var(--dim)">Maximum acceptable delay for Bot Chat messages (usually instant, but handles chat processing delays)</small>
-    </div>
-
-    <div class="settings-group" style="background:rgba(59,130,246,0.1);border-left:3px solid var(--accent);padding:12px">
-      <small style="color:var(--dim)">
-        <strong>How it works:</strong> When both bots detect the same MAYDAY, they exchange distance info via Bot Chat Channel (jumps away).
-        The closer bot takes priority. Messages are instant and reliable - no more DM failures!
-        Format: <code style="background:rgba(0,0,0,0.2);padding:2px 4px">RESCUE_CLAIM|player|system|poi|timestamp|jumps|bot_name</code>
+    <div class="settings-group" style="background:rgba(59,130,246,0.1);border-left:3px solid var(--accent);padding:12px;margin-bottom:16px">
+      <label style="color:var(--text-bright);font-weight:600;margin-bottom:8px;display:block">🤖 Multi-Bot Rescue Assignments</label>
+      <small style="color:var(--dim);display:block;margin-bottom:12px">
+        Assign primary bots for each rescue type. The other bot only joins if the primary is busy handling another rescue.
+        Bot Chat Channel handles coordination automatically (no need for manual partner settings).
       </small>
-    </div>
 
-    <hr style="border-color:var(--dim);opacity:0.3;margin:16px 0">
+      <div style="margin-bottom:12px">
+        <label style="display:block;margin-bottom:4px"><strong>Credit Top-Off Bot</strong> <span style="color:var(--dim)">(handles fleet credit redistribution)</span></label>
+        <select id="set-rescue-creditTopOffBot" style="width:100%;max-width:250px">
+          ${botOpts.map(o => o.replace(`value="${esc(creditTopOffBot)}"`, `value="${esc(creditTopOffBot)}" selected`)).join('')}
+        </select>
+      </div>
+
+      <div style="margin-bottom:12px">
+        <label style="display:block;margin-bottom:4px"><strong>Fleet Rescue Bot</strong> <span style="color:var(--dim)">(handles stranded fleet members)</span></label>
+        <select id="set-rescue-fleetRescueBot" style="width:100%;max-width:250px">
+          ${botOpts.map(o => o.replace(`value="${esc(fleetRescueBot)}"`, `value="${esc(fleetRescueBot)}" selected`)).join('')}
+        </select>
+      </div>
+
+      <div style="margin-bottom:12px">
+        <label style="display:block;margin-bottom:4px"><strong>MAYDAY Rescue Bot</strong> <span style="color:var(--dim)">(handles emergency MAYDAY calls)</span></label>
+        <select id="set-rescue-maydayRescueBot" style="width:100%;max-width:250px">
+          ${botOpts.map(o => o.replace(`value="${esc(maydayRescueBot)}"`, `value="${esc(maydayRescueBot)}" selected`)).join('')}
+        </select>
+      </div>
+    </div>
 
     <div class="settings-group">
       <label>💰 Credit top-off amount (0 = disabled)</label>
@@ -7730,11 +7747,11 @@ function saveRescueSettings() {
     maydayFuelThreshold: parseInt(document.getElementById('set-rescue-maydayFuelThreshold').value) || 15,
     costPerJump: parseInt(document.getElementById('set-rescue-costPerJump').value) || 50,
     costPerFuel: parseInt(document.getElementById('set-rescue-costPerFuel').value) || 2,
-    cooperationEnabled: document.getElementById('set-rescue-cooperationEnabled').checked || false,
-    partnerBotName: document.getElementById('set-rescue-partnerBotName').value || '',
-    cooperationMaxDelaySeconds: parseInt(document.getElementById('set-rescue-cooperationMaxDelay').value) || 30,
     creditTopOffAmount: parseInt(document.getElementById('set-rescue-creditTopOffAmount').value) || 10000,
     creditTopOffMinThreshold: parseInt(document.getElementById('set-rescue-creditTopOffMinThreshold').value) || 10000,
+    creditTopOffBot: document.getElementById('set-rescue-creditTopOffBot').value || '',
+    fleetRescueBot: document.getElementById('set-rescue-fleetRescueBot').value || '',
+    maydayRescueBot: document.getElementById('set-rescue-maydayRescueBot').value || '',
   };
   send({ type: 'saveSettings', routine: 'rescue', settings: s });
   alert('FuelRescue settings saved!');
@@ -8313,6 +8330,169 @@ function saveTradeBuyerSettings() {
   send({ type: 'saveSettings', routine: 'trade_buyer', settings: s });
   settings.trade_buyer = s;
   alert('Trade Buyer settings saved!');
+}
+
+// ── Fuel Cell Sell Settings ────────────────────────────────────────────
+function renderFuelCellSellerSettings(panel) {
+  const fc = settings.fuel_cell_seller || {};
+  const homeSystem = fc.homeSystem || '';
+  const homeStation = fc.homeStation || '';
+  const fuelCostPerJump = fc.fuelCostPerJump || 10;
+  const refuelThreshold = fc.refuelThreshold || 35;
+  const repairThreshold = fc.repairThreshold || 80;
+  const priceMode = fc.priceMode || 'auto';
+  const baseTargetPrice = fc.baseTargetPrice || 40;
+  const autoMinPrice = fc.autoMinPrice || 30;
+  const autoMaxPrice = fc.autoMaxPrice || 50;
+
+  // Build home system dropdown options from mapData
+  const sysOpts = ['<option value="">(select home system)</option>'];
+  for (const sysId in mapData) {
+    const sys = mapData[sysId];
+    const sysName = sys.name || sysId;
+    const sel = sysId === homeSystem ? ' selected' : '';
+    sysOpts.push(`<option value="${esc(sysId)}"${sel}>${esc(sysName)} (${esc(sysId)})</option>`);
+  }
+
+  // Build station options for selected home system
+  let stationOpts = ['<option value="">(select station)</option>'];
+  if (homeSystem && mapData[homeSystem]) {
+    for (const poi of mapData[homeSystem].pois || []) {
+      if (!poi.has_base) continue;
+      const sel = poi.id === homeStation ? ' selected' : '';
+      const label = poi.base_name || poi.name || poi.id;
+      stationOpts.push(`<option value="${esc(poi.id)}"${sel}>${esc(label)}</option>`);
+    }
+  }
+
+  const isAuto = priceMode === 'auto';
+  const autoFieldsDisplay = isAuto ? 'display:block' : 'display:none';
+  const manualFieldsDisplay = isAuto ? 'display:none' : 'display:block';
+
+  panel.innerHTML = `
+    <h3>Fuel Cell Sell Settings</h3>
+    <div class="settings-desc">
+      The fuel cell seller bot travels to all non-pirate stations and posts fuel cells for sale.
+      It loads from faction home storage, visits each station, creates sell orders, then returns home.
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home System</div>
+        <div class="setting-hint">The system where faction storage with fuel cells is located.</div>
+      </div>
+      <select id="set-fc-homeSystem" onchange="updateFCSystemStations()" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;min-width:200px">${sysOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home Station</div>
+        <div class="setting-hint">Station with faction storage containing fuel cells.</div>
+      </div>
+      <select id="set-fc-homeStation" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;min-width:200px">${stationOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Fuel Cost Per Jump (credits)</div>
+        <div class="setting-hint">Estimated fuel cost per system jump.</div>
+      </div>
+      <input type="number" id="set-fc-fuelCostPerJump" min="0" max="1000" value="${fuelCostPerJump}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Refuel when fuel drops below this %.</div>
+      </div>
+      <input type="number" id="set-fc-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold (%)</div>
+        <div class="setting-hint">Repair hull when HP drops below this %.</div>
+      </div>
+      <input type="number" id="set-fc-repairThreshold" min="20" max="80" value="${repairThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Price Mode</div>
+        <div class="setting-hint">Auto calculates price between min/max; Manual uses fixed price.</div>
+      </div>
+      <select id="set-fc-priceMode" onchange="toggleFCPriceFields()" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px">
+        <option value="auto" ${priceMode === 'auto' ? 'selected' : ''}>Auto (target mid-range)</option>
+        <option value="manual" ${priceMode === 'manual' ? 'selected' : ''}>Manual</option>
+      </select>
+    </div>
+
+    <div class="setting-row" id="fc-auto-fields" style="${autoFieldsDisplay}">
+      <div>
+        <div class="setting-label">Auto Price Range (credits)</div>
+        <div class="setting-hint">Target price somewhere in this range. Bot picks best available or midpoint.</div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <input type="number" id="set-fc-autoMinPrice" min="1" max="10000" value="${autoMinPrice}" placeholder="Min">
+        <span>-</span>
+        <input type="number" id="set-fc-autoMaxPrice" min="1" max="10000" value="${autoMaxPrice}" placeholder="Max">
+      </div>
+    </div>
+
+    <div class="setting-row" id="fc-manual-fields" style="${manualFieldsDisplay}">
+      <div>
+        <div class="setting-label">Base Target Price (credits)</div>
+        <div class="setting-hint">Fixed price to list fuel cells for sale.</div>
+      </div>
+      <input type="number" id="set-fc-baseTargetPrice" min="1" max="10000" value="${baseTargetPrice}">
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveFuelCellSellerSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function toggleFCPriceFields() {
+  const mode = document.getElementById('set-fc-priceMode').value;
+  document.getElementById('fc-auto-fields').style.display = mode === 'auto' ? 'block' : 'none';
+  document.getElementById('fc-manual-fields').style.display = mode === 'manual' ? 'block' : 'none';
+}
+
+function updateFCSystemStations() {
+  const homeSystem = document.getElementById('set-fc-homeSystem').value;
+  const stationSelect = document.getElementById('set-fc-homeStation');
+  if (!stationSelect) return;
+
+  if (!homeSystem || !mapData[homeSystem]) {
+    stationSelect.innerHTML = '<option value="">(select station)</option>';
+    return;
+  }
+
+  const stationOpts = ['<option value="">(select station)</option>'];
+  for (const poi of mapData[homeSystem].pois || []) {
+    if (!poi.has_base) continue;
+    const label = poi.base_name || poi.name || poi.id;
+    stationOpts.push(`<option value="${esc(poi.id)}">${esc(label)}</option>`);
+  }
+  stationSelect.innerHTML = stationOpts.join('');
+}
+
+function saveFuelCellSellerSettings() {
+  const s = {
+    homeSystem: document.getElementById('set-fc-homeSystem').value.trim(),
+    homeStation: document.getElementById('set-fc-homeStation').value.trim(),
+    fuelCostPerJump: parseInt(document.getElementById('set-fc-fuelCostPerJump').value) || 10,
+    refuelThreshold: parseInt(document.getElementById('set-fc-refuelThreshold').value) || 35,
+    repairThreshold: parseInt(document.getElementById('set-fc-repairThreshold').value) || 80,
+    priceMode: document.getElementById('set-fc-priceMode').value,
+    baseTargetPrice: parseInt(document.getElementById('set-fc-baseTargetPrice').value) || 40,
+    autoMinPrice: parseInt(document.getElementById('set-fc-autoMinPrice').value) || 30,
+    autoMaxPrice: parseInt(document.getElementById('set-fc-autoMaxPrice').value) || 50,
+  };
+  send({ type: 'saveSettings', routine: 'fuel_cell_seller', settings: s });
+  settings.fuel_cell_seller = s;
+  alert('Fuel Cell Sell settings saved!');
 }
 
 // ── AI Settings ────────────────────────────────────────────
@@ -9216,6 +9396,10 @@ function completeConsolidatedMission(templateId) {
 
 function renderFactionPage() {
   renderFactionSidebar();
+  // Try to load facilities cache when faction tab is opened (non-blocking)
+  if (!personalFacilityLoadComplete) {
+    loadFacilitiesCache();
+  }
   if (factionSelectedBot) {
     fetchFactionInfo(factionSelectedBot);
   } else {
@@ -9425,7 +9609,7 @@ function renderFactionContent(username) {
   const leader = f.leader || f.owner || '';
 
   // Panel navigation tabs
-  const panels = ['overview', 'members', 'storage', 'facilities', 'rooms', 'missions', 'diplomacy', 'intel', 'activity'];
+  const panels = ['overview', 'members', 'storage', 'facilities', 'personal', 'rooms', 'missions', 'diplomacy', 'intel', 'activity'];
   const panelNav = panels.map(p => {
     const active = factionActivePanel === p ? ' active' : '';
     const label = p.charAt(0).toUpperCase() + p.slice(1);
@@ -9445,6 +9629,9 @@ function renderFactionContent(username) {
       break;
     case 'facilities':
       panelHtml = renderFactionFacilities(f, username);
+      break;
+    case 'personal':
+      panelHtml = renderPersonalFacilities(f, username);
       break;
     case 'rooms':
       panelHtml = renderFactionRooms(f, username);
@@ -10305,7 +10492,7 @@ function fetchFactionFacilities(username) {
       return;
     }
     const d = result.data;
-    const facilities = Array.isArray(d) ? d : (Array.isArray(d.facilities) ? d.facilities : []);
+    const facilities = Array.isArray(d) ? d : (Array.isArray(d.faction_facilities) ? d.faction_facilities : []);
     if (facilities.length === 0) {
       container.innerHTML = '<div class="faction-no-data">No faction facilities at this station.</div>';
       return;
@@ -10524,6 +10711,725 @@ function factionBuildFacility(username, facilityType) {
       appendLine('system', `Build failed: ${result.error || 'unknown'}`);
     }
   });
+}
+
+// Personal Facilities State
+let personalFacilityTypes = []; // Cached facility types list (personal + production)
+let personalFacilityDetails = {}; // { typeId: details }
+let personalFacilitiesList = []; // Current player's facilities
+let personalFacilityPage = 0;
+let personalFacilityPageSize = 20;
+let personalFacilityTotalPages = { personal: 0, production: 0 };
+let personalFacilityLoading = false;
+let personalFacilityLoadComplete = false;
+let personalFacilitySelected = null;
+let personalFacilityVersion = null;
+let personalFacilityCategory = 'personal'; // 'personal' or 'production'
+
+// Load facilities from server cache (returns true if loaded successfully)
+async function loadFacilitiesCache() {
+  try {
+    const res = await fetch('/api/facilities');
+    const data = await res.json();
+    console.log('Cache API response:', data);
+    if (data.version && data.version === '0.269.15') {
+      personalFacilityVersion = data.version;
+      console.log('Loading', data.personal?.length, 'personal and', data.production?.length, 'production types from cache');
+      // Load cached types (already deduplicated from server)
+      if (data.personal && data.personal.length > 0) {
+        const existingIds = new Set(personalFacilityTypes.map(t => t.facility_type || t.type || t.id));
+        const newPersonal = data.personal.filter(t => !existingIds.has(t.facility_type || t.id)).map(t => ({ ...t, _category: 'personal' }));
+        personalFacilityTypes.push(...newPersonal);
+      }
+      if (data.production && data.production.length > 0) {
+        const existingIds = new Set(personalFacilityTypes.map(t => t.facility_type || t.type || t.id));
+        const newProduction = data.production.filter(t => !existingIds.has(t.facility_type || t.id)).map(t => ({ ...t, _category: 'production' }));
+        personalFacilityTypes.push(...newProduction);
+      }
+      // Load cached details
+      if (data.details) {
+        personalFacilityDetails = { ...data.details };
+      }
+      personalFacilityLoadComplete = true;
+      console.log('Loaded facilities from cache:', personalFacilityTypes.length, 'types total');
+      return true;
+    } else {
+      console.log('Cache version mismatch or empty:', data.version);
+      return false;
+    }
+  } catch (err) {
+    console.warn('Failed to load facilities cache:', err);
+    return false;
+  }
+}
+
+// Save facilities to server cache
+async function saveFacilitiesCache() {
+  if (!personalFacilityVersion) return;
+  try {
+    const personal = personalFacilityTypes.filter(t => t._category === 'personal').map(t => ({
+      facility_type: t.facility_type || t.type || t.id,
+      name: t.name,
+      description: t.description,
+      category: t.category
+    }));
+    const production = personalFacilityTypes.filter(t => t._category === 'production').map(t => ({
+      facility_type: t.facility_type || t.type || t.id,
+      name: t.name,
+      description: t.description,
+      category: t.category
+    }));
+    await fetch('/api/facilities', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        version: personalFacilityVersion,
+        personal,
+        production,
+        details: personalFacilityDetails
+      })
+    });
+    console.log('Saved facilities to cache');
+  } catch (err) {
+    console.warn('Failed to save facilities cache:', err);
+  }
+}
+
+// Personal Facilities UI
+function renderPersonalFacilities(f, username) {
+  const bot = bots.find(b => b.username === username);
+  const docked = bot ? bot.docked : false;
+  const dockWarning = !docked
+    ? '<div style="color:var(--yellow);font-size:11px;margin-bottom:12px">Bot must be docked at a station to manage personal facilities.</div>'
+    : '';
+
+  return `
+    ${dockWarning}
+    <div style="display:flex;flex-direction:column;flex:1;min-height:0;gap:16px">
+      <div class="faction-section">
+        <div class="faction-section-title">My Personal Facilities</div>
+        <div id="personalFacilitiesList">
+          <button class="sm" onclick="fetchPersonalFacilities('${esc(username)}')" ${!docked ? 'disabled' : ''}>Load My Facilities</button>
+        </div>
+      </div>
+      <div class="faction-section" style="flex:1;display:flex;flex-direction:column;min-height:0">
+        <div class="faction-section-title">Available Personal Facilities</div>
+        <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
+          <button class="sm" id="pf-cat-personal" style="background:var(--accent);color:#fff" onclick="switchPersonalFacilityCategory('personal','${esc(username)}')">Personal</button>
+          <button class="sm" id="pf-cat-production" onclick="switchPersonalFacilityCategory('production','${esc(username)}')">Production</button>
+          <span id="pf-category-info" style="font-size:11px;color:var(--text-dim);margin-left:auto"></span>
+        </div>
+        <div id="personalFacilityTypes" style="flex:1;min-height:0;overflow-y:auto">
+          <button class="sm" onclick="fetchPersonalFacilityTypes('${esc(username)}')" ${!docked ? 'disabled' : ''}>Load Available Types</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function switchPersonalFacilityCategory(category, username) {
+  personalFacilityCategory = category;
+  personalFacilityPage = 0; // Reset to first page when switching
+  // Update button styles
+  const personalBtn = document.getElementById('pf-cat-personal');
+  const productionBtn = document.getElementById('pf-cat-production');
+  if (personalBtn) {
+    if (category === 'personal') {
+      personalBtn.style.background = 'var(--accent)';
+      personalBtn.style.color = '#fff';
+    } else {
+      personalBtn.style.background = '';
+      personalBtn.style.color = '';
+    }
+  }
+  if (productionBtn) {
+    if (category === 'production') {
+      productionBtn.style.background = 'var(--accent)';
+      productionBtn.style.color = '#fff';
+    } else {
+      productionBtn.style.background = '';
+      productionBtn.style.color = '';
+    }
+  }
+  // If we have cached data for this category, render it
+  if (personalFacilityTypes.length > 0 && personalFacilityVersion === '0.269.15') {
+    renderPersonalFacilityList(document.getElementById('personalFacilityTypes'), username);
+  } else {
+    fetchPersonalFacilityTypes(username);
+  }
+}
+
+function fetchPersonalFacilities(username) {
+  // Existing implementation unchanged
+
+  const container = document.getElementById('personalFacilitiesList');
+  if (!container) return;
+  container.innerHTML = '<div class="faction-no-data">Loading...</div>';
+  sendExec(username, 'facility', { action: 'list' }, (result) => {
+    if (!result.ok || !result.data) {
+      container.innerHTML = `<div class="faction-no-data">${esc(result.error || 'Could not load facilities')}</div>`;
+      return;
+    }
+    const d = result.data;
+    const facilities = Array.isArray(d) ? d : (Array.isArray(d.player_facilities) ? d.player_facilities : []);
+    personalFacilitiesList = facilities;
+    if (facilities.length === 0) {
+      container.innerHTML = '<div class="faction-no-data">You have no personal facilities. Build one below!</div>';
+      return;
+    }
+    container.innerHTML = facilities.map(fac => {
+      const name = fac.name || fac.facility_type || fac.type || '?';
+      const facId = fac.facility_id || fac.id || '';
+      const active = fac.active === true;
+      const activeStr = active ? '<span style="color:var(--green)">Active</span>' : '<span style="color:var(--red)">Inactive</span>';
+      const category = fac.category || '';
+      return `<div class="faction-card">
+        <div style="display:flex;justify-content:space-between;align-items:center">
+          <div>
+            <span class="fc-name">${esc(name)}</span>
+            <span style="margin-left:8px;font-size:10px">${activeStr}</span>
+            ${category ? `<span style="margin-left:8px;font-size:10px;color:var(--text-dim)">${esc(category)}</span>` : ''}
+          </div>
+          <div style="display:flex;gap:4px">
+            <button class="sm" style="font-size:10px;padding:2px 6px" onclick="togglePersonalFacility('${esc(username)}','${esc(facId)}','${active}')">${active ? 'Disable' : 'Enable'}</button>
+          </div>
+        </div>
+      </div>`;
+    }).join('');
+  });
+}
+
+function togglePersonalFacility(username, facilityId, currentlyActive) {
+  const newState = currentlyActive === 'true' ? false : true;
+  sendExec(username, 'facility', { action: 'toggle', facility_id: facilityId }, (result) => {
+    if (result.ok) {
+      appendLine('system', `${username}: Facility toggled ${newState ? 'on' : 'off'}`);
+      fetchPersonalFacilities(username);
+    } else {
+      appendLine('system', `Toggle failed: ${result.error || 'unknown'}`);
+    }
+  });
+}
+
+async function fetchPersonalFacilityTypes(username) {
+  const container = document.getElementById('personalFacilityTypes');
+  if (!container) return;
+  container.innerHTML = '<div class="faction-no-data">Loading available types...</div>';
+  
+  // First, try to load from cache if not already done
+  if (!personalFacilityLoadComplete) {
+    const loaded = await loadFacilitiesCache();
+    if (loaded && personalFacilityLoadComplete) {
+      console.log('Using cached data after loadFacilitiesCache:', personalFacilityTypes.length, 'types');
+      renderPersonalFacilityList(container, username);
+      return;
+    }
+  }
+  
+  // Use cached data if fully loaded from cache
+  if (personalFacilityTypes.length > 0 && personalFacilityLoadComplete && personalFacilityVersion) {
+    console.log('Using cached data,', personalFacilityTypes.length, 'types, version:', personalFacilityVersion);
+    renderPersonalFacilityList(container, username);
+    return;
+  }
+  
+  console.log('Cache not ready, fetching from API. Has types:', personalFacilityTypes.length, 'Complete:', personalFacilityLoadComplete, 'Version:', personalFacilityVersion);
+  personalFacilityLoading = true;
+  personalFacilityPage = 0;
+  // Don't clear types if we already have some from cache - reuse them
+  if (personalFacilityTypes.length === 0) {
+    personalFacilityTypes = [];
+  }
+  personalFacilityLoadComplete = false;
+  
+  // Fetch both personal and production categories
+  fetchPersonalFacilityPage(username, container, 0, 'personal');
+}
+
+async function fetchPersonalFacilityPage(username, container, page, category) {
+  personalFacilityLoading = true;
+  container.innerHTML = `<div class="faction-no-data">Loading ${category} page ${page + 1}...</div>`;
+  
+  sendExec(username, 'facility', { action: 'types', category: category, page: page }, async (result) => {
+    if (!result.ok || !result.data) {
+      container.innerHTML = `<div class="faction-no-data">${esc(result.error || 'Could not load types')}</div>`;
+      personalFacilityLoading = false;
+      return;
+    }
+    const d = result.data;
+    const types = Array.isArray(d) ? d : (Array.isArray(d.types) ? d.types : []);
+    const hint = d.hint || '';
+    const totalPages = d.total_pages || 0;
+    
+    // Track total pages for this category
+    if (totalPages > 0) {
+      personalFacilityTotalPages[category] = totalPages;
+    }
+    
+    // Add category marker to each type and add to cache (with deduplication)
+    const existingIds = new Set(personalFacilityTypes.filter(t => t._category === category).map(t => t.facility_type || t.type || t.id));
+    const typedTypes = types
+      .filter(t => !existingIds.has(t.facility_type || t.type || t.id))
+      .map(t => ({ ...t, _category: category }));
+    personalFacilityTypes.push(...typedTypes);
+    
+    // If more pages exist for this category, continue loading with delay
+    const hasMore = types.length >= personalFacilityPageSize && (page + 1) < totalPages;
+    if (hasMore) {
+      const loadedCount = personalFacilityTypes.filter(t => t._category === category).length;
+      container.innerHTML = `<div class="faction-no-data">Loaded ${loadedCount} ${category} types. Loading more...</div>`;
+      // 2 second delay between pages
+      setTimeout(() => {
+        fetchPersonalFacilityPage(username, container, page + 1, category);
+      }, 2000);
+    } else {
+      // Done with this category - check if we need to fetch production
+      const personalLoaded = personalFacilityTypes.some(t => t._category === 'personal');
+      const productionLoaded = personalFacilityTypes.some(t => t._category === 'production');
+      
+      if (category === 'personal' && !productionLoaded) {
+        // Fetch production category next
+        const count = personalFacilityTypes.filter(t => t._category === 'personal').length;
+        container.innerHTML = `<div class="faction-no-data">Loaded ${count} personal types. Now loading production...</div>`;
+        setTimeout(() => {
+          fetchPersonalFacilityPage(username, container, 0, 'production');
+        }, 2000);
+      } else {
+        // All done
+        personalFacilityVersion = '0.269.15';
+        personalFacilityPage = 0;
+        personalFacilityLoadComplete = true;
+        
+        // Update button states
+        document.getElementById('pf-cat-personal')?.classList.add('active');
+        document.getElementById('pf-cat-production')?.classList.remove('active');
+        
+        renderPersonalFacilityList(container, username);
+        personalFacilityLoading = false;
+        
+        // Save to server cache
+        saveFacilitiesCache();
+      }
+    }
+  });
+}
+
+function renderPersonalFacilityList(container, username) {
+  // Filter by current category and sort by name to ensure consistent order
+  let types = personalFacilityTypes.filter(t => t._category === personalFacilityCategory);
+  // Sort by name for consistent pagination
+  types = types.sort((a, b) => (a.name || a.facility_type || '').localeCompare(b.name || b.facility_type || ''));
+  
+  const totalItems = types.length;
+  // Use tracked total pages from server, or fallback to calculated
+  let totalPages = personalFacilityTotalPages[personalFacilityCategory] || 0;
+  if (totalPages === 0) {
+    totalPages = Math.ceil(totalItems / personalFacilityPageSize);
+  }
+  
+  // Validate page against bounds
+  if (personalFacilityPage >= totalPages) {
+    personalFacilityPage = Math.max(0, totalPages - 1);
+  }
+  
+  if (totalItems === 0) {
+    container.innerHTML = '<div class="faction-no-data">No facility types found</div>';
+    return;
+  }
+  
+  // Get current page items (using server's pagination - 20 per page)
+  const startIdx = personalFacilityPage * personalFacilityPageSize;
+  const endIdx = Math.min(startIdx + personalFacilityPageSize, totalItems);
+  const pageItems = types.slice(startIdx, endIdx);
+  
+  // Show loading indicator if not complete
+  const loadingMsg = !personalFacilityLoadComplete && totalPages > 0 && totalItems < (totalPages * personalFacilityPageSize)
+    ? `<div style="font-size:11px;color:var(--yellow);margin-bottom:8px">Loading... ${totalItems}/${totalPages * personalFacilityPageSize} types loaded</div>`
+    : '';
+  
+  // Only enable pagination if fully loaded
+  const canPaginate = personalFacilityLoadComplete;
+  
+  container.innerHTML = `
+    <div style="font-size:11px;color:var(--text-dim);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
+      <span>${totalItems} ${personalFacilityCategory} facility types
+        ${personalFacilityVersion ? `(cache v${personalFacilityVersion})` : ''}
+      </span>
+      <span>Page ${personalFacilityPage + 1} of ${totalPages}</span>
+    </div>
+    ${loadingMsg}
+    <div id="personalFacilityListScroll" style="flex:1;min-height:0;overflow-y:auto">
+      ${pageItems.map(t => {
+        const typeId = t.facility_type || t.type || t.id || '';
+        const name = t.name || typeId || '?';
+        const desc = t.description || t.desc || '';
+        return `<div class="faction-card" style="padding:8px;margin-bottom:4px;cursor:pointer" onclick="showPersonalFacilityDetails('${esc(username)}','${esc(typeId)}')">
+          <div style="font-size:12px;font-weight:600;color:var(--text-bright)">${esc(name)}</div>
+          <div style="font-size:11px;color:var(--text-dim)">${esc(desc.substring(0, 100))}${desc.length > 100 ? '...' : ''}</div>
+        </div>`;
+      }).join('')}
+    </div>
+    <div style="display:flex;justify-content:center;gap:8px;margin-top:8px;padding:8px 0;border-top:1px solid var(--border)">
+      <button class="sm" onclick="changePersonalFacilityPage(${personalFacilityPage - 1}, '${esc(username)}')" ${!canPaginate || personalFacilityPage <= 0 ? 'disabled' : ''}>&lt; Prev</button>
+      <button class="sm" onclick="changePersonalFacilityPage(${personalFacilityPage + 1}, '${esc(username)}')" ${!canPaginate || personalFacilityPage >= totalPages - 1 ? 'disabled' : ''}>Next &gt;</button>
+    </div>
+  `;
+  
+  // Update category info
+  const infoEl = document.getElementById('pf-category-info');
+  if (infoEl) {
+    infoEl.textContent = `${totalItems} ${personalFacilityCategory} types`;
+  }
+}
+
+function changePersonalFacilityPage(page, username) {
+  // Validate page number
+  if (page < 0) page = 0;
+  personalFacilityPage = page;
+  const container = document.getElementById('personalFacilityTypes');
+  if (container) {
+    console.log('Changing to page:', page, 'username:', username);
+    // Force clear and re-render
+    container.innerHTML = '';
+    renderPersonalFacilityList(container, username);
+  }
+}
+
+function showPersonalFacilityDetails(username, typeId) {
+  const container = document.getElementById('personalFacilityTypes');
+  if (!container) return;
+  
+  // Use cached details if available
+  if (personalFacilityDetails[typeId]) {
+    renderPersonalFacilityDetailCard(container, username, typeId, personalFacilityDetails[typeId]);
+    return;
+  }
+  
+  container.innerHTML = '<div class="faction-no-data">Loading details...</div>';
+  console.log('Fetching facility details for:', typeId);
+  
+  sendExec(username, 'facility', { action: 'types', facility_type: typeId }, (result) => {
+    console.log('Facility details result:', result);
+    if (!result.ok || !result.data) {
+      container.innerHTML = `<div class="faction-no-data">${esc(result.error || 'Could not load details')}</div>`;
+      return;
+    }
+    const d = result.data;
+    const detail = Array.isArray(d) ? d[0] : (d.type || d);
+    
+    console.log('Facility detail parsed:', detail);
+    if (detail) {
+      personalFacilityDetails[typeId] = detail;
+      // Save to server cache in background
+      saveFacilitiesCache();
+    }
+    
+    renderPersonalFacilityDetailCard(container, username, typeId, detail);
+  });
+}
+
+function renderPersonalFacilityDetailCard(container, username, typeId, detail) {
+  if (!detail) {
+    container.innerHTML = '<div class="faction-no-data">No details available</div>';
+    return;
+  }
+  
+  const name = detail.name || detail.facility_type || typeId || '?';
+  const desc = detail.description || detail.desc || '';
+  const category = detail.category || 'personal';
+  const level = detail.level ?? detail.tier ?? '';
+  const levelStr = level ? ` Level ${level}` : '';
+  const recipeId = detail.recipe || detail.recipe_id || '';
+  const hint = detail.hint || '';
+  const buildable = detail.buildable !== false;
+  
+  // Build cost (server returns build_cost)
+  const buildCost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? 0;
+  const buildCostStr = buildCost ? `${Number(buildCost).toLocaleString()}cr` : '';
+  
+  // Labor cost
+  const laborCost = detail.labor_cost ?? 0;
+  const laborCostStr = laborCost ? `${laborCost} labor` : '';
+  
+  // Build time
+  const buildTime = detail.build_time ?? 0;
+  const buildTimeStr = buildTime ? `${buildTime}s` : '';
+  
+  // Build materials (server returns build_materials)
+  const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || detail.resources || [];
+  let matsHtml = '';
+  if (Array.isArray(mats) && mats.length > 0) {
+    matsHtml = '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
+      mats.map(m => {
+        const mName = m.name || m.item_name || m.item_id || m.resource || '?';
+        const mQty = m.quantity || m.count || m.amount || 1;
+        return `<span style="color:var(--text)">${mQty}x ${esc(mName)}</span>`;
+      }).join(', ') + '</div>';
+  } else if (typeof mats === 'object' && !Array.isArray(mats) && Object.keys(mats).length > 0) {
+    matsHtml = '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
+      Object.entries(mats).map(([k, v]) => `<span style="color:var(--text)">${v}x ${esc(k)}</span>`).join(', ') + '</div>';
+  }
+  
+  const stats = [];
+  if (detail.capacity) stats.push(`Capacity: ${detail.capacity}`);
+  if (detail.storage_capacity) stats.push(`Storage: ${detail.storage_capacity}`);
+  if (detail.production_rate) stats.push(`Production: ${detail.production_rate}`);
+  if (recipeId) stats.push(`Recipe: ${recipeId}`);
+  let statsHtml = '';
+  if (stats.length > 0) {
+    statsHtml = `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">${stats.join(' | ')}</div>`;
+  }
+  
+  const warningHtml = hint ? `<div style="margin-top:6px;font-size:11px;color:var(--orange)">${esc(hint)}</div>` : '';
+  const notBuildableHtml = !buildable ? `<div style="margin-top:6px;font-size:11px;color:var(--red)">Cannot build directly - ${esc(hint || 'must upgrade existing facility')}</div>` : '';
+  
+  const detailHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+        <div>
+          <div style="font-size:14px;font-weight:700;color:var(--text-bright)">${esc(name)}${esc(levelStr)}</div>
+          <div style="font-size:11px;color:var(--text-dim)">${esc(category)}</div>
+        </div>
+        <button class="sm" onclick="fetchPersonalFacilityTypes('${esc(username)}')">Back to List</button>
+      </div>
+      <div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>
+      ${buildCostStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Build Cost: ${esc(buildCostStr)}</div>` : ''}
+      ${laborCostStr ? `<div style="font-size:11px;color:var(--yellow);margin-left:8px">${esc(laborCostStr)}</div>` : ''}
+      ${buildTimeStr ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">Build Time: ${esc(buildTimeStr)}</div>` : ''}
+      ${matsHtml}
+      ${statsHtml}
+      ${warningHtml}
+      ${notBuildableHtml}
+      ${buildable ? `
+      <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+        <button class="primary sm" style="width:100%" onclick="buildPersonalFacility('${esc(username)}','${esc(typeId)}')">Build Facility</button>
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
+        This will withdraw required materials from faction storage and build the facility on your current player.
+      </div>
+      ` : ''}
+    </div>
+  `;
+  
+  container.innerHTML = detailHtml;
+}
+
+async function buildPersonalFacility(username, facilityType) {
+  const container = document.getElementById('personalFacilityTypes');
+  if (!container) return;
+  
+  // Show progress UI
+  let progressHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="font-size:14px;font-weight:700;color:var(--text-bright);margin-bottom:12px">Building: ${esc(facilityType)}</div>
+      <div id="build-progress" style="font-size:12px;color:var(--text)">
+        <div id="bp-step-1">Getting facility details...</div>
+        <div id="bp-step-2" style="color:var(--text-dim)">Checking faction storage...</div>
+        <div id="bp-step-3" style="color:var(--text-dim)">Withdrawing materials...</div>
+        <div id="bp-step-4" style="color:var(--text-dim)">Building facility...</div>
+      </div>
+      <div id="bp-status" style="margin-top:12px;font-size:11px"></div>
+      <div id="bp-actions" style="margin-top:12px;display:flex;gap:8px"></div>
+    </div>
+  `;
+  container.innerHTML = progressHtml;
+  
+  const updateStep = (step, status, color) => {
+    const el = document.getElementById(`bp-step-${step}`);
+    if (el) {
+      el.style.color = color || 'var(--text)';
+      el.textContent = status;
+    }
+  };
+  
+  const setStatus = (msg, color) => {
+    const el = document.getElementById('bp-status');
+    if (el) {
+      el.style.color = color || 'var(--text)';
+      el.textContent = msg;
+    }
+  };
+  
+  const showError = (msg) => {
+    setStatus('ERROR: ' + msg, 'var(--red)');
+    document.getElementById('bp-actions').innerHTML = '<button class="sm" onclick="fetchPersonalFacilityTypes(\'' + esc(username) + '\')">Back to List</button>';
+  };
+  
+  const showSuccess = () => {
+    setStatus('Facility built successfully!', 'var(--green)');
+    document.getElementById('bp-actions').innerHTML = '<button class="primary sm" onclick="fetchPersonalFacilities(\'' + esc(username) + '\')">View My Facilities</button>';
+  };
+  
+  // Step 1: Get facility type details
+  updateStep(1, 'Getting facility details...', 'var(--text)');
+  
+  const detailsResult = await new Promise(resolve => {
+    sendExec(username, 'facility', { action: 'types', facility_type: facilityType }, resolve);
+  });
+  
+  if (!detailsResult.ok || !detailsResult.data) {
+    showError(detailsResult.error || 'Failed to get facility details');
+    return;
+  }
+  
+  const d = detailsResult.data;
+  const detail = Array.isArray(d) ? d[0] : (d.type || d.facility || d);
+  
+  if (!detail) {
+    showError('Could not find facility type details');
+    return;
+  }
+  
+  // Get required materials - use build_materials as that's what the server returns
+  const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || detail.resources || [];
+  const cost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? detail.credit_cost ?? 0;
+  
+  console.log('Facility details:', detail);
+  console.log('Materials:', mats, 'Cost:', cost);
+  
+  updateStep(1, `Got details for ${detail.name || facilityType}`, 'var(--green)');
+  updateStep(2, 'Checking faction storage...', 'var(--text)');
+  
+  // Step 2: Get faction storage to check availability
+  const storageResult = await new Promise(resolve => {
+    sendExec(username, 'view_faction_storage', {}, resolve);
+  });
+  
+  if (!storageResult.ok || !storageResult.data) {
+    showError(storageResult.error || 'Failed to get faction storage');
+    return;
+  }
+  
+  const factionItems = storageResult.data.items || storageResult.data.storage || [];
+  const factionCredits = storageResult.data.credits || 0;
+  
+  // Check if we have enough materials and credits
+  const missing = [];
+  if (cost > 0 && factionCredits < cost) {
+    missing.push(`${Number(cost - factionCredits).toLocaleString()} more credits needed (have ${Number(factionCredits).toLocaleString()})`);
+  }
+  
+  if (Array.isArray(mats) && mats.length > 0) {
+    for (const m of mats) {
+      const mId = m.item_id || m.name || m.resource || '?';
+      const mName = m.name || m.item_id || '?';
+      const mQty = m.quantity || m.count || m.amount || 1;
+      // Use item_id for lookup in faction storage
+      const available = factionItems.find(i => (i.item_id === mId || i.name === mId));
+      const availQty = available?.quantity || 0;
+      if (availQty < mQty) {
+        missing.push(`${mQty - availQty}x more ${mName} needed (have ${availQty})`);
+      }
+    }
+  }
+  
+  if (missing.length > 0) {
+    setStatus('Missing materials: ' + missing.join(', '), 'var(--orange)');
+    document.getElementById('bp-actions').innerHTML = `
+      <button class="sm" onclick="buildPersonalFacilityConfirm('${esc(username)}','${esc(facilityType)}','${esc(JSON.stringify(mats))}',${cost})">Try Anyway</button>
+      <button class="sm" onclick="fetchPersonalFacilityTypes('${esc(username)}')">Cancel</button>
+    `;
+    return;
+  }
+  
+  updateStep(2, `Faction storage OK (${factionCredits.toLocaleString()} credits)`, 'var(--green)');
+  updateStep(3, 'Withdrawing materials...', 'var(--text)');
+  
+  // Step 3: Withdraw materials from faction storage
+  let withdrawnCredits = 0;
+  
+  if (cost > 0) {
+    setStatus(`Withdrawing ${cost.toLocaleString()} credits...`);
+    const creditResult = await new Promise(resolve => {
+      sendExec(username, 'faction_withdraw_credits', { amount: cost }, resolve);
+    });
+    if (creditResult.ok) {
+      withdrawnCredits = cost;
+      setStatus(`Withdrew ${withdrawnCredits.toLocaleString()} credits`);
+    } else {
+      showError('Failed to withdraw credits: ' + (creditResult.error || 'unknown'));
+      return;
+    }
+  }
+  
+  if (Array.isArray(mats) && mats.length > 0) {
+    let matIndex = 0;
+    for (const m of mats) {
+      matIndex++;
+      // Use item_id for API calls, name for display
+      const mId = m.item_id || m.name || m.resource || '?';
+      const mName = m.name || m.item_id || '?';
+      const mQty = m.quantity || m.count || m.amount || 1;
+      setStatus(`Withdrawing ${mQty}x ${mName} (${matIndex}/${mats.length})...`);
+      
+      // Use faction_withdraw_items to get from faction storage - needs item_id
+      const withdrawResult = await new Promise(resolve => {
+        sendExec(username, 'faction_withdraw_items', { item_id: mId, quantity: mQty }, resolve);
+      });
+      
+      if (!withdrawResult.ok) {
+        showError(`Failed to withdraw ${mName}: ${withdrawResult.error || 'unknown'}`);
+        return;
+      }
+    }
+  }
+  
+  updateStep(3, `Withdrew all materials`, 'var(--green)');
+  updateStep(4, 'Building facility...', 'var(--text)');
+  
+  // Small delay to ensure items are in personal storage
+  await new Promise(resolve => setTimeout(resolve, 500));
+  
+  // Step 4: Build the facility
+  const buildResult = await new Promise(resolve => {
+    sendExec(username, 'facility', { action: 'build', facility_type: facilityType }, resolve);
+  });
+  
+  if (buildResult.ok) {
+    updateStep(4, 'Facility built!', 'var(--green)');
+    showSuccess();
+  } else {
+    showError(buildResult.error || 'Build failed');
+  }
+}
+
+// Separate function for confirming build when materials are missing
+async function buildPersonalFacilityConfirm(username, facilityType, matsJson, cost) {
+  const mats = JSON.parse(matsJson);
+  const container = document.getElementById('personalFacilityTypes');
+  if (!container) return;
+  
+  setStatus('Building anyway (may fail)...', 'var(--orange)');
+  
+  if (cost > 0) {
+    await new Promise(resolve => {
+      sendExec(username, 'faction_withdraw_credits', { amount: cost }, () => resolve(true));
+    });
+  }
+  
+  if (Array.isArray(mats) && mats.length > 0) {
+    for (const m of mats) {
+      const mId = m.item_id || m.name || m.resource || '?';
+      const mQty = m.quantity || m.count || m.amount || 1;
+      await new Promise(resolve => {
+        sendExec(username, 'faction_withdraw_items', { item_id: mId, quantity: mQty }, () => resolve(true));
+      });
+    }
+  }
+  
+  await new Promise(resolve => setTimeout(resolve, 500));
+  
+  const buildResult = await new Promise(resolve => {
+    sendExec(username, 'facility', { action: 'build', facility_type: facilityType }, resolve);
+  });
+  
+  if (buildResult.ok) {
+    setStatus('Facility built!', 'var(--green)');
+    document.getElementById('bp-actions').innerHTML = '<button class="primary sm" onclick="fetchPersonalFacilities(\'' + esc(username) + '\')">View My Facilities</button>';
+  } else {
+    setStatus('Build failed: ' + (buildResult.error || 'unknown'), 'var(--red)');
+    document.getElementById('bp-actions').innerHTML = '<button class="sm" onclick="fetchPersonalFacilityTypes(\'' + esc(username) + '\')">Back to List</button>';
+  }
 }
 
 function fetchFacilityHelp(username) {

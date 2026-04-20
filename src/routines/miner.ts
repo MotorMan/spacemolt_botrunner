@@ -426,6 +426,7 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
 
   let hasMiningLaser = false;
+  let hasStripMiner = false;
   let hasGasHarvester = false;
   let hasIceHarvester = false;
   let hasLeadLinedCargo = false;
@@ -436,11 +437,15 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
     const modId = (modObj?.id as string) || (modObj?.type_id as string) || "";
     const modName = (modObj?.name as string) || "";
     const modType = (modObj?.type as string) || "";
+    const modSpecial = (modObj?.special as string) || "";
 
-    const checkStr = `${modId} ${modName} ${modType}`.toLowerCase();
+    const checkStr = `${modId} ${modName} ${modType} ${modSpecial}`.toLowerCase();
 
     if (checkStr.includes("mining_laser") || checkStr.includes("mining laser")) {
       hasMiningLaser = true;
+    }
+    if (checkStr.includes("strip_miner") || checkStr.includes("strip miner")) {
+      hasStripMiner = true;
     }
     if (checkStr.includes("gas_harvester") || checkStr.includes("gas harvester")) {
       hasGasHarvester = true;
@@ -460,7 +465,7 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
 
   // Priority: radioactive > ice > gas > ore (if multiple types present, use settings preference)
   const detectedTypes: string[] = [];
-  if (hasMiningLaser) detectedTypes.push("ore");
+  if (hasMiningLaser || hasStripMiner) detectedTypes.push("ore");
   if (hasGasHarvester) detectedTypes.push("gas");
   if (hasIceHarvester) detectedTypes.push("ice");
   if (hasRadioactiveEquipment) detectedTypes.push("radioactive");
@@ -480,6 +485,11 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   if (hasGasHarvester) {
     ctx.log("info", "Gas harvester detected — gas harvesting mode");
     return "gas";
+  }
+  if (hasStripMiner) {
+    ctx.log("info", "Strip miner detected — ore mining mode (limited to common ores: carbon, copper, iron, lead, silicon, aluminum)");
+    ctx.log("warn", "Strip miners can only mine common rarity ores — will only target carbon/copper/iron/lead/silicon/aluminum");
+    return "ore";
   }
   if (hasMiningLaser) {
     ctx.log("info", "Mining laser detected — ore mining mode");
@@ -525,11 +535,58 @@ async function hasEquipmentForMiningType(ctx: RoutineContext, miningType: "ore" 
   switch (miningType) {
     case "ore":
       return moduleStr.includes("mining_laser") || moduleStr.includes("mining laser") ||
+             moduleStr.includes("strip_miner") || moduleStr.includes("strip miner") ||
              moduleStr.includes("deep_core_survey_scanner") || moduleStr.includes("deep core survey scanner");
     case "gas": return moduleStr.includes("gas_harvester") || moduleStr.includes("gas harvester");
     case "ice": return moduleStr.includes("ice_harvester") || moduleStr.includes("ice harvester");
     case "radioactive": return hasRadioactiveEquipmentCached(modules);
   }
+}
+
+/**
+ * Check if the ship has strip miner equipped (limited to basic ores only).
+ * Strip miners can ONLY mine iron_ore and copper_ore - they cannot mine rarer ores.
+ */
+async function hasStripMiner(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+  let modules: unknown[];
+
+  if (cachedModules) {
+    modules = cachedModules;
+  } else {
+    const shipResp = await bot.exec("get_ship");
+    if (shipResp.error) return false;
+    const shipData = shipResp.result as Record<string, unknown>;
+    modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  }
+
+  const moduleStr = modules.map(m => {
+    const obj = typeof m === "object" && m !== null ? m as Record<string, unknown> : {};
+    return `${obj.id || ""} ${obj.name || ""} ${obj.type || ""}`.toLowerCase();
+  }).join(" ");
+
+  return moduleStr.includes("strip_miner") || moduleStr.includes("strip miner");
+}
+
+/**
+ * List of ores that strip miners can mine (common rarity only).
+ * Strip miners are limited to common ores - cannot mine rare/exotic ores.
+ * Common ores: carbon, copper, iron, lead, silicon, aluminum
+ */
+const STRIP_MINER_ORES = new Set([
+  "carbon_ore",
+  "copper_ore", 
+  "iron_ore",
+  "lead_ore",
+  "silicon_ore",
+  "aluminum_ore"
+]);
+
+/**
+ * Check if an ore is minable by strip miner.
+ */
+function isStripMinerOre(oreId: string): boolean {
+  return STRIP_MINER_ORES.has(oreId.toLowerCase());
 }
 
 /**
@@ -1314,6 +1371,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
   const settings0 = getMinerSettings(bot.username);
   const homeSystem = settings0.homeSystem || bot.system;
+  const cargoThresholdRatio = settings0.cargoThreshold / 100;
+
+  // ── CRITICAL FIX: Check cargo after client restart/timeout before anything else ──
+  // If cargo is full at routine start, log a warning - the session recovery will handle it
+  const startCargoFill = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+  if (startCargoFill >= cargoThresholdRatio) {
+    ctx.log("mining", `Warning: Cargo full (${Math.round(startCargoFill * 100)}%) at routine start`);
+  }
 
   // ── Cache ship modules at routine start ──
   // This avoids repeated get_ship calls that may return incomplete data
@@ -1323,8 +1388,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   // ── Mining session recovery ──
   const activeSession = getActiveMiningSession(bot.username);
   let recoveredSession: MiningSession | null = null;
+  let sessionWasReturningHome = false;
   if (activeSession) {
     ctx.log("mining", `Found incomplete mining session: ${activeSession.targetResourceName} (${activeSession.state})`);
+    
+    // CRITICAL FIX: Track if the session was in returning_home state
+    // This is needed to properly resume after client restart/timeouts
+    sessionWasReturningHome = activeSession.state === "returning_home";
+    
     // Validate session - check if target resource is still valid
     if (activeSession.targetResourceId) {
       const locations = mapStore.findOreLocations(activeSession.targetResourceId);
@@ -1511,6 +1582,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Deep core capability check - needed for quota selection below
     const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
 
+    // Check for strip miner (limited to basic ores only)
+    const usingStripMiner = await hasStripMiner(ctx, cachedModules || undefined);
+
     // Radioactive mining: check if we can access hidden POIs (requires deep core extractor)
     // Without extractor, can only mine regular ore belts
     // Use full capability check (all 3 modules) to avoid false positives from detection
@@ -1547,6 +1621,15 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       resourceLabel = targetResource === settings.targetOre ? "ore" : (targetResource === settings.targetIce ? "ice" : "gas");
     }
 
+    // ── STRIP MINER RESTRICTION ──
+    // Strip miners can ONLY mine basic ores (iron/copper) - cannot mine rarer ores
+    // If strip miner is equipped and target is not a common ore, override to iron_ore
+    if (usingStripMiner && targetResource && !isStripMinerOre(targetResource)) {
+      ctx.log("warn", `Strip miner limitation: cannot mine ${targetResource} — overriding to iron_ore`);
+      targetResource = "iron_ore";
+      resourceLabel = "ore";
+    }
+
     // Log mining configuration (re-checked each cycle)
     if (targetResource) {
       ctx.log("mining", `Target ${resourceLabel}: ${targetResource} (mode: ${settings.miningType})`);
@@ -1559,10 +1642,25 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Select quotas based on mining type ──
     // CRITICAL FIX: Deep core miners should use deepCoreQuotas, not oreQuotas
+    // STRIP MINER: Use iron/copper specific quotas (basic ores only)
     const useDeepCore = deepCoreCap.canMine;
-    const quotas = useDeepCore 
+    let quotas = useDeepCore 
       ? settings.deepCoreQuotas 
       : (miningType === "ice" ? settings.iceQuotas : (miningType === "ore" ? settings.oreQuotas : (miningType === "radioactive" ? settings.radioactiveQuotas : settings.gasQuotas)));
+    
+    // Strip miner restriction: filter quotas to only iron/copper ores
+    if (usingStripMiner) {
+      const filteredQuotas: Record<string, number> = {};
+      for (const [ore, quota] of Object.entries(quotas)) {
+        if (isStripMinerOre(ore)) {
+          filteredQuotas[ore] = quota;
+        }
+      }
+      if (Object.keys(filteredQuotas).length > 0) {
+        quotas = filteredQuotas;
+        ctx.log("debug", `Strip miner - using filtered quotas: ${JSON.stringify(quotas)}`);
+      }
+    }
     
     if (useDeepCore) {
       ctx.log("debug", `Deep core mining detected - using deepCoreQuotas: ${JSON.stringify(quotas)}`);
@@ -1648,15 +1746,35 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           recoveredSession = null;
         } else {
           ctx.log("mining", `Resuming recovered session: ${recoveredSession.targetResourceName} @ ${recoveredSession.targetPoiName}`);
-          // Update session state based on current position
-          if (bot.system === recoveredSession.homeSystem && bot.docked) {
-            recoveredSession.state = "depositing";
-          } else if (bot.system === recoveredSession.targetSystemId) {
-            recoveredSession.state = "mining";
+          
+          // CRITICAL FIX: Check cargo BEFORE deciding to continue mining
+          // If cargo is full (or session was returning_home), return home first
+          const currentFill = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+          const isCargoFull = currentFill >= cargoThresholdRatio;
+          
+          if (isCargoFull) {
+            ctx.log("mining", `Cargo full (${Math.round(currentFill * 100)}%) — session must return home first`);
+            // Keep the returning_home state from the session
+            recoveredSession.state = "returning_home";
+            await updateMiningSession(bot.username, { state: "returning_home" });
+          } else if (sessionWasReturningHome) {
+            // Session was returning_home but cargo isn't full - might have been a restart during return
+            // Keep it as returning_home to complete the return journey
+            ctx.log("mining", "Session was returning_home — completing return journey");
+            recoveredSession.state = "returning_home";
+            await updateMiningSession(bot.username, { state: "returning_home" });
           } else {
-            recoveredSession.state = "traveling_to_ore";
+            // Update session state based on current position
+            if (bot.system === recoveredSession.homeSystem && bot.docked) {
+              recoveredSession.state = "depositing";
+            } else if (bot.system === recoveredSession.targetSystemId) {
+              recoveredSession.state = "mining";
+            } else {
+              // traveling_to_ore or returning_home
+              recoveredSession.state = recoveredSession.state as any;
+            }
+            await updateMiningSession(bot.username, { state: recoveredSession.state });
           }
-          await updateMiningSession(bot.username, { state: recoveredSession.state });
         }
       }
     }
@@ -1665,6 +1783,51 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let effectiveTarget = recoveredSession ? recoveredSession.targetResourceId : priorityTarget;
     const isQuotaDriven = recoveredSession ? recoveredSession.isQuotaDriven : !!quotaTargetResource;
     const maxJumps = settings.maxJumps || 10;
+
+    // CRITICAL FIX: If session is in returning_home state, return home instead of mining
+    // This catches both full cargo and session Was returning_home
+    if (recoveredSession && recoveredSession.state === "returning_home") {
+      ctx.log("mining", "Session state is returning_home — returning to deposit cargo first");
+      yield "return_home";
+      yield "pre_return_fuel";
+      const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+      if (!returnFueled) {
+        const { pois: currentPois } = await getSystemInfo(ctx);
+        const currentStation = findStation(currentPois);
+        if (currentStation) {
+          await refuelAtStation(ctx, currentStation, safetyOpts.fuelThresholdPct);
+        }
+      }
+      const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      if (!homeArrived) {
+        ctx.log("error", "Failed to return to home system — will retry next cycle");
+        await sleep(30000);
+        continue;
+      }
+      const { pois: homePois } = await getSystemInfo(ctx);
+      const homeStation = findStation(homePois);
+      if (homeStation) {
+        yield "travel_to_station";
+        await bot.exec("travel", { target_poi: homeStation.id });
+      }
+      yield "deposit_cargo";
+      await ensureDocked(ctx);
+      await dumpCargo(ctx, settings);
+      await bot.refreshCargo();
+      const remainingCargo = bot.inventory.filter(
+        i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell")
+      );
+      if (remainingCargo.length > 0) {
+        const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
+        ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
+        await sleep(5000);
+        continue;
+      }
+      ctx.log("mining", "Cargo deposited — session complete");
+      await completeMiningSession(bot.username);
+      recoveredSession = null;
+      continue;
+    }
 
     // Initialize target location variables (may be set by deep core search below)
     // CRITICAL FIX: Restore target location from recovered session to prevent
@@ -1732,14 +1895,34 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               oresToCheck = quotaEntries.map(e => e.oreId);
               ctx.log("mining", `Deep core quota priority: ${oresToCheck.map((oreId, i) => `${oreId} (deficit: ${quotaEntries[i].deficit.toLocaleString()})`).join(", ")}`);
             } else {
-              // All deep core quotas met - STOP MINING (do not cycle)
-              ctx.log("mining", `All deep core quotas met - no deficit found. Waiting for quota increase or manual override.`);
-              ctx.log("mining", `Current storage: ${Object.entries(deepCoreQuotas).map(([oreId, quotaTarget]) => {
+              // All deep core quotas met - pick the one with smallest surplus (closest to deficit)
+              // This ensures the miner keeps cycling through ores based on quota priorities,
+              // never fully stopping mining
+              const allEntries: Array<{ oreId: string; deficit: number }> = [];
+              for (const [oreId, quotaTarget] of Object.entries(deepCoreQuotas)) {
                 const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
-                return `${oreId}: ${current.toLocaleString()}/${quotaTarget.toLocaleString()}`;
-              }).join(", ")}`);
-              await sleep(60000);
-              continue;
+                const deficit = quotaTarget - current;
+                allEntries.push({ oreId, deficit });
+              }
+              
+              if (allEntries.length > 0) {
+                // Sort by deficit descending (largest = closest to zero = smallest surplus)
+                // deficit = target - current, so -211 (small surplus) > -64567 (big surplus)
+                allEntries.sort((a, b) => b.deficit - a.deficit);
+                const smallestSurplus = allEntries[0];
+                ctx.log("mining", `All deep core quotas met - cycling to ${smallestSurplus.oreId} (smallest surplus: ${smallestSurplus.deficit.toLocaleString()})`);
+                ctx.log("mining", `Current storage: ${Object.entries(deepCoreQuotas).map(([oreId, quotaTarget]) => {
+                  const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
+                  return `${oreId}: ${current.toLocaleString()}/${quotaTarget.toLocaleString()}`;
+                }).join(", ")}`);
+                oresToCheck = [smallestSurplus.oreId];
+              } else {
+                // No quotas at all - wait
+                ctx.log("mining", "No deep core ore quotas configured - waiting for quota setup");
+                ctx.log("mining", "Configure deepCoreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue)");
+                await sleep(60000);
+                continue;
+              }
             }
           } else {
             // No deep core quotas configured - don't mine anything

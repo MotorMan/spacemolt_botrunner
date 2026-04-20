@@ -724,12 +724,22 @@ async function engageTarget(
     ctx.log("combat", `   Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
   }
 
-  // Start the battle
-  const attackResp = await bot.exec("attack", { target_id: target.id });
+  // Start the battle - try pirate_id first, fallback to name if needed
+  let attackResp = await bot.exec("attack", { target_id: target.id });
+  
+  // If attack fails, try using the name as fallback
+  if (attackResp.error) {
+    const msg = attackResp.error.message.toLowerCase();
+    if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in")) {
+      ctx.log("combat", `Attack with pirate_id failed - trying name "${target.name}" instead...`);
+      attackResp = await bot.exec("attack", { target_id: target.name });
+    }
+  }
+  
   if (attackResp.error) {
     const msg = attackResp.error.message.toLowerCase();
     if (msg.includes("not found") || msg.includes("invalid") ||
-        msg.includes("no target") || msg.includes("already")) {
+        msg.includes("no target") || msg.includes("already") || msg.includes("not in")) {
       ctx.log("combat", `${target.name} is no longer available or already fighting`);
       return false;
     }
@@ -1605,6 +1615,9 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
       bot.poi = poi.id;
+
+      // Brief pause to ensure travel fully processed (especially for jumps between systems)
+      await sleep(1000);
 
       // Scan for targets
       yield "scan_for_targets";

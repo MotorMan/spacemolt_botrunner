@@ -3561,3 +3561,73 @@ export async function checkCustomsInspection(
  * Get customs statistics for AI chat context.
  */
 export { getBotCustomsStats };
+
+const MOBILE_CAPITAL_NOT_FOUND_REGEX = /It's called a Mobile Capital for a reason[^.]*\.?\s*Jump to (\w+) to find it/i;
+
+export function parseTravelHint(errorMessage: string): string | null {
+  if (!errorMessage) return null;
+  const match = MOBILE_CAPITAL_NOT_FOUND_REGEX.exec(errorMessage);
+  return match ? match[1] : null;
+}
+
+export async function travelToStationWithHint(
+  ctx: RoutineContext,
+  stationId: string,
+  stationName: string,
+  targetSystemId: string,
+  opts: {
+    fuelThresholdPct: number;
+    hullThresholdPct: number;
+    noJettison?: boolean;
+    autoCloak?: boolean;
+    hint?: string;
+    maxRetries?: number;
+  }
+): Promise<{ success: boolean; usedHint: boolean; hintSystem?: string }> {
+  const { bot } = ctx;
+  const maxRetries = opts.maxRetries ?? 3;
+  let hintSystem = opts.hint || null;
+  let usedHint = false;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    ctx.log("travel", `Traveling to ${stationName || stationId} in ${targetSystemId}... (attempt ${attempt + 1}/${maxRetries})`);
+    const travelResp = await bot.exec("travel", { target_poi: stationId, target_system: targetSystemId });
+
+    if (!travelResp.error) {
+      ctx.log("travel", `Arrived at ${stationName || stationId}`);
+      return { success: true, usedHint, hintSystem: hintSystem || undefined };
+    }
+
+    const errorMsg = travelResp.error?.message || "";
+    ctx.log("error", `Travel failed: ${errorMsg}`);
+
+    if (!hintSystem) {
+      const parsedHint = parseTravelHint(errorMsg);
+      if (parsedHint) {
+        ctx.log("travel", `Received hint: Jump to ${parsedHint} to find it`);
+        hintSystem = parsedHint;
+        usedHint = true;
+      }
+    }
+
+    if (hintSystem && attempt < maxRetries - 1) {
+      ctx.log("travel", `Rerouting to hint system ${hintSystem}...`);
+      const navResult = await navigateToSystem(ctx, hintSystem, {
+        fuelThresholdPct: opts.fuelThresholdPct,
+        hullThresholdPct: opts.hullThresholdPct,
+        noJettison: opts.noJettison,
+        autoCloak: opts.autoCloak,
+      });
+
+      if (!navResult) {
+        ctx.log("error", `Failed to navigate to hint system ${hintSystem}`);
+        return { success: false, usedHint, hintSystem };
+      }
+
+      targetSystemId = hintSystem;
+      hintSystem = null;
+    }
+  }
+
+  return { success: false, usedHint, hintSystem: hintSystem || undefined };
+}

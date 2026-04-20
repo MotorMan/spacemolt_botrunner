@@ -1133,8 +1133,15 @@ class MapStore {
    * Find the best mining location for a resource, scored by abundance and accessibility.
    * Prefers POIs with high remaining resources, low depletion, and recent scans.
    * HEAVILY priorit hidden POIs (deep core mining) over regular POIs.
+   * 
+   * @param oreId - The ore/resource ID to find locations for
+   * @param fromSystem - System to calculate distance from (default: faction home)
+   * @param blacklist - Systems to exclude
+   * @param shipSpeed - Ship jump speed (1-6, default 1). Speed 1=120s/jump, 2=110s, 3=100s, 4=80s, 5=50s, 6=30s
+   * @param shipCargo - Ship cargo capacity (default 8000)
+   * @param isMiningShip - Whether ship has mining ship double-cargo bonus (default false)
    */
-  findBestMiningLocation(oreId: string, fromSystem?: string, blacklist?: string[]): Array<{
+  findBestMiningLocation(oreId: string, fromSystem?: string, blacklist?: string[], shipSpeed?: number, shipCargo?: number, isMiningShip?: boolean): Array<{
     systemId: string;
     systemName: string;
     poiId: string;
@@ -1157,6 +1164,16 @@ class MapStore {
     const locations = this.findOreLocations(oreId);
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+    
+    // Ship parameters with defaults
+    const speed = shipSpeed || 1;
+    const cargo = shipCargo || 8000;
+    const isMining = isMiningShip || false;
+    const effectiveCargo = isMining ? cargo * 2 : cargo;
+    
+    // Jump times lookup for later use
+    const jumpTimes: Record<number, number> = { 1: 120, 2: 110, 3: 100, 4: 80, 5: 50, 6: 30 };
+    const jumpTime = jumpTimes[speed] || 120;
 
     const scored = locations
       .filter(loc => !blacklistSet.has(loc.systemId.toLowerCase()))
@@ -1176,23 +1193,41 @@ class MapStore {
         }
 
         // Score components:
-        // 1. Resource abundance (0-100 points) — based on remaining/max ratio
-        let abundanceScore = 0;
-        if (loc.maxRemaining > 0) {
-          abundanceScore = (loc.remaining / loc.maxRemaining) * 100;
-        } else if (loc.totalMined > 0) {
-          // No scan data — use historical yield as proxy (capped at 50)
-          abundanceScore = Math.min(50, Math.log10(loc.totalMined) * 10);
+        // 1. Resource abundance — based on TOTAL remaining, not percentage
+        // This way, 19K remaining beats 8K remaining regardless of percentage mined
+        // Capped at 100 points (equivalent to maxRemaining >= 10000)
+        let abundanceScore = Math.min(100, Math.log10(loc.remaining + 1) * 15);
+        
+        // But also give bonus for high percentage (virgin systems)
+        if (loc.depletionPercent >= 95) {
+          abundanceScore += 20; // Virgin system bonus
         }
 
-        // 2. Availability bonus (0-50 points) — depletion_percent from game API means
-        // "% available" (100 = full, 0 = empty), despite the misleading name
-        const availabilityScore = (loc.depletionPercent / 100) * 50;
+        // 2. Availability bonus (0-30 points) — lower weight, just to prefer healthier systems
+        const availabilityScore = (loc.depletionPercent / 100) * 30;
 
-        // 3. Distance penalty (0-40 points) — gentler slope: 2 points per jump
-        // This ensures distance still matters even for far systems
-        // 0 jumps: 40, 10 jumps: 20, 20 jumps: 0
-        const distanceScore = Math.max(0, 40 - jumpsAway * 2);
+        // 3. Distance penalty — Adjusted for ship speed and cargo capacity
+        // Faster ships can travel further efficiently, larger cargo means fewer returns
+        // Speed bonus: speed 6 is ~4x faster than speed 1, so reduce penalty by up to 60%
+        // Cargo bonus: larger cargo = fewer trips back, reduce penalty proportionally
+        const speedFactor = speed >= 5 ? 0.4 : speed >= 4 ? 0.6 : speed >= 3 ? 0.75 : speed >= 2 ? 0.85 : 1.0;
+        const cargoFactor = Math.min(1.5, effectiveCargo / 8000); // Up to 1.5x bonus for large cargo
+        
+        // Base penalty (for speed 1, cargo 8000), then apply factors
+        let basePenalty = 50 - jumpsAway * 3;
+        if (jumpsAway > 10) {
+          basePenalty -= (jumpsAway - 10) * 4;
+        }
+        // Apply ship bonuses
+        const adjustedPenalty = basePenalty * speedFactor * (2 - cargoFactor * 0.5);
+        const distanceScore = Math.max(-60, Math.round(adjustedPenalty));
+
+        // 3b. Richness efficiency bonus (0-35 points) — rewards high richness CLOSE to current position
+        // Faster ships get bonus for distant rich POIs
+        const maxEfficiencyJumps = speed >= 5 ? 18 : speed >= 4 ? 15 : speed >= 3 ? 14 : 12;
+        const richnessEfficiencyScore = jumpsAway <= maxEfficiencyJumps && loc.richness > 25
+          ? Math.min(35, (loc.richness - 25) * (1 - jumpsAway / maxEfficiencyJumps) * 0.6)
+          : 0;
 
         // 4. Scan freshness bonus (0-20 points)
         let freshnessScore = 20;
@@ -1217,12 +1252,14 @@ class MapStore {
         // Score bonus: +200 points (guarantees they beat regular POIs)
         const hiddenPoiBonus = loc.isHidden ? 200 : 0;
 
-        // 7. Richness bonus (0-30 points)
+        // 7. Richness bonus (0-60 points)
         // Higher richness = more efficient mining (more ore per action)
-        // Richness ranges from ~1-100+, so scale accordingly
-        const richnessScore = Math.min(30, loc.richness * 0.3);
+        // Key insight: richness 34 is ~2x better than 15, not just additive
+        // Use stronger scaling: richness * 1.5, capped at 60
+        const richnessScore = Math.min(60, loc.richness * 1.5);
 
-        const score = abundanceScore + availabilityScore + distanceScore + freshnessScore + depletionPenalty + hiddenPoiBonus + richnessScore;
+        const score = abundanceScore + availabilityScore + distanceScore + freshnessScore + 
+                   depletionPenalty + hiddenPoiBonus + richnessScore + richnessEfficiencyScore;
 
         return {
           ...loc,
@@ -1622,6 +1659,39 @@ class MapStore {
     if (!this.data.mobile_capitol) return false;
     return this.data.mobile_capitol.system_id === systemId && 
            this.data.mobile_capitol.poi_id === poiId;
+  }
+
+  findStationInSystem(systemId: string, stationIdPattern?: string): { poiId: string; poiName: string; baseId: string } | null {
+    const sys = this.data.systems[systemId];
+    if (!sys) return null;
+    
+    for (const poi of sys.pois) {
+      if (!poi.has_base) continue;
+      
+      if (stationIdPattern) {
+        const normalizedPattern = stationIdPattern.toLowerCase().replace(/_/g, ' ');
+        const normalizedPoiId = poi.id.toLowerCase().replace(/_/g, ' ');
+        const normalizedBaseId = (poi.base_id || '').toLowerCase().replace(/_/g, ' ');
+        
+        if (normalizedPoiId.includes(normalizedPattern) || 
+            normalizedBaseId.includes(normalizedPattern) ||
+            poi.name.toLowerCase().replace(/_/g, ' ').includes(normalizedPattern)) {
+          return {
+            poiId: poi.id,
+            poiName: poi.name,
+            baseId: poi.base_id || poi.id,
+          };
+        }
+      } else {
+        return {
+          poiId: poi.id,
+          poiName: poi.name,
+          baseId: poi.base_id || poi.id,
+        };
+      }
+    }
+    
+    return null;
   }
 
   /** Formatted summary string for menu display. */

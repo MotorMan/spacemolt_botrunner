@@ -105,6 +105,87 @@ interface Recipe {
   category?: string;
 }
 
+// ── Active facility materials tracking ─────────────────────────────────
+
+interface ActiveFacilityMaterial {
+  itemId: string;
+  name: string;
+  facilityName: string;
+  recipeId: string;
+}
+
+let cachedActiveFacilityMaterials: ActiveFacilityMaterial[] = [];
+
+async function getActivePlayerFacilityMaterials(
+  ctx: RoutineContext,
+  recipes: Recipe[],
+): Promise<ActiveFacilityMaterial[]> {
+  if (cachedActiveFacilityMaterials.length > 0) {
+    return cachedActiveFacilityMaterials;
+  }
+
+  const { bot } = ctx;
+  const materials: ActiveFacilityMaterial[] = [];
+
+  try {
+    const resp = await bot.exec("facility", { action: "list" });
+    
+    if (resp.error) {
+      ctx.log("craft", `Facility list failed: ${resp.error.message}`);
+      return materials;
+    }
+
+    const result = resp.result as Record<string, unknown> | undefined;
+    const playerFacilities = (result?.player_facilities as Array<Record<string, unknown>>) || [];
+
+    for (const facility of playerFacilities) {
+      const isActive = facility.active === true;
+      if (!isActive) continue;
+
+      const recipeId = facility.recipe_id as string;
+      if (!recipeId) continue;
+
+      const facilityName = facility.name as string || "Unknown Facility";
+      const facilityType = facility.type as string || "";
+
+      const recipe = recipes.find(r => r.recipe_id === recipeId);
+      if (!recipe) {
+        ctx.log("craft", `Active facility "${facilityName}" uses unknown recipe: ${recipeId}`);
+        continue;
+      }
+
+      for (const comp of recipe.components) {
+        materials.push({
+          itemId: comp.item_id,
+          name: comp.name || comp.item_id,
+          facilityName,
+          recipeId,
+        });
+      }
+
+      ctx.log("craft", `Active facility: ${facilityName} (${facilityType}) needs: ${recipe.components.map(c => `${c.quantity}x ${c.name}`).join(", ")}`);
+    }
+
+    cachedActiveFacilityMaterials = materials;
+
+    if (materials.length > 0) {
+      ctx.log("craft", `Active facilities need ${materials.length} material types: ${[...new Set(materials.map(m => m.name))].join(", ")}`);
+    }
+
+  } catch (err) {
+    ctx.log("error", `Error fetching active facilities: ${err}`);
+  }
+
+  return materials;
+}
+
+function isMaterialNeededByActiveFacility(
+  itemId: string,
+  activeMaterials: ActiveFacilityMaterial[],
+): boolean {
+  return activeMaterials.some(m => m.itemId === itemId);
+}
+
 function parseRecipes(data: unknown): Recipe[] {
   if (!data || typeof data !== "object") return [];
   const d = data as Record<string, unknown>;
@@ -1181,6 +1262,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
 
   while (bot.state === "running") {
+    // Clear facility cache at start of each cycle
+    cachedActiveFacilityMaterials = [];
+
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await sleep(30000); continue; }
@@ -1434,32 +1518,47 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("craft", "Nothing to craft");
     }
 
+    // ── Get active facility materials before deposit ─────────────────────
+    let activeFacilityMaterials: ActiveFacilityMaterial[] = [];
+    if (bot.docked && !personalMode) {
+      activeFacilityMaterials = await getActivePlayerFacilityMaterials(ctx, recipes);
+    }
+
     // ── Deposit crafted goods to faction storage (only if in faction mode) ──
     if (bot.docked && !personalMode) {
       await bot.refreshCargo();
       await bot.refreshStorage();
       const depositedItems: string[] = [];
+      const skippedForFacility: string[] = [];
 
       // First, deposit all crafted items from cargo to faction storage
       for (const item of [...bot.inventory]) {
         if (item.quantity <= 0) continue;
-        // Use unified storage command: deposit from cargo to faction storage
+        
+        if (isMaterialNeededByActiveFacility(item.itemId, activeFacilityMaterials)) {
+          skippedForFacility.push(`${item.quantity}x ${item.name}`);
+          continue;
+        }
+        
         const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
         if (!dResp.error) {
           depositedItems.push(`${item.quantity}x ${item.name}`);
           logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (crafted)`);
         } else {
-          // Fallback: deposit to personal storage
           await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
         }
       }
 
-      // Transfer ALL items from personal storage to faction storage (including fuel/energy cells)
-      // This ensures the dedicated crafter bot's personal storage stays empty
+      // Transfer items from personal storage to faction storage (skip materials needed by active facilities)
       await bot.refreshStorage();
       for (const item of [...bot.storage]) {
         if (item.quantity <= 0) continue;
-        // Use unified storage command: transfer from personal storage to faction storage
+        
+        if (isMaterialNeededByActiveFacility(item.itemId, activeFacilityMaterials)) {
+          skippedForFacility.push(`${item.quantity}x ${item.name}`);
+          continue;
+        }
+        
         const transferResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "storage" });
         if (!transferResp.error) {
           depositedItems.push(`${item.quantity}x ${item.name} (from storage)`);
@@ -1469,6 +1568,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
       if (depositedItems.length > 0) {
         ctx.log("trade", `Deposited to faction: ${depositedItems.join(", ")}`);
+      }
+      if (skippedForFacility.length > 0) {
+        ctx.log("craft", `Kept for active facilities: ${skippedForFacility.join(", ")}`);
       }
       await bot.refreshCargo();
       await bot.refreshStorage();

@@ -855,6 +855,22 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
         const arrived = await navigateToSystem(ctx, station.systemId, safetyOpts);
+        
+        // CRITICAL FIX: Check cargo after travel attempt (success or failure)
+        // If travel failed but we still have full cargo, return home to deposit first
+        // This prevents the "full cargo at remote station" bug
+        await bot.refreshStatus();
+        const postTravelCargoPct = bot.cargoMax > 0 ? (bot.cargo / bot.cargoMax) : 0;
+        
+        if (postTravelCargoPct >= 0.95) {
+          ctx.log("warn", `Travel to ${station.systemId} ${arrived ? 'completed' : 'failed'} but cargo is full (${Math.round(postTravelCargoPct * 100)}%) — returning home to deposit first`);
+          yield "return_home";
+          await depositAtHome(ctx, settings);
+          ctx.log("info", "Cargo deposited — resuming cleanup routine");
+          // Continue to next iteration of the while loop to restart scanning
+          continue;
+        }
+        
         if (!arrived) {
           ctx.log("error", `Failed to reach ${station.systemId} — skipping`);
           continue;
@@ -901,6 +917,19 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
         bot.poi = station.poiId;
+      }
+      
+      // CRITICAL FIX: After intra-system travel (travel to station POI), check cargo
+      // If cargo is now full, return home to deposit before attempting dock/collection
+      await bot.refreshStatus();
+      const afterTravelCargoPct = bot.cargoMax > 0 ? (bot.cargo / bot.cargoMax) : 0;
+      if (afterTravelCargoPct >= 0.95) {
+        ctx.log("warn", `Cargo full (${Math.round(afterTravelCargoPct * 100)}%) after travel to ${station.poiName} — returning home to deposit first`);
+        yield "return_home";
+        await depositAtHome(ctx, settings);
+        ctx.log("info", "Cargo deposited — resuming cleanup routine");
+        // Return to start of station loop to check if we should continue
+        continue;
       }
 
       // Explicit dock attempt - don't use ensureDocked's complex logic

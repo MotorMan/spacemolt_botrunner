@@ -20,6 +20,7 @@ import { commandReceiverRoutine } from "./routines/command_receiver.js";
 import { fleetHunterCommanderRoutine } from "./routines/fleet_hunter_commander.js";
 import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordinate.js";
 import { escortRoutine } from "./routines/escort.js";
+import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
@@ -89,6 +90,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   fleet_hunter_subordinate: { name: "FleetHunterWing", fn: fleetHunterSubordinateRoutine },
   faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },
   trade_buyer: { name: "TradeBuyer", fn: tradeBuyerRoutine },
+  fuel_cell_seller: { name: "FuelCellSeller", fn: fuelCellSellerRoutine },
   cleanup: { name: "Cleanup", fn: cleanupRoutine },
   ai: { name: "AI", fn: aiRoutine },
   cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },
@@ -667,7 +669,7 @@ async function main(): Promise<void> {
 
     // Session resume is fast (5s delay to match renewal queue), full login requires rate limiting (25s delay)
     const SESSION_RESUME_DELAY_MS = 5000;
-    const FULL_LOGIN_DELAY_MS = 25000;
+    const FULL_LOGIN_DELAY_MS = 13000;
     let botIndex = 0;
 
     for (const [name, bot] of bots) {

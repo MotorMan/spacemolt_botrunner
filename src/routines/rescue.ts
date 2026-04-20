@@ -44,6 +44,7 @@ import {
   type RescueSession,
 } from "./rescueActivity.js";
 import { isKnownPlayer } from "../playernames.js";
+import { mapStore } from "../mapstore.js";
 import {
   shouldRescuePlayer,
   recordRescueRequest,
@@ -78,6 +79,7 @@ import {
   isRescueClaimedByPartner,
   registerCooperationHandler,
   unregisterCooperationHandler,
+  recordRoundRobinComplete,
   type RescueClaim,
 } from "../cooperation/rescueCooperation.js";
 
@@ -95,57 +97,105 @@ function getRescueSettings(): {
   homeStation?: string;
   costPerJump: number;
   costPerFuel: number;
-  cooperationEnabled: boolean;
-  partnerBotName: string;
-  cooperationMaxDelaySeconds: number;
   creditTopOffAmount: number;
   creditTopOffMinThreshold: number;
   maydayPirateProximityThreshold: number;
   maydayPirateLockoutMinutes: number;
+  creditTopOffBot: string;
+  fleetRescueBot: string;
+  maydayRescueBot: string;
+  premiumFuelReserve: number;
 } {
   const all = readSettings();
   const r = all.rescue || {};
   const ft = all.fuel_transfer || {};
-  // Also check global settings for homeSystem
   const general = all.general || {};
   return {
-    /** Fuel % below which a bot is considered in need of rescue. */
     fuelThreshold: (r.fuelThreshold as number) || 10,
-    /** Number of fuel cells to deliver per rescue. */
     rescueFuelCells: (r.rescueFuelCells as number) || 10,
-    /** Credits to send per rescue (if docked at same station). */
     rescueCredits: (r.rescueCredits as number) || 500,
-    /** Seconds between fleet scans. */
     scanIntervalSec: (r.scanIntervalSec as number) || 30,
-    /** Keep own fuel above this %. */
     refuelThreshold: (r.refuelThreshold as number) || 60,
-    /** Maximum jumps away to respond to MAYDAYs (0 = unlimited). */
     maydayMaxJumps: (r.maydayMaxJumps as number) || 12,
-    /** Max fuel % for MAYDAY sender to be considered a valid rescue (avoids ambushes). */
     maydayFuelThreshold: (r.maydayFuelThreshold as number) || 15,
-    /** Home system from rescue settings, fuel_transfer settings, or global settings */
     homeSystem: (r.homeSystem as string) || (ft.homeSystem as string) || (general.homeSystem as string),
-    /** Home station ID (format: "systemId|stationId") */
     homeStation: (r.homeStation as string) || '',
-    /** Credits charged per jump for rescue billing */
     costPerJump: (r.costPerJump as number) || 50,
-    /** Credits charged per unit of fuel for rescue billing */
     costPerFuel: (r.costPerFuel as number) || 2,
-    /** Cooperation enabled for multi-bot coordination */
-    cooperationEnabled: (r.cooperationEnabled as boolean) || false,
-    /** Partner bot name for DM communication */
-    partnerBotName: (r.partnerBotName as string) || '',
-    /** Max acceptable delay for cooperation messages */
-    cooperationMaxDelaySeconds: (r.cooperationMaxDelaySeconds as number) || 30,
-    /** Credits threshold for topping off bots (0 = disabled) */
     creditTopOffAmount: (r.creditTopOffAmount as number) || 10000,
-    /** Minimum credits a bot must have before topping off (prevents constant top-offs) */
     creditTopOffMinThreshold: (r.creditTopOffMinThreshold as number) || 10000,
-    /** Maximum jumps from pirate base to decline MAYDAY (0 = disabled) */
     maydayPirateProximityThreshold: (r.maydayPirateProximityThreshold as number) || 5,
-    /** Minutes to lockout MAYDAYs from players near pirate bases */
     maydayPirateLockoutMinutes: (r.maydayPirateLockoutMinutes as number) || 30,
+    creditTopOffBot: (r.creditTopOffBot as string) || '',
+    fleetRescueBot: (r.fleetRescueBot as string) || '',
+    maydayRescueBot: (r.maydayRescueBot as string) || '',
+    premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
   };
+}
+
+/**
+ * Check if this bot is the primary assigned for credit top-off operations.
+ * Returns true if this bot is the primary credit top-off bot, or if no assignment exists (legacy behavior).
+ */
+function isPrimaryCreditTopOffBot(botUsername: string): boolean {
+  const settings = getRescueSettings();
+  if (!settings.creditTopOffBot) {
+    return true;
+  }
+  return botUsername === settings.creditTopOffBot;
+}
+
+/**
+ * Check if this bot is the primary assigned for fleet rescue operations.
+ * Returns true if this bot is the primary fleet rescue bot, or if no assignment exists (legacy behavior).
+ */
+function isPrimaryFleetRescueBot(botUsername: string): boolean {
+  const settings = getRescueSettings();
+  if (!settings.fleetRescueBot) {
+    return true;
+  }
+  return botUsername === settings.fleetRescueBot;
+}
+
+/**
+ * Check if this bot is the primary assigned for MAYDAY rescue operations.
+ * Returns true if this bot is the primary MAYDAY rescue bot, or if no assignment exists (legacy behavior).
+ */
+function isPrimaryMaydayRescueBot(botUsername: string): boolean {
+  const settings = getRescueSettings();
+  if (!settings.maydayRescueBot) {
+    return true;
+  }
+  return botUsername === settings.maydayRescueBot;
+}
+
+/**
+ * Get the backup bot username for a given rescue type.
+ * Returns the other rescue bot if there's one assigned, otherwise returns empty string.
+ */
+function getBackupBotForRescue(botUsername: string, rescueType: 'fleet' | 'mayday' | 'creditTopOff'): string {
+  const settings = getRescueSettings();
+  const fleet = (globalThis as any).getFleetStatus?.() || [];
+  
+  let primaryBot: string;
+  if (rescueType === 'fleet') {
+    primaryBot = settings.fleetRescueBot;
+  } else if (rescueType === 'mayday') {
+    primaryBot = settings.maydayRescueBot;
+  } else {
+    primaryBot = settings.creditTopOffBot;
+  }
+  
+  // If this bot is the primary, find the other bot
+  if (botUsername === primaryBot || !primaryBot) {
+    for (const b of fleet) {
+      if (b.username !== botUsername && b.state === 'running') {
+        return b.username;
+      }
+    }
+  }
+  
+  return '';
 }
 
 // ── Pirate Base Proximity & MAYDAY Lockout ──────────────────────────────────────────────────
@@ -248,7 +298,7 @@ async function checkForPirateTrap(
   targetUsername: string,
   targetSystem: string,
   isMaydayTarget: boolean,
-  settings: { partnerBotName: string; maydayMaxJumps: number }
+  settings: { maydayMaxJumps: number }
 ): Promise<{ isTrap: boolean; reason: string; details: Record<string, unknown> }> {
   const { bot } = ctx;
   const fleet = ctx.getFleetStatus?.() || [];
@@ -869,6 +919,115 @@ async function hasRefuelingPump(ctx: RoutineContext): Promise<boolean> {
 }
 
 /**
+ * Check if we have sufficient premium fuel cells in cargo for emergency reserves.
+ * Returns the quantity of premium fuel cells currently in cargo.
+ */
+async function getPremiumFuelCellsInCargo(ctx: RoutineContext): Promise<number> {
+  const { bot } = ctx;
+  await bot.refreshCargo();
+  const premiumCell = bot.inventory.find(i => i.itemId === "premium_fuel_cell");
+  return premiumCell?.quantity || 0;
+}
+
+/**
+ * Ensure we have the configured reserve of premium fuel cells in cargo.
+ * This is used to maintain emergency reserves for self-rescue scenarios.
+ * 
+ * @returns true if we have the required reserve (or acquired it), false if unable
+ */
+async function ensurePremiumFuelReserve(ctx: RoutineContext, reserveCount: number): Promise<boolean> {
+  const { bot } = ctx;
+  
+  if (reserveCount <= 0) {
+    return true; // No reserve needed
+  }
+  
+  const settings = getRescueSettings();
+  const currentPremium = await getPremiumFuelCellsInCargo(ctx);
+  
+  if (currentPremium >= reserveCount) {
+    ctx.log("rescue", `✓ Premium fuel reserve OK: ${currentPremium}/${reserveCount}`);
+    return true;
+  }
+  
+  ctx.log("rescue", `⚠️ Low premium fuel reserve: ${currentPremium}/${reserveCount} — acquiring more...`);
+  
+  // Must be docked to buy from market
+  if (!bot.docked) {
+    await ensureDocked(ctx);
+  }
+  
+  // First check faction storage
+  await bot.refreshFactionStorage();
+  const factionPremium = bot.factionStorage?.find(i => i.itemId === "premium_fuel_cell");
+  
+  if (factionPremium && factionPremium.quantity >= reserveCount) {
+    ctx.log("rescue", `Found ${factionPremium.quantity}x premium fuel cells in faction storage`);
+    const { collectFromStorage } = await import("./common.js");
+    await collectFromStorage(ctx);
+    await bot.refreshCargo();
+    const afterCollect = await getPremiumFuelCellsInCargo(ctx);
+    if (afterCollect >= reserveCount) {
+      ctx.log("rescue", `✓ Acquired premium fuel reserve from faction storage: ${afterCollect}/${reserveCount}`);
+      return true;
+    }
+  }
+  
+  // Try buying from market
+  const needed = reserveCount - currentPremium;
+  const marketResp = await bot.exec("view_market");
+  
+  if (!marketResp.error && marketResp.result) {
+    const mData = marketResp.result as Record<string, unknown>;
+    const items = (
+      Array.isArray(mData) ? mData :
+      Array.isArray(mData.items) ? mData.items :
+      Array.isArray(mData.market) ? mData.market :
+      []
+    ) as Array<Record<string, unknown>>;
+    
+    const premiumItem = items.find(i => 
+      ((i.item_id as string) || (i.id as string)) === "premium_fuel_cell"
+    );
+    
+    if (premiumItem) {
+      const itemId = (premiumItem.item_id as string) || (premiumItem.id as string) || "";
+      const price = (premiumItem.price as number) || (premiumItem.buy_price as number) || 0;
+      const available = (premiumItem.quantity as number) || (premiumItem.stock as number) || 0;
+      const qty = Math.min(needed, available);
+      
+      if (qty > 0 && (price * qty) <= bot.credits) {
+        ctx.log("rescue", `Buying ${qty}x premium fuel cells (${price}cr each)...`);
+        const buyResp = await bot.exec("buy", { item_id: itemId, quantity: qty });
+        if (!buyResp.error) {
+          await bot.refreshCargo();
+          const afterBuy = await getPremiumFuelCellsInCargo(ctx);
+          ctx.log("rescue", `✓ Acquired premium fuel reserve from market: ${afterBuy}/${reserveCount}`);
+          return afterBuy >= reserveCount;
+        } else {
+          ctx.log("rescue", `Buy failed: ${buyResp.error.message}`);
+        }
+      }
+    }
+  }
+  
+  // Try regular fuel cells if premium not available
+  ctx.log("rescue", `Premium fuel cells not available — trying regular fuel cells as fallback...`);
+  await bot.refreshCargo();
+  const regularFuel = bot.inventory.find(i => 
+    i.itemId.includes("fuel_cell") && i.itemId !== "premium_fuel_cell"
+  );
+  
+  if (regularFuel && regularFuel.quantity >= reserveCount) {
+    ctx.log("rescue", `✓ Using regular fuel cells as reserve: ${regularFuel.quantity}/${reserveCount}`);
+    return true;
+  }
+  
+  ctx.log("rescue", `⚠️ Could not maintain premium fuel reserve - continuing anyway`);
+  return false; // Not critical enough to fail the mission
+}
+
+/**
  * Credit top-off function — redistributes credits from faction treasury
  * to ONE bot that is running low, including self.
  * This is designed to be called repeatedly in a background loop,
@@ -1098,10 +1257,15 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
   ctx.log("rescue", `✓ Marked ${ourBotNames.length} bots as our own (excluded from ghost tracking)`);
 
   // ── Start background credit top-off loop (non-blocking) ──
-  startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+  // Only the primary credit top-off bot should run this background loop
+  if (isPrimaryCreditTopOffBot(bot.username)) {
+    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+  } else {
+    ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
+  }
 
   // ── Register Bot Chat handler for rescue cooperation ──
-  // This replaces the old DM-based coordination system
+  // This enables coordination with other rescue bots via Bot Chat Channel
   const botChatHandler = (message: BotChatMessage) => {
     if (message.sender === bot.username) return; // Ignore own messages
     
@@ -1111,10 +1275,9 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
     }
   };
 
-  if (isCooperationEnabled() && settings.cooperationEnabled) {
-    registerCooperationHandler(bot.username, botChatHandler);
-    ctx.log("coop", `🤝 Registered Bot Chat handler for cooperation with ${settings.partnerBotName}`);
-  }
+  // Always register cooperation handler - Bot Chat Channel handles coordination automatically
+  registerCooperationHandler(bot.username, botChatHandler);
+  ctx.log("coop", `🤝 Registered Bot Chat handler for rescue cooperation`);
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -1276,7 +1439,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         ctx.log("rescue", `Session state '${recoveredSession.state}' - continuing return to home (${homeSystem})...`);
         bot.system = target.system;
         bot.poi = target.poi;
-        skipToReturnHome = true;
+skipToReturnHome = true;
       }
     }
 
@@ -1290,7 +1453,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         continue;
       }
 
-      const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
+      // Check if we're the primary fleet rescue bot
+      const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+      ctx.log("rescue", `🔍 Fleet scan - primary fleet rescue: ${isFleetRescuePrimary ? 'YES (this bot)' : 'NO (waiting for ' + (settings.fleetRescueBot || 'other bot') + ')'} `);
+
+      const targets = isFleetRescuePrimary ? findStrandedBots(fleet, bot.username, settings.fuelThreshold) : [];
 
       // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
       for (const target of targets) {
@@ -1312,6 +1479,12 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       cleanupStaleQueue();
 
       // ── Check for MAYDAY requests if no fleet targets ──
+      // Check if we're the primary MAYDAY rescue bot
+      const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
+      if (!isMaydayRescuePrimary) {
+        ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
+      }
+
       let maydayTarget: RescueTarget | null = null;
       if (targets.length === 0) {
         const mayday = getNextMayday();
@@ -1426,8 +1599,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           // ── RESCUE COOPERATION: Check with partner bot if enabled ──
           let partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
           
-          if (isCooperationEnabled() && settings.cooperationEnabled) {
-            ctx.log("coop", `🤝 Cooperation enabled (partner: ${settings.partnerBotName})`);
+          if (isCooperationEnabled()) {
+            ctx.log("coop", `🤝 Bot Chat Channel cooperation active`);
             ctx.log("coop", `🤝 MAYDAY: ${mayday.sender} at ${mayday.system}/${mayday.poi}`);
             
             if (partnerClaim) {
@@ -1544,7 +1717,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
           
           // ── RESCUE COOPERATION: Send claim to partner bot ──
-          if (isCooperationEnabled() && settings.cooperationEnabled) {
+          if (isCooperationEnabled()) {
             const myClaim: RescueClaim = {
               type: "RESCUE_CLAIM",
               player: mayday.sender,
@@ -1556,17 +1729,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             };
 
             // Send claim to partner bot and wait for it to complete
-            ctx.log("coop", `📧 Sending rescue claim to ${settings.partnerBotName}...`);
+            ctx.log("coop", `📧 Sending rescue claim to Bot Chat Channel...`);
             const sendResult = await sendRescueClaim(bot, myClaim);
             if (sendResult.ok) {
-              ctx.log("coop", `📧 Sent rescue claim to ${settings.partnerBotName}: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
+              ctx.log("coop", `📧 Sent rescue claim: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
             } else {
               ctx.log("coop", `⚠️ Failed to send rescue claim: ${sendResult.error}`);
             }
 
             // Wait briefly for partner's claim to arrive (accounts for chat delays)
-            // Use configured delay, default 3 seconds
-            const cooperationDelay = Math.min(settings.cooperationMaxDelaySeconds * 1000, 5000);
+            // Use default 3 second delay
+            const cooperationDelay = 3000;
             ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for partner claim...`);
             await sleep(cooperationDelay);
 
@@ -1938,7 +2111,6 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
         // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names ──
         const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
-          partnerBotName: settings.partnerBotName,
           maydayMaxJumps: settings.maydayMaxJumps
         });
         if (trapCheck.isTrap) {
@@ -1987,38 +2159,127 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         }
 
         // Also check if route to target passes through blacklisted systems
-        try {
-          const routeResp = await bot.exec("find_route", { target_system: target.system });
-          if (!routeResp.error && routeResp.result) {
-            const route = routeResp.result as Record<string, unknown>;
-            const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
-            
-            if (routeData) {
-              const blacklistedOnRoute = routeData.find(r =>
-                blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
-              );
-              
-              if (blacklistedOnRoute) {
-                ctx.log("rescue", `🚫 BLOCKED: Route to ${target.system} passes through blacklisted system "${blacklistedOnRoute.system_id}"`);
-                ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available`);
-                
-                const activeSession = getActiveRescueSession(bot.username);
-                if (activeSession) {
-                  await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
-                }
-                
-                if (isMaydayTarget) {
-                  const mayday = getNextMayday();
-                  if (mayday) markMaydayHandled(mayday);
-                }
-                
-                await sleep(settings.scanIntervalSec * 1000);
-                continue;
-              }
+        // Try multiple routes if the first one is blocked
+        let routeToTarget: Array<{ system_id: string; name: string }> | null = null;
+        let routeAttempts = 0;
+        const MAX_ROUTE_ATTEMPTS = 3;
+        
+        while (routeAttempts < MAX_ROUTE_ATTEMPTS && !routeToTarget) {
+          routeAttempts++;
+          
+          // First try the mapped route (uses blacklist internally)
+          if (routeAttempts === 1) {
+            const mappedRoute = mapStore.findRoute(bot.system, target.system, blacklist);
+            if (mappedRoute && mappedRoute.length > 1) {
+              // Convert array of system IDs to route format
+              routeToTarget = mappedRoute.map((sysId, idx) => ({
+                system_id: sysId,
+                name: sysId,
+              }));
+              ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found safe mapped route (${routeToTarget.length} systems)`);
+            } else {
+              ctx.log("rescue", `📍 Route attempt ${routeAttempts}: No mapped route found, trying server...`);
             }
           }
-        } catch (e) {
-          ctx.log("warn", `Could not validate route to ${target.system}: ${e}`);
+          
+          // Second attempt: Query server for route
+          if (!routeToTarget && routeAttempts === 2) {
+            try {
+              const routeResp = await bot.exec("find_route", { target_system: target.system });
+              if (!routeResp.error && routeResp.result) {
+                const route = routeResp.result as Record<string, unknown>;
+                const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+                
+                if (routeData && routeData.length > 0) {
+                  // Check if this route passes through blacklisted systems
+                  const blacklistedOnRoute = routeData.find(r =>
+                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                  );
+                  
+                  if (!blacklistedOnRoute) {
+                    routeToTarget = routeData;
+                    ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found safe server route (${routeToTarget.length} systems)`);
+                  } else {
+                    ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Server route blocked by "${blacklistedOnRoute.system_id}"`);
+                  }
+                }
+              }
+            } catch (e) {
+              ctx.log("warn", `Route attempt ${routeAttempts} failed: ${e}`);
+            }
+          }
+          
+          // Third attempt: Try server route and filter out blacklisted systems manually
+          if (!routeToTarget && routeAttempts === 3) {
+            try {
+              const routeResp = await bot.exec("find_route", { target_system: target.system });
+              if (!routeResp.error && routeResp.result) {
+                const route = routeResp.result as Record<string, unknown>;
+                const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+                
+                if (routeData && routeData.length > 1) {
+                  // Find the blacklisted system and try to find alternative path around it
+                  const blockedIdx = routeData.findIndex(r =>
+                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                  );
+                  
+                  if (blockedIdx > 0) {
+                    // Try to find a route from system before the blocked one to the system after
+                    const beforeBlocked = routeData[blockedIdx - 1]?.system_id;
+                    const afterBlocked = routeData[blockedIdx + 1]?.system_id;
+                    
+                    if (beforeBlocked && afterBlocked) {
+                      ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Trying to bypass blocked system "${routeData[blockedIdx].system_id}"`);
+                      
+                      // Try to find alternate route from beforeBlocked to afterBlocked
+                      const altRoute = mapStore.findRoute(beforeBlocked, afterBlocked, blacklist);
+                      if (altRoute && altRoute.length > 1) {
+                        // Combine: before blocked portion + alternate route + after blocked portion
+                        const beforePortion = routeData.slice(0, blockedIdx);
+                        const afterPortion = routeData.slice(blockedIdx + 1);
+                        
+                        // Insert alternate route (excluding endpoints since they're already in route)
+                        const altPortion = altRoute.slice(1, -1).map(sysId => ({
+                          system_id: sysId,
+                          name: sysId,
+                        }));
+                        
+                        routeToTarget = [...beforePortion, ...altPortion, ...afterPortion];
+                        ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found bypass route! Total ${routeToTarget.length} systems`);
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              ctx.log("warn", `Route attempt ${routeAttempts} failed: ${e}`);
+            }
+          }
+          
+          // If we still don't have a route, wait a bit and retry
+          if (!routeToTarget && routeAttempts < MAX_ROUTE_ATTEMPTS) {
+            ctx.log("rescue", `📍 Route attempt ${routeAttempts} failed - retrying in 1s...`);
+            await sleep(1000);
+          }
+        }
+        
+        // If no safe route found after all attempts, abort
+        if (!routeToTarget) {
+          ctx.log("rescue", `🚫 BLOCKED: All routes to ${target.system} pass through blacklisted systems`);
+          ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available after ${MAX_ROUTE_ATTEMPTS} attempts`);
+          
+          const activeSession = getActiveRescueSession(bot.username);
+          if (activeSession) {
+            await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
+          }
+          
+          if (isMaydayTarget) {
+            const mayday = getNextMayday();
+            if (mayday) markMaydayHandled(mayday);
+          }
+          
+          await sleep(settings.scanIntervalSec * 1000);
+          continue;
         }
 
         ctx.log(logCategory, `Navigating to ${target.system}...`);
@@ -2664,6 +2925,10 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     if (recoveredSession || getActiveRescueSession(bot.username)) {
       await completeRescueSession(bot.username);
 
+      // Record round-robin completion for same-location coordination
+      recordRoundRobinComplete(target.system, bot.username);
+      ctx.log("coop", `📝 Recorded round-robin completion for ${target.system} by ${bot.username}`);
+
       // Also mark the queue entry as completed if this was our own bot
       if (isOwnBot(target.username)) {
         const queue = getRescueQueue();
@@ -2695,7 +2960,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
   // Cleanup when routine exits
   stopCreditTopOffBackground();
-  if (isCooperationEnabled() && settings.cooperationEnabled) {
+  if (isCooperationEnabled()) {
     unregisterCooperationHandler(bot.username, botChatHandler);
     ctx.log("coop", `🤝 Unregistered Bot Chat handler for cooperation`);
   }
@@ -3713,6 +3978,11 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
     logStatus(ctx);
     ctx.log("mayday", "✓ Bot is docked and ready for next MAYDAY");
 
+    // ── Ensure premium fuel reserve for emergency self-rescue ──
+    // This prevents the endless rescue loop by keeping fuel cells for when WE run out
+    yield "check_reserve";
+    await ensurePremiumFuelReserve(ctx, settings.premiumFuelReserve);
+
     // Short cooldown before next scan
     await sleep(10000);
   }
@@ -3836,7 +4106,12 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   // ── Start background credit top-off loop (non-blocking) ──
-  startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+  // Only the primary credit top-off bot should run this background loop
+  if (isPrimaryCreditTopOffBot(bot.username)) {
+    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+  } else {
+    ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
+  }
 
   // Log category - determined when target is selected
   let logCategory: string = "rescue";
@@ -4022,7 +4297,11 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
-      const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
+      // Check if we're the primary fleet rescue bot
+      const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+      ctx.log("rescue", `🔍 Fleet scan - primary fleet rescue: ${isFleetRescuePrimary ? 'YES (this bot)' : 'NO (waiting for ' + (settings.fleetRescueBot || 'other bot') + ')'} `);
+
+      const targets = isFleetRescuePrimary ? findStrandedBots(fleet, bot.username, settings.fuelThreshold) : [];
 
       // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
       for (const target of targets) {
@@ -4044,6 +4323,12 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       cleanupStaleQueue();
 
       // ── Check for MAYDAY requests if no fleet targets ──
+      // Check if we're the primary MAYDAY rescue bot
+      const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
+      if (!isMaydayRescuePrimary) {
+        ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
+      }
+
       let maydayTarget: RescueTarget | null = null;
       if (targets.length === 0) {
         const mayday = getNextMayday();
@@ -4158,8 +4443,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           // ── RESCUE COOPERATION: Check with partner bot if enabled ──
           let partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
           
-          if (isCooperationEnabled() && settings.cooperationEnabled) {
-            ctx.log("coop", `🤝 Cooperation enabled (partner: ${settings.partnerBotName})`);
+          if (isCooperationEnabled()) {
+            ctx.log("coop", `🤝 Bot Chat Channel cooperation active`);
             ctx.log("coop", `🤝 MAYDAY: ${mayday.sender} at ${mayday.system}/${mayday.poi}`);
             
             if (partnerClaim) {
@@ -4276,7 +4561,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
           
           // ── RESCUE COOPERATION: Send claim to partner bot ──
-          if (isCooperationEnabled() && settings.cooperationEnabled) {
+          if (isCooperationEnabled()) {
             const myClaim: RescueClaim = {
               type: "RESCUE_CLAIM",
               player: mayday.sender,
@@ -4288,17 +4573,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             };
 
             // Send claim to partner bot and wait for it to complete
-            ctx.log("coop", `📧 Sending rescue claim to ${settings.partnerBotName}...`);
+            ctx.log("coop", `📧 Sending rescue claim to Bot Chat Channel...`);
             const sendResult = await sendRescueClaim(bot, myClaim);
             if (sendResult.ok) {
-              ctx.log("coop", `📧 Sent rescue claim to ${settings.partnerBotName}: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
+              ctx.log("coop", `📧 Sent rescue claim: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
             } else {
               ctx.log("coop", `⚠️ Failed to send rescue claim: ${sendResult.error}`);
             }
 
             // Wait briefly for partner's claim to arrive (accounts for chat delays)
-            // Use configured delay, default 3 seconds
-            const cooperationDelay = Math.min(settings.cooperationMaxDelaySeconds * 1000, 5000);
+            // Use default 3 second delay
+            const cooperationDelay = 3000;
             ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for partner claim...`);
             await sleep(cooperationDelay);
 
@@ -4745,7 +5030,6 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
       // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names ──
       const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
-        partnerBotName: settings.partnerBotName,
         maydayMaxJumps: settings.maydayMaxJumps
       });
       if (trapCheck.isTrap) {
@@ -4794,38 +5078,118 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       }
 
       // Also check if route to target passes through blacklisted systems
-      try {
-        const routeResp = await bot.exec("find_route", { target_system: target.system });
-        if (!routeResp.error && routeResp.result) {
-          const route = routeResp.result as Record<string, unknown>;
-          const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
-          
-          if (routeData) {
-            const blacklistedOnRoute = routeData.find(r =>
-              blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
-            );
-            
-            if (blacklistedOnRoute) {
-              ctx.log("rescue", `🚫 BLOCKED: Route to ${target.system} passes through blacklisted system "${blacklistedOnRoute.system_id}"`);
-              ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available`);
-              
-              const activeSession = getActiveRescueSession(bot.username);
-              if (activeSession) {
-                await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
-              }
-              
-              if (isMaydayTarget) {
-                const mayday = getNextMayday();
-                if (mayday) markMaydayHandled(mayday);
-              }
-              
-              await sleep(settings.scanIntervalSec * 1000);
-              continue;
-            }
+      // Try multiple routes if the first one is blocked
+      let routeToTarget: Array<{ system_id: string; name: string }> | null = null;
+      let routeAttempts = 0;
+      const MAX_ROUTE_ATTEMPTS = 3;
+      
+      while (routeAttempts < MAX_ROUTE_ATTEMPTS && !routeToTarget) {
+        routeAttempts++;
+        
+        // First try the mapped route (uses blacklist internally)
+        if (routeAttempts === 1) {
+          const mappedRoute = mapStore.findRoute(bot.system, target.system, blacklist);
+          if (mappedRoute && mappedRoute.length > 1) {
+            routeToTarget = mappedRoute.map((sysId, idx) => ({
+              system_id: sysId,
+              name: sysId,
+            }));
+            ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found safe mapped route (${routeToTarget.length} systems)`);
+          } else {
+            ctx.log("rescue", `📍 Route attempt ${routeAttempts}: No mapped route found, trying server...`);
           }
         }
-      } catch (e) {
-        ctx.log("warn", `Could not validate route to ${target.system}: ${e}`);
+        
+        // Second attempt: Query server for route
+        if (!routeToTarget && routeAttempts === 2) {
+          try {
+            const routeResp = await bot.exec("find_route", { target_system: target.system });
+            if (!routeResp.error && routeResp.result) {
+              const route = routeResp.result as Record<string, unknown>;
+              const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+              
+              if (routeData && routeData.length > 0) {
+                const blacklistedOnRoute = routeData.find(r =>
+                  blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                );
+                
+                if (!blacklistedOnRoute) {
+                  routeToTarget = routeData;
+                  ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found safe server route (${routeToTarget.length} systems)`);
+                } else {
+                  ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Server route blocked by "${blacklistedOnRoute.system_id}"`);
+                }
+              }
+            }
+          } catch (e) {
+            ctx.log("warn", `Route attempt ${routeAttempts} failed: ${e}`);
+          }
+        }
+        
+        // Third attempt: Try server route and filter out blacklisted systems manually
+        if (!routeToTarget && routeAttempts === 3) {
+          try {
+            const routeResp = await bot.exec("find_route", { target_system: target.system });
+            if (!routeResp.error && routeResp.result) {
+              const route = routeResp.result as Record<string, unknown>;
+              const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+              
+              if (routeData && routeData.length > 1) {
+                const blockedIdx = routeData.findIndex(r =>
+                  blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                );
+                
+                if (blockedIdx > 0) {
+                  const beforeBlocked = routeData[blockedIdx - 1]?.system_id;
+                  const afterBlocked = routeData[blockedIdx + 1]?.system_id;
+                  
+                  if (beforeBlocked && afterBlocked) {
+                    ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Trying to bypass blocked system "${routeData[blockedIdx].system_id}"`);
+                    
+                    const altRoute = mapStore.findRoute(beforeBlocked, afterBlocked, blacklist);
+                    if (altRoute && altRoute.length > 1) {
+                      const beforePortion = routeData.slice(0, blockedIdx);
+                      const afterPortion = routeData.slice(blockedIdx + 1);
+                      
+                      const altPortion = altRoute.slice(1, -1).map(sysId => ({
+                        system_id: sysId,
+                        name: sysId,
+                      }));
+                      
+                      routeToTarget = [...beforePortion, ...altPortion, ...afterPortion];
+                      ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found bypass route! Total ${routeToTarget.length} systems`);
+                    }
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            ctx.log("warn", `Route attempt ${routeAttempts} failed: ${e}`);
+          }
+        }
+        
+        if (!routeToTarget && routeAttempts < MAX_ROUTE_ATTEMPTS) {
+          ctx.log("rescue", `📍 Route attempt ${routeAttempts} failed - retrying in 1s...`);
+          await sleep(1000);
+        }
+      }
+      
+      if (!routeToTarget) {
+        ctx.log("rescue", `🚫 BLOCKED: All routes to ${target.system} pass through blacklisted systems`);
+        ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available after ${MAX_ROUTE_ATTEMPTS} attempts`);
+        
+        const activeSession = getActiveRescueSession(bot.username);
+        if (activeSession) {
+          await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
+        }
+        
+        if (isMaydayTarget) {
+          const mayday = getNextMayday();
+          if (mayday) markMaydayHandled(mayday);
+        }
+        
+        await sleep(settings.scanIntervalSec * 1000);
+        continue;
       }
 
       ctx.log(logCategory, `Navigating to ${target.system}...`);
@@ -5745,6 +6109,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     }
     await bot.refreshStatus();
     logStatus(ctx);
+
+    // ── Ensure premium fuel reserve for emergency self-rescue ──
+    // This prevents the endless rescue loop by keeping fuel cells for when WE run out
+    yield "check_reserve";
+    await ensurePremiumFuelReserve(ctx, settings.premiumFuelReserve);
 
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {

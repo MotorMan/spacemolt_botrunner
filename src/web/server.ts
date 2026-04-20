@@ -60,6 +60,31 @@ const DATA_DIR = join(process.cwd(), "data");
 const SETTINGS_FILE = join(DATA_DIR, "settings.json");
 const STATS_FILE = join(DATA_DIR, "stats.json");
 const MAIN_LOG_FILE = join(DATA_DIR, "main_logs.json");
+const FACILITIES_FILE = join(DATA_DIR, "facilities.json");
+
+interface CachedFacilities {
+  version: string;
+  lastUpdated: string;
+  personal: { facility_type: string; name: string; description: string; category: string; level?: number }[];
+  production: { facility_type: string; name: string; description: string; category: string; level?: number }[];
+  details: Record<string, unknown>;
+}
+
+function loadFacilities(): CachedFacilities {
+  if (existsSync(FACILITIES_FILE)) {
+    try {
+      return JSON.parse(readFileSync(FACILITIES_FILE, "utf-8")) as CachedFacilities;
+    } catch (err) {
+      console.warn(`Warning: corrupt facilities.json, starting fresh —`, err);
+    }
+  }
+  return { version: "", lastUpdated: "", personal: [], production: [], details: {} };
+}
+
+function saveFacilities(data: CachedFacilities): void {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(FACILITIES_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
 
 interface MainLogs {
   activity: string[];
@@ -656,6 +681,31 @@ export class WebServer {
         function saveCraftingLoadouts(loadouts: Record<string, Record<string, number>>): void {
           if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
           writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+        }
+
+        // GET /api/facilities - Get cached facility types
+        if (url.pathname === "/api/facilities" && req.method === "GET") {
+          const facilities = loadFacilities();
+          return Response.json(facilities);
+        }
+
+        // POST /api/facilities - Save facility types
+        if (url.pathname === "/api/facilities" && req.method === "POST") {
+          const body = await req.json() as CachedFacilities;
+          if (!body?.version) {
+            return Response.json({ error: "Missing version" }, { status: 400 });
+          }
+          const existing = loadFacilities();
+          // Merge: keep existing details, add new ones
+          const merged: CachedFacilities = {
+            version: body.version,
+            lastUpdated: new Date().toISOString(),
+            personal: body.personal || existing.personal,
+            production: body.production || existing.production,
+            details: { ...existing.details, ...body.details },
+          };
+          saveFacilities(merged);
+          return Response.json({ ok: true });
         }
 
         // GET /api/crafting-loadouts - Load all loadouts

@@ -59,6 +59,7 @@ const DEEP_CORE_ORES = new Set([
   "prismatic_nebulite",
   "exotic_matter",
   "dark_matter_residue",
+  "adamantite_ore",
 ]);
 
 /**
@@ -1919,7 +1920,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               } else {
                 // No quotas at all - wait
                 ctx.log("mining", "No deep core ore quotas configured - waiting for quota setup");
-                ctx.log("mining", "Configure deepCoreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue)");
+                ctx.log("mining", "Configure deepCoreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue, adamantite_ore)");
                 await sleep(60000);
                 continue;
               }
@@ -1927,7 +1928,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           } else {
             // No deep core quotas configured - don't mine anything
             ctx.log("mining", "No deep core ore quotas configured - waiting for quota setup");
-            ctx.log("mining", "Configure deepCoreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue)");
+            ctx.log("mining", "Configure deepCoreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue, adamantite_ore)");
             await sleep(60000);
             continue;
           }

@@ -70,6 +70,20 @@ function scoreRecipeAvailability(
 }
 
 /**
+ * Check if a recipe has all materials available (at least 1 batch worth).
+ */
+function hasRecipeMaterials(
+  recipe: Recipe,
+  countItemFn: (itemId: string) => number,
+): boolean {
+  for (const comp of recipe.components) {
+    const have = countItemFn(comp.item_id);
+    if (have < comp.quantity) return false;
+  }
+  return true;
+}
+
+/**
  * Find the best recipe that produces a given item.
  * Prefers recipes with materials already available in storage.
  */
@@ -253,12 +267,34 @@ export function calculateCraftingPlan(
 }
 
 /**
+ * Find all recipes that produce a given item and return them sorted by material availability.
+ * This allows callers to pick the best recipe based on current materials.
+ */
+export function findAllRecipesForItem(
+  itemId: string,
+  recipes: Recipe[],
+  countItemFn: (itemId: string) => number,
+): Recipe[] {
+  const candidates = recipes.filter(r => r.output_item_id === itemId);
+  if (candidates.length === 0) return [];
+
+  const scored = candidates.map(recipe => ({
+    recipe,
+    score: scoreRecipeAvailability(recipe, countItemFn),
+  }));
+
+  scored.sort((a, b) => b.score - a.score);
+  return scored.map(s => s.recipe);
+}
+
+/**
  * Calculate crafting plans for multiple goal items.
  * Plans are calculated in order (FIFO), and inventory is updated
  * after each plan to account for items that will be crafted.
  * 
  * Each goal can specify either a specific recipe or just an item ID.
- * When a recipe is specified, that exact recipe will be used.
+ * When a recipe is specified, that exact recipe will be used UNLESS
+ * materials are not available - then it will try alternatives.
  */
 export function calculateMultiGoalPlan(
   goals: Array<{ itemId: string; quantity: number; recipe?: Recipe }>,
@@ -284,8 +320,27 @@ export function calculateMultiGoalPlan(
 
   // Calculate plans in order
   for (const goal of goals) {
-    // Use the specified recipe if provided, otherwise find best recipe for the item
-    const goalRecipe = goal.recipe || findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0);
+    // Find the best recipe for this goal item, considering current materials
+    // If user specified a recipe, try that first, but fall back to better alternatives if no materials
+    let goalRecipe: Recipe | null = null;
+    
+    if (goal.recipe) {
+      // Check if the specified recipe has materials available
+      const hasMaterials = hasRecipeMaterials(goal.recipe, (itemId) => inventory.get(itemId) || 0);
+      if (hasMaterials) {
+        goalRecipe = goal.recipe;
+      } else {
+        // Specified recipe has no materials - find better alternative
+        const alternatives = findAllRecipesForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0);
+        if (alternatives.length > 0 && alternatives[0] !== goal.recipe) {
+          goalRecipe = alternatives[0];
+        } else {
+          goalRecipe = goal.recipe;
+        }
+      }
+    } else {
+      goalRecipe = findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0);
+    }
     
     if (!goalRecipe) continue;
     

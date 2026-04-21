@@ -606,7 +606,7 @@ async function tryBuyMissingMaterials(
 async function craftPrerequisites(
   ctx: RoutineContext,
   recipe: Recipe,
-  recipeIndex: Map<string, Recipe>,
+  recipes: Recipe[],
   depth: number = 0,
   personalMode: boolean = false,
 ): Promise<string[]> {
@@ -618,19 +618,47 @@ async function craftPrerequisites(
     const totalAvailable = countItem(ctx, comp.item_id, personalMode);
     if (totalAvailable >= comp.quantity) continue; // have enough
 
-    const deficit = comp.quantity - totalAvailable;
-    const prereqRecipe = recipeIndex.get(comp.item_id);
-    if (!prereqRecipe) {
-      // DEBUG: No recipe found to craft this component
-      // ctx.log("craft", `  No recipe found to craft ${comp.name || comp.item_id}`);
-      continue; // no recipe to craft this item
+    // Find all recipes that can produce this component, pick the one with most materials
+    const allRecipesForComp = recipes.filter(r => r.output_item_id === comp.item_id);
+    if (allRecipesForComp.length === 0) continue; // no recipe to craft this item
+
+    // Score each recipe by material availability
+    let bestRecipe: Recipe | null = null;
+    let bestScore = -1;
+    for (const r of allRecipesForComp) {
+      let score = 0;
+      let totalNeeded = 0;
+      for (const c of r.components) {
+        const have = countItem(ctx, c.item_id, personalMode);
+        totalNeeded += c.quantity;
+        score += Math.min(have, c.quantity);
+      }
+      // Prefer recipes where we have more complete materials
+      if (totalNeeded > 0) {
+        const pctScore = Math.round((score / totalNeeded) * 100);
+        if (pctScore > bestScore) {
+          bestScore = pctScore;
+          bestRecipe = r;
+        }
+      } else {
+        // No ingredients needed - this is a simple recipe
+        if (bestScore < 50) {
+          bestScore = 50;
+          bestRecipe = r;
+        }
+      }
     }
+
+    if (!bestRecipe) continue;
+
+    const deficit = comp.quantity - totalAvailable;
+    const prereqRecipe = bestRecipe;
 
     // How many batches do we need? (each batch produces output_quantity)
     const batchesNeeded = Math.ceil(deficit / (prereqRecipe.output_quantity || 1));
 
     // Recursively craft sub-prerequisites first
-    const subCrafted = await craftPrerequisites(ctx, prereqRecipe, recipeIndex, depth + 1, personalMode);
+    const subCrafted = await craftPrerequisites(ctx, prereqRecipe, recipes, depth + 1, personalMode);
     crafted.push(...subCrafted);
 
     // Refresh inventories after sub-crafting
@@ -738,7 +766,6 @@ async function craftPrerequisites(
 async function craftFromCategories(
   ctx: RoutineContext,
   recipes: Recipe[],
-  recipeIndex: Map<string, Recipe>,
   enabledCategories: string[],
   craftingSkillLevel: number,
   personalMode: boolean = false,
@@ -792,17 +819,26 @@ async function craftFromCategories(
     const hasMats = hasMaterialsAnywhere(ctx, recipe, 1, personalMode);
     if (!hasMats) continue;
 
+    // Calculate material availability score for this recipe
+    let materialScore = 0;
+    let totalNeeded = 0;
+    for (const c of recipe.components) {
+      const have = countItem(ctx, c.item_id, personalMode);
+      totalNeeded += c.quantity;
+      materialScore += Math.min(have, c.quantity);
+    }
+    const materialPct = totalNeeded > 0 ? Math.round((materialScore / totalNeeded) * 100) : 50;
+
     const priority = categoryPriority[recipeCategory] || 99;
-    const complexity = recipe.components.reduce((sum, c) => sum + c.quantity, 0);
-    candidates.push({ recipe, priority, complexity });
+    candidates.push({ recipe, priority, complexity: materialPct }); // Use complexity field to store material score
   }
 
   if (candidates.length === 0) return crafted;
 
-  // Sort by category priority first, then by complexity (prefer simpler within same category)
+  // Sort by category priority first, then by material availability (higher = better)
   candidates.sort((a, b) => {
     if (a.priority !== b.priority) return a.priority - b.priority;
-    return a.complexity - b.complexity;
+    return b.complexity - a.complexity; // Higher material score first
   });
 
   // Deposit non-essential cargo to make space before crafting (only in faction mode)
@@ -839,6 +875,24 @@ async function craftFromCategories(
       if (hasMaterialsAnywhere(ctx, candidate.recipe, 1, personalMode)) {
         target = candidate.recipe;
         break;
+      }
+    }
+
+    // If there are multiple recipes producing same output, pick the one with most materials
+    if (target) {
+      const outputId = target.output_item_id;
+      const alternatives = candidates.filter(c => c.recipe.output_item_id === outputId && c.recipe !== target);
+      for (const alt of alternatives) {
+        if (hasMaterialsAnywhere(ctx, alt.recipe, 1, personalMode)) {
+          // Compare material availability
+          let targetScore = 0, altScore = 0;
+          for (const c of target.components) targetScore += Math.min(countItem(ctx, c.item_id, personalMode), c.quantity);
+          for (const c of alt.recipe.components) altScore += Math.min(countItem(ctx, c.item_id, personalMode), c.quantity);
+          if (altScore > targetScore) {
+            ctx.log("craft", `Switching from ${target.name} to ${alt.recipe.name} (more materials available)`);
+            target = alt.recipe;
+          }
+        }
       }
     }
 
@@ -1028,9 +1082,10 @@ async function executeCraftingPlan(
         if (bot.state !== "running") break;
         if (planItem.quantityToCraft <= 0) continue;
 
-        // Craft using full skill (not scaled by remaining quantity for round-robin)
-        // The craftRecipeWithPrereqs function will handle final batch sizing internally
-        const batchSize = Math.floor(craftingSkillLevel || 1);
+        // Craft only what's needed (or 1 batch minimum), respecting quantityToCraft
+        const maxBatchesByRemaining = planItem.quantityToCraft;
+        const maxBatchesBySkill = Math.max(1, Math.floor(craftingSkillLevel || 1));
+        const batchSize = Math.min(maxBatchesByRemaining, maxBatchesBySkill);
 
         const result = await craftRecipeWithPrereqs(
           ctx,
@@ -1124,16 +1179,16 @@ async function craftRecipeWithPrereqs(
       break;
     }
 
-    // Determine batch size: use full skill level as long as materials allow
-    // This prevents progressive batch reduction
+    // Determine batch size: limited by remaining items needed, skill level, and available materials
     const remainingItems = targetItems - totalCrafted;
     if (remainingItems <= 0) break;
     
+    const maxBatchesByRemaining = Math.ceil(remainingItems / (recipe.output_quantity || 1));
     const maxBatchesBySkill = Math.max(1, Math.floor(craftingSkillLevel || 1));
     const maxBatchesByMaterials = Math.max(1, Math.floor(maxCraftableNow));
     
-    // Use full skill level by default, only reduce if we can't use that many (not enough materials to make full batch)
-    let batchSize = Math.min(maxBatchesBySkill, maxBatchesByMaterials);
+    // Use the minimum of remaining needed, skill level, and available materials
+    let batchSize = Math.min(maxBatchesByRemaining, maxBatchesBySkill, maxBatchesByMaterials);
     batchSize = Math.max(1, batchSize);
 
     ctx.log("craft", `  Batch: ${batchSize}x (skill: ${craftingSkillLevel}, remaining: ${remainingItems} items, canCraft: ${maxCraftableNow * (recipe.output_quantity || 1)} items)`);
@@ -1426,7 +1481,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── If no goals configured, craft from enabled categories ──
     if (goalItems.length === 0 && !isSpecializedBot) {
       ctx.log("craft", `No goal items configured — crafting from enabled categories: ${settings.enabledCategories.join(", ")}`);
-      const categoryCrafted = await craftFromCategories(ctx, recipes, recipeIndex, settings.enabledCategories, craftingSkillLevel, personalMode);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, settings.enabledCategories, craftingSkillLevel, personalMode);
       if (categoryCrafted.length > 0) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
       } else {
@@ -1439,7 +1494,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── If no goals match assigned categories, craft from assigned categories ──
     if (goalItems.length === 0 && isSpecializedBot) {
       ctx.log("craft", `No goal items match assigned categories — crafting from assigned categories: ${assignedCategories.join(", ")}`);
-      const categoryCrafted = await craftFromCategories(ctx, recipes, recipeIndex, assignedCategories, craftingSkillLevel, personalMode);
+      const categoryCrafted = await craftFromCategories(ctx, recipes, assignedCategories, craftingSkillLevel, personalMode);
       if (categoryCrafted.length > 0) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
       } else {

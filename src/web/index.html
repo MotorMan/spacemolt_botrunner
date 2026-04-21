@@ -12617,9 +12617,10 @@ function renderMinerSettings(panel) {
   }
 
   // Build ore filter lists
+  const deepCoreOreIds = new Set(['void_essence', 'fury_crystal', 'legacy_ore', 'prismatic_nebulite', 'exotic_matter', 'dark_matter_residue', 'adamantite_ore']);
   const oreOres = knownOres.filter(o => {
     const n = o.name.toLowerCase();
-    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo') && !n.includes('polonium') && !n.includes('radium') && !n.includes('uranium') && !n.includes('thorium');
+    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo') && !n.includes('polonium') && !n.includes('radium') && !n.includes('uranium') && !n.includes('thorium') && !deepCoreOreIds.has(o.item_id);
   });
   const gasOres = knownOres.filter(o => {
     const n = o.name.toLowerCase();
@@ -12642,6 +12643,7 @@ function renderMinerSettings(panel) {
     { item_id: 'prismatic_nebulite', name: 'Prismatic Nebulite' },
     { item_id: 'exotic_matter', name: 'Exotic Matter' },
     { item_id: 'dark_matter_residue', name: 'Dark Matter Residue' },
+    { item_id: 'adamantite_ore', name: 'Adamantite Ore' },
   ];
 
   const oreOpts = ['<option value="">(any ore — harvest whatever is available)</option>'];
@@ -13337,10 +13339,13 @@ function renderMinerQuotasSettings(panel) {
   const deepCoreQuotas = m.deepCoreQuotas || {};
   const radioactiveQuotas = m.radioactiveQuotas || {};
 
+  // Deep core ore IDs (for filtering basic ores)
+  const deepCoreOreIds = new Set(['void_essence', 'fury_crystal', 'legacy_ore', 'prismatic_nebulite', 'exotic_matter', 'dark_matter_residue', 'adamantite_ore']);
+
   // Build ore filter lists
   const oreOres = knownOres.filter(o => {
     const n = o.name.toLowerCase();
-    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo') && !n.includes('polonium') && !n.includes('radium') && !n.includes('uranium') && !n.includes('thorium');
+    return !n.includes('gas') && !n.includes('nebula') && !n.includes('plasma') && !n.includes('hydrogen') && !n.includes('helium') && !n.includes('ice') && !n.includes('frost') && !n.includes('cryo') && !n.includes('polonium') && !n.includes('radium') && !n.includes('uranium') && !n.includes('thorium') && !deepCoreOreIds.has(o.item_id);
   });
   const gasOres = knownOres.filter(o => {
     const n = o.name.toLowerCase();
@@ -13358,6 +13363,7 @@ function renderMinerQuotasSettings(panel) {
     { item_id: 'prismatic_nebulite', name: 'Prismatic Nebulite' },
     { item_id: 'exotic_matter', name: 'Exotic Matter' },
     { item_id: 'dark_matter_residue', name: 'Dark Matter Residue' },
+    { item_id: 'adamantite_ore', name: 'Adamantite Ore' },
   ];
   // Radioactive ores
   const radioactiveOresList = [

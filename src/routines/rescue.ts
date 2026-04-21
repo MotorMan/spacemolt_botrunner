@@ -2383,70 +2383,125 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
       if (bot.state !== "running") break;
 
-      // ── Travel to stranded bot's POI ──
-      if (target.poi) {
-        yield "travel_to_target";
+       // ── Travel to stranded bot's POI ──
+       if (target.poi) {
+         yield "travel_to_target";
 
-        // CRITICAL: Refresh target's current position from fleet status after arriving at system
-        const fleet = ctx.getFleetStatus?.() || [];
-        const targetBot = fleet.find(b => b.username === target.username);
-        if (targetBot) {
-          const oldSystem = target.system;
-          const oldPoi = target.poi;
-          target.system = targetBot.system || target.system;
-          target.poi = targetBot.poi || target.poi;
-          target.docked = targetBot.docked;
-          if (oldSystem !== target.system || oldPoi !== target.poi) {
-            ctx.log("rescue", `📍 Target position updated after arrival: ${oldSystem}/${oldPoi} -> ${target.system}/${target.poi}`);
-          }
-        }
+         // CRITICAL: Refresh target's current position from fleet status after arriving at system
+         const fleet = ctx.getFleetStatus?.() || [];
+         const targetBot = fleet.find(b => b.username === target.username);
+         if (targetBot) {
+           const oldSystem = target.system;
+           const oldPoi = target.poi;
+           target.system = targetBot.system || target.system;
+           target.poi = targetBot.poi || target.poi;
+           target.docked = targetBot.docked;
+           if (oldSystem !== target.system || oldPoi !== target.poi) {
+             ctx.log("rescue", `📍 Target position updated after arrival: ${oldSystem}/${oldPoi} -> ${target.system}/${target.poi}`);
+           }
+         }
 
-        // Resolve POI name to POI ID by querying system info
-        let targetPoiId: string | null = null;
-        let targetPoiName: string = target.poi;
-        
-        try {
-          const { pois } = await getSystemInfo(ctx);
-          // Find POI by name (case-insensitive match)
-          const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
-          if (matchedPoi) {
-            targetPoiId = matchedPoi.id;
-            targetPoiName = matchedPoi.name;
-            ctx.log(logCategory, `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
-          } else {
-            // Try partial match as fallback
-            const partialMatch = pois.find(p => p.name.toLowerCase().includes(target.poi.toLowerCase()) || target.poi.toLowerCase().includes(p.name.toLowerCase()));
-            if (partialMatch) {
-              targetPoiId = partialMatch.id;
-              targetPoiName = partialMatch.name;
-              ctx.log(logCategory, `Partial POI match: "${target.poi}" -> ID: ${targetPoiId}`);
-            }
-          }
-        } catch (e) {
-          ctx.log("warn", `Could not query system POIs: ${e}`);
-        }
-        
-        // Use POI ID if resolved, otherwise fall back to name
-        const travelTarget = targetPoiId || target.poi;
-        
-        ctx.log(logCategory, `Traveling to ${target.username}'s location (${targetPoiName})...`);
-        const travelResp = await bot.exec("travel", { target_poi: travelTarget });
-        // Check for battle notifications after travel
-        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
-          ctx.log("combat", "Battle detected while traveling to POI - fleeing!");
-          continue;
-        }
-        if (travelResp.error && !travelResp.error.message.includes("already")) {
-          ctx.log("error", `Travel failed: ${travelResp.error.message}`);
-        } else {
-          // Success - update bot.poi with the resolved name
-          bot.poi = targetPoiName;
-        }
-        // Update session state after traveling to POI
-        if (recoveredSession || getActiveRescueSession(bot.username)) {
-          await updateRescueSession(bot.username, { state: "at_poi" });
-        }
-      }
+         // Resolve POI name to POI ID by querying system info
+         let targetPoiId: string | null = null;
+         let targetPoiName: string = target.poi;
+         
+         try {
+           const { pois } = await getSystemInfo(ctx);
+           // Find POI by name (case-insensitive match)
+           const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
+           if (matchedPoi) {
+             targetPoiId = matchedPoi.id;
+             targetPoiName = matchedPoi.name;
+             ctx.log(logCategory, `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
+           } else {
+             // Try partial match as fallback
+             const partialMatch = pois.find(p => p.name.toLowerCase().includes(target.poi.toLowerCase()) || target.poi.toLowerCase().includes(p.name.toLowerCase()));
+             if (partialMatch) {
+               targetPoiId = partialMatch.id;
+               targetPoiName = partialMatch.name;
+               ctx.log(logCategory, `Partial POI match: "${target.poi}" -> ID: ${targetPoiId}`);
+             }
+           }
+         } catch (e) {
+           ctx.log("warn", `Could not query system POIs: ${e}`);
+         }
+         
+         // Use POI ID if resolved, otherwise fall back to name
+         const travelTarget = targetPoiId || target.poi;
+         
+         ctx.log(logCategory, `Traveling to ${target.username}'s location (${targetPoiName})...`);
+         const travelResp = await bot.exec("travel", { target_poi: travelTarget });
+         
+         // Check for battle notifications after travel
+         if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+           ctx.log("combat", "Battle detected while traveling to POI - fleeing!");
+           continue;
+         }
+         
+         let travelSucceeded = !travelResp.error || travelResp.error.message.toLowerCase().includes("already");
+         
+         if (travelResp.error && !travelResp.error.message.toLowerCase().includes("already")) {
+           ctx.log("error", `Travel failed: ${travelResp.error.message}`);
+         }
+         
+         if (travelSucceeded) {
+           // Success - update bot.poi with the resolved name
+           bot.poi = targetPoiName;
+         } else {
+           // Travel failed - target may be at an unknown/hidden POI
+           ctx.log("rescue", `⚠️ Could not travel to ${targetPoiName} - POI may be hidden or unknown`);
+           ctx.log("rescue", `📡 Using get_nearby to scan for ${target.username} in the area...`);
+           
+           // Scan for nearby players to find the target
+           const nearbyResp = await bot.exec("get_nearby", { range: 50000 });
+           if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby", battleState)) {
+             ctx.log("combat", "Battle detected during scan - fleeing!");
+             continue;
+           }
+           
+           if (!nearbyResp.error && nearbyResp.result) {
+             const data = nearbyResp.result as Record<string, unknown>;
+             const players = Array.isArray(data.players) ? data.players :
+                             Array.isArray(data.nearby) ? data.nearby :
+                             Array.isArray(data.ships) ? data.ships : [];
+             
+             let foundTarget = false;
+             for (const p of players as Array<Record<string, unknown>>) {
+               const username = (p.username as string) || (p.name as string);
+               if (username && username.toLowerCase() === target.username.toLowerCase()) {
+                 ctx.log("rescue", `✓ Found ${target.username} nearby via get_nearby scan`);
+                 foundTarget = true;
+                 // Update our position to be at the same POI as target
+                 bot.poi = (p.poi as string) || target.poi;
+                 break;
+               }
+             }
+             
+             if (!foundTarget) {
+               ctx.log("error", `${target.username} not found in nearby scan after failed POI travel`);
+               ctx.log("rescue", `Marking rescue as failed - target unreachable at this location`);
+               if (recoveredSession || getActiveRescueSession(bot.username)) {
+                 await failRescueSession(bot.username, `Target not found at ${target.system}/${target.poi} after POI travel failure`);
+                 const activeSession = getActiveRescueSession(bot.username);
+                 if (activeSession) {
+                   await completeRescueSession(bot.username);
+                 }
+               }
+               await sleep(settings.scanIntervalSec * 1000);
+               continue;
+             }
+           } else {
+             ctx.log("error", `get_nearby scan failed after POI travel failure: ${nearbyResp.error?.message || 'unknown error'}`);
+             await sleep(settings.scanIntervalSec * 1000);
+             continue;
+           }
+         }
+         
+         // Update session state after traveling to POI (or confirming presence via get_nearby)
+         if (recoveredSession || getActiveRescueSession(bot.username)) {
+           await updateRescueSession(bot.username, { state: "at_poi" });
+         }
+       }
 
       // ── Transfer fuel ──
       yield "transfer_fuel";

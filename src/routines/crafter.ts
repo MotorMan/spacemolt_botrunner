@@ -1028,8 +1028,9 @@ async function executeCraftingPlan(
         if (bot.state !== "running") break;
         if (planItem.quantityToCraft <= 0) continue;
 
-        // Craft one batch at a time - ALWAYS use integer >= 1
-        const batchSize = Math.max(1, Math.min(Math.floor(planItem.quantityToCraft), Math.floor(craftingSkillLevel || 1)));
+        // Craft using full skill (not scaled by remaining quantity for round-robin)
+        // The craftRecipeWithPrereqs function will handle final batch sizing internally
+        const batchSize = Math.floor(craftingSkillLevel || 1);
 
         const result = await craftRecipeWithPrereqs(
           ctx,
@@ -1123,21 +1124,17 @@ async function craftRecipeWithPrereqs(
       break;
     }
 
-    // Determine batch size: min of (remaining in items, maxCraftableNow, craftingSkillLevel)
-    // ALWAYS use integer >= 1
+    // Determine batch size: use full skill level as long as materials allow
+    // This prevents progressive batch reduction
     const remainingItems = targetItems - totalCrafted;
-    if (remainingItems <= 0) break;  // Goal already met
+    if (remainingItems <= 0) break;
     
-    const outputQty = recipe.output_quantity || 1;
-    const maxBatchesByItems = Math.ceil(remainingItems / outputQty);
-    const maxBatchesByMaterials = Math.floor(maxCraftableNow);
-    const maxBatchesBySkill = Math.floor(craftingSkillLevel || 1);
-    const batchSize = Math.max(1, Math.min(
-      maxBatchesByItems,  // Never craft more than needed to hit the goal (in batches)
-      maxBatchesByMaterials,  // Limited by available materials
-      maxBatchesBySkill  // Limited by crafting skill
-    ));
-    if (batchSize <= 0) break;
+    const maxBatchesBySkill = Math.max(1, Math.floor(craftingSkillLevel || 1));
+    const maxBatchesByMaterials = Math.max(1, Math.floor(maxCraftableNow));
+    
+    // Use full skill level by default, only reduce if we can't use that many (not enough materials to make full batch)
+    let batchSize = Math.min(maxBatchesBySkill, maxBatchesByMaterials);
+    batchSize = Math.max(1, batchSize);
 
     ctx.log("craft", `  Batch: ${batchSize}x (skill: ${craftingSkillLevel}, remaining: ${remainingItems} items, canCraft: ${maxCraftableNow * (recipe.output_quantity || 1)} items)`);
 

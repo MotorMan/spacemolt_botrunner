@@ -10497,27 +10497,44 @@ function fetchFactionFacilities(username) {
       container.innerHTML = '<div class="faction-no-data">No faction facilities at this station.</div>';
       return;
     }
-    container.innerHTML = facilities.map(fac => {
-      const name = fac.name || fac.facility_type || fac.type || '?';
-      const facId = fac.facility_id || fac.id || '';
-      const level = fac.level ?? fac.tier ?? '';
-      const enabled = fac.enabled !== false;
-      const status = enabled ? '<span style="color:var(--green)">Active</span>' : '<span style="color:var(--red)">Disabled</span>';
-      const levelStr = level ? ` (Level ${level})` : '';
-      return `<div class="faction-card">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <div>
-            <span class="fc-name">${esc(name)}${esc(levelStr)}</span>
-            <span style="margin-left:8px;font-size:10px">${status}</span>
+    
+    sendExec(username, 'facility', { action: 'upgrades' }, (upResult) => {
+      factionFacilityUpgrades = {};
+      if (upResult.ok && upResult.data) {
+        const upData = upResult.data;
+        const allUpgrades = [...(Array.isArray(upData.upgrades) ? upData.upgrades : []), ...(Array.isArray(upData.faction_upgrades) ? upData.faction_upgrades : [])];
+        allUpgrades.forEach(u => {
+          const key = u.your_facility_id || u.facility_id;
+          if (key) factionFacilityUpgrades[key] = u;
+        });
+      }
+      
+      container.innerHTML = facilities.map(fac => {
+        const name = fac.name || fac.facility_type || fac.type || '?';
+        const facId = fac.facility_id || fac.id || '';
+        const level = fac.level ?? fac.tier ?? '';
+        const enabled = fac.enabled !== false;
+        const status = enabled ? '<span style="color:var(--green)">Active</span>' : '<span style="color:var(--red)">Disabled</span>';
+        const levelStr = level ? ` (Level ${level})` : '';
+        const factionService = fac.faction_service || '';
+        const canTransfer = !factionService;
+        const upgradeInfo = factionFacilityUpgrades[facId];
+        const hasUpgrade = upgradeInfo && upgradeInfo.upgrade_to;
+        return `<div class="faction-card">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <span class="fc-name">${esc(name)}${esc(levelStr)}</span>
+              <span style="margin-left:8px;font-size:10px">${status}</span>
+            </div>
+            <div style="display:flex;gap:4px">
+              ${canTransfer ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_player')">Transfer to Player</button>` : ''}
+              <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionToggleFacility('${esc(username)}','${esc(facId)}')">${enabled ? 'Disable' : 'Enable'}</button>
+              ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showFactionFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade Details</button>` : ''}
+            </div>
           </div>
-          <div style="display:flex;gap:4px">
-            <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionToggleFacility('${esc(username)}','${esc(facId)}')">${enabled ? 'Disable' : 'Enable'}</button>
-            <button class="sm" style="font-size:10px;padding:2px 6px" onclick="factionCheckUpgrades('${esc(username)}','${esc(facId)}','${esc(name)}')">Upgrades</button>
-          </div>
-        </div>
-        <div id="fac-upgrades-${esc(facId)}"></div>
-      </div>`;
-    }).join('');
+        </div>`;
+      }).join('');
+    });
   });
 }
 
@@ -10536,13 +10553,14 @@ function factionCheckUpgrades(username, facilityId, facilityName) {
   const container = document.getElementById(`fac-upgrades-${facilityId}`);
   if (!container) return;
   container.innerHTML = '<div class="faction-no-data">Loading upgrades...</div>';
-  sendExec(username, 'facility', { action: 'upgrades', facility_id: facilityId }, (result) => {
+  sendExec(username, 'facility', { action: 'upgrades' }, (result) => {
     if (!result.ok || !result.data) {
       container.innerHTML = `<div style="font-size:11px;color:var(--text-dim);margin-top:6px">${esc(result.error || 'No upgrades available')}</div>`;
       return;
     }
     const d = result.data;
-    const upgrades = Array.isArray(d) ? d : (Array.isArray(d.upgrades) ? d.upgrades : []);
+    const allUpgrades = [...(Array.isArray(d.upgrades) ? d.upgrades : []), ...(Array.isArray(d.faction_upgrades) ? d.faction_upgrades : [])];
+    const upgrades = allUpgrades.filter(u => (u.your_facility_id || u.facility_id) === facilityId);
     if (upgrades.length === 0) {
       container.innerHTML = '<div style="font-size:11px;color:var(--text-dim);margin-top:6px">No upgrades available (max level)</div>';
       return;
@@ -10565,7 +10583,7 @@ function factionCheckUpgrades(username, facilityId, facilityName) {
         const effectStr = Array.isArray(effects) && effects.length > 0
           ? effects.map(e => typeof e === 'string' ? e : (e.description || e.name || JSON.stringify(e))).join(', ')
           : '';
-        const uType = u.facility_type || u.type || '';
+        const uType = u.type_id || u.facility_type || u.type || '';
         return `<div style="padding:6px 0;border-bottom:1px solid #21262d;font-size:11px">
           <div style="display:flex;justify-content:space-between;align-items:center">
             <div>
@@ -10584,14 +10602,95 @@ function factionCheckUpgrades(username, facilityId, facilityName) {
 }
 
 function factionUpgradeFacility(username, facilityId, facilityType) {
-  sendExec(username, 'facility', { action: 'upgrade', facility_id: facilityId, facility_type: facilityType }, (result) => {
-    if (result.ok) {
-      appendLine('system', `${username}: Facility upgraded!`);
+  const container = document.getElementById(`fac-upgrades-${facilityId}`);
+  if (!container) return;
+  
+  container.innerHTML = '<div style="font-size:11px;padding:4px 0">Upgrading...</div>';
+  
+  (async () => {
+    const upgradesResult = await new Promise(resolve => {
+      sendExec(username, 'facility', { action: 'upgrades' }, resolve);
+    });
+    
+    if (!upgradesResult.ok || !upgradesResult.data) {
+      container.innerHTML = `<div style="font-size:11px;color:var(--red);padding:4px 0">Failed: ${upgradesResult.error || 'Could not get upgrades'}</div>`;
+      return;
+    }
+    
+    const d = upgradesResult.data;
+    const allUpgrades = [...(Array.isArray(d.upgrades) ? d.upgrades : []), ...(Array.isArray(d.faction_upgrades) ? d.faction_upgrades : [])];
+    const upgradeData = allUpgrades.find(u => (u.your_facility_id || u.facility_id) === facilityId && (u.type_id || u.facility_type || u.type) === facilityType);
+    
+    if (!upgradeData) {
+      container.innerHTML = '<div style="font-size:11px;color:var(--red);padding:4px 0">Could not find upgrade info</div>';
+      return;
+    }
+    
+    const mats = upgradeData.materials || upgradeData.requirements || [];
+    const cost = upgradeData.cost ?? upgradeData.credits ?? upgradeData.price ?? 0;
+    
+    const storageResult = await new Promise(resolve => {
+      sendExec(username, 'view_faction_storage', {}, resolve);
+    });
+    
+    if (!storageResult.ok || !storageResult.data) {
+      container.innerHTML = `<div style="font-size:11px;color:var(--red);padding:4px 0">Failed to check storage</div>`;
+      return;
+    }
+    
+    const factionItems = storageResult.data.items || storageResult.data.storage || [];
+    const factionCredits = storageResult.data.credits || 0;
+    
+    const missing = [];
+    if (cost > 0 && factionCredits < cost) {
+      missing.push(`${cost - factionCredits} more credits`);
+    }
+    if (Array.isArray(mats) && mats.length > 0) {
+      for (const m of mats) {
+        const mId = m.item_id || m.name || '?';
+        const mQty = m.quantity || m.count || 1;
+        const available = factionItems.find(i => (i.item_id === mId || i.name === mId));
+        if ((available?.quantity || 0) < mQty) {
+          missing.push(`${mQty - (available?.quantity || 0)}x more ${m.name || mId}`);
+        }
+      }
+    }
+    
+    if (missing.length > 0) {
+      container.innerHTML = `<div style="font-size:11px;color:var(--orange);padding:4px 0">Missing: ${missing.join(', ')}</div>`;
+      return;
+    }
+    
+    if (cost > 0) {
+      await new Promise(resolve => {
+        sendExec(username, 'storage', { action: 'withdraw', item_id: 'credits', quantity: cost, target: 'faction' }, resolve);
+      });
+    }
+    
+    if (Array.isArray(mats) && mats.length > 0) {
+      for (const m of mats) {
+        const mId = m.item_id || m.name || '?';
+        const mQty = m.quantity || m.count || 1;
+        await new Promise(resolve => {
+          sendExec(username, 'storage', { action: 'deposit', target: 'self', item_id: mId, quantity: mQty, source: 'faction' }, resolve);
+        });
+      }
+    }
+    
+    container.innerHTML = '<div style="font-size:11px;padding:4px 0;color:var(--text-dim)">Withdrawn materials, upgrading...</div>';
+    
+    const upgradeResult = await new Promise(resolve => {
+      sendExec(username, 'facility', { action: 'upgrade', facility_id: facilityId, facility_type: facilityType }, resolve);
+    });
+    
+    if (upgradeResult.ok) {
+      const hint = upgradeResult.data?.hint || 'Facility upgraded!';
+      appendLine('system', `${username}: ${hint}`);
       fetchFactionFacilities(username);
     } else {
-      appendLine('system', `Upgrade failed: ${result.error || 'unknown'}`);
+      container.innerHTML = `<div style="font-size:11px;color:var(--red);padding:4px 0">Failed: ${upgradeResult.error || 'unknown'}</div>`;
     }
-  });
+  })();
 }
 
 function fetchFactionBuildableTypes(username) {
@@ -10725,6 +10824,8 @@ let personalFacilityLoadComplete = false;
 let personalFacilitySelected = null;
 let personalFacilityVersion = null;
 let personalFacilityCategory = 'personal'; // 'personal' or 'production'
+let personalFacilityUpgrades = {}; // { facilityId: upgradeData }
+let factionFacilityUpgrades = {}; // { facilityId: upgradeData }
 
 // Load facilities from server cache (returns true if loaded successfully)
 async function loadFacilitiesCache() {
@@ -10875,27 +10976,55 @@ function fetchPersonalFacilities(username) {
     personalFacilitiesList = facilities;
     if (facilities.length === 0) {
       container.innerHTML = '<div class="faction-no-data">You have no personal facilities. Build one below!</div>';
+      personalFacilityUpgrades = {};
       return;
     }
-    container.innerHTML = facilities.map(fac => {
-      const name = fac.name || fac.facility_type || fac.type || '?';
-      const facId = fac.facility_id || fac.id || '';
-      const active = fac.active === true;
-      const activeStr = active ? '<span style="color:var(--green)">Active</span>' : '<span style="color:var(--red)">Inactive</span>';
-      const category = fac.category || '';
-      return `<div class="faction-card">
-        <div style="display:flex;justify-content:space-between;align-items:center">
-          <div>
-            <span class="fc-name">${esc(name)}</span>
-            <span style="margin-left:8px;font-size:10px">${activeStr}</span>
-            ${category ? `<span style="margin-left:8px;font-size:10px;color:var(--text-dim)">${esc(category)}</span>` : ''}
+    
+    sendExec(username, 'facility', { action: 'upgrades' }, (upResult) => {
+      personalFacilityUpgrades = {};
+      if (upResult.ok && upResult.data) {
+        const upData = upResult.data;
+        const playerUpgrades = Array.isArray(upData) ? upData : (Array.isArray(upData.upgrades) ? upData.upgrades : []);
+        const factionUpgrades = Array.isArray(upData.faction_upgrades) ? upData.faction_upgrades : [];
+        const allUpgrades = [...playerUpgrades, ...factionUpgrades];
+        allUpgrades.forEach(u => {
+          const key = u.your_facility_id || u.facility_id;
+          if (key) {
+            personalFacilityUpgrades[key] = u;
+          }
+        });
+      }
+      
+container.innerHTML = facilities.map(fac => {
+        const name = fac.name || fac.facility_type || fac.type || '?';
+        const facId = fac.facility_id || fac.id || '';
+        const active = fac.active === true;
+        const activeStr = active ? '<span style="color:var(--green)">Active</span>' : '<span style="color:var(--red)">Inactive</span>';
+        const category = fac.category || '';
+        const level = fac.level ?? '';
+        const levelStr = level ? ` Lv${level}` : '';
+        const factionService = fac.faction_service || '';
+        const isTransferable = !factionService;
+        
+        const upgradeInfo = personalFacilityUpgrades[facId];
+        const hasUpgrade = upgradeInfo && upgradeInfo.upgrade_to;
+        
+        return `<div class="faction-card">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <span class="fc-name">${esc(name)}${levelStr}</span>
+              <span style="margin-left:8px;font-size:10px">${activeStr}</span>
+              ${category ? `<span style="margin-left:8px;font-size:10px;color:var(--text-dim)">${esc(category)}</span>` : ''}
+            </div>
+            <div style="display:flex;gap:4px">
+              ${isTransferable ? `<button class="sm" style="font-size:10px;padding:2px 6px" onclick="transferPersonalFacility('${esc(username)}','${esc(facId)}','to_faction')">Transfer to Faction</button>` : ''}
+              ${hasUpgrade ? `<button class="primary sm" style="font-size:10px;padding:2px 6px" onclick="showPersonalFacilityUpgradeDetails('${esc(username)}','${esc(facId)}')">Upgrade Details</button>` : ''}
+              <button class="sm" style="font-size:10px;padding:2px 6px" onclick="togglePersonalFacility('${esc(username)}','${esc(facId)}','${active}')">${active ? 'Disable' : 'Enable'}</button>
+            </div>
           </div>
-          <div style="display:flex;gap:4px">
-            <button class="sm" style="font-size:10px;padding:2px 6px" onclick="togglePersonalFacility('${esc(username)}','${esc(facId)}','${active}')">${active ? 'Disable' : 'Enable'}</button>
-          </div>
-        </div>
-      </div>`;
-    }).join('');
+        </div>`;
+      }).join('');
+    });
   });
 }
 
@@ -10907,6 +11036,426 @@ function togglePersonalFacility(username, facilityId, currentlyActive) {
       fetchPersonalFacilities(username);
     } else {
       appendLine('system', `Toggle failed: ${result.error || 'unknown'}`);
+    }
+  });
+}
+
+function upgradePersonalFacility(username, facilityId) {
+  const upgradeInfo = personalFacilityUpgrades[facilityId];
+  if (!upgradeInfo || !upgradeInfo.upgrade_to) {
+    appendLine('system', 'No upgrade available for this facility');
+    return;
+  }
+  
+  const container = document.getElementById('personalFacilitiesList');
+  if (!container) return;
+  
+  const up = upgradeInfo.upgrade_to;
+  const upgradeType = up.type_id || up.facility_type || up.type || '';
+  const uName = up.name || upgradeType || 'Unknown';
+  
+  const mats = up.materials || up.requirements || up.build_materials || [];
+  const cost = up.cost ?? up.credits ?? up.price ?? up.credit_cost ?? 0;
+  
+  let progressHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="font-size:14px;font-weight:700;color:var(--text-bright);margin-bottom:12px">Upgrading: ${esc(uName)}</div>
+      <div id="up-step-1">Getting upgrade details...</div>
+      <div id="up-step-2" style="color:var(--text-dim)">Checking faction storage...</div>
+      <div id="up-step-3" style="color:var(--text-dim)">Withdrawing materials...</div>
+      <div id="up-step-4" style="color:var(--text-dim)">Upgrading facility...</div>
+      <div id="up-status" style="margin-top:12px;font-size:11px"></div>
+      <div id="up-actions" style="margin-top:12px"></div>
+    </div>
+  `;
+  container.innerHTML = progressHtml;
+  
+  const updateStep = (step, status, color) => {
+    const el = document.getElementById(`up-step-${step}`);
+    if (el) { el.style.color = color || 'var(--text)'; el.textContent = status; }
+  };
+  const setStatus = (msg, color) => {
+    const el = document.getElementById('up-status');
+    if (el) { el.style.color = color || 'var(--text)'; el.textContent = msg; }
+  };
+  const showError = (msg) => {
+    setStatus('ERROR: ' + msg, 'var(--red)');
+    document.getElementById('up-actions').innerHTML = '<button class="sm" onclick="fetchPersonalFacilities(\'' + esc(username) + '\')">Back to List</button>';
+  };
+  const showSuccess = () => {
+    setStatus('Facility upgraded successfully!', 'var(--green)');
+    document.getElementById('up-actions').innerHTML = '<button class="primary sm" onclick="fetchPersonalFacilities(\'' + esc(username) + '\')">View My Facilities</button>';
+  };
+  
+  (async () => {
+    updateStep(1, 'Getting upgrade details...', 'var(--text)');
+    
+    const detailsResult = await new Promise(resolve => {
+      sendExec(username, 'facility', { action: 'upgrades' }, resolve);
+    });
+    
+    if (!detailsResult.ok || !detailsResult.data) {
+      showError(detailsResult.error || 'Failed to get upgrade details');
+      return;
+    }
+    
+    updateStep(1, 'Got upgrade details', 'var(--green)');
+    updateStep(2, 'Checking faction storage...', 'var(--text)');
+    
+    const storageResult = await new Promise(resolve => {
+      sendExec(username, 'view_faction_storage', {}, resolve);
+    });
+    
+    if (!storageResult.ok || !storageResult.data) {
+      showError(storageResult.error || 'Failed to get faction storage');
+      return;
+    }
+    
+    const factionItems = storageResult.data.items || storageResult.data.storage || [];
+    const factionCredits = storageResult.data.credits || 0;
+    
+    const missing = [];
+    if (cost > 0 && factionCredits < cost) {
+      missing.push(`${Number(cost - factionCredits).toLocaleString()} more credits needed (have ${Number(factionCredits).toLocaleString()})`);
+    }
+    
+    if (Array.isArray(mats) && mats.length > 0) {
+      for (const m of mats) {
+        const mId = m.item_id || m.name || m.resource || '?';
+        const mName = m.name || m.item_id || '?';
+        const mQty = m.quantity || m.count || m.amount || 1;
+        const available = factionItems.find(i => (i.item_id === mId || i.name === mId));
+        const availQty = available?.quantity || 0;
+        if (availQty < mQty) {
+          missing.push(`${mQty - availQty}x more ${mName} needed (have ${availQty})`);
+        }
+      }
+    }
+    
+    if (missing.length > 0) {
+      setStatus('Missing: ' + missing.join(', '), 'var(--orange)');
+      document.getElementById('up-actions').innerHTML = '<button class="sm" onclick="fetchPersonalFacilities(\'' + esc(username) + '\')">Back to List</button>';
+      return;
+    }
+    
+    updateStep(2, `Faction storage OK (${factionCredits.toLocaleString()} credits)`, 'var(--green)');
+    updateStep(3, 'Withdrawing materials...', 'var(--text)');
+    
+    if (cost > 0) {
+      setStatus(`Withdrawing ${cost.toLocaleString()} credits...`);
+      const creditResult = await new Promise(resolve => {
+        sendExec(username, 'storage', { action: 'withdraw', item_id: 'credits', quantity: cost, target: 'faction' }, resolve);
+      });
+      if (!creditResult.ok) {
+        showError('Failed to withdraw credits: ' + (creditResult.error || 'unknown'));
+        return;
+      }
+    }
+    
+    if (Array.isArray(mats) && mats.length > 0) {
+      for (const m of mats) {
+        const mId = m.item_id || m.name || m.resource || '?';
+        const mName = m.name || m.item_id || '?';
+        const mQty = m.quantity || m.count || m.amount || 1;
+        setStatus(`Withdrawing ${mQty}x ${mName}...`);
+        const matResult = await new Promise(resolve => {
+          sendExec(username, 'storage', { action: 'deposit', target: 'self', item_id: mId, quantity: mQty, source: 'faction' }, resolve);
+        });
+        if (!matResult.ok) {
+          showError(`Failed to withdraw ${mName}: ${matResult.error || 'unknown'}`);
+          return;
+        }
+      }
+    }
+    
+    updateStep(3, 'Materials withdrawn', 'var(--green)');
+    updateStep(4, 'Upgrading facility...', 'var(--text)');
+    
+    const upgradeResult = await new Promise(resolve => {
+      sendExec(username, 'facility', { action: 'upgrade', facility_id: facilityId, facility_type: upgradeType }, resolve);
+    });
+    
+    if (upgradeResult.ok) {
+      const hint = upgradeResult.data?.hint || 'Facility upgraded!';
+      appendLine('system', `${username}: ${hint}`);
+      showSuccess();
+    } else {
+      showError(upgradeResult.error || 'Upgrade failed');
+    }
+  })();
+}
+
+function showPersonalFacilityUpgradeDetails(username, facilityId) {
+  const container = document.getElementById('personalFacilitiesList');
+  if (!container) return;
+  
+  const upgradeInfo = personalFacilityUpgrades[facilityId];
+  if (!upgradeInfo || !upgradeInfo.upgrade_to) {
+    container.innerHTML = '<div class="faction-no-data">No upgrade available</div>';
+    return;
+  }
+  
+  const up = upgradeInfo.upgrade_to;
+  
+  const uName = up.name || up.facility_type || up.type || '?';
+  const uLevel = up.level ?? '';
+  const levelStr = uLevel ? ` Lv${uLevel}` : '';
+  const desc = up.description || up.desc || '';
+  const cost = up.cost ?? up.credits ?? up.price ?? up.credit_cost ?? 0;
+  const costStr = cost ? `${Number(cost).toLocaleString()}cr` : '';
+  const mats = up.materials || up.requirements || up.build_materials || [];
+  let matsHtml = '';
+  if (Array.isArray(mats) && mats.length > 0) {
+    matsHtml = '<div style="font-size:11px;color:var(--text-dim);margin-top:8px">Required Materials:</div>' +
+      mats.map(m => {
+        const mName = m.name || m.item_name || m.item_id || '?';
+        const mQty = m.quantity || m.count || m.amount || 1;
+        return `<div style="font-size:11px;padding:2px 0">• ${mQty}x ${esc(mName)}</div>`;
+      }).join('');
+  } else if (typeof mats === 'object' && !Array.isArray(mats) && Object.keys(mats).length > 0) {
+    matsHtml = '<div style="font-size:11px;color:var(--text-dim);margin-top:8px">Required Materials:</div>' +
+      Object.entries(mats).map(([k, v]) => `<div style="font-size:11px;padding:2px 0">• ${v}x ${esc(k)}</div>`).join('');
+  }
+  
+  const detailHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+        <div>
+          <div style="font-size:14px;font-weight:700;color:var(--text-bright)">Upgrade to ${esc(uName)}${esc(levelStr)}</div>
+        </div>
+        <button class="sm" onclick="fetchPersonalFacilities('${esc(username)}')">Back to List</button>
+      </div>
+      ${desc ? `<div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>` : ''}
+      ${costStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Upgrade Cost: ${esc(costStr)}</div>` : ''}
+      ${matsHtml}
+      <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+        <button class="primary sm" style="width:100%" onclick="upgradePersonalFacility('${esc(username)}','${esc(facilityId)}')">Upgrade Facility</button>
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
+        This will withdraw required materials from your storage and upgrade the facility.
+      </div>
+    </div>
+  `;
+  
+  container.innerHTML = detailHtml;
+}
+
+function showFactionFacilityUpgradeDetails(username, facilityId) {
+  const container = document.getElementById('factionFacilitiesList');
+  if (!container) return;
+  
+  const upgradeInfo = factionFacilityUpgrades[facilityId];
+  if (!upgradeInfo || !upgradeInfo.upgrade_to) {
+    container.innerHTML = '<div class="faction-no-data">No upgrade available</div>';
+    return;
+  }
+  
+  const up = upgradeInfo.upgrade_to;
+  
+  const uName = up.name || up.facility_type || up.type || '?';
+  const uLevel = up.level ?? '';
+  const levelStr = uLevel ? ` Lv${uLevel}` : '';
+  const desc = up.description || up.desc || '';
+  const cost = up.cost ?? up.credits ?? up.price ?? up.credit_cost ?? 0;
+  const costStr = cost ? `${Number(cost).toLocaleString()}cr` : '';
+  const mats = up.materials || up.requirements || up.build_materials || [];
+  let matsHtml = '';
+  if (Array.isArray(mats) && mats.length > 0) {
+    matsHtml = '<div style="font-size:11px;color:var(--text-dim);margin-top:8px">Required Materials:</div>' +
+      mats.map(m => {
+        const mName = m.name || m.item_name || m.item_id || '?';
+        const mQty = m.quantity || m.count || m.amount || 1;
+        return `<div style="font-size:11px;padding:2px 0">• ${mQty}x ${esc(mName)}</div>`;
+      }).join('');
+  } else if (typeof mats === 'object' && !Array.isArray(mats) && Object.keys(mats).length > 0) {
+    matsHtml = '<div style="font-size:11px;color:var(--text-dim);margin-top:8px">Required Materials:</div>' +
+      Object.entries(mats).map(([k, v]) => `<div style="font-size:11px;padding:2px 0">• ${v}x ${esc(k)}</div>`).join('');
+  }
+  
+  const upgradeType = up.type_id || up.facility_type || up.type || '';
+  
+  const detailHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+        <div>
+          <div style="font-size:14px;font-weight:700;color:var(--text-bright)">Upgrade to ${esc(uName)}${esc(levelStr)}</div>
+        </div>
+        <button class="sm" onclick="fetchFactionFacilities('${esc(username)}')">Back to List</button>
+      </div>
+      ${desc ? `<div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>` : ''}
+      ${costStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Upgrade Cost: ${esc(costStr)}</div>` : ''}
+      ${matsHtml}
+      <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+        <button class="primary sm" style="width:100%" onclick="upgradeFactionFacility('${esc(username)}','${esc(facilityId)}','${esc(upgradeType)}')">Upgrade Facility</button>
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
+        This will withdraw required materials from faction storage and upgrade the facility.
+      </div>
+    </div>
+  `;
+  
+  container.innerHTML = detailHtml;
+}
+
+function upgradeFactionFacility(username, facilityId, upgradeType) {
+  const container = document.getElementById('factionFacilitiesList');
+  if (!container) return;
+  
+  const upgradeInfo = factionFacilityUpgrades[facilityId];
+  if (!upgradeInfo || !upgradeInfo.upgrade_to) {
+    appendLine('system', 'No upgrade available for this facility');
+    return;
+  }
+  
+  const up = upgradeInfo.upgrade_to;
+  const uName = up.name || upgradeType || 'Unknown';
+  
+  const mats = up.materials || up.requirements || up.build_materials || [];
+  const cost = up.cost ?? up.credits ?? up.price ?? up.credit_cost ?? 0;
+  
+  let progressHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="font-size:14px;font-weight:700;color:var(--text-bright);margin-bottom:12px">Upgrading: ${esc(uName)}</div>
+      <div id="fup-step-1">Getting upgrade details...</div>
+      <div id="fup-step-2" style="color:var(--text-dim)">Checking faction storage...</div>
+      <div id="fup-step-3" style="color:var(--text-dim)">Withdrawing materials...</div>
+      <div id="fup-step-4" style="color:var(--text-dim)">Upgrading facility...</div>
+      <div id="fup-status" style="margin-top:12px;font-size:11px"></div>
+      <div id="fup-actions" style="margin-top:12px"></div>
+    </div>
+  `;
+  container.innerHTML = progressHtml;
+  
+  const updateStep = (step, status, color) => {
+    const el = document.getElementById(`fup-step-${step}`);
+    if (el) { el.style.color = color || 'var(--text)'; el.textContent = status; }
+  };
+  const setStatus = (msg, color) => {
+    const el = document.getElementById('fup-status');
+    if (el) { el.style.color = color || 'var(--text)'; el.textContent = msg; }
+  };
+  const showError = (msg) => {
+    setStatus('ERROR: ' + msg, 'var(--red)');
+    document.getElementById('fup-actions').innerHTML = '<button class="sm" onclick="fetchFactionFacilities(\'' + esc(username) + '\')">Back to List</button>';
+  };
+  const showSuccess = () => {
+    setStatus('Facility upgraded successfully!', 'var(--green)');
+    document.getElementById('fup-actions').innerHTML = '<button class="primary sm" onclick="fetchFactionFacilities(\'' + esc(username) + '\')">View Faction Facilities</button>';
+  };
+  
+  (async () => {
+    updateStep(1, 'Getting upgrade details...', 'var(--text)');
+    
+    const detailsResult = await new Promise(resolve => {
+      sendExec(username, 'facility', { action: 'upgrades' }, resolve);
+    });
+    
+    if (!detailsResult.ok || !detailsResult.data) {
+      showError(detailsResult.error || 'Failed to get upgrade details');
+      return;
+    }
+    
+    updateStep(1, 'Got upgrade details', 'var(--green)');
+    updateStep(2, 'Checking faction storage...', 'var(--text)');
+    
+    const storageResult = await new Promise(resolve => {
+      sendExec(username, 'view_faction_storage', {}, resolve);
+    });
+    
+    if (!storageResult.ok || !storageResult.data) {
+      showError(storageResult.error || 'Failed to get faction storage');
+      return;
+    }
+    
+    const factionItems = storageResult.data.items || storageResult.data.storage || [];
+    const factionCredits = storageResult.data.credits || 0;
+    
+    const missing = [];
+    if (cost > 0 && factionCredits < cost) {
+      missing.push(`${Number(cost - factionCredits).toLocaleString()} more credits needed (have ${Number(factionCredits).toLocaleString()})`);
+    }
+    
+    if (Array.isArray(mats) && mats.length > 0) {
+      for (const m of mats) {
+        const mId = m.item_id || m.name || m.resource || '?';
+        const mName = m.name || m.item_id || '?';
+        const mQty = m.quantity || m.count || m.amount || 1;
+        const available = factionItems.find(i => (i.item_id === mId || i.name === mId));
+        const availQty = available?.quantity || 0;
+        if (availQty < mQty) {
+          missing.push(`${mQty - availQty}x more ${mName} needed (have ${availQty})`);
+        }
+      }
+    }
+    
+    if (missing.length > 0) {
+      setStatus('Missing: ' + missing.join(', '), 'var(--orange)');
+      document.getElementById('fup-actions').innerHTML = '<button class="sm" onclick="fetchFactionFacilities(\'' + esc(username) + '\')">Back to List</button>';
+      return;
+    }
+    
+    updateStep(2, `Faction storage OK (${factionCredits.toLocaleString()} credits)`, 'var(--green)');
+    updateStep(3, 'Withdrawing materials...', 'var(--text)');
+    
+    if (cost > 0) {
+      setStatus(`Withdrawing ${cost.toLocaleString()} credits...`);
+      const creditResult = await new Promise(resolve => {
+        sendExec(username, 'storage', { action: 'withdraw', item_id: 'credits', quantity: cost, target: 'faction' }, resolve);
+      });
+      if (!creditResult.ok) {
+        showError('Failed to withdraw credits: ' + (creditResult.error || 'unknown'));
+        return;
+      }
+    }
+    
+    if (Array.isArray(mats) && mats.length > 0) {
+      for (const m of mats) {
+        const mId = m.item_id || m.name || m.resource || '?';
+        const mName = m.name || m.item_id || '?';
+        const mQty = m.quantity || m.count || m.amount || 1;
+        setStatus(`Withdrawing ${mQty}x ${mName}...`);
+        const matResult = await new Promise(resolve => {
+          sendExec(username, 'storage', { action: 'deposit', target: 'self', item_id: mId, quantity: mQty, source: 'faction' }, resolve);
+        });
+        if (!matResult.ok) {
+          showError(`Failed to withdraw ${mName}: ${matResult.error || 'unknown'}`);
+          return;
+        }
+      }
+    }
+    
+    updateStep(3, 'Materials withdrawn', 'var(--green)');
+    updateStep(4, 'Upgrading facility...', 'var(--text)');
+    
+    const upgradeResult = await new Promise(resolve => {
+      sendExec(username, 'facility', { action: 'upgrade', facility_id: facilityId, facility_type: upgradeType }, resolve);
+    });
+    
+    if (upgradeResult.ok) {
+      const hint = upgradeResult.data?.hint || 'Facility upgraded!';
+      appendLine('system', `${username}: ${hint}`);
+      showSuccess();
+    } else {
+      showError(upgradeResult.error || 'Upgrade failed');
+    }
+  })();
+}
+
+function transferPersonalFacility(username, facilityId, direction) {
+  if (direction !== 'to_faction' && direction !== 'to_player') {
+    appendLine('system', 'Invalid transfer direction');
+    return;
+  }
+  sendExec(username, 'facility', { action: 'transfer', facility_id: facilityId, direction: direction }, (result) => {
+    if (result.ok) {
+      const hint = result.data?.hint || (direction === 'to_faction' 
+        ? 'Facility transferred to your faction. Rent will now be deducted from faction storage.'
+        : 'Facility transferred to you. Rent will now be deducted from your credits.');
+      appendLine('system', hint);
+      fetchPersonalFacilities(username);
+      fetchFactionFacilities(username);
+    } else {
+      appendLine('system', `Transfer failed: ${result.error || 'unknown'}`);
     }
   });
 }
@@ -11139,7 +11688,29 @@ function renderPersonalFacilityDetailCard(container, username, typeId, detail) {
   const category = detail.category || 'personal';
   const level = detail.level ?? detail.tier ?? '';
   const levelStr = level ? ` Level ${level}` : '';
-  const recipeId = detail.recipe || detail.recipe_id || '';
+  const rawRecipe = detail.recipe || null;
+  let recipeDisplay = '';
+  if (rawRecipe && typeof rawRecipe === 'object') {
+    const recipeName = rawRecipe.name || rawRecipe.id || detail.recipe_id || '';
+    const craftingTime = rawRecipe.crafting_time || rawRecipe.time || '';
+    const timeStr = craftingTime ? ` (${craftingTime}s)` : '';
+    
+    const inputs = rawRecipe.inputs || rawRecipe.components || rawRecipe.ingredients || [];
+    const outputs = rawRecipe.outputs || rawRecipe.output || rawRecipe.result || rawRecipe.produces || [];
+    
+    const inputsStr = inputs.length > 0 
+      ? inputs.map(i => `${i.quantity || 1}x ${i.name || i.item_id || '?'}`).join(', ')
+      : '-';
+    const outputsStr = outputs.length > 0
+      ? outputs.map(o => `${o.quantity || 1}x ${o.name || o.item_id || '?'}`).join(', ')
+      : '-';
+    
+    recipeDisplay = `<span style="font-weight:600">${esc(recipeName)}${timeStr}</span><br/>` +
+      `<span style="color:var(--text-dim)">Inputs:</span> ${esc(inputsStr)}<br/>` +
+      `<span style="color:var(--text-dim)">Outputs:</span> <span style="color:var(--green)">${esc(outputsStr)}</span>`;
+  } else if (typeof rawRecipe === 'string') {
+    recipeDisplay = esc(rawRecipe);
+  }
   const hint = detail.hint || '';
   const buildable = detail.buildable !== false;
   
@@ -11174,10 +11745,14 @@ function renderPersonalFacilityDetailCard(container, username, typeId, detail) {
   if (detail.capacity) stats.push(`Capacity: ${detail.capacity}`);
   if (detail.storage_capacity) stats.push(`Storage: ${detail.storage_capacity}`);
   if (detail.production_rate) stats.push(`Production: ${detail.production_rate}`);
-  if (recipeId) stats.push(`Recipe: ${recipeId}`);
   let statsHtml = '';
   if (stats.length > 0) {
     statsHtml = `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">${stats.join(' | ')}</div>`;
+  }
+  
+  let recipeHtml = '';
+  if (recipeDisplay) {
+    recipeHtml = `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">Recipe: ${recipeDisplay}</div>`;
   }
   
   const warningHtml = hint ? `<div style="margin-top:6px;font-size:11px;color:var(--orange)">${esc(hint)}</div>` : '';
@@ -11198,6 +11773,7 @@ function renderPersonalFacilityDetailCard(container, username, typeId, detail) {
       ${buildTimeStr ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">Build Time: ${esc(buildTimeStr)}</div>` : ''}
       ${matsHtml}
       ${statsHtml}
+      ${recipeHtml}
       ${warningHtml}
       ${notBuildableHtml}
       ${buildable ? `
@@ -11341,7 +11917,7 @@ async function buildPersonalFacility(username, facilityType) {
   if (cost > 0) {
     setStatus(`Withdrawing ${cost.toLocaleString()} credits...`);
     const creditResult = await new Promise(resolve => {
-      sendExec(username, 'faction_withdraw_credits', { amount: cost }, resolve);
+      sendExec(username, 'storage', { action: 'withdraw', item_id: 'credits', quantity: cost, target: 'faction' }, resolve);
     });
     if (creditResult.ok) {
       withdrawnCredits = cost;
@@ -11364,7 +11940,7 @@ async function buildPersonalFacility(username, facilityType) {
       
       // Use faction_withdraw_items to get from faction storage - needs item_id
       const withdrawResult = await new Promise(resolve => {
-        sendExec(username, 'faction_withdraw_items', { item_id: mId, quantity: mQty }, resolve);
+        sendExec(username, 'storage', { action: 'deposit', target: 'self', item_id: mId, quantity: mQty, source: 'faction' }, resolve);
       });
       
       if (!withdrawResult.ok) {

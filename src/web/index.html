@@ -7315,11 +7315,19 @@ function addShipToCraftingList() {
     }
   }
 
-  // Add default modules to craftLimits
+  // Add default modules to craftLimits - count occurrences of each module type
+  const moduleCounts = new Map();
   for (const mod of ship.default_modules || []) {
     const item = catalog.items?.[mod];
     if (item) {
-      settings.crafter.craftLimits[mod] = 1; // 1 of each module
+      const count = (moduleCounts.get(mod) || 0) + 1;
+      moduleCounts.set(mod, count);
+    }
+  }
+  for (const [mod, count] of moduleCounts) {
+    const item = catalog.items?.[mod];
+    if (item) {
+      settings.crafter.craftLimits[mod] = count;
       addedCount++;
     }
   }
@@ -7365,11 +7373,19 @@ function loadShipLoadout() {
     }
   }
 
-  // Add default modules to craftLimits
+  // Add default modules to craftLimits - count occurrences of each module type
+  const loadoutModuleCounts = new Map();
   for (const mod of loadout.defaultModules) {
     const item = catalog.items?.[mod];
     if (item) {
-      settings.crafter.craftLimits[mod] = 1; // 1 of each module
+      const count = (loadoutModuleCounts.get(mod) || 0) + 1;
+      loadoutModuleCounts.set(mod, count);
+    }
+  }
+  for (const [mod, count] of loadoutModuleCounts) {
+    const item = catalog.items?.[mod];
+    if (item) {
+      settings.crafter.craftLimits[mod] = count;
       addedCount++;
     }
   }

@@ -188,6 +188,10 @@ export class Bot {
   private lastWarningAlertMs = 0;
   private static readonly WARNING_ALERT_COOLDOWN_MS = 60_000;
 
+  /** Timestamp of the last battle response to AI chat service (ms). Prevents spam. */
+  private lastBattleResponseMs = 0;
+  private static readonly BATTLE_RESPONSE_COOLDOWN_MS = 15000;
+
   /** Track ongoing login to prevent duplicate concurrent logins */
   private _loginPromise: Promise<boolean> | null = null;
 
@@ -1254,24 +1258,58 @@ export class Bot {
 
           debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
         }
-      } else if (msgType === "battle_damage" && data && typeof data === "object") {
-        // Battle damage also indicates we're in battle
-        const attackerName = (data.attacker_name as string) || "";
-        const targetName = (data.target_name as string) || "";
-        const totalDamage = (data.total_damage as number) || 0;
+       } else if (msgType === "battle_damage" && data && typeof data === "object") {
+         // Battle damage also indicates we're in battle
+         const attackerName = (data.attacker_name as string) || "";
+         const targetName = (data.target_name as string) || "";
+         const totalDamage = (data.total_damage as number) || 0;
 
-        // CRITICAL: Set battle state on damage too (battle_update might not arrive first)
-        const battleId = (data.battle_id as string) || this.currentBattle.battleId || "";
-        if (battleId || attackerName) {
-          this.currentBattle.inBattle = true;
-          if (battleId) {
-            this.currentBattle.battleId = battleId;
-          }
-          this.currentBattle.lastUpdate = Date.now();
-        }
+         // CRITICAL: Set battle state on damage too (battle_update might not arrive first)
+         const battleId = (data.battle_id as string) || this.currentBattle.battleId || "";
+         if (battleId || attackerName) {
+           this.currentBattle.inBattle = true;
+           if (battleId) {
+             this.currentBattle.battleId = battleId;
+           }
+           this.currentBattle.lastUpdate = Date.now();
+         }
 
-        debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
-      } else if (type === "system" && data && typeof data === "object") {
+         debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
+
+         // Check if we should send a battle response to AI chat
+         const now = Date.now();
+         if (now - this.lastBattleResponseMs > Bot.BATTLE_RESPONSE_COOLDOWN_MS) {
+           // Only respond if we're taking damage or just entered battle
+           if (totalDamage > 0 || !this.currentBattle.inBattle) {
+             this.lastBattleResponseMs = now;
+             await this.sendBattleResponseToAI(attackerName, totalDamage);
+           }
+         }
+       } else if (msgType === "battle_update" && data && typeof data === "object") {
+         const battleId = (data.battle_id as string) || "";
+         const tick = (data.tick as number) || 0;
+         const participants = Array.isArray(data.participants) ? data.participants : [];
+         
+         if (battleId) {
+           // We're in battle - update global state
+           this.currentBattle.inBattle = true;
+           this.currentBattle.battleId = battleId;
+           this.currentBattle.lastUpdate = Date.now();
+           this.currentBattle.participants = participants as Array<Record<string, unknown>>;
+ 
+           debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
+         }
+         
+         // Check if we should send a battle response to AI chat (when we just entered battle)
+         const now = Date.now();
+         if (now - this.lastBattleResponseMs > Bot.BATTLE_RESPONSE_COOLDOWN_MS) {
+           // Only respond when we just entered battle (not already in battle)
+           if (!this.currentBattle.inBattle) {
+             this.lastBattleResponseMs = now;
+             await this.sendBattleResponseToAI("", 0);
+           }
+         }
+       } else if (type === "system" && data && typeof data === "object") {
         const message = (data.message as string) || "";
         const msgLower = message.toLowerCase();
 
@@ -1423,16 +1461,197 @@ export class Bot {
     }
   }
 
-  /** Post a faction chat warning about an imminent attack or pirate detection. */
-  private async sendWarningFactionAlert(message: string): Promise<void> {
-    try {
-      const content = `[COMBAT WARNING] ${this.username} — ${message} | ${this.system}/${this.poi}`;
-      await this.api.execute("chat", { channel: "faction", content });
-      this.log("combat", `Faction warning sent`);
-    } catch (err) {
-      this.log("error", `Warning alert failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
+   /** Post a faction chat warning about an imminent attack or pirate detection. */
+   private async sendWarningFactionAlert(message: string): Promise<void> {
+     try {
+       const content = `[COMBAT WARNING] ${this.username} — ${message} | ${this.system}/${this.poi}`;
+       await this.api.execute("chat", { channel: "faction", content });
+       this.log("combat", `Faction warning sent`);
+     } catch (err) {
+       this.log("error", `Warning alert failed: ${err instanceof Error ? err.message : String(err)}`);
+     }
+   }
+
+   /**
+    * Send a witty battle response to the AI chat service when attacked.
+    * This gets the attacker info and sends a personality-appropriate response.
+    */
+   private async sendBattleResponseToAI(attackerName: string, damageTaken: number): Promise<void> {
+     try {
+       // Get AI Chat service from global scope
+       const aiChatService = (globalThis as any).aiChatService;
+       if (!aiChatService || typeof aiChatService.addChatMessage !== "function") {
+         this.log("ai_chat_debug", "AI Chat service not available for battle response");
+         return;
+       }
+
+       // Get nearby entities to provide context
+       const nearbyResp = await this.api.execute("get_nearby");
+       let nearbyInfo = "";
+       if (nearbyResp.result && typeof nearbyResp.result === "object") {
+         const nearby = nearbyResp.result as Record<string, unknown>;
+         const players = Array.isArray(nearby.players) ? nearby.players : [];
+         const npcs = Array.isArray(nearby.npcs) ? nearby.npcs : [];
+         const stations = Array.isArray(nearby.stations) ? nearby.stations : [];
+         
+         if (players.length > 0) {
+           nearbyInfo += ` | Players nearby: ${players.map(p => (p as any).name || (p as any).username || "Unknown").join(", ")}`;
+         }
+         if (npcs.length > 0) {
+           nearbyInfo += ` | NPCs nearby: ${npcs.map(n => (n as any).name || "Unknown").join(", ")}`;
+         }
+         if (stations.length > 0) {
+           nearbyInfo += ` | Stations nearby: ${stations.map(s => (s as any).name || "Unknown").join(", ")}`;
+         }
+       }
+
+        // Get battle status for more details
+        const battleStatusResp = await this.api.execute("get_battle_status");
+        let battleInfo = "";
+        let isAttackerFriendly = false;
+        let ourSideId: number | undefined;
+        if (battleStatusResp.result && typeof battleStatusResp.result === "object") {
+          const battle = battleStatusResp.result as Record<string, unknown>;
+          const participants = Array.isArray(battle.participants) ? battle.participants : [];
+          
+          // Find our side and enemy side
+          // Explicitly check and cast your_side_id to number
+          const yourSideIdRaw = battle.your_side_id;
+          if (typeof yourSideIdRaw === "number") {
+            ourSideId = yourSideIdRaw;
+            const ourZone = battle.your_zone;
+            const ourStance = battle.your_stance;
+            
+            // Find our participant data
+            const ourParticipant = participants.find((p: any) => p.side_id === ourSideId);
+            
+            // Get ship info for context
+            const shipResp = await this.api.execute("get_ship");
+            let shipInfo = "";
+            if (shipResp.result && typeof shipResp.result === "object") {
+              const ship = shipResp.result as Record<string, unknown>;
+              const shipName = (ship as any).name || "Unknown Ship";
+              const shipClass = (ship as any).class || "Unknown Class";
+              shipInfo = `I'm flying a ${shipClass} named ${shipName}`;
+            }
+            
+            // Determine if we're winning or losing based on hull/shield from our participant data
+            const ourHullPct = ourParticipant?.hull_pct || ourParticipant?.hull_percent || 100;
+            const ourShieldPct = ourParticipant?.shield_pct || ourParticipant?.shield_percent || 100;
+            
+            let statusComment = "";
+            if (ourHullPct <= 30) {
+              statusComment = "I'm taking heavy damage!";
+            } else if (ourHullPct <= 60) {
+              statusComment = "I've got some hull damage but I'm still fighting!";
+            } else if (ourShieldPct <= 30) {
+              statusComment = "My shields are down but hull is holding!";
+            } else {
+              statusComment = "I'm holding my own in this fight!";
+            }
+            
+            // Get enemy zone info if available
+            const enemyZone = battle.enemy_zone || 'unknown';
+            
+            battleInfo = ` | Battle status: ${shipInfo}. ${statusComment} Enemy zone: ${enemyZone}, Our zone: ${ourZone || 'unknown'}`;
+          }
+          // If we don't have a valid side ID, we skip battle details (can't determine friend/foe)
+        }
+
+        // Create a message that mentions the attacker (if we have their name)
+        let messageContent = "";
+        if (attackerName && attackerName !== "Unknown" && attackerName !== "") {
+          // Check if attacker is actually on our side (to avoid friendly fire mentions)
+          let isAttackerFriendly = false;
+          if (this.currentBattle.participants && this.currentBattle.participants.length > 0 && ourSideId !== undefined) {
+            isAttackerFriendly = this.currentBattle.participants.some(
+              p => (p as any).username === attackerName && (p as any).side_id === ourSideId
+            );
+          }
+          
+          if (!isAttackerFriendly) {
+            messageContent = `${attackerName} just hit me for ${damageTaken} damage! `;
+          } else {
+            messageContent = "Whoa! Friendly fire! ";
+          }
+        } else {
+          messageContent = "I'm under attack! ";
+        }
+
+       // Add personality-appropriate witty response based on damage and situation
+       const wittyResponses = [
+         "That tickles! Is that the best you've got?",
+         "Ow! My mom could hit harder than that!",
+         "Is your weapon broken or are you just bad at this?",
+         "You fight like a drunk federation cadet!",
+         "My shields absorbed that like a sponge!",
+         "Did you forget to load your weapons?",
+         "Is that a peace offering or an attack?",
+         "You shoot like my grandma playing laser tag!",
+         "I've seen stronger hits from a peashooter!",
+         "Is that all? I barely felt that!",
+         "My grandfather's toupee has more firepower!",
+         "You couldn't hit the broadside of a barn!",
+         "Is that supposed to hurt? Adorable.",
+         "My pet rock could do better than that!",
+         "Are you trying to scratch my paint?",
+         "That barely registered on my damage sensors!",
+         "Is that a nerf gun or a real weapon?",
+         "You fight like you're afraid of winning!",
+         "Is that your attack or did you sneeze on my shields?"
+       ];
+       
+       // Select a random witty response
+       const randomIndex = Math.floor(Math.random() * wittyResponses.length);
+       const wittyResponse = wittyResponses[randomIndex];
+       
+       // If we took significant damage, use a different tone
+       if (damageTaken >= 50) {
+         const seriousResponses = [
+           "Okay, that actually hurt. Who are you working for?",
+           "Not bad! You've got my attention now.",
+           "Alright, you wanna dance? Let's go!",
+           "That sting means you're worth fighting!",
+           "Okay, okay... you've made this interesting.",
+           "Now we're talking! Let's see what you've really got!",
+           "You've got guts, I'll give you that.",
+           "That's more like it! Now we're getting somewhere.",
+           "Alright, you've earned my respect. Let's finish this.",
+           "Okay, you're not completely useless after all."
+         ];
+         const seriousIndex = Math.floor(Math.random() * seriousResponses.length);
+         messageContent += seriousResponses[seriousIndex];
+       } else {
+         messageContent += wittyResponse;
+       }
+       
+       // Add battle context if available
+       if (battleInfo) {
+         messageContent += battleInfo;
+       }
+       
+       // Add nearby info if available
+       if (nearbyInfo) {
+         messageContent += nearbyInfo;
+       }
+       
+       // Send the message to AI chat service as a local chat message
+       // This will allow any bot to respond based on their personality
+       aiChatService.addChatMessage({
+         sender: "System", // Mark as system message so bots know it's a battle alert
+         channel: "local",
+         content: messageContent,
+         timestamp: Date.now(),
+         botUsername: this.username,
+         botSystem: this.system,
+         botPoi: this.poi
+       });
+       
+       this.log("ai_chat", `Sent battle response to AI chat: ${messageContent.substring(0, 100)}...`);
+     } catch (err) {
+       this.log("error", `Failed to send battle response to AI chat: ${err instanceof Error ? err.message : String(err)}`);
+     }
+   }
 
   /**
    * Extract and track player names, pirates, and empire NPCs from a get_nearby response.

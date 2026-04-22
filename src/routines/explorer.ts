@@ -819,7 +819,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Direct to Unknown mode: jump directly to nearest unknown or stale system ──
     if (currentSettings.directToUnknown) {
       const blacklist = getSystemBlacklist();
-      const unknowns = findUnknownSystems(ctx, systemId, blacklist);
+      const unknowns = findUnknownSystems(ctx, systemId, blacklist, fledFromSystems);
 
       if (unknowns.length > 0) {
         // Pick the nearest high-priority target (unknown first, then stale)
@@ -859,7 +859,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         // If grouping is enabled, find nearby unknowns to visit after the target
         let nearbyUnknowns: string[] = [];
         if (currentSettings.groupUnknowns) {
-          nearbyUnknowns = findNearbyUnknowns(ctx, target.id, 2, blacklist);
+          nearbyUnknowns = findNearbyUnknowns(ctx, target.id, 2, blacklist, fledFromSystems);
           if (nearbyUnknowns.length > 0) {
             ctx.log("exploration", `Grouping enabled: ${nearbyUnknowns.length} additional unknown(s) near ${target.name}`);
           }
@@ -1436,6 +1436,11 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
         yield "navigate";
         await ensureUndocked(ctx);
         const blacklist = getSystemBlacklist();
+        // Skip blacklisted systems (persistent + temporary)
+        if (blacklist.some(b => b.toLowerCase() === hiddenPoi.systemId.toLowerCase()) || isTemporarilyBlacklisted(hiddenPoi.systemId)) {
+          ctx.log("info", `Skipping blacklisted system: ${hiddenPoi.systemName}`);
+          continue;
+        }
         const arrived = await navigateToSystem(ctx, hiddenPoi.systemId, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
         if (!arrived) {
           ctx.log("error", `Could not reach ${hiddenPoi.systemName} — skipping POI`);
@@ -1703,6 +1708,7 @@ async function hasDeepCoreSurveyScanner(ctx: RoutineContext): Promise<boolean> {
  */
 async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
+  const fledFromSystems = new Set<string>(); // Track systems we've fled from due to pirates
 
   await bot.refreshStatus();
   const homeSystem = bot.system;
@@ -1756,8 +1762,10 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     for (const [sysId, sys] of Object.entries(allSystems)) {
       // Skip pirate systems — they are hostile!
       if (isPirateSystem(sysId)) continue;
-      // Skip blacklisted systems
+      // Skip blacklisted systems (persistent + temporary + fled from)
       if (blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(sysId)) continue;
+      if (fledFromSystems.has(sysId)) continue;
 
       // If focus area is set, check if this system is within range
       if (focusAreaSystem) {
@@ -2020,7 +2028,7 @@ const STALE_POI_DAYS = 7;
  *
  * Within each tier, systems are sorted by jump distance ascending (nearest first).
  */
-function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklist: string[]): Array<{
+function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklist: string[], fledFromSystems: Set<string>): Array<{
   id: string;
   name: string;
   distance: number;
@@ -2055,8 +2063,10 @@ function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklis
       const connId = conn.system_id;
       if (!connId) continue;
       if (visited.has(connId)) continue;
-      // Skip blacklisted systems
+      // Skip blacklisted systems, temporarily blacklisted systems, and systems we've fled from
       if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(connId)) continue;
+      if (fledFromSystems.has(connId)) continue;
 
       visited.add(connId);
       const newRoute = [...route, connId];
@@ -2139,7 +2149,7 @@ function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklis
  * Find unknown or stale systems near a target system (for grouping).
  * Returns systems within maxJumps that have 0 POIs or all-stale POIs.
  */
-function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps: number, blacklist: string[]): string[] {
+function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps: number, blacklist: string[], fledFromSystems: Set<string>): string[] {
   const nearby: string[] = [];
   const staleThreshold = Date.now() - STALE_POI_DAYS * 24 * 60 * 60 * 1000;
 
@@ -2162,6 +2172,8 @@ function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps:
       if (!connId) continue;
       if (visited.has(connId)) continue;
       if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(connId)) continue;
+      if (fledFromSystems.has(connId)) continue;
 
       visited.add(connId);
 

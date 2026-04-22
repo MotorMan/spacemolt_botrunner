@@ -33,14 +33,14 @@ interface LlmMessage {
 }
 
 export interface ChatMessage {
-  sender: string;
-  channel: "local" | "faction" | "system" | "private";
-  content: string;
-  timestamp: number;
-  botUsername?: string; // Which bot received this
-  botSystem?: string;   // System where message was received (for local chat)
-  botPoi?: string;      // POI where message was received (for local chat)
-  targetId?: string;    // Target player for private messages
+   sender: string;
+   channel: "local" | "faction" | "system" | "private";
+   content: string;
+   timestamp: number;
+   botUsername?: string; // Which bot received this
+   botSystem?: string;   // System where message was received (for local chat)
+   botPoi?: string;      // POI where message was received (for local chat)
+   targetId?: string;    // Target player for private messages
 }
 
 interface BotLockInfo {
@@ -157,25 +157,26 @@ function getBotPersonality(botName: string): string {
 }
 
 function getAiChatSettings(): {
-  enabled: boolean;
-  model: string;
-  baseUrl: string;
-  apiKey: string;
-  cycleIntervalSec: number;
-  respondToMentions: boolean;
-  respondToQuestions: boolean;
-  respondToAll: boolean;
-  respondToSystem: boolean;
-  respondToMayday: boolean;
-  respondToCustoms: boolean;
-  customsResponseChance: number; // 1 in X chance to respond
-  karenModeChance: number; // 1 in X chance for Karen mode (0 = disabled)
-  personality: string;
-  lockDurationSec: number;
-  conversationCooldownSec: number;
-  factionChatRoundsLimit: number; // Max rounds of AI responses in faction chat (0 = unlimited)
-  llmTimeoutSec: number; // Timeout for LLM API calls in seconds
-  maxTokens: number; // Maximum tokens for LLM response
+   enabled: boolean;
+   model: string;
+   baseUrl: string;
+   apiKey: string;
+   cycleIntervalSec: number;
+   respondToMentions: boolean;
+   respondToQuestions: boolean;
+   respondToAll: boolean;
+   respondToSystem: boolean;
+   respondToMayday: boolean;
+   respondToCustoms: boolean;
+   customsResponseChance: number; // 1 in X chance to respond
+   karenModeChance: number; // 1 in X chance for Karen mode (0 = disabled)
+   respondToBattleMessages: boolean; // Whether to respond to battle messages
+   personality: string;
+   lockDurationSec: number;
+   conversationCooldownSec: number;
+   factionChatRoundsLimit: number; // Max rounds of AI responses in faction chat (0 = unlimited)
+   llmTimeoutSec: number; // Timeout for LLM API calls in seconds
+   maxTokens: number; // Maximum tokens for LLM response
 } {
   const all = readSettings();
   const s = (all.ai_chat || {}) as Record<string, unknown>;
@@ -195,27 +196,28 @@ function getAiChatSettings(): {
     (s.model as string) ||
     "llama3.2";
 
-  return {
-    enabled: (s.enabled as boolean) ?? false,
-    model,
-    baseUrl,
-    apiKey,
-    cycleIntervalSec: (s.cycleIntervalSec as number) || 5,
-    respondToMentions: (s.respondToMentions as boolean) ?? true,
-    respondToQuestions: (s.respondToQuestions as boolean) ?? false,
-    respondToAll: (s.respondToAll as boolean) ?? false,
-    respondToSystem: (s.respondToSystem as boolean) ?? false,
-    respondToMayday: (s.respondToMayday as boolean) ?? true,
-    respondToCustoms: (s.respondToCustoms as boolean) ?? true,
-    customsResponseChance: (s.customsResponseChance as number) ?? 10,
-    karenModeChance: (s.karenModeChance as number) ?? 100,
-    personality: (s.personality as string) || DEFAULT_PERSONALITY,
-    lockDurationSec: (s.lockDurationSec as number) || 60,
-    conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
-    factionChatRoundsLimit: (s.factionChatRoundsLimit as number) ?? 5,
-    llmTimeoutSec: (s.llmTimeoutSec as number) ?? 30,
-    maxTokens: (s.maxTokens as number) ?? 1000,
-  };
+   return {
+     enabled: (s.enabled as boolean) ?? false,
+     model,
+     baseUrl,
+     apiKey,
+     cycleIntervalSec: (s.cycleIntervalSec as number) || 5,
+     respondToMentions: (s.respondToMentions as boolean) ?? true,
+     respondToQuestions: (s.respondToQuestions as boolean) ?? false,
+     respondToAll: (s.respondToAll as boolean) ?? false,
+     respondToSystem: (s.respondToSystem as boolean) ?? false,
+     respondToMayday: (s.respondToMayday as boolean) ?? true,
+     respondToCustoms: (s.respondToCustoms as boolean) ?? true,
+     customsResponseChance: (s.customsResponseChance as number) ?? 10,
+     karenModeChance: (s.karenModeChance as number) ?? 100,
+     respondToBattleMessages: (s.respondToBattleMessages as boolean) ?? true,
+     personality: (s.personality as string) || DEFAULT_PERSONALITY,
+     lockDurationSec: (s.lockDurationSec as number) || 60,
+     conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
+     factionChatRoundsLimit: (s.factionChatRoundsLimit as number) ?? 5,
+     llmTimeoutSec: (s.llmTimeoutSec as number) ?? 30,
+     maxTokens: (s.maxTokens as number) ?? 1000,
+   };
 }
 
 // ── Memory ────────────────────────────────────────────────────
@@ -794,11 +796,21 @@ export class AiChatService {
       return;
     }
 
-    // Skip MAYDAY messages if disabled (player won't see responses anyway)
-    if (msg.content.includes("MAYDAY") && !settings.respondToMayday) {
-      this.logFn("ai_chat_debug", `MAYDAY response disabled, ignoring: ${msg.sender} - ${msg.content.slice(0, 50)}`);
-      return;
-    }
+     // Skip MAYDAY messages if disabled (player won't see responses anyway)
+     if (msg.content.includes("MAYDAY") && !settings.respondToMayday) {
+       this.logFn("ai_chat_debug", `MAYDAY response disabled, ignoring: ${msg.sender} - ${msg.content.slice(0, 50)}`);
+       return;
+     }
+     
+     // Skip battle messages if disabled
+     if (msg.sender === "System" && 
+         (msg.content.includes("just hit me for") || 
+          msg.content.includes("Whoa! Friendly fire!") || 
+          msg.content.includes("I'm under attack!")) && 
+         !settings.respondToBattleMessages) {
+       this.logFn("ai_chat_debug", `Battle response disabled, ignoring: ${msg.sender} - ${msg.content.slice(0, 50)}`);
+       return;
+     }
 
     // Skip messages from AI bots (prevent self-talk loops)
     // Note: Self-messages are already filtered in addChatMessage(), so this is extra safety

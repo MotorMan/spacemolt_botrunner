@@ -2656,7 +2656,8 @@ function renderManualControls() {
     i.itemId.toLowerCase().includes('ammo') ||
     i.itemId.toLowerCase().includes('missile') ||
     i.itemId.toLowerCase().includes('rocket') ||
-    i.itemId.toLowerCase().includes('torpedo')
+    i.itemId.toLowerCase().includes('torpedo') ||
+    i.itemId.toLowerCase().includes('plasma')
   );
   
   // Show weapon reload section if:
@@ -3108,7 +3109,8 @@ function mcLoadWeaponData() {
           i.item_id.toLowerCase().includes('ammo') ||
           i.item_id.toLowerCase().includes('missile') ||
           i.item_id.toLowerCase().includes('rocket') ||
-          i.item_id.toLowerCase().includes('torpedo')
+          i.item_id.toLowerCase().includes('torpedo') ||
+          i.item_id.toLowerCase().includes('plasma')
         )
       );
 
@@ -8734,10 +8736,14 @@ function renderAiChatSettings(panel) {
           <input type="checkbox" id="set-aichat-respondToMayday" ${respondToMayday ? 'checked' : ''}>
           <span style="font-size:12px;color:var(--text)">Respond to MAYDAY messages (player won't see)</span>
         </label>
-        <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-          <input type="checkbox" id="set-aichat-respondToCustoms" ${respondToCustoms ? 'checked' : ''}>
-          <span style="font-size:12px;color:var(--text)">Respond to Customs inspections</span>
-        </label>
+         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+           <input type="checkbox" id="set-aichat-respondToCustoms" ${respondToCustoms ? 'checked' : ''}>
+           <span style="font-size:12px;color:var(--text)">Respond to Customs inspections</span>
+         </label>
+         <label style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+           <input type="checkbox" id="set-aichat-respondToBattleMessages" ${respondToBattleMessages ? 'checked' : ''}>
+           <span style="font-size:12px;color:var(--text)">Respond to battle messages</span>
+         </label>
       </div>
     </div>
 
@@ -8772,27 +8778,28 @@ function renderAiChatSettings(panel) {
 }
 
 function saveAiChatSettings() {
-  const s = {
-    enabled: document.getElementById('set-aichat-enabled').checked,
-    baseUrl: document.getElementById('set-aichat-baseUrl').value.trim(),
-    apiKey: document.getElementById('set-aichat-apiKey').value.trim(),
-    model: document.getElementById('set-aichat-model').value.trim(),
-    cycleIntervalSec: parseInt(document.getElementById('set-aichat-cycleIntervalSec').value) || 5,
-    respondToMentions: document.getElementById('set-aichat-respondToMentions').checked,
-    respondToQuestions: document.getElementById('set-aichat-respondToQuestions').checked,
-    respondToAll: document.getElementById('set-aichat-respondToAll').checked,
-    respondToSystem: document.getElementById('set-aichat-respondToSystem').checked,
-    respondToMayday: document.getElementById('set-aichat-respondToMayday').checked,
-    respondToCustoms: document.getElementById('set-aichat-respondToCustoms').checked,
-    customsResponseChance: parseInt(document.getElementById('set-aichat-customsResponseChance').value) || 25,
-    karenModeChance: parseInt(document.getElementById('set-aichat-karenModeChance').value) || 500,
-    personality: document.getElementById('set-aichat-personality').value.trim(),
-    lockDurationSec: parseInt(document.getElementById('set-aichat-lockDurationSec').value) || 60,
-    conversationCooldownSec: parseInt(document.getElementById('set-aichat-conversationCooldownSec').value) || 15,
-    factionChatRoundsLimit: parseInt(document.getElementById('set-aichat-factionChatRoundsLimit').value) ?? 5,
-    llmTimeoutSec: parseInt(document.getElementById('set-aichat-llmTimeoutSec').value) || 30,
-    maxTokens: parseInt(document.getElementById('set-aichat-maxTokens').value) || 1000,
-  };
+   const s = {
+     enabled: document.getElementById('set-aichat-enabled').checked,
+     baseUrl: document.getElementById('set-aichat-baseUrl').value.trim(),
+     apiKey: document.getElementById('set-aichat-apiKey').value.trim(),
+     model: document.getElementById('set-aichat-model').value.trim(),
+     cycleIntervalSec: parseInt(document.getElementById('set-aichat-cycleIntervalSec').value) || 5,
+     respondToMentions: document.getElementById('set-aichat-respondToMentions').checked,
+     respondToQuestions: document.getElementById('set-aichat-respondToQuestions').checked,
+     respondToAll: document.getElementById('set-aichat-respondToAll').checked,
+     respondToSystem: document.getElementById('set-aichat-respondToSystem').checked,
+     respondToMayday: document.getElementById('set-aichat-respondToMayday').checked,
+     respondToCustoms: document.getElementById('set-aichat-respondToCustoms').checked,
+     respondToBattleMessages: document.getElementById('set-aichat-respondToBattleMessages').checked,
+     customsResponseChance: parseInt(document.getElementById('set-aichat-customsResponseChance').value) || 25,
+     karenModeChance: parseInt(document.getElementById('set-aichat-karenModeChance').value) || 500,
+     personality: document.getElementById('set-aichat-personality').value.trim(),
+     lockDurationSec: parseInt(document.getElementById('set-aichat-lockDurationSec').value) || 60,
+     conversationCooldownSec: parseInt(document.getElementById('set-aichat-conversationCooldownSec').value) || 15,
+     factionChatRoundsLimit: parseInt(document.getElementById('set-aichat-factionChatRoundsLimit').value) ?? 5,
+     llmTimeoutSec: parseInt(document.getElementById('set-aichat-llmTimeoutSec').value) || 30,
+     maxTokens: parseInt(document.getElementById('set-aichat-maxTokens').value) || 1000,
+   };
   send({ type: 'saveSettings', routine: 'ai_chat', settings: s });
   settings.ai_chat = s;
   // Update toggle button state

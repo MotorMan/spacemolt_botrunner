@@ -2859,6 +2859,7 @@ function renderManualControls() {
         <option value="cargo_to_station">Cargo → Station</option>
         <option value="cargo_to_faction">Cargo → Faction</option>
         <option value="station_to_faction">Station → Faction</option>
+        <option value="station_to_cargo">Station → Cargo</option>
       </select>
       <button class="primary sm" onclick="mcDepositAll()">Start Queue</button>
       <button class="sm" onclick="mcStopDepositAll()">Stop</button>
@@ -3947,6 +3948,16 @@ function mcBuildDepositQueue(mode) {
         items.push({ item_id: itemId, quantity: qty, target: 'faction', source: 'storage' });
       }
     }
+  } else if (mode === 'station_to_cargo') {
+    // Withdraw all items from station storage to cargo
+    // Command: storage action=withdraw target=self item_id=X quantity=Y source=storage
+    for (const item of storage) {
+      const itemId = item.itemId || item.item_id;
+      const qty = item.quantity || item.count || 1;
+      if (qty > 0 && itemId) {
+        items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'storage', action: 'withdraw' });
+      }
+    }
   }
   
   return { mode, items, index: 0 };
@@ -3986,13 +3997,14 @@ function mcProcessDepositQueue() {
   
   const item = items[index];
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-  logResponse(`<span class="resp-cmd">${ts} > depositing ${item.quantity}x ${item.item_id} (${index + 1}/${items.length})</span>`);
+  const verb = item.action === 'withdraw' ? 'withdrawing' : 'depositing';
+  logResponse(`<span class="resp-cmd">${ts} > ${verb} ${item.quantity}x ${item.item_id} (${index + 1}/${items.length})</span>`);
   
-  // All deposit operations use the storage command
-  // Format: storage action=deposit target=X item_id=Y quantity=Z source=W
+  // All transfer operations use the storage command
+  // Format: storage action=X target=Y item_id=Z quantity=W source=V
   const command = 'storage';
   const params = {
-    action: 'deposit',
+    action: item.action || 'deposit',  // 'deposit' or 'withdraw'
     target: item.target,      // 'self' (station) or 'faction'
     item_id: item.item_id,
     quantity: item.quantity,

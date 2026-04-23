@@ -6141,6 +6141,10 @@ function renderGeneralSettings(panel) {
   const factionDonatePct = general.factionDonatePct ?? 10;
   const factionStorageSystem = general.factionStorageSystem || '';
   const factionStorageStation = general.factionStorageStation || '';
+  const fightTier0Ships = general.fightTier0Ships ?? true;
+  const fightTier1Ships = general.fightTier1Ships ?? true;
+  const maxTier0Ships = general.maxTier0Ships ?? 8;
+  const hullFleeThreshold = general.hullFleeThreshold ?? 20;
 
   // Build station options from mapData
   let stationOpts = '<option value="">(not set)</option>';
@@ -6187,6 +6191,42 @@ function renderGeneralSettings(panel) {
       </div>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Combat: Fight Tier 0 Ships</div>
+        <div class="setting-hint">When attacked by players in starter ships (Tier 0), engage in combat instead of fleeing. Only applies if your ship has weapons.</div>
+      </div>
+      <input type="checkbox" id="set-general-fightTier0" ${fightTier0Ships ? 'checked' : ''} />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Combat: Fight Tier 1 Ships</div>
+        <div class="setting-hint">When attacked by players in basic ships (Tier 1), engage in combat instead of fleeing. Only applies if your ship has weapons.</div>
+      </div>
+      <input type="checkbox" id="set-general-fightTier1" ${fightTier1Ships ? 'checked' : ''} />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Combat: Max Tier 0 Ships to Fight</div>
+        <div class="setting-hint">Maximum number of Tier 0 ships to engage simultaneously. Will flee if more than this number attack at once.</div>
+      </div>
+      <input type="number" id="set-general-maxTier0Ships" min="1" max="20" value="${maxTier0Ships}" style="width:80px" />
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Combat: Hull Flee Threshold %</div>
+        <div class="setting-hint">If hull drops below this percentage during battle, initiate flee. Set to 0 to never flee based on hull damage.</div>
+      </div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <input type="range" id="set-general-hullFleeThreshold" min="0" max="50" step="5" value="${hullFleeThreshold}"
+          oninput="document.getElementById('hullFleeLabel').textContent = this.value + '%'" style="width:120px" />
+        <span id="hullFleeLabel" style="min-width:36px;text-align:right;font-variant-numeric:tabular-nums">${hullFleeThreshold}%</span>
+      </div>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
     </div>
@@ -6201,6 +6241,10 @@ function saveGeneralSettings() {
     factionDonatePct: parseInt(document.getElementById('set-general-donatePct').value) || 0,
     factionStorageSystem,
     factionStorageStation,
+    fightTier0Ships: document.getElementById('set-general-fightTier0').checked,
+    fightTier1Ships: document.getElementById('set-general-fightTier1').checked,
+    maxTier0Ships: parseInt(document.getElementById('set-general-maxTier0Ships').value) || 8,
+    hullFleeThreshold: parseInt(document.getElementById('set-general-hullFleeThreshold').value) || 20,
   };
   send({ type: 'saveSettings', routine: 'general', settings: s });
 }
@@ -7595,6 +7639,7 @@ function renderRescueSettings(panel) {
   const refuelThreshold = r.refuelThreshold ?? 60;
   const maydayMaxJumps = r.maydayMaxJumps ?? 12;
   const maydayFuelThreshold = r.maydayFuelThreshold ?? 15;
+  const ghostThreshold = r.ghostThreshold ?? 3;
   const homeSystem = r.homeSystem || '';
   const homeStation = r.homeStation || '';
   const costPerJump = r.costPerJump ?? 50;
@@ -7683,6 +7728,12 @@ function renderRescueSettings(panel) {
       <label>MAYDAY fuel threshold (%)</label>
       <input type="number" id="set-rescue-maydayFuelThreshold" value="${maydayFuelThreshold}" min="5" max="50" style="width:80px">
       <small style="color:var(--dim)">Only respond to MAYDAYs where pilot has less than this % fuel (avoids ambushes)</small>
+    </div>
+
+    <div class="settings-group">
+      <label>Ghosting blacklist threshold</label>
+      <input type="number" id="set-rescue-ghostThreshold" value="${ghostThreshold}" min="1" max="10" style="width:80px">
+      <small style="color:var(--dim)">Number of ghost incidents before blacklisting a player from rescue service</small>
     </div>
 
     <div class="settings-group">
@@ -7775,6 +7826,7 @@ function saveRescueSettings() {
     refuelThreshold: parseInt(document.getElementById('set-rescue-refuelThreshold').value) || 60,
     maydayMaxJumps: parseInt(document.getElementById('set-rescue-maydayMaxJumps').value) || 0,
     maydayFuelThreshold: parseInt(document.getElementById('set-rescue-maydayFuelThreshold').value) || 15,
+    ghostThreshold: parseInt(document.getElementById('set-rescue-ghostThreshold').value) || 3,
     costPerJump: parseInt(document.getElementById('set-rescue-costPerJump').value) || 50,
     costPerFuel: parseInt(document.getElementById('set-rescue-costPerFuel').value) || 2,
     creditTopOffAmount: parseInt(document.getElementById('set-rescue-creditTopOffAmount').value) || 10000,

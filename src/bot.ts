@@ -139,6 +139,9 @@ export class Bot {
   /** Accumulated stats for this bot. */
   stats: BotStats = { totalMined: 0, totalCrafted: 0, totalTrades: 0, totalProfit: 0, totalSystems: 0 };
 
+  /** Bot-specific settings loaded from disk. */
+  settings?: Record<string, unknown>;
+
   // Action log (last N entries)
   readonly actionLog: string[] = [];
   private maxLogEntries = 200;

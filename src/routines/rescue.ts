@@ -118,6 +118,7 @@ function getRescueSettings(): {
     refuelThreshold: (r.refuelThreshold as number) || 60,
     maydayMaxJumps: (r.maydayMaxJumps as number) || 12,
     maydayFuelThreshold: (r.maydayFuelThreshold as number) || 15,
+    ghostThreshold: (r.ghostThreshold as number) || 3,
     homeSystem: (r.homeSystem as string) || (ft.homeSystem as string) || (general.homeSystem as string),
     homeStation: (r.homeStation as string) || '',
     costPerJump: (r.costPerJump as number) || 50,
@@ -1513,7 +1514,7 @@ skipToReturnHome = true;
           ctx.log("mayday", `✓ Fuel check passed: ${mayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
-          const rescueDecision = shouldRescuePlayer(mayday.sender);
+          const rescueDecision = shouldRescuePlayer(mayday.sender, settings.ghostThreshold);
           if (!rescueDecision.shouldRescue) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - ${rescueDecision.reason}`);
             markMaydayHandled(mayday);
@@ -3462,7 +3463,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
   await bot.refreshStatus();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
-  
+
   if (settings.homeSystem) {
     ctx.log("system", `Home base configured: ${homeSystem}`);
   } else {
@@ -3582,7 +3583,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       ctx.log("mayday", `✓ Fuel check passed: ${nextMayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
       // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
-      const rescueDecision = shouldRescuePlayer(nextMayday.sender);
+      const rescueDecision = shouldRescuePlayer(nextMayday.sender, settings.ghostThreshold);
       if (!rescueDecision.shouldRescue) {
         ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - ${rescueDecision.reason}`);
         markMaydayHandled(nextMayday);
@@ -4412,7 +4413,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log("mayday", `✓ Fuel check passed: ${mayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
-          const rescueDecision = shouldRescuePlayer(mayday.sender);
+          const rescueDecision = shouldRescuePlayer(mayday.sender, settings.ghostThreshold);
           if (!rescueDecision.shouldRescue) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - ${rescueDecision.reason}`);
             markMaydayHandled(mayday);

@@ -1168,7 +1168,7 @@ async function signalEscort(
   ctx: RoutineContext,
   action: "jump" | "travel" | "dock" | "undock",
   systemId?: string,
-  channel: "faction" | "local" | "file" = "faction",
+  channel: "faction" | "local" | "file" | "chat" = "faction",
 ): Promise<void> {
   const { bot } = ctx;
   const message = `[ESCORT] ${action}${systemId ? ` ${systemId}` : ""}`;
@@ -1177,6 +1177,9 @@ async function signalEscort(
     await bot.exec("chat", { channel: "faction", content: message });
   } else if (channel === "local") {
     ctx.log("escort", `Signal: ${message}`);
+  } else if (channel === "chat") {
+    // Use non-API chat channel for instant coordination
+    ctx.sendBotChat?.(message, "escort");
   } else {
     // File-based signaling for cross-bot coordination on same machine
     const { writeFileSync, existsSync, mkdirSync } = await import("fs");

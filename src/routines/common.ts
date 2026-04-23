@@ -803,6 +803,188 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
   }
 }
 
+// ── Combat utilities ──────────────────────────────────────────
+
+/** Check if the bot's ship has any equipped weapons. */
+export async function hasWeapons(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error || !shipResp.result) {
+    ctx.log("warn", "Unable to check ship weapons - get_ship failed");
+    return false;
+  }
+
+  const result = shipResp.result as Record<string, unknown>;
+  const modules = result.modules as Array<Record<string, unknown>> | undefined;
+  if (!modules) return false;
+
+  // Check for weapon modules (pulse_laser, etc.)
+  return modules.some(mod => {
+    const category = (mod.category as string)?.toLowerCase();
+    return category === "weapon" || category?.includes("laser") || category?.includes("cannon");
+  });
+}
+
+/** Get the tier of a ship by its ID from the catalog. */
+export function getShipTier(shipId: string): number | null {
+  const ship = catalogStore.getShip(shipId);
+  return ship?.tier ?? null;
+}
+
+/**
+ * Determine if we should engage attacking players in combat.
+ * Checks general settings, our weapons, and attacker ship tiers.
+ */
+export async function shouldEngagePlayersInCombat(ctx: RoutineContext, players: NearbyEntity[]): Promise<boolean> {
+  const { bot } = ctx;
+
+  // Check if we have weapons
+  const hasWeaponsEquipped = await hasWeapons(ctx);
+  if (!hasWeaponsEquipped) {
+    ctx.log("combat", "No weapons equipped - cannot fight players");
+    return false;
+  }
+
+  // Get general settings
+  const generalSettings = (ctx.bot.settings as any)?.general || {};
+  const fightTier0 = (generalSettings.fightTier0Ships as boolean) ?? true;
+  const fightTier1 = (generalSettings.fightTier1Ships as boolean) ?? true;
+  const maxTier0Ships = (generalSettings.maxTier0Ships as number) ?? 8;
+
+  // Count attackers by tier
+  let tier0Count = 0;
+  let tier1Count = 0;
+  let otherTiers = 0;
+
+  for (const player of players) {
+    if (player.shipTier === 0) tier0Count++;
+    else if (player.shipTier === 1) tier1Count++;
+    else otherTiers++;
+  }
+
+  ctx.log("combat", `Attacker composition: ${tier0Count} T0, ${tier1Count} T1, ${otherTiers} other tiers`);
+
+  // Check if we should fight based on settings
+  const shouldFightTier0 = fightTier0 && tier0Count <= maxTier0Ships;
+  const shouldFightTier1 = fightTier1 && tier1Count > 0;
+  const hasOtherTiers = otherTiers > 0;
+
+  // Only fight if all attackers are T0/T1 and we allow fighting them
+  if (hasOtherTiers) {
+    ctx.log("combat", "Higher tier ships detected - not engaging");
+    return false;
+  }
+
+  if (tier0Count > 0 && !shouldFightTier0) {
+    ctx.log("combat", `Too many T0 ships (${tier0Count} > ${maxTier0Ships}) or T0 fighting disabled - not engaging`);
+    return false;
+  }
+
+  if (tier1Count > 0 && !shouldFightTier1) {
+    ctx.log("combat", "T1 ships detected but T1 fighting disabled - not engaging");
+    return false;
+  }
+
+  // We should fight!
+  return (tier0Count > 0 && shouldFightTier0) || (tier1Count > 0 && shouldFightTier1);
+}
+
+/**
+ * Engage in battle against attacking players.
+ * Advances to engaged zone and starts firing.
+ */
+export async function engageInBattle(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+
+  ctx.log("combat", "ENGAGING IN BATTLE - advancing to engaged zone...");
+
+  // Advance 3 times to get to engaged zone
+  for (let i = 0; i < 3; i++) {
+    const advanceResp = await bot.exec("battle", { action: "advance" });
+    if (advanceResp.error) {
+      ctx.log("error", `Battle advance ${i + 1} failed: ${advanceResp.error.message}`);
+      // Continue trying - sometimes the first advance fails
+    } else {
+      ctx.log("combat", `Battle advance ${i + 1} successful`);
+    }
+
+    // Wait for server response
+    await new Promise(resolve => setTimeout(resolve, 1000));
+  }
+
+  ctx.log("combat", "Setting battle stance to FIRE...");
+  const fireResp = await bot.exec("battle", { action: "stance", stance: "fire" });
+  if (fireResp.error) {
+    ctx.log("error", `Failed to set fire stance: ${fireResp.error.message}`);
+  } else {
+    ctx.log("combat", "Battle stance set to FIRE - now actively fighting!");
+  }
+
+  // Start monitoring battle status
+  monitorAndHandleBattleFlee(ctx);
+}
+
+/**
+ * Monitor battle status and flee if hull drops below threshold.
+ * Runs in background and handles fleeing automatically.
+ */
+export async function monitorAndHandleBattleFlee(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  const generalSettings = (bot.settings as any)?.general || {};
+  const hullFleeThreshold = (generalSettings.hullFleeThreshold as number) ?? 20;
+
+  if (hullFleeThreshold <= 0) {
+    ctx.log("combat", "Hull flee threshold disabled (set to 0) - not monitoring hull");
+    return;
+  }
+
+  ctx.log("combat", `Monitoring battle status - will flee if hull drops below ${hullFleeThreshold}%`);
+
+  const monitorInterval = setInterval(async () => {
+    try {
+      // Check if we're still in a battle
+      const battleStatus = await getBattleStatus(ctx);
+      if (!battleStatus || !battleStatus.is_participant) {
+        ctx.log("combat", "Battle monitoring: No longer in battle");
+        clearInterval(monitorInterval);
+        return;
+      }
+
+      // Check our hull
+      await bot.refreshStatus();
+      const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+
+      if (hullPct <= hullFleeThreshold) {
+        ctx.log("combat", `Hull critical (${hullPct}% <= ${hullFleeThreshold}%) - initiating flee!`);
+        clearInterval(monitorInterval);
+
+        // Flee from battle
+        const fled = await fleeFromBattle(ctx, true, 35000);
+        if (fled) {
+          ctx.log("combat", "Successfully fled battle due to low hull");
+
+          // Check if we should return home
+          if (hullPct <= 10) { // Very low hull - return home
+            ctx.log("combat", "Hull very low - should return home for repairs");
+            // Note: Routines should check for low hull and trigger return_home
+          }
+        } else {
+          ctx.log("error", "Failed to flee battle despite low hull");
+        }
+      }
+    } catch (error) {
+      ctx.log("error", `Battle monitoring error: ${error}`);
+      clearInterval(monitorInterval);
+    }
+  }, 5000); // Check every 5 seconds
+
+  // Stop monitoring after 30 minutes (safety timeout)
+  setTimeout(() => {
+    clearInterval(monitorInterval);
+    ctx.log("combat", "Battle monitoring timeout reached");
+  }, 30 * 60 * 1000);
+}
+
 // ── Safety checks ────────────────────────────────────────────
 
 /** Check fuel and hull, dock/refuel/repair if below thresholds.
@@ -2740,6 +2922,15 @@ export interface PirateDetectionResult {
   pirates: NearbyEntity[];
 }
 
+export interface NearbyEntitiesResult {
+  pirates: NearbyEntity[];
+  players: NearbyEntity[];
+  hasPirates: boolean;
+  hasPlayers: boolean;
+  pirateCount: number;
+  playerCount: number;
+}
+
 /** Pirate tier type for threat assessment - matches API values */
 export type PirateTier = "small" | "medium" | "large" | "capitol" | "boss" | "raider" | "salvager" | "tanker" | "fighter" | "destroyer" | "cruiser" | "battleship";
 
@@ -2765,7 +2956,7 @@ export function getPirateThreatLevel(tier: string | undefined | null): number {
   return PIRATE_THREAT_LEVELS[tier.toLowerCase()] || 2;
 }
 
-/** Pirate entity from get_nearby response */
+/** Entity from get_nearby response (pirates or players) */
 export interface NearbyEntity {
   id: string;
   name: string;
@@ -2780,6 +2971,8 @@ export interface NearbyEntity {
   shield?: number;
   maxShield?: number;
   status?: string;
+  shipId?: string; // For players
+  shipTier?: number; // For players
 }
 
 /**
@@ -2890,6 +3083,128 @@ export function parseNearbyForPirates(result: unknown): PirateDetectionResult {
     pirateCount: pirates.length,
     highestTier,
     pirates,
+  };
+}
+
+/**
+ * Parse get_nearby response to detect both pirates and players.
+ * @param result - The result from get_nearby API call
+ * @returns Detection result with pirates and players
+ */
+export function parseNearbyEntities(result: unknown): NearbyEntitiesResult {
+  if (!result || typeof result !== "object") {
+    return { pirates: [], players: [], hasPirates: false, hasPlayers: false, pirateCount: 0, playerCount: 0 };
+  }
+
+  const r = result as Record<string, unknown>;
+  const pirates: NearbyEntity[] = [];
+  const players: NearbyEntity[] = [];
+
+  // Handle different response formats
+  let rawEntities: Array<Record<string, unknown>> = [];
+
+  if (Array.isArray(r)) {
+    rawEntities = r;
+  } else if (Array.isArray(r.entities)) {
+    rawEntities = r.entities as Array<Record<string, unknown>>;
+  } else if (Array.isArray(r.players) && r.players.length > 0) {
+    rawEntities = r.players as Array<Record<string, unknown>>;
+  } else if (Array.isArray(r.nearby)) {
+    rawEntities = r.nearby as Array<Record<string, unknown>>;
+  }
+
+  // Parse entities looking for pirates and players
+  for (const e of rawEntities) {
+    const id = (e.id as string) || (e.player_id as string) || (e.entity_id as string) || (e.pirate_id as string) || "";
+    if (!id) continue;
+
+    let faction = "";
+    if (typeof e.faction === "string") faction = e.faction.toLowerCase();
+    else if (typeof e.faction_id === "string") faction = e.faction_id.toLowerCase();
+
+    let type = "";
+    if (typeof e.type === "string") type = e.type.toLowerCase();
+    else if (typeof e.entity_type === "string") type = e.entity_type.toLowerCase();
+
+    const isPirate = !!(e.pirate_id) || type.includes("pirate") || faction.includes("pirate");
+    const isPlayer = !isPirate && (type.includes("player") || type.includes("ship") || e.player_id);
+
+    if (isPirate) {
+      const tier = (e.tier as PirateTier) || "small";
+      const isBoss = !!(e.is_boss as boolean);
+
+      pirates.push({
+        id,
+        name: (e.name as string) || (e.username as string) || (e.pirate_name as string) || id,
+        type: "pirate",
+        faction: "pirate",
+        isNPC: true,
+        isPirate: true,
+        tier,
+        isBoss,
+        hull: e.hull as number,
+        maxHull: e.max_hull as number,
+        shield: e.shield as number,
+        maxShield: e.max_shield as number,
+        status: e.status as string,
+      });
+    } else if (isPlayer) {
+      const shipId = (e.ship_id as string) || (e.ship as string) || "";
+      const shipTier = shipId ? getShipTier(shipId) : null;
+
+      players.push({
+        id,
+        name: (e.name as string) || (e.username as string) || id,
+        type: "player",
+        faction: faction || "neutral",
+        isNPC: false,
+        isPirate: false,
+        shipId,
+        shipTier: shipTier ?? undefined,
+        hull: e.hull as number,
+        maxHull: e.max_hull as number,
+        shield: e.shield as number,
+        maxShield: e.max_shield as number,
+        status: e.status as string,
+      });
+    }
+  }
+
+  // Parse pirates array (special format from get_nearby at POIs)
+  if (Array.isArray(r.pirates)) {
+    const rawPirates = r.pirates as Array<Record<string, unknown>>;
+    for (const p of rawPirates) {
+      const id = (p.pirate_id as string) || "";
+      if (!id) continue;
+
+      const tier = (p.tier as PirateTier) || "small";
+      const isBoss = !!(p.is_boss as boolean);
+
+      pirates.push({
+        id,
+        name: (p.name as string) || (p.pirate_name as string) || id,
+        type: "pirate",
+        faction: "pirate",
+        isNPC: true,
+        isPirate: true,
+        tier,
+        isBoss,
+        hull: p.hull as number,
+        maxHull: p.max_hull as number,
+        shield: p.shield as number,
+        maxShield: p.max_shield as number,
+        status: p.status as string,
+      });
+    }
+  }
+
+  return {
+    pirates,
+    players,
+    hasPirates: pirates.length > 0,
+    hasPlayers: players.length > 0,
+    pirateCount: pirates.length,
+    playerCount: players.length,
   };
 }
 
@@ -3037,17 +3352,38 @@ export async function handleBattleNotifications(
         battleState.battleId = battleNotif.battleId || null;
         battleState.battleStartTick = Date.now();
         battleState.isFleeing = false;
-        
-        // Check for pirates in battle participants
+
+        // Check for pirates in battle participants first
         if (battleNotif.participants) {
           const pirateResult = parsePiratesFromBattleParticipants(battleNotif.participants);
           if (pirateResult.hasPirates) {
             ctx.log("combat", `⚠️ PIRATES DETECTED IN BATTLE! ${pirateResult.pirateCount} pirate(s), highest tier: ${pirateResult.highestTier}`);
+            ctx.log("combat", "Initiating emergency flee from pirates!");
+            await fleeFromBattle(ctx, true, 35000);
+            return true;
           }
         }
-        
-        // Immediately initiate flee
-        ctx.log("combat", "Initiating emergency flee!");
+
+        // No pirates detected - check for players via get_nearby
+        ctx.log("combat", "No pirates detected - checking for attacking players...");
+        const nearbyResp = await ctx.bot.exec("get_nearby");
+        if (!nearbyResp.error && nearbyResp.result) {
+          const nearbyResult = parseNearbyEntities(nearbyResp.result);
+          ctx.log("combat", `Nearby entities: ${nearbyResult.playerCount} players, ${nearbyResult.pirateCount} pirates`);
+
+          // Check if we should fight players
+          if (nearbyResult.hasPlayers) {
+            const shouldFight = await shouldEngagePlayersInCombat(ctx, nearbyResult.players);
+            if (shouldFight) {
+              ctx.log("combat", "Decided to engage attacking players in combat!");
+              await engageInBattle(ctx);
+              return true; // We're fighting, not fleeing
+            }
+          }
+        }
+
+        // Default: flee if we can't determine attackers or shouldn't fight
+        ctx.log("combat", "Unable to determine attackers or decided not to fight - fleeing!");
         await fleeFromBattle(ctx, true, 35000);
         return true;
 
@@ -3095,6 +3431,7 @@ export async function handleBattleNotifications(
           battleState.inBattle = false;
           battleState.battleId = null;
           battleState.isFleeing = false;
+          ctx.log("combat", "Battle won! Resuming normal operations.");
         }
         break;
     }

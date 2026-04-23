@@ -150,10 +150,10 @@ export function recordSuccessfulRescue(playerName: string, creditsBilled: number
  * Check if we should rescue a player.
  * Returns:
  * - true/false if manual override is set
- * - false if ghost count >= 3
+ * - false if ghost count >= threshold
  * - true otherwise (auto-decision)
  */
-export function shouldRescuePlayer(playerName: string): { shouldRescue: boolean; reason: string } {
+export function shouldRescuePlayer(playerName: string, ghostThreshold: number = 3): { shouldRescue: boolean; reason: string } {
   const record = getPlayerRecord(playerName);
 
   // Manual override takes precedence
@@ -165,8 +165,8 @@ export function shouldRescuePlayer(playerName: string): { shouldRescue: boolean;
   }
 
   // Auto-decision based on ghost count
-  if (record.ghostCount >= 3) {
-    return { shouldRescue: false, reason: `Too many ghosts (${record.ghostCount})` };
+  if (record.ghostCount >= ghostThreshold) {
+    return { shouldRescue: false, reason: `Too many ghosts (${record.ghostCount}/${ghostThreshold})` };
   }
 
   return { shouldRescue: true, reason: "Auto-approve" };

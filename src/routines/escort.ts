@@ -27,6 +27,7 @@
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
+import { getBotChatChannel } from "../botmanager.js";
 import { mapStore } from "../mapstore.js";
 import { getSystemBlacklist } from "../web/server.js";
 import {
@@ -85,7 +86,7 @@ function getEscortSettings(username?: string): {
   autoCloak: boolean;
   ammoThreshold: number;
   maxReloadAttempts: number;
-  signalChannel: "faction" | "local" | "file";
+  signalChannel: "faction" | "local" | "file" | "chat";
 } {
   const all = readSettings();
   const e = all.escort || {};
@@ -803,9 +804,56 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       } else {
         ctx.log("escort", `✗ No faction chat signal found from ${minerName}`);
       }
+    } else if (settings.signalChannel === "chat") {
+      // Check via bot chat system (non-API, instant communication)
+      ctx.log("escort", `Checking chat signal via sendBotChat for ${minerName}...`);
+      const chatChannel = getBotChatChannel();
+      
+       // Register handler to catch escort signals from this miner
+       const handler = (msg: { channel: string; sender: string; content: string; } | { channel: string; sender: string; }) => {
+         // Type guard to ensure msg has content property
+         if ('content' in msg && msg.channel === "escort" && msg.sender === minerName && typeof msg.content === 'string') {
+           const match = msg.content.match(/\[ESCORT\]\s*(jump|travel|dock|undock)\s*(\S+)?/i);
+           if (match) {
+             return {
+               action: match[1].toLowerCase(),
+               systemId: match[2] || undefined
+             };
+           }
+         }
+         return null;
+       };
+      
+      chatChannel.onMessage(minerName, handler);
+      // Wait briefly for pending messages
+      await sleep(1000);
+      
+      // Check for recent escort messages
+      const recentMessages = chatChannel.getHistory("escort", 20);
+      const msg = recentMessages.find(m => m.sender === minerName);
+      let chatSignal = null;
+      
+      if (msg) {
+        const match = msg.content.match(/\[ESCORT\]\s*(jump|travel|dock|undock)\s*(\S+)?/i);
+        if (match) {
+          chatSignal = {
+            action: match[1].toLowerCase(),
+            systemId: match[2] || undefined
+          };
+        }
+      }
+      
+      chatChannel.offMessage(minerName, handler);
+      escortSignal = chatSignal;
+      
+      if (escortSignal) {
+        ctx.log("escort", `✓ Found chat signal: ${escortSignal.action} ${escortSignal.systemId || ""}`);
+      } else {
+        ctx.log("escort", `✗ No chat signal found from ${minerName}`);
+      }
     }
 
-    // If primary channel failed, try the other as fallback
+    // If primary channel failed, try the other as fallback (including chat)
     if (!escortSignal && settings.signalChannel === "file") {
       ctx.log("escort", `Falling back to faction chat check...`);
       escortSignal = await checkEscortSignals(ctx, minerName);
@@ -849,6 +897,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
             },
           };
           
+
           const arrived = await navigateToSystem(ctx, targetSystem, jumpSafetyOpts);
           if (arrived) {
             minerSystem = targetSystem;

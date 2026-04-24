@@ -93,10 +93,10 @@ const COMMAND_TTL: Record<string, number> = {
   v2_get_skills: 120_000,
   v2_get_queue: 5_000,
   v2_get_missions: 60_000,
-  catalog: 1800_000,
+  catalog: 3600_000,
 };
 
-const INV_STATUS   = ["get_status", "v2_get_player", "get_queue", "v2_get_queue"];
+const INV_STATUS   = ["get_status", "v2_get_player", "get_queue", "v2_get_queue", "get_skills"];
 const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey_system", "find_route"];
 const INV_CARGO    = ["get_cargo", "v2_get_cargo"];
 const INV_SHIP     = ["get_ship", "v2_get_ship"];
@@ -139,6 +139,7 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   decline_mission: [...INV_STATUS, ...INV_MISSIONS],
   cloak: INV_STATUS,
   attack: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
+  battle: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
   catalog: [],
 };
 

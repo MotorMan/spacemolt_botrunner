@@ -316,6 +316,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
   const visitedSystems = new Set<string>();
   const fledFromSystems = new Set<string>(); // Track systems we've fled from due to pirates
+  const path: string[] = []; // Track the path of systems visited to enable reverse fleeing
   let lastSystem: string | null = null;
 
   // ── Startup: dock at local station to clear cargo & refuel ──
@@ -452,6 +453,9 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
     visitedSystems.add(systemId);
+    if (path.length === 0) {
+      path.push(systemId); // Initialize path with starting system
+    }
 
     // Try to capture security level
     await fetchSecurityLevel(ctx, systemId);
@@ -487,7 +491,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           await recordPirateSighting(ctx, systemId, pirateResult.pirates);
 
           // Add temporary blacklist for this system
-          addTemporaryPirateBlacklist(systemId, 30); // 30 minutes
+          addTemporaryPirateBlacklist(systemId, 10); // 10 minutes
 
           // CRITICAL: Verify actual current system before fleeing
           // During cascade emergency jumps, lastSystem can get out of sync
@@ -495,43 +499,48 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           const actualSystemId = bot.system;
           ctx.log("combat", `Verified actual position before flee: system=${actualSystemId}, lastSystem=${lastSystem}`);
 
-          // Flee back the way we came - BUT only if lastSystem is actually connected
-          const lastSystemConnected = lastSystem && connections.some(c => c.id === lastSystem);
-          
-          if (lastSystem && lastSystemConnected) {
-            ctx.log("combat", `Fleeing back to ${lastSystem} (the way we came)...`);
-            await ensureUndocked(ctx);
-            const fleeJump = await bot.exec("jump", { target_system: lastSystem });
+          // Flee back the way we came using the path stack
+          if (path.length > 1) {
+            const fleeTarget = path[path.length - 2]; // The system before the current one
+            const fleeTargetConnected = connections.some(c => c.id === fleeTarget);
 
-            // Check for battle interrupt on flee jump
-            if (fleeJump.error) {
-              const fleeMsg = fleeJump.error.message.toLowerCase();
-              if (fleeJump.error.code === "battle_interrupt" || fleeMsg.includes("interrupted by battle") || fleeMsg.includes("interrupted by combat")) {
-                ctx.log("combat", `Flee jump interrupted by battle! ${fleeJump.error.message} - using emergency flee!`);
-                const { emergencyFleeFromPirates } = await import("./common.js");
-                await emergencyFleeFromPirates(ctx, pirateResult);
+            if (fleeTargetConnected) {
+              ctx.log("combat", `Fleeing back to ${fleeTarget} (exact reverse path)...`);
+              await ensureUndocked(ctx);
+              const fleeJump = await bot.exec("jump", { target_system: fleeTarget });
+
+              // Check for battle interrupt on flee jump
+              if (fleeJump.error) {
+                const fleeMsg = fleeJump.error.message.toLowerCase();
+                if (fleeJump.error.code === "battle_interrupt" || fleeMsg.includes("interrupted by battle") || fleeMsg.includes("interrupted by combat")) {
+                  ctx.log("combat", `Flee jump interrupted by battle! ${fleeJump.error.message} - using emergency flee!`);
+                  const { emergencyFleeFromPirates } = await import("./common.js");
+                  await emergencyFleeFromPirates(ctx, pirateResult);
+                } else {
+                  ctx.log("error", `Failed to flee to ${fleeTarget}: ${fleeJump.error.message}`);
+                  // Try emergency flee if jump fails
+                  const { emergencyFleeFromPirates } = await import("./common.js");
+                  await emergencyFleeFromPirates(ctx, pirateResult);
+                }
               } else {
-                ctx.log("error", `Failed to flee to ${lastSystem}: ${fleeJump.error.message}`);
-                // Try emergency flee if jump fails
-                const { emergencyFleeFromPirates } = await import("./common.js");
-                await emergencyFleeFromPirates(ctx, pirateResult);
+                ctx.log("combat", `Successfully fled to ${fleeTarget}`);
+                bot.stats.totalSystems++;
+                // Update path: remove the current system from path since we fled from it
+                path.pop();
+                // Update lastSystem to the system we fled from (for avoidance logic)
+                lastSystem = actualSystemId;
+                // Continue to next iteration to rescan new system
+                await sleep(5000);
+                continue;
               }
             } else {
-              ctx.log("combat", `Successfully fled to ${lastSystem}`);
-              bot.stats.totalSystems++;
-              // Update lastSystem to reflect actual position after successful jump
-              lastSystem = actualSystemId;
-              // Continue to next iteration to rescan new system
-              await sleep(5000);
-              continue;
+              ctx.log("error", `Flee target ${fleeTarget} is not connected to current system (${actualSystemId}) - using emergency flee.`);
+              const { emergencyFleeFromPirates } = await import("./common.js");
+              await emergencyFleeFromPirates(ctx, pirateResult);
             }
           } else {
-            // lastSystem is not connected or not available - use emergency flee
-            if (lastSystem && !lastSystemConnected) {
-              ctx.log("error", `lastSystem (${lastSystem}) is not connected to current system (${actualSystemId}) - cannot flee that way! Using emergency flee.`);
-            } else {
-              ctx.log("combat", "No previous system to flee to - using emergency flee");
-            }
+            // No previous system in path - use emergency flee
+            ctx.log("combat", "No previous system in path to flee to - using emergency flee");
             const { emergencyFleeFromPirates } = await import("./common.js");
             await emergencyFleeFromPirates(ctx, pirateResult);
           }
@@ -877,6 +886,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
         ctx.log("travel", `Arrived at ${target.name || target.id}`);
         bot.stats.totalSystems++;
+        path.push(target.id); // Track the arrived system in path
         await checkCustomsInspection(ctx, systemId);
 
         // Check for pirates and battle
@@ -953,6 +963,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
         ctx.log("travel", `Jumped to ${random.name || random.id}`);
         bot.stats.totalSystems++;
+        path.push(random.id); // Track the new system in path
         await checkCustomsInspection(ctx, systemId);
         // Check for pirates
         const nearbyResp = await bot.exec("get_nearby");
@@ -1020,6 +1031,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     ctx.log("travel", `Jumped to ${nextSystem.name || nextSystem.id}`);
     bot.stats.totalSystems++;
+    path.push(nextSystem.id); // Track the new system in path
 
     // Check for customs inspection after jump
     await checkCustomsInspection(ctx, systemId);
@@ -1330,6 +1342,9 @@ async function* visitOtherPoi(
  */
 async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
+  const visitedHiddenPois = new Set<string>(); // Track visited hidden POIs this cycle
+  const path: string[] = []; // Track the path of systems visited
+  let lastSystem: string | null = null;
 
   // ── Check for deep core survey scanner ──
   const scannerCap = await hasDeepCoreSurveyScanner(ctx);
@@ -1341,6 +1356,12 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
   }
 
   ctx.log("system", "Deep Core Scan mode — refreshing known hidden POIs...");
+
+  // Initialize path with current system
+  await bot.refreshStatus();
+  if (path.length === 0 && bot.system) {
+    path.push(bot.system);
+  }
 
   // ── Startup: dock at local station to clear cargo & refuel ──
   yield "startup_prep";
@@ -1374,9 +1395,6 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
       ctx.log("system", `Startup complete — Fuel: ${startFuel}% | Cargo: ${bot.cargo}/${bot.cargoMax}`);
     }
   }
-
-  const visitedHiddenPois = new Set<string>(); // Track visited hidden POIs this cycle
-  let lastSystem: string | null = null;
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -1446,6 +1464,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
           ctx.log("error", `Could not reach ${hiddenPoi.systemName} — skipping POI`);
           continue;
         }
+        path.push(hiddenPoi.systemId); // Track the arrived system in path
         lastSystem = bot.system;
       }
 
@@ -1709,9 +1728,13 @@ async function hasDeepCoreSurveyScanner(ctx: RoutineContext): Promise<boolean> {
 async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
   const fledFromSystems = new Set<string>(); // Track systems we've fled from due to pirates
+  const path: string[] = []; // Track the path of systems visited
 
   await bot.refreshStatus();
   const homeSystem = bot.system;
+  if (homeSystem) {
+    path.push(homeSystem);
+  }
 
   ctx.log("system", "Trade Update mode — cycling known stations to refresh market data...");
 
@@ -1844,6 +1867,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           ctx.log("error", `Could not reach ${target.systemName} — skipping`);
           continue;
         }
+        path.push(target.systemId); // Track the arrived system in path
       }
 
       if (bot.state !== "running") break;

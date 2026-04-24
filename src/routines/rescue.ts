@@ -87,6 +87,7 @@ import {
 
 function getRescueSettings(): {
   fuelThreshold: number;
+  ghostThreshold: number;
   rescueFuelCells: number;
   rescueCredits: number;
   scanIntervalSec: number;

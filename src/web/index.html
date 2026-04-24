@@ -643,19 +643,8 @@ let reconnectDelay = 1000;
 let modalMode = 'add';
 let activeSettingsTab = 'general';
 
-// Profile state
-let profileBot = null;       // username of bot being viewed
-let profileSystemData = null; // cached system info {pois, connections}
-let profileRecipes = null;    // cached recipes from catalog
-let profileMarket = null;     // cached market items from view_market (sorted by price)
-let profileSkills = {};       // cached skills { skill_id: level }
-let profileSkillsList = null;  // full skill objects for display (null = not fetched)
-let profileFactionStorage = null; // cached faction storage items (null = not fetched, [] = empty/error)
-let mapData = {};             // systems from mapStore
-let statsDaily = {};          // persisted stats: { botName: { "2026-02-20": {...} } }
-let catalog = { items: {}, ships: {}, skills: {}, recipes: {}, lastFetched: null };
-let statsPeriod = 'today';    // 'today' | 'week' | 'all'
-let activeOreFilters = new Set(); // selected ore item_ids to filter by
+// Global faction storage cache (populated from any bot's view_faction_storage)
+let globalFactionStorage = []; // Array of {item_id, name, quantity}
 
 // Battle state
 let battleState = {
@@ -736,7 +725,7 @@ let wsInitTimer = null;
 /** Fetch initial data via REST API as fallback if WebSocket is slow */
 async function fetchInitialData() {
   try {
-    const [botsRes, discoveredRes, routinesRes, settingsRes, mapRes, statsRes, catalogRes, mainLogsRes] = await Promise.all([
+    const [botsRes, discoveredRes, routinesRes, settingsRes, mapRes, statsRes, catalogRes, mainLogsRes, factionStorageRes] = await Promise.all([
       fetch('/api/bots').then(r => r.json()),
       fetch('/api/bots/discovered').then(r => r.json()),
       fetch('/api/routines').then(r => r.json()),
@@ -745,6 +734,7 @@ async function fetchInitialData() {
       fetch('/api/stats').then(r => r.json()),
       fetch('/api/catalog').then(r => r.json()),
       fetch('/api/logs/main').then(r => r.json()),
+      fetch('/api/faction-storage').then(r => r.json()).catch(() => ({ items: [] })), // Best effort
     ]);
 
     // Merge discovered bots with status data (discovered gives us usernames even if not logged in)
@@ -793,6 +783,12 @@ async function fetchInitialData() {
     knownOres = [];
     statsDaily = statsRes || {};
     catalog = catalogRes || { items: {}, ships: {}, skills: {}, recipes: {}, lastFetched: null };
+    // Load faction storage (shared warehouse)
+    globalFactionStorage = (factionStorageRes?.items || factionStorageRes?.entries || []).map(e => ({
+      item_id: e.itemId || e.item_id,
+      name: e.name || '?',
+      quantity: e.quantity || 0,
+    }));
     renderBots();
     renderStats();
     updateChatBotSelect();
@@ -1848,6 +1844,7 @@ function openProfile(username) {
   profileBot = username;
   profileSystemData = null;
   profileRecipes = null;
+  profileMarket = null;
   profileSkills = {};
   profileSkillsList = null;
   profileFactionStorage = null;
@@ -2860,6 +2857,7 @@ function renderManualControls() {
         <option value="cargo_to_faction">Cargo → Faction</option>
         <option value="station_to_faction">Station → Faction</option>
         <option value="station_to_cargo">Station → Cargo</option>
+        <option value="faction_to_station">Faction → Station</option>
       </select>
       <button class="primary sm" onclick="mcDepositAll()">Start Queue</button>
       <button class="sm" onclick="mcStopDepositAll()">Stop</button>
@@ -3958,8 +3956,19 @@ function mcBuildDepositQueue(mode) {
         items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'storage', action: 'withdraw' });
       }
     }
+  } else if (mode === 'faction_to_station') {
+    // Deposit all items from faction storage to station storage
+    // Command: storage action=deposit target=self item_id=X quantity=Y source=faction
+    const factionItems = profileFactionStorage || [];
+    for (const item of factionItems) {
+      const itemId = item.item_id;
+      const qty = item.quantity || item.count || 1;
+      if (qty > 0 && itemId) {
+        items.push({ item_id: itemId, quantity: qty, target: 'self', source: 'faction', action: 'deposit' });
+      }
+    }
   }
-  
+
   return { mode, items, index: 0 };
 }
 
@@ -5174,12 +5183,19 @@ function fetchFactionStorage(username) {
     if (profileBot !== username) return; // stale response
     if (!result.ok && !result.data) {
       profileFactionStorage = [];
+      globalFactionStorage = []; // also clear global
       renderManualControls();
       return;
     }
     const d = result.data || {};
     profileFactionStorage = d.items || d.storage || [];
+    // Also update global faction storage for market tab
+    globalFactionStorage = profileFactionStorage;
     renderManualControls();
+    // Refresh market if visible
+    if (document.getElementById('page-market')?.classList.contains('active')) {
+      renderMarketTable();
+    }
   });
 }
 
@@ -5273,8 +5289,8 @@ function renderMapPage() {
 
 // ── Market Tab ──────────────────────────────────────────────
 
-let marketSortKey = 'name';
-let marketSortAsc = true;
+let marketSortKey = 'profit';
+let marketSortAsc = false;
 
 function renderMarketPage() {
   renderMarketTable();
@@ -5285,41 +5301,94 @@ function sortMarketBy(key) {
     marketSortAsc = !marketSortAsc;
   } else {
     marketSortKey = key;
-    marketSortAsc = key === 'name'; // name defaults ascending, numbers descending
+    // Default ascending for text and age columns, descending for numeric value columns
+    if (key === 'name' || key === 'station' || key === 'age') {
+      marketSortAsc = true;
+    } else {
+      marketSortAsc = false;
+    }
   }
   renderMarketTable();
 }
 
 function renderMarketTable() {
-  const container = document.getElementById('marketTableWrap');
-  const statsEl = document.getElementById('marketStats');
-  if (!container) return;
+  try {
+    const container = document.getElementById('marketTableWrap');
+    const statsEl = document.getElementById('marketStats');
+    if (!container) {
+      console.error('marketTableWrap container NOT FOUND');
+      return;
+    }
+    // Show loading state immediately
+    container.innerHTML = '<div style="padding:16px;color:var(--text-dim)">Loading market data...</div>';
 
-  // Collect all market + order data across all stations
-  const itemMap = new Map();
-  // item_id -> { name, stations: [{ sysName, stationName, buy, sell }], buyOrderQty, sellOrderQty }
+    console.log('renderMarketTable: mapData keys', Object.keys(mapData).length, 'bots count', bots.length);
 
+    // Aggregate inventory across all bots AND faction storage
+    const inventoryMap = new Map(); // itemId -> total qty
+
+    // 1. Sum bot cargo inventory and personal storage
+    for (const bot of bots) {
+      // cargo
+      if (bot.inventory && Array.isArray(bot.inventory)) {
+        for (const item of bot.inventory) {
+          const itemId = item.itemId || item.id;
+          if (!itemId) continue;
+          const qty = item.quantity || 0;
+          inventoryMap.set(itemId, (inventoryMap.get(itemId) || 0) + qty);
+        }
+      }
+      // personal storage (items stored at stations)
+      if (bot.storage && Array.isArray(bot.storage)) {
+        for (const item of bot.storage) {
+          const itemId = item.itemId || item.id;
+          if (!itemId) continue;
+          const qty = item.quantity || 0;
+          inventoryMap.set(itemId, (inventoryMap.get(itemId) || 0) + qty);
+        }
+      }
+    }
+
+    // 2. Add faction storage (shared warehouse)
+    if (globalFactionStorage && Array.isArray(globalFactionStorage)) {
+      for (const item of globalFactionStorage) {
+        const itemId = item.item_id || item.itemId;
+        if (!itemId) continue;
+        const qty = item.quantity || 0;
+        inventoryMap.set(itemId, (inventoryMap.get(itemId) || 0) + qty);
+      }
+    }
+
+    console.log('Inventory map size:', inventoryMap.size, 'faction storage items:', globalFactionStorage.length);
+
+  // Build itemMap from mapData
+  const itemMap = new Map(); // itemId -> { name, stations: [] }
   for (const [sysId, sys] of Object.entries(mapData)) {
     const sysName = sys.name || sysId;
     for (const poi of (sys.pois || [])) {
       const stationName = poi.name || poi.id;
-
-      // Market prices + order quantities (from view_market order book)
-      if (poi.market && poi.market.length > 0) {
+      if (poi.market && Array.isArray(poi.market)) {
         for (const m of poi.market) {
-          if (!m.item_id) continue;
-          if (!itemMap.has(m.item_id)) {
-            itemMap.set(m.item_id, { name: m.item_name || m.item_id, stations: [], buyOrderQty: 0, sellOrderQty: 0 });
+          const itemId = m.item_id;
+          if (!itemId) continue;
+          if (!itemMap.has(itemId)) {
+            itemMap.set(itemId, { name: m.item_name || itemId, stations: [] });
           }
-          const entry = itemMap.get(m.item_id);
+          const entry = itemMap.get(itemId);
+          // Correct API mapping:
+          // m.best_buy = highest price station pays (they buy from players) = SELL price to us
+          // m.best_sell = lowest price station charges (they sell to players) = BUY price from us
+          // m.buy_quantity = total demand (sum of all buy orders at various prices)
+          // m.sell_quantity = total supply (sum of all sell orders at various prices)
           entry.stations.push({
-            sysId, sysName, stationName,
-            buy: m.best_buy,
-            sell: m.best_sell,
-            updated: m.last_updated,
+            sysName,
+            stationName,
+            sellPrice: m.best_buy != null ? m.best_buy : null,  // station buys from us
+            buyPrice: m.best_sell != null ? m.best_sell : null, // station sells to us
+            demand: m.buy_quantity || 0,    // total quantity wanted by station
+            supply: m.sell_quantity || 0,   // total quantity station has for sale
+            updated: m.last_updated || null,
           });
-          entry.buyOrderQty += (m.buy_quantity || 0);
-          entry.sellOrderQty += (m.sell_quantity || 0);
         }
       }
     }
@@ -5333,62 +5402,134 @@ function renderMarketTable() {
     }
   }
 
-  if (statsEl) {
-    statsEl.textContent = `${itemMap.size} items across ${stationSet.size} stations in ${Object.keys(mapData).length} systems`;
-  }
-
-  if (itemMap.size === 0) {
-    container.innerHTML = '<div class="map-empty">No market data yet. Bots record market prices when they dock at stations.</div>';
-    return;
-  }
-
-  // Build rows with computed fields for sorting
+  // Prepare rows with search filter
   const searchTerm = (document.getElementById('marketSearch')?.value || '').toLowerCase();
   const rows = [];
 
   for (const [itemId, data] of itemMap) {
-    if (searchTerm && !data.name.toLowerCase().includes(searchTerm) && !itemId.toLowerCase().includes(searchTerm)) continue;
+    let bestSell = null;      // Highest price station pays (we sell TO them)
+    let bestSellStation = '';
+    let totalDemand = 0;      // Sum of all buy orders (total demand at all prices)
+    let bestSellUpdated = null;
+    let bestBuy = null;       // Lowest price station sells for (we buy FROM them)
 
-    let bestSell = null, bestSellStation = '';
     for (const s of data.stations) {
-      if (s.sell != null && (bestSell === null || s.sell > bestSell)) {
-        bestSell = s.sell;
+      // s.sellPrice = station's best buy price (they buy from us)
+      if (s.sellPrice != null && (bestSell === null || s.sellPrice > bestSell)) {
+        bestSell = s.sellPrice;
         bestSellStation = `${s.stationName} (${s.sysName})`;
+        totalDemand = s.demand;    // demand = sum of all buy_orders
+        bestSellUpdated = s.updated;
+      }
+      // s.buyPrice = station's best sell price (they sell to us)
+      if (s.buyPrice != null && s.buyPrice > 0 && (bestBuy === null || s.buyPrice < bestBuy)) {
+        bestBuy = s.buyPrice;
       }
     }
 
-    let bestBuy = null, bestBuyStation = '';
-    for (const s of data.stations) {
-      if (s.buy != null && s.buy > 0 && (bestBuy === null || s.buy < bestBuy)) {
-        bestBuy = s.buy;
-        bestBuyStation = `${s.stationName} (${s.sysName})`;
+    // Skip items with no buy orders (no one wants to buy from us)
+    if (bestSell === null) continue;
+    if (totalDemand <= 0) continue;
+
+    // Search filter
+    if (searchTerm && !itemId.toLowerCase().includes(searchTerm) && !data.name.toLowerCase().includes(searchTerm)) {
+      continue;
+    }
+
+    const inventoryQty = inventoryMap.get(itemId) || 0;
+
+    // Compute age string and filter out stale data (> 1 day)
+    let ageStr = '-';
+    let skipStale = false;
+    if (bestSellUpdated) {
+      const updatedMs = Date.parse(bestSellUpdated);
+      if (!isNaN(updatedMs)) {
+        const ageMs = Date.now() - updatedMs;
+        const ageMins = Math.floor(ageMs / 60000);
+        let ageHours = 0;
+        if (ageMins < 60) {
+          ageStr = `${ageMins}m`;
+        } else {
+          ageHours = Math.floor(ageMins / 60);
+          if (ageHours < 24) {
+            ageStr = `${ageHours}h`;
+          } else {
+            const ageDays = Math.floor(ageHours / 24);
+            ageStr = `${ageDays}d`;
+          }
+        }
+        // Skip items older than 1 day (24 hours)
+        if (ageHours >= 24) {
+          skipStale = true;
+        }
       }
     }
 
-    const spread = (bestSell != null && bestBuy != null) ? bestSell - bestBuy : null;
+    // Skip stale items (older than 1 day)
+    if (skipStale) continue;
+
+    // Realistic sell-side profit: (best price station pays) × quantity we can actually sell
+    // Items are acquired via mining/crafting (≈0 cost) or already in inventory
+    const sellableQty = Math.min(totalDemand, inventoryQty);
+    const revenue = bestSell * sellableQty;
 
     rows.push({
-      itemId, name: data.name,
-      bestSell, bestSellStation,
-      bestBuy, bestBuyStation,
-      spread, stationCount: data.stations.length,
-      buyOrderQty: data.buyOrderQty,
-      sellOrderQty: data.sellOrderQty,
+      itemId,
+      name: data.name,
+      bestSell,
+      bestSellStation,
+      demand: totalDemand,
+      inventoryQty,
+      profit: revenue,
+      ageStr,
+      ageMs: bestSellUpdated ? Date.parse(bestSellUpdated) : Infinity,
     });
   }
 
-  // Sort
+  // Update stats
+  if (statsEl) {
+    statsEl.textContent = `${rows.length} items across ${stationSet.size} stations in ${Object.keys(mapData).length} systems`;
+  }
+
+  if (rows.length === 0) {
+    container.innerHTML = '<div class="map-empty">No sell listings found. Explore stations to gather market data.</div>';
+    return;
+  }
+
   rows.sort((a, b) => {
     let av, bv;
     switch (marketSortKey) {
-      case 'name': av = a.name.toLowerCase(); bv = b.name.toLowerCase(); break;
-      case 'bestSell': av = a.bestSell ?? -1; bv = b.bestSell ?? -1; break;
-      case 'bestBuy': av = a.bestBuy ?? Infinity; bv = b.bestBuy ?? Infinity; break;
-      case 'spread': av = a.spread ?? -Infinity; bv = b.spread ?? -Infinity; break;
-      case 'buyQty': av = a.buyOrderQty; bv = b.buyOrderQty; break;
-      case 'sellQty': av = a.sellOrderQty; bv = b.sellOrderQty; break;
-      case 'stations': av = a.stationCount; bv = b.stationCount; break;
-      default: av = a.name; bv = b.name;
+      case 'name':
+        av = a.itemId.toLowerCase();
+        bv = b.itemId.toLowerCase();
+        break;
+      case 'bestSell':
+        av = a.bestSell ?? -1;
+        bv = b.bestSell ?? -1;
+        break;
+      case 'station':
+        av = a.bestSellStation.toLowerCase();
+        bv = b.bestSellStation.toLowerCase();
+        break;
+      case 'sellQty':  // using sellQty key for demand column
+        av = a.demand;
+        bv = b.demand;
+        break;
+      case 'inventory':
+        av = a.inventoryQty;
+        bv = b.inventoryQty;
+        break;
+      case 'profit':
+        av = a.profit ?? -Infinity;
+        bv = b.profit ?? -Infinity;
+        break;
+      case 'age':
+        av = a.ageMs;
+        bv = b.ageMs;
+        break;
+      default:
+        av = a.itemId.toLowerCase();
+        bv = b.itemId.toLowerCase();
     }
     if (av < bv) return marketSortAsc ? -1 : 1;
     if (av > bv) return marketSortAsc ? 1 : -1;
@@ -5397,37 +5538,42 @@ function renderMarketTable() {
 
   const arrow = (key) => marketSortKey === key ? (marketSortAsc ? ' ▲' : ' ▼') : '';
 
+  // Generate table
   let html = `<table class="mkt-table" style="width:100%">`;
   html += `<thead><tr>`;
-  html += `<th style="cursor:pointer" onclick="sortMarketBy('name')">Item${arrow('name')}</th>`;
-  html += `<th style="cursor:pointer" onclick="sortMarketBy('bestSell')">Best Sell${arrow('bestSell')}</th>`;
-  html += `<th>Station</th>`;
-  html += `<th style="cursor:pointer" onclick="sortMarketBy('sellQty')">Sell Orders${arrow('sellQty')}</th>`;
-  html += `<th style="cursor:pointer" onclick="sortMarketBy('bestBuy')">Cheapest Buy${arrow('bestBuy')}</th>`;
-  html += `<th>Station</th>`;
-  html += `<th style="cursor:pointer" onclick="sortMarketBy('buyQty')">Buy Orders${arrow('buyQty')}</th>`;
-  html += `<th style="cursor:pointer" onclick="sortMarketBy('spread')">Spread${arrow('spread')}</th>`;
-  html += `<th style="cursor:pointer" onclick="sortMarketBy('stations')"># Stations${arrow('stations')}</th>`;
+  html += `<th title="Item identifier" style="cursor:pointer" onclick="sortMarketBy('name')">Item ID${arrow('name')}</th>`;
+  html += `<th title="Highest price any station will pay to buy from you (their best buy order)" style="cursor:pointer" onclick="sortMarketBy('bestSell')">Best Buy${arrow('bestSell')}</th>`;
+  html += `<th title="Station offering that buy price" style="cursor:pointer" onclick="sortMarketBy('station')">At Station${arrow('station')}</th>`;
+  html += `<th title="Total buy order quantity at all prices (total demand at station)" style="cursor:pointer" onclick="sortMarketBy('sellQty')">Demand${arrow('sellQty')}</th>`;
+  html += `<th title="Quantity currently in your fleet's cargo holds" style="cursor:pointer" onclick="sortMarketBy('inventory')">In Stock${arrow('inventory')}</th>`;
+  html += `<th title="Potential revenue = Best Buy Price × min(Demand, In Stock)" style="cursor:pointer" onclick="sortMarketBy('profit')">Profit${arrow('profit')}</th>`;
+  html += `<th title="How old this listing data is" style="cursor:pointer" onclick="sortMarketBy('age')">Age${arrow('age')}</th>`;
   html += `</tr></thead><tbody>`;
 
-  for (const r of rows) {
-    const spreadColor = r.spread != null ? (r.spread > 0 ? 'var(--green)' : r.spread < 0 ? 'var(--red)' : 'var(--text-dim)') : 'var(--text-dim)';
+  console.log('Rows to render:', rows.length);
 
+  for (const r of rows) {
+    const profitColor = r.profit != null ? (r.profit > 0 ? 'var(--green)' : (r.profit < 0 ? 'var(--red)' : 'var(--text-dim)')) : 'var(--text-dim)';
     html += `<tr>`;
-    html += `<td style="font-weight:500">${esc(r.name)}</td>`;
+    html += `<td style="font-weight:500">${esc(r.itemId)}</td>`;
     html += `<td class="mkt-sell">${r.bestSell != null ? r.bestSell.toLocaleString() + ' cr' : '-'}</td>`;
-    html += `<td style="font-size:11px;color:var(--text-dim)">${r.bestSellStation ? esc(r.bestSellStation) : '-'}</td>`;
-    html += `<td style="text-align:center;color:var(--yellow)">${r.sellOrderQty > 0 ? r.sellOrderQty.toLocaleString() : '-'}</td>`;
-    html += `<td class="mkt-buy">${r.bestBuy != null ? r.bestBuy.toLocaleString() + ' cr' : '-'}</td>`;
-    html += `<td style="font-size:11px;color:var(--text-dim)">${r.bestBuyStation ? esc(r.bestBuyStation) : '-'}</td>`;
-    html += `<td style="text-align:center;color:var(--green)">${r.buyOrderQty > 0 ? r.buyOrderQty.toLocaleString() : '-'}</td>`;
-    html += `<td style="color:${spreadColor};font-weight:500">${r.spread != null ? (r.spread > 0 ? '+' : '') + r.spread.toLocaleString() + ' cr' : '-'}</td>`;
-    html += `<td style="text-align:center">${r.stationCount}</td>`;
+    html += `<td style="font-size:11px;color:var(--text-dim)">${esc(r.bestSellStation)}</td>`;
+    html += `<td style="text-align:center">${r.demand != null ? r.demand.toLocaleString() : '-'}</td>`;
+    html += `<td style="text-align:center">${r.inventoryQty != null ? r.inventoryQty.toLocaleString() : '0'}</td>`;
+    html += `<td style="color:${profitColor};font-weight:500">${r.profit != null ? r.profit.toLocaleString() + ' cr' : '-'}</td>`;
+    html += `<td style="text-align:center;color:var(--text-dim);font-size:11px">${r.ageStr}</td>`;
     html += `</tr>`;
   }
 
   html += `</tbody></table>`;
+  console.log('Generated HTML length:', html.length);
   container.innerHTML = html;
+  } catch (e) {
+    console.error('renderMarketTable error:', e);
+    // Try to show error in container if we have it, but safe fallback
+    const c = document.getElementById('marketTableWrap');
+    if (c) c.innerHTML = '<div style="color:var(--red);padding:16px">Error: ' + e.message + '</div>';
+  }
 }
 
 function renderMapStats() {
@@ -8014,8 +8160,48 @@ function renderFactionTraderSettings(panel) {
   const refuelThreshold = t.refuelThreshold ?? 50;
   const repairThreshold = t.repairThreshold ?? 40;
   const minSellPrice = t.minSellPrice ?? 0;
-  const tradeItems = Array.isArray(t.tradeItems) ? t.tradeItems.join(', ') : '';
   const stationPriority = t.stationPriority ?? false;
+
+  // Build trade items array from new format or migrate old format
+  let tradeItems = [];
+  if (Array.isArray(t.tradeItems)) {
+    if (t.tradeItems.length > 0 && typeof t.tradeItems[0] === 'string') {
+      // Old format: string array - migrate to new format
+      tradeItems = t.tradeItems.map(itemId => ({ itemId, maxSellQty: 0, minSellPrice: 0, soldQty: 0 }));
+    } else {
+      // New format: object array
+      tradeItems = t.tradeItems;
+    }
+  }
+
+  // Get all items from catalog for dropdown
+  const allItems = Object.values(catalog.items || {}).filter(item => {
+    // Exclude ores (faction trader shouldn't sell raw ores)
+    return item.category !== 'ore';
+  }).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+  // Build dropdown options
+  const itemOptions = allItems.map(item =>
+    `<option value="${esc(item.item_id)}">${esc(item.name || item.item_id)}</option>`
+  ).join('');
+
+  // Build trade items table rows
+  const tradeItemsRows = tradeItems.map((item, idx) => {
+    const itemName = allItems.find(i => i.item_id === item.itemId)?.name || item.itemId;
+    const soldQty = item.soldQty || 0;
+    const remaining = item.maxSellQty > 0 ? Math.max(0, item.maxSellQty - soldQty) : '∞';
+    return `
+      <tr data-item-id="${esc(item.itemId)}">
+        <td style="padding:6px 8px">${esc(itemName)}</td>
+        <td style="padding:6px 8px"><input type="number" min="0" max="9999999" value="${item.maxSellQty || 0}" class="ft-max-qty" style="width:80px" title="0 = sell all" /></td>
+        <td style="padding:6px 8px"><input type="number" min="0" max="9999999" value="${item.minSellPrice || 0}" class="ft-min-price" style="width:80px" title="0 = use global min sell price" /></td>
+        <td style="padding:6px 8px;font-size:11px;color:var(--dim)">${soldQty} sold<br><span style="color:var(--text)">${remaining} left</span></td>
+        <td style="padding:6px 8px;text-align:center">
+          <button class="btn-icon" onclick="resetFactionTradeItemSold('${esc(item.itemId)}')" title="Reset sold count" style="margin-right:4px">↺</button>
+          <button class="btn-icon" onclick="removeFactionTradeItem(this)" title="Remove">✕</button>
+        </td>
+      </tr>`;
+  }).join('');
 
   panel.innerHTML = `
     <h3>Faction Trader Settings</h3>
@@ -8047,18 +8233,10 @@ function renderFactionTraderSettings(panel) {
 
     <div class="setting-row">
       <div>
-        <div class="setting-label">Min Sell Price (credits)</div>
-        <div class="setting-hint">Minimum price per unit to accept for sales. 0 = no minimum.</div>
+        <div class="setting-label">Global Min Sell Price (credits)</div>
+        <div class="setting-hint">Default minimum price per unit. Individual item prices can override this. 0 = no minimum.</div>
       </div>
-      <input type="number" id="set-faction_trader-minSellPrice" min="0" max="10000" value="${minSellPrice}">
-    </div>
-
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Trade Items Filter</div>
-        <div class="setting-hint">Comma-separated list of item names or keywords to allow trading (empty = trade all items in faction storage). Example: "aluminum,platinum,consumer"</div>
-      </div>
-      <input type="text" id="set-faction_trader-tradeItems" value="${esc(tradeItems)}" placeholder="aluminum, platinum, consumer electronics" style="background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:5px 8px;width:100%;box-sizing:border-box">
+      <input type="number" id="set-faction_trader-minSellPrice" min="0" max="1000000" value="${minSellPrice}">
     </div>
 
     <div class="setting-row">
@@ -8072,16 +8250,121 @@ function renderFactionTraderSettings(panel) {
       </select>
     </div>
 
+    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">📦 Trade Items</div>
+      <div class="setting-hint" style="margin-bottom:12px">Select items to trade. Empty list = trade all items (except raw ores). Use Max Qty = 0 to sell all of that item. Set individual Min Price to override the global minimum.</div>
+      <table id="faction-trader-items-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:6px 8px;text-align:left;font-size:12px">Item</th>
+          <th style="padding:6px 8px;text-align:left;font-size:12px">Max Qty (0=all)</th>
+          <th style="padding:6px 8px;text-align:left;font-size:12px">Min Price (0=global)</th>
+          <th style="padding:6px 8px;text-align:left;font-size:12px">Sold / Remaining</th>
+          <th style="padding:6px 8px;text-align:center;font-size:12px;width:60px"></th>
+        </tr></thead>
+        <tbody>${tradeItemsRows || '<tr><td colspan="5" style="padding:12px;text-align:center;color:var(--dim)">No items configured. All items (except ores) will be traded.</td></tr>'}</tbody>
+      </table>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="ft-add-item" style="flex:1">${itemOptions ? '<option value="">-- select item --</option>' + itemOptions : '<option value="">No items available</option>'}</select>
+        <input type="number" id="ft-add-max-qty" min="0" max="9999999" value="0" style="width:80px" placeholder="Max Qty" title="0 = sell all" />
+        <input type="number" id="ft-add-min-price" min="0" max="9999999" value="0" style="width:80px" placeholder="Min Price" title="0 = use global" />
+        <button class="secondary" onclick="addFactionTradeItem()">Add</button>
+      </div>
+    </div>
+
     <div class="settings-save-bar">
+      <button class="secondary" onclick="resetAllFactionTradeSold()">↺ Reset All Sold Counts</button>
       <button class="primary" onclick="saveFactionTraderSettings()">Save Settings</button>
     </div>
   `;
 }
 
+function addFactionTradeItem() {
+  const itemSelect = document.getElementById('ft-add-item');
+  const maxQtyInput = document.getElementById('ft-add-max-qty');
+  const minPriceInput = document.getElementById('ft-add-min-price');
+  const itemId = itemSelect.value;
+  if (!itemId) return;
+
+  const maxQty = parseInt(maxQtyInput.value) || 0;
+  const minPrice = parseInt(minPriceInput.value) || 0;
+
+  // Check if item already exists in table
+  const existing = document.querySelector(`#faction-trader-items-table tbody tr[data-item-id="${CSS.escape(itemId)}"]`);
+  if (existing) return; // Item already added
+
+  const itemName = itemSelect.options[itemSelect.selectedIndex].text;
+  const tbody = document.querySelector('#faction-trader-items-table tbody');
+
+  // Remove "no items" message if present
+  const emptyRow = tbody.querySelector('td[colspan]');
+  if (emptyRow) emptyRow.parentElement.remove();
+
+  const tr = document.createElement('tr');
+  tr.dataset.itemId = itemId;
+  tr.innerHTML = `
+    <td style="padding:6px 8px">${esc(itemName)}</td>
+    <td style="padding:6px 8px"><input type="number" min="0" max="9999999" value="${maxQty}" class="ft-max-qty" style="width:80px" title="0 = sell all" /></td>
+    <td style="padding:6px 8px"><input type="number" min="0" max="9999999" value="${minPrice}" class="ft-min-price" style="width:80px" title="0 = use global min sell price" /></td>
+    <td style="padding:6px 8px;font-size:11px;color:var(--dim)">0 sold<br><span style="color:var(--text)">${maxQty > 0 ? maxQty : '∞'}</span> left</td>
+    <td style="padding:6px 8px;text-align:center">
+      <button class="btn-icon" onclick="resetFactionTradeItemSold('${esc(itemId)}')" title="Reset sold count" style="margin-right:4px">↺</button>
+      <button class="btn-icon" onclick="removeFactionTradeItem(this)" title="Remove">✕</button>
+    </td>
+  `;
+  tbody.appendChild(tr);
+
+  // Reset inputs
+  itemSelect.value = '';
+  maxQtyInput.value = '0';
+  minPriceInput.value = '0';
+}
+
+function removeFactionTradeItem(btn) {
+  btn.closest('tr').remove();
+  // Show empty message if no items left
+  const tbody = document.querySelector('#faction-trader-items-table tbody');
+  if (tbody.children.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="5" style="padding:12px;text-align:center;color:var(--dim)">No items configured. All items (except ores) will be traded.</td></tr>';
+  }
+}
+
+function resetFactionTradeItemSold(itemId) {
+  if (!confirm('Reset sold quantity for this item?')) return;
+  const s = settings.faction_trader || {};
+  if (!s.tradeItems) return;
+  const item = s.tradeItems.find((t) => t.itemId === itemId);
+  if (item) {
+    item.soldQty = 0;
+    send({ type: 'saveSettings', routine: 'faction_trader', settings: s });
+    settings.faction_trader = s;
+    renderFactionTraderSettings(document.querySelector('#settings-panel'));
+  }
+}
+
+function resetAllFactionTradeSold() {
+  if (!confirm('Reset ALL sold quantities?')) return;
+  const s = settings.faction_trader || {};
+  if (!s.tradeItems) return;
+  s.tradeItems.forEach((item) => { item.soldQty = 0; });
+  send({ type: 'saveSettings', routine: 'faction_trader', settings: s });
+  settings.faction_trader = s;
+  renderFactionTraderSettings(document.querySelector('#settings-panel'));
+}
+
 function saveFactionTraderSettings() {
-  const tradeItemsInput = document.getElementById('set-faction_trader-tradeItems').value.trim();
-  const tradeItems = tradeItemsInput ? tradeItemsInput.split(',').map(s => s.trim()).filter(s => s) : [];
-  
+  // Collect trade items from table, preserving soldQty from existing settings
+  const existingTradeItems = settings.faction_trader?.tradeItems || [];
+  const tradeItems = [];
+  for (const row of document.querySelectorAll('#faction-trader-items-table tbody tr[data-item-id]')) {
+    const itemId = row.dataset.itemId;
+    const maxQty = parseInt(row.querySelector('.ft-max-qty').value) || 0;
+    const minPrice = parseInt(row.querySelector('.ft-min-price').value) || 0;
+    // Preserve soldQty from existing settings
+    const existing = existingTradeItems.find(t => t.itemId === itemId);
+    const soldQty = existing?.soldQty || 0;
+    tradeItems.push({ itemId, maxSellQty: maxQty, minSellPrice: minPrice, soldQty });
+  }
+
   const s = {
     fuelCostPerJump: parseInt(document.getElementById('set-faction_trader-fuelCostPerJump').value) || 50,
     refuelThreshold: parseInt(document.getElementById('set-faction_trader-refuelThreshold').value) || 50,
@@ -18058,7 +18341,29 @@ function addCombatLogEntry(event) {
 // ═══════════════════════════════════════════════════════════
 // Init
 // ═══════════════════════════════════════════════════════════
+
+// Load faction storage from disk (shared warehouse)
+async function loadGlobalFactionStorage() {
+  try {
+    const res = await fetch('/api/faction-storage');
+    const data = await res.json();
+    globalFactionStorage = (data.items || data.entries || []).map(e => ({
+      item_id: e.itemId || e.item_id,
+      name: e.name || '?',
+      quantity: e.quantity || 0,
+    }));
+    console.log('Loaded faction storage items:', globalFactionStorage.length);
+    // Re-render market if visible
+    if (document.getElementById('page-market')?.classList.contains('active')) {
+      renderMarketTable();
+    }
+  } catch (e) {
+    console.warn('Failed to load faction storage:', e);
+  }
+}
+
 connect();
+loadGlobalFactionStorage(); // Load immediately on page load
 setInterval(refreshFactionFunds, 60000);
 // Poll battle status every 2 seconds when in battle
 setInterval(pollBattleStatus, 2000);

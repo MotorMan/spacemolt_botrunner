@@ -9,6 +9,7 @@ import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { getSystemBlacklist } from "../web/server.js";
+import { clearFactionStorageCache } from "../factionStorageCache.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -22,6 +23,7 @@ import {
   detectAndRecoverFromDeath,
   maxItemsForCargo,
   readSettings,
+  writeSettings,
   sleep,
   isPirateSystem,
   checkAndFleeFromBattle,
@@ -45,6 +47,13 @@ import {
 
 // ── Settings ─────────────────────────────────────────────────
 
+interface TradeItemConfig {
+  itemId: string;
+  maxSellQty: number;  // 0 = sell all available
+  minSellPrice: number; // 0 = use global minSellPrice
+  soldQty?: number;     // Track quantity sold (persisted in settings)
+}
+
 function getFactionTraderSettings(username?: string): {
   homeSystem: string;
   homeStation: string;
@@ -52,13 +61,36 @@ function getFactionTraderSettings(username?: string): {
   refuelThreshold: number;
   repairThreshold: number;
   minSellPrice: number;
-  tradeItems: string[];
+  tradeItems: TradeItemConfig[];
   stationPriority: boolean;
 } {
   const all = readSettings();
   const general = all.general || {};
   const t = all.faction_trader || {};
   const botOverrides = username ? (all[username] || {}) : {};
+
+  // Migrate old format (string array) to new format if needed
+  let tradeItems: TradeItemConfig[] = [];
+  if (Array.isArray(t.tradeItems)) {
+    if (t.tradeItems.length > 0 && typeof t.tradeItems[0] === 'string') {
+      // Old format: string array
+      tradeItems = (t.tradeItems as string[]).map((itemId: string) => ({
+        itemId,
+        maxSellQty: 0,
+        minSellPrice: 0,
+        soldQty: 0,
+      }));
+    } else {
+      // New format: object array
+      tradeItems = (t.tradeItems as TradeItemConfig[]).map((item: any) => ({
+        itemId: item.itemId || '',
+        maxSellQty: item.maxSellQty || 0,
+        minSellPrice: item.minSellPrice || 0,
+        soldQty: item.soldQty || 0,
+      })).filter(item => item.itemId);
+    }
+  }
+
   return {
     // Use faction storage station from general settings as home, fallback to faction_trader-specific
     homeSystem: (botOverrides.homeSystem as string)
@@ -71,7 +103,7 @@ function getFactionTraderSettings(username?: string): {
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     minSellPrice: (t.minSellPrice as number) || 0,
-    tradeItems: Array.isArray(t.tradeItems) ? (t.tradeItems as string[]) : [],
+    tradeItems,
     stationPriority: (botOverrides.stationPriority as boolean) || false,
   };
 }
@@ -201,6 +233,90 @@ function getItemMarketCost(itemId: string): number {
   return cheapest === Infinity ? 0 : cheapest;
 }
 
+/**
+ * Calculate optimal sell quantity based on actual buy orders at destination.
+ * Calls view_market to get real buy orders with quantities.
+ */
+async function calculateFactionOptimalSellQuantity(
+  ctx: RoutineContext,
+  itemId: string,
+  itemName: string,
+  availableQuantity: number,
+  minPricePerUnit: number,
+): Promise<{ sellQty: number; expectedRevenue: number; priceBreakdown: string; weightedAvgPrice: number }> {
+  const { bot } = ctx;
+
+  // Check the market for this specific item
+  const marketResp = await bot.exec("view_market", { item_id: itemId });
+  if (marketResp.error || !marketResp.result) {
+    ctx.log("trade", `view_market failed for ${itemName} — using cached data`);
+    return {
+      sellQty: availableQuantity,
+      expectedRevenue: availableQuantity * minPricePerUnit,
+      priceBreakdown: "cached",
+      weightedAvgPrice: minPricePerUnit,
+    };
+  }
+
+  const marketData = marketResp.result as Record<string, unknown>;
+  const items = (
+    Array.isArray(marketData) ? marketData :
+    Array.isArray((marketData as Record<string, unknown>).items) ? (marketData as Record<string, unknown>).items :
+    []
+  ) as Array<Record<string, unknown>>;
+
+  const itemMarket = items.find(i => (i.item_id as string) === itemId);
+  if (!itemMarket) {
+    ctx.log("trade", `No market data for ${itemName} — using cached data`);
+    return {
+      sellQty: availableQuantity,
+      expectedRevenue: availableQuantity * minPricePerUnit,
+      priceBreakdown: "cached",
+      weightedAvgPrice: minPricePerUnit,
+    };
+  }
+
+  const buyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
+  if (buyOrders.length === 0) {
+    ctx.log("trade", `No buy orders for ${itemName} — cannot sell`);
+    return { sellQty: 0, expectedRevenue: 0, priceBreakdown: "no buy orders", weightedAvgPrice: 0 };
+  }
+
+  // Calculate how many we can sell at or above minimum price
+  let remainingToSell = availableQuantity;
+  let totalRevenue = 0;
+  let totalSold = 0;
+  const priceDetails: string[] = [];
+
+  for (const order of buyOrders) {
+    if (remainingToSell <= 0) break;
+
+    const priceEach = (order.price_each as number) || 0;
+    const orderQty = (order.quantity as number) || 0;
+
+    if (orderQty <= 0 || priceEach <= 0) continue;
+    if (priceEach < minPricePerUnit) continue;
+
+    const qtyAtThisPrice = Math.min(remainingToSell, orderQty);
+    const revenueAtThisPrice = qtyAtThisPrice * priceEach;
+
+    totalRevenue += revenueAtThisPrice;
+    totalSold += qtyAtThisPrice;
+    remainingToSell -= qtyAtThisPrice;
+
+    priceDetails.push(`${qtyAtThisPrice}x @ ${priceEach}cr`);
+  }
+
+  const weightedAvgPrice = totalSold > 0 ? totalRevenue / totalSold : 0;
+  const priceBreakdown = priceDetails.join(", ");
+
+  if (remainingToSell > 0) {
+    ctx.log("trade", `Market check: can sell ${totalSold}/${availableQuantity}x ${itemName} (${priceBreakdown}), holding ${remainingToSell}x`);
+  }
+
+  return { sellQty: totalSold, expectedRevenue: totalRevenue, priceBreakdown, weightedAvgPrice };
+}
+
 /** Free cargo weight (not item count — callers must divide by item size). */
 function getFreeSpace(bot: Bot): number {
   if (bot.cargoMax <= 0) return 999;
@@ -227,7 +343,7 @@ function findFactionSellRoutes(
 ): FactionSellRoute[] {
   const { bot } = ctx;
   const routes: FactionSellRoute[] = [];
-  
+
   // Use personal storage in personal mode, faction storage otherwise
   const storage = personalMode ? bot.storage : bot.factionStorage;
   if (storage.length === 0) return routes;
@@ -249,11 +365,22 @@ function findFactionSellRoutes(
     // Filter by allowed items if configured
     if (settings.tradeItems.length > 0) {
       const match = settings.tradeItems.some(t =>
-        item.itemId.toLowerCase().includes(t.toLowerCase()) ||
-        item.name.toLowerCase().includes(t.toLowerCase())
+        t.itemId === item.itemId ||
+        item.itemId.toLowerCase().includes(t.itemId.toLowerCase()) ||
+        item.name.toLowerCase().includes(t.itemId.toLowerCase())
       );
       if (!match) continue;
     }
+
+    // Get per-item settings
+    const itemConfig = settings.tradeItems.find(t => t.itemId === item.itemId);
+    const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
+    const itemMaxSellQty = itemConfig?.maxSellQty || 0;
+    const itemSoldQty = itemConfig?.soldQty || 0;
+    const remainingSellQty = itemMaxSellQty > 0 ? Math.max(0, itemMaxSellQty - itemSoldQty) : item.quantity;
+
+    // Skip if we've already sold the max quantity
+    if (itemMaxSellQty > 0 && remainingSellQty <= 0) continue;
 
     // Find best buyer for this item
     const buyers = allBuys
@@ -264,7 +391,7 @@ function findFactionSellRoutes(
     const materialCost = getItemMarketCost(item.itemId);
 
     for (const buy of buyers) {
-      if (settings.minSellPrice > 0 && buy.price < settings.minSellPrice) continue;
+      if (itemMinSellPrice > 0 && buy.price < itemMinSellPrice) continue;
 
       // Round-trip fuel: current → dest + dest → home
       const toDest = estimateFuelCost(currentSystem, buy.systemId, costPerJump);
@@ -273,7 +400,9 @@ function findFactionSellRoutes(
       const roundTripJumps = toDest.jumps + (returnHome.jumps < 999 ? returnHome.jumps : 0);
       const roundTripFuel = toDest.cost + (returnHome.jumps < 999 ? returnHome.cost : 0);
 
-      const qty = Math.min(item.quantity, buy.quantity, maxItemsForCargo(cargoCapacity, item.itemId));
+      // Calculate quantity to sell, respecting max sell qty
+      const maxQty = itemMaxSellQty > 0 ? Math.min(remainingSellQty, item.quantity) : item.quantity;
+      const qty = Math.min(maxQty, buy.quantity, maxItemsForCargo(cargoCapacity, item.itemId));
       if (qty <= 0) continue;
 
       // Skip routes that sell below material cost + round-trip fuel (would lose money)
@@ -766,6 +895,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     if (isInStation) {
       // ── In-station: batch withdraw→sell loop ──
       let totalSold = 0;
+      let totalRevenue = 0;
       let remaining = route!.availableQty;
 
       // Check if items are already in cargo (recovery from interrupted session)
@@ -833,16 +963,34 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           // First try to sell the trade item we already have
           const inCargo = bot.inventory.find(i => i.itemId === route!.itemId);
           if (inCargo && inCargo.quantity > 0) {
-            const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: inCargo.quantity });
-            if (!sResp.error) {
-              // Verify sale
-              await bot.refreshCargo();
-              const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-              const actuallySold = inCargo.quantity - afterSell;
-              if (actuallySold > 0) {
-                totalSold += actuallySold;
-                ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} from full cargo`);
+            // Get actual market data before selling
+            const itemConfig = settings.tradeItems.find(t => t.itemId === route!.itemId);
+            const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
+
+            const marketCheck = await calculateFactionOptimalSellQuantity(
+              ctx, route!.itemId, route!.itemName, inCargo.quantity, itemMinSellPrice
+            );
+
+            if (marketCheck.sellQty > 0) {
+              ctx.log("trade", `Selling ${marketCheck.sellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
+              const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: marketCheck.sellQty });
+              if (!sResp.error) {
+                // Get actual revenue from sell result
+                const sr = sResp.result as Record<string, unknown> | undefined;
+                const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+
+                // Verify sale
+                await bot.refreshCargo();
+                const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+                const actuallySold = marketCheck.sellQty - afterSell;
+                if (actuallySold > 0) {
+                  totalSold += actuallySold;
+                  const revenue = actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice;
+                  ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} from full cargo — ${revenue}cr revenue (actual)`);
+                }
               }
+            } else {
+              ctx.log("trade", `No viable buy orders for ${route!.itemName} — skipping`);
             }
             continue;
           }
@@ -900,6 +1048,16 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             wQty = Math.max(1, Math.floor(wQty / 2));
             wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: wQty });
           }
+          // Handle no_faction_storage error — return home and retry
+          if (wResp.error && wResp.error.message.includes("no_faction_storage")) {
+            ctx.log("error", `No faction storage at current station — returning to home station`);
+            // Clear faction storage cache to prevent stale data
+            clearFactionStorageCache();
+            bot.factionStorage = [];
+            // Skip to return home
+            await sleep(30000);
+            break;
+          }
         }
 
         if (wResp.error) {
@@ -918,7 +1076,18 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
         remaining -= wQty;
 
-        const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: wQty });
+        // Get actual market data before selling
+        const itemConfig = settings.tradeItems.find(t => t.itemId === route!.itemId);
+        const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
+
+        const marketCheck = await calculateFactionOptimalSellQuantity(
+          ctx, route!.itemId, route!.itemName, wQty, itemMinSellPrice
+        );
+
+        const sellQty = marketCheck.sellQty > 0 ? marketCheck.sellQty : wQty;
+        ctx.log("trade", `Selling ${sellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
+
+        const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: sellQty });
         // Check for battle notifications after sell
         if (sResp.notifications && Array.isArray(sResp.notifications)) {
           const battleDetected = await handleBattleNotifications(ctx, sResp.notifications, battleState);
@@ -942,7 +1111,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         // Verify sale by checking cargo after sell
         await bot.refreshCargo();
         const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-        const actuallySold = afterWithdraw - afterSell;
+        const actuallySold = sellQty - afterSell;
 
         if (actuallySold <= 0) {
           ctx.log("error", `Sell command succeeded but no items were sold - item still in cargo (${afterWithdraw}x)`);
@@ -954,18 +1123,23 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           break;
         }
 
+        // Get actual revenue from sell result
+        const sr = sResp.result as Record<string, unknown> | undefined;
+        const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+        const revenue = actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice;
+
         totalSold += actuallySold;
-        ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} (${totalSold} total, ${remaining} remaining)`);
+        totalRevenue += revenue;
+        ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} — ${revenue}cr revenue (actual, ${totalSold} total)`);
       }
 
       if (totalSold > 0) {
         await bot.refreshStatus();
         await recordMarketData(ctx);
-        const revenue = totalSold * route!.sellPrice;
         bot.stats.totalTrades++;
-        bot.stats.totalProfit += revenue;
-        ctx.log("trade", `Faction sale complete: ${totalSold}x ${route!.itemName} — ${revenue}cr revenue`);
-        await factionDonateProfit(ctx, revenue);
+        bot.stats.totalProfit += totalRevenue;
+        ctx.log("trade", `Faction sale complete: ${totalSold}x ${route!.itemName} — ${totalRevenue}cr revenue (actual)`);
+        await factionDonateProfit(ctx, totalRevenue);
         // Complete trade session for in-station sale
         const session = createTradeSession({
           botUsername: bot.username,
@@ -984,7 +1158,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             sellQty: totalSold,
             jumps: 0,
             profitPerUnit: route!.sellPrice,
-            totalProfit: revenue,
+            totalProfit: totalRevenue,
           },
           isFactionRoute: true,
           isCargoRoute: false,
@@ -1081,6 +1255,16 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           if (wResp.error && wResp.error.message.includes("cargo_full")) {
             qty = Math.max(1, Math.floor(qty / 2));
             wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: qty });
+          }
+          // Handle no_faction_storage error — return home and retry
+          if (wResp.error && wResp.error.message.includes("no_faction_storage")) {
+            ctx.log("error", `No faction storage at current station — returning to home station`);
+            // Clear faction storage cache to prevent stale data
+            clearFactionStorageCache();
+            bot.factionStorage = [];
+            // Skip to return home
+            await sleep(30000);
+            break;
           }
         }
 
@@ -1245,33 +1429,66 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       await bot.refreshCargo();
       const inCargo = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
       if (inCargo > 0) {
-        const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: inCargo });
-        if (sResp.error) {
-          ctx.log("error", `Sell failed: ${sResp.error.message}`);
-          await failTradeSession(bot.username, `Sell failed: ${sResp.error.message}`);
+        // Get actual market data to calculate real expected revenue
+        const itemConfig = settings.tradeItems.find(t => t.itemId === route!.itemId);
+        const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
+
+        const marketCheck = await calculateFactionOptimalSellQuantity(
+          ctx, route!.itemId, route!.itemName, inCargo, itemMinSellPrice
+        );
+
+        if (marketCheck.sellQty <= 0) {
+          ctx.log("trade", `No viable buy orders for ${route!.itemName} at ${route!.destPoiName} — skipping sell`);
+          await failTradeSession(bot.username, "No viable buy orders at destination");
         } else {
-          // Verify sale by checking cargo after sell
-          await bot.refreshCargo();
-          const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-          const actuallySold = inCargo - afterSell;
-
-          if (actuallySold <= 0) {
-            ctx.log("error", `Sell command succeeded but no items were sold - item still in cargo (${inCargo}x)`);
-            await failTradeSession(bot.username, "Sell command did not remove items from cargo");
+          ctx.log("trade", `Selling ${marketCheck.sellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
+          const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: marketCheck.sellQty });
+          if (sResp.error) {
+            ctx.log("error", `Sell failed: ${sResp.error.message}`);
+            await failTradeSession(bot.username, `Sell failed: ${sResp.error.message}`);
           } else {
-            const revenue = actuallySold * route!.sellPrice;
-            bot.stats.totalTrades++;
-            bot.stats.totalProfit += revenue;
-            ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue`);
-            await factionDonateProfit(ctx, revenue);
-            // Complete trade session
-            const actualProfit = revenue; // No acquisition cost for faction items
-            await completeTradeSession(bot.username, revenue, actualProfit);
-            ctx.log("trade", "Trade session completed successfully");
+            // Get actual revenue from sell result
+            const sr = sResp.result as Record<string, unknown> | undefined;
+            const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
 
-            // Always refuel after selling before heading home (especially important for long return trips)
-            ctx.log("system", "Topping off fuel before return journey...");
-            await tryRefuel(ctx);
+            // Verify sale by checking cargo after sell
+            await bot.refreshCargo();
+            const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+            const actuallySold = marketCheck.sellQty - afterSell;
+
+            if (actuallySold <= 0) {
+              ctx.log("error", `Sell command succeeded but no items were sold - item still in cargo (${inCargo}x)`);
+              await failTradeSession(bot.username, "Sell command did not remove items from cargo");
+            } else {
+              const revenue = actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice;
+              bot.stats.totalTrades++;
+              bot.stats.totalProfit += revenue;
+              ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue (actual)`);
+              await factionDonateProfit(ctx, revenue);
+              // Complete trade session
+              const actualProfit = revenue; // No acquisition cost for faction items
+              await completeTradeSession(bot.username, revenue, actualProfit);
+              ctx.log("trade", "Trade session completed successfully");
+
+              // Update sold quantity tracking in settings
+              try {
+                const allSettings = readSettings();
+                const ftSettings = (allSettings["faction_trader"] as Record<string, unknown>) || {};
+                const tradeItems = (ftSettings.tradeItems as TradeItemConfig[]) || [];
+                const itemIndex = tradeItems.findIndex(t => t.itemId === route!.itemId);
+                if (itemIndex >= 0) {
+                  tradeItems[itemIndex].soldQty = (tradeItems[itemIndex].soldQty || 0) + actuallySold;
+                  writeSettings({ faction_trader: { tradeItems } as Record<string, unknown> });
+                  ctx.log("trade", `Updated sold quantity for ${route!.itemName}: ${tradeItems[itemIndex].soldQty} total`);
+                }
+              } catch (err) {
+                ctx.log("error", `Failed to update sold quantity tracking: ${err}`);
+              }
+
+              // Always refuel after selling before heading home (especially important for long return trips)
+              ctx.log("system", "Topping off fuel before return journey...");
+              await tryRefuel(ctx);
+            }
           }
         }
       } else {

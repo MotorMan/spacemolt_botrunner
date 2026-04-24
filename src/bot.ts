@@ -7,6 +7,7 @@ import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 import { getFactionStorageCache, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
+import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -180,10 +181,18 @@ export class Bot {
   /** Optional callback for faction activity log entries. */
   onFactionLog?: (username: string, line: string) => void;
 
-  /** Cached skill levels for detecting level-ups. */
-  private skillLevels: Map<string, number> = new Map();
+   /** Cached skill levels for detecting level-ups. */
+   private skillLevels: Map<string, number> = new Map();
+   /** Cached skill XP for tracking gains. */
+   private skillXP: Map<string, number> = new Map();
+   /** Cached total cumulative XP (if available from API). */
+   private skillTotalXP: Map<string, number> = new Map();
+   /** Cached XP-to-next for accurate gain calculation across level-ups. */
+   private skillXpToNext: Map<string, number> = new Map();
+   /** Snapshot of skills (level, XP, totalXP, xpToNext) taken before a command to measure gains. */
+   private skillSnapshot: Map<string, { level: number; xp: number; totalXP?: number; xpToNext?: number }> = new Map();
 
-  /** Timestamp of the last faction combat alert (ms). Rate-limits chat spam. */
+   /** Timestamp of the last faction combat alert (ms). Rate-limits chat spam. */
   private lastCombatAlertMs = 0;
   private static readonly COMBAT_ALERT_COOLDOWN_MS = 30_000;
 
@@ -362,10 +371,13 @@ export class Bot {
       this.log("customs", `✅ Customs clearance received (outcome: ${outcome}), resuming ${command}`);
     }
 
-    this._lastAction = command;
-    debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
+     this._lastAction = command;
+     debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
 
-    // Apply 120s timeout to jump/travel commands to detect hangs
+     // Capture skill snapshot before command to measure gains later
+     this.captureSkillSnapshot();
+
+     // Apply 120s timeout to jump/travel commands to detect hangs
     // Max normal jump time is 110s (without towing), so 120s is safe threshold
     let resp: ApiResponse;
     if (command === "jump" || command === "travel") {
@@ -491,21 +503,34 @@ export class Bot {
       }
     }
 
-    // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
-    // This helps collect player names faster as we move through the galaxy
-    if (!resp.error) {
-      const navigationCommands = ["travel", "jump", "dock", "undock"];
-      if (navigationCommands.includes(command)) {
-        // Small delay to let the navigation complete
-        await sleep(500);
-        const nearbyResp = await this.api.execute("get_nearby");
-        if (!nearbyResp.error && nearbyResp.result) {
-          this.trackNearbyPlayers(nearbyResp.result);
-        }
-      }
-    }
+     // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
+     // This helps collect player names faster as we move through the galaxy
+     if (!resp.error) {
+       const navigationCommands = ["travel", "jump", "dock", "undock"];
+       if (navigationCommands.includes(command)) {
+         // Small delay to let the navigation complete
+         await sleep(500);
+         const nearbyResp = await this.api.execute("get_nearby");
+         if (!nearbyResp.error && nearbyResp.result) {
+           this.trackNearbyPlayers(nearbyResp.result);
+         }
+       }
+     }
 
-    return resp;
+      // Track piloting XP after ship-based actions that grant exp
+      const PILOTING_EXP_COMMANDS = new Set([
+        'jump', 'travel', 'mine', 'attack', 'salvage_wreck', 'loot_wreck',
+        'refuel', 'repair', 'dock', 'undock', 'survey_system'
+      ]);
+      if (!resp.error && PILOTING_EXP_COMMANDS.has(command)) {
+         try {
+            await this.logSkillGains(command);
+         } catch (e) {
+            // ignore tracking errors
+         }
+      }
+
+      return resp;
   }
 
   /** Login using stored credentials. Returns true on success. Prevents duplicate concurrent logins. */
@@ -546,10 +571,16 @@ export class Bot {
       return false;
     }
 
-    this.log("system", "Login successful");
-    this.api.resetFullLoginFlag();
-    await this.refreshStatus();
-    return true;
+     this.log("system", "Login successful");
+     this.api.resetFullLoginFlag();
+     await this.refreshStatus();
+     // Populate initial skill snapshot
+     try {
+       await this.checkSkills();
+     } catch {
+       // ignore skill fetch errors
+     }
+     return true;
   }
 
   /** Resume session from disk without full login. Returns true if session was restored and is valid. */
@@ -568,9 +599,14 @@ export class Bot {
       return false;
     }
 
-    this.log("system", "Session resumed successfully");
-    await this.refreshStatus();
-    return true;
+     this.log("system", "Session resumed successfully");
+     await this.refreshStatus();
+     try {
+       await this.checkSkills();
+     } catch {
+       // ignore
+     }
+     return true;
   }
 
   /** Fetch current game state and cache it. */
@@ -875,59 +911,171 @@ export class Bot {
     return this.skillLevels.get(skillId) ?? 0;
   }
 
-  /** Fetch skills and log any level-ups since the last check. */
-  async checkSkills(): Promise<void> {
-    const resp = await this.exec("get_skills");
-    if (!resp.result || typeof resp.result !== "object") return;
-
-    const r = resp.result as Record<string, unknown>;
-
-    // Resolve the skills container — handles all known API shapes:
-    //   Array at top level:          [{ skill_id, name, level }, ...]
-    //   Array nested under .skills:  { skills: [{ skill_id, ... }] }
-    //   Dict nested under .skills:   { skills: { crafting_basic: { level, xp, ... } } }
-    //   Dict at top level:           { crafting_basic: { level, xp, ... } }
-    //   Dict with numeric values:    { crafting_basic: 7, ... }
-    let skillsContainer: unknown = r;
-    if (!Array.isArray(r) && r.skills !== undefined) {
-      skillsContainer = r.skills;
+   /** Fetch skills and log any level-ups since the last check. */
+    async checkSkills(): Promise<void> {
+      const fresh = await this.fetchAllSkills();
+      for (const [id, data] of fresh.entries()) {
+        const prev = this.skillLevels.get(id);
+        if (prev !== undefined && data.level > prev) {
+          this.log("skill", `LEVEL UP! ${id}: ${prev} -> ${data.level}`);
+        }
+        this.skillLevels.set(id, data.level);
+        this.skillXP.set(id, data.xp);
+        this.skillTotalXP.set(id, data.totalXP ?? 0);
+        this.skillXpToNext.set(id, data.xpToNext ?? 0);
+      }
     }
 
-    const entries: Array<{ id: string; name: string; level: number }> = [];
-
-    if (Array.isArray(skillsContainer)) {
-      for (const skill of skillsContainer as Array<Record<string, unknown>>) {
-        const id = (skill.skill_id as string) || (skill.id as string) || (skill.name as string) || "";
-        const name = (skill.name as string) || id;
-        const level = (skill.level as number) ?? 0;
-        if (id) entries.push({ id, name, level });
-      }
-    } else if (skillsContainer && typeof skillsContainer === "object") {
-      for (const [key, val] of Object.entries(skillsContainer as Record<string, unknown>)) {
-        if (typeof val === "number") {
-          entries.push({ id: key, name: key, level: val });
-        } else if (val && typeof val === "object") {
-          const s = val as Record<string, unknown>;
-          const level = (s.level as number) ?? (s.current_level as number) ?? 0;
-          const name = (s.name as string) || key;
-          entries.push({ id: key, name, level });
+     /** Fetch all skills as a Map<skillId, {level, xp, xpToNext, totalXP?}>. */
+     private async fetchAllSkills(): Promise<Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>> {
+     const resp = await this.api.execute('get_skills');
+     if (resp.error || !resp.result) return new Map();
+     const r = resp.result as Record<string, unknown>;
+     let skillsContainer: unknown = r;
+     if (!Array.isArray(r) && r.skills !== undefined) {
+       skillsContainer = r.skills;
+     }
+      const map = new Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>();
+      if (Array.isArray(skillsContainer)) {
+        for (const skill of skillsContainer as Array<Record<string, unknown>>) {
+          const id = (skill.skill_id as string) || (skill.id as string) || (skill.name as string) || "";
+          const level = (skill.level as number) ?? 0;
+          const rawXP = (skill.xp as number) ?? (skill.experience as number) ?? (skill.current_xp as string) ?? 0;
+          const xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
+          const xpToNext = (skill.xp_to_next_level as number) ??
+                           (skill.xp_to_next as number) ??
+                           (skill.xp_needed as number) ??
+                           (skill.xp_remaining as number) ??
+                           (skill.next_level_xp as number);
+          const totalXP = (skill.total_xp as number) ??
+                          (skill.total_experience as number) ??
+                          (skill.cumulative_xp as number);
+          const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = { level, xp, xpToNext: xpToNext ?? undefined };
+          if (totalXP !== undefined) entry.totalXP = totalXP;
+          if (id) map.set(id, entry);
+        }
+      } else if (skillsContainer && typeof skillsContainer === 'object') {
+        for (const [key, val] of Object.entries(skillsContainer as Record<string, unknown>)) {
+          let level = 0;
+          let xp = 0;
+          let xpToNext: number | undefined;
+          let totalXP: number | undefined;
+          if (typeof val === 'number') {
+            level = val;
+          } else if (val && typeof val === 'object') {
+            const s = val as Record<string, unknown>;
+            level = (s.level as number) ?? (s.current_level as number) ?? 0;
+            const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as string) ?? 0;
+            xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
+            xpToNext = (s.xp_to_next_level as number) ??
+                       (s.xp_to_next as number) ??
+                       (s.xp_needed as number) ??
+                       (s.xp_remaining as number) ??
+                       (s.next_level_xp as number);
+            totalXP = (s.total_xp as number) ??
+                      (s.total_experience as number) ??
+                      (s.cumulative_xp as number);
+          }
+          const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = { level, xp, xpToNext: xpToNext ?? undefined };
+          if (totalXP !== undefined) entry.totalXP = totalXP;
+          map.set(key, entry);
         }
       }
+      return map;
     }
 
-    for (const { id, name, level } of entries) {
-      const prev = this.skillLevels.get(id);
-      if (prev !== undefined && level > prev) {
-        this.log("skill", `LEVEL UP! ${name}: ${prev} -> ${level}`);
+    /** Capture current skill levels & XP for before/after comparison. */
+    captureSkillSnapshot(): void {
+      this.skillSnapshot = new Map(
+        Array.from(this.skillLevels.entries()).map(([id, level]) => [
+          id,
+          {
+            level,
+            xp: this.skillXP.get(id) ?? 0,
+            totalXP: this.skillTotalXP.get(id) ?? undefined,
+            xpToNext: this.skillXpToNext.get(id) ?? undefined
+          }
+        ])
+      );
+    }
+
+    /** Compare skills after a command and log any gains. */
+     private async logSkillGains(command: string): Promise<void> {
+       const fresh = await this.fetchAllSkills();
+       if (fresh.size === 0) return; // failed to fetch, keep old snapshot
+       const gains: Array<{
+         id: string;
+         name: string;
+         levelBefore: number;
+         levelAfter: number;
+         xpBefore: number;
+         xpAfter: number;
+         xpGained: number;
+         xpToNext?: number;
+         totalXPBefore?: number;
+         totalXPAfter?: number;
+       }> = [];
+       for (const [id, data] of fresh.entries()) {
+         const old = this.skillSnapshot.get(id);
+         if (!old) continue;
+         let xpGained: number;
+         // Prefer using total cumulative XP if available for exact gain
+         if (old.totalXP !== undefined && data.totalXP !== undefined) {
+           xpGained = data.totalXP - old.totalXP;
+         } else if (data.level > old.level) {
+           // Level-up: remaining XP to finish old level + XP in new level
+           const oldRemaining = (old.xpToNext !== undefined) ? (old.xpToNext - old.xp) : 0;
+           xpGained = oldRemaining + data.xp;
+         } else {
+           xpGained = data.xp - old.xp;
+         }
+         const levelDelta = data.level - old.level;
+         if (xpGained > 0 || levelDelta > 0) {
+           gains.push({
+             id,
+             name: id,
+             levelBefore: old.level,
+             levelAfter: data.level,
+             xpBefore: old.xp,
+             xpAfter: data.xp,
+             xpGained,
+             xpToNext: data.xpToNext,
+             totalXPBefore: old.totalXP,
+             totalXPAfter: data.totalXP,
+           });
+         }
+       }
+      if (gains.length > 0) {
+        const parts = gains.map(g => {
+          if (g.levelAfter > g.levelBefore && g.xpGained > 0) return `+${g.xpGained} ${g.id} (lvl ${g.levelAfter - g.levelBefore})`;
+          if (g.xpGained > 0) return `+${g.xpGained} ${g.id}`;
+          return `+${g.levelAfter - g.levelBefore} ${g.id}`;
+        }).join(", ");
+        this.log("skills", `Skill gains: ${parts}`);
+        recordSkillGains(this, command, this.shipName, gains);
+        // Also update piloting-specific aggregated stats if piloting was among gains
+        const pilotGain = gains.find(g => g.id.toLowerCase().includes('pilot'));
+        if (pilotGain) {
+          recordPilotingActivity(this, command, pilotGain.xpGained, pilotGain.levelAfter, pilotGain.xpAfter, this.shipName);
+        }
       }
-      this.skillLevels.set(id, level);
+      // Update in-memory skill maps to the fresh snapshot for next command
+      this.skillLevels.clear();
+      this.skillXP.clear();
+      this.skillTotalXP.clear();
+      this.skillXpToNext.clear();
+      for (const [id, data] of fresh.entries()) {
+        this.skillLevels.set(id, data.level);
+        this.skillXP.set(id, data.xp);
+        this.skillTotalXP.set(id, data.totalXP ?? 0);
+        this.skillXpToNext.set(id, data.xpToNext ?? 0);
+      }
     }
-  }
 
-  /**
-   * Start a customs hold - blocks travel/jump actions until cleared.
-   */
-  startCustomsHold(): void {
+    /**
+     * Start a customs hold - blocks travel/jump actions until cleared.
+     */
+   startCustomsHold(): void {
     // Don't restart if already active - prevents timer reset and AI response spam
     if (this.customsHold.active) {
       this.log("customs", "📋 Customs hold already active - ignoring duplicate stop request");
@@ -1084,7 +1232,7 @@ export class Bot {
               senderLower.includes("rim ranger");
             
             if (!contentLower.includes("mayday") && !isEmpireNpc) {
-              playerNameStore.add(sender);
+              playerNameStore.add(sender, "", "", this.system, this.poi);
             } else if (isEmpireNpc) {
               debugLogForBot(this.username, "playernames:skip", `${this.username}`, `Ignored empire NPC sender: "${sender}"`);
             } else {
@@ -1361,7 +1509,7 @@ export class Bot {
 
           // Track pirate name
           if (pirateName && pirateName !== "Unknown") {
-            playerNameStore.add(pirateName);
+            playerNameStore.add(pirateName, pirateT, "", this.system, this.poi);
           }
 
           // Combat chat alerts disabled — was spamming faction chat
@@ -1473,6 +1621,48 @@ export class Bot {
      } catch (err) {
        this.log("error", `Warning alert failed: ${err instanceof Error ? err.message : String(err)}`);
      }
+   }
+
+   /** Fetch piloting skill info (level and XP) via get_skills. */
+   async getPilotingSkill(): Promise<{ level: number; xp: number } | null> {
+     const resp = await this.api.execute('get_skills');
+     if (resp.error || !resp.result) return null;
+     const r = resp.result as Record<string, unknown>;
+     let skillsContainer: unknown = r;
+     if (!Array.isArray(r) && r.skills !== undefined) {
+       skillsContainer = r.skills;
+     }
+     let result: { level: number; xp: number } | null = null;
+     const process = (id: string, name: string, level: number, xp: number) => {
+       if (!result && (id.toLowerCase().includes('pilot') || name.toLowerCase().includes('pilot'))) {
+         result = { level, xp };
+       }
+     };
+     if (Array.isArray(skillsContainer)) {
+       for (const skill of skillsContainer as Array<Record<string, unknown>>) {
+         const id = (skill.skill_id as string) || (skill.id as string) || (skill.name as string) || "";
+         const name = (skill.name as string) || id;
+         const level = (skill.level as number) ?? 0;
+         const rawXP = (skill.xp as number) ?? (skill.experience as number) ?? (skill.current_xp as string) ?? 0;
+         const xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
+         if (id) process(id, name, level, xp);
+       }
+     } else if (skillsContainer && typeof skillsContainer === 'object') {
+       for (const [key, val] of Object.entries(skillsContainer as Record<string, unknown>)) {
+         let level = 0;
+         let xp = 0;
+         if (typeof val === 'number') {
+           level = val;
+         } else if (val && typeof val === 'object') {
+           const s = val as Record<string, unknown>;
+           level = (s.level as number) ?? (s.current_level as number) ?? 0;
+           const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as string) ?? 0;
+           xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
+         }
+         process(key, key, level, xp);
+       }
+     }
+     return result;
    }
 
    /**
@@ -1656,11 +1846,9 @@ export class Bot {
      }
    }
 
-  /**
-   * Extract and track player names, pirates, and empire NPCs from a get_nearby response.
-   * Players, pirates, and empire NPCs are tracked in separate categories.
-   * Empire NPCs are excluded from player tracking even if they appear in player arrays.
-   */
+   /**
+    * Extract and track player names, pirates, and empire NPCs from a get_nearby response.
+    */
   trackNearbyPlayers(nearbyResult: unknown): void {
     if (!nearbyResult || typeof nearbyResult !== "object") {
       this.log("debug", "trackNearbyPlayers: no result or not object");
@@ -1708,7 +1896,32 @@ export class Bot {
           if (empireNpcNames.has(trimmedName)) {
             continue;
           }
-          if (playerNameStore.add(trimmedName)) {
+          // Extract faction info - try faction_tag first (from nearby array), then faction/faction_id
+          let faction = "";
+          if (typeof entity.faction_tag === "string" && entity.faction_tag) {
+            faction = entity.faction_tag;
+          } else if (typeof entity.faction === "string" && entity.faction) {
+            faction = entity.faction;
+          } else if (typeof entity.faction_id === "string" && entity.faction_id) {
+            faction = entity.faction_id;
+          }
+          // Extract ship info - try ship_class (from nearby array), then ship/ship_type/ship_name
+          let ship = "";
+          if (typeof entity.ship_class === "string" && entity.ship_class) {
+            ship = entity.ship_class;
+          } else if (typeof entity.ship === "string" && entity.ship) {
+            ship = entity.ship;
+          } else if (typeof entity.ship_type === "string" && entity.ship_type) {
+            ship = entity.ship_type;
+          } else if (typeof entity.ship_name === "string" && entity.ship_name) {
+            ship = entity.ship_name;
+          }
+          // Log status message if available
+          if (typeof entity.status_message === "string" && entity.status_message) {
+            debugLogForBot(this.username, "playernames:status", `${this.username}`, 
+              `Player ${trimmedName}: ${entity.status_message}`);
+          }
+          if (playerNameStore.add(trimmedName, faction, ship, this.system, this.poi)) {
             playerCount++;
           }
         }
@@ -1721,7 +1934,9 @@ export class Bot {
     for (const pirate of piratesArray as Array<Record<string, unknown>>) {
       const name = pirate.name as string;
       if (name && name.trim()) {
-        if (playerNameStore.addPirate(name)) {
+        const faction = (pirate.faction as string) || "";
+        const ship = (pirate.ship_type as string) || (pirate.ship as string) || "";
+        if (playerNameStore.addPirate(name, faction, ship, this.system, this.poi)) {
           pirateCount++;
         }
       }
@@ -1732,7 +1947,9 @@ export class Bot {
     for (const npc of empireNpcsArray as Array<Record<string, unknown>>) {
       const name = npc.name as string;
       if (name && name.trim()) {
-        if (playerNameStore.addEmpireNpc(name)) {
+        const faction = (npc.faction as string) || "";
+        const ship = (npc.ship_type as string) || (npc.ship as string) || "";
+        if (playerNameStore.addEmpireNpc(name, faction, ship, this.system, this.poi)) {
           empireNpcCount++;
         }
       }
@@ -1762,7 +1979,7 @@ export class Bot {
     for (const member of members as Array<Record<string, unknown>>) {
       const name = (member.username as string) || (member.player_name as string) || (member.name as string);
       if (name && name.trim()) {
-        if (playerNameStore.add(name)) {
+        if (playerNameStore.add(name, '', '', this.system, this.poi)) {
           count++;
         }
       }
@@ -1808,7 +2025,7 @@ export class Bot {
             nameLower.startsWith("[customs]") ||
             nameLower.startsWith("[police]");
           
-          if (!isEmpireNpc && playerNameStore.add(trimmedName)) {
+          if (!isEmpireNpc && playerNameStore.add(trimmedName, '', '', this.system, this.poi)) {
             count++;
           }
         }

@@ -445,6 +445,22 @@ export class WebServer {
             faction: this.factionLog,
           });
         }
+        if (url.pathname === "/api/faction-storage") {
+          // Return faction shared warehouse contents
+          const factionStoragePath = join(process.cwd(), "data", "factionStorage.json");
+          if (!existsSync(factionStoragePath)) {
+            return Response.json({ items: [] });
+          }
+          try {
+            const raw = readFileSync(factionStoragePath, "utf-8");
+            const data = JSON.parse(raw);
+            // Normalize: entries may be under "entries" or "items"
+            const items = data.entries || data.items || [];
+            return Response.json({ items });
+          } catch {
+            return Response.json({ items: [] });
+          }
+        }
 
         // Shutdown endpoint
         if (url.pathname === "/api/shutdown" && req.method === "POST") {

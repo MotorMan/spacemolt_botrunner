@@ -3,6 +3,36 @@ import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
 
 const PLAYER_NAMES_FILE = join(process.cwd(), "data", "playerNames.json");
+const FULL_PLAYER_INFO_FILE = join(process.cwd(), "data", "fullPlayerInfo.json");
+
+/**
+ * Full detail information for a player/pirate/empire NPC.
+ */
+export interface EntityDetail {
+  name: string;
+  type: "player" | "pirate" | "empire_npc";
+  faction: string; // 4-letter faction code (e.g., "SOLR", "CRMS", "NEBU", "VOID")
+  ship: string; // Last seen ship name/type
+  lastSeen: string; // ISO timestamp of last sighting
+  system: string; // Last known system
+  poi: string; // Last known POI/location
+  normalized: string; // Normalized name for lookup
+}
+
+/**
+ * Data stored in fullPlayerInfo.json.
+ */
+interface FullPlayerInfoData {
+  players: Record<string, EntityDetail>;
+  pirates: Record<string, EntityDetail>;
+  empire_npcs: Record<string, EntityDetail>;
+  lastUpdated: string;
+  counts: {
+    players: number;
+    pirates: number;
+    empire_npcs: number;
+  };
+}
 
 /**
  * Persistent store for known player names, pirates, and empire NPCs.
@@ -19,8 +49,69 @@ export class PlayerNameStore {
   private _botName: string | null = null;
   private _initialized = false;
 
+  // Full detail tracking
+  private fullPlayerInfo: FullPlayerInfoData = {
+    players: {},
+    pirates: {},
+    empire_npcs: {},
+    lastUpdated: new Date().toISOString(),
+    counts: {
+      players: 0,
+      pirates: 0,
+      empire_npcs: 0,
+    },
+  };
+
   constructor() {
     // Load will be called synchronously on first use if not already loaded
+    this.loadFullPlayerInfo();
+  }
+
+  /** Load full player info from disk (lazy, called on first access) */
+  private loadFullPlayerInfo(): void {
+    try {
+      if (!existsSync(FULL_PLAYER_INFO_FILE)) {
+        debugLogForBot(this._botName || "unknown", "fullplayerinfo:load", `${this._botName || "unknown"}`, "No full player info file, starting fresh");
+        this.saveFullPlayerInfo();
+        return;
+      }
+      const text = readFileSync(FULL_PLAYER_INFO_FILE, "utf-8");
+      const data = JSON.parse(text) as FullPlayerInfoData;
+      this.fullPlayerInfo = {
+        players: data.players || {},
+        pirates: data.pirates || {},
+        empire_npcs: data.empire_npcs || {},
+        lastUpdated: data.lastUpdated || new Date().toISOString(),
+        counts: data.counts || { players: 0, pirates: 0, empire_npcs: 0 },
+      };
+      // Recalculate counts
+      this.fullPlayerInfo.counts.players = Object.keys(this.fullPlayerInfo.players).length;
+      this.fullPlayerInfo.counts.pirates = Object.keys(this.fullPlayerInfo.pirates).length;
+      this.fullPlayerInfo.counts.empire_npcs = Object.keys(this.fullPlayerInfo.empire_npcs).length;
+      debugLogForBot(this._botName || "unknown", "fullplayerinfo:load", `${this._botName || "unknown"}`, 
+        `Loaded ${this.fullPlayerInfo.counts.players} players, ${this.fullPlayerInfo.counts.pirates} pirates, ${this.fullPlayerInfo.counts.empire_npcs} empire NPCs`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[PlayerNameStore] Load full player info failed: ${msg}`);
+      this.fullPlayerInfo = {
+        players: {},
+        pirates: {},
+        empire_npcs: {},
+        lastUpdated: new Date().toISOString(),
+        counts: { players: 0, pirates: 0, empire_npcs: 0 },
+      };
+    }
+  }
+
+  /** Save full player info to disk */
+  private saveFullPlayerInfo(): void {
+    try {
+      this.fullPlayerInfo.lastUpdated = new Date().toISOString();
+      writeFileSync(FULL_PLAYER_INFO_FILE, JSON.stringify(this.fullPlayerInfo, null, 2), "utf-8");
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(`[PlayerNameStore] Save full player info failed: ${msg}`);
+    }
   }
 
   /** Ensure data is loaded from disk (called lazily on first use) */
@@ -110,11 +201,10 @@ export class PlayerNameStore {
   }
 
   /**
-   * Add a player name to the store.
-   * Returns true if this is a new name (not previously seen).
-   * Handles deduplication with normalization for special characters.
+   * Add/update a player with full details.
+   * Returns true if this is a new player (not previously seen).
    */
-  add(name: string): boolean {
+  add(name: string, faction = "", ship = "", system = "", poi = ""): boolean {
     this.ensureLoaded();
 
     if (!name || typeof name !== "string") {
@@ -126,28 +216,41 @@ export class PlayerNameStore {
       return false;
     }
 
+    const isNew = !this.normalizedMap.has(normalized);
+
+    // Always add/update full detail record
+    this.fullPlayerInfo.players[normalized] = {
+      name: name,
+      type: "player",
+      faction: faction,
+      ship: ship,
+      lastSeen: new Date().toISOString(),
+      system: system,
+      poi: poi,
+      normalized: normalized,
+    };
+
     // Check if we already have this name (case-insensitive, normalized)
-    if (this.normalizedMap.has(normalized)) {
-      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Duplicate ignored: "${name}"`);
-      return false;
+    if (!isNew) {
+      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Updated: "${name}" (faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
+    } else {
+      // Add to both sets
+      this.names.add(name);
+      this.normalizedMap.set(normalized, name);
+      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added: "${name}" (total: ${this.names.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     }
 
-    // Add to both sets
-    this.names.add(name);
-    this.normalizedMap.set(normalized, name);
-
-    debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added: "${name}" (total: ${this.names.size})`);
-
-    // Persist to disk
+    this.fullPlayerInfo.counts.players = Object.keys(this.fullPlayerInfo.players).length;
+    this.saveFullPlayerInfo();
     this.save();
-    return true;
+    return isNew;
   }
 
   /**
-   * Add a pirate name to the store.
-   * Returns true if this is a new name (not previously seen).
+   * Add/update a pirate with full details.
+   * Returns true if this is a new pirate (not previously seen).
    */
-  addPirate(name: string): boolean {
+  addPirate(name: string, faction = "", ship = "", system = "", poi = ""): boolean {
     this.ensureLoaded();
 
     if (!name || typeof name !== "string") {
@@ -159,28 +262,41 @@ export class PlayerNameStore {
       return false;
     }
 
+    const isNew = !this.pirateNormalizedMap.has(normalized);
+
+    // Always add/update full detail record
+    this.fullPlayerInfo.pirates[normalized] = {
+      name: name,
+      type: "pirate",
+      faction: faction,
+      ship: ship,
+      lastSeen: new Date().toISOString(),
+      system: system,
+      poi: poi,
+      normalized: normalized,
+    };
+
     // Check if we already have this name (case-insensitive, normalized)
-    if (this.pirateNormalizedMap.has(normalized)) {
-      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Pirate duplicate ignored: "${name}"`);
-      return false;
+    if (!isNew) {
+      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Pirate updated: "${name}" (faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
+    } else {
+      // Add to both sets
+      this.pirates.add(name);
+      this.pirateNormalizedMap.set(normalized, name);
+      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added pirate: "${name}" (total: ${this.pirates.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     }
 
-    // Add to both sets
-    this.pirates.add(name);
-    this.pirateNormalizedMap.set(normalized, name);
-
-    debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added pirate: "${name}" (total: ${this.pirates.size})`);
-
-    // Persist to disk
+    this.fullPlayerInfo.counts.pirates = Object.keys(this.fullPlayerInfo.pirates).length;
+    this.saveFullPlayerInfo();
     this.save();
-    return true;
+    return isNew;
   }
 
   /**
-   * Add an empire NPC name to the store.
-   * Returns true if this is a new name (not previously seen).
+   * Add/update an empire NPC with full details.
+   * Returns true if this is a new empire NPC (not previously seen).
    */
-  addEmpireNpc(name: string): boolean {
+  addEmpireNpc(name: string, faction = "", ship = "", system = "", poi = ""): boolean {
     this.ensureLoaded();
 
     if (!name || typeof name !== "string") {
@@ -192,21 +308,34 @@ export class PlayerNameStore {
       return false;
     }
 
+    const isNew = !this.empireNpcNormalizedMap.has(normalized);
+
+    // Always add/update full detail record
+    this.fullPlayerInfo.empire_npcs[normalized] = {
+      name: name,
+      type: "empire_npc",
+      faction: faction,
+      ship: ship,
+      lastSeen: new Date().toISOString(),
+      system: system,
+      poi: poi,
+      normalized: normalized,
+    };
+
     // Check if we already have this name (case-insensitive, normalized)
-    if (this.empireNpcNormalizedMap.has(normalized)) {
-      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Empire NPC duplicate ignored: "${name}"`);
-      return false;
+    if (!isNew) {
+      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Empire NPC updated: "${name}" (faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
+    } else {
+      // Add to both sets
+      this.empireNpcs.add(name);
+      this.empireNpcNormalizedMap.set(normalized, name);
+      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added empire NPC: "${name}" (total: ${this.empireNpcs.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     }
 
-    // Add to both sets
-    this.empireNpcs.add(name);
-    this.empireNpcNormalizedMap.set(normalized, name);
-
-    debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added empire NPC: "${name}" (total: ${this.empireNpcs.size})`);
-
-    // Persist to disk
+    this.fullPlayerInfo.counts.empire_npcs = Object.keys(this.fullPlayerInfo.empire_npcs).length;
+    this.saveFullPlayerInfo();
     this.save();
-    return true;
+    return isNew;
   }
 
   /**
@@ -285,6 +414,130 @@ export class PlayerNameStore {
   }
 
   /**
+   * Get detailed information for a player.
+   * Returns EntityDetail or null if not found.
+   */
+  getPlayerDetail(name: string): EntityDetail | null {
+    this.ensureLoaded();
+    const normalized = this.normalize(name);
+    return this.fullPlayerInfo.players[normalized] || null;
+  }
+
+  /**
+   * Get detailed information for a pirate.
+   * Returns EntityDetail or null if not found.
+   */
+  getPirateDetail(name: string): EntityDetail | null {
+    this.ensureLoaded();
+    const normalized = this.normalize(name);
+    return this.fullPlayerInfo.pirates[normalized] || null;
+  }
+
+  /**
+   * Get detailed information for an empire NPC.
+   * Returns EntityDetail or null if not found.
+   */
+  getEmpireNpcDetail(name: string): EntityDetail | null {
+    this.ensureLoaded();
+    const normalized = this.normalize(name);
+    return this.fullPlayerInfo.empire_npcs[normalized] || null;
+  }
+
+  /**
+   * Get detailed information for any entity (player, pirate, or empire NPC).
+   * Returns EntityDetail or null if not found.
+   */
+  getEntityDetail(name: string): EntityDetail | null {
+    this.ensureLoaded();
+    const normalized = this.normalize(name);
+    return this.fullPlayerInfo.players[normalized] ||
+           this.fullPlayerInfo.pirates[normalized] ||
+           this.fullPlayerInfo.empire_npcs[normalized] ||
+           null;
+  }
+
+  /**
+   * Get all player details, sorted by name.
+   */
+  getAllPlayerDetails(): EntityDetail[] {
+    this.ensureLoaded();
+    return Object.values(this.fullPlayerInfo.players)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * Get all pirate details, sorted by name.
+   */
+  getAllPirateDetails(): EntityDetail[] {
+    this.ensureLoaded();
+    return Object.values(this.fullPlayerInfo.pirates)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * Get all empire NPC details, sorted by name.
+   */
+  getAllEmpireNpcDetails(): EntityDetail[] {
+    this.ensureLoaded();
+    return Object.values(this.fullPlayerInfo.empire_npcs)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * Update an existing entity's details (for when we see them again with new info).
+   * Returns true if entity was found and updated.
+   */
+  updateEntity(name: string, updates: Partial<Omit<EntityDetail, "name" | "type" | "normalized">>): boolean {
+    this.ensureLoaded();
+    const normalized = this.normalize(name);
+    const now = new Date().toISOString();
+
+    // Try each category
+    for (const category of ["players", "pirates", "empire_npcs"] as const) {
+      const entity = this.fullPlayerInfo[category][normalized];
+      if (entity) {
+        entity.faction = updates.faction || entity.faction;
+        entity.ship = updates.ship || entity.ship;
+        entity.system = updates.system || entity.system;
+        entity.poi = updates.poi || entity.poi;
+        entity.lastSeen = now;
+        this.saveFullPlayerInfo();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * Search for entities by name (partial match, case-insensitive).
+   * Returns array of EntityDetail matches.
+   */
+  search(query: string): EntityDetail[] {
+    this.ensureLoaded();
+    const queryLower = query.toLowerCase().trim();
+    if (!queryLower) return [];
+
+    const results: EntityDetail[] = [];
+    for (const category of ["players", "pirates", "empire_npcs"] as const) {
+      for (const entity of Object.values(this.fullPlayerInfo[category])) {
+        if (entity.name.toLowerCase().includes(queryLower) ||
+            entity.normalized.includes(queryLower)) {
+          results.push(entity);
+        }
+      }
+    }
+    return results.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  /**
+   * Get full player info data (for export or analysis).
+   */
+  getFullPlayerInfo(): FullPlayerInfoData {
+    this.ensureLoaded();
+    return JSON.parse(JSON.stringify(this.fullPlayerInfo));
+  }
+
+  /**
    * Save player names, pirates, and empire NPCs to disk.
    */
   private save(): void {
@@ -316,7 +569,15 @@ export class PlayerNameStore {
     this.pirateNormalizedMap.clear();
     this.empireNpcs.clear();
     this.empireNpcNormalizedMap.clear();
+    this.fullPlayerInfo = {
+      players: {},
+      pirates: {},
+      empire_npcs: {},
+      lastUpdated: new Date().toISOString(),
+      counts: { players: 0, pirates: 0, empire_npcs: 0 },
+    };
     this.save();
+    this.saveFullPlayerInfo();
   }
 }
 

@@ -106,6 +106,19 @@ main {
 .tab-page.active {
   display: flex;
 }
+#page-players {
+  padding: 0;
+  gap: 0;
+}
+#page-players.active {
+  display: flex;
+}
+#playersFrame {
+  flex: 1;
+  width: 100%;
+  border: none;
+  min-height: 0;
+}
 #page-dashboard { flex: 1 0 auto; overflow: visible; }
 
 /* ── Bot table ──────────────────────────────────── */

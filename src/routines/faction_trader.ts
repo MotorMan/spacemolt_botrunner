@@ -357,23 +357,18 @@ function findFactionSellRoutes(
   for (const item of storage) {
     const lower = item.itemId.toLowerCase();
     if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-    // Never trade raw ores, ice, or gas — those are crafting inputs
-    const catItem = catalogStore.getItem(item.itemId);
-    if (catItem?.category === "ore") continue;
     if (item.quantity <= 0) continue;
 
-    // Filter by allowed items if configured
+    // Filter by allowed items if configured (case-insensitive match)
     if (settings.tradeItems.length > 0) {
-      const match = settings.tradeItems.some(t =>
-        t.itemId === item.itemId ||
-        item.itemId.toLowerCase().includes(t.itemId.toLowerCase()) ||
-        item.name.toLowerCase().includes(t.itemId.toLowerCase())
-      );
+      const itemIdLower = item.itemId.toLowerCase();
+      const match = settings.tradeItems.some(t => t.itemId.toLowerCase() === itemIdLower);
       if (!match) continue;
     }
 
-    // Get per-item settings
-    const itemConfig = settings.tradeItems.find(t => t.itemId === item.itemId);
+    // Get per-item settings (case-insensitive match)
+    const itemIdLower = item.itemId.toLowerCase();
+    const itemConfig = settings.tradeItems.find(t => t.itemId.toLowerCase() === itemIdLower);
     const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
     const itemMaxSellQty = itemConfig?.maxSellQty || 0;
     const itemSoldQty = itemConfig?.soldQty || 0;

@@ -21,6 +21,7 @@
       <div class="top-tab" data-tab="faction" onclick="switchTab('faction')">Faction</div>
       <div class="top-tab" data-tab="shipyard" onclick="switchTab('shipyard')">Shipyard</div>
       <div class="top-tab" data-tab="stats" onclick="switchTab('stats')">Stats</div>
+      <div class="top-tab" data-tab="players" onclick="switchTab('players')">Players</div>
       <div class="top-tab" data-tab="settings" onclick="switchTab('settings')">Settings</div>
     </div>
   </div>
@@ -496,6 +497,11 @@
     </div>
   </div>
 
+  <!-- ══ Players Tab ══ -->
+  <div class="tab-page" id="page-players">
+    <iframe id="playersFrame" src="/players.html"></iframe>
+  </div>
+
   <!-- ══ Stats Tab ══ -->
   <div class="tab-page" id="page-stats">
     <div class="stats-page-header">
@@ -716,6 +722,11 @@ function switchTab(name) {
     renderFleetCombatControls(true); // Force render when tab is opened
     // Update battle UI visibility
     updateBattleUI();
+  }
+  if (name === 'players') {
+    // Refresh the iframe to get latest data
+    const frame = document.getElementById('playersFrame');
+    if (frame) frame.src = frame.src;
   }
 }
 
@@ -2873,6 +2884,26 @@ function renderManualControls() {
       <button class="sm" onclick="mcRefreshStorageForDepositAll()" title="Refresh storage lists">Refresh</button>
     </div>
 
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Ship Loadout Withdrawal</label>
+    </div>
+    
+    <div class="cmd-group">
+      <label>Loadout</label>
+      <select id="mc-loadout-select" style="min-width:150px">
+        <option value="">-- Select Loadout --</option>
+      </select>
+      <input type="number" id="mc-loadout-multiplier" min="1" max="99" value="1" style="width:70px" title="Multiply loadout quantities by this number">
+      <button class="primary sm" onclick="mcStartLoadoutWithdrawal()">Withdraw</button>
+      <button class="sm" onclick="mcStopLoadoutWithdrawal()">Stop</button>
+    </div>
+    
+    <div class="cmd-group">
+      <label>Withdrawal Status</label>
+      <span id="mc-loadout-withdrawal-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
+      <button class="sm" onclick="mcRefreshFactionStorage()" title="Refresh faction storage">Refresh</button>
+    </div>
+
     <div class="cmd-group">
       <label>Gift Item</label>
       <select id="mc-gift-source">
@@ -2925,6 +2956,8 @@ function renderManualControls() {
 
   // Show details for initially selected recipe
   if (profileRecipes && profileRecipes.length > 0) showRecipeDetails();
+  // Populate ship loadout dropdown
+  mcPopulateLoadoutSelect();
 }
 
 function showRecipeDetails() {
@@ -3866,6 +3899,10 @@ function mcStartManualRescue() {
 let depositAllQueue = null;  // { mode: string, items: Array<{item_id, quantity, source, target}>, index: number }
 let depositAllRunning = false;
 
+// Ship loadout withdrawal queue (Faction → Station)
+let loadoutWithdrawalQueue = null;  // { items: Array<{item_id, quantity}>, index: number, loadoutName: string }
+let loadoutWithdrawalRunning = false;
+
 /** Refresh both cargo and storage before starting deposit all */
 function mcRefreshStorageForDepositAll() {
   if (!profileBot) return;
@@ -4077,6 +4114,161 @@ function mcStopDepositAll() {
   logResponse(`<span class="resp-err">Deposit All stopped. ${remaining} items remaining.</span>`);
   depositAllQueue = null;
   mcUpdateQueueStatus();
+}
+
+// ── Ship Loadout Withdrawal Queue System ───────────────────────
+
+/** Build the loadout withdrawal queue from selected loadout + multiplier */
+function mcBuildLoadoutWithdrawalQueue() {
+  const bot = bots.find(b => b.username === profileBot);
+  if (!bot) return null;
+  
+  const loadoutSelect = document.getElementById('mc-loadout-select');
+  const multiplierInput = document.getElementById('mc-loadout-multiplier');
+  if (!loadoutSelect || !multiplierInput) return null;
+  
+  const loadoutName = loadoutSelect.value;
+  if (!loadoutName) {
+    logResponse('<span class="resp-err">Select a ship loadout first</span>');
+    return null;
+  }
+  
+  const multiplier = Math.max(1, Math.min(99, parseInt(multiplierInput.value) || 1));
+  const loadouts = getShipLoadouts();
+  const loadout = loadouts[loadoutName];
+  
+  if (!loadout) {
+    logResponse(`<span class="resp-err">Loadout "${esc(loadoutName)}" not found</span>`);
+    return null;
+  }
+  
+  const items = [];
+  
+  // Add build materials (multiplied)
+  for (const mat of (loadout.buildMaterials || [])) {
+    const itemId = mat.item_id;
+    const quantity = (mat.quantity || 1) * multiplier;
+    if (itemId && quantity > 0) {
+      items.push({ item_id: itemId, quantity: quantity });
+    }
+  }
+  
+  // Add default modules (count occurrences, multiply by multiplier)
+  const moduleCounts = new Map();
+  for (const mod of (loadout.defaultModules || [])) {
+    const count = (moduleCounts.get(mod) || 0) + 1;
+    moduleCounts.set(mod, count);
+  }
+  for (const [mod, count] of moduleCounts) {
+    const quantity = count * multiplier;
+    if (mod && quantity > 0) {
+      items.push({ item_id: mod, quantity: quantity });
+    }
+  }
+  
+  if (items.length === 0) {
+    logResponse('<span class="resp-err">No items in selected loadout</span>');
+    return null;
+  }
+  
+  return { loadoutName, items, index: 0 };
+}
+
+/** Update the loadout withdrawal queue status display */
+function mcUpdateLoadoutWithdrawalStatus() {
+  const statusEl = document.getElementById('mc-loadout-withdrawal-status');
+  if (!statusEl) return;
+  
+  if (!loadoutWithdrawalRunning || !loadoutWithdrawalQueue) {
+    statusEl.textContent = 'Idle';
+    statusEl.style.color = 'var(--text-dim)';
+    return;
+  }
+  
+  const { items, index } = loadoutWithdrawalQueue;
+  const remaining = items.length - index;
+  statusEl.textContent = `Processing: ${index}/${items.length} (${remaining} remaining)`;
+  statusEl.style.color = loadoutWithdrawalRunning ? 'var(--green)' : 'var(--yellow)';
+}
+
+/** Process next item in the loadout withdrawal queue */
+function mcProcessLoadoutWithdrawal() {
+  if (!loadoutWithdrawalRunning || !loadoutWithdrawalQueue) return;
+  
+  const { items, index } = loadoutWithdrawalQueue;
+  
+  if (index >= items.length) {
+    // Queue complete
+    logResponse(`<span class="resp-ok">Loadout Withdrawal complete! All items transferred from faction to station storage.</span>`);
+    loadoutWithdrawalRunning = false;
+    loadoutWithdrawalQueue = null;
+    mcUpdateLoadoutWithdrawalStatus();
+    return;
+  }
+  
+  const item = items[index];
+  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  logResponse(`<span class="resp-cmd">${ts} > Withdrawing ${item.quantity}x ${item.item_id} (${index + 1}/${items.length})</span>`);
+  
+  // Use storage command: action=deposit, target=self (station), source=faction
+  // This moves items from faction storage to the bot's station storage
+  const command = 'storage';
+  const params = {
+    action: 'deposit',
+    target: 'self',
+    item_id: item.item_id,
+    quantity: item.quantity,
+    source: 'faction'
+  };
+  
+  sendExec(profileBot, command, params, (result) => {
+    if (result.ok) {
+      logResponse(`<span class="resp-ok">OK</span>`);
+    } else {
+      logResponse(`<span class="resp-err">Failed: ${esc(result.error || 'unknown')}</span>`);
+    }
+    
+    loadoutWithdrawalQueue.index++;
+    mcUpdateLoadoutWithdrawalStatus();
+    
+    // Wait a bit before next item (respect tick rate)
+    setTimeout(mcProcessLoadoutWithdrawal, TICK_COOLDOWN_MS + 500);
+  });
+}
+
+/** Start the loadout withdrawal queue */
+function mcStartLoadoutWithdrawal() {
+  if (!profileBot) return;
+  if (loadoutWithdrawalRunning) {
+    logResponse('<span class="resp-err">Loadout withdrawal already running</span>');
+    return;
+  }
+  
+  const queue = mcBuildLoadoutWithdrawalQueue();
+  if (!queue) return;
+  
+  loadoutWithdrawalQueue = queue;
+  loadoutWithdrawalRunning = true;
+  
+  logResponse(`<span class="resp-cmd">Starting Loadout Withdrawal: ${queue.loadoutName} (${queue.items.length} items, x${queue.items[0]?.quantity || 1} multiplier)</span>`);
+  mcUpdateLoadoutWithdrawalStatus();
+  
+  // Start processing
+  setTimeout(mcProcessLoadoutWithdrawal, 500);
+}
+
+/** Stop the loadout withdrawal queue */
+function mcStopLoadoutWithdrawal() {
+  if (!loadoutWithdrawalRunning) {
+    logResponse('<span class="resp-err">No loadout withdrawal queue running</span>');
+    return;
+  }
+  
+  loadoutWithdrawalRunning = false;
+  const remaining = loadoutWithdrawalQueue.items.length - loadoutWithdrawalQueue.index;
+  logResponse(`<span class="resp-err">Loadout Withdrawal stopped. ${remaining} items remaining.</span>`);
+  loadoutWithdrawalQueue = null;
+  mcUpdateLoadoutWithdrawalStatus();
 }
 
 // ── Gift Send All Queue System ───────────────────────────────
@@ -6877,13 +7069,25 @@ function renderCrafterSettings(panel) {
         <button class="sm" onclick="saveShipLoadoutPrompt()">💾 Save</button>
         <button class="sm danger" onclick="deleteShipLoadout()" id="ship-load-delete-btn" disabled>🗑 Delete</button>
       </div>
-      <div style="font-size:11px;color:var(--dim);margin-top:6px" id="ship-loadout-count">
-        No ship loadouts saved yet. Select a ship and click Save to create one.
-      </div>
-    </div>
+     <div style="font-size:11px;color:var(--dim);margin-top:6px" id="ship-loadout-count">
+         No ship loadouts saved yet. Select a ship and click Save to create one.
+       </div>
+     </div>
 
-    <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
-      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🛸 Select Ship to Commission</div>
+     <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+       <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🚢 Ship Commission Multiplier</div>
+       <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
+         Multiply ship loadout materials by this number to commission multiple ships at once (1-99).
+       </div>
+       <div style="display:flex;gap:8px;align-items:center">
+         <label style="font-size:12px;color:var(--text)">Ships to Commission:</label>
+         <input type="number" id="set-crafter-shipCommissionMultiplier" min="1" max="99" value="${crafter.shipCommissionMultiplier || 1}" style="width:70px;padding:4px 8px;font-size:12px">
+         <span style="font-size:11px;color:var(--dim)">x multiplier</span>
+       </div>
+     </div>
+
+     <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+       <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🛸 Select Ship to Commission</div>
       <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
         <select id="ship-select" onchange="onShipSelect()" style="flex:1;min-width:150px">
           <option value="">-- Select Ship --</option>
@@ -7130,6 +7334,7 @@ function saveCrafterSettings() {
     refuelThreshold: parseInt(document.getElementById('set-crafter-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-crafter-repairThreshold').value) || 40,
     goalProcessingMode,
+    shipCommissionMultiplier: Math.max(1, Math.min(99, parseInt(document.getElementById('set-crafter-shipCommissionMultiplier')?.value) || 1)),
     autoBuy: {
       enabled: autoBuyEnabled,
       maxPricePercentOverBase: autoBuyMaxPricePercent,
@@ -7457,6 +7662,18 @@ function updateShipLoadoutSelect() {
   if (deleteBtn) deleteBtn.disabled = loadoutNames.length === 0;
 }
 
+// Populate ship loadout dropdown in manual controls
+function mcPopulateLoadoutSelect() {
+  const select = document.getElementById('mc-loadout-select');
+  if (!select) return;
+  
+  const loadouts = getShipLoadouts();
+  const loadoutNames = Object.keys(loadouts).sort();
+  
+  select.innerHTML = '<option value="">-- Select Loadout --</option>' +
+    loadoutNames.map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('');
+}
+
 // Save ship loadout
 function saveShipLoadoutPrompt() {
   const shipSelect = document.getElementById('ship-select');
@@ -7491,6 +7708,7 @@ function saveShipLoadout(name) {
   const success = saveShipLoadoutToStorage(name, loadoutData);
   if (success) {
     updateShipLoadoutSelect();
+    mcPopulateLoadoutSelect();
     alert(`Ship loadout "${name}" saved successfully!`);
   } else {
     alert('Failed to save ship loadout.');
@@ -7508,22 +7726,26 @@ function addShipToCraftingList() {
 
   const ship = catalog.ships[shipId];
 
+  // Get the ship commission multiplier (default to 1)
+  const multiplier = parseInt(document.getElementById('set-crafter-shipCommissionMultiplier')?.value) || 1;
+  const clampedMultiplier = Math.max(1, Math.min(99, multiplier));
+
   // Initialize crafter settings if needed
   if (!settings.crafter) settings.crafter = {};
   if (!settings.crafter.craftLimits) settings.crafter.craftLimits = {};
 
-  // Add build materials to craftLimits
+  // Add build materials to craftLimits (multiplied)
   let addedCount = 0;
   for (const mat of ship.build_materials || []) {
     const itemId = mat.item_id;
-    const quantity = mat.quantity;
+    const quantity = mat.quantity * clampedMultiplier;
     if (itemId && quantity > 0) {
       settings.crafter.craftLimits[itemId] = quantity;
       addedCount++;
     }
   }
 
-  // Add default modules to craftLimits - count occurrences of each module type
+  // Add default modules to craftLimits - count occurrences of each module type (multiplied)
   const moduleCounts = new Map();
   for (const mod of ship.default_modules || []) {
     const item = catalog.items?.[mod];
@@ -7535,7 +7757,7 @@ function addShipToCraftingList() {
   for (const [mod, count] of moduleCounts) {
     const item = catalog.items?.[mod];
     if (item) {
-      settings.crafter.craftLimits[mod] = count;
+      settings.crafter.craftLimits[mod] = count * clampedMultiplier;
       addedCount++;
     }
   }
@@ -7544,7 +7766,7 @@ function addShipToCraftingList() {
   renderCrafterSettings(document.getElementById('settingsContent'));
 
   if (addedCount > 0) {
-    alert(`Added "${ship.name || shipId}" to crafting list:\n${addedCount} items total (materials + modules).\nClick "Save Settings" to persist.`);
+    alert(`Added "${ship.name || shipId}" x${clampedMultiplier} to crafting list:\n${addedCount} items total (materials + modules).\nClick "Save Settings" to persist.`);
   } else {
     alert('No items were added to the crafting list.');
   }
@@ -7566,22 +7788,26 @@ function loadShipLoadout() {
     return;
   }
 
+  // Get the ship commission multiplier (default to 1)
+  const multiplier = parseInt(document.getElementById('set-crafter-shipCommissionMultiplier')?.value) || 1;
+  const clampedMultiplier = Math.max(1, Math.min(99, multiplier));
+
   // Initialize crafter settings if needed
   if (!settings.crafter) settings.crafter = {};
   if (!settings.crafter.craftLimits) settings.crafter.craftLimits = {};
 
-  // Add build materials to craftLimits
+  // Add build materials to craftLimits (multiplied)
   let addedCount = 0;
   for (const mat of loadout.buildMaterials) {
     const itemId = mat.item_id;
-    const quantity = mat.quantity;
+    const quantity = mat.quantity * clampedMultiplier;
     if (itemId && quantity > 0) {
       settings.crafter.craftLimits[itemId] = quantity;
       addedCount++;
     }
   }
 
-  // Add default modules to craftLimits - count occurrences of each module type
+  // Add default modules to craftLimits - count occurrences of each module type (multiplied)
   const loadoutModuleCounts = new Map();
   for (const mod of loadout.defaultModules) {
     const item = catalog.items?.[mod];
@@ -7593,7 +7819,7 @@ function loadShipLoadout() {
   for (const [mod, count] of loadoutModuleCounts) {
     const item = catalog.items?.[mod];
     if (item) {
-      settings.crafter.craftLimits[mod] = count;
+      settings.crafter.craftLimits[mod] = count * clampedMultiplier;
       addedCount++;
     }
   }
@@ -7609,7 +7835,7 @@ function loadShipLoadout() {
   renderCrafterSettings(document.getElementById('settingsContent'));
 
   if (addedCount > 0) {
-    alert(`Loaded "${name}": Added ${addedCount} items to crafting list (${loadout.buildMaterials.length} materials, ${loadout.defaultModules.length} modules). Click "Save Settings" to persist.`);
+    alert(`Loaded "${name}" x${clampedMultiplier}: Added ${addedCount} items to crafting list (${loadout.buildMaterials.length} materials, ${loadout.defaultModules.length} modules). Click "Save Settings" to persist.`);
   } else {
     alert(`Loaded "${name}" but no items were added.`);
   }
@@ -7629,6 +7855,7 @@ async function deleteShipLoadout() {
   const success = deleteShipLoadoutFromStorage(name);
   if (success) {
     updateShipLoadoutSelect();
+    mcPopulateLoadoutSelect();
     alert(`Ship loadout "${name}" deleted.`);
   } else {
     alert('Failed to delete ship loadout.');

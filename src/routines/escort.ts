@@ -103,7 +103,7 @@ function getEscortSettings(username?: string): {
     autoCloak: (e.autoCloak as boolean) ?? false,
     ammoThreshold: (e.ammoThreshold as number) || 5,
     maxReloadAttempts: (e.maxReloadAttempts as number) || 3,
-    signalChannel: ((e.signalChannel as string) || "file") as "faction" | "local" | "file",
+    signalChannel: ((e.signalChannel as string) || "chat") as "faction" | "local" | "file" | "chat",
   };
 }
 
@@ -805,45 +805,28 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("escort", `✗ No faction chat signal found from ${minerName}`);
       }
     } else if (settings.signalChannel === "chat") {
-      // Check via bot chat system (non-API, instant communication)
-      ctx.log("escort", `Checking chat signal via sendBotChat for ${minerName}...`);
+      // Check via bot chat channel (non-API, instant communication)
+      ctx.log("escort", `Checking bot chat channel for signals from ${minerName}...`);
       const chatChannel = getBotChatChannel();
-      
-       // Register handler to catch escort signals from this miner
-       const handler = (msg: { channel: string; sender: string; content: string; } | { channel: string; sender: string; }) => {
-         // Type guard to ensure msg has content property
-         if ('content' in msg && msg.channel === "escort" && msg.sender === minerName && typeof msg.content === 'string') {
-           const match = msg.content.match(/\[ESCORT\]\s*(jump|travel|dock|undock)\s*(\S+)?/i);
-           if (match) {
-             return {
-               action: match[1].toLowerCase(),
-               systemId: match[2] || undefined
-             };
-           }
-         }
-         return null;
-       };
-      
-      chatChannel.onMessage(minerName, handler);
-      // Wait briefly for pending messages
-      await sleep(1000);
-      
-      // Check for recent escort messages
-      const recentMessages = chatChannel.getHistory("escort", 20);
-      const msg = recentMessages.find(m => m.sender === minerName);
+
+      // Check recent messages from the miner in the escort channel
+      const recentMessages = chatChannel.getHistory("escort", 50);
+      // Find the most recent message from the miner (iterate from end to get latest)
       let chatSignal = null;
-      
-      if (msg) {
-        const match = msg.content.match(/\[ESCORT\]\s*(jump|travel|dock|undock)\s*(\S+)?/i);
-        if (match) {
-          chatSignal = {
-            action: match[1].toLowerCase(),
-            systemId: match[2] || undefined
-          };
+      for (let i = recentMessages.length - 1; i >= 0; i--) {
+        const msg = recentMessages[i];
+        if (msg.sender === minerName) {
+          const match = msg.content.match(/\[ESCORT\]\s*(jump|travel|dock|undock)\s*(\S+)?/i);
+          if (match) {
+            chatSignal = {
+              action: match[1].toLowerCase(),
+              systemId: match[2] || undefined
+            };
+          }
+          break; // Use the most recent message
         }
       }
-      
-      chatChannel.offMessage(minerName, handler);
+
       escortSignal = chatSignal;
       
       if (escortSignal) {

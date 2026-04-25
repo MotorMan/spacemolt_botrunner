@@ -6,6 +6,14 @@ const PLAYER_NAMES_FILE = join(process.cwd(), "data", "playerNames.json");
 const FULL_PLAYER_INFO_FILE = join(process.cwd(), "data", "fullPlayerInfo.json");
 
 /**
+ * Ship history entry for tracking previously seen ships.
+ */
+export interface ShipHistoryEntry {
+  ship: string; // Ship name/type
+  lastSeen: string; // ISO timestamp when this ship was last seen
+}
+
+/**
  * Full detail information for a player/pirate/empire NPC.
  */
 export interface EntityDetail {
@@ -17,6 +25,7 @@ export interface EntityDetail {
   system: string; // Last known system
   poi: string; // Last known POI/location
   normalized: string; // Normalized name for lookup
+  shipHistory?: ShipHistoryEntry[]; // Previously seen ships (no duplicates)
 }
 
 /**
@@ -201,6 +210,32 @@ export class PlayerNameStore {
   }
 
   /**
+   * Update an entity's ship, tracking history without duplicates.
+   * Only adds to history if the ship actually changed and isn't already logged.
+   */
+  private updateShipWithHistory(entity: EntityDetail, newShip: string, timestamp: string): void {
+    if (!newShip || newShip === entity.ship) {
+      return; // No change or empty ship
+    }
+
+    // If entity has an existing ship, add it to history
+    if (entity.ship && entity.ship !== newShip) {
+      if (!entity.shipHistory) {
+        entity.shipHistory = [];
+      }
+
+      // Check if this ship is already in history
+      const alreadyLogged = entity.shipHistory.some(entry => entry.ship === entity.ship);
+      if (!alreadyLogged) {
+        entity.shipHistory.push({ ship: entity.ship, lastSeen: entity.lastSeen });
+      }
+    }
+
+    // Update to new ship
+    entity.ship = newShip;
+  }
+
+  /**
    * Add/update a player with full details.
    * Returns true if this is a new player (not previously seen).
    */
@@ -217,18 +252,29 @@ export class PlayerNameStore {
     }
 
     const isNew = !this.normalizedMap.has(normalized);
+    const now = new Date().toISOString();
 
-    // Always add/update full detail record
-    this.fullPlayerInfo.players[normalized] = {
-      name: name,
-      type: "player",
-      faction: faction,
-      ship: ship,
-      lastSeen: new Date().toISOString(),
-      system: system,
-      poi: poi,
-      normalized: normalized,
-    };
+    if (!isNew && this.fullPlayerInfo.players[normalized]) {
+      // Update existing player - track ship history
+      const entity = this.fullPlayerInfo.players[normalized];
+      this.updateShipWithHistory(entity, ship, entity.lastSeen);
+      entity.faction = faction || entity.faction;
+      entity.system = system || entity.system;
+      entity.poi = poi || entity.poi;
+      entity.lastSeen = now;
+    } else {
+      // New player
+      this.fullPlayerInfo.players[normalized] = {
+        name: name,
+        type: "player",
+        faction: faction,
+        ship: ship,
+        lastSeen: now,
+        system: system,
+        poi: poi,
+        normalized: normalized,
+      };
+    }
 
     // Check if we already have this name (case-insensitive, normalized)
     if (!isNew) {
@@ -263,18 +309,29 @@ export class PlayerNameStore {
     }
 
     const isNew = !this.pirateNormalizedMap.has(normalized);
+    const now = new Date().toISOString();
 
-    // Always add/update full detail record
-    this.fullPlayerInfo.pirates[normalized] = {
-      name: name,
-      type: "pirate",
-      faction: faction,
-      ship: ship,
-      lastSeen: new Date().toISOString(),
-      system: system,
-      poi: poi,
-      normalized: normalized,
-    };
+    if (!isNew && this.fullPlayerInfo.pirates[normalized]) {
+      // Update existing pirate - track ship history
+      const entity = this.fullPlayerInfo.pirates[normalized];
+      this.updateShipWithHistory(entity, ship, entity.lastSeen);
+      entity.faction = faction || entity.faction;
+      entity.system = system || entity.system;
+      entity.poi = poi || entity.poi;
+      entity.lastSeen = now;
+    } else {
+      // New pirate
+      this.fullPlayerInfo.pirates[normalized] = {
+        name: name,
+        type: "pirate",
+        faction: faction,
+        ship: ship,
+        lastSeen: now,
+        system: system,
+        poi: poi,
+        normalized: normalized,
+      };
+    }
 
     // Check if we already have this name (case-insensitive, normalized)
     if (!isNew) {
@@ -309,18 +366,29 @@ export class PlayerNameStore {
     }
 
     const isNew = !this.empireNpcNormalizedMap.has(normalized);
+    const now = new Date().toISOString();
 
-    // Always add/update full detail record
-    this.fullPlayerInfo.empire_npcs[normalized] = {
-      name: name,
-      type: "empire_npc",
-      faction: faction,
-      ship: ship,
-      lastSeen: new Date().toISOString(),
-      system: system,
-      poi: poi,
-      normalized: normalized,
-    };
+    if (!isNew && this.fullPlayerInfo.empire_npcs[normalized]) {
+      // Update existing empire NPC - track ship history
+      const entity = this.fullPlayerInfo.empire_npcs[normalized];
+      this.updateShipWithHistory(entity, ship, entity.lastSeen);
+      entity.faction = faction || entity.faction;
+      entity.system = system || entity.system;
+      entity.poi = poi || entity.poi;
+      entity.lastSeen = now;
+    } else {
+      // New empire NPC
+      this.fullPlayerInfo.empire_npcs[normalized] = {
+        name: name,
+        type: "empire_npc",
+        faction: faction,
+        ship: ship,
+        lastSeen: now,
+        system: system,
+        poi: poi,
+        normalized: normalized,
+      };
+    }
 
     // Check if we already have this name (case-insensitive, normalized)
     if (!isNew) {
@@ -497,7 +565,10 @@ export class PlayerNameStore {
       const entity = this.fullPlayerInfo[category][normalized];
       if (entity) {
         entity.faction = updates.faction || entity.faction;
-        entity.ship = updates.ship || entity.ship;
+        // Handle ship update with history tracking
+        if (updates.ship !== undefined && updates.ship !== entity.ship) {
+          this.updateShipWithHistory(entity, updates.ship, entity.lastSeen);
+        }
         entity.system = updates.system || entity.system;
         entity.poi = updates.poi || entity.poi;
         entity.lastSeen = now;

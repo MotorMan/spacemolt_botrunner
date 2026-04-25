@@ -30,9 +30,64 @@ import {
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
 } from "./common.js";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { join } from "path";
 
 /** Minimum fuel % before heading back to refuel. */
 const FUEL_SAFETY_PCT = 40;
+
+// ── Market Details Storage ──────────────────────────────────
+
+const DATA_DIR = join(process.cwd(), "data");
+const MARKET_DETAILS_FILE = join(DATA_DIR, "marketDetails.json");
+
+interface MarketOrderDetail {
+  price: number;
+  quantity: number;
+}
+
+interface MarketItemDetails {
+  systemId: string;
+  stationPoiId: string;
+  stationName: string;
+  itemId: string;
+  itemName: string;
+  buyOrders: MarketOrderDetail[];
+  sellOrders: MarketOrderDetail[];
+  lastUpdated: string;
+}
+
+interface MarketDetailsData {
+  lastSaved: string;
+  items: MarketItemDetails[];
+}
+
+function loadMarketDetails(): MarketDetailsData {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (existsSync(MARKET_DETAILS_FILE)) {
+    try {
+      const raw = readFileSync(MARKET_DETAILS_FILE, "utf-8");
+      return JSON.parse(raw) as MarketDetailsData;
+    } catch {
+      // Corrupt file — start fresh
+    }
+  }
+  return { lastSaved: now(), items: [] };
+}
+
+function saveMarketDetails(data: MarketDetailsData): void {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  data.lastSaved = now();
+  writeFileSync(MARKET_DETAILS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function now(): string {
+  return new Date().toISOString();
+}
 /** Default minimum fuel % required before attempting a system jump. */
 const DEFAULT_JUMP_FUEL_PCT = 50;
 
@@ -1196,8 +1251,62 @@ async function* scanStation(
       Array.isArray(result.items) ? result.items :
       Array.isArray(result.market) ? result.market :
       []
-    ) as unknown[];
+    ) as Array<Record<string, unknown>>;
     marketCount = items.length;
+
+    // Extract detailed order book data from view_market response and save to marketDetails.json
+    if (items.length > 0) {
+      const marketDetails = loadMarketDetails();
+      let detailsUpdated = false;
+
+      ctx.log("info", `Saving detailed market data for ${items.length} items...`);
+
+      for (const item of items) {
+        const itemId = (item.item_id as string) || (item.id as string) || "";
+        const itemName = (item.name as string) || (item.item_name as string) || itemId;
+
+        if (!itemId) continue;
+
+        const buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map(order => ({
+          price: (order.price_each as number) || (order.price as number) || 0,
+          quantity: (order.quantity as number) || 0,
+        })).filter(order => order.price > 0 && order.quantity > 0);
+
+        const sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map(order => ({
+          price: (order.price_each as number) || (order.price as number) || 0,
+          quantity: (order.quantity as number) || 0,
+        })).filter(order => order.price > 0 && order.quantity > 0);
+
+        // Update or add to market details
+        const existingIndex = marketDetails.items.findIndex(
+          m => m.systemId === systemId && m.stationPoiId === poi.id && m.itemId === itemId
+        );
+
+        const marketItemDetail: MarketItemDetails = {
+          systemId,
+          stationPoiId: poi.id,
+          stationName: poi.name,
+          itemId,
+          itemName,
+          buyOrders,
+          sellOrders,
+          lastUpdated: now(),
+        };
+
+        if (existingIndex >= 0) {
+          marketDetails.items[existingIndex] = marketItemDetail;
+        } else {
+          marketDetails.items.push(marketItemDetail);
+        }
+
+        detailsUpdated = true;
+      }
+
+      if (detailsUpdated) {
+        saveMarketDetails(marketDetails);
+        ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
+      }
+    }
   }
 
   const missionsResp = await bot.exec("get_missions");
@@ -1935,6 +2044,67 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
           if (marketResp.result && typeof marketResp.result === "object") {
             mapStore.updateMarket(target.systemId, target.stationPoi, marketResp.result as Record<string, unknown>);
+
+            // Extract detailed order book data from view_market response and save to marketDetails.json
+            const result = marketResp.result as Record<string, unknown>;
+            const items = (
+              Array.isArray(result) ? result :
+              Array.isArray(result.items) ? result.items :
+              Array.isArray(result.market) ? result.market :
+              []
+            ) as Array<Record<string, unknown>>;
+
+            if (items.length > 0) {
+              ctx.log("info", `Saving detailed market data for ${items.length} items...`);
+              const marketDetails = loadMarketDetails();
+              let detailsUpdated = false;
+
+              for (const item of items) {
+                const itemId = (item.item_id as string) || (item.id as string) || "";
+                const itemName = (item.name as string) || (item.item_name as string) || itemId;
+
+                if (!itemId) continue;
+
+                const buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map(order => ({
+                  price: (order.price_each as number) || (order.price as number) || 0,
+                  quantity: (order.quantity as number) || 0,
+                })).filter(order => order.price > 0 && order.quantity > 0);
+
+                const sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map(order => ({
+                  price: (order.price_each as number) || (order.price as number) || 0,
+                  quantity: (order.quantity as number) || 0,
+                })).filter(order => order.price > 0 && order.quantity > 0);
+
+                // Update or add to market details
+                const existingIndex = marketDetails.items.findIndex(
+                  m => m.systemId === target.systemId && m.stationPoiId === target.stationPoi && m.itemId === itemId
+                );
+
+                const marketItemDetail: MarketItemDetails = {
+                  systemId: target.systemId,
+                  stationPoiId: target.stationPoi,
+                  stationName: target.stationName,
+                  itemId,
+                  itemName,
+                  buyOrders,
+                  sellOrders,
+                  lastUpdated: now(),
+                };
+
+                if (existingIndex >= 0) {
+                  marketDetails.items[existingIndex] = marketItemDetail;
+                } else {
+                  marketDetails.items.push(marketItemDetail);
+                }
+
+                detailsUpdated = true;
+              }
+
+              if (detailsUpdated) {
+                saveMarketDetails(marketDetails);
+                ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
+              }
+            }
           }
 
           const missResp = await bot.exec("get_missions");

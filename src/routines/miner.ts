@@ -312,7 +312,7 @@ function getMinerSettings(username?: string): {
   stayOutUntilFull: boolean;
   maxJumps: number;
   escortName: string;
-  escortSignalChannel: "faction" | "local" | "file";
+   escortSignalChannel: "faction" | "local" | "file" | "chat";
   // Flock mining settings
   flockEnabled: boolean;
   flockName: string;
@@ -399,7 +399,7 @@ function getMinerSettings(username?: string): {
     escortName: (botOverrides.escortName as string) || (m.escortName as string) || "",
     escortSignalChannel:
       parseSignalChannel(botOverrides.escortSignalChannel) ??
-      parseSignalChannel(m.escortSignalChannel) ?? "faction",
+      parseSignalChannel(m.escortSignalChannel) ?? "chat",
     // Flock mining settings
     flockEnabled: (botOverrides.flockEnabled as boolean) ?? (m.flockEnabled as boolean) ?? false,
     flockName: (botOverrides.flockName as string) || (m.flockName as string) || "",

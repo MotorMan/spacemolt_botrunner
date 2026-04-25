@@ -1,0 +1,586 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Players - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background: var(--bg); color: var(--text); }
+    body { padding: 16px; display:flex; flex-direction:column; overflow:hidden; }
+    .players-layout { flex:1; min-height:0; display:flex; flex-direction:column; }
+    .players-header { display:flex; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+    .players-header h3 { margin:0; color:var(--text-bright); }
+    .players-stats { color:var(--text-dim); font-size:12px; }
+    .view-tabs { display:flex; gap:0; border-bottom:1px solid var(--border); margin-bottom:12px; flex-wrap:wrap; }
+    .view-tab { padding:8px 16px; cursor:pointer; border-bottom:2px solid transparent; color:var(--text-dim); font-size:13px; }
+    .view-tab:hover { color:var(--text); }
+    .view-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+    .view-content { flex:1; min-height:0; overflow:auto; }
+    .players-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .players-table th { text-align:left; padding:8px 12px; background:var(--card-bg); border-bottom:1px solid var(--border); color:var(--text-dim); font-weight:600; white-space:nowrap; }
+    .players-table td { padding:6px 12px; border-bottom:1px solid var(--border); white-space:nowrap; }
+    .players-table tr:hover { background:var(--hover); }
+    .faction-badge { display:inline-block; padding:2px 8px; border-radius:3px; font-size:11px; font-weight:600; }
+    .faction-BUSY { background:#e3f2fd; color:#1565c0; }
+    .faction-HEXC { background:#fff3e0; color:#e65100; }
+    .faction-ENDL { background:#e8f5e9; color:#2e7d32; }
+    .faction-CAST { background:#f3e5f5; color:#7b1fa2; }
+    .faction-CULT { background:#fce4ec; color:#c62828; }
+    .faction-ORLV { background:#e0f2f1; color:#00695c; }
+    .faction-ORBK { background:#fff8e1; color:#f57f17; }
+    .faction-STRG { background:#f1f8e9; color:#558b2f; }
+    .faction-VIPR { background:#fce4ec; color:#ad1457; }
+    .faction-BEAT { background:#e8eaf6; color:#283593; }
+    .faction-ALPH { background:#e0f7fa; color:#006064; }
+    .faction-NIFG { background:#fbe9e7; color:#bf360c; }
+    .faction-NCOL { background:#f3e5f5; color:#4a148c; }
+    .ship-badge { display:inline-block; padding:2px 6px; background:var(--card-bg); border:1px solid var(--border); border-radius:3px; font-size:11px; }
+    .time-ago { color:var(--text-dim); font-size:11px; }
+    .stat-card { background:var(--card-bg); border:1px solid var(--border); border-radius:6px; padding:12px; display:inline-block; margin:4px; min-width:120px; }
+    .stat-card-label { font-size:11px; color:var(--text-dim); }
+    .stat-card-value { font-size:20px; font-weight:700; color:var(--text-bright); }
+    .chart-bar { display:flex; align-items:center; gap:8px; margin:4px 0; }
+    .chart-bar-label { min-width:150px; font-size:12px; }
+    .chart-bar-track { flex:1; height:20px; background:var(--card-bg); border-radius:3px; overflow:hidden; border:1px solid var(--border); }
+    .chart-bar-fill { height:100%; background:var(--accent); transition:width 0.3s; }
+    .chart-bar-value { font-size:12px; min-width:40px; text-align:right; }
+    .grid-view { display:grid; grid-template-columns:repeat(auto-fill, minmax(280px, 1fr)); gap:12px; }
+    .player-card { background:var(--card-bg); border:1px solid var(--border); border-radius:6px; padding:12px; }
+    .player-card-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:8px; }
+    .player-card-name { font-weight:600; color:var(--text-bright); }
+    .player-card-info { font-size:12px; color:var(--text-dim); line-height:1.6; }
+    .system-cloud { display:flex; flex-wrap:wrap; gap:8px; }
+    .system-tag { padding:4px 10px; background:var(--card-bg); border:1px solid var(--border); border-radius:4px; font-size:12px; cursor:pointer; }
+    .system-tag:hover { border-color:var(--accent); }
+    .system-tag-count { background:var(--accent); color:#fff; padding:1px 6px; border-radius:3px; margin-left:4px; font-size:10px; }
+    .timeline { position:relative; padding-left:20px; }
+    .timeline::before { content:''; position:absolute; left:8px; top:0; bottom:0; width:2px; background:var(--border); }
+    .timeline-item { position:relative; padding:8px 0; }
+    .timeline-item::before { content:''; position:absolute; left:-16px; top:12px; width:8px; height:8px; border-radius:50%; background:var(--accent); }
+    .matrix-table { width:100%; border-collapse:collapse; font-size:11px; }
+    .matrix-table th { padding:4px 8px; background:var(--card-bg); border:1px solid var(--border); }
+    .matrix-table td { padding:4px 8px; text-align:center; border:1px solid var(--border); }
+    .matrix-cell-high { background:#c8e6c9; }
+    .matrix-cell-medium { background:#fff9c4; }
+    .matrix-cell-low { background:#ffcdd2; }
+    .search-input { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; flex:1; max-width:300px; }
+    .filter-select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .empty-state { text-align:center; padding:40px; color:var(--text-dim); }
+  </style>
+</head>
+<body>
+  <div class="players-layout">
+    <div class="players-header">
+      <h3>Players</h3>
+      <span class="players-stats" id="playersStats"></span>
+      <input type="text" class="search-input" id="playerSearch" placeholder="Search players, factions, ships..." oninput="filterPlayers()">
+      <select class="filter-select" id="factionFilter" onchange="filterPlayers()">
+        <option value="">All Factions</option>
+      </select>
+      <select class="filter-select" id="typeFilter" onchange="filterPlayers()">
+        <option value="">All Types</option>
+        <option value="player">Players</option>
+        <option value="npc_pirate">Pirates</option>
+        <option value="npc_empire">Empire NPCs</option>
+      </select>
+    </div>
+
+    <div class="view-tabs">
+      <div class="view-tab active" onclick="switchView('table')">Table View</div>
+      <div class="view-tab" onclick="switchView('cards')">Card Grid</div>
+      <div class="view-tab" onclick="switchView('faction')">By Faction</div>
+      <div class="view-tab" onclick="switchView('ships')">Ship Popularity</div>
+      <div class="view-tab" onclick="switchView('systems')">By System</div>
+      <div class="view-tab" onclick="switchView('timeline')">Last Seen</div>
+      <div class="view-tab" onclick="switchView('matrix')">Faction x Ship Matrix</div>
+      <div class="view-tab" onclick="switchView('activity')">Activity Score</div>
+      <div class="view-tab" onclick="switchView('scatter')">Scatter Plot</div>
+    </div>
+
+    <div class="view-content" id="viewContent">
+      <div class="empty-state">Loading player data...</div>
+    </div>
+  </div>
+
+  <script>
+    let playerData = { players: {} };
+    let ws = null;
+    let currentView = 'table';
+    let filteredPlayers = [];
+
+    // ── WebSocket Connection ──────────────────────────────
+    function connect() {
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      ws = new WebSocket(`${proto}//${location.host}/ws`);
+      
+      ws.onopen = () => {
+        loadPlayerData();
+      };
+      
+      ws.onclose = () => {
+        setTimeout(connect, 2000);
+      };
+      
+      ws.onmessage = (ev) => {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch { return; }
+        if (msg.type === 'init') {
+          loadPlayerData();
+        }
+      };
+    }
+
+    // ── Load Player Data ──────────────────────────────────
+    async function loadPlayerData() {
+      try {
+        const res = await fetch('/api/players');
+        playerData = await res.json();
+        updateStats();
+        populateFilters();
+        renderView();
+      } catch (e) {
+        console.error('Failed to load player data:', e);
+      }
+    }
+
+    // ── Update Stats Bar ─────────────────────────────────
+    function updateStats() {
+      const players = Object.values(playerData.players || {});
+      const total = players.length;
+      const factions = new Set(players.map(p => p.faction).filter(f => f));
+      const ships = new Set(players.map(p => p.ship).filter(s => s));
+      const systems = new Set(players.map(p => p.system).filter(s => s));
+      
+      document.getElementById('playersStats').textContent = 
+        `${total} players | ${factions.size} factions | ${ships.size} ship types | ${systems.size} systems`;
+    }
+
+    // ── Populate Filters ─────────────────────────────────
+    function populateFilters() {
+      const players = Object.values(playerData.players || {});
+      const factions = new Set(players.map(p => p.faction).filter(f => f));
+      const factionSelect = document.getElementById('factionFilter');
+      
+      // Keep "All Factions" option
+      factionSelect.innerHTML = '<option value="">All Factions</option>' +
+        [...factions].sort().map(f => `<option value="${f}">${f} (${players.filter(p => p.faction === f).length})</option>`).join('');
+    }
+
+    // ── Filter Players ────────────────────────────────────
+    function filterPlayers() {
+      const search = (document.getElementById('playerSearch').value || '').toLowerCase();
+      const faction = document.getElementById('factionFilter').value;
+      const type = document.getElementById('typeFilter').value;
+      
+      const players = Object.entries(playerData.players || {});
+      
+      filteredPlayers = players.filter(([key, p]) => {
+        if (type && p.type !== type) return false;
+        if (faction && p.faction !== faction) return false;
+        if (search) {
+          const searchLower = search.toLowerCase();
+          return (p.name || '').toLowerCase().includes(searchLower) ||
+                 (p.faction || '').toLowerCase().includes(searchLower) ||
+                 (p.ship || '').toLowerCase().includes(searchLower) ||
+                 (p.system || '').toLowerCase().includes(searchLower);
+        }
+        return true;
+      });
+      
+      renderView();
+    }
+
+    // ── Switch View ───────────────────────────────────────
+    function switchView(view) {
+      currentView = view;
+      document.querySelectorAll('.view-tab').forEach(t => t.classList.remove('active'));
+      document.querySelector(`.view-tab[onclick*="${view}"]`)?.classList.add('active');
+      renderView();
+    }
+
+    // ── Render Current View ──────────────────────────────
+    function renderView() {
+      const content = document.getElementById('viewContent');
+      if (filteredPlayers.length === 0 && currentView !== 'matrix') {
+        filterPlayers();
+        if (filteredPlayers.length === 0) {
+          content.innerHTML = '<div class="empty-state">No players match your filters</div>';
+          return;
+        }
+      }
+      
+      switch(currentView) {
+        case 'table': renderTableView(); break;
+        case 'cards': renderCardView(); break;
+        case 'faction': renderFactionView(); break;
+        case 'ships': renderShipView(); break;
+        case 'systems': renderSystemView(); break;
+        case 'timeline': renderTimelineView(); break;
+        case 'matrix': renderMatrixView(); break;
+        case 'activity': renderActivityView(); break;
+        case 'scatter': renderScatterView(); break;
+      }
+    }
+
+    // ── Table View ───────────────────────────────────────
+    function renderTableView() {
+      const content = document.getElementById('viewContent');
+      const rows = filteredPlayers.map(([key, p]) => {
+        const lastSeen = new Date(p.lastSeen);
+        const timeAgo = getTimeAgo(lastSeen);
+        const factionClass = (p.faction || 'none').replace(/\s/g, '');
+        
+        return `<tr>
+          <td><strong>${esc(p.name || key)}</strong></td>
+          <td><span class="faction-badge faction-${factionClass}">${esc(p.faction || 'None')}</span></td>
+          <td><span class="ship-badge">${esc(p.ship || 'Unknown')}</span></td>
+          <td>${esc(p.type || 'player')}</td>
+          <td>${esc(p.system || '-')}</td>
+          <td>${esc(p.poi || '-')}</td>
+          <td><span class="time-ago" title="${lastSeen.toLocaleString()}">${timeAgo}</span></td>
+        </tr>`;
+      }).join('');
+      
+      content.innerHTML = `<table class="players-table">
+        <thead><tr>
+          <th>Name</th><th>Faction</th><th>Ship</th><th>Type</th><th>System</th><th>POI</th><th>Last Seen</th>
+        </tr></thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    }
+
+    // ── Card Grid View ──────────────────────────────────
+    function renderCardView() {
+      const content = document.getElementById('viewContent');
+      const cards = filteredPlayers.map(([key, p]) => {
+        const lastSeen = new Date(p.lastSeen);
+        const timeAgo = getTimeAgo(lastSeen);
+        const factionClass = (p.faction || 'none').replace(/\s/g, '');
+        
+        return `<div class="player-card">
+          <div class="player-card-header">
+            <span class="player-card-name">${esc(p.name || key)}</span>
+            <span class="faction-badge faction-${factionClass}">${esc(p.faction || 'None')}</span>
+          </div>
+          <div class="player-card-info">
+            <div>🚀 ${esc(p.ship || 'Unknown')}</div>
+            <div>📍 ${esc(p.system || '-')} / ${esc(p.poi || '-')}</div>
+            <div>🕒 ${timeAgo}</div>
+            <div>🏷️ ${esc(p.type || 'player')}</div>
+          </div>
+        </div>`;
+      }).join('');
+      
+      content.innerHTML = `<div class="grid-view">${cards}</div>`;
+    }
+
+    // ── Faction View ─────────────────────────────────────
+    function renderFactionView() {
+      const content = document.getElementById('viewContent');
+      const players = filteredPlayers.map(([k, p]) => p);
+      const factions = {};
+      
+      players.forEach(p => {
+        const f = p.faction || 'No Faction';
+        if (!factions[f]) factions[f] = [];
+        factions[f].push(p);
+      });
+      
+      const html = Object.entries(factions)
+        .sort((a, b) => b[1].length - a[1].length)
+        .map(([faction, members]) => {
+          const factionClass = faction.replace(/\s/g, '');
+          const ships = {};
+          members.forEach(m => { ships[m.ship] = (ships[m.ship] || 0) + 1; });
+          
+          return `<div style="margin-bottom:20px">
+            <h4><span class="faction-badge faction-${factionClass}">${esc(faction)}</span> (${members.length} members)</h4>
+            <div style="margin:8px 0;font-size:12px;color:var(--text-dim)">
+              Ships: ${Object.entries(ships).map(([s, c]) => `${s} (${c})`).join(', ')}
+            </div>
+            <table class="players-table">
+              <thead><tr><th>Name</th><th>Ship</th><th>System</th><th>Last Seen</th></tr></thead>
+              <tbody>${members.map(m => `<tr>
+                <td>${esc(m.name)}</td>
+                <td><span class="ship-badge">${esc(m.ship)}</span></td>
+                <td>${esc(m.system || '-')}</td>
+                <td><span class="time-ago">${getTimeAgo(new Date(m.lastSeen))}</span></td>
+              </tr>`).join('')}</tbody>
+            </table>
+          </div>`;
+        }).join('');
+      
+      content.innerHTML = html || '<div class="empty-state">No faction data</div>';
+    }
+
+    // ── Ship Popularity View ────────────────────────────
+    function renderShipView() {
+      const content = document.getElementById('viewContent');
+      const players = filteredPlayers.map(([k, p]) => p);
+      const ships = {};
+      
+      players.forEach(p => {
+        const ship = p.ship || 'Unknown';
+        if (!ships[ship]) ships[ship] = { count: 0, players: [], factions: new Set() };
+        ships[ship].count++;
+        ships[ship].players.push(p.name);
+        if (p.faction) ships[ship].factions.add(p.faction);
+      });
+      
+      const maxCount = Math.max(...Object.values(ships).map(s => s.count));
+      
+      const html = Object.entries(ships)
+        .sort((a, b) => b[1].count - a[1].count)
+        .map(([ship, data]) => {
+          const pct = (data.count / maxCount) * 100;
+          return `<div class="chart-bar">
+            <div class="chart-bar-label">${esc(ship)}</div>
+            <div class="chart-bar-track">
+              <div class="chart-bar-fill" style="width:${pct}%"></div>
+            </div>
+            <div class="chart-bar-value">${data.count}</div>
+            <div style="font-size:11px;color:var(--text-dim);min-width:100px">
+              ${[...data.factions].slice(0, 3).join(', ')}${data.factions.size > 3 ? '...' : ''}
+            </div>
+          </div>`;
+        }).join('');
+      
+      content.innerHTML = `<h4>Ship Popularity (Most Popular to Rarest)</h4>
+        <div style="margin-top:12px">${html}</div>`;
+    }
+
+    // ── System View ──────────────────────────────────────
+    function renderSystemView() {
+      const content = document.getElementById('viewContent');
+      const players = filteredPlayers.map(([k, p]) => p);
+      const systems = {};
+      
+      players.forEach(p => {
+        const sys = p.system || 'Unknown';
+        if (!systems[sys]) systems[sys] = { count: 0, players: [], ships: new Set() };
+        systems[sys].count++;
+        systems[sys].players.push(p);
+        if (p.ship) systems[sys].ships.add(p.ship);
+      });
+      
+      const html = Object.entries(systems)
+        .sort((a, b) => b[1].count - a[1].count)
+        .map(([system, data]) => {
+          return `<div class="system-tag" onclick="filterBySystem('${esc(system)}')">
+            ${esc(system)} <span class="system-tag-count">${data.count}</span>
+            <div style="font-size:10px;color:var(--text-dim)">${[...data.ships].slice(0, 3).join(', ')}</div>
+          </div>`;
+        }).join('');
+      
+      content.innerHTML = `<h4>Players by System (click to filter)</h4>
+        <div class="system-cloud" style="margin-top:12px">${html}</div>
+        <div style="margin-top:16px">
+          <table class="players-table">
+            <thead><tr><th>System</th><th>Count</th><th>Ship Types</th><th>Players</th></tr></thead>
+            <tbody>${Object.entries(systems).sort((a, b) => b[1].count - a[1].count).map(([sys, data]) => `<tr>
+              <td><strong>${esc(sys)}</strong></td>
+              <td>${data.count}</td>
+              <td>${[...data.ships].join(', ')}</td>
+              <td>${data.players.map(p => p.name).join(', ')}</td>
+            </tr>`).join('')}</tbody>
+          </table>
+        </div>`;
+    }
+
+    // ── Timeline View ───────────────────────────────────
+    function renderTimelineView() {
+      const content = document.getElementById('viewContent');
+      const players = filteredPlayers.map(([k, p]) => p)
+        .sort((a, b) => new Date(b.lastSeen) - new Date(a.lastSeen));
+      
+      const now = new Date();
+      const html = players.map(p => {
+        const lastSeen = new Date(p.lastSeen);
+        const minsAgo = Math.floor((now - lastSeen) / 60000);
+        let statusColor = '#4caf50';
+        if (minsAgo > 60) statusColor = '#ff9800';
+        if (minsAgo > 1440) statusColor = '#f44336';
+        
+        return `<div class="timeline-item">
+          <div style="display:flex;justify-content:space-between;align-items:center">
+            <div>
+              <strong>${esc(p.name)}</strong>
+              <span class="ship-badge" style="margin-left:8px">${esc(p.ship)}</span>
+              <span class="faction-badge faction-${(p.faction || 'none').replace(/\s/g, '')}" style="margin-left:8px">${esc(p.faction || 'None')}</span>
+            </div>
+            <div style="text-align:right">
+              <div style="font-size:12px">${p.system} / ${p.poi}</div>
+              <div class="time-ago">${getTimeAgo(lastSeen)}</div>
+            </div>
+          </div>
+        </div>`;
+      }).join('');
+      
+      content.innerHTML = `<h4>Last Seen Timeline (Most Recent First)</h4>
+        <div class="timeline" style="margin-top:16px">${html}</div>`;
+    }
+
+    // ── Faction x Ship Matrix ───────────────────────────
+    function renderMatrixView() {
+      const content = document.getElementById('viewContent');
+      const allPlayers = Object.values(playerData.players || {});
+      const factions = [...new Set(allPlayers.map(p => p.faction || 'None').filter(f => f))].sort();
+      const ships = [...new Set(allPlayers.map(p => p.ship || 'Unknown'))].sort();
+      
+      // Build matrix
+      const matrix = {};
+      factions.forEach(f => { matrix[f] = {}; ships.forEach(s => { matrix[f][s] = 0; }); });
+      allPlayers.forEach(p => {
+        const f = p.faction || 'None';
+        const s = p.ship || 'Unknown';
+        if (matrix[f]) matrix[f][s] = (matrix[f][s] || 0) + 1;
+      });
+      
+      const maxVal = Math.max(...allPlayers.map(p => 1));
+      
+      let html = `<h4>Faction vs Ship Matrix</h4>
+        <table class="matrix-table" style="margin-top:12px">
+          <thead><tr><th>Faction</th>${ships.map(s => `<th>${esc(s)}</th>`).join('')}</tr></thead>
+          <tbody>${factions.map(f => `<tr>
+            <td><strong>${esc(f)}</strong></td>
+            ${ships.map(s => {
+              const val = matrix[f][s] || 0;
+              const cellClass = val === 0 ? '' : val > 2 ? 'matrix-cell-high' : val > 1 ? 'matrix-cell-medium' : 'matrix-cell-low';
+              return `<td class="${cellClass}">${val || '-'}</td>`;
+            }).join('')}
+          </tr>`).join('')}</tbody>
+        </table>`;
+      
+      content.innerHTML = html;
+    }
+
+    // ── Activity Score View ─────────────────────────────
+    function renderActivityView() {
+      const content = document.getElementById('viewContent');
+      const now = new Date();
+      const players = filteredPlayers.map(([k, p]) => {
+        const lastSeen = new Date(p.lastSeen);
+        const minsAgo = Math.floor((now - lastSeen) / 60000);
+        let score = 0;
+        if (minsAgo < 5) score = 100;
+        else if (minsAgo < 30) score = 80;
+        else if (minsAgo < 60) score = 60;
+        else if (minsAgo < 1440) score = 30;
+        else score = 10;
+        
+        return { ...p, score, minsAgo };
+      }).sort((a, b) => b.score - a.score);
+      
+      const html = players.map(p => {
+        const barColor = p.score > 80 ? '#4caf50' : p.score > 50 ? '#ff9800' : '#f44336';
+        return `<div class="chart-bar">
+          <div class="chart-bar-label" style="min-width:200px">
+            <strong>${esc(p.name)}</strong>
+            <span class="ship-badge" style="margin-left:4px">${esc(p.ship)}</span>
+          </div>
+          <div class="chart-bar-track">
+            <div class="chart-bar-fill" style="width:${p.score}%;background:${barColor}"></div>
+          </div>
+          <div class="chart-bar-value">${p.score}</div>
+          <div style="font-size:11px;color:var(--text-dim);min-width:80px">${p.minsAgo < 60 ? p.minsAgo + 'm ago' : Math.floor(p.minsAgo / 60) + 'h ago'}</div>
+        </div>`;
+      }).join('');
+      
+      content.innerHTML = `<h4>Activity Score (100 = Very Active, 0 = Inactive)</h4>
+        <div style="margin-top:12px">${html}</div>`;
+    }
+
+    // ── Scatter Plot View ───────────────────────────────
+    function renderScatterView() {
+      const content = document.getElementById('viewContent');
+      const players = filteredPlayers.map(([k, p]) => p);
+      
+      // Group by faction and count
+      const factions = {};
+      players.forEach(p => {
+        const f = p.faction || 'None';
+        if (!factions[f]) factions[f] = { count: 0, ships: new Set(), systems: new Set() };
+        factions[f].count++;
+        if (p.ship) factions[f].ships.add(p.ship);
+        if (p.system) factions[f].systems.add(p.system);
+      });
+      
+      // Create scatter data: x = ship variety, y = system variety, size = player count
+      const scatterData = Object.entries(factions).map(([faction, data]) => ({
+        faction,
+        x: data.ships.size,
+        y: data.systems.size,
+        size: data.count,
+        ships: [...data.ships],
+        systems: [...data.systems]
+      }));
+      
+      const maxSize = Math.max(...scatterData.map(d => d.size));
+      const maxX = Math.max(...scatterData.map(d => d.x));
+      const maxY = Math.max(...scatterData.map(d => d.y));
+      
+      const plotWidth = 600;
+      const plotHeight = 400;
+      
+      const dots = scatterData.map(d => {
+        const xPos = (d.x / maxX) * plotWidth;
+        const yPos = plotHeight - (d.y / maxY) * plotHeight;
+        const radius = 10 + (d.size / maxSize) * 40;
+        const factionClass = d.faction.replace(/\s/g, '');
+        return `<g>
+          <circle cx="${xPos}" cy="${yPos}" r="${radius}" fill="var(--accent)" opacity="0.6" />
+          <text x="${xPos}" y="${yPos - radius - 5}" text-anchor="middle" font-size="11" fill="var(--text)">${esc(d.faction)} (${d.size})</text>
+          <title>${esc(d.faction)}\nShips: ${d.ships.join(', ')}\nSystems: ${d.systems.length}</title>
+        </g>`;
+      }).join('');
+      
+      content.innerHTML = `<h4>Faction Analysis: Ship Variety vs System Coverage</h4>
+        <div style="margin-top:12px;text-align:center">
+          <svg width="${plotWidth}" height="${plotHeight}" style="background:var(--card-bg);border:1px solid var(--border);border-radius:6px">
+            <!-- Grid lines -->
+            ${[0,1,2,3,4].map(i => `<line x1="0" y1="${plotHeight * i / 4}" x2="${plotWidth}" y2="${plotHeight * i / 4}" stroke="var(--border)" stroke-dasharray="4" />`).join('')}
+            ${[0,1,2,3,4].map(i => `<line x1="${plotWidth * i / 4}" y1="0" x2="${plotWidth * i / 4}" y2="${plotHeight}" stroke="var(--border)" stroke-dasharray="4" />`).join('')}
+            <!-- Dots -->
+            ${dots}
+            <!-- Labels -->
+            <text x="${plotWidth / 2}" y="${plotHeight + 30}" text-anchor="middle" font-size="12" fill="var(--text-dim)">Ship Variety (Unique Ships)</text>
+            <text x="-${plotHeight / 2}" y="15" text-anchor="middle" font-size="12" fill="var(--text-dim)" transform="rotate(-90)">System Coverage</text>
+          </svg>
+        </div>
+        <div style="margin-top:16px;font-size:12px;color:var(--text-dim)">
+          Bubble size = number of players in faction. Hover for details.
+        </div>`;
+    }
+
+    // ── Helper Functions ─────────────────────────────────
+    function filterBySystem(system) {
+      document.getElementById('playerSearch').value = system;
+      filterPlayers();
+    }
+
+    function getTimeAgo(date) {
+      const now = new Date();
+      const diffMs = now - date;
+      const diffMins = Math.floor(diffMs / 60000);
+      const diffHours = Math.floor(diffMins / 60);
+      const diffDays = Math.floor(diffHours / 24);
+      
+      if (diffMins < 1) return 'Just now';
+      if (diffMins < 60) return `${diffMins}m ago`;
+      if (diffHours < 24) return `${diffHours}h ${diffMins % 60}m ago`;
+      return `${diffDays}d ago`;
+    }
+
+    function esc(s) {
+      if (!s) return '';
+      const d = document.createElement('div');
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    // ── Initialize ──────────────────────────────────────
+    connect();
+  </script>
+</body>
+</html>

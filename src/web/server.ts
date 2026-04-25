@@ -776,10 +776,37 @@ export class WebServer {
           });
         }
 
+        // API endpoint for player data
+        if (url.pathname === "/api/players" && req.method === "GET") {
+          const playersPath = join(DATA_DIR, "fullPlayerInfo.json");
+          if (!existsSync(playersPath)) {
+            return Response.json({ players: {}, total: 0 });
+          }
+          try {
+            const raw = readFileSync(playersPath, "utf-8");
+            const data = JSON.parse(raw);
+            const playerCount = Object.keys(data.players || {}).length;
+            return Response.json({ ...data, total: playerCount });
+          } catch {
+            return Response.json({ players: {}, total: 0 });
+          }
+        }
+
         // Serve settings.html for settings route
         if (url.pathname === "/settings.html") {
           const settingsPath = join(import.meta.dir, "settings.html");
           return new Response(readFileSync(settingsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve players.html for players route
+        if (url.pathname === "/players.html") {
+          const playersPath = join(import.meta.dir, "players.html");
+          return new Response(readFileSync(playersPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",

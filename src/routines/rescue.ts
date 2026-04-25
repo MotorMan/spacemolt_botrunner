@@ -1,5 +1,7 @@
 import type { Routine, RoutineContext, BotStatus } from "../bot.js";
 import type { BotChatMessage } from "../bot_chat_channel.js";
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   findStation,
   getSystemInfo,
@@ -1030,6 +1032,50 @@ async function ensurePremiumFuelReserve(ctx: RoutineContext, reserveCount: numbe
 }
 
 /**
+ * Retrieve actual credits of a bot by parsing its debug log.
+ * Reads last 20 lines, finds most recent get_status response, extracts credits.
+ */
+async function getActualCreditsFromLog(botUsername: string, ctx: RoutineContext): Promise<number | null> {
+  const logDir = './data/logs';
+  const logFileName = `${botUsername}_debug.log`;
+  const logPath = path.resolve(logDir, logFileName);
+
+  try {
+    if (!fs.existsSync(logPath)) {
+      ctx.log("rescue", `💰 Log file not found for ${botUsername}: ${logPath}`);
+      return null;
+    }
+
+    const content = fs.readFileSync(logPath, 'utf-8');
+    const lines = content.split('\n').filter(l => l.trim());
+    const last20 = lines.slice(-20);
+
+    // Find most recent get_status response line
+    let statusLine: string | null = null;
+    for (let i = last20.length - 1; i >= 0; i--) {
+      if (last20[i].includes('get_status response') && last20[i].includes(botUsername)) {
+        statusLine = last20[i];
+        break;
+      }
+    }
+
+    if (!statusLine) {
+      ctx.log("rescue", `💰 No get_status response found in last 20 lines of ${botUsername}'s log`);
+      return null;
+    }
+
+    const jsonStart = statusLine.indexOf('{');
+    if (jsonStart === -1) return null;
+
+    const data = JSON.parse(statusLine.substring(jsonStart)) as { player?: { credits?: number } };
+    return data.player?.credits ?? null;
+  } catch (e) {
+    ctx.log("rescue", `💰 Error reading log for ${botUsername}: ${e}`);
+    return null;
+  }
+}
+
+/**
  * Credit top-off function — redistributes credits from faction treasury
  * to ONE bot that is running low, including self.
  * This is designed to be called repeatedly in a background loop,
@@ -1058,46 +1104,130 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
   for (const member of fleet) {
     if (member.username === bot.username) continue;
     if (member.state !== "running" && member.state !== "idle") continue;
-    // Only top off if bot has less than minThreshold credits
-    if (member.credits >= minThreshold) continue;
-    if (member.credits >= targetAmount) continue;
 
-    const needed = targetAmount - member.credits;
-    ctx.log("rescue", `💰 ${member.username} has ${member.credits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+    const currentCredits = member.credits;
 
-    // Withdraw from faction treasury
-    ctx.log("rescue", `💰 Withdrawing ${needed}cr from faction treasury for ${member.username}...`);
+    // Track consecutive 0 credit readings
+    if (currentCredits === 0) {
+      const count = (consecutiveZeroCredits.get(member.username) || 0) + 1;
+      consecutiveZeroCredits.set(member.username, count);
+      ctx.log("rescue", `💰 ${member.username} has 0 credits (consecutive count: ${count})`);
+    } else {
+      if (consecutiveZeroCredits.has(member.username)) {
+        ctx.log("rescue", `💰 ${member.username} credits recovered to ${currentCredits}, reset consecutive 0 count`);
+        consecutiveZeroCredits.delete(member.username);
+      }
+      // Handle non-0 low credits as before
+      if (currentCredits >= minThreshold || currentCredits >= targetAmount) continue;
+      const needed = targetAmount - currentCredits;
+      ctx.log("rescue", `💰 ${member.username} has ${currentCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
+      const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+      if (withdrawResp.error) {
+        ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
+        return false;
+      }
+
+      ctx.log("rescue", `💰 Successfully withdrew ${needed}cr, sending to ${member.username}...`);
+      const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
+      if (giftResp.error) {
+        ctx.log("rescue", `💰 Gift to ${member.username} failed: ${giftResp.error.message}`);
+        await bot.exec("faction_deposit_credits", { amount: needed });
+        return false;
+      } else {
+        ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
+        return true;
+      }
+    }
+
+    // Only proceed with 0-credit bots after 5 consecutive readings
+    const consecutiveCount = consecutiveZeroCredits.get(member.username) || 0;
+    if (consecutiveCount < 5) {
+      ctx.log("rescue", `💰 ${member.username} has 0 credits but only ${consecutiveCount} consecutive readings, need 5 to verify`);
+      continue;
+    }
+
+    // Verify actual credits via debug log
+    ctx.log("rescue", `💰 ${member.username} has 5 consecutive 0 credit readings, verifying via debug log...`);
+    const actualCredits = await getActualCreditsFromLog(member.username, ctx);
+    if (actualCredits === null) {
+      ctx.log("rescue", `💰 Failed to verify credits for ${member.username} from log, skipping`);
+      continue;
+    }
+
+    if (actualCredits >= minThreshold) {
+      ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr (>= ${minThreshold}), false 0 reading. Resetting count.`);
+      consecutiveZeroCredits.delete(member.username);
+      continue;
+    }
+
+    // Proceed with top-off using verified credits
+    const needed = targetAmount - actualCredits;
+    ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
     const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
     if (withdrawResp.error) {
       ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
-      return false; // treasury likely empty, stop trying
+      return false;
     }
 
     ctx.log("rescue", `💰 Successfully withdrew ${needed}cr, sending to ${member.username}...`);
-    // Send credits to the bot
     const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
     if (giftResp.error) {
       ctx.log("rescue", `💰 Gift to ${member.username} failed: ${giftResp.error.message}`);
-      // Re-deposit withdrawn credits back
       await bot.exec("faction_deposit_credits", { amount: needed });
       return false;
     } else {
       ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
-      return true; // Successfully topped off one bot
+      consecutiveZeroCredits.delete(member.username);
+      return true;
     }
   }
 
   // Top off self if needed
   ctx.log("rescue", `💰 No other bots need topping off, checking self...`);
   await bot.refreshStatus();
+
+  // Track consecutive 0 credits for self
+  if (bot.credits === 0) {
+    const count = (consecutiveZeroCredits.get(bot.username) || 0) + 1;
+    consecutiveZeroCredits.set(bot.username, count);
+    ctx.log("rescue", `💰 Self has 0 credits (consecutive count: ${count})`);
+  } else {
+    if (consecutiveZeroCredits.has(bot.username)) {
+      ctx.log("rescue", `💰 Self credits recovered to ${bot.credits}, reset consecutive 0 count`);
+      consecutiveZeroCredits.delete(bot.username);
+    }
+  }
+
   if (bot.credits < minThreshold) {
     if (bot.credits >= targetAmount) {
       ctx.log("rescue", `💰 Self credits OK (${bot.credits}cr >= ${targetAmount}cr), no action needed`);
       return false;
     }
-    
-    const needed = targetAmount - bot.credits;
-    ctx.log("rescue", `💰 Self has ${bot.credits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
+    // Apply same 5-consecutive-0 check for self
+    const selfConsecutive = consecutiveZeroCredits.get(bot.username) || 0;
+    if (bot.credits === 0 && selfConsecutive < 5) {
+      ctx.log("rescue", `💰 Self has 0 credits but only ${selfConsecutive} consecutive readings, need 5 to verify`);
+      return false;
+    }
+
+    // Verify via log if credits are 0
+    let actualSelfCredits = bot.credits;
+    if (bot.credits === 0) {
+      ctx.log("rescue", `💰 Self has 0 credits, verifying via debug log...`);
+      const verified = await getActualCreditsFromLog(bot.username, ctx);
+      if (verified !== null) actualSelfCredits = verified;
+      if (actualSelfCredits >= minThreshold) {
+        ctx.log("rescue", `💰 Verified self has ${actualSelfCredits}cr, false 0 reading. Resetting count.`);
+        consecutiveZeroCredits.delete(bot.username);
+        return false;
+      }
+    }
+
+    const needed = targetAmount - actualSelfCredits;
+    ctx.log("rescue", `💰 Self has ${actualSelfCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
 
     const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
     if (withdrawResp.error) {
@@ -1105,7 +1235,8 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       return false;
     }
 
-    ctx.log("rescue", `💰 Withdrew ${needed}cr from faction treasury for self (now at ${bot.credits + needed}cr)`);
+    ctx.log("rescue", `💰 Withdrew ${needed}cr from faction treasury for self (now at ${actualSelfCredits + needed}cr)`);
+    consecutiveZeroCredits.delete(bot.username);
     return true;
   }
 
@@ -1115,6 +1246,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 
 // ── Background credit top-off state ──────────────────────────────────────────
 let creditTopOffIntervalId: NodeJS.Timeout | null = null;
+const consecutiveZeroCredits = new Map<string, number>(); // botUsername -> consecutive 0 credit count
 
 /**
  * Background credit top-off loop — runs independently every 60 seconds,

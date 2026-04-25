@@ -44,6 +44,8 @@ import {
   handleBattleNotifications,
   getBattleStatus,
   fleeFromBattle,
+  shouldEngagePlayersInCombat,
+  engageInBattle,
 } from "./common.js";
 
 // ── Deep core mining constants ───────────────────────────────────────────
@@ -3027,16 +3029,61 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Also check battle status directly (in case we missed notifications)
     // CRITICAL: Check WebSocket state FIRST for fastest detection
     if (bot.isInBattle()) {
-      ctx.log("combat", `Direct battle check [WebSocket]: IN BATTLE! - fleeing immediately!`);
+      ctx.log("combat", `Direct battle check [WebSocket]: IN BATTLE! - checking engagement...`);
+
+      // Check for nearby players to decide if we should engage
+      const nearbyResp = await bot.exec("get_nearby");
+      if (nearbyResp.result && typeof nearbyResp.result === "object") {
+        const { parseNearbyEntities } = await import("./common.js");
+        const nearbyResult = parseNearbyEntities(nearbyResp.result);
+
+        if (nearbyResult.hasPlayers) {
+          const shouldFight = await shouldEngagePlayersInCombat(ctx, nearbyResult.players);
+          if (shouldFight) {
+            ctx.log("combat", "Decided to ENGAGE attacking players in combat!");
+            battleState.inBattle = true;
+            battleState.isFleeing = false;
+            await engageInBattle(ctx);
+            await sleep(30000);
+            continue;
+          }
+        }
+      }
+
+      // Default: flee if we can't determine attackers or shouldn't fight
+      ctx.log("combat", "Not engaging - fleeing from battle!");
       await fleeFromBattle(ctx, true, 35000);
       ctx.log("error", "Battle detected via WebSocket - fled, will retry mining");
       await sleep(30000);
       continue;
     }
-    
+
     const directBattleStatus = await getBattleStatus(ctx);
     if (directBattleStatus && directBattleStatus.is_participant) {
-      ctx.log("combat", `Direct battle status check: IN BATTLE (ID: ${directBattleStatus.battle_id}) - fleeing!`);
+      ctx.log("combat", `Direct battle status check: IN BATTLE (ID: ${directBattleStatus.battle_id}) - checking engagement...`);
+
+      // Check for nearby players to decide if we should engage
+      const nearbyResp2 = await bot.exec("get_nearby");
+      if (nearbyResp2.result && typeof nearbyResp2.result === "object") {
+        const { parseNearbyEntities } = await import("./common.js");
+        const nearbyResult2 = parseNearbyEntities(nearbyResp2.result);
+
+        if (nearbyResult2.hasPlayers) {
+          const shouldFight2 = await shouldEngagePlayersInCombat(ctx, nearbyResult2.players);
+          if (shouldFight2) {
+            ctx.log("combat", "Decided to ENGAGE attacking players in combat!");
+            battleState.inBattle = true;
+            battleState.battleId = directBattleStatus.battle_id;
+            battleState.isFleeing = false;
+            await engageInBattle(ctx);
+            await sleep(30000);
+            continue;
+          }
+        }
+      }
+
+      // Default: flee if we can't determine attackers or shouldn't fight
+      ctx.log("combat", "Not engaging - fleeing from battle!");
       await fleeFromBattle(ctx, true, 35000);
       ctx.log("error", "Battle detected via status check - fled, will retry mining");
       await sleep(30000);
@@ -3181,20 +3228,60 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         
         // Check WebSocket battle state first (fastest)
         if (bot.isInBattle()) {
-          ctx.log("combat", `PERIODIC CHECK [WebSocket]: IN BATTLE! - fleeing immediately!`);
+          ctx.log("combat", `PERIODIC CHECK [WebSocket]: IN BATTLE! - checking engagement...`);
           battleState.inBattle = true;
           battleState.isFleeing = false;
+
+          // Check for nearby players to decide if we should engage
+          const nearbyResp = await bot.exec("get_nearby");
+          if (nearbyResp.result && typeof nearbyResp.result === "object") {
+            const { parseNearbyEntities } = await import("./common.js");
+            const nearbyResult = parseNearbyEntities(nearbyResp.result);
+
+            if (nearbyResult.hasPlayers) {
+              const shouldFight = await shouldEngagePlayersInCombat(ctx, nearbyResult.players);
+              if (shouldFight) {
+                ctx.log("combat", "Decided to ENGAGE attacking players in combat (periodic check)!");
+                await engageInBattle(ctx);
+                await sleep(30000);
+                continue; // Continue the harvest loop while fighting
+              }
+            }
+          }
+
+          // Default: flee if we can't determine attackers or shouldn't fight
+          ctx.log("combat", "Not engaging - fleeing from battle (periodic check)!");
           await fleeFromBattle(ctx, true, 35000);
           stopReason = "battle detected (WebSocket periodic check)";
           break;
         }
-        
+
         // Also check via API (fallback)
         const battleStatusCheck = await getBattleStatus(ctx);
         if (battleStatusCheck && battleStatusCheck.is_participant) {
-          ctx.log("combat", `PERIODIC CHECK: IN BATTLE! Battle ID: ${battleStatusCheck.battle_id} - fleeing!`);
+          ctx.log("combat", `PERIODIC CHECK: IN BATTLE! Battle ID: ${battleStatusCheck.battle_id} - checking engagement...`);
           battleState.inBattle = true;
           battleState.battleId = battleStatusCheck.battle_id;
+
+          // Check for nearby players to decide if we should engage
+          const nearbyResp2 = await bot.exec("get_nearby");
+          if (nearbyResp2.result && typeof nearbyResp2.result === "object") {
+            const { parseNearbyEntities } = await import("./common.js");
+            const nearbyResult2 = parseNearbyEntities(nearbyResp2.result);
+
+            if (nearbyResult2.hasPlayers) {
+              const shouldFight2 = await shouldEngagePlayersInCombat(ctx, nearbyResult2.players);
+              if (shouldFight2) {
+                ctx.log("combat", "Decided to ENGAGE attacking players in combat (periodic check)!");
+                await engageInBattle(ctx);
+                await sleep(30000);
+                continue; // Continue the harvest loop while fighting
+              }
+            }
+          }
+
+          // Default: flee if we can't determine attackers or shouldn't fight
+          ctx.log("combat", "Not engaging - fleeing from battle (periodic check)!");
           await fleeFromBattle(ctx, true, 35000);
           stopReason = "battle detected (status check)";
           break;

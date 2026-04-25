@@ -58,6 +58,10 @@ const DATA_DIR = join(process.cwd(), "data");
 const PILOT_FILE = join(DATA_DIR, "pilotSkill.json");
 const SKILLS_FILE = join(DATA_DIR, "skills.json");
 
+// ── Logging toggle ──────────────────────────────────────────────
+// Set to true to re-enable file logging (currently disabled due to excessive disk writes)
+const ENABLE_SKILL_FILE_LOGGING = false;
+
 // ── In-memory stores ────────────────────────────────────────────
 
 let pilotDataMap: Record<string, BotPilotData> = {};
@@ -213,7 +217,7 @@ export function recordPilotingActivity(
       data.ship = ship;
       computeDerivedStats(data);
       pilotDataMap[bot.username] = data;
-      savePilotData();
+      if (ENABLE_SKILL_FILE_LOGGING) savePilotData();
     } catch (err) {
       console.error(`Piloting tracking error for ${bot.username}:`, err);
     }
@@ -270,7 +274,7 @@ export function recordSkillGains(
        totalXPAfter: g.totalXPAfter,
      });
    }
-   saveSkillLog();
+   if (ENABLE_SKILL_FILE_LOGGING) saveSkillLog();
  }
 
  // ── Initialize ────────────────────────────────────────────────

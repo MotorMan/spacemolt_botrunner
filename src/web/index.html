@@ -2116,7 +2116,11 @@ function renderProfileTopbar() {
     const botMiner = botSettings.minerName || '';
     const effectiveMiner = botMiner || globalMiner;
     // Build miner dropdown from known bots
-    const knownBotsList = (window.discoveredBots || []).filter(b => b && b.trim());
+    // Use bots array (from WebSocket) as primary source, fallback to discoveredBots
+    const knownBotsList = [...new Set([
+      ...bots.map(b => b.username),
+      ...(window.discoveredBots || [])
+    ])].filter(b => b && b.trim());
     const minerOpts = [`<option value=""${!botMiner ? ' selected' : ''}>(global: ${globalMiner || 'none'})</option>`];
     for (const b of knownBotsList) {
       const sel = b === botMiner ? ' selected' : '';
@@ -8174,16 +8178,28 @@ function renderFactionTraderSettings(panel) {
     }
   }
 
-  // Get all items from catalog for dropdown
-  const allItems = Object.values(catalog.items || {}).filter(item => {
-    // Exclude ores (faction trader shouldn't sell raw ores)
-    return item.category !== 'ore';
-  }).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  // Build item list from catalog + faction storage (union of both)
+  const catalogItems = Object.values(catalog.items || {});
+  const storageItemIds = new Set((globalFactionStorage || []).map(e => e.item_id));
+  // Include all catalog items + any storage items not already in catalog
+  const allItemsMap = new Map();
+  for (const item of catalogItems) {
+    allItemsMap.set(item.item_id, item);
+  }
+  for (const entry of (globalFactionStorage || [])) {
+    if (!allItemsMap.has(entry.item_id)) {
+      allItemsMap.set(entry.item_id, { item_id: entry.item_id, name: entry.name || entry.item_id, category: 'storage' });
+    }
+  }
+  const allItems = Array.from(allItemsMap.values()).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
 
-  // Build dropdown options
-  const itemOptions = allItems.map(item =>
-    `<option value="${esc(item.item_id)}">${esc(item.name || item.item_id)}</option>`
-  ).join('');
+  // Build dropdown options (show storage quantity if available)
+  const storageQtyMap = new Map((globalFactionStorage || []).map(e => [e.item_id, e.quantity]));
+  const itemOptions = allItems.map(item => {
+    const qty = storageQtyMap.get(item.item_id);
+    const label = qty !== undefined ? `${item.name || item.item_id} (${qty} in storage)` : (item.name || item.item_id);
+    return `<option value="${esc(item.item_id)}">${esc(label)}</option>`;
+  }).join('');
 
   // Build trade items table rows
   const tradeItemsRows = tradeItems.map((item, idx) => {
@@ -8252,7 +8268,7 @@ function renderFactionTraderSettings(panel) {
 
     <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
       <div class="setting-label" style="margin-bottom:8px">📦 Trade Items</div>
-      <div class="setting-hint" style="margin-bottom:12px">Select items to trade. Empty list = trade all items (except raw ores). Use Max Qty = 0 to sell all of that item. Set individual Min Price to override the global minimum.</div>
+      <div class="setting-hint" style="margin-bottom:12px">Select items to trade. Empty list = trade all items in faction storage. Items from faction storage show quantity in parentheses. Use Max Qty = 0 to sell all of that item. Set individual Min Price to override the global minimum.</div>
       <table id="faction-trader-items-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
         <thead><tr style="border-bottom:1px solid var(--border)">
           <th style="padding:6px 8px;text-align:left;font-size:12px">Item</th>
@@ -8261,7 +8277,7 @@ function renderFactionTraderSettings(panel) {
           <th style="padding:6px 8px;text-align:left;font-size:12px">Sold / Remaining</th>
           <th style="padding:6px 8px;text-align:center;font-size:12px;width:60px"></th>
         </tr></thead>
-        <tbody>${tradeItemsRows || '<tr><td colspan="5" style="padding:12px;text-align:center;color:var(--dim)">No items configured. All items (except ores) will be traded.</td></tr>'}</tbody>
+        <tbody>${tradeItemsRows || '<tr><td colspan="5" style="padding:12px;text-align:center;color:var(--dim)">No items configured. All items in faction storage will be traded.</td></tr>'}</tbody>
       </table>
       <div style="display:flex;gap:8px;align-items:center">
         <select id="ft-add-item" style="flex:1">${itemOptions ? '<option value="">-- select item --</option>' + itemOptions : '<option value="">No items available</option>'}</select>
@@ -8324,7 +8340,7 @@ function removeFactionTradeItem(btn) {
   // Show empty message if no items left
   const tbody = document.querySelector('#faction-trader-items-table tbody');
   if (tbody.children.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="5" style="padding:12px;text-align:center;color:var(--dim)">No items configured. All items (except ores) will be traded.</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" style="padding:12px;text-align:center;color:var(--dim)">No items configured. All items in faction storage will be traded.</td></tr>';
   }
 }
 
@@ -8958,6 +8974,7 @@ function renderAiChatSettings(panel) {
   const respondToSystem = ac.respondToSystem ?? false;
   const respondToMayday = ac.respondToMayday ?? true;
   const respondToCustoms = ac.respondToCustoms ?? true;
+  const respondToBattleMessages = ac.respondToBattleMessages ?? false;
   const customsResponseChance = ac.customsResponseChance ?? 25; // 1 in X chance
   const karenModeChance = ac.karenModeChance ?? 500; // 1 in X chance
   const personality = ac.personality || '';
@@ -14300,7 +14317,11 @@ function renderEscortSettings(panel) {
   const fleeTierOpts = tierOptions.map(t => `<option value="${t}"${t === globalFleeFromTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
 
   // Find all bots running escort routine
-  const knownBotsList = (window.discoveredBots || []).filter(b => b && b.trim());
+  // Use bots array (from WebSocket) as primary source, fallback to discoveredBots
+  const knownBotsList = [...new Set([
+    ...bots.map(b => b.username),
+    ...(window.discoveredBots || [])
+  ])].filter(b => b && b.trim());
   const escortBots = bots.filter(b => b.routine === 'escort');
 
   // Build miner dropdown options (reused for each row)

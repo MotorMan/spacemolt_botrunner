@@ -3,16 +3,20 @@
  * Tracks active mining targets, quotas being worked on, and current location.
  */
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
 import { join } from "path";
 
 const DATA_DIR = join(process.cwd(), "data");
 const ACTIVITY_FILE = join(DATA_DIR, "minerActivity.json");
-const ACTIVITY_FILE_BACKUP = join(DATA_DIR, "minerActivity.json.bak");
-const ACTIVITY_FILE_TEMP = join(DATA_DIR, "minerActivity.json.tmp");
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 100;
+const WRITE_INTERVAL_MS = 60000; // Write to disk once per minute
+
+// In-memory cache of miner activity data
+let cachedData: string | null = null;
+let writeTimer: NodeJS.Timeout | null = null;
+let isFlushPending = false;
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -54,64 +58,41 @@ export interface MinerActivityData {
 }
 
 export function loadMinerActivity(): MinerActivityData {
-  // Try main file first, then fallback to backup
-  const filesToTry = [ACTIVITY_FILE, ACTIVITY_FILE_BACKUP];
-  
-  for (const file of filesToTry) {
-    try {
-      if (existsSync(file)) {
-        const content = readFileSync(file, "utf-8").trim();
-        if (!content) {
-          console.warn(`Empty miner activity file: ${file}`);
-          continue;
-        }
-        const parsed = JSON.parse(content);
-        // Basic validation
-        if (typeof parsed !== "object" || parsed === null) {
-          console.warn(`Invalid miner activity data structure from ${file}`);
-          continue;
-        }
-        console.log(`Loaded miner activity from ${file}`);
-        return parsed;
+  // Try main file
+  try {
+    if (existsSync(ACTIVITY_FILE)) {
+      const content = readFileSync(ACTIVITY_FILE, "utf-8").trim();
+      if (!content) {
+        console.warn("Empty miner activity file");
+        cachedData = null;
+        return {};
       }
-    } catch (err) {
-      console.warn(`Could not load ${file}:`, err);
+      const parsed = JSON.parse(content);
+      // Basic validation
+      if (typeof parsed !== "object" || parsed === null) {
+        console.warn("Invalid miner activity data structure");
+        cachedData = null;
+        return {};
+      }
+      console.log("Loaded miner activity from", ACTIVITY_FILE);
+      // Populate cache on load
+      cachedData = JSON.stringify(parsed, null, 2) + "\n";
+      return parsed;
     }
+  } catch (err) {
+    console.warn("Could not load miner activity:", err);
   }
   
   console.warn("No valid miner activity file found. Starting with empty data.");
+  cachedData = null;
   return {};
 }
 
 async function saveWithRetry(data: string): Promise<boolean> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // Step 1: Create backup of existing file if it exists
-      if (existsSync(ACTIVITY_FILE)) {
-        try {
-          // Copy current to backup (read + write to avoid rename issues during crash)
-          const content = readFileSync(ACTIVITY_FILE, "utf-8");
-          writeFileSync(ACTIVITY_FILE_BACKUP, content, "utf-8");
-        } catch (backupErr) {
-          console.warn("Could not create backup file:", backupErr);
-        }
-      }
-      
-      // Step 2: Write to temp file first
-      writeFileSync(ACTIVITY_FILE_TEMP, data, "utf-8");
-      
-      // Step 3: Atomic rename from temp to actual file
-      renameSync(ACTIVITY_FILE_TEMP, ACTIVITY_FILE);
-      
-      // Step 4: Clean up temp file if it still exists (rename should remove it)
-      if (existsSync(ACTIVITY_FILE_TEMP)) {
-        try {
-          unlinkSync(ACTIVITY_FILE_TEMP);
-        } catch (_) {
-          // Ignore cleanup errors
-        }
-      }
-      
+      // Write directly to the activity file
+      writeFileSync(ACTIVITY_FILE, data, "utf-8");
       return true;
     } catch (err: any) {
       console.warn(`Save attempt ${attempt}/${MAX_RETRIES} failed:`, err?.message || err);
@@ -132,15 +113,52 @@ export async function saveMinerActivity(data: MinerActivityData): Promise<void> 
     if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
     
     const jsonData = JSON.stringify(data, null, 2) + "\n";
-    const success = await saveWithRetry(jsonData);
     
-    if (!success) {
-      console.error("FAILED to save minerActivity.json after all retries! Data may be lost.");
-      console.error("Last known data structure keys:", Object.keys(data).join(", "));
+    // Update in-memory cache
+    cachedData = jsonData;
+    
+    // Schedule a write if one isn't already pending
+    if (!isFlushPending) {
+      isFlushPending = true;
+      if (writeTimer) {
+        clearTimeout(writeTimer);
+      }
+      writeTimer = setTimeout(async () => {
+        isFlushPending = false;
+        writeTimer = null;
+        const success = await saveWithRetry(cachedData!);
+        if (!success) {
+          console.error("FAILED to save minerActivity.json after all retries! Data may be lost.");
+          console.error("Last known data structure keys:", Object.keys(JSON.parse(cachedData!)).join(", "));
+        }
+      }, WRITE_INTERVAL_MS);
     }
   } catch (err) {
     console.error("Unexpected error in saveMinerActivity:", err);
   }
+}
+
+/**
+ * Force an immediate write of cached data to disk.
+ * Used during shutdown to ensure no data loss.
+ */
+export async function flushMinerActivity(): Promise<boolean> {
+  if (cachedData === null) {
+    return true; // Nothing to flush
+  }
+  
+  // Clear any pending timer
+  if (writeTimer) {
+    clearTimeout(writeTimer);
+    writeTimer = null;
+  }
+  isFlushPending = false;
+  
+  const success = await saveWithRetry(cachedData);
+  if (!success) {
+    console.error("FAILED to flush minerActivity.json after all retries! Data may be lost.");
+  }
+  return success;
 }
 
 function getBotActivity(botUsername: string) {

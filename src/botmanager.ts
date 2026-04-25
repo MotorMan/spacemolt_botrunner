@@ -32,6 +32,7 @@ import { AiChatService } from "./aichat_service.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
 import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_chat_channel.js";
+import { flushMinerActivity } from "./routines/minerActivity.js";
 
 interface BotState {
   wasRunning: boolean;
@@ -816,6 +817,16 @@ async function main(): Promise<void> {
     mapStore.flush();
     catalogStore.flush();
     flushFactionStorageCache();
+    // Flush miner activity data to ensure no data loss
+    flushMinerActivity().then(success => {
+      if (success) {
+        server.logSystem("Miner activity data flushed successfully");
+      } else {
+        server.logSystem("WARNING: Failed to flush miner activity data");
+      }
+    }).catch(err => {
+      server.logSystem(`ERROR flushing miner activity data: ${err}`);
+    });
     server.stop();
     
     // If restarting due to mass session loss, clear all session files

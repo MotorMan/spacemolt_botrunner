@@ -776,6 +776,17 @@ export class WebServer {
           });
         }
 
+        // Serve settings.html for settings route
+        if (url.pathname === "/settings.html") {
+          const settingsPath = join(import.meta.dir, "settings.html");
+          return new Response(readFileSync(settingsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve index.html for all other routes (read fresh for dev, no cache)
         return new Response(readFileSync(indexPath, "utf-8"), {
           headers: {

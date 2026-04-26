@@ -178,9 +178,6 @@ function createFleetCommandListener(ctx: RoutineContext): (command: FleetCommand
     // Ignore if not for our fleet
     if (command.fleetId !== settings.fleetId) return;
 
-    // Ignore if hunting is disabled (except for enable command)
-    if (!settings.huntingEnabled && command.type !== "HUNTING_ENABLED") return;
-
     ctx.log("fleet", `Received command: ${command.type} ${command.params || ""}`);
     fleetState.lastCommandTime = Date.now();
     fleetState.currentCommand = command.type;
@@ -253,6 +250,7 @@ async function executeMoveCommand(ctx: RoutineContext, params: string): Promise<
     fuelThresholdPct: settings.refuelThreshold,
     hullThresholdPct: settings.repairThreshold,
     autoCloak: settings.autoCloak,
+    skipBlacklist: true, // Fleet hunters BYPASS blacklist - they hunt in pirate systems!
   };
 
   // Navigate to system
@@ -314,24 +312,31 @@ async function analyzeBattleForSubordinate(
 
   interface SideInfo {
     sideId: number;
-    playerCount: number;
+    ourBotCount: number;
     pirateCount: number;
-    playerNames: string[];
+    ourBotNames: string[];
     pirateNames: string[];
   }
 
+  // Find which side the subordinate's bot is on
+  const ourParticipant = battleStatus.participants.find(p => p.player_id === bot.username || p.username === bot.username);
+  const ourSideId = ourParticipant?.side_id;
+
   const sideInfo: SideInfo[] = battleStatus.sides.map(side => {
     const members = battleStatus.participants.filter(p => p.side_id === side.side_id);
-    const players = members.filter(p => {
+    // Count OUR bots on this side (not just "non-pirates")
+    const ourBots = members.filter(p => {
       const u = (p.username || "").toLowerCase();
-      return !u.includes("pirate") && !u.includes("drifter") &&
-             !u.includes("executioner") && !u.includes("sentinel") &&
-             !u.includes("prowler") && !u.includes("apex") &&
-             !u.includes("razor") && !u.includes("striker") &&
-             !u.includes("rampart") && !u.includes("stalwart") &&
-             !u.includes("bastion") && !u.includes("onslaught") &&
-             !u.includes("iron") && !u.includes("strike") &&
-             !p.username?.startsWith("[POLICE]");
+      const isOurBot = p.player_id === bot.username || p.username === bot.username ||
+                      !u.includes("pirate") && !u.includes("drifter") &&
+                      !u.includes("executioner") && !u.includes("sentinel") &&
+                      !u.includes("prowler") && !u.includes("apex") &&
+                      !u.includes("razor") && !u.includes("striker") &&
+                      !u.includes("rampart") && !u.includes("stalwart") &&
+                      !u.includes("bastion") && !u.includes("onslaught") &&
+                      !u.includes("iron") && !u.includes("strike") &&
+                      !p.username?.startsWith("[POLICE]");
+      return isOurBot;
     });
     const pirates = members.filter(p => {
       const u = (p.username || "").toLowerCase();
@@ -346,15 +351,15 @@ async function analyzeBattleForSubordinate(
 
     return {
       sideId: side.side_id,
-      playerCount: players.length,
+      ourBotCount: ourBots.length,
       pirateCount: pirates.length,
-      playerNames: players.map(p => p.username || p.player_id),
+      ourBotNames: ourBots.map(p => p.username || p.player_id),
       pirateNames: pirates.map(p => p.username || p.player_id),
     };
   });
 
   ctx.log("combat", `📊 Sub battle analysis: ${sideInfo.map(s =>
-    `Side ${s.sideId}: ${s.playerCount}p [${s.playerNames.join(",")}] vs ${s.pirateCount}pir [${s.pirateNames.join(",")}]`
+    `Side ${s.sideId}: ${s.ourBotCount}ours [${s.ourBotNames.join(",")}] vs ${s.pirateCount}pir [${s.pirateNames.join(",")}]`
   ).join(" | ")}`);
 
   // POLICE check
@@ -363,26 +368,20 @@ async function analyzeBattleForSubordinate(
     return { shouldJoin: false, reason: "POLICE involved — staying out", pirateCount: 0 };
   }
 
-  // Find player vs pirate sides
-  const playerVsPirateSides = sideInfo.filter(s => s.playerCount > 0 && s.pirateCount > 0);
-
-  if (playerVsPirateSides.length === 0) {
-    const nonPirateParticipants = battleStatus.participants.filter(p => {
-      const u = (p.username || "").toLowerCase();
-      return !u.includes("pirate") && !u.includes("drifter") && !p.username?.startsWith("[POLICE]");
-    });
-    if (nonPirateParticipants.length >= 2 && battleStatus.sides.length >= 2) {
-      return { shouldJoin: false, reason: "PvP battle — staying out", pirateCount: 0 };
+  // Find the side OUR bot is on — that's the side to join!
+  const ourSide = sideInfo.find(s => s.sideId === ourSideId);
+  if (!ourSide) {
+    // If we can't find our side, find ANY side with our bots
+    const anySideWithUs = sideInfo.find(s => s.ourBotCount > 0);
+    if (!anySideWithUs) {
+      // We're in the battle but not on any side? Just join the first side with space
+      return { shouldJoin: true, sideId: battleStatus.sides[0]?.side_id, reason: "Auto-joining first available side" };
     }
-    return { shouldJoin: false, reason: "Pirate vs pirate — not engaging", pirateCount: 0 };
+    return { shouldJoin: true, sideId: anySideWithUs.sideId, reason: `Joining our side (${anySideWithUs.ourBotCount} bots)` };
   }
 
-  const sideToJoin = playerVsPirateSides.find(s => s.playerCount > 0);
-  if (!sideToJoin) {
-    return { shouldJoin: false, reason: "Could not determine side", pirateCount: 0 };
-  }
-
-  const opposingSide = sideInfo.find(s => s.sideId !== sideToJoin.sideId);
+  // Find opposing side (the one with pirates)
+  const opposingSide = sideInfo.find(s => s.sideId !== ourSide.sideId);
   const opposingPirateCount = opposingSide?.pirateCount || 0;
 
   if (opposingPirateCount >= minPiratesToFlee) {
@@ -391,8 +390,8 @@ async function analyzeBattleForSubordinate(
 
   return {
     shouldJoin: true,
-    sideId: sideToJoin.sideId,
-    reason: `Joining side ${sideToJoin.sideId} vs ${opposingPirateCount} pirate(s)`,
+    sideId: ourSide.sideId,
+    reason: `Joining our side ${ourSide.sideId} vs ${opposingPirateCount} pirate(s)`,
     pirateCount: opposingPirateCount,
   };
 }
@@ -408,52 +407,41 @@ async function executeAttackCommand(ctx: RoutineContext, params: string): Promis
   const settings = getFleetHunterSettings();
 
   fleetState.currentTargetId = targetData.id;
+  // CRITICAL: Reset fleeing flag when starting a new attack
+  fleetState.isFleeing = false;
 
-  // ── STEP 1: Check for existing battles ────────────────────
-  const battleStatus = await getBattleStatus(ctx);
-
-  if (battleStatus) {
-    ctx.log("combat", `⚔️ Subordinate: existing battle detected — analyzing...`);
-    const analysis = await analyzeBattleForSubordinate(ctx, settings.minPiratesToFlee);
-
-    if (!analysis.shouldJoin) {
-      ctx.log("combat", `⏭️ Subordinate skipping battle: ${analysis.reason}`);
-      fleetState.currentTargetId = null;
-      return;
-    }
-
-    // Join battle on player's side
-    ctx.log("combat", `✅ Subordinate joining battle side ${analysis.sideId}: ${analysis.reason}`);
-    const engageResp = await bot.exec("battle", { action: "engage", side_id: analysis.sideId!.toString() });
-
-    if (engageResp.error) {
-      ctx.log("error", `Subordinate failed to join battle: ${engageResp.error.message}`);
-      fleetState.currentTargetId = null;
-      return;
-    }
-
-    // Fight in joined battle
-    await fightSubordinateJoinedBattle(ctx, targetData, settings);
-    fleetState.currentTargetId = null;
-    return;
-  }
-
-  // ── STEP 2: No existing battle — start fresh fight ────────
   ctx.log("combat", `🎯 Subordinate engaging ${targetData.name}...`);
 
-  // Attack the target
-  const attackResp = await bot.exec("attack", { target_id: targetData.id });
-  if (attackResp.error) {
-    const msg = attackResp.error.message.toLowerCase();
-    if (msg.includes("not found") || msg.includes("invalid") ||
-        msg.includes("no target") || msg.includes("already")) {
-      ctx.log("combat", `${targetData.name} unavailable — subordinate standing down`);
+  // If sideId is provided, use "engage" to join the correct side
+  // This ensures ALL subordinates join the SAME side as the commander
+  if (targetData.sideId !== undefined) {
+    ctx.log("combat", `Joining battle side ${targetData.sideId}...`);
+    const engageResp = await bot.exec("battle", { action: "engage", side_id: targetData.sideId.toString() });
+    if (engageResp.error) {
+      ctx.log("error", `Subordinate failed to join battle side: ${engageResp.error.message}`);
+      // Fallback: try attacking directly
+      const attackResp = await bot.exec("attack", { target_id: targetData.id });
+      if (attackResp.error) {
+        ctx.log("error", `Subordinate attack also failed: ${attackResp.error.message}`);
+        fleetState.currentTargetId = null;
+        return;
+      }
+    }
+  } else {
+    // No sideId provided — just attack (backward compatibility)
+    const attackResp = await bot.exec("attack", { target_id: targetData.id });
+    if (attackResp.error) {
+      const msg = attackResp.error.message.toLowerCase();
+      if (msg.includes("not found") || msg.includes("invalid") ||
+          msg.includes("no target") || msg.includes("already")) {
+        ctx.log("combat", `${targetData.name} unavailable — subordinate standing down`);
+        fleetState.currentTargetId = null;
+        return;
+      }
+      ctx.log("error", `Subordinate attack failed: ${attackResp.error.message}`);
       fleetState.currentTargetId = null;
       return;
     }
-    ctx.log("error", `Subordinate attack failed: ${attackResp.error.message}`);
-    fleetState.currentTargetId = null;
-    return;
   }
 
   ctx.log("combat", `⚔️ Subordinate battle started with ${targetData.name} — advancing`);
@@ -536,6 +524,9 @@ async function fightSubordinateTacticalLoop(
     if (bot.state !== "running") return false;
     tickCount++;
 
+    // CRITICAL: Reset fleeing flag when in active combat
+    fleetState.isFleeing = false;
+
     // Use get_battle_status (FREE, no tick cost)
     const status = await getBattleStatus(ctx);
     if (!status) {
@@ -574,29 +565,16 @@ async function fightSubordinateTacticalLoop(
       }
     }
 
-    // Emergency flee (ONLY based on hull)
+    // Emergency flee (ONLY based on hull — NEVER flee for any other reason)
     if (hullPct <= settings.fleeThreshold) {
       ctx.log("combat", `💀 Hull critical (${hullPct}%) — subordinate fleeing!`);
       await emergencyFleeSpamSubordinate(ctx, `hull at ${hullPct}%`);
       return false;
     }
 
-    // 3rd party detection
-    const ourSideId = status.your_side_id;
-    const thirdPartyParticipants = status.participants.filter(p =>
-      p.side_id !== ourSideId &&
-      p.player_id !== bot.username &&
-      p.username !== bot.username &&
-      p.player_id !== targetData.id &&
-      p.username !== targetData.name &&
-      !p.is_destroyed
-    );
-
-    if (thirdPartyParticipants.length >= settings.minPiratesToFlee) {
-      ctx.log("combat", `🚨 ${thirdPartyParticipants.length} third parties — subordinate fleeing!`);
-      await emergencyFleeSpamSubordinate(ctx, `${thirdPartyParticipants.length} third parties`);
-      return false;
-    }
+    // NOTE: Subordinates NEVER flee based on pirate count, police, or third parties.
+    // They ONLY flee when hull <= fleeThreshold.
+    // This is intentional — they are combat bots designed to fight.
 
     // Log battle state
     const enemyStance = targetParticipant?.stance || "unknown";
@@ -884,6 +862,25 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
         case "DOCK":
           yield "exec_dock";
           await executeDockCommand(ctx);
+          break;
+        case "BATTLE_ADVANCE":
+          yield "battle_advance";
+          await ctx.bot.exec("battle", { action: "advance" });
+          break;
+        case "BATTLE_RETREAT":
+          yield "battle_retreat";
+          await ctx.bot.exec("battle", { action: "retreat" });
+          break;
+        case "BATTLE_STANCE":
+          yield "battle_stance";
+          const stance = params || "fire";
+          await ctx.bot.exec("battle", { action: "stance", stance });
+          break;
+        case "BATTLE_TARGET":
+          yield "battle_target";
+          if (params) {
+            await ctx.bot.exec("battle", { action: "target", target_id: params });
+          }
           break;
         default:
           ctx.log("warn", `Unknown fleet command: ${cmd}`);

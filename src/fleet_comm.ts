@@ -22,7 +22,11 @@ type FleetCommandType =
   | "HUNTING_ENABLED"
   | "HUNTING_DISABLED"
   | "MANUAL_MODE_ENTERED"
-  | "AUTO_MODE_ENTERED";
+  | "AUTO_MODE_ENTERED"
+  | "BATTLE_ADVANCE"
+  | "BATTLE_RETREAT"
+  | "BATTLE_STANCE"
+  | "BATTLE_TARGET";
 
 export interface FleetCommand {
   type: FleetCommandType;
@@ -111,11 +115,8 @@ class FleetCommService {
       return;
     }
 
-    // Check if hunting is enabled
-    if (!state.huntingEnabled && !["STATUS_UPDATE"].includes(command)) {
-      console.log(`Fleet ${fleetId} hunting is disabled - command ${command} ignored`);
-      return;
-    }
+    // Hunting enabled state no longer blocks commands - manual/emergency commands should always work
+    // Hunting enabled only affects automatic patrol loops in commander/subordinate routines
 
     const fleetCommand: FleetCommand = {
       type: command,
@@ -286,11 +287,12 @@ export function parseMoveParams(params: string): { systemId: string; poiId?: str
   };
 }
 
-export function parseAttackTarget(params: string): { id: string; name: string } | null {
+export function parseAttackTarget(params: string): { id: string; name: string; sideId?: number } | null {
   if (!params) return null;
   const parts = params.split(":");
   return {
     id: parts[0],
     name: parts[1] || parts[0],
+    sideId: parts[2] ? parseInt(parts[2]) : undefined,
   };
 }

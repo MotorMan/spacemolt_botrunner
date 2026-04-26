@@ -905,47 +905,42 @@ function connect() {
         // Re-initialize rescue systems dropdown if profile is open
         if (profileBot) mcInitRescueSystems();
         break;
-      case 'status':
-        bots = msg.bots || [];
-        renderBots();
-        renderStats();
-        updateChatBotSelect();
-        // Update profile sidebar if open (location, credits, cargo, etc.)
-        if (profileBot) {
-          updateProfileSidebar();
+  case 'status':
+        // Only update bots array if we're not in the middle of refreshing storage
+        // (to avoid clobbering fresh data from our own fetches)
+        if (!window._refreshingStorage) {
+          bots = msg.bots || [];
+          renderBots();
+          renderStats();
+          updateChatBotSelect();
+          // Update profile sidebar if open (location, credits, cargo, etc.)
+          if (profileBot) {
+            updateProfileSidebar();
           
-          // If bot changed systems or docked status, refresh relevant data
-          // (renderManualControls will be called when the data fetches complete)
-          const bot = bots.find(b => b.username === profileBot);
-          const prevBot = window._profilePrevBot;
-          window._profilePrevBot = bot;
+            // If bot changed systems or docked status, refresh relevant data
+            // (renderManualControls will be called when the data fetches complete)
+            const bot = bots.find(b => b.username === profileBot);
+            const prevBot = window._profilePrevBot;
+            window._profilePrevBot = bot;
           
-          if (bot && prevBot && (bot.system !== prevBot.system || bot.docked !== prevBot.docked)) {
-            // System changed or docked/undocked - refresh system data
-            profileSystemData = null;
-            fetchSystemData(profileBot);
+            if (bot && prevBot && (bot.system !== prevBot.system || bot.docked !== prevBot.docked)) {
+              // System changed or docked/undocked - refresh system data
+              profileSystemData = null;
+              fetchSystemData(profileBot);
             
-            // If now docked, refresh station-specific data
-            if (bot.docked) {
-              profileMarket = null;
-              profileRecipes = null;
-              profileFactionStorage = null;
-              fetchMarket(profileBot);
-              fetchRecipes(profileBot);
-              fetchFactionStorage(profileBot);
+              // If now docked, refresh station-specific data
+              if (bot.docked) {
+                profileMarket = null;
+                profileRecipes = null;
+                profileFactionStorage = null;
+                fetchMarket(profileBot);
+                fetchRecipes(profileBot);
+                fetchFactionStorage(profileBot);
+              }
             }
           }
-        }
-        // Update stats tab bot list if visible
-        if (document.getElementById('page-stats')?.classList.contains('active')) renderStatsTab();
-        // Update Fleet Combat controls if visible (refresh commander dropdown only)
-        if (document.getElementById('page-fleetcombat')?.classList.contains('active')) {
-          renderFleetCombatControls(false); // false = don't force full re-render
-          // Also refresh navigation UI and fleet status if commander is selected
-          if (battleState.commanderBot) {
-            updateNavigationUI();
-            updateFleetStatusUI();
-          }
+        } else {
+          console.log('[DEBUG] status handler: BLOCKED - window._refreshingStorage is true');
         }
         break;
       case 'log':
@@ -2523,9 +2518,18 @@ function renderSkillsList() {
   }).join('');
 }
 
-function renderManualControls() {
+function renderManualControls(isFreshRender) {
+  // Block re-render if we just rendered with fresh data from storage refresh
+  if (!isFreshRender && window._blockRenderUntil && Date.now() < window._blockRenderUntil) {
+    return;
+  }
   const bot = getProfileBot();
   if (!bot) return;
+
+  // Use fresh data if available (set by mcExec callback), otherwise use bot data
+  const freshCargo = window._freshCargo || bot.inventory || [];
+  const freshStorage = window._freshStorage || bot.storage || [];
+  const freshFaction = window._freshFactionStorage || profileFactionStorage || [];
 
   const poiOpts = profileSystemData && profileSystemData.pois
     ? [...profileSystemData.pois].sort((a, b) => ((a.name || a.id) || '').localeCompare((b.name || b.id) || '')).map(p => `<option value="${esc(p.id)}">${esc(p.name || p.id)} (${esc(p.type || '')})</option>`).join('')
@@ -2554,17 +2558,17 @@ function renderManualControls() {
     : '<option value="">No systems mapped</option>';
 
   // Build sell/deposit item options from cargo
-  const cargoOpts = bot.inventory && bot.inventory.length > 0
-    ? bot.inventory.map(i => `<option value="${esc(i.itemId)}" data-max="${i.quantity}">${esc(i.name)} (${i.quantity})</option>`).join('')
+  const cargoOpts = freshCargo.length > 0
+    ? freshCargo.map(i => `<option value="${esc(i.itemId)}" data-max="${i.quantity}">${esc(i.name)} (${i.quantity})</option>`).join('')
     : '<option value="">No items</option>';
 
   // Build withdraw item options from storage
-  const storOpts = bot.storage && bot.storage.length > 0
-    ? bot.storage.map(i => `<option value="${esc(i.itemId)}" data-max="${i.quantity}">${esc(i.name)} (${i.quantity})</option>`).join('')
+  const storOpts = freshStorage.length > 0
+    ? freshStorage.map(i => `<option value="${esc(i.itemId)}" data-max="${i.quantity}">${esc(i.name)} (${i.quantity})</option>`).join('')
     : '<option value="">No items</option>';
 
   // Build faction storage item options (with sorting)
-  let factionItems = profileFactionStorage && profileFactionStorage.length > 0 ? profileFactionStorage.slice() : [];
+  let factionItems = freshFaction.length > 0 ? freshFaction.slice() : [];
   if (factionItems.length > 0) {
     // Sort items based on sort order
     if (factionWithdrawSortOrder === 'alpha') {
@@ -2601,13 +2605,13 @@ function renderManualControls() {
 
   // Build gift item options from both cargo and storage
   const giftItems = [];
-  if (bot.inventory && bot.inventory.length > 0) {
-    for (const i of bot.inventory) {
+  if (freshCargo.length > 0) {
+    for (const i of freshCargo) {
       giftItems.push({ itemId: i.itemId, name: i.name, quantity: i.quantity, source: 'cargo' });
     }
   }
-  if (bot.storage && bot.storage.length > 0) {
-    for (const i of bot.storage) {
+  if (freshStorage.length > 0) {
+    for (const i of freshStorage) {
       // Avoid duplicates - if item already in cargo, just mark it has storage too
       const existing = giftItems.find(g => g.itemId === i.itemId);
       if (existing) {
@@ -2664,7 +2668,7 @@ function renderManualControls() {
   let weaponReloadSection = '';
   
   // Check if bot has ammo items in cargo
-  const ammoItems = (bot.inventory || []).filter(i => 
+  const ammoItems = (freshCargo).filter(i => 
     i.itemId.toLowerCase().includes('ammo') ||
     i.itemId.toLowerCase().includes('missile') ||
     i.itemId.toLowerCase().includes('rocket') ||
@@ -4902,6 +4906,12 @@ let cooldownTimer = null;
 function mcExec(command, params) {
   if (!profileBot) return;
 
+  // Set flag immediately for storage commands to block status updates
+  const isStorageCommand = ['deposit_items', 'withdraw_items', 'storage', 'sell', 'buy', 'jettison', 'craft'].includes(command);
+  if (isStorageCommand) {
+    window._refreshingStorage = true;
+  }
+
   // Rate limit action commands (1 per tick)
   if (!QUERY_COMMANDS.has(command)) {
     const lastTime = lastActionTime[profileBot] || 0;
@@ -4924,31 +4934,93 @@ function mcExec(command, params) {
       logResponse(`<span class="resp-ok">OK</span>` + formatResult(command, result.data));
     } else {
       logResponse(`<span class="resp-err">Error: ${esc(result.error || 'unknown')}</span>`);
+      // Clear flag on error
+      if (isStorageCommand) window._refreshingStorage = false;
     }
 
-    // Refresh profile after commands that change state
-    setTimeout(() => {
-      renderProfileSidebar();
-      // Refresh weapon data after reload to update ammo counts
-      if (command === 'reload' && result.ok) {
-        cachedWeaponData = [];
-        const loadBtn = document.getElementById('mc-load-weapons-btn');
-        const controls = document.getElementById('mc-weapon-reload-controls');
-        if (loadBtn) loadBtn.style.display = 'inline-block';
-        if (controls) controls.style.display = 'none';
-      }
-      renderManualControls();
-    }, 500);
+    if (isStorageCommand && result.ok) {
+      // After commands that modify storage, refresh all data from server then update UI
+      const getFreshBot = () => bots.find(b => b.username === profileBot);
+      let pendingFetches = 0;
 
-    // Refresh system/market data after location or trade changes
-    if (['jump', 'dock', 'undock', 'travel', 'buy', 'sell'].includes(command) && result.ok) {
-      setTimeout(() => {
-        if (profileBot) {
-          fetchSystemData(profileBot);
-          const pBot = bots.find(b => b.username === profileBot);
-          if (pBot && pBot.docked) fetchMarket(profileBot);
+      const checkAllDone = () => {
+        if (pendingFetches <= 0) {
+          window._refreshingStorage = false;
+          // Render with fresh data, then block re-renders for 3 seconds
+          renderProfileSidebar();
+          renderManualControls(true); // true = force render (don't block)
+          window._blockRenderUntil = Date.now() + 3000;
+          // Clear fresh data variables after rendering
+          setTimeout(() => {
+            window._freshCargo = null;
+            window._freshStorage = null;
+            window._freshFactionStorage = null;
+          }, 100);
         }
-      }, 100);
+      };
+
+      // Step 1: Fetch updated cargo
+      pendingFetches++;
+      sendExec(profileBot, 'get_cargo', {}, (cargoResult) => {
+        const bot = getFreshBot();
+        if (bot && cargoResult.ok && cargoResult.data) {
+          const freshCargo = cargoResult.data.cargo || cargoResult.data.items || [];
+          bot.inventory = freshCargo;
+          window._freshCargo = freshCargo;
+        }
+        pendingFetches--;
+        checkAllDone();
+      });
+
+      // Step 2: Fetch updated station storage
+      pendingFetches++;
+      sendExec(profileBot, 'view_storage', {}, (storageResult) => {
+        const bot = getFreshBot();
+        if (bot && storageResult.ok && storageResult.data) {
+          const freshStorage = storageResult.data.storage || storageResult.data.items || [];
+          bot.storage = freshStorage;
+          window._freshStorage = freshStorage;
+        }
+        pendingFetches--;
+        checkAllDone();
+      });
+
+      // Step 3: Fetch updated faction storage
+      pendingFetches++;
+      sendExec(profileBot, 'view_faction_storage', {}, (factionResult) => {
+        if (factionResult.ok && factionResult.data) {
+          const freshFaction = factionResult.data.items || factionResult.data.storage || [];
+          profileFactionStorage = freshFaction;
+          window._freshFactionStorage = freshFaction;
+        }
+        pendingFetches--;
+        checkAllDone();
+      });
+    } else {
+      // Original behavior for other commands
+      setTimeout(() => {
+        renderProfileSidebar();
+        // Refresh weapon data after reload to update ammo counts
+        if (command === 'reload' && result.ok) {
+          cachedWeaponData = [];
+          const loadBtn = document.getElementById('mc-load-weapons-btn');
+          const controls = document.getElementById('mc-weapon-reload-controls');
+          if (loadBtn) loadBtn.style.display = 'inline-block';
+          if (controls) controls.style.display = 'none';
+        }
+        renderManualControls();
+      }, 500);
+
+      // Refresh system/market data after location or trade changes
+      if (['jump', 'dock', 'undock', 'travel', 'buy', 'sell'].includes(command) && result.ok) {
+        setTimeout(() => {
+          if (profileBot) {
+            fetchSystemData(profileBot);
+            const pBot = bots.find(b => b.username === profileBot);
+            if (pBot && pBot.docked) fetchMarket(profileBot);
+          }
+        }, 100);
+      }
     }
   });
 }
@@ -17309,7 +17381,144 @@ function renderFleetCombatControls(force = false) {
 
   controls.innerHTML = `
     <div class="cmd-group">
-      <label style="color:var(--text-bright);font-weight:600">Fleet Configuration</label>
+      <label style="color:var(--text-right);font-weight:600">⚔️ Fleet Configuration</label>
+      <button class="sm" style="margin-left:auto" onclick="fcToggleSettings()">
+        <span id="fc-settings-toggle">📐 Show Settings</span>
+      </button>
+    </div>
+
+    <div class="cmd-group">
+      <label>Fleet ID</label>
+      <input type="text" id="fc-fleet-id" value="${esc(fleetCombatFleetId)}" placeholder="default">
+      <button class="sm" onclick="fcSetFleetId()">Set</button>
+      <small style="color:var(--text-dim);display:block;margin-top:4px">All fleet bots must use the same Fleet ID</small>
+    </div>
+
+    <div id="fc-settings-panel" style="display:none;border:1px solid var(--border);border-radius:4px;padding:10px;margin:8px 0">
+      <div class="cmd-group">
+        <label>Fire Mode</label>
+        <select id="fc-fire-mode">
+          <option value="spread"${fleetCombatFireMode === 'spread' ? ' selected' : ''}>Spread (bots pick different targets)</option>
+          <option value="focus"${fleetCombatFireMode === 'focus' ? ' selected' : ''}>Focus Fire (all bots attack same target)</option>
+        </select>
+        <button class="sm" onclick="fcSetFireMode()">Save</button>
+      </div>
+
+      <div class="cmd-group">
+        <label>Patrol System</label>
+        <select id="fc-patrol-system">
+          <option value="">(auto — nearest low-sec)</option>
+          ${knownSystems.length > 0 ? knownSystems.sort((a,b) => (a.name||a.id).localeCompare(b.name||b.id)).map(s => {
+            const sel = s.id === (fleetHunterSettings.patrolSystem || '') ? ' selected' : '';
+            const label = s.name ? `${s.name} (${s.id})` : s.id;
+            return `<option value="${esc(s.id)}"${sel}>${esc(label)}</option>`;
+          }).join('') : ''}
+        </select>
+        <button class="sm" onclick="fcSetPatrolSystem()">Save</button>
+      </div>
+
+      <div class="cmd-group">
+        <label>Fleet Size</label>
+        <input type="number" id="fc-fleet-size" min="2" max="50" value="${fleetHunterSettings.fleetSize || 6}">
+        <button class="sm" onclick="fcSetFleetSize()">Save</button>
+        <small style="color:var(--text-dim);display:block;margin-top:4px">Expected number of subordinates</small>
+      </div>
+
+      <div class="cmd-group">
+        <label>Refuel Threshold (%)</label>
+        <input type="number" id="fc-refuel-threshold" min="20" max="80" value="${fleetHunterSettings.refuelThreshold ?? 40}">
+        <button class="sm" onclick="fcSetRefuelThreshold()">Save</button>
+      </div>
+
+      <div class="cmd-group">
+        <label>Repair Threshold (%)</label>
+        <input type="number" id="fc-repair-threshold" min="20" max="80" value="${fleetHunterSettings.repairThreshold ?? 30}">
+        <button class="sm" onclick="fcSetRepairThreshold()">Save</button>
+      </div>
+
+      <div class="cmd-group">
+        <label>Flee Threshold (%)</label>
+        <input type="number" id="fc-flee-threshold" min="5" max="50" value="${fleetHunterSettings.fleeThreshold ?? 20}">
+        <button class="sm" onclick="fcSetFleeThreshold()">Save</button>
+      </div>
+
+      <div class="cmd-group">
+        <label>Max Attack Tier</label>
+        <select id="fc-max-attack-tier">
+          ${['small','medium','large','capitol','boss'].map(t => `<option value="${t}"${fleetHunterSettings.maxAttackTier === t ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('')}
+        </select>
+        <button class="sm" onclick="fcSetMaxAttackTier()">Save</button>
+      </div>
+
+      <div class="cmd-group">
+        <label>Flee From Tier</label>
+        <select id="fc-flee-from-tier">
+          ${['small','medium','large','capitol','boss'].map(t => `<option value="${t}"${fleetHunterSettings.fleeFromTier === t ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('')}
+        </select>
+        <button class="sm" onclick="fcSetFleeFromTier()">Save</button>
+      </div>
+
+      <div class="cmd-group">
+        <label>Min Pirates to Flee</label>
+        <input type="number" id="fc-min-pirates-flee" min="1" max="10" value="${fleetHunterSettings.minPiratesToFlee ?? 3}">
+        <button class="sm" onclick="fcSetMinPiratesFlee()">Save</button>
+      </div>
+
+      <div class="cmd-group">
+        <label>Auto-Cloak</label>
+        <select id="fc-auto-cloak">
+          <option value="false"${!fleetHunterSettings.autoCloak ? ' selected' : ''}>Disabled</option>
+          <option value="true"${fleetHunterSettings.autoCloak ? ' selected' : ''}>Enabled</option>
+        </select>
+        <button class="sm" onclick="fcSetAutoCloak()">Save</button>
+      </div>
+
+      <div class="cmd-group">
+        <label>Ammo Threshold</label>
+        <input type="number" id="fc-ammo-threshold" min="1" max="20" value="${fleetHunterSettings.ammoThreshold ?? 5}">
+        <button class="sm" onclick="fcSetAmmoThreshold()">Save</button>
+      </div>
+
+      <div class="cmd-group">
+        <label>Max Reload Attempts</label>
+        <input type="number" id="fc-max-reload-attempts" min="1" max="10" value="${fleetHunterSettings.maxReloadAttempts ?? 3}">
+        <button class="sm" onclick="fcSetMaxReloadAttempts()">Save</button>
+      </div>
+
+      <div class="cmd-group">
+        <label>Broadcast to Faction Chat</label>
+        <select id="fc-enable-faction-broadcast">
+          <option value="false"${!fleetHunterSettings.enableFactionBroadcast ? ' selected' : ''}>Disabled (Local Only)</option>
+          <option value="true"${fleetHunterSettings.enableFactionBroadcast ? ' selected' : ''}>Enabled (Broadcast)</option>
+        </select>
+        <button class="sm" onclick="fcSetEnableFactionBroadcast()">Save</button>
+      </div>
+    </div>
+
+    <div class="cmd-group">
+      <label>Hunting Status</label>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+        <button class="${fleetCombatHuntingEnabled ? 'primary' : 'sm'}" onclick="fcSetHuntingEnabled(true)" ${fleetCombatHuntingEnabled ? 'disabled' : ''}>▶ Enable Hunting</button>
+        <button class="${!fleetCombatHuntingEnabled ? 'danger' : 'sm'}" onclick="fcSetHuntingEnabled(false)" ${!fleetCombatHuntingEnabled ? 'disabled' : ''}>⏸ Disable Hunting</button>
+        <span style="margin-left:auto;font-size:12px;color:${fleetCombatHuntingEnabled ? 'var(--green)' : 'var(--red)'};font-weight:600">
+          ${fleetCombatHuntingEnabled ? '🟢 ACTIVE' : '🔴 PAUSED'}
+        </span>
+      </div>
+    </div>
+
+    <div class="cmd-group">
+      <label>Control Mode</label>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+        <button class="${!fleetCombatManualMode ? 'primary' : 'sm'}" onclick="fcSetManualMode(false)" ${!fleetCombatManualMode ? 'disabled' : ''}>🤖 Auto</button>
+        <button class="${fleetCombatManualMode ? 'primary' : 'sm'}" onclick="fcSetManualMode(true)" ${fleetCombatManualMode ? 'disabled' : ''}>🎮 Manual</button>
+        <span style="margin-left:auto;font-size:12px;color:var(--text-dim)">
+          ${fleetCombatManualMode ? 'Manual: Awaiting your commands' : 'Auto: Autonomous hunting'}
+        </span>
+      </div>
+    </div>
+
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-right);font-weight:600">⚔️ Battle Commander</label>
     </div>
 
     <div class="cmd-group">
@@ -17620,6 +17829,244 @@ function fcHold() {
 
 function fcPatrol() {
   fcSendCommand('PATROL');
+}
+
+function fcToggleSettings() {
+  const panel = document.getElementById('fc-settings-panel');
+  const toggle = document.getElementById('fc-settings-toggle');
+  if (panel.style.display === 'none') {
+    panel.style.display = 'block';
+    toggle.textContent = '📈 Hide Settings';
+  } else {
+    panel.style.display = 'none';
+    toggle.textContent = '📐 Show Settings';
+  }
+}
+
+function fcSetPatrolSystem() {
+  const systemId = document.getElementById('fc-patrol-system').value;
+  logFleetCombat(`Patrol system set to: ${systemId || '(auto)'}`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { patrolSystem: systemId } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Patrol system saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcSetFleetSize() {
+  const size = parseInt(document.getElementById('fc-fleet-size').value) || 6;
+  logFleetCombat(`Fleet size set to: ${size}`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { fleetSize: size } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Fleet size saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcSetRefuelThreshold() {
+  const val = parseInt(document.getElementById('fc-refuel-threshold').value) || 40;
+  logFleetCombat(`Refuel threshold set to: ${val}%`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { refuelThreshold: val } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Refuel threshold saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcSetRepairThreshold() {
+  const val = parseInt(document.getElementById('fc-repair-threshold').value) || 30;
+  logFleetCombat(`Repair threshold set to: ${val}%`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { repairThreshold: val } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Repair threshold saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcSetFleeThreshold() {
+  const val = parseInt(document.getElementById('fc-flee-threshold').value) || 20;
+  logFleetCombat(`Flee threshold set to: ${val}%`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { fleeThreshold: val } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Flee threshold saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcSetMaxAttackTier() {
+  const tier = document.getElementById('fc-max-attack-tier').value;
+  logFleetCombat(`Max attack tier set to: ${tier}`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { maxAttackTier: tier } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Max attack tier saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcSetFleeFromTier() {
+  const tier = document.getElementById('fc-flee-from-tier').value;
+  logFleetCombat(`Flee from tier set to: ${tier}`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { fleeFromTier: tier } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Flee from tier saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcSetMinPiratesFlee() {
+  const val = parseInt(document.getElementById('fc-min-pirates-flee').value) || 3;
+  logFleetCombat(`Min pirates to flee set to: ${val}`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { minPiratesToFlee: val } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Min pirates to flee saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcSetAutoCloak() {
+  const val = document.getElementById('fc-auto-cloak').value === 'true';
+  logFleetCombat(`Auto-cloak set to: ${val ? 'Enabled' : 'Disabled'}`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { autoCloak: val } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Auto-cloak saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcSetAmmoThreshold() {
+  const val = parseInt(document.getElementById('fc-ammo-threshold').value) || 5;
+  logFleetCombat(`Ammo threshold set to: ${val}`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { ammoThreshold: val } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Ammo threshold saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcSetMaxReloadAttempts() {
+  const val = parseInt(document.getElementById('fc-max-reload-attempts').value) || 3;
+  logFleetCombat(`Max reload attempts set to: ${val}`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { maxReloadAttempts: val } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Max reload attempts saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcSetEnableFactionBroadcast() {
+  const val = document.getElementById('fc-enable-faction-broadcast').value === 'true';
+  logFleetCombat(`Faction broadcast set to: ${val ? 'Enabled' : 'Disabled'}`);
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fleet_hunter: { enableFactionBroadcast: val } }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Error: ${data.error}`, 'error'); return; }
+    window.currentSettings = data;
+    settings = data;
+    logFleetCombat('Faction broadcast saved');
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function fcScan() {
+  const commanderBot = battleState.commanderBot || (bots.find(b => b.routine === 'fleet_hunter_commander')?.username);
+  if (!commanderBot) {
+    logFleetCombat('No commander bot found', 'error');
+    return;
+  }
+  logFleetCombat(`Scanning nearby area with ${commanderBot}...`);
+  fetch(`/api/exec`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ bot: commanderBot, command: 'get_nearby' }),
+  }).then(r => r.json()).then(data => {
+    if (data.error) { logFleetCombat(`Scan failed: ${data.error}`, 'error'); return; }
+    const result = data.data || data.result;
+    if (!result) { logFleetCombat('No nearby entities found'); return; }
+    const entities = parseNearby(result);
+    logFleetCombat(`Found ${entities.length} nearby entities:`, 'success');
+    entities.forEach(e => {
+      const type = e.isPirate ? `Pirate (${e.tier || 'unknown'})` : e.type;
+      logFleetCombat(`- ${e.name} (${type}) [${e.id}]`);
+    });
+  }).catch(err => logFleetCombat(`Error: ${err.message}`, 'error'));
+}
+
+function parseNearby(result) {
+  if (!result || typeof result !== 'object') return [];
+  const r = result;
+  let rawEntities = [];
+  if (Array.isArray(r)) {
+    rawEntities = r;
+  } else if (Array.isArray(r.entities)) {
+    rawEntities = r.entities;
+  } else if (Array.isArray(r.players)) {
+    rawEntities = r.players;
+  } else if (Array.isArray(r.nearby)) {
+    rawEntities = r.nearby;
+  }
+  return rawEntities.map(e => ({
+    id: e.id || e.player_id || e.entity_id || e.pirate_id || '',
+    name: e.name || e.username || e.pirate_name || '',
+    type: (e.type || '').toLowerCase(),
+    isPirate: !!(e.pirate_id || (e.type || '').includes('pirate') || (e.faction || '').toLowerCase().includes('pirate')),
+    tier: e.tier || '',
+  })).filter(e => e.id);
 }
 
 function fcAttack() {
@@ -18521,28 +18968,29 @@ function battleReload(weaponId, ammoItemId) {
   });
 }
 
-/** Send battle command to commander bot */
+/** Send battle command to entire fleet */
 function sendBattleCommand(action, params) {
   if (!battleState.commanderBot) return;
   
-  // Send via bot's action API
-  fetch(`/api/bot/${encodeURIComponent(battleState.commanderBot)}/action`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      type: 'battle',
-      action: action,
-      ...params
-    })
-  }).then(r => r.json()).then(data => {
-    if (data.error) {
-      logFleetCombat(`Command error: ${data.error.message}`, 'error');
-    } else if (data.result) {
-      logFleetCombat(`Command executed: ${JSON.stringify(data.result)}`, 'success');
-    }
-  }).catch(err => {
-    logFleetCombat(`Command error: ${err.message}`, 'error');
-  });
+  // Map battle action to fleet command type
+  const commandMap = {
+    'advance': 'BATTLE_ADVANCE',
+    'retreat': 'BATTLE_RETREAT',
+    'stance': 'BATTLE_STANCE',
+    'target': 'BATTLE_TARGET'
+  };
+  
+  const fleetCmd = commandMap[action];
+  if (!fleetCmd) {
+    logFleetCombat(`Unknown battle action: ${action}`, 'error');
+    return;
+  }
+  
+  // Send via fleet command API to broadcast to all subordinates
+  const cmdParams = action === 'stance' ? (params.stance || 'fire') : 
+                   action === 'target' ? params.target_id : '';
+  
+  fcSendCommand(fleetCmd, cmdParams);
 }
 
 /** Poll battle status when in battle */

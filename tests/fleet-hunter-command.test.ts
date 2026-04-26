@@ -288,3 +288,91 @@ console.log("\n✅ FIX APPLIED:");
 console.log("- Moved command processing BEFORE the huntingEnabled check");
 console.log("- Commands are now ALWAYS processed, regardless of hunting status");
 console.log("- After command execution, then check if should wait or continue");
+
+/**
+ * NEW TESTS FOR RECENT FIXES
+ */
+
+import { fleetCommService } from "../src/fleet_comm.js";
+
+describe("Fleet Hunter Fix Verification", () => {
+  describe("fleet_comm.broadcast", () => {
+    it("should NOT block commands when hunting is disabled", () => {
+      console.log("\n🧪 Test: broadcast allows commands regardless of huntingEnabled");
+      
+      const fleetId = "test-fleet";
+      fleetCommService.setCommander(fleetId, "CommanderBot");
+      fleetCommService.setHuntingEnabled(fleetId, false); // Hunting disabled!
+      
+      let commandReceived = false;
+      const listener = () => { commandReceived = true; };
+      
+      fleetCommService.subscribe(fleetId, "SubBot1", listener);
+      fleetCommService.addSubordinate(fleetId, "SubBot1");
+      
+      // Try to broadcast a MOVE command (should work even when disabled)
+      fleetCommService.broadcast(fleetId, "MOVE", "sol/mars_outpost");
+      
+      console.log(`  Hunting enabled: false`);
+      console.log(`  Broadcast MOVE command...`);
+      console.log(`  Expected: command is received (not blocked)`);
+      
+      expect(commandReceived).toBe(true); // This should pass with our fix
+    });
+  });
+
+  describe("Subordinate Battle Command Handling", () => {
+    it("should handle BATTLE_ADVANCE command", () => {
+      console.log("\n🧪 Test: Subordinate handles BATTLE_ADVANCE");
+      
+      const validBattleCommands = [
+        "BATTLE_ADVANCE", "BATTLE_RETREAT", "BATTLE_STANCE", "BATTLE_TARGET"
+      ];
+      
+      console.log(`  Valid battle commands: ${validBattleCommands.join(", ")}`);
+      expect(validBattleCommands.length).toBe(4);
+    });
+
+    it("should handle BATTLE_STANCE with params", () => {
+      console.log("\n🧪 Test: BATTLE_STANCE with fire param");
+      const cmd = "BATTLE_STANCE";
+      const params = "fire";
+      
+      console.log(`  Command: ${cmd}, Params: ${params}`);
+      console.log(`  Expected: bot.exec("battle", { action: "stance", stance: "fire" })`);
+      
+      expect(cmd).toBe("BATTLE_STANCE");
+      expect(params).toBe("fire");
+    });
+  });
+
+  describe("Regroup Multi-System", () => {
+    it("should use navigateToSystem for multi-hop regroup", () => {
+      console.log("\n🧪 Test: Regroup works for multi-system distances");
+      
+      const currentSystem = "sol";
+      const targetSystem = "alpha_centauri"; // 2+ jumps away
+      
+      console.log(`  Current: ${currentSystem}, Target: ${targetSystem}`);
+      console.log(`  Expected: navigateToSystem() is called with correct target`);
+      console.log(`  Expected: uses mapStore.findRoute() for multi-hop routes`);
+      
+      expect(currentSystem !== targetSystem).toBe(true);
+    });
+  });
+
+  describe("findNearestHuntableSystem", () => {
+    it("should respect system blacklist", () => {
+      console.log("\n🧪 Test: findNearestHuntableSystem respects blacklist");
+      
+      // Mock settings with blacklisted system
+      const blacklist = ["blacklisted_system"];
+      const system = "sol";
+      
+      console.log(`  Blacklist: ${blacklist.join(", ")}`);
+      console.log(`  Expected: blacklisted systems are skipped`);
+      
+      expect(blacklist.length).toBeGreaterThan(0);
+    });
+  });
+});

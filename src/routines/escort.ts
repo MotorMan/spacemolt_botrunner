@@ -52,28 +52,19 @@ import {
   sleep,
   logStatus,
 } from "./common.js";
+import {
+  type NearbyEntity,
+  type PirateTier,
+  parseNearby,
+  isPirateTarget,
+  ensureAmmoLoaded,
+  emergencyFleeSpam,
+  analyzeExistingBattle,
+  engageTarget as battleEngageTarget,
+} from "./battle.js";
+import { getBattleStatus } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
-
-type PirateTier = "small" | "medium" | "large" | "capitol" | "boss";
-
-const TIER_ORDER: Record<PirateTier, number> = {
-  small: 1,
-  medium: 2,
-  large: 3,
-  capitol: 4,
-  boss: 5,
-};
-
-function getTierLevel(tier: PirateTier | undefined | null): number {
-  if (!tier) return 1;
-  return TIER_ORDER[tier] ?? 1;
-}
-
-function isTierTooHigh(pirateTier: PirateTier | undefined, maxTier: PirateTier): boolean {
-  if (!pirateTier) return false;
-  return getTierLevel(pirateTier) > getTierLevel(maxTier);
-}
 
 function getEscortSettings(username?: string): {
   minerName: string;
@@ -253,392 +244,11 @@ async function checkFileEscortSignals(
   }
 }
 
-// ── Nearby entity parsing (reused from hunter) ───────────────
+// ── Nearby entity parsing ─────────────────────────────────────
+// Using parseNearby and isPirateTarget from battle.ts
 
-interface NearbyEntity {
-  id: string;
-  name: string;
-  type: string;
-  faction: string;
-  isNPC: boolean;
-  isPirate: boolean;
-  tier?: "small" | "medium" | "large" | "capitol" | "boss";
-  isBoss?: boolean;
-  hull?: number;
-  maxHull?: number;
-  shield?: number;
-  maxShield?: number;
-  status?: string;
-}
-
-function parseNearby(result: unknown): NearbyEntity[] {
-  if (!result || typeof result !== "object") return [];
-  const r = result as Record<string, unknown>;
-  const entities: NearbyEntity[] = [];
-
-  let rawEntities: Array<Record<string, unknown>> = [];
-
-  if (Array.isArray(r)) {
-    rawEntities = r;
-  } else if (Array.isArray(r.entities)) {
-    rawEntities = r.entities as Array<Record<string, unknown>>;
-  } else if (Array.isArray(r.players) && r.players.length > 0) {
-    rawEntities = r.players as Array<Record<string, unknown>>;
-  } else if (Array.isArray(r.nearby)) {
-    rawEntities = r.nearby as Array<Record<string, unknown>>;
-  }
-
-  for (const e of rawEntities) {
-    const id = (e.id as string) || (e.player_id as string) || (e.entity_id as string) || (e.pirate_id as string) || "";
-    let faction = "";
-    if (typeof e.faction === "string") {
-      faction = e.faction.toLowerCase();
-    } else if (typeof e.faction_id === "string") {
-      faction = e.faction_id.toLowerCase();
-    }
-
-    let type = "";
-    if (typeof e.type === "string") {
-      type = e.type.toLowerCase();
-    } else if (typeof e.entity_type === "string") {
-      type = e.entity_type.toLowerCase();
-    }
-
-    const isPirate = !!(e.pirate_id) || type.includes("pirate") || faction.includes("pirate");
-    const isNPC = isPirate || !!(e.is_npc) || type === "npc" || type === "enemy" || (typeof e.name === "string" && e.name.toLowerCase().includes("drifter"));
-
-    entities.push({
-      id,
-      name: (e.name as string) || (e.username as string) || (e.pirate_name as string) || (e.pirate_id as string) || id,
-      type,
-      faction,
-      isNPC,
-      isPirate,
-    });
-  }
-
-  if (Array.isArray(r.pirates)) {
-    const rawPirates = r.pirates as Array<Record<string, unknown>>;
-    for (const p of rawPirates) {
-      const id = (p.pirate_id as string) || "";
-      if (!id) continue;
-
-      const tier = (p.tier as string) || "small";
-      const isBoss = !!(p.is_boss as boolean);
-
-      entities.push({
-        id,
-        name: (p.name as string) || (p.pirate_name as string) || id,
-        type: "pirate",
-        faction: "pirate",
-        isNPC: true,
-        isPirate: true,
-        tier: tier as "small" | "medium" | "large" | "capitol" | "boss",
-        isBoss,
-        hull: p.hull as number,
-        maxHull: p.max_hull as number,
-        shield: p.shield as number,
-        maxShield: p.max_shield as number,
-        status: p.status as string,
-      });
-    }
-  }
-
-  return entities.filter(e => e.id);
-}
-
-const PIRATE_KEYWORDS = ["drifter", "pirate", "raider", "outlaw", "bandit", "corsair", "marauder", "hostile"];
-
-function isHostileTarget(entity: NearbyEntity, maxAttackTier: PirateTier = "large"): boolean {
-  // Always attack pirates
-  if (entity.isPirate) {
-    if (isTierTooHigh(entity.tier, maxAttackTier)) return false;
-    return true;
-  }
-  // Attack NPCs with pirate-like names/factions
-  if (!entity.isNPC) return false;
-
-  const factionMatch = entity.faction ? PIRATE_KEYWORDS.some(kw => entity.faction.includes(kw)) : false;
-  const typeMatch = entity.type ? PIRATE_KEYWORDS.some(kw => entity.type.includes(kw)) : false;
-  const nameMatch = entity.name ? PIRATE_KEYWORDS.some(kw => entity.name.toLowerCase().includes(kw)) : false;
-
-  return factionMatch || typeMatch || nameMatch;
-}
-
-// ── Security zone detection ─────────────────────────────────
-
-/**
- * Check if the current system has security/police monitoring.
- * Returns true if the system is monitored (NOT lawless).
- * In these systems, we should NOT attack back to avoid police retaliation.
- */
-function isSecurityMonitoredSystem(securityLevel: string | undefined): boolean {
-  if (!securityLevel) return false;
-  const level = securityLevel.toLowerCase().trim();
-
-  // Empire/high security systems are monitored
-  if (level.includes("high") || level.includes("maximum") || level.includes("empire")) {
-    return true;
-  }
-
-  // Medium security is also monitored
-  if (level.includes("medium") || level.includes("moderate")) {
-    return true;
-  }
-
-  // Lawless/null systems are NOT monitored (safe to fight)
-  if (level.includes("lawless") || level.includes("null") || level.includes("unregulated")) {
-    return false;
-  }
-
-  // Low security/frontier may or may not be monitored - treat as monitored to be safe
-  if (level.includes("low") || level.includes("frontier")) {
-    return true;
-  }
-
-  // Numeric security > 25 is considered monitored
-  const numeric = parseInt(level, 10);
-  if (!isNaN(numeric) && numeric > 25) {
-    return true;
-  }
-
-  // Default to true if we can't determine - better safe than sorry
-  return false;
-}
-
-// ── Combat (simplified from hunter) ─────────────────────────
-
-async function engageTarget(
-  ctx: RoutineContext,
-  target: NearbyEntity,
-  fleeThreshold: number,
-  fleeFromTier: PirateTier,
-  minPiratesToFlee: number,
-  securityMonitored: boolean,
-): Promise<boolean> {
-  const { bot } = ctx;
-
-  if (!target.id) return false;
-
-  // If we're in a security monitored system, DO NOT attack - flee instead
-  if (securityMonitored) {
-    ctx.log("combat", `⚠ SECURITY MONITORED ZONE - Cannot attack ${target.name} - fleeing to avoid police!`);
-    await bot.exec("stance", { stance: "flee" });
-    return false;
-  }
-
-  const scanResp = await bot.exec("scan", { target_id: target.id });
-  if (scanResp.error) {
-    ctx.log("combat", `Scan failed for ${target.name}: ${scanResp.error.message}`);
-  } else if (scanResp.result) {
-    const s = scanResp.result as Record<string, unknown>;
-    const shipType = (s.ship_type as string) || (s.ship as string) || "unknown";
-    const faction = (s.faction as string) || target.faction || "unknown";
-    ctx.log("combat", `Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
-  }
-
-  ctx.log("combat", `Engaging ${target.name}...`);
-
-  const attackResp = await bot.exec("attack", { target_id: target.id });
-  if (attackResp.error) {
-    const msg = attackResp.error.message.toLowerCase();
-    if (msg.includes("not found") || msg.includes("invalid") ||
-        msg.includes("no target") || msg.includes("already in battle")) {
-      ctx.log("combat", `${target.name} is no longer available or already fighting`);
-      return false;
-    }
-    ctx.log("error", `Attack attempt on ${target.name}: ${attackResp.error.message}`);
-  }
-
-  // Advance up to 3 zones
-  for (let zone = 0; zone < 3; zone++) {
-    if (bot.state !== "running") return false;
-
-    await bot.refreshStatus();
-    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-    if (hullPct <= fleeThreshold) {
-      ctx.log("combat", `Hull critical (${hullPct}%) while advancing — fleeing!`);
-      await bot.exec("stance", { stance: "flee" });
-      return false;
-    }
-
-    const advResp = await bot.exec("advance");
-    if (advResp.error) break;
-  }
-
-  // Main combat loop
-  const MAX_COMBAT_TICKS = 30;
-  for (let tick = 0; tick < MAX_COMBAT_TICKS; tick++) {
-    if (bot.state !== "running") return false;
-
-    await bot.refreshStatus();
-    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-    const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
-
-    // Emergency flee if hull critical
-    if (hullPct <= fleeThreshold) {
-      ctx.log("combat", `Hull critical (${hullPct}%) — fleeing!`);
-      await bot.exec("stance", { stance: "flee" });
-      await bot.exec("retreat");
-      return false;
-    }
-
-    // If in security monitored space, keep fleeing every tick
-    if (securityMonitored) {
-      ctx.log("combat", `Security monitored zone - issuing flee command (tick ${tick + 1})`);
-      await bot.exec("stance", { stance: "flee" });
-      
-      // Check if we've successfully fled the combat
-      const nearbyCheck = await bot.exec("get_nearby");
-      if (!nearbyCheck.error && nearbyCheck.result) {
-        bot.trackNearbyPlayers(nearbyCheck.result);
-        const entities = parseNearby(nearbyCheck.result);
-        
-        // If target is no longer nearby, we've successfully fled
-        if (!entities.some(e => e.id === target.id)) {
-          ctx.log("combat", `Successfully fled from ${target.name} in security monitored zone`);
-          return false;
-        }
-      }
-      
-      // Continue fleeing for a few ticks before giving up
-      if (tick >= 10) {
-        ctx.log("combat", `Could not escape ${target.name} after 10 ticks in monitored zone - attempting retreat`);
-        await bot.exec("retreat");
-        return false;
-      }
-      
-      continue;
-    }
-
-    // Check for pirate-based flee conditions
-    const nearbyResp = await bot.exec("get_nearby");
-    if (!nearbyResp.error && nearbyResp.result) {
-      bot.trackNearbyPlayers(nearbyResp.result);
-
-      const entities = parseNearby(nearbyResp.result);
-      const pirateCount = entities.filter(e => e.isPirate).length;
-      const highestPirateTier = entities
-        .filter(e => e.isPirate && e.tier)
-        .reduce((max, e) => getTierLevel(e.tier) > getTierLevel(max) ? e.tier! : max, "small" as PirateTier);
-
-      if (pirateCount >= minPiratesToFlee) {
-        ctx.log("combat", `Too many pirates (${pirateCount}) — fleeing!`);
-        await bot.exec("stance", { stance: "flee" });
-        await bot.exec("retreat");
-        return false;
-      }
-
-      if (isTierTooHigh(highestPirateTier, fleeFromTier)) {
-        ctx.log("combat", `Pirate tier too high (${highestPirateTier}) — fleeing!`);
-        await bot.exec("stance", { stance: "flee" });
-        await bot.exec("retreat");
-        return false;
-      }
-    }
-
-    // Brace when shields critical
-    const shieldsCritical = shieldPct < 15 && hullPct < 70;
-    if (shieldsCritical) {
-      ctx.log("combat", `Bracing (shields ${shieldPct}%, hull ${hullPct}%)`);
-      await bot.exec("stance", { stance: "brace" });
-    } else {
-      await bot.exec("stance", { stance: "fire" });
-    }
-
-    ctx.log("combat", `Tick ${tick + 1}: hull ${hullPct}% | shields ${shieldPct}% — attacking ${target.name}`);
-
-    const nearbyCheck = await bot.exec("get_nearby");
-    if (!nearbyCheck.error && nearbyCheck.result) {
-      bot.trackNearbyPlayers(nearbyCheck.result);
-      const entities = parseNearby(nearbyCheck.result);
-
-      if (entities.some(e => e.id === target.id)) {
-        const atkResp = await bot.exec("attack", { target_id: target.id });
-        if (atkResp.error) {
-          const msg = atkResp.error.message.toLowerCase();
-          if (msg.includes("not in battle") || msg.includes("no battle") ||
-              msg.includes("battle_over") || msg.includes("destroyed") ||
-              msg.includes("dead") || msg.includes("not found") ||
-              msg.includes("already") || msg.includes("ended")) {
-            ctx.log("combat", `${target.name} eliminated`);
-            return true;
-          }
-        }
-      } else {
-        ctx.log("combat", `${target.name} is gone — eliminated or fled`);
-        return true;
-      }
-    } else {
-      const atkResp = await bot.exec("attack", { target_id: target.id });
-      if (atkResp.error) {
-        const msg = atkResp.error.message.toLowerCase();
-        if (msg.includes("not in battle") || msg.includes("no battle") ||
-            msg.includes("battle_over") || msg.includes("destroyed") ||
-            msg.includes("dead") || msg.includes("not found") ||
-            msg.includes("already") || msg.includes("ended")) {
-          ctx.log("combat", `${target.name} eliminated`);
-          return true;
-        }
-      }
-    }
-
-    const finalCheck = await bot.exec("get_nearby");
-    if (!finalCheck.error && finalCheck.result) {
-      bot.trackNearbyPlayers(finalCheck.result);
-      const entitiesFinal = parseNearby(finalCheck.result);
-      if (!entitiesFinal.some(e => e.id === target.id)) {
-        ctx.log("combat", `${target.name} is gone — eliminated or fled`);
-        return true;
-      }
-    }
-  }
-
-  ctx.log("combat", `Combat with ${target.name} reached max ticks — moving on`);
-  return true;
-}
-
-// ── Ammo management ──────────────────────────────────────────
-
-async function ensureAmmoLoaded(
-  ctx: RoutineContext,
-  threshold: number,
-  maxAttempts: number,
-): Promise<boolean> {
-  const { bot } = ctx;
-  await bot.refreshStatus();
-
-  if (bot.ammo > threshold) return true;
-  if (bot.ammo < 0) return true; // ammo field not supported
-
-  ctx.log("combat", `Ammo low (${bot.ammo}) — reloading...`);
-
-  for (let i = 0; i < maxAttempts; i++) {
-    const resp = await bot.exec("reload");
-    if (resp.error) {
-      const msg = resp.error.message.toLowerCase();
-      if (msg.includes("full") || msg.includes("already")) {
-        await bot.refreshStatus();
-        return true;
-      }
-      if (msg.includes("no ammo") || msg.includes("no_ammo") || msg.includes("empty")) {
-        ctx.log("combat", "No ammo available — need to resupply at station");
-        return false;
-      }
-      ctx.log("combat", `Reload attempt ${i + 1} failed: ${resp.error.message}`);
-      continue;
-    }
-
-    await bot.refreshStatus();
-    if (bot.ammo > threshold) {
-      ctx.log("combat", `Reloaded — ammo: ${bot.ammo}`);
-      return true;
-    }
-  }
-
-  ctx.log("combat", `Could not reload after ${maxAttempts} attempts — ammo: ${bot.ammo}`);
-  return bot.ammo > 0;
-}
+// ── Combat ─────────────────────────────────────────────────
+// Using battle.ts functions for combat detection and engagement
 
 // ── Safe-system docking (reused from hunter) ─────────────────
 
@@ -1085,21 +695,18 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "scan_system";
     await fetchSecurityLevel(ctx, bot.system);
 
-    // Check if we're in a security monitored system
-    const currentSystemSecurity = mapStore.getSystem(bot.system)?.security_level;
-    const securityMonitored = isSecurityMonitoredSystem(currentSystemSecurity);
-    
-    if (securityMonitored) {
-      ctx.log("combat", `⚠ SECURITY MONITORED ZONE detected (${currentSystemSecurity}) - will flee from attackers instead of fighting back`);
-    } else {
-      ctx.log("combat", `✓ Lawless space detected (${currentSystemSecurity}) - free to engage hostiles`);
+    // Check if we're already in battle (from protecting miner)
+    const existingBattle = await getBattleStatus(ctx);
+    if (existingBattle) {
+      ctx.log("combat", `⚔️ Already in battle (${existingBattle.battle_id}) — continuing fight...`);
+      // battle.ts functions will handle the ongoing battle
     }
 
     const nearbyResp = await bot.exec("get_nearby");
     if (!nearbyResp.error && nearbyResp.result) {
       bot.trackNearbyPlayers(nearbyResp.result);
       const entities = parseNearby(nearbyResp.result);
-      const targets = entities.filter(e => isHostileTarget(e, settings.maxAttackTier));
+      const targets = entities.filter(e => isPirateTarget(e, false, settings.maxAttackTier));
 
       if (targets.length > 0) {
         ctx.log("combat", `Found ${targets.length} hostile(s) in system: ${targets.map(t => t.name).join(", ")}`);
@@ -1123,7 +730,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
           }
 
           yield "engage";
-          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, securityMonitored);
+          const won = await battleEngageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier);
 
           if (won) {
             totalKills++;

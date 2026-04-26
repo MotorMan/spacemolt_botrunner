@@ -101,24 +101,46 @@ function isHuntableSystem(securityLevel: string | undefined): boolean {
 }
 
 function findNearestHuntableSystem(fromSystemId: string): string | null {
-  const visited = new Set<string>([fromSystemId]);
-  const queue: string[] = [fromSystemId];
+  // FLEET HUNTERS BYPASS SYSTEM BLACKLIST! They are combat bots that MUST enter
+  // pirate-infested systems (which are often blacklisted for mining/trading bots).
+  // Fleet hunters intentionally go into dangerous systems to hunt pirates.
+
+  // First check direct connections (1 jump away) - NO blacklist filter
+  for (const conn of mapStore.getConnections(fromSystemId)) {
+    const sysId = conn.system_id;
+    const sys = mapStore.getSystem(sysId);
+    if (sys && isHuntableSystem(sys.security_level)) return sysId;
+  }
+
+  // BFS using mapStore.findRoute - NO blacklist filter for fleet hunters
+  const visited = new Set<string>([fromSystemId.toLowerCase()]);
+  const queue: { systemId: string; hops: number }[] = [{ systemId: fromSystemId, hops: 0 }];
 
   while (queue.length > 0) {
-    const current = queue.shift()!;
-    for (const conn of mapStore.getConnections(current)) {
-      if (visited.has(conn.system_id)) continue;
-      visited.add(conn.system_id);
+    const { systemId, hops } = queue.shift()!;
+    if (hops > 5) continue; // Limit search depth
 
-      const secLevel = conn.security_level || mapStore.getSystem(conn.system_id)?.security_level;
-      if (isHuntableSystem(secLevel)) return conn.system_id;
+    // findRoute without blacklist - fleet hunters can go anywhere
+    const route = mapStore.findRoute(fromSystemId, systemId);
+    if (route && route.length > 1) {
+      const target = route[route.length - 1];
+      const sys = mapStore.getSystem(target);
+      if (sys && isHuntableSystem(sys.security_level)) {
+        return target;
+      }
+    }
 
-      queue.push(conn.system_id);
+    for (const conn of mapStore.getConnections(systemId)) {
+      const connId = conn.system_id;
+      if (visited.has(connId.toLowerCase())) continue;
+      visited.add(connId.toLowerCase());
+      queue.push({ systemId: connId, hops: hops + 1 });
     }
   }
 
+  // Fallback: check all known systems - NO blacklist filter
   for (const systemId of mapStore.getAllSystemIds()) {
-    if (visited.has(systemId)) continue;
+    if (visited.has(systemId.toLowerCase())) continue;
     const sys = mapStore.getSystem(systemId);
     if (!sys || !isHuntableSystem(sys.security_level)) continue;
     return systemId;
@@ -241,10 +263,11 @@ async function orderFleetMove(ctx: RoutineContext, systemId: string, poiId?: str
   await broadcastFleetCommand(ctx, "MOVE", params, { targetSystem: systemId, targetPoi: poiId });
 }
 
-/** Send an ATTACK command with target ID. */
-async function orderFleetAttack(ctx: RoutineContext, targetId: string, targetName: string): Promise<void> {
-  await broadcastFleetCommand(ctx, "ATTACK", `${targetId}:${targetName}`, { targetId, targetName });
-}
+  /** Send an ATTACK command with target ID and optional side ID. */
+  async function orderFleetAttack(ctx: RoutineContext, targetId: string, targetName: string, sideId?: number): Promise<void> {
+    const params = sideId !== undefined ? `${targetId}:${targetName}:${sideId}` : `${targetId}:${targetName}`;
+    await broadcastFleetCommand(ctx, "ATTACK", params, { targetId, targetName, sideId });
+  }
 
 /** Send a FLEE command to the fleet. */
 async function orderFleetFlee(ctx: RoutineContext): Promise<void> {
@@ -493,14 +516,8 @@ async function analyzeBattleForFleet(
   });
 
   ctx.log("combat", `   ${sideInfo.map(s =>
-    `Side ${s.sideId}: ${s.playerCount} player(s) [${s.playerNames.join(",")}] vs ${s.pirateCount} pirate(s) [${s.pirateNames.join(",")}]`
+    `Side ${s.sideId}: ${s.playerCount}p [${s.playerNames.join(",")}] vs ${s.pirateCount}pir [${s.pirateNames.join(",")}]`
   ).join(" | ")}`);
-
-  // POLICE check
-  const hasPolice = battleStatus.participants.some(p => p.username?.startsWith("[POLICE]"));
-  if (hasPolice) {
-    return { shouldJoin: false, reason: "POLICE involved — fleet staying out", pirateCount: 0 };
-  }
 
   // Find player vs pirate sides
   const playerVsPirateSides = sideInfo.filter(s => s.playerCount > 0 && s.pirateCount > 0);
@@ -525,9 +542,9 @@ async function analyzeBattleForFleet(
   const opposingSide = sideInfo.find(s => s.sideId !== sideToJoin.sideId);
   const opposingPirateCount = opposingSide?.pirateCount || 0;
 
-  if (opposingPirateCount >= minPiratesToFlee) {
-    return { shouldJoin: false, reason: `Too many pirates (${opposingPirateCount}) — too dangerous for fleet`, pirateCount: opposingPirateCount };
-  }
+  // NOTE: Fleet hunters NEVER flee based on pirate count or police.
+  // They ONLY flee when hull <= fleeThreshold.
+  // This is intentional — they are combat bots designed to fight.
 
   return {
     shouldJoin: true,
@@ -573,21 +590,21 @@ async function engageTargetFleet(
       return false;
     }
 
-    // Order fleet to attack the target
-    await orderFleetAttack(ctx, target.id, target.name);
+    // Order fleet to attack the target, pass side ID so they join correctly
+    await orderFleetAttack(ctx, target.id, target.name, analysis.sideId);
     await sleep(1000);
 
     return await fightJoinedBattleFleet(ctx, target, fleeThreshold, minPiratesToFlee, fireMode);
   }
 
-  // ── STEP 2: No existing battle — start fresh fight ────────
+  // ── STEP 2: No existing battle — start fresh fight ──────
   ctx.log("combat", `🎯 Fleet engaging ${target.name}...`);
 
   // Order fleet to attack
   await orderFleetAttack(ctx, target.id, target.name);
   await sleep(1000);
 
-  // Commander attacks too
+  // Commander attacks too (starts the battle)
   const attackResp = await bot.exec("attack", { target_id: target.id });
   if (attackResp.error) {
     const msg = attackResp.error.message.toLowerCase();
@@ -701,31 +718,14 @@ async function fightFreshBattleFleet(
       }
     }
 
-    // Emergency flee (ONLY based on hull)
+    // Emergency flee (ONLY based on hull — NEVER flee for any other reason)
     if (hullPct <= fleeThreshold) {
       ctx.log("combat", `💀 Hull critical (${hullPct}%) — fleet fleeing!`);
       await emergencyFleeSpamFleet(ctx, `hull at ${hullPct}%`);
       return false;
     }
 
-    // 3rd party detection
-    const ourSideId = status.your_side_id;
-    const thirdPartyParticipants = status.participants.filter(p =>
-      p.side_id !== ourSideId &&
-      p.player_id !== bot.username &&
-      p.username !== bot.username &&
-      p.player_id !== target.id &&
-      p.username !== target.name &&
-      !p.is_destroyed
-    );
-
-    if (thirdPartyParticipants.length >= minPiratesToFlee) {
-      ctx.log("combat", `🚨 ${thirdPartyParticipants.length} third parties — fleet fleeing!`);
-      await emergencyFleeSpamFleet(ctx, `${thirdPartyParticipants.length} third parties`);
-      return false;
-    }
-
-    // Log battle state
+    // Log battle state (NO third-party flee — fleet hunters fight until hull is critical)
     const enemyStance = targetParticipant?.stance || "unknown";
     const enemyZone = targetParticipant?.zone || "unknown";
     ctx.log("combat", `Fleet Tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Shields=${shieldPct}%`);
@@ -845,24 +845,7 @@ async function fightJoinedBattleFleet(
       return false;
     }
 
-    // 3rd party detection
-    const ourSideId = status.your_side_id;
-    const thirdPartyParticipants = status.participants.filter(p =>
-      p.side_id !== ourSideId &&
-      p.player_id !== bot.username &&
-      p.username !== bot.username &&
-      p.player_id !== target.id &&
-      p.username !== target.name &&
-      !p.is_destroyed
-    );
-
-    if (thirdPartyParticipants.length >= minPiratesToFlee) {
-      ctx.log("combat", `🚨 ${thirdPartyParticipants.length} third parties — fleet fleeing!`);
-      await emergencyFleeSpamFleet(ctx, `${thirdPartyParticipants.length} third parties`);
-      return false;
-    }
-
-    // Log battle state
+    // Log battle state (NO third-party flee — fleet hunters fight until hull is critical)
     const enemyStance = targetParticipant?.stance || "unknown";
     const enemyZone = targetParticipant?.zone || "unknown";
     ctx.log("combat", `Fleet Tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Shields=${shieldPct}%`);
@@ -1020,6 +1003,7 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
             fuelThresholdPct: currentSettings.refuelThreshold,
             hullThresholdPct: currentSettings.repairThreshold,
             autoCloak: currentSettings.autoCloak,
+            skipBlacklist: true, // Fleet hunters BYPASS blacklist - they hunt in pirate systems!
           };
           
           // Navigate to system if different

@@ -1353,12 +1353,13 @@ export async function depositNonFuelCargo(ctx: RoutineContext): Promise<boolean>
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean> },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; skipBlacklist?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
   const MAX_RETRIES_PER_JUMP = 10;
-  const blacklist = getSystemBlacklist();
+  // Fleet hunters BYPASS blacklist — they MUST enter pirate systems
+  const blacklist = opts.skipBlacklist ? [] : getSystemBlacklist();
 
   // Normalize system names for comparison (replace underscores with spaces, lowercase)
   const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();

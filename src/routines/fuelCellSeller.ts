@@ -23,7 +23,6 @@ import {
   detectAndRecoverFromDeath,
   maxItemsForCargo,
   readSettings,
-  sleep,
   isPirateSystem,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
@@ -248,12 +247,12 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
   while (bot.state === "running") {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) {
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
     if (await checkAndFleeFromBattle(ctx, "fuelCellSeller")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -273,7 +272,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!fueled) {
           ctx.log("error", "Cannot refuel for return journey");
-          await sleep(60000);
+          await ctx.sleep(60000);
           continue;
         }
         await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
@@ -283,7 +282,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         const travelResp = await bot.exec("travel", { target_poi: settings.homeStation });
         if (travelResp.error) {
           ctx.log("error", `Return travel failed: ${travelResp.error.message}`);
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
         bot.poi = settings.homeStation;
@@ -302,7 +301,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
         if (withdrawResp.error) {
           ctx.log("error", `Withdraw failed: ${withdrawResp.error.message} — waiting for cargo`);
-          await sleep(60000);
+          await ctx.sleep(60000);
           continue;
         }
 
@@ -312,7 +311,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
         if (cargoQty <= 0) {
           ctx.log("fc", "Withdraw returned no cargo — waiting for cargo");
-          await sleep(60000);
+          await ctx.sleep(60000);
           continue;
         }
 
@@ -342,7 +341,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
         if (withdrawResp.error) {
           ctx.log("error", `Withdraw failed: ${withdrawResp.error.message} — waiting for cargo`);
-          await sleep(10000);
+          await ctx.sleep(10000);
           continue;
         }
 
@@ -352,7 +351,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
         if (newCargoQty <= 0) {
           ctx.log("fc", "Withdraw returned no cargo — waiting for cargo to become available");
-          await sleep(10000);
+          await ctx.sleep(10000);
           continue;
         }
 
@@ -374,7 +373,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
       if (fcData.stations.length === 0) {
         ctx.log("fc", "Still no stations — waiting");
-        await sleep(60000);
+        await ctx.sleep(60000);
         continue;
       }
 
@@ -422,7 +421,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Cannot refuel — waiting");
-        await sleep(60000);
+        await ctx.sleep(60000);
         continue;
       }
 
@@ -430,7 +429,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       const arrived = await navigateToSystem(ctx, target.systemId, safetyOpts);
       if (!arrived) {
         ctx.log("error", "Failed to reach target system");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
     }
@@ -534,7 +533,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       const fueled = await ensureFueled(ctx, returnThreshold);
       if (!fueled) {
         ctx.log("error", "Failed to refuel before return journey");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
 

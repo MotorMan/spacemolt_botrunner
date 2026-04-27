@@ -45,10 +45,13 @@ import {
   getModProfile,
   ensureModsFitted,
   readSettings,
-  sleep,
   logStatus,
   getBattleStatus,
+  type BattleState,
+  handleBattleNotifications,
   fleeFromBattle,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
 } from "./common.js";
 
 import type { PirateTier, NearbyEntity } from "./battle.js";
@@ -437,7 +440,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     const settings = getHunterSettings(bot.username);
     const safetyOpts = {
@@ -457,7 +460,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
     const fueled = await ensureFueled(ctx, settings.refuelThreshold);
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -535,7 +538,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
             await fetchSecurityLevel(ctx, bot.system);
           } else {
             ctx.log("error", "No connected systems found — waiting 30s");
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -549,7 +552,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
     const confirmedSec = mapStore.getSystem(bot.system)?.security_level;
     if (!isHuntableSystem(confirmedSec)) {
       ctx.log("info", `${bot.system} is ${confirmedSec || "unknown"} security — no pirates here. Will search again next cycle`);
-      await sleep(3000);
+      await ctx.sleep(3000);
       continue;
     }
 
@@ -635,7 +638,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
       bot.poi = poi.id;
 
       // Brief pause to ensure travel fully processed (especially for jumps between systems)
-      await sleep(1000);
+      await ctx.sleep(1000);
 
       // Scan for targets
       yield "scan_for_targets";

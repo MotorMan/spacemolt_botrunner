@@ -13,10 +13,6 @@ const ACTIVITY_FILE_TEMP = join(DATA_DIR, "rescueActivity.json.tmp");
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 100;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 export type RescueSessionState = "navigating" | "at_system" | "traveling_to_poi" | "at_poi" | "delivering_fuel" | "returning_home" | "completed" | "failed";
 
 export interface RescueTarget {
@@ -85,7 +81,7 @@ export function loadRescueActivity(): RescueActivityData {
   return {};
 }
 
-async function saveWithRetry(data: string): Promise<boolean> {
+async function saveWithRetry(data: string, ctx?: { sleep: (ms: number) => Promise<void> }): Promise<boolean> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       // Step 1: Create backup of existing file if it exists
@@ -121,7 +117,11 @@ async function saveWithRetry(data: string): Promise<boolean> {
       if (attempt < MAX_RETRIES) {
         // Exponential backoff
         const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-        await sleep(delay);
+        if (ctx) {
+          await ctx.sleep(delay);
+        } else {
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
     }
   }

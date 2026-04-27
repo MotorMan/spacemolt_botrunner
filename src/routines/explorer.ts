@@ -22,7 +22,6 @@ import {
   detectAndRecoverFromDeath,
   readSettings,
   writeSettings,
-  sleep,
   isPirateSystem,
   checkCustomsInspection,
   checkAndFleeFromPirates,
@@ -390,7 +389,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check for battle after travel
       if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
         ctx.log("combat", "Battle detected during startup travel - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         // Continue to main loop which will handle battle
       } else if (tResp.error && !tResp.error.message.includes("already")) {
         ctx.log("error", `Could not reach station: ${tResp.error.message}`);
@@ -404,7 +403,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check for battle after dock
       if (await checkBattleAfterCommand(ctx, dResp.notifications, "dock")) {
         ctx.log("combat", "Battle detected during startup dock - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         // Continue to main loop which will handle battle
       } else if (!dResp.error || dResp.error.message.includes("already")) {
         bot.docked = true;
@@ -462,7 +461,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Clean up expired temporary blacklists ──
     cleanupTemporaryBlacklist();
@@ -471,14 +470,14 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (bot.isInBattle()) {
       ctx.log("combat", "[WebSocket] Battle detected via WebSocket - fleeing immediately!");
       if (await checkAndFleeFromBattle(ctx, "explorer")) {
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
     }
 
     // ── Battle check — also check via API (fallback) ──
     if (await checkAndFleeFromBattle(ctx, "explorer")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -504,7 +503,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     let { pois, connections, systemId } = await getSystemInfo(ctx);
     if (!systemId) {
       ctx.log("error", "Could not determine current system — waiting 30s");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
     visitedSystems.add(systemId);
@@ -529,7 +528,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
         ctx.log("combat", "Battle detected during proximity check - fleeing immediately!");
         if (await checkAndFleeFromBattle(ctx, "explorer")) {
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
       }
@@ -585,7 +584,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
                 // Update lastSystem to the system we fled from (for avoidance logic)
                 lastSystem = actualSystemId;
                 // Continue to next iteration to rescan new system
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
             } else {
@@ -600,7 +599,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             await emergencyFleeFromPirates(ctx, pirateResult);
           }
           
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
       }
@@ -617,7 +616,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check for battle after survey
       if (await checkBattleAfterCommand(ctx, surveyResp.notifications, "survey_system")) {
         ctx.log("combat", "Battle detected during survey - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -734,7 +733,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const fueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
     if (!fueled) {
       ctx.log("error", "Could not refuel — waiting 30s before retry...");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -779,7 +778,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check for battle after travel
       if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
         ctx.log("combat", "Battle detected during travel - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -796,7 +795,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
         // Check battle status after scavenge (it makes multiple commands)
         if (await checkAndFleeFromBattle(ctx, "scavenge")) {
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
       }
@@ -916,7 +915,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         const directFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
         if (!directFueled) {
           ctx.log("error", "Could not refuel for direct jump — waiting 30s...");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
         
@@ -935,7 +934,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         const arrived = await navigateToSystem(ctx, target.id, { fuelThresholdPct: currentSettings.refuelThreshold, hullThresholdPct: 30 });
         if (!arrived) {
           ctx.log("error", `Could not reach ${target.name || target.id} — will retry next loop`);
-          await sleep(10000);
+          await ctx.sleep(10000);
           continue;
         }
 
@@ -948,7 +947,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         const nearbyResp = await bot.exec("get_nearby");
         if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
           ctx.log("error", "Battle detected after arrival - fleeing!");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
         if (nearbyResp.result && typeof nearbyResp.result === "object") {
@@ -956,7 +955,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           if (fled) {
             ctx.log("error", "Pirates detected - fled, will retry");
             fledFromSystems.add(systemId);
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -972,7 +971,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const jumpFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
     if (!jumpFueled) {
       ctx.log("error", "Could not refuel before jump — waiting 30s...");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -985,7 +984,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         const rndFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
         if (!rndFueled) {
           ctx.log("error", "Cannot refuel for random jump — waiting 30s...");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
         // Smart selection: avoid dead-ends and pirate systems
@@ -999,7 +998,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
             ctx.log("combat", `Jump interrupted by battle! ${jumpResp.error.message} - fleeing!`);
             await fleeFromBattle(ctx);
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
           // Check if we're in battle - need to flee immediately
@@ -1009,11 +1008,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             if (!fled) {
               ctx.log("error", "Flee command failed - battle engagement active");
             }
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-          await sleep(10000);
+          await ctx.sleep(10000);
           continue;
         }
         ctx.log("travel", `Jumped to ${random.name || random.id}`);
@@ -1027,7 +1026,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           if (fled) {
             ctx.log("error", "Pirates detected - fled, will retry");
             fledFromSystems.add(systemId); // Mark this system as hostile
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -1035,7 +1034,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       } else {
         ctx.log("error", "No connections from this system — stuck! Waiting 60s...");
-        await sleep(60000);
+        await ctx.sleep(60000);
       }
       continue;
     }
@@ -1048,7 +1047,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       const jf = await ensureFueled(ctx, currentSettings.refuelThreshold);
       if (!jf) {
         ctx.log("error", "Cannot refuel — waiting 30s...");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
     }
@@ -1062,7 +1061,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
         ctx.log("combat", `Jump interrupted by battle! ${jumpResp.error.message} - fleeing!`);
         await fleeFromBattle(ctx);
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
       // Check if we're in battle - need to flee immediately
@@ -1072,7 +1071,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (!fled) {
           ctx.log("error", "Flee command failed - battle engagement active");
         }
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
       if (msg.includes("fuel")) {
@@ -1080,7 +1079,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       } else {
         ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
       }
-      await sleep(10000);
+      await ctx.sleep(10000);
       continue;
     }
 
@@ -1097,7 +1096,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (fled) {
         ctx.log("error", "Pirates detected - fled, will retry");
         fledFromSystems.add(systemId); // Mark this system as hostile
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
     }
@@ -1123,7 +1122,7 @@ async function* scanResourcePoi(
   // Check for battle after get_poi
   if (await checkBattleAfterCommand(ctx, poiResp.notifications, "get_poi")) {
     ctx.log("combat", "Battle detected at POI scan - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -1210,7 +1209,7 @@ async function* scanStation(
   // Check for battle after dock (unlikely at station, but possible if interrupted)
   if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
     ctx.log("combat", "Battle detected during docking - fleeing!");
-    await sleep(3000);
+    await ctx.sleep(3000);
     return;
   }
 
@@ -1239,7 +1238,7 @@ async function* scanStation(
   // Check for battle after view_market
   if (await checkBattleAfterCommand(ctx, marketResp.notifications, "view_market")) {
     ctx.log("combat", "Battle detected during market scan - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -1314,7 +1313,7 @@ async function* scanStation(
   // Check for battle after get_missions
   if (await checkBattleAfterCommand(ctx, missionsResp.notifications, "get_missions")) {
     ctx.log("combat", "Battle detected during mission scan - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -1390,7 +1389,7 @@ async function* scanStation(
   // Check for battle after undock
   if (await checkBattleAfterCommand(ctx, undockResp.notifications, "undock")) {
     ctx.log("combat", "Battle detected during undock - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -1414,7 +1413,7 @@ async function* visitOtherPoi(
   // Check for battle notifications first
   if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
     ctx.log("combat", "Battle detected at POI - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -1460,7 +1459,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
   if (!scannerCap) {
     ctx.log("error", "Deep core scan mode requires a deep core survey scanner module!");
     ctx.log("error", "Please equip a deep core survey scanner and try again.");
-    await sleep(30000);
+    await ctx.sleep(30000);
     return;
   }
 
@@ -1508,19 +1507,19 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (bot.isInBattle()) {
       ctx.log("combat", "[WebSocket] Battle detected via WebSocket - fleeing immediately!");
       if (await checkAndFleeFromBattle(ctx, "deep_core_scan")) {
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
     }
 
     if (await checkAndFleeFromBattle(ctx, "deep_core_scan")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -1540,7 +1539,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
     if (hiddenPois.length === 0) {
       ctx.log("info", "No hidden POIs found to scan — run explorer mode first to discover them!");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -1555,7 +1554,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
       const fueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
       if (!fueled) {
         ctx.log("error", "Cannot refuel — waiting 30s...");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
 
@@ -1585,7 +1584,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
       if (await checkBattleAfterCommand(ctx, surveyResp.notifications, "survey_system")) {
         ctx.log("combat", "Battle detected during survey - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -1605,7 +1604,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
       if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
         ctx.log("combat", "Battle detected during travel - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -1615,7 +1614,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
         if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
           ctx.log("combat", `Travel to hidden POI interrupted by battle! ${tResp.error.message} - fleeing!`);
           await fleeFromBattle(ctx);
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
         ctx.log("error", `Travel to ${hiddenPoi.poiName} failed: ${tResp.error.message}`);
@@ -1629,7 +1628,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
       if (await checkBattleAfterCommand(ctx, poiResp.notifications, "get_poi")) {
         ctx.log("combat", "Battle detected at POI scan - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -1737,7 +1736,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
     const cycleFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Deep core scan cycle done — visited ${visitedHiddenPois.size} POI(s), ${bot.credits} cr, ${cycleFuel}% fuel`);
     visitedHiddenPois.clear(); // Reset for next cycle
-    await sleep(5000);
+    await ctx.sleep(5000);
   }
 }
 
@@ -1865,11 +1864,11 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive2 = await detectAndRecoverFromDeath(ctx);
-    if (!alive2) { await sleep(30000); continue; }
+    if (!alive2) { await ctx.sleep(30000); continue; }
 
     // ── Battle check — if in battle, flee immediately ──
     if (await checkAndFleeFromBattle(ctx, "trade_update")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -1935,7 +1934,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     if (stationSystems.length === 0) {
       const focusMsg = focusAreaSystem ? ` within ${maxJumps} jumps of ${focusAreaSystem}` : '';
       ctx.log("info", `No known stations${focusMsg} — run an explorer in 'explore' mode first. Waiting 60s...`);
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -1964,7 +1963,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const fueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
       if (!fueled) {
         ctx.log("error", "Cannot refuel — waiting 30s...");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
 
@@ -1989,7 +1988,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       // Check for battle after travel
       if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
         ctx.log("combat", "Battle detected during travel - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -2007,7 +2006,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
         // Check battle status after scavenge
         if (await checkAndFleeFromBattle(ctx, "scavenge")) {
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
       }
@@ -2025,7 +2024,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         // Check for battle after dock
         if (await checkBattleAfterCommand(ctx, dResp.notifications, "dock")) {
           ctx.log("combat", "Battle detected during docking - fleeing!");
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
 
@@ -2038,7 +2037,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           // Check for battle after view_market
           if (await checkBattleAfterCommand(ctx, marketResp.notifications, "view_market")) {
             ctx.log("combat", "Battle detected during market scan - fleeing!");
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
 
@@ -2112,7 +2111,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           // Check for battle after get_missions
           if (await checkBattleAfterCommand(ctx, missResp.notifications, "get_missions")) {
             ctx.log("combat", "Battle detected during mission scan - fleeing!");
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
 
@@ -2134,7 +2133,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           // Check for battle after undock
           if (await checkBattleAfterCommand(ctx, undockResp.notifications, "undock")) {
             ctx.log("combat", "Battle detected during undock - fleeing!");
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
 
@@ -2204,7 +2203,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     await bot.refreshStatus();
     const cycleFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Trade update cycle done — ${stationSystems.length} stations, ${bot.credits} cr, ${cycleFuel}% fuel`);
-    await sleep(5000);
+    await ctx.sleep(5000);
   }
 }
 
@@ -2410,7 +2409,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   // Check for battle after get_cargo
   if (await checkBattleAfterCommand(ctx, cargoResp.notifications, "get_cargo")) {
     ctx.log("combat", "Battle detected during cargo check - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
@@ -2465,7 +2464,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   // Check for battle after faction_withdraw_items
   if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
     ctx.log("combat", "Battle detected during fuel cell withdraw - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
@@ -2488,7 +2487,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   // Check for battle after faction_withdraw_items
   if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
     ctx.log("combat", "Battle detected during fuel cell withdraw - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
@@ -2509,7 +2508,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
     ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
@@ -2530,7 +2529,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
     ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
@@ -2550,7 +2549,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
     // Check for battle after withdraw_credits
     if (await checkBattleAfterCommand(ctx, withdrawCreditsResp.notifications, "withdraw_credits")) {
       ctx.log("combat", "Battle detected during credits withdraw - fleeing!");
-      await sleep(5000);
+      await ctx.sleep(5000);
       return false;
     }
 
@@ -2565,7 +2564,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
       // Check for battle after retry buy
       if (await checkBattleAfterCommand(ctx, retryResp.notifications, "buy")) {
         ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         return false;
       }
 
@@ -2586,7 +2585,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
       // Check for battle after retry buy
       if (await checkBattleAfterCommand(ctx, retryRegularResp.notifications, "buy")) {
         ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         return false;
       }
 
@@ -2672,7 +2671,7 @@ async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolea
     // Check for battle after travel
     if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
       ctx.log("combat", "Battle detected during travel - fleeing!");
-      await sleep(5000);
+      await ctx.sleep(5000);
       return false;
     }
 
@@ -2690,7 +2689,7 @@ async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolea
     // Check for battle after dock
     if (await checkBattleAfterCommand(ctx, dResp.notifications, "dock")) {
       ctx.log("combat", "Battle detected during dock - fleeing!");
-      await sleep(5000);
+      await ctx.sleep(5000);
       return false;
     }
 
@@ -2741,7 +2740,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
     // Check for battle after travel
     if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
       log("combat", "Battle detected during travel - fleeing!");
-      await sleep(5000);
+      await ctx.sleep(5000);
       return false;
     }
 
@@ -2764,7 +2763,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
     // Check for battle after dock
     if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
       log("combat", "Battle detected during dock - fleeing!");
-      await sleep(5000);
+      await ctx.sleep(5000);
       return false;
     }
 
@@ -2781,7 +2780,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   // Check for battle after get_cargo
   if (await checkBattleAfterCommand(ctx, cargoResp.notifications, "get_cargo")) {
     log("combat", "Battle detected during cargo check - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
@@ -2833,7 +2832,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
     log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
@@ -2853,7 +2852,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
     log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 

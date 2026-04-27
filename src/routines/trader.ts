@@ -21,7 +21,6 @@ import {
   maxItemsForCargo,
   getItemSize,
   readSettings,
-  sleep,
   logFactionActivity,
   isPirateSystem,
   checkAndFleeFromBattle,
@@ -801,7 +800,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     // If we're already in battle from previous cycle, re-issue flee command
@@ -829,7 +828,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         battleState.isFleeing = false;
       } else {
         // Still in battle - wait briefly and continue to next cycle to re-flee
-        await sleep(2000);
+        await ctx.sleep(2000);
         continue;
       }
     } else {
@@ -838,7 +837,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         // Battle detected - set battle state and flee
         battleState.inBattle = true;
         battleState.isFleeing = false;
-        await sleep(2000);
+        await ctx.sleep(2000);
         continue;
       }
     }
@@ -909,7 +908,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Cannot refuel for recovered session — will retry next cycle");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
       
@@ -930,7 +929,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       if (!arrived) {
         ctx.log("error", "Failed to reach destination for recovered session — will retry");
         await ensureDocked(ctx);
-        await sleep(60000);
+        await ctx.sleep(60000);
         continue;
       }
 
@@ -944,7 +943,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const travelResp = await bot.exec("travel", { target_poi: recoveredSession.destPoi });
         if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
           ctx.log("combat", "Battle detected during travel — fleeing!");
-          await sleep(2000);
+          await ctx.sleep(2000);
           continue;
         }
         // CRITICAL: Check for battle interrupt error
@@ -953,7 +952,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
             ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
             await fleeFromBattle(ctx);
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
         }
@@ -963,7 +962,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       const dockResp = await bot.exec("dock");
       if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
         ctx.log("combat", "Battle detected during dock — fleeing!");
-        await sleep(2000);
+        await ctx.sleep(2000);
         continue;
       }
       if (dockResp.error && !dockResp.error.message.includes("already")) {
@@ -986,7 +985,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           await failTradeSessionWithLockRelease(recoveredSession.botUsername, "No station at destination");
           recoveredSessionHandled = true; // Mark as handled to prevent re-recovery
           await ensureDocked(ctx);
-          await sleep(60000);
+          await ctx.sleep(60000);
           continue;
         }
 
@@ -1160,7 +1159,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                 const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
                 if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
                   ctx.log("combat", "Battle detected during travel — fleeing!");
-                  await sleep(2000);
+                  await ctx.sleep(2000);
                   continue;
                 }
                 // CRITICAL: Check for battle interrupt error
@@ -1169,7 +1168,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                     ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                     await fleeFromBattle(ctx);
-                    await sleep(5000);
+                    await ctx.sleep(5000);
                     continue;
                   }
                 }
@@ -1343,7 +1342,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       } else {
         ctx.log("trade", "No profitable trade routes found — waiting 60s before re-scanning");
       }
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -1528,7 +1527,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           releaseTradeLock(bot.username, candidate.itemId, "aborted:cannot_refuel");
           pendingLockItemId = null;
           pendingLockReleased = true;
-          await sleep(30000);
+          await ctx.sleep(30000);
           break;
         }
 
@@ -1550,7 +1549,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const tResp = await bot.exec("travel", { target_poi: candidate.sourcePoi });
         if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
           ctx.log("combat", "Battle detected during travel — fleeing!");
-          await sleep(2000);
+          await ctx.sleep(2000);
           continue;
         }
         // CRITICAL: Check for battle interrupt error
@@ -1559,7 +1558,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
             ctx.log("combat", `Travel interrupted by battle! ${tResp.error.message} - fleeing!`);
             await fleeFromBattle(ctx);
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
         }
@@ -1864,7 +1863,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
       ctx.log("trade", "All routes failed — waiting 60s before re-scanning");
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -2120,7 +2119,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("trade", `Session will resume: ${session?.itemId} (${session?.quantityBought}x) → ${session?.destPoiName}`);
 
         // Wait 60 seconds before next cycle will retry (gives network time to recover)
-        await sleep(60000);
+        await ctx.sleep(60000);
         continue;
       }
     }
@@ -2132,7 +2131,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       const t2Resp = await bot.exec("travel", { target_poi: route.destPoi });
       if (await checkBattleAfterCommand(ctx, t2Resp.notifications, "travel", battleState)) {
         ctx.log("combat", "Battle detected during travel — fleeing!");
-        await sleep(2000);
+        await ctx.sleep(2000);
         continue;
       }
       // CRITICAL: Check for battle interrupt error
@@ -2141,7 +2140,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         if (t2Resp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
           ctx.log("combat", `Travel interrupted by battle! ${t2Resp.error.message} - fleeing!`);
           await fleeFromBattle(ctx);
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
       }
@@ -2154,7 +2153,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           const travelResp = await bot.exec("travel", { target_poi: station.id });
           if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
             ctx.log("combat", "Battle detected during travel — fleeing!");
-            await sleep(2000);
+            await ctx.sleep(2000);
             continue;
           }
           // CRITICAL: Check for battle interrupt error
@@ -2162,7 +2161,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             const errMsg = travelResp.error.message.toLowerCase();
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
           }
@@ -2179,7 +2178,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           if (fled) {
             ctx.log("error", "Pirates detected at destination - fled, aborting trade");
             await ensureDocked(ctx);
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -2191,7 +2190,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const d2Resp = await bot.exec("dock");
     if (await checkBattleAfterCommand(ctx, d2Resp.notifications, "dock", battleState)) {
       ctx.log("combat", "Battle detected during dock — fleeing!");
-      await sleep(2000);
+      await ctx.sleep(2000);
       continue;
     }
     if (d2Resp.error && !d2Resp.error.message.includes("already")) {
@@ -2298,7 +2297,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             const tResp = await bot.exec("travel", { target_poi: best.buyer.poiId });
             if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
               ctx.log("combat", "Battle detected during travel — fleeing!");
-              await sleep(2000);
+              await ctx.sleep(2000);
               continue;
             }
             // CRITICAL: Check for battle interrupt error
@@ -2307,7 +2306,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${tResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
             }
@@ -2375,7 +2374,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             const tResp = await bot.exec("travel", { target_poi: buyer.poiId });
             if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
               ctx.log("combat", "Battle detected during travel — fleeing!");
-              await sleep(2000);
+              await ctx.sleep(2000);
               continue;
             }
             // CRITICAL: Check for battle interrupt error
@@ -2384,7 +2383,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${tResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
             }
@@ -2448,7 +2447,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
             if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
               ctx.log("combat", "Battle detected during travel — fleeing!");
-              await sleep(2000);
+              await ctx.sleep(2000);
               continue;
             }
             // CRITICAL: Check for battle interrupt error
@@ -2457,7 +2456,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
             }
@@ -2494,7 +2493,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           const travelResp = await bot.exec("travel", { target_poi: SOL_CENTRAL });
           if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
             ctx.log("combat", "Battle detected during travel — fleeing!");
-            await sleep(2000);
+            await ctx.sleep(2000);
             continue;
           }
           // CRITICAL: Check for battle interrupt error
@@ -2502,7 +2501,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             const errMsg = travelResp.error.message.toLowerCase();
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
           }
@@ -2605,7 +2604,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
               if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
                 ctx.log("combat", "Battle detected during travel — fleeing!");
-                await sleep(2000);
+                await ctx.sleep(2000);
                 continue;
               }
               // CRITICAL: Check for battle interrupt error
@@ -2613,7 +2612,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                 const errMsg = travelResp.error.message.toLowerCase();
                 if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                   ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
-                  await sleep(5000);
+                  await ctx.sleep(5000);
                   continue;
                 }
               }
@@ -2663,7 +2662,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             const travelResp = await bot.exec("travel", { target_poi: homeStation.id });
             if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
               ctx.log("combat", "Battle detected during travel — fleeing!");
-              await sleep(2000);
+              await ctx.sleep(2000);
               continue;
             }
             // CRITICAL: Check for battle interrupt error
@@ -2672,14 +2671,14 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
             }
             const dockResp = await bot.exec("dock");
             if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock", battleState)) {
               ctx.log("combat", "Battle detected during dock — fleeing!");
-              await sleep(2000);
+              await ctx.sleep(2000);
               continue;
             }
             bot.docked = true;

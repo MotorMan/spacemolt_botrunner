@@ -42,14 +42,30 @@ interface CraftingPlan {
   totalSteps: number;
 }
 
+/** Recipes that should NEVER be used - they are inefficient/wasteful */
+const BLACKLISTED_RECIPES = new Set([
+  "basic_silicon_refinement", // Noob trap - severe waste of basic materials
+]);
+
+/** Recipes that should be heavily penalized - only use as absolute last resort */
+const PENALTY_RECIPES: Record<string, number> = {
+  "synthesize_bio_polymer": -1000, // Massive penalty - materials better suited for other recipes
+};
+
 /**
  * Score a recipe based on material availability.
  * Returns a score from 0-100 where higher means more materials are available.
+ * Blacklisted recipes return -Infinity. Penalized recipes get a massive score reduction.
  */
 function scoreRecipeAvailability(
   recipe: Recipe,
   countItemFn: (itemId: string) => number,
 ): number {
+  // Check if recipe is blacklisted
+  if (BLACKLISTED_RECIPES.has(recipe.recipe_id)) {
+    return -Infinity;
+  }
+
   if (recipe.components.length === 0) return 50; // No ingredients needed
 
   let totalAvailability = 0;
@@ -66,7 +82,14 @@ function scoreRecipeAvailability(
   if (totalNeeded === 0) return 50;
   
   // Return percentage of materials available (0-100)
-  return Math.round((totalAvailability / totalNeeded) * 100);
+  let score = Math.round((totalAvailability / totalNeeded) * 100);
+  
+  // Apply penalties for undesirable recipes
+  if (recipe.recipe_id in PENALTY_RECIPES) {
+    score += PENALTY_RECIPES[recipe.recipe_id];
+  }
+  
+  return score;
 }
 
 /**

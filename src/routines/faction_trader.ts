@@ -24,7 +24,6 @@ import {
   maxItemsForCargo,
   readSettings,
   writeSettings,
-  sleep,
   isPirateSystem,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
@@ -243,7 +242,13 @@ async function calculateFactionOptimalSellQuantity(
   itemName: string,
   availableQuantity: number,
   minPricePerUnit: number,
-): Promise<{ sellQty: number; expectedRevenue: number; priceBreakdown: string; weightedAvgPrice: number }> {
+): Promise<{
+  sellQty: number;
+  expectedRevenue: number;
+  priceBreakdown: string;
+  weightedAvgPrice: number;
+  buyOrders: Array<{ priceEach: number; orderQty: number; qtyToSell: number }>;
+}> {
   const { bot } = ctx;
 
   // Check the market for this specific item
@@ -255,6 +260,7 @@ async function calculateFactionOptimalSellQuantity(
       expectedRevenue: availableQuantity * minPricePerUnit,
       priceBreakdown: "cached",
       weightedAvgPrice: minPricePerUnit,
+      buyOrders: [],
     };
   }
 
@@ -273,13 +279,14 @@ async function calculateFactionOptimalSellQuantity(
       expectedRevenue: availableQuantity * minPricePerUnit,
       priceBreakdown: "cached",
       weightedAvgPrice: minPricePerUnit,
+      buyOrders: [],
     };
   }
 
   const buyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
   if (buyOrders.length === 0) {
     ctx.log("trade", `No buy orders for ${itemName} — cannot sell`);
-    return { sellQty: 0, expectedRevenue: 0, priceBreakdown: "no buy orders", weightedAvgPrice: 0 };
+    return { sellQty: 0, expectedRevenue: 0, priceBreakdown: "no buy orders", weightedAvgPrice: 0, buyOrders: [] };
   }
 
   // Calculate how many we can sell at or above minimum price
@@ -287,6 +294,7 @@ async function calculateFactionOptimalSellQuantity(
   let totalRevenue = 0;
   let totalSold = 0;
   const priceDetails: string[] = [];
+const eligibleBuyOrders: Array<{ priceEach: number; orderQty: number; qtyToSell: number }> = [];
 
   for (const order of buyOrders) {
     if (remainingToSell <= 0) break;
@@ -305,6 +313,11 @@ async function calculateFactionOptimalSellQuantity(
     remainingToSell -= qtyAtThisPrice;
 
     priceDetails.push(`${qtyAtThisPrice}x @ ${priceEach}cr`);
+    eligibleBuyOrders.push({
+      priceEach,
+      orderQty,
+      qtyToSell: qtyAtThisPrice,
+    });
   }
 
   const weightedAvgPrice = totalSold > 0 ? totalRevenue / totalSold : 0;
@@ -314,7 +327,7 @@ async function calculateFactionOptimalSellQuantity(
     ctx.log("trade", `Market check: can sell ${totalSold}/${availableQuantity}x ${itemName} (${priceBreakdown}), holding ${remainingToSell}x`);
   }
 
-  return { sellQty: totalSold, expectedRevenue: totalRevenue, priceBreakdown, weightedAvgPrice };
+  return { sellQty: totalSold, expectedRevenue: totalRevenue, priceBreakdown, weightedAvgPrice, buyOrders: eligibleBuyOrders };
 }
 
 /** Free cargo weight (not item count — callers must divide by item size). */
@@ -440,7 +453,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle state tracking (per-cycle initialization) ──
     const battleState: BattleState = {
@@ -453,7 +466,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "faction_trader")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -530,7 +543,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Cannot refuel for recovered session — will retry next cycle");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
 
@@ -551,7 +564,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       if (!arrived) {
         ctx.log("error", "Failed to reach destination for recovered session — will retry");
         await ensureDocked(ctx);
-        await sleep(60000);
+        await ctx.sleep(60000);
         continue;
       }
 
@@ -567,7 +580,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         // Check for battle after travel
         if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
           ctx.log("combat", "Battle detected during travel - fleeing!");
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
 
@@ -576,7 +589,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           const errMsg = travelResp.error.message.toLowerCase();
           if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
             ctx.log("combat", `Travel to destination interrupted by battle! ${travelResp.error.message} - fleeing!`);
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
         }
@@ -590,7 +603,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
           if (fled) {
             ctx.log("error", "Pirates detected at destination - fled, will retry");
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -638,7 +651,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!fueled) {
           ctx.log("error", "Cannot refuel for recovered session — will retry next cycle");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
 
@@ -659,7 +672,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         if (!arrived) {
           ctx.log("error", "Failed to reach destination for recovered session — will retry");
           await ensureDocked(ctx);
-          await sleep(60000);
+          await ctx.sleep(60000);
           continue;
         }
 
@@ -675,7 +688,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           // Check for battle after travel
           if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
             ctx.log("combat", "Battle detected during travel - fleeing!");
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
 
@@ -684,7 +697,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             const errMsg = travelResp.error.message.toLowerCase();
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel to destination interrupted by battle! ${travelResp.error.message} - fleeing!`);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
           }
@@ -849,7 +862,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             // Check for battle after travel
             if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
               ctx.log("combat", "Battle detected during travel home - fleeing!");
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
 
@@ -858,7 +871,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               const errMsg = tResp.error.message.toLowerCase();
               if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel home interrupted by battle! ${tResp.error.message} - fleeing!`);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
             }
@@ -870,7 +883,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           continue;
         }
         ctx.log("trade", `No ${storageType} storage items to sell — waiting 60s`);
-        await sleep(60000);
+        await ctx.sleep(60000);
         continue;
       }
     }
@@ -917,7 +930,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             battleState.isFleeing = false;
           } else {
             // Still in battle - wait briefly and continue to next cycle to re-flee
-            await sleep(2000);
+            await ctx.sleep(2000);
             continue;
           }
         }
@@ -1050,7 +1063,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             clearFactionStorageCache();
             bot.factionStorage = [];
             // Skip to return home
-            await sleep(30000);
+            await ctx.sleep(30000);
             break;
           }
         }
@@ -1069,63 +1082,164 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           break;
         }
 
-        remaining -= wQty;
+        // remaining adjusted after sell based on actual quantity sold
 
         // Get actual market data before selling
         const itemConfig = settings.tradeItems.find(t => t.itemId === route!.itemId);
         const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
 
-        const marketCheck = await calculateFactionOptimalSellQuantity(
+        // Get initial market check to list eligible buy orders
+        const initialMarketCheck = await calculateFactionOptimalSellQuantity(
           ctx, route!.itemId, route!.itemName, wQty, itemMinSellPrice
         );
 
-        const sellQty = marketCheck.sellQty > 0 ? marketCheck.sellQty : wQty;
-        ctx.log("trade", `Selling ${sellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
-
-        const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: sellQty });
-        // Check for battle notifications after sell
-        if (sResp.notifications && Array.isArray(sResp.notifications)) {
-          const battleDetected = await handleBattleNotifications(ctx, sResp.notifications, battleState);
-          if (battleDetected) {
-            ctx.log("combat", "Battle detected during sell - initiating flee!");
-            battleState.isFleeing = false;
-          }
+        if (initialMarketCheck.buyOrders.length === 0) {
+          ctx.log("trade", `No viable buy orders for ${route!.itemName} — skipping`);
+          continue;
         }
-        if (sResp.error) {
-          ctx.log("error", `Sell failed: ${sResp.error.message}`);
-          // Fail the session if we have no successful sales yet
-          if (totalSold <= 0) {
-            const session = getActiveSession(bot.username);
-            if (session) {
-              await failTradeSession(bot.username, `Sell failed: ${sResp.error.message}`);
+
+        ctx.log("trade", `Processing ${initialMarketCheck.buyOrders.length} buy orders for ${route!.itemName} (min price: ${itemMinSellPrice}cr)`);
+
+        // Process each buy order individually, highest price first
+        for (const buyOrder of initialMarketCheck.buyOrders) {
+          const { priceEach, qtyToSell: targetQty } = buyOrder;
+          ctx.log("trade", `[DEBUG] Processing buy order: ${targetQty}x @ ${priceEach}cr`);
+
+          let orderTotalSold = 0;
+          const maxRetries = 3;
+
+          // Retry loop for this buy order
+          for (let retry = 0; retry < maxRetries; retry++) {
+            // Refresh market data to confirm buy order still exists
+            const marketResp = await bot.exec("view_market", { item_id: route!.itemId });
+            if (marketResp.error || !marketResp.result) {
+              ctx.log("warn", `[DEBUG] Failed to refresh market for ${route!.itemName} (retry ${retry + 1}/${maxRetries})`);
+              await ctx.sleep(1000);
+              continue;
             }
+
+            const marketData = marketResp.result as Record<string, unknown>;
+            const items = Array.isArray(marketData) ? marketData :
+              Array.isArray((marketData as any).items) ? (marketData as any).items : [];
+            const itemMarket = items.find((i: any) => i.item_id === route!.itemId);
+            if (!itemMarket) {
+              ctx.log("warn", `[DEBUG] No market data for ${route!.itemName} (retry ${retry + 1}/${maxRetries})`);
+              await ctx.sleep(1000);
+              continue;
+            }
+
+            const currentBuyOrders = (itemMarket.buy_orders as Array<Record<string, unknown>>) || [];
+            // Find matching buy order (same price, still has quantity)
+            const matchingOrder = currentBuyOrders.find(o => 
+              (o.price_each as number) === priceEach && (o.quantity as number) > 0
+            );
+
+            if (!matchingOrder) {
+              ctx.log("trade", `[DEBUG] Buy order at ${priceEach}cr no longer available — skipping`);
+              break; // Exit retry loop for this order
+            }
+
+            const currentOrderQty = (matchingOrder.quantity as number) || 0;
+            const currentPrice = (matchingOrder.price_each as number) || 0;
+
+            // Check current cargo
+            await bot.refreshCargo();
+            const cargoQty = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+            if (cargoQty <= 0) {
+              ctx.log("trade", `No ${route!.itemName} remaining in cargo — stopping`);
+              break;
+            }
+
+            // Calculate quantity to sell now
+            const sellNow = Math.min(targetQty - orderTotalSold, currentOrderQty, cargoQty);
+            if (sellNow <= 0) {
+              ctx.log("trade", `[DEBUG] Buy order at ${priceEach}cr has no remaining quantity — skipping`);
+              break;
+            }
+
+            ctx.log("trade", `Attempting to sell ${sellNow}x ${route!.itemName} at ${currentPrice}cr (retry ${retry + 1}/${maxRetries})...`);
+
+            const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: sellNow });
+
+            // Check for battle notifications
+            if (sResp.notifications && Array.isArray(sResp.notifications)) {
+              const battleDetected = await handleBattleNotifications(ctx, sResp.notifications, battleState);
+              if (battleDetected) {
+                ctx.log("combat", "Battle detected during sell - initiating flee!");
+                battleState.isFleeing = false;
+                await ctx.sleep(5000);
+                break;
+              }
+            }
+
+            if (sResp.error) {
+              ctx.log("error", `Sell failed: ${sResp.error.message} (retry ${retry + 1}/${maxRetries})`);
+              await ctx.sleep(1000);
+              continue;
+            }
+
+            // Verify sale
+            await bot.refreshCargo();
+            const afterQty = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+            const soldThisAttempt = cargoQty - afterQty;
+
+            if (soldThisAttempt <= 0) {
+              ctx.log("error", `Sell succeeded but no items sold (retry ${retry + 1}/${maxRetries})`);
+              await ctx.sleep(1000);
+              continue;
+            }
+
+            // Success
+            orderTotalSold += soldThisAttempt;
+            const revenue = soldThisAttempt * currentPrice;
+            totalSold += soldThisAttempt;
+            totalRevenue += revenue;
+            ctx.log("trade", `Sold ${soldThisAttempt}x ${route!.itemName} at ${currentPrice}cr — ${revenue}cr (order total: ${orderTotalSold}/${targetQty}, overall total: ${totalSold})`);
+
+            // If we've sold the target quantity for this order, break
+            if (orderTotalSold >= targetQty) {
+              break;
+            }
+            await ctx.sleep(500); // Short delay before next attempt on same order
           }
-          break;
+
+          if (orderTotalSold === 0) {
+            ctx.log("error", `Failed to sell any items for buy order at ${priceEach}cr after ${maxRetries} retries`);
+          } else if (orderTotalSold < targetQty) {
+            ctx.log("trade", `Partially sold buy order at ${priceEach}cr: ${orderTotalSold}/${targetQty}`);
+          }
         }
 
-        // Verify sale by checking cargo after sell
-        await bot.refreshCargo();
-        const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
-        const actuallySold = sellQty - afterSell;
-
-        if (actuallySold <= 0) {
-          ctx.log("error", `Sell command succeeded but no items were sold - item still in cargo (${afterWithdraw}x)`);
-          // Fail the session
+        // After processing all buy orders, check if we sold anything
+        if (totalSold === 0) {
+          ctx.log("error", `No items were sold for ${route!.itemName} — failing session`);
           const session = getActiveSession(bot.username);
           if (session) {
-            await failTradeSession(bot.username, "Sell command did not remove items from cargo");
+            await failTradeSession(bot.username, "No items were actually sold");
           }
           break;
+        } else {
+          ctx.log("trade", `Finished selling ${route!.itemName}: ${totalSold}x total, ${totalRevenue}cr revenue`);
+          remaining -= totalSold;
+          // Deposit any unsold cargo back to storage
+          await bot.refreshCargo();
+          const remainingCargo = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
+          if (remainingCargo > 0) {
+            ctx.log("trade", `Depositing ${remainingCargo}x unsold ${route!.itemName} back to storage`);
+            let dResp;
+            if (personalMode) {
+              dResp = await bot.exec("deposit_items", { item_id: route!.itemId, quantity: remainingCargo });
+            } else {
+              dResp = await bot.exec("faction_deposit_items", { item_id: route!.itemId, quantity: remainingCargo });
+            }
+            if (dResp.error) {
+              ctx.log("error", `Failed to deposit unsold items: ${dResp.error.message}`);
+            } else {
+              remaining += remainingCargo; // Add back to remaining to sell
+            }
+          }
+          continue;
         }
-
-        // Get actual revenue from sell result
-        const sr = sResp.result as Record<string, unknown> | undefined;
-        const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
-        const revenue = actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice;
-
-        totalSold += actuallySold;
-        totalRevenue += revenue;
-        ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} — ${revenue}cr revenue (actual, ${totalSold} total)`);
       }
 
       if (totalSold > 0) {
@@ -1235,7 +1349,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         qty = Math.min(route!.sellQty, route!.availableQty, maxItemsForCargo(freeSpace, route!.itemId));
         if (qty <= 0) {
           ctx.log("trade", "No cargo space for withdrawal — skipping");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
 
@@ -1258,14 +1372,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             clearFactionStorageCache();
             bot.factionStorage = [];
             // Skip to return home
-            await sleep(30000);
+            await ctx.sleep(30000);
             break;
           }
         }
 
         if (wResp.error) {
           ctx.log("error", `Withdraw failed: ${wResp.error.message}`);
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
 
@@ -1277,7 +1391,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         const inCargo = bot.inventory.find(i => i.itemId === route!.itemId);
         if (!inCargo || inCargo.quantity <= 0) {
           ctx.log("error", "Cargo recovery: items not in cargo!");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
         qty = inCargo.quantity;
@@ -1338,7 +1452,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         ctx.log("trade", `Session will resume when fueled: ${session?.itemId} (${session?.quantityBought}x) → ${session?.destPoiName}`);
 
         // Wait 60 seconds before next cycle
-        await sleep(60000);
+        await ctx.sleep(60000);
         continue;
       }
 
@@ -1387,7 +1501,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           ctx.log("trade", `Session will resume: ${session?.itemId} (${session?.quantityBought}x) → ${session?.destPoiName}`);
 
           // Wait 60 seconds before next cycle will retry (gives network time to recover)
-          await sleep(60000);
+          await ctx.sleep(60000);
           continue;
         }
       }
@@ -1399,7 +1513,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         // Check for battle after travel
         if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
           ctx.log("combat", "Battle detected during travel to destination - fleeing!");
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
 
@@ -1408,7 +1522,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           const errMsg = travelResp.error.message.toLowerCase();
           if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
             ctx.log("combat", `Travel to destination interrupted by battle! ${travelResp.error.message} - fleeing!`);
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
         }
@@ -1518,7 +1632,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         // Check for battle after travel
         if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
           ctx.log("combat", "Battle detected during travel home - fleeing!");
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
 
@@ -1527,7 +1641,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           const errMsg = tResp.error.message.toLowerCase();
           if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
             ctx.log("combat", `Travel home interrupted by battle! ${tResp.error.message} - fleeing!`);
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
         }

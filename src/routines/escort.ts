@@ -49,7 +49,6 @@ import {
   getModProfile,
   ensureModsFitted,
   readSettings,
-  sleep,
   logStatus,
 } from "./common.js";
 import {
@@ -342,7 +341,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     const settings = getEscortSettings(bot.username);
     const safetyOpts = {
@@ -353,7 +352,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (!minerName) {
       ctx.log("error", "No minerName configured in escort settings — waiting 30s");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -367,7 +366,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     const fueled = await ensureFueled(ctx, settings.refuelThreshold);
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -561,7 +560,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
               await ensureUndocked(ctx);
             }
             consecutiveFailedChecks = 0;
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -598,7 +597,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         if (!arrived) {
           ctx.log("error", `Could not reach ${minerSystem} — will retry next cycle`);
           consecutiveFailedChecks++;
-          await sleep(15000);
+          await ctx.sleep(15000);
           continue;
         }
         consecutiveFailedChecks = 0;
@@ -622,7 +621,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         await tryRefuel(ctx);
         await repairShip(ctx);
       }
-      await sleep(15000);
+      await ctx.sleep(15000);
       continue;
     }
 

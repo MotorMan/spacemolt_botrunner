@@ -37,7 +37,6 @@ import {
   ensureUndocked,
   tryRefuel,
   repairShip,
-  ensureFueled,
   navigateToSystem,
   fetchSecurityLevel,
   getBattleStatus,
@@ -46,26 +45,17 @@ import {
   detectAndRecoverFromDeath,
   ensureModsFitted,
   getModProfile,
-  readSettings,
-  fleeFromBattle,
-  checkAndFleeFromBattle,
-  checkBattleAfterCommand,
 } from "./common.js";
 import {
-  type NearbyEntity,
   engageTarget,
-  parseNearby,
-  isPirateTarget,
 } from "./battle.js";
 
 // ── Settings ────────────────────────────────────────
 
 type PirateTier = "small" | "medium" | "large" | "capitol" | "boss";
 
-interface FleetHunterSettings {
+function getFleetHunterSettings(): {
   fleetId: string;
-  patrolSystem: string;
-  fireMode: "focus" | "spread";
   refuelThreshold: number;
   repairThreshold: number;
   fleeThreshold: number;
@@ -77,16 +67,12 @@ interface FleetHunterSettings {
   maxReloadAttempts: number;
   huntingEnabled: boolean;
   manualMode: boolean;
-}
-
-function getFleetHunterSettings(): FleetHunterSettings {
+} {
   const all = readSettings();
   const h = all.fleet_hunter || {};
-  
+
   return {
     fleetId: (h.fleetId as string) || "default",
-    patrolSystem: (h.patrolSystem as string) || "",
-    fireMode: ((h.fireMode as "focus" | "spread") || "focus") as "focus" | "spread",
     refuelThreshold: (h.refuelThreshold as number) || 40,
     repairThreshold: (h.repairThreshold as number) || 30,
     fleeThreshold: (h.fleeThreshold as number) || 20,

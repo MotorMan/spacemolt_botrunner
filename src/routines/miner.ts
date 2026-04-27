@@ -20,7 +20,6 @@ import {
   scavengeWrecks,
   detectAndRecoverFromDeath,
   getSystemInfo,
-  sleep,
 } from "./common.js";
 import {
   getRadioactiveCapability,
@@ -1433,7 +1432,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Refresh cached ship modules after death recovery ──
     // (modules could change if ship was destroyed and replaced)
@@ -1499,7 +1498,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           const detected = await detectMiningType(ctx, cachedModules || undefined);
           if (!detected) {
             ctx.log("error", "Cannot determine mining type for flock leader — waiting 30s");
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
           actualMiningType = detected;
@@ -1540,7 +1539,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (!flockState) {
           ctx.log("flock", `Flock mode: FOLLOWER of "${settings.flockName}" — waiting for leader...`);
           // Wait for leader to announce target
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
         
@@ -1548,7 +1547,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const registered = await registerFlockMember(settings.flockName, bot.username, false);
         if (!registered) {
           ctx.log("error", "Failed to join flock — state may be stale");
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
         
@@ -1577,7 +1576,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const detected = await detectMiningType(ctx, cachedModules || undefined);
       if (!detected) {
         ctx.log("error", "Cannot determine mining type — please check ship equipment");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
       miningType = detected;
@@ -1807,7 +1806,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
       if (!homeArrived) {
         ctx.log("error", "Failed to return to home system — will retry next cycle");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
       const { pois: homePois } = await getSystemInfo(ctx);
@@ -1826,7 +1825,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (remainingCargo.length > 0) {
         const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
         ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
       ctx.log("mining", "Cargo deposited — session complete");
@@ -1926,7 +1925,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 // No quotas at all - wait
                 ctx.log("mining", "No deep core ore quotas configured - waiting for quota setup");
                 ctx.log("mining", "Configure deepCoreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue, adamantite_ore)");
-                await sleep(60000);
+                await ctx.sleep(60000);
                 continue;
               }
             }
@@ -1934,7 +1933,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             // No deep core quotas configured - don't mine anything
             ctx.log("mining", "No deep core ore quotas configured - waiting for quota setup");
             ctx.log("mining", "Configure deepCoreQuotas for deep core ores (void_essence, fury_crystal, legacy_ore, prismatic_nebulite, exotic_matter, dark_matter_residue, adamantite_ore)");
-            await sleep(60000);
+            await ctx.sleep(60000);
             continue;
           }
 
@@ -1986,7 +1985,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
           if (!foundDeepCoreTarget) {
             ctx.log("error", "No deep core ore targets found — waiting 60s before retry");
-            await sleep(60000);
+            await ctx.sleep(60000);
             continue;
           }
         }
@@ -2060,7 +2059,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
     if (!fueled) {
       ctx.log("error", "Cannot refuel — waiting 30s...");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -2337,7 +2336,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Flock followers wait for leader to arrive first (optional synchronization)
       if (!isFlockLeader && settings.flockEnabled && settings.flockName) {
         ctx.log("flock", "Waiting 5s for leader to jump first...");
-        await sleep(5000);
+        await ctx.sleep(5000);
       }
 
       // CRITICAL FIX: If rally system is configured, navigate to it first as a waypoint
@@ -2358,13 +2357,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           const ironpeakArrived = await navigateToSystem(ctx, "ironpeak", safetyOpts);
           if (!ironpeakArrived) {
             ctx.log("error", "Failed to reach ironpeak from markeb — will retry next cycle");
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
           ctx.log("mining", "Successfully arrived at ironpeak - ready to mine exotic_matter");
         } else {
           ctx.log("error", "Failed to reach markeb system — will retry next cycle");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
       } else if (rallySystem && settings.flockEnabled && settings.flockName && rallySystem !== bot.system && rallySystem !== targetSystemId) {
@@ -2373,7 +2372,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (rallyArrived) {
           ctx.log("flock", `Arrived at rally system ${rallySystem} — proceeding to mining target ${targetSystemId}`);
           // Brief pause to sync with flock members
-          await sleep(2000);
+          await ctx.sleep(2000);
         } else {
           ctx.log("error", `Failed to reach rally system ${rallySystem} — proceeding directly to mining target`);
         }
@@ -2384,7 +2383,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (minerSettings.escortName) {
         ctx.log("escort", `Signaling escorts to jump to ${targetSystemId}...`);
         await signalEscort(ctx, "jump", targetSystemId, minerSettings.escortSignalChannel);
-        await sleep(2000); // Brief pause to let escorts read the signal
+        await ctx.sleep(2000); // Brief pause to let escorts read the signal
       }
 
       const arrived = await navigateToSystem(ctx, targetSystemId, safetyOpts);
@@ -2436,7 +2435,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (remainingCargo.length > 0) {
           const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
           ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
         ctx.log("mining", "Cargo deposited — restarting mining cycle");
@@ -2585,7 +2584,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       // if the deep core target isn't available in the current system.
       if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
         ctx.log("mining", `Deep core miner: ${effectiveTarget} not found in current system — waiting for next cycle to retry target`);
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
       
@@ -2639,7 +2638,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (!miningPoi) {
       ctx.log("error", `No ${resourceLabel} field/cloud found in this system — waiting 30s before retry`);
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -2812,7 +2811,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               if (remainingCargo.length > 0) {
                 const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
                 ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
               ctx.log("mining", "Cargo deposited — restarting mining cycle");
@@ -2915,7 +2914,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (remainingCargo.length > 0) {
         const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
         ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
       ctx.log("mining", "Cargo deposited — restarting mining cycle");
@@ -2979,12 +2978,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             const outResp = await bot.exec("travel", { target_system: firstConn.system_id });
             if (!outResp.error) {
               ctx.log("mining", `Traveled to ${targetSysName} — returning to ${homeSys}`);
-              await sleep(3000);
+              await ctx.sleep(3000);
               const backResp = await bot.exec("travel", { target_system: homeSys });
               if (!backResp.error) {
                 bot.system = homeSys;
                 ctx.log("mining", `Returned to ${homeSys} — retrying POI discovery`);
-                await sleep(3000);
+                await ctx.sleep(3000);
                 // Try get_poi again after re-entering
                 const retryDiscover = await bot.exec("get_poi", { poi_id: miningPoi.id });
                 if (!retryDiscover.error && retryDiscover.result) {
@@ -3007,7 +3006,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
 
         if (!bot.poi || bot.poi !== miningPoi.id) {
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
       }
@@ -3021,7 +3020,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const battleDetected = await handleBattleNotifications(ctx, nearbyResp.notifications, battleState);
       if (battleDetected) {
         ctx.log("error", "Battle detected at mining location - fleeing!");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
     }
@@ -3044,7 +3043,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             battleState.inBattle = true;
             battleState.isFleeing = false;
             await engageInBattle(ctx);
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -3054,7 +3053,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("combat", "Not engaging - fleeing from battle!");
       await fleeFromBattle(ctx, true, 35000);
       ctx.log("error", "Battle detected via WebSocket - fled, will retry mining");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -3076,7 +3075,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             battleState.battleId = directBattleStatus.battle_id;
             battleState.isFleeing = false;
             await engageInBattle(ctx);
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -3086,7 +3085,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("combat", "Not engaging - fleeing from battle!");
       await fleeFromBattle(ctx, true, 35000);
       ctx.log("error", "Battle detected via status check - fled, will retry mining");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -3095,7 +3094,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
       if (fled) {
         ctx.log("error", "Pirates detected - fled mining location, will retry");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
     }
@@ -3135,7 +3134,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             ctx.log("error", `CRITICAL: Cannot reach hidden POI ${targetPoiName}. At ${finalPoi}, expected ${intendedPoi}`);
             // Abort mining - we're at the wrong place
             ctx.log("error", "Aborting deep core mining - cannot reach correct hidden POI");
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         } else {
@@ -3243,7 +3242,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               if (shouldFight) {
                 ctx.log("combat", "Decided to ENGAGE attacking players in combat (periodic check)!");
                 await engageInBattle(ctx);
-                await sleep(30000);
+                await ctx.sleep(30000);
                 continue; // Continue the harvest loop while fighting
               }
             }
@@ -3274,7 +3273,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               if (shouldFight2) {
                 ctx.log("combat", "Decided to ENGAGE attacking players in combat (periodic check)!");
                 await engageInBattle(ctx);
-                await sleep(30000);
+                await ctx.sleep(30000);
                 continue; // Continue the harvest loop while fighting
               }
             }
@@ -3306,7 +3305,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           break;
         }
         // Still in battle - continue to next cycle to re-flee again
-        await sleep(2000); // Brief pause before next flee attempt
+        await ctx.sleep(2000); // Brief pause before next flee attempt
         continue;
       }
 
@@ -3452,7 +3451,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                     if (remainingCargo.length > 0) {
                       const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
                       ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
-                      await sleep(5000);
+                      await ctx.sleep(5000);
                       continue;
                     }
                     ctx.log("mining", "Cargo deposited — restarting mining cycle");
@@ -3626,7 +3625,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                           if (remainingCargo.length > 0) {
                             const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
                             ctx.log("error", `Cargo deposit FAILED — items still in cargo: ${itemsLeft}`);
-                            await sleep(5000);
+                            await ctx.sleep(5000);
                             continue;
                           }
                           ctx.log("mining", "Cargo deposited — restarting mining cycle");
@@ -4384,7 +4383,7 @@ miningType === "radioactive" ? pois.filter(p => (p.hidden === true && !canMineHi
           // Retry instead of exiting the routine
           if (poiHasTargetResource) {
             ctx.log("warn", `Equipment error but target resource is available — likely transient error, will retry`);
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue; // Retry mining
           }
           
@@ -4462,7 +4461,7 @@ miningType === "radioactive" ? pois.filter(p => (p.hidden === true && !canMineHi
           }
           
           ctx.log("warn", `Equipment error (${miningErrorCount}/3) — retrying in 10s...`);
-          await sleep(10000);
+          await ctx.sleep(10000);
           continue; // Retry mining
         }
         ctx.log("error", `Harvest error: ${mineResp.error.message}`);
@@ -4725,7 +4724,7 @@ miningType === "radioactive" ? pois.filter(p => (p.hidden === true && !canMineHi
       const docked = await ensureDocked(ctx);
       if (!docked) {
         ctx.log("error", "Failed to find station — waiting before retry");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
     } else {

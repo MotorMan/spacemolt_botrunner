@@ -8,7 +8,6 @@ import {
   repairShip,
   readSettings,
   writeSettings,
-  sleep,
   logFactionActivity,
   isOreBeltPoi,
 } from "./common.js";
@@ -716,7 +715,7 @@ export const coordinatorRoutine: Routine = async function* (ctx: RoutineContext)
 
     if (demandMap.size === 0) {
       ctx.log("coord", "No buy demand found on any known market — waiting for explorer/market data");
-      await sleep(settings.cycleIntervalSec * 1000);
+      await ctx.sleep(settings.cycleIntervalSec * 1000);
       continue;
     }
 
@@ -729,7 +728,7 @@ export const coordinatorRoutine: Routine = async function* (ctx: RoutineContext)
     const recipes = await fetchAllRecipes(ctx);
     if (recipes.length === 0) {
       ctx.log("error", "No recipes available — waiting for next cycle");
-      await sleep(settings.cycleIntervalSec * 1000);
+      await ctx.sleep(settings.cycleIntervalSec * 1000);
       continue;
     }
     ctx.log("coord", `Loaded ${recipes.length} recipes`);
@@ -953,6 +952,6 @@ export const coordinatorRoutine: Routine = async function* (ctx: RoutineContext)
 
     // ── Wait for next cycle ──
     ctx.log("info", `Next analysis in ${settings.cycleIntervalSec}s...`);
-    await sleep(settings.cycleIntervalSec * 1000);
+    await ctx.sleep(settings.cycleIntervalSec * 1000);
   }
 };

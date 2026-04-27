@@ -905,7 +905,7 @@ function connect() {
         // Re-initialize rescue systems dropdown if profile is open
         if (profileBot) mcInitRescueSystems();
         break;
-  case 'status':
+        case 'status':
         // Only update bots array if we're not in the middle of refreshing storage
         // (to avoid clobbering fresh data from our own fetches)
         if (!window._refreshingStorage) {
@@ -916,18 +916,20 @@ function connect() {
           // Update profile sidebar if open (location, credits, cargo, etc.)
           if (profileBot) {
             updateProfileSidebar();
-          
+            // Update storage/cargo dropdowns in manual controls (without full re-render)
+            updateStorageDropdowns();
+
             // If bot changed systems or docked status, refresh relevant data
             // (renderManualControls will be called when the data fetches complete)
             const bot = bots.find(b => b.username === profileBot);
             const prevBot = window._profilePrevBot;
             window._profilePrevBot = bot;
-          
+
             if (bot && prevBot && (bot.system !== prevBot.system || bot.docked !== prevBot.docked)) {
               // System changed or docked/undocked - refresh system data
               profileSystemData = null;
               fetchSystemData(profileBot);
-            
+
               // If now docked, refresh station-specific data
               if (bot.docked) {
                 profileMarket = null;
@@ -2518,6 +2520,99 @@ function renderSkillsList() {
   }).join('');
 }
 
+function updateStorageDropdowns() {
+  const bot = getProfileBot();
+  if (!bot) return;
+
+  // Use fresh data if available (set by mcExec callback), otherwise use bot data
+  const cargoItems = window._freshCargo || bot.inventory || [];
+  const storageItems = window._freshStorage || bot.storage || [];
+  const factionItems = window._freshFactionStorage || profileFactionStorage || [];
+
+  // Helper to update a select element while preserving selection
+  function updateSelect(id, items, valueField, nameField, qtyField, selectedValue) {
+    const sel = document.getElementById(id);
+    if (!sel) return;
+    const currentValue = selectedValue !== undefined ? selectedValue : sel.value;
+    let opts = items.map(i =>
+      `<option value="${esc(i[valueField])}" data-max="${i[qtyField] || 0}"${i[valueField] === currentValue ? ' selected' : ''}>${esc(i[nameField])} (${i[qtyField] || 0})</option>`
+    ).join('');
+    if (!opts) opts = '<option value="">No items</option>';
+    sel.innerHTML = opts;
+  }
+
+  // Update cargo dropdowns (sell, deposit, jettison)
+  updateSelect('mc-sell-item', cargoItems, 'itemId', 'name', 'quantity');
+  updateSelect('mc-dep-item', cargoItems, 'itemId', 'name', 'quantity');
+  updateSelect('mc-jettison-item', cargoItems, 'itemId', 'name', 'quantity');
+
+  // Update storage dropdowns (withdraw, faction deposit)
+  updateSelect('mc-wit-item', storageItems, 'itemId', 'name', 'quantity');
+  updateSelect('mc-fac-dep-item', storageItems, 'itemId', 'name', 'quantity');
+
+  // Update faction storage dropdown (withdraw)
+  const factionSelect = document.getElementById('mc-fac-wit-item');
+  if (factionSelect) {
+    const currentValue = factionSelect.value;
+    let sortedFaction = [...factionItems];
+    if (factionWithdrawSortOrder === 'alpha') {
+      sortedFaction.sort((a, b) => {
+        const nameA = (a.name || a.item_name || a.item_id || '').toLowerCase();
+        const nameB = (b.name || b.item_name || b.item_id || '').toLowerCase();
+        return nameA.localeCompare(nameB);
+      });
+    } else if (factionWithdrawSortOrder === 'quantity') {
+      sortedFaction.sort((a, b) => (b.quantity || 0) - (a.quantity || 0));
+    }
+    let opts = sortedFaction.map(i =>
+      `<option value="${esc(i.item_id)}" data-max="${i.quantity}"${i.item_id === currentValue ? ' selected' : ''}>${esc(i.name)} (${Number(i.quantity).toLocaleString()})</option>`
+    ).join('');
+    if (!opts) opts = profileFactionStorage === null ? '<option value="">Click Refresh to load</option>' : '<option value="">Empty or not available</option>';
+    factionSelect.innerHTML = opts;
+  }
+
+  // Update gift item dropdown (cargo + storage combined)
+  const giftSelect = document.getElementById('mc-gift-item');
+  if (giftSelect) {
+    const currentValue = giftSelect.value;
+    const giftItems = [];
+    for (const i of cargoItems) {
+      giftItems.push({ itemId: i.itemId, name: i.name, quantity: i.quantity, source: 'cargo' });
+    }
+    for (const i of storageItems) {
+      const existing = giftItems.find(g => g.itemId === i.itemId);
+      if (existing) {
+        existing.hasStorage = true;
+      } else {
+        giftItems.push({ itemId: i.itemId, name: i.name, quantity: i.quantity, source: 'storage' });
+      }
+    }
+    let opts = giftItems.map(i =>
+      `<option value="${esc(i.itemId)}" data-max="${i.quantity}" data-source="${i.source}"${i.itemId === currentValue ? ' selected' : ''}>${esc(i.name)} (${i.quantity})</option>`
+    ).join('');
+    if (!opts) opts = '<option value="">No items</option>';
+    giftSelect.innerHTML = opts;
+  }
+
+  // Update ammo dropdown for weapon reload (from cargo)
+  const ammoSelect = document.getElementById('mc-ammo-select');
+  if (ammoSelect) {
+    const currentValue = ammoSelect.value;
+    const ammoItems = cargoItems.filter(i =>
+      i.itemId.toLowerCase().includes('ammo') ||
+      i.itemId.toLowerCase().includes('missile') ||
+      i.itemId.toLowerCase().includes('rocket') ||
+      i.itemId.toLowerCase().includes('torpedo') ||
+      i.itemId.toLowerCase().includes('plasma')
+    );
+    let opts = ammoItems.map(a =>
+      `<option value="${esc(a.itemId)}" data-max="${a.quantity}"${a.itemId === currentValue ? ' selected' : ''}>${esc(a.name)} (${a.quantity})</option>`
+    ).join('');
+    if (!opts) opts = '<option value="">No ammo in cargo</option>';
+    ammoSelect.innerHTML = opts;
+  }
+}
+
 function renderManualControls(isFreshRender) {
   // Block re-render if we just rendered with fresh data from storage refresh
   if (!isFreshRender && window._blockRenderUntil && Date.now() < window._blockRenderUntil) {
@@ -3073,10 +3168,13 @@ function mcRefreshFactionStorage() {
       profileFactionStorage = items;
       logResponse(`<span class="resp-ok">Loaded ${items.length} faction storage items</span>`);
       renderManualControls();
+      // Also update dropdowns directly in case renderManualControls was blocked
+      updateStorageDropdowns();
     } else {
       profileFactionStorage = [];
       logResponse(`<span class="resp-err">Failed to load faction storage: ${esc(result.error || 'not at station')}</span>`);
       renderManualControls();
+      updateStorageDropdowns();
     }
   });
 }
@@ -4949,6 +5047,8 @@ function mcExec(command, params) {
           // Render with fresh data, then block re-renders for 3 seconds
           renderProfileSidebar();
           renderManualControls(true); // true = force render (don't block)
+          // Also update dropdowns directly to preserve selections
+          updateStorageDropdowns();
           window._blockRenderUntil = Date.now() + 3000;
           // Clear fresh data variables after rendering
           setTimeout(() => {
@@ -5453,6 +5553,7 @@ function fetchFactionStorage(username) {
       profileFactionStorage = [];
       globalFactionStorage = []; // also clear global
       renderManualControls();
+      updateStorageDropdowns();
       return;
     }
     const d = result.data || {};
@@ -5460,6 +5561,7 @@ function fetchFactionStorage(username) {
     // Also update global faction storage for market tab
     globalFactionStorage = profileFactionStorage;
     renderManualControls();
+    updateStorageDropdowns();
     // Refresh market if visible
     if (document.getElementById('page-market')?.classList.contains('active')) {
       renderMarketTable();

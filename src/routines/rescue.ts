@@ -14,7 +14,6 @@ import {
   scavengeWrecks,
   detectAndRecoverFromDeath,
   readSettings,
-  sleep,
   logStatus,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
@@ -680,12 +679,12 @@ async function emergencyFleeFromPirates(
     // If battle was detected during polling, flee was already issued
     if (battleDetectedDuringJump) {
       ctx.log("combat", "Battle detected during rescue flee jump - waiting for flee to complete...");
-      await sleep(3000);
+      await ctx.sleep(3000);
       return;
     }
 
     // After fleeing, scan again to ensure we're safe
-    await sleep(2000);
+    await ctx.sleep(2000);
     const fled = await checkAndFleeFromPiratesRescue(ctx, "post-flee scan");
     if (fled) {
       ctx.log("combat", "⚠️ Pirates followed us! Continuing to flee...");
@@ -1416,11 +1415,11 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "rescue")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -1583,7 +1582,7 @@ skipToReturnHome = true;
       const fleet = ctx.getFleetStatus?.() || [];
       if (fleet.length === 0) {
         ctx.log("info", "No fleet data available — waiting...");
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -1875,7 +1874,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             // Use default 3 second delay
             const cooperationDelay = 3000;
             ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for partner claim...`);
-            await sleep(cooperationDelay);
+            await ctx.sleep(cooperationDelay);
 
             // Re-check for partner claims after delay
             partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
@@ -1941,7 +1940,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                       ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                       await fleeFromBattle(ctx);
-                      await sleep(5000);
+                      await ctx.sleep(5000);
                       continue;
                     }
                     ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -2006,7 +2005,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                   if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                     ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                     await fleeFromBattle(ctx);
-                    await sleep(5000);
+                    await ctx.sleep(5000);
                     continue;
                   }
                   ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -2043,7 +2042,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           idleStartTime = 0;
         }
 
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -2108,7 +2107,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     }
 
     if (!target) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -2116,7 +2115,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     if (!target.system || target.system.trim() === "") {
       ctx.log("rescue", `⚠️ Target ${target.username} has no valid system — refreshing status and skipping...`);
       ctx.log("rescue", `💡 This can happen with stale fleet data or hidden POIs`);
-      await sleep(settings.scanIntervalSec * 1000);
+      await ctx.sleep(settings.scanIntervalSec * 1000);
       continue;
     }
 
@@ -2219,7 +2218,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             const fueled = await ensureFueled(ctx, settings.refuelThreshold);
             if (!fueled) {
               ctx.log("error", "Cannot refuel self — waiting before retry...");
-              await sleep(settings.scanIntervalSec * 1000);
+              await ctx.sleep(settings.scanIntervalSec * 1000);
               continue;
             }
           } else {
@@ -2263,7 +2262,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (mayday) markMaydayHandled(mayday);
           }
           
-          await sleep(settings.scanIntervalSec * 1000);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }
 
@@ -2288,7 +2287,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (mayday) markMaydayHandled(mayday);
           }
           
-          await sleep(settings.scanIntervalSec * 1000);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }
 
@@ -2393,7 +2392,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           // If we still don't have a route, wait a bit and retry
           if (!routeToTarget && routeAttempts < MAX_ROUTE_ATTEMPTS) {
             ctx.log("rescue", `📍 Route attempt ${routeAttempts} failed - retrying in 1s...`);
-            await sleep(1000);
+            await ctx.sleep(1000);
           }
         }
         
@@ -2412,7 +2411,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (mayday) markMaydayHandled(mayday);
           }
           
-          await sleep(settings.scanIntervalSec * 1000);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }
 
@@ -2480,7 +2479,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (failures >= 3) {
               ctx.log("error", `❌ ${failureReason} — ABORTING after ${failures} consecutive failures`);
               await failRescueSession(bot.username, `Aborted after ${failures} consecutive navigation failures`);
-              await sleep(settings.scanIntervalSec * 1000);
+              await ctx.sleep(settings.scanIntervalSec * 1000);
               continue;
             }
 
@@ -2491,7 +2490,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               await failRescueSession(bot.username, "Could not reach target system");
             }
           }
-          await sleep(settings.scanIntervalSec * 1000);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }
         // CRITICAL: Refresh status to update bot.system after navigation
@@ -2505,7 +2504,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (recoveredSession || getActiveRescueSession(bot.username)) {
             await failRescueSession(bot.username, "Pirates detected on arrival - fleeing");
           }
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
 
@@ -2621,12 +2620,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                    await completeRescueSession(bot.username);
                  }
                }
-               await sleep(settings.scanIntervalSec * 1000);
+               await ctx.sleep(settings.scanIntervalSec * 1000);
                continue;
              }
            } else {
              ctx.log("error", `get_nearby scan failed after POI travel failure: ${nearbyResp.error?.message || 'unknown error'}`);
-             await sleep(settings.scanIntervalSec * 1000);
+             await ctx.sleep(settings.scanIntervalSec * 1000);
              continue;
            }
          }
@@ -2652,7 +2651,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (recoveredSession || getActiveRescueSession(bot.username)) {
           await failRescueSession(bot.username, "Pirates detected before refuel - fleeing");
         }
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -2669,7 +2668,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             // Re-add to queue so another bot can try
             // (For now, just log - the MAYDAY is already marked as handled)
           }
-          await sleep(settings.scanIntervalSec * 1000);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }
 
@@ -2893,7 +2892,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -2955,7 +2954,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
               await fleeFromBattle(ctx);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
             ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
@@ -3144,7 +3143,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     isReturningIdle = false;
 
     // Short cooldown before next scan
-    await sleep(10000);
+    await ctx.sleep(10000);
   }
 
   // Cleanup when routine exits
@@ -3185,7 +3184,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
   if (!rescueParams) {
     ctx.log("error", "No rescue parameters provided! Need targetSystem, targetPOI, and targetPlayer.");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -3200,11 +3199,11 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "manual_rescue")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -3236,7 +3235,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         const fueled = await ensureFueled(ctx, settings.refuelThreshold);
         if (!fueled) {
           ctx.log("error", "Cannot refuel self — aborting mission");
-          await sleep(5000);
+          await ctx.sleep(5000);
           return;
         }
       }
@@ -3252,7 +3251,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
       const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Could not reach ${targetSystem} — aborting mission`);
-        await sleep(5000);
+        await ctx.sleep(5000);
         return;
       }
     }
@@ -3270,7 +3269,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
       const currentPoi = targetBotCheck.poi;
       if (currentSystem && currentSystem !== targetSystem) {
         ctx.log("rescue", `⚠️ Target moved from ${targetSystem} to ${currentSystem} - aborting manual rescue`);
-        await sleep(5000);
+        await ctx.sleep(5000);
         return;
       }
       if (currentPoi && currentPoi !== targetPOI) {
@@ -3477,7 +3476,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -3519,7 +3518,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
               await fleeFromBattle(ctx);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
           }
@@ -3617,11 +3616,11 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "mayday_rescue")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -3687,7 +3686,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         // No pending MAYDAYs - idle and wait
         ctx.log("mayday", "No pending MAYDAY requests - standing by...");
         yield "idle";
-        await sleep(10000); // Check every 10 seconds
+        await ctx.sleep(10000); // Check every 10 seconds
         continue;
       }
 
@@ -3732,7 +3731,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
     // mayday is guaranteed to be set at this point (either from recovery or fresh)
     if (!mayday) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -3756,7 +3755,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         const fueled = await ensureFueled(ctx, settings.refuelThreshold);
         if (!fueled) {
           ctx.log("error", "Cannot refuel self - cannot respond to MAYDAY");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
       }
@@ -3786,7 +3785,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     if (maxJumps > 0 && jumpsToTarget > maxJumps) {
       ctx.log("mayday", `⚠️ MAYDAY too far: ${jumpsToTarget} jumps (max: ${maxJumps}) - ignoring`);
       markMaydayHandled(mayday);
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
     
@@ -3853,7 +3852,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
           await failRescueSession(bot.username, "Could not reach target system");
         }
         markMaydayHandled(mayday);
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
       // Update session state after successful navigation
@@ -4059,7 +4058,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -4105,7 +4104,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
               await fleeFromBattle(ctx);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
           }
@@ -4173,7 +4172,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
     await ensurePremiumFuelReserve(ctx, settings.premiumFuelReserve);
 
     // Short cooldown before next scan
-    await sleep(10000);
+    await ctx.sleep(10000);
   }
 };
 
@@ -4308,11 +4307,11 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "rescue")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -4482,7 +4481,7 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       const fleet = ctx.getFleetStatus?.() || [];
       if (fleet.length === 0) {
         ctx.log("info", "No fleet data available — waiting...");
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -4774,7 +4773,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             // Use default 3 second delay
             const cooperationDelay = 3000;
             ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for partner claim...`);
-            await sleep(cooperationDelay);
+            await ctx.sleep(cooperationDelay);
 
             // Re-check for partner claims after delay
             partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
@@ -4838,7 +4837,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                       ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                       await fleeFromBattle(ctx);
-                      await sleep(5000);
+                      await ctx.sleep(5000);
                       continue;
                     }
                     ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -4903,7 +4902,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                   if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                     ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                     await fleeFromBattle(ctx);
-                    await sleep(5000);
+                    await ctx.sleep(5000);
                     continue;
                   }
                   ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -4984,7 +4983,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (!bot.docked) {
             await scavengeWrecks(ctx);
           }
-          await sleep(settings.scanIntervalSec * 1000);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }
       }
@@ -4997,7 +4996,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     if (!target) {
       // Should not happen, but safety check
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -5005,7 +5004,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     if (!target.system || target.system.trim() === "") {
       ctx.log("rescue", `⚠️ Target ${target.username} has no valid system — refreshing status and skipping...`);
       ctx.log("rescue", `💡 This can happen with stale fleet data or hidden POIs`);
-      await sleep(settings.scanIntervalSec * 1000);
+      await ctx.sleep(settings.scanIntervalSec * 1000);
       continue;
     }
 
@@ -5109,7 +5108,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       const fueled = await ensureFueled(ctx, settings.refuelThreshold);
       if (!fueled) {
         ctx.log("error", "Cannot refuel self — waiting before retry...");
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
     } else {
@@ -5203,7 +5202,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (recoveredSession || getActiveRescueSession(bot.username)) {
           await failRescueSession(bot.username, "Could not acquire fuel cells or credits");
         }
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
     } else {
@@ -5237,7 +5236,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (mayday) markMaydayHandled(mayday);
         }
         
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -5262,7 +5261,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (mayday) markMaydayHandled(mayday);
         }
         
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -5359,7 +5358,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         
         if (!routeToTarget && routeAttempts < MAX_ROUTE_ATTEMPTS) {
           ctx.log("rescue", `📍 Route attempt ${routeAttempts} failed - retrying in 1s...`);
-          await sleep(1000);
+          await ctx.sleep(1000);
         }
       }
       
@@ -5377,7 +5376,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (mayday) markMaydayHandled(mayday);
         }
         
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -5445,7 +5444,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (failures >= 3) {
             ctx.log("error", `❌ ${failureReason} — ABORTING after ${failures} consecutive failures`);
             await failRescueSession(bot.username, `Aborted after ${failures} consecutive navigation failures`);
-            await sleep(settings.scanIntervalSec * 1000);
+            await ctx.sleep(settings.scanIntervalSec * 1000);
             continue;
           }
 
@@ -5456,7 +5455,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             await failRescueSession(bot.username, "Could not reach target system");
           }
         }
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -5560,7 +5559,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
             ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
             await fleeFromBattle(ctx);
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
         }
@@ -5592,7 +5591,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
                 if (!jumpResp.error || jumpResp.error.message.includes("already")) {
                   // Now jump back to the target POI
-                  await sleep(2000); // Brief pause for system to update
+                  await ctx.sleep(2000); // Brief pause for system to update
 
                   ctx.log("rescue", `🚀 Jumping back to ${targetPoiName} from ${jumpGate.name}...`);
                   const returnResp = await bot.exec("travel", { target_poi: travelTarget });
@@ -5628,7 +5627,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         // If we haven't succeeded and this is our bot, refresh position again
         if (!travelSuccess && isOurBot && travelAttempts < maxTravelAttempts) {
           ctx.log("rescue", `⏳ Waiting before next attempt for ${target.username}...`);
-          await sleep(3000);
+          await ctx.sleep(3000);
         }
       }
 
@@ -5665,7 +5664,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 const jumpResp = await bot.exec("travel", { target_poi: jumpGate.id });
                 
                 if (!jumpResp.error || jumpResp.error.message.includes("already")) {
-                  await sleep(2000);
+                  await ctx.sleep(2000);
                   ctx.log("rescue", `🚀 Jumping back to ${target.poi} from ${jumpGate.name}...`);
                   const returnResp = await bot.exec("travel", { target_poi: target.poi });
                   
@@ -5710,7 +5709,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             }
             
             // Don't fail the session permanently - just continue the loop
-            await sleep(10000);
+            await ctx.sleep(10000);
             continue;
           }
           
@@ -5802,7 +5801,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                   ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                   await fleeFromBattle(ctx);
-                  await sleep(5000);
+                  await ctx.sleep(5000);
                   continue;
                 }
               }
@@ -5863,7 +5862,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             }
             
             // Retry by continuing the loop without failing the session
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
 
@@ -5924,7 +5923,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                       ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                       await fleeFromBattle(ctx);
-                      await sleep(5000);
+                      await ctx.sleep(5000);
                       continue;
                     }
                   }
@@ -5960,7 +5959,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
       if (!targetPlayerId) {
         ctx.log("error", `Could not find player ID for ${target.username} — aborting transfer`);
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -6069,7 +6068,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
               await fleeFromBattle(ctx);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
           }
@@ -6216,7 +6215,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -6262,7 +6261,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
               await fleeFromBattle(ctx);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
           }
@@ -6330,7 +6329,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     isReturningIdle = false;
 
     // Short cooldown before next scan
-    await sleep(10000);
+    await ctx.sleep(10000);
   }
 
   // Cleanup when routine exits

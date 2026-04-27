@@ -23,7 +23,6 @@ import {
   fullSalvageWrecks,
   processTowedWrecks,
   getSystemInfo,
-  sleep,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
   getBattleStatus,
@@ -197,11 +196,11 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "salvager")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -236,7 +235,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
     if (!fueled) {
       ctx.log("error", "Cannot refuel — waiting 30s...");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -284,7 +283,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (!skipScanning && visitPois.length === 0) {
       ctx.log("error", "No salvageable POIs in this system — waiting 60s");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -325,7 +324,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
             battleState.isFleeing = false;
           } else {
             // Still in battle - wait briefly and continue to next cycle to re-flee
-            await sleep(2000);
+            await ctx.sleep(2000);
             continue;
           }
         }
@@ -722,7 +721,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     const dockResp = await bot.exec("dock");
     if (dockResp.error && !dockResp.error.message.includes("already")) {
       ctx.log("error", `Dock failed: ${dockResp.error.message}`);
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
     bot.docked = true;
@@ -863,7 +862,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     // If nothing was found, wait longer before next sweep
     if (totalLooted === 0) {
       ctx.log("scavenge", "No wrecks found — waiting 60s before next sweep");
-      await sleep(60000);
+      await ctx.sleep(60000);
     }
   }
 };

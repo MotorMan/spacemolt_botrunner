@@ -20,7 +20,6 @@ import {
   maxItemsForCargo,
   getItemSize,
   readSettings,
-  sleep,
   logFactionActivity,
   isPirateSystem,
   type BaseServices,
@@ -424,7 +423,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
   // Validate home system is configured
   if (!settings.homeSystem) {
     ctx.log("error", "No home system configured for trade buyer — please set homeSystem in settings");
-    await sleep(60000);
+    await ctx.sleep(60000);
     return;
   }
 
@@ -432,7 +431,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
   const homeStation = getHomeStation(settings.homeSystem);
   if (!homeStation) {
     ctx.log("error", `Cannot find station in home system ${settings.homeSystem}`);
-    await sleep(60000);
+    await ctx.sleep(60000);
     return;
   }
 
@@ -444,11 +443,11 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "trade_buyer")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -502,7 +501,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Cannot refuel for recovered session — will retry next cycle");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
 
@@ -522,7 +521,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       if (!arrived) {
         ctx.log("error", "Failed to reach home system — will retry");
         await ensureDocked(ctx);
-        await sleep(60000);
+        await ctx.sleep(60000);
         continue;
       }
 
@@ -627,7 +626,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     if (routes.length === 0 && !recoveredSession) {
       ctx.log("trade", "No profitable buy opportunities found — waiting 60s before re-scanning");
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -694,7 +693,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
             battleState.isFleeing = false;
           } else {
             // Still in battle - wait briefly and continue to next cycle to re-flee
-            await sleep(2000);
+            await ctx.sleep(2000);
             continue;
           }
         }
@@ -725,7 +724,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
           const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
           if (!fueled) {
             ctx.log("error", "Cannot refuel for buy run — waiting 30s");
-            await sleep(30000);
+            await ctx.sleep(30000);
             break;
           }
 
@@ -784,7 +783,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
             const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
             if (fled) {
               ctx.log("error", "Pirates detected at source - fled, will retry");
-              await sleep(30000);
+              await ctx.sleep(30000);
               continue;
             }
           }
@@ -983,7 +982,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       }
 
       ctx.log("trade", "All routes failed — waiting 60s before re-scanning");
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -1000,7 +999,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       battleState.isFleeing = false;
       await fleeFromBattle(ctx, false, 5000);
       await ensureDocked(ctx);
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -1009,7 +1008,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     if (!fueled2) {
       ctx.log("error", "Cannot refuel for delivery — will retry next cycle");
       await ensureDocked(ctx);
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -1057,7 +1056,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
         await ensureDocked(ctx);
         ctx.log("trade", "Docked and waiting for network recovery — buy session preserved");
-        await sleep(60000);
+        await ctx.sleep(60000);
         continue;
       }
     }
@@ -1073,7 +1072,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       battleState.battleId = preHomeStationBattleCheck.battle_id;
       battleState.isFleeing = false;
       await fleeFromBattle(ctx, false, 5000);
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
     

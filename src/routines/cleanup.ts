@@ -20,7 +20,6 @@ import {
   detectAndRecoverFromDeath,
   maxItemsForCargo,
   readSettings,
-  sleep,
   logFactionActivity,
   isPirateSystem,
   getSystemInfo,
@@ -414,7 +413,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     // Check for battle after travel
     if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
       ctx.log("combat", "Battle detected during travel to home station - fleeing!");
-      await sleep(5000);
+      await ctx.sleep(5000);
       return;
     }
 
@@ -438,7 +437,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
 
   // Check for battle after dock
   if (await checkAndFleeFromBattle(ctx, "dock")) {
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -534,7 +533,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(10000); continue; }
+    if (!alive) { await ctx.sleep(10000); continue; }
 
     // ── Battle state tracking (per-cycle initialization) ──
     const battleState: BattleState = {
@@ -547,7 +546,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "cleanup")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -767,7 +766,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
         ? `No items at focus station — waiting 30 seconds`
         : "No stations with stored items — waiting 30 seconds";
       ctx.log("info", waitMsg);
-      await sleep(30000);
+      await ctx.sleep(30000);
 
       emptyScanCount++;
 
@@ -899,7 +898,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
         // Check for battle after travel
         if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
           ctx.log("combat", "Battle detected during travel - fleeing!");
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
 
@@ -908,7 +907,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
           // CRITICAL: Check for battle interrupt error
           if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
             ctx.log("combat", `Travel to station interrupted by battle! ${tResp.error.message} - fleeing!`);
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
           if (!errMsg.includes("already")) {
@@ -963,7 +962,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Check for battle after dock
       if (await checkAndFleeFromBattle(ctx, "dock")) {
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -1073,6 +1072,6 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Wait before next run
     ctx.log("info", "Next cleanup run in 30 seconds");
-    await sleep(30000);
+    await ctx.sleep(30000);
   }
 };

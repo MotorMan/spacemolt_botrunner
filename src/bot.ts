@@ -55,6 +55,8 @@ export interface RoutineContext {
   api: SpaceMoltAPI;
   bot: Bot;
   log: (category: string, message: string) => void;
+  /** Interruptible sleep - checks for stop signal periodically. */
+  sleep: (ms: number) => Promise<void>;
   /** Optional: get status of all bots in the fleet (used by rescue routine). */
   getFleetStatus?: () => BotStatus[];
   /** Optional: send a chat message to other bots. */
@@ -856,6 +858,24 @@ export class Bot {
       api: this.api,
       bot: this,
       log: (cat, msg) => this.log(cat, msg),
+      // Interruptible sleep that checks for stop signal every 100ms
+      sleep: (ms: number) => {
+        return new Promise<void>((resolve) => {
+          const start = Date.now();
+          const self = this; // Capture this for use in setInterval callback
+          const timer = setInterval(() => {
+            if (self._state === "stopping") {
+              clearInterval(timer);
+              resolve();
+              return;
+            }
+            if (Date.now() - start >= ms) {
+              clearInterval(timer);
+              resolve();
+            }
+          }, 100);
+        });
+      },
       getFleetStatus: opts?.getFleetStatus,
       sendBotChat: opts?.sendBotChat,
       getAllBotNames: opts?.getAllBotNames,
@@ -867,8 +887,8 @@ export class Bot {
           this.log("system", `Stopped during state: ${stateName}`);
           break;
         }
-        // Small gap between actions
-        await sleep(2000);
+        // Small gap between actions - use interruptible sleep
+        await ctx.sleep(2000);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);

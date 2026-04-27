@@ -8,7 +8,6 @@ import {
   detectAndRecoverFromDeath,
   readSettings,
   scavengeWrecks,
-  sleep,
   logFactionActivity,
 } from "./common.js";
 import {
@@ -37,6 +36,16 @@ const SHIP_PASSIVE_RECIPE_IDS = new Set([
   "onboard_alloy_synthesis",
   "onboard_munitions_fabrication",
 ]);
+
+/** Recipes that should NEVER be used - they are inefficient/wasteful */
+const BLACKLISTED_RECIPES = new Set([
+  "basic_silicon_refinement", // Noob trap - severe waste of basic materials
+]);
+
+/** Recipes that should be heavily penalized - only use as absolute last resort */
+const PENALTY_RECIPES: Record<string, number> = {
+  "synthesize_bio_polymer": -1000, // Massive penalty - materials better suited for other recipes
+};
 
 /** Processing mode for goal-based crafting */
 type GoalProcessingMode = "batch" | "round-robin";
@@ -624,8 +633,11 @@ async function craftPrerequisites(
 
     // Score each recipe by material availability
     let bestRecipe: Recipe | null = null;
-    let bestScore = -1;
+    let bestScore = -Infinity;
     for (const r of allRecipesForComp) {
+      // Skip blacklisted recipes
+      if (BLACKLISTED_RECIPES.has(r.recipe_id)) continue;
+
       let score = 0;
       let totalNeeded = 0;
       for (const c of r.components) {
@@ -636,16 +648,18 @@ async function craftPrerequisites(
       // Prefer recipes where we have more complete materials
       if (totalNeeded > 0) {
         const pctScore = Math.round((score / totalNeeded) * 100);
-        if (pctScore > bestScore) {
-          bestScore = pctScore;
-          bestRecipe = r;
-        }
+        score = pctScore;
       } else {
         // No ingredients needed - this is a simple recipe
-        if (bestScore < 50) {
-          bestScore = 50;
-          bestRecipe = r;
-        }
+        score = 50;
+      }
+      // Apply penalties for undesirable recipes
+      if (r.recipe_id in PENALTY_RECIPES) {
+        score += PENALTY_RECIPES[r.recipe_id];
+      }
+      if (score > bestScore) {
+        bestScore = score;
+        bestRecipe = r;
       }
     }
 
@@ -811,6 +825,9 @@ async function craftFromCategories(
     const recipeCategory = recipe.category || "";
     if (!enabledCategories.includes(recipeCategory)) continue;
 
+    // Skip blacklisted recipes
+    if (BLACKLISTED_RECIPES.has(recipe.recipe_id)) continue;
+
     // Skip recipes with no ingredients
     if (recipe.components.length === 0) continue;
     // Skip recipes that cannot be crafted manually
@@ -827,7 +844,12 @@ async function craftFromCategories(
       totalNeeded += c.quantity;
       materialScore += Math.min(have, c.quantity);
     }
-    const materialPct = totalNeeded > 0 ? Math.round((materialScore / totalNeeded) * 100) : 50;
+    let materialPct = totalNeeded > 0 ? Math.round((materialScore / totalNeeded) * 100) : 50;
+
+    // Apply penalties for undesirable recipes
+    if (recipe.recipe_id in PENALTY_RECIPES) {
+      materialPct += PENALTY_RECIPES[recipe.recipe_id];
+    }
 
     const priority = categoryPriority[recipeCategory] || 99;
     candidates.push({ recipe, priority, complexity: materialPct }); // Use complexity field to store material score
@@ -878,18 +900,18 @@ async function craftFromCategories(
       }
     }
 
-    // If there are multiple recipes producing same output, pick the one with most materials
+    // If there are multiple recipes producing same output, pick the one with best score (including penalties)
     if (target) {
       const outputId = target.output_item_id;
+      const targetCandidate = candidates.find(c => c.recipe === target);
       const alternatives = candidates.filter(c => c.recipe.output_item_id === outputId && c.recipe !== target);
       for (const alt of alternatives) {
         if (hasMaterialsAnywhere(ctx, alt.recipe, 1, personalMode)) {
-          // Compare material availability
-          let targetScore = 0, altScore = 0;
-          for (const c of target.components) targetScore += Math.min(countItem(ctx, c.item_id, personalMode), c.quantity);
-          for (const c of alt.recipe.components) altScore += Math.min(countItem(ctx, c.item_id, personalMode), c.quantity);
+          // Compare using pre-calculated complexity score (includes penalties)
+          const targetScore = targetCandidate?.complexity ?? 0;
+          const altScore = alt.complexity;
           if (altScore > targetScore) {
-            ctx.log("craft", `Switching from ${target.name} to ${alt.recipe.name} (more materials available)`);
+            ctx.log("craft", `Switching from ${target.name} to ${alt.recipe.name} (better score: ${altScore} vs ${targetScore})`);
             target = alt.recipe;
           }
         }
@@ -1110,7 +1132,7 @@ async function executeCraftingPlan(
 
         // Small delay between crafts in round-robin mode
         if (result.crafted > 0) {
-          await sleep(500);
+          await ctx.sleep(500);
         }
       }
     }
@@ -1232,7 +1254,7 @@ async function craftRecipeWithPrereqs(
 
     // Small delay after withdrawal
     if (batchSize > 1) {
-      await sleep(300);
+      await ctx.sleep(300);
     }
 
     // Execute the craft command
@@ -1319,7 +1341,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     const settings = getCrafterSettings();
 
@@ -1337,7 +1359,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     const recipes = await fetchAllRecipes(ctx);
     if (recipes.length === 0) {
       ctx.log("error", "No recipes available — waiting 60s");
-      await sleep(10000);
+      await ctx.sleep(10000);
       continue;
     }
 
@@ -1486,7 +1508,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
       } else {
         ctx.log("info", `No materials available for enabled categories. Waiting 60s...`);
-        await sleep(60000);
+        await ctx.sleep(60000);
       }
       continue;
     }
@@ -1499,7 +1521,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("craft", `Crafted: ${categoryCrafted.join(", ")}`);
       } else {
         ctx.log("info", `No materials available for assigned categories. Waiting 60s...`);
-        await sleep(60000);
+        await ctx.sleep(60000);
       }
       continue;
     }
@@ -1536,7 +1558,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (allPlanItems.length === 0) {
       ctx.log("craft", `✓ All goals already met - nothing to craft`);
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -1669,6 +1691,6 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Wait before next cycle ──
     ctx.log("info", "Waiting 60s before next crafting cycle...");
-    await sleep(10000);
+    await ctx.sleep(10000);
   }
 };

@@ -8,7 +8,6 @@ import {
   findStation,
   isStationPoi,
   readSettings,
-  sleep,
   checkAndFleeFromBattle,
   repairShip,
 } from "./common.js";
@@ -237,7 +236,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
         if (navAttempts < MAX_NAV_ATTEMPTS) {
           const waitTime = 10000 * navAttempts; // 10s, 20s, 30s
           ctx.log("travel", `API timeout detected - waiting ${waitTime/1000}s before retry...`);
-          await sleep(waitTime);
+          await ctx.sleep(waitTime);
           await bot.refreshStatus();
         }
       }

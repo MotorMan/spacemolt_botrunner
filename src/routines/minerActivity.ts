@@ -18,10 +18,6 @@ let cachedData: string | null = null;
 let writeTimer: NodeJS.Timeout | null = null;
 let isFlushPending = false;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 export type MiningSessionState = "traveling_to_ore" | "mining" | "returning_home" | "depositing" | "completed" | "abandoned" | "failed";
 
 export type MiningType = "ore" | "gas" | "ice" | "radioactive";
@@ -88,7 +84,7 @@ export function loadMinerActivity(): MinerActivityData {
   return {};
 }
 
-async function saveWithRetry(data: string): Promise<boolean> {
+async function saveWithRetry(data: string, ctx?: { sleep: (ms: number) => Promise<void> }): Promise<boolean> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       // Write directly to the activity file
@@ -100,7 +96,11 @@ async function saveWithRetry(data: string): Promise<boolean> {
       if (attempt < MAX_RETRIES) {
         // Exponential backoff
         const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-        await sleep(delay);
+        if (ctx) {
+          await ctx.sleep(delay);
+        } else {
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
     }
   }

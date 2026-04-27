@@ -13,10 +13,6 @@ const ACTIVITY_FILE_TEMP = join(DATA_DIR, "traderActivity.json.tmp");
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 100;
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 export type TradeSessionState = "buying" | "in_transit" | "at_destination" | "selling" | "completed" | "abandoned" | "failed";
 
 export interface TradeSession {
@@ -89,7 +85,7 @@ export function loadTraderActivity(): TraderActivityData {
   return {};
 }
 
-async function saveWithRetry(data: string): Promise<boolean> {
+async function saveWithRetry(data: string, ctx?: { sleep: (ms: number) => Promise<void> }): Promise<boolean> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
       // Step 1: Create backup of existing file if it exists
@@ -125,7 +121,11 @@ async function saveWithRetry(data: string): Promise<boolean> {
       if (attempt < MAX_RETRIES) {
         // Exponential backoff
         const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-        await sleep(delay);
+        if (ctx) {
+          await ctx.sleep(delay);
+        } else {
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
       }
     }
   }

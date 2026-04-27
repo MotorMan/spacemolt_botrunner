@@ -908,7 +908,10 @@ function connect() {
         case 'status':
         // Only update bots array if we're not in the middle of refreshing storage
         // (to avoid clobbering fresh data from our own fetches)
-        if (!window._refreshingStorage) {
+        // Also check if we recently refreshed storage (within last 10 seconds)
+        const _storageRefreshTime = window._lastStorageRefresh || 0;
+        const _blockStatusUpdate = window._refreshingStorage || (Date.now() - _storageRefreshTime < 10000);
+        if (!_blockStatusUpdate) {
           bots = msg.bots || [];
           renderBots();
           renderStats();
@@ -942,7 +945,8 @@ function connect() {
             }
           }
         } else {
-          console.log('[DEBUG] status handler: BLOCKED - window._refreshingStorage is true');
+          const _reason = window._refreshingStorage ? 'refreshingStorage is true' : `recently refreshed (${(Date.now() - _storageRefreshTime) / 1000}s ago)`;
+          console.log(`[DEBUG] status handler: BLOCKED - ${_reason}`);
         }
         break;
       case 'log':
@@ -2384,12 +2388,16 @@ function renderProfileSidebar() {
   const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
   const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
 
-  const invItems = bot.inventory && bot.inventory.length > 0
-    ? bot.inventory.map(i => `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`).join('')
+  // Use fresh data if available (set by handleExecResult callback), otherwise use bot data
+  const freshCargo = window._freshCargo || bot.inventory || [];
+  const freshStorage = window._freshStorage || bot.storage || [];
+
+  const invItems = freshCargo.length > 0
+    ? freshCargo.map(i => `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`).join('')
     : '<div class="inv-empty">Empty</div>';
 
-  const storItems = bot.storage && bot.storage.length > 0
-    ? bot.storage.map(i => `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`).join('')
+  const storItems = freshStorage.length > 0
+    ? freshStorage.map(i => `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`).join('')
     : '<div class="inv-empty">Empty</div>';
 
   document.getElementById('profileSidebar').innerHTML = `
@@ -2463,16 +2471,20 @@ function updateProfileSidebar() {
 
   // Only update cargo/storage/skills cards if sidebar doesn't have focus
   if (!sidebar.contains(document.activeElement)) {
+    // Use fresh data if available, otherwise use bot data
+    const freshCargo = window._freshCargo || bot.inventory || [];
+    const freshStorage = window._freshStorage || bot.storage || [];
+
     // Update cargo hold
-    const invItems = bot.inventory && bot.inventory.length > 0
-      ? bot.inventory.map(i => `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`).join('')
+    const invItems = freshCargo.length > 0
+      ? freshCargo.map(i => `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`).join('')
       : '<div class="inv-empty">Empty</div>';
     const cargoCard = sidebar.querySelector('.profile-card:nth-child(2) .inv-list');
     if (cargoCard) cargoCard.innerHTML = invItems;
 
     // Update station storage
-    const storItems = bot.storage && bot.storage.length > 0
-      ? bot.storage.map(i => `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`).join('')
+    const storItems = freshStorage.length > 0
+      ? freshStorage.map(i => `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`).join('')
       : '<div class="inv-empty">Empty</div>';
     const storageCard = sidebar.querySelector('.profile-card:nth-child(3) .inv-list');
     if (storageCard) storageCard.innerHTML = storItems;
@@ -5044,18 +5056,20 @@ function mcExec(command, params) {
       const checkAllDone = () => {
         if (pendingFetches <= 0) {
           window._refreshingStorage = false;
+          window._lastStorageRefresh = Date.now(); // Mark when we last refreshed storage
           // Render with fresh data, then block re-renders for 3 seconds
           renderProfileSidebar();
           renderManualControls(true); // true = force render (don't block)
           // Also update dropdowns directly to preserve selections
           updateStorageDropdowns();
-          window._blockRenderUntil = Date.now() + 3000;
-          // Clear fresh data variables after rendering
+          window._blockRenderUntil = Date.now() + 10000; // Block re-renders for 10 seconds
+          // Clear fresh data variables after sufficient time (15 seconds)
+          // This gives time for any pending status messages to be processed
           setTimeout(() => {
             window._freshCargo = null;
             window._freshStorage = null;
             window._freshFactionStorage = null;
-          }, 100);
+          }, 15000);
         }
       };
 
@@ -5502,7 +5516,36 @@ function fetchMarket(username) {
 }
 
 function fetchSkills(username) {
+  // Set to null to show "Loading..." message
+  profileSkillsList = null;
+  renderProfileSidebar();
+
+  // Track retry count to avoid infinite loops
+  if (!fetchSkills.retryCount) fetchSkills.retryCount = {};
+  if (!fetchSkills.retryCount[username]) fetchSkills.retryCount[username] = 0;
+  const maxRetries = 2;
+
+  // Set a timeout to retry if callback doesn't fire within 5 seconds
+  const timeoutId = setTimeout(() => {
+    if (profileBot === username && profileSkillsList === null) {
+      if (fetchSkills.retryCount[username] < maxRetries) {
+        fetchSkills.retryCount[username]++;
+        logResponse(`<span class="resp-warn">Skills load timed out, retrying (${fetchSkills.retryCount[username]}/${maxRetries})...</span>`);
+        fetchSkills(username); // Retry
+      } else {
+        profileSkillsList = [];
+        profileSkills = {};
+        renderProfileSidebar();
+        logResponse('<span class="resp-err">Skills load failed after retries. Click Retry to try again.</span>');
+        fetchSkills.retryCount[username] = 0;
+      }
+    }
+  }, 5000);
+
   sendExec(username, 'get_skills', undefined, (result) => {
+    clearTimeout(timeoutId); // Clear the timeout since callback fired
+    fetchSkills.retryCount[username] = 0; // Reset retry count on success
+
     if (profileBot !== username) return; // stale response
     if (!result.ok || !result.data) {
       profileSkillsList = [];
@@ -12061,6 +12104,7 @@ function showFactionFacilityUpgradeDetails(username, facilityId) {
   }
   
   const upgradeType = up.type_id || up.facility_type || up.type || '';
+  const storageFacilityTypes = ['faction_lockbox', 'faction_storage', 'faction_stronghold'];
   
   const detailHtml = `
     <div class="faction-card" style="padding:12px">
@@ -12077,7 +12121,7 @@ function showFactionFacilityUpgradeDetails(username, facilityId) {
         <button class="primary sm" style="width:100%" onclick="upgradeFactionFacility('${esc(username)}','${esc(facilityId)}','${esc(upgradeType)}')">Upgrade Facility</button>
       </div>
       <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
-        This will withdraw required materials from faction storage and upgrade the facility.
+        ${storageFacilityTypes.includes(upgradeType) ? 'This will withdraw required materials from faction storage and upgrade the facility.' : 'This will upgrade the facility using materials in faction storage.'}
       </div>
     </div>
   `;
@@ -12088,25 +12132,29 @@ function showFactionFacilityUpgradeDetails(username, facilityId) {
 function upgradeFactionFacility(username, facilityId, upgradeType) {
   const container = document.getElementById('factionFacilitiesList');
   if (!container) return;
-  
+
   const upgradeInfo = factionFacilityUpgrades[facilityId];
   if (!upgradeInfo || !upgradeInfo.upgrade_to) {
     appendLine('system', 'No upgrade available for this facility');
     return;
   }
-  
+
   const up = upgradeInfo.upgrade_to;
   const uName = up.name || upgradeType || 'Unknown';
-  
+
   const mats = up.materials || up.requirements || up.build_materials || [];
   const cost = up.cost ?? up.credits ?? up.price ?? up.credit_cost ?? 0;
+
+  // Facility types that need materials withdrawn from faction storage to station storage
+  const storageFacilityTypes = ['faction_lockbox', 'faction_storage', 'faction_stronghold'];
+  const needsWithdrawal = storageFacilityTypes.includes(upgradeType);
   
   let progressHtml = `
     <div class="faction-card" style="padding:12px">
       <div style="font-size:14px;font-weight:700;color:var(--text-bright);margin-bottom:12px">Upgrading: ${esc(uName)}</div>
       <div id="fup-step-1">Getting upgrade details...</div>
       <div id="fup-step-2" style="color:var(--text-dim)">Checking faction storage...</div>
-      <div id="fup-step-3" style="color:var(--text-dim)">Withdrawing materials...</div>
+      ${needsWithdrawal ? '<div id="fup-step-3" style="color:var(--text-dim)">Withdrawing materials...</div>' : ''}
       <div id="fup-step-4" style="color:var(--text-dim)">Upgrading facility...</div>
       <div id="fup-status" style="margin-top:12px;font-size:11px"></div>
       <div id="fup-actions" style="margin-top:12px"></div>
@@ -12178,41 +12226,45 @@ function upgradeFactionFacility(username, facilityId, upgradeType) {
     
     if (missing.length > 0) {
       setStatus('Missing: ' + missing.join(', '), 'var(--orange)');
-      document.getElementById('fup-actions').innerHTML = '<button class="sm" onclick="fetchFactionFacilities(\'' + esc(username) + '\')">Back to List</button>';
+      document.getElementById('up-actions').innerHTML = '<button class="sm" onclick="fetchFactionFacilities(\'' + esc(username) + '\')">Back to List</button>';
       return;
     }
     
     updateStep(2, `Faction storage OK (${factionCredits.toLocaleString()} credits)`, 'var(--green)');
-    updateStep(3, 'Withdrawing materials...', 'var(--text)');
-    
-    if (cost > 0) {
-      setStatus(`Withdrawing ${cost.toLocaleString()} credits...`);
-      const creditResult = await new Promise(resolve => {
-        sendExec(username, 'storage', { action: 'withdraw', item_id: 'credits', quantity: cost, target: 'faction' }, resolve);
-      });
-      if (!creditResult.ok) {
-        showError('Failed to withdraw credits: ' + (creditResult.error || 'unknown'));
-        return;
-      }
-    }
-    
-    if (Array.isArray(mats) && mats.length > 0) {
-      for (const m of mats) {
-        const mId = m.item_id || m.name || m.resource || '?';
-        const mName = m.name || m.item_id || '?';
-        const mQty = m.quantity || m.count || m.amount || 1;
-        setStatus(`Withdrawing ${mQty}x ${mName}...`);
-        const matResult = await new Promise(resolve => {
-          sendExec(username, 'storage', { action: 'deposit', target: 'self', item_id: mId, quantity: mQty, source: 'faction' }, resolve);
+
+    if (needsWithdrawal) {
+      updateStep(3, 'Withdrawing materials...', 'var(--text)');
+      
+      if (cost > 0) {
+        setStatus(`Withdrawing ${cost.toLocaleString()} credits...`);
+        const creditResult = await new Promise(resolve => {
+          sendExec(username, 'storage', { action: 'withdraw', item_id: 'credits', quantity: cost, target: 'faction' }, resolve);
         });
-        if (!matResult.ok) {
-          showError(`Failed to withdraw ${mName}: ${matResult.error || 'unknown'}`);
+        if (!creditResult.ok) {
+          showError('Failed to withdraw credits: ' + (creditResult.error || 'unknown'));
           return;
         }
       }
+      
+      if (Array.isArray(mats) && mats.length > 0) {
+        for (const m of mats) {
+          const mId = m.item_id || m.name || m.resource || '?';
+          const mName = m.name || m.item_id || '?';
+          const mQty = m.quantity || m.count || m.amount || 1;
+          setStatus(`Withdrawing ${mQty}x ${mName}...`);
+          const matResult = await new Promise(resolve => {
+            sendExec(username, 'storage', { action: 'deposit', target: 'self', item_id: mId, quantity: mQty, source: 'faction' }, resolve);
+          });
+          if (!matResult.ok) {
+            showError(`Failed to withdraw ${mName}: ${matResult.error || 'unknown'}`);
+            return;
+          }
+        }
+      }
+      
+      updateStep(3, 'Materials withdrawn', 'var(--green)');
     }
-    
-    updateStep(3, 'Materials withdrawn', 'var(--green)');
+
     updateStep(4, 'Upgrading facility...', 'var(--text)');
     
     const upgradeResult = await new Promise(resolve => {

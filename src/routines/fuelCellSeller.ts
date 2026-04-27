@@ -33,12 +33,22 @@ const FUEL_CELL_ITEM_ID = "fuel_cell";
 const FUEL_CELL_ITEM_NAME = "Fuel Cell";
 const FC_STATIONS_FILE = "data/fcStations.json";
 
+interface FCOrder {
+  orderId: string;
+  quantity: number;
+  remaining: number;
+  filledQuantity: number;
+  priceEach: number;
+  createdAt: string;
+}
+
 interface FCStationEntry {
   systemId: string;
   poiId: string;
   poiName: string;
   ordersPlaced: number;
-  lastOrderId: string | null;
+  ordersUnsold: number;
+  activeOrders: FCOrder[];
   lastVisit: string | null;
   lastPrice: number | null;
 }
@@ -64,8 +74,20 @@ function loadFCStationsData(): FCStationsData {
         lastStarted: new Date().toISOString(),
       };
     }
-    const data = readFileSync(FC_STATIONS_FILE, "utf-8");
-    return JSON.parse(data);
+    const rawData = readFileSync(FC_STATIONS_FILE, "utf-8");
+    const data: FCStationsData = JSON.parse(rawData);
+    // Backward compatibility: only keep fields we want, add ordersUnsold and activeOrders if missing
+    data.stations = data.stations.map(station => ({
+      systemId: station.systemId,
+      poiId: station.poiId,
+      poiName: station.poiName,
+      ordersPlaced: station.ordersPlaced ?? 0,
+      ordersUnsold: station.ordersUnsold ?? 0,
+      activeOrders: station.activeOrders ?? [],
+      lastVisit: station.lastVisit ?? null,
+      lastPrice: station.lastPrice ?? null,
+    }));
+    return data;
   } catch {
     return {
       version: 1,
@@ -137,7 +159,8 @@ function initializeFCStations(settings: ReturnType<typeof getFuelCellSellerSetti
         poiId: poi.id,
         poiName: poi.name,
         ordersPlaced: 0,
-        lastOrderId: null,
+        ordersUnsold: 0,
+        activeOrders: [],
         lastVisit: null,
         lastPrice: null,
       });
@@ -198,11 +221,12 @@ function getNextStation(
   const totalStations = data.stations.length;
   if (totalStations === 0) return -1;
 
-  const unvisitedStations = data.stations
+  // Prioritize unvisited stations first
+  const unvisited = data.stations
     .map((station, idx) => ({ station, idx }))
     .filter(({ station }) => station.ordersPlaced === 0);
 
-  if (unvisitedStations.length > 0) {
+  if (unvisited.length > 0) {
     const startIdx = (currentIndex + 1) % totalStations;
     for (let i = 0; i < totalStations; i++) {
       const idx = (startIdx + i) % totalStations;
@@ -212,15 +236,24 @@ function getNextStation(
     }
   }
 
-  const startIdx = (currentIndex + 1) % totalStations;
-  for (let i = 0; i < totalStations; i++) {
-    const idx = (startIdx + i) % totalStations;
-    if (data.stations[idx]) {
-      return idx;
-    }
-  }
+  // All stations visited: sort by sales volume (ordersPlaced - ordersUnsold) descending
+  const stationSales = data.stations.map((station, idx) => ({
+    idx,
+    sales: station.ordersPlaced - station.ordersUnsold,
+    lastVisit: station.lastVisit ? new Date(station.lastVisit).getTime() : 0,
+  }));
 
-  return currentIndex;
+  // Sort by sales descending, then lastVisit ascending (oldest first)
+  stationSales.sort((a, b) => {
+    if (b.sales !== a.sales) return b.sales - a.sales;
+    return a.lastVisit - b.lastVisit;
+  });
+
+  // Find next station in sorted order after currentIndex
+  const sortedIndices = stationSales.map(s => s.idx);
+  const currentSortedPos = sortedIndices.indexOf(currentIndex);
+  const nextSortedPos = (currentSortedPos + 1) % sortedIndices.length;
+  return sortedIndices[nextSortedPos];
 }
 
 export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -478,44 +511,84 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       continue;
     }
 
+    // Get current active orders at this station
+    let currentStationOrders: FCOrder[] = [];
+    const ordersResp = await bot.exec("view_orders", { scope: "personal" });
+    if (!ordersResp.error && ordersResp.result) {
+      const ordersData = ordersResp.result as Record<string, unknown>;
+      const orders = (ordersData.orders as any[]) || [];
+      // Filter for fuel_cell sell orders
+      const fcOrders = orders.filter(o => o.item_id === FUEL_CELL_ITEM_ID && o.side === "sell");
+      currentStationOrders = fcOrders.map(o => ({
+        orderId: o.order_id,
+        quantity: o.quantity,
+        remaining: o.remaining,
+        filledQuantity: o.filled_quantity,
+        priceEach: o.price_each,
+        createdAt: o.created_at,
+      }));
+    }
+
+    // Calculate current unsold from active orders
+    const currentUnsold = currentStationOrders.reduce((sum, o) => sum + o.remaining, 0);
+
+    // Get market data for pricing
     let marketData: unknown = null;
     const marketResp = await bot.exec("view_market", { item_id: FUEL_CELL_ITEM_ID });
     if (!marketResp.error && marketResp.result) {
       marketData = marketResp.result;
     }
 
-    const price = await getOptimalPrice(ctx, marketData, settings);
-    ctx.log("fc", `Creating sell orders: ${availableQty}x @ ${price}cr each`);
+    let price: number | null = null;
+    if (availableQty > 0) {
+      price = await getOptimalPrice(ctx, marketData, settings);
+      ctx.log("fc", `Creating sell orders: ${availableQty}x @ ${price}cr each`);
+    }
 
     let ordersPlacedCount = 0;
-    let lastOrderId: string | null = null;
 
     if (availableQty > 0) {
-      // Create single sell order for all remaining - server will merge with existing orders
       const createResp = await bot.exec("create_sell_order", {
         item_id: FUEL_CELL_ITEM_ID,
         quantity: availableQty,
-        price_each: price,
+        price_each: price!,
       });
 
       if (createResp.error) {
         ctx.log("error", `Create sell order failed: ${createResp.error.message}`);
       } else {
-        const result = createResp.result as Record<string, unknown>;
-        const orderId = (result.order_id as string) || null;
+        ctx.log("fc", `Listed ${availableQty}x ${FUEL_CELL_ITEM_NAME} @ ${price!}cr`);
+
+        // Refresh orders after creating new one
+        const updatedOrdersResp = await bot.exec("view_orders", { scope: "personal" });
+        if (!updatedOrdersResp.error && updatedOrdersResp.result) {
+          const updatedOrdersData = updatedOrdersResp.result as Record<string, unknown>;
+          const updatedOrders = (updatedOrdersData.orders as any[]) || [];
+          const updatedFcOrders = updatedOrders.filter(o => o.item_id === FUEL_CELL_ITEM_ID && o.side === "sell");
+          currentStationOrders = updatedFcOrders.map(o => ({
+            orderId: o.order_id,
+            quantity: o.quantity,
+            remaining: o.remaining,
+            filledQuantity: o.filled_quantity,
+            priceEach: o.price_each,
+            createdAt: o.created_at,
+          }));
+        }
+
         ordersPlacedCount = availableQty;
-        lastOrderId = orderId;
-        ctx.log("fc", `Listed ${availableQty}x ${FUEL_CELL_ITEM_NAME} @ ${price}cr (order: ${orderId})`);
       }
     }
 
-    fcData.stations[targetIdx] = {
-      ...target,
-      ordersPlaced: (fcData.stations[targetIdx]?.ordersPlaced || 0) + ordersPlacedCount,
-      lastOrderId,
-      lastVisit: new Date().toISOString(),
-      lastPrice: price,
-    };
+    // Update station entry with latest data
+    const currentStation = fcData.stations[targetIdx];
+    currentStation.ordersPlaced += ordersPlacedCount;
+    currentStation.ordersUnsold = currentStationOrders.reduce((sum, o) => sum + o.remaining, 0);
+    currentStation.activeOrders = currentStationOrders;
+    if (ordersPlacedCount > 0) {
+      currentStation.lastPrice = price;
+    }
+    currentStation.lastVisit = new Date().toISOString();
+
     fcData.currentStationIndex = targetIdx;
     saveFCStationsData(fcData);
 

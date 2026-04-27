@@ -3221,69 +3221,34 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Periodic battle status check (backup detection in case notifications fail)
       // CRITICAL: Check WebSocket state FIRST for fastest detection (no API call needed)
+      // FIX: Check EVERY cycle, not just every 8 seconds!
+      if (bot.isInBattle()) {
+        ctx.log("combat", `PERIODIC CHECK [WebSocket]: IN BATTLE! - initiating IMMEDIATE flee!`);
+        battleState.inBattle = true;
+        battleState.isFleeing = false;
+
+        // Issue flee stance and return immediately - DON'T wait for disengage!
+        // The harvest loop below will re-issue flee every cycle
+        await bot.exec("battle", { action: "stance", stance: "flee" });
+        ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
+        // Continue to the battle handling code below (lines 3290-3309)
+      }
+
+      // Also check via API periodically (fallback)
       const now = Date.now();
-      if ((now - lastBattleCheck) > BATTLE_CHECK_INTERVAL_MS) {
+      if (!battleState.inBattle && (now - lastBattleCheck) > BATTLE_CHECK_INTERVAL_MS) {
         lastBattleCheck = now;
-        
-        // Check WebSocket battle state first (fastest)
-        if (bot.isInBattle()) {
-          ctx.log("combat", `PERIODIC CHECK [WebSocket]: IN BATTLE! - checking engagement...`);
-          battleState.inBattle = true;
-          battleState.isFleeing = false;
 
-          // Check for nearby players to decide if we should engage
-          const nearbyResp = await bot.exec("get_nearby");
-          if (nearbyResp.result && typeof nearbyResp.result === "object") {
-            const { parseNearbyEntities } = await import("./common.js");
-            const nearbyResult = parseNearbyEntities(nearbyResp.result);
-
-            if (nearbyResult.hasPlayers) {
-              const shouldFight = await shouldEngagePlayersInCombat(ctx, nearbyResult.players);
-              if (shouldFight) {
-                ctx.log("combat", "Decided to ENGAGE attacking players in combat (periodic check)!");
-                await engageInBattle(ctx);
-                await ctx.sleep(30000);
-                continue; // Continue the harvest loop while fighting
-              }
-            }
-          }
-
-          // Default: flee if we can't determine attackers or shouldn't fight
-          ctx.log("combat", "Not engaging - fleeing from battle (periodic check)!");
-          await fleeFromBattle(ctx, true, 35000);
-          stopReason = "battle detected (WebSocket periodic check)";
-          break;
-        }
-
-        // Also check via API (fallback)
         const battleStatusCheck = await getBattleStatus(ctx);
         if (battleStatusCheck && battleStatusCheck.is_participant) {
-          ctx.log("combat", `PERIODIC CHECK: IN BATTLE! Battle ID: ${battleStatusCheck.battle_id} - checking engagement...`);
+          ctx.log("combat", `PERIODIC CHECK [API]: IN BATTLE! Battle ID: ${battleStatusCheck.battle_id} - initiating IMMEDIATE flee!`);
           battleState.inBattle = true;
           battleState.battleId = battleStatusCheck.battle_id;
+          battleState.isFleeing = false;
 
-          // Check for nearby players to decide if we should engage
-          const nearbyResp2 = await bot.exec("get_nearby");
-          if (nearbyResp2.result && typeof nearbyResp2.result === "object") {
-            const { parseNearbyEntities } = await import("./common.js");
-            const nearbyResult2 = parseNearbyEntities(nearbyResp2.result);
-
-            if (nearbyResult2.hasPlayers) {
-              const shouldFight2 = await shouldEngagePlayersInCombat(ctx, nearbyResult2.players);
-              if (shouldFight2) {
-                ctx.log("combat", "Decided to ENGAGE attacking players in combat (periodic check)!");
-                await engageInBattle(ctx);
-                await ctx.sleep(30000);
-                continue; // Continue the harvest loop while fighting
-              }
-            }
-          }
-
-          // Default: flee if we can't determine attackers or shouldn't fight
-          ctx.log("combat", "Not engaging - fleeing from battle (periodic check)!");
-          await fleeFromBattle(ctx, true, 35000);
-          stopReason = "battle detected (status check)";
-          break;
+          // Issue flee stance and return immediately - DON'T wait for disengage!
+          await bot.exec("battle", { action: "stance", stance: "flee" });
+          ctx.log("combat", "Flee stance issued via API check - will re-issue every cycle until disengaged!");
         }
       }
 
@@ -3692,6 +3657,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           const cargoItem = bot.inventory.find(i => i.itemId === jettisonOreId);
           if (cargoItem && cargoItem.quantity > 0) {
             const jettisonResp = await bot.exec("jettison", { item_id: jettisonOreId, quantity: cargoItem.quantity });
+
+            // CRITICAL: Check for battle interrupt after jettison (the bot was hit here!)
+            if (jettisonResp.error && (
+              jettisonResp.error.code === "battle_interrupt" ||
+              jettisonResp.error.message.toLowerCase().includes("interrupted by battle") ||
+              jettisonResp.error.message.toLowerCase().includes("interrupted by combat")
+            )) {
+              ctx.log("combat", `Jettison interrupted by battle! ${jettisonResp.error.message} - fleeing IMMEDIATELY!`);
+              battleState.inBattle = true;
+              battleState.battleId = null;
+              battleState.isFleeing = false;
+              // Issue flee and DON'T wait - let the harvest loop re-issue
+              await fleeFromBattle(ctx, false, 5000);
+              stopReason = "battle detected (jettison interrupted)";
+              break;
+            }
+
             if (!jettisonResp.error) {
               const dcTag = isDeepCoreMining ? " [deep core]" : "";
               ctx.log("mining", `Jettisoned ${cargoItem.quantity}x ${cargoItem.name || jettisonOreId} (pre-mine cargo cleanup${dcTag})`);
@@ -3699,23 +3681,31 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             }
           }
         }
+
+        // If battle was detected during jettison, break out of harvest loop
+        if (battleState.inBattle) {
+          break;
+        }
       }
 
       // Pre-mine battle check - prevents mine command from freezing if battle starts
       // CRITICAL: Check WebSocket state FIRST for fastest detection
+      // FIX: Break immediately after detecting battle - DON'T try to mine!
       if (bot.isInBattle()) {
-        ctx.log("combat", `PRE-MINE CHECK [WebSocket]: IN BATTLE! - initiating flee immediately!`);
+        ctx.log("combat", `PRE-MINE CHECK [WebSocket]: IN BATTLE! - initiating flee and BREAKING!`);
         battleState.inBattle = true;
         battleState.isFleeing = false;
-        await fleeFromBattle(ctx, false, 5000); // Initial flee, don't wait for disengage
+        await bot.exec("battle", { action: "stance", stance: "flee" }); // Issue flee immediately
+        break; // BREAK out of harvest loop - don't try to mine!
       } else {
         const preMineBattleCheck = await getBattleStatus(ctx);
         if (preMineBattleCheck && preMineBattleCheck.is_participant) {
-          ctx.log("combat", `PRE-MINE CHECK: IN BATTLE! Battle ID: ${preMineBattleCheck.battle_id} - initiating flee!`);
+          ctx.log("combat", `PRE-MINE CHECK: IN BATTLE! Battle ID: ${preMineBattleCheck.battle_id} - initiating flee and BREAKING!`);
           battleState.inBattle = true;
           battleState.battleId = preMineBattleCheck.battle_id;
           battleState.isFleeing = false;
-          await fleeFromBattle(ctx, false, 5000); // Initial flee, don't wait for disengage
+          await bot.exec("battle", { action: "stance", stance: "flee" }); // Issue flee immediately
+          break; // BREAK out of harvest loop - don't try to mine!
         }
       }
 
@@ -3735,11 +3725,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const msg = mineResp.error.message.toLowerCase();
         // CRITICAL: Check for battle interrupt - stop mining immediately
         if (mineResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
-          ctx.log("combat", `Mine interrupted by battle! ${mineResp.error.message} - fleeing!`);
-          await fleeFromBattle(ctx);
+          ctx.log("combat", `Mine interrupted by battle! ${mineResp.error.message} - fleeing IMMEDIATELY!`);
           battleState.inBattle = true;
           battleState.isFleeing = false;
-          stopReason = "battle detected";
+          // Issue flee and DON'T wait for disengage - let the loop re-issue
+          await bot.exec("battle", { action: "stance", stance: "flee" });
+          stopReason = "battle detected (mine interrupted)";
           break;
         }
         if (msg.includes("depleted") || msg.includes("no resources") || msg.includes("no gas") || msg.includes("no ice") || msg.includes("no minable")) {

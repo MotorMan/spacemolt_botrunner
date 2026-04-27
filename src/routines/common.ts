@@ -3359,8 +3359,9 @@ export async function handleBattleNotifications(
           const pirateResult = parsePiratesFromBattleParticipants(battleNotif.participants);
           if (pirateResult.hasPirates) {
             ctx.log("combat", `⚠️ PIRATES DETECTED IN BATTLE! ${pirateResult.pirateCount} pirate(s), highest tier: ${pirateResult.highestTier}`);
-            ctx.log("combat", "Initiating emergency flee from pirates!");
-            await fleeFromBattle(ctx, true, 35000);
+            ctx.log("combat", "Issuing flee stance IMMEDIATELY (non-blocking)!");
+            // FIX: Issue flee and return immediately - DON'T wait for disengage!
+            await ctx.bot.exec("battle", { action: "stance", stance: "flee" });
             return true;
           }
         }
@@ -3384,8 +3385,9 @@ export async function handleBattleNotifications(
         }
 
         // Default: flee if we can't determine attackers or shouldn't fight
-        ctx.log("combat", "Unable to determine attackers or decided not to fight - fleeing!");
-        await fleeFromBattle(ctx, true, 35000);
+        ctx.log("combat", "Unable to determine attackers or decided not to fight - issuing flee IMMEDIATELY (non-blocking)!");
+        // FIX: Issue flee and return immediately - DON'T wait for disengage!
+        await ctx.bot.exec("battle", { action: "stance", stance: "flee" });
         return true;
 
       case "battle_tick":
@@ -3393,16 +3395,17 @@ export async function handleBattleNotifications(
         if (battleNotif.participants) {
           const pirateResult = parsePiratesFromBattleParticipants(battleNotif.participants);
           if (pirateResult.hasPirates && !battleState.isFleeing) {
-            ctx.log("combat", `⚠️ PIRATES DETECTED IN BATTLE UPDATE! ${pirateResult.pirateCount} pirate(s) - fleeing!`);
+            ctx.log("combat", `⚠️ PIRATES DETECTED IN BATTLE UPDATE! ${pirateResult.pirateCount} pirate(s) - issuing flee!`);
             battleState.isFleeing = false; // Reset to trigger flee
           }
         }
-        
+
         if (battleState.inBattle && !battleState.isFleeing) {
           ctx.log("combat", `Battle tick ${battleNotif.tick} - combat continues (we're still in battle!)`);
           // If we somehow missed the battle start, flee now
-          ctx.log("combat", "Initiating late flee!");
-          await fleeFromBattle(ctx, true, 35000);
+          ctx.log("combat", "Initiating late flee - issuing stance IMMEDIATELY (non-blocking)!");
+          // FIX: Issue flee and return immediately - DON'T wait for disengage!
+          await ctx.bot.exec("battle", { action: "stance", stance: "flee" });
           return true;
         }
         break;
@@ -3412,8 +3415,9 @@ export async function handleBattleNotifications(
         battleState.lastHitTick = Date.now();
         // If we're not already fleeing, start fleeing
         if (battleState.inBattle && !battleState.isFleeing) {
-          ctx.log("combat", "Hit detected - ensuring flee is active!");
-          await fleeFromBattle(ctx, true, 35000);
+          ctx.log("combat", "Hit detected - issuing flee IMMEDIATELY (non-blocking)!");
+          // FIX: Issue flee and return immediately - DON'T wait for disengage!
+          await ctx.bot.exec("battle", { action: "stance", stance: "flee" });
           return true;
         }
         break;

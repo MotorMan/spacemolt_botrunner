@@ -5,10 +5,24 @@
   "scripts": {
     "start": "bun run src/botmanager.ts",
     "bots": "bun run src/botmanager.ts",
-    "dashboard": "bun run src/botmanager.ts"
+    "dashboard": "bun run src/botmanager.ts",
+    "test": "vitest run tests/",
+    "test:node": "node --test tests/bot-chat-coordination.test.ts 2>&1",
+    "test:simple": "node --test tests/ 2>&1",
+    "test:verbose": "node --test tests/ --verbose 2>&1",
+    "start:debug": "node --inspect-brk src/web/server.js",
+    "build": "tsc -p tsconfig.json",
+    "build:watch": "tsc -p tsconfig.json -w",
+    "lint": "npx eslint . --ext .ts --max-warnings 0",
+    "lint:fix": "npx eslint . --ext .ts --fix",
+    "typecheck": "npx tsc --noEmit"
   },
   "devDependencies": {
     "bun-types": "^1.3.9",
-    "typescript": "^5.9.3"
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.0"
+  },
+  "dependencies": {
+    "@mariozechner/pi-ai": "^0.61.0"
   }
 }

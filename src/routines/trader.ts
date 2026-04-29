@@ -417,12 +417,37 @@ function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: num
   return { jumps, cost: jumps * costPerJump };
 }
 
-/** Find profitable trade routes from mapStore price spreads. */
-function findTradeOpportunities(settings: ReturnType<typeof getTraderSettings>, currentSystem: string, cargoCapacity: number = 999): TradeRoute[] {
+/** Find profitable trade routes from mapStore price spreads and market insights. */
+function findTradeOpportunities(
+  settings: ReturnType<typeof getTraderSettings>,
+  currentSystem: string,
+  currentPoi: string,
+  cargoCapacity: number = 999,
+  marketInsights: Array<Record<string, unknown>> = []
+): TradeRoute[] {
+  // Extract oversupply items to filter out bad sell destinations
+  const oversupplyItems = new Set<string>();
+  for (const insight of marketInsights) {
+    if (insight.category === "supply_imbalance" &&
+        insight.message && typeof insight.message === "string" &&
+        insight.message.includes("units for sale here") &&
+        insight.message.includes("no buyers") &&
+        insight.item_id && typeof insight.item_id === "string") {
+      oversupplyItems.add(insight.item_id);
+    }
+  }
   const spreads = mapStore.findPriceSpreads();
   const routes: TradeRoute[] = [];
 
+  // Process market insights first (higher priority)
+  const insightRoutes = processMarketInsights(marketInsights, currentSystem, currentPoi, settings, cargoCapacity);
+  routes.push(...insightRoutes);
+
   for (const sp of spreads) {
+    // Skip routes that would sell oversupplied items at current station
+    if (oversupplyItems.has(sp.itemId) && sp.destSystem === currentSystem && sp.destPoi === currentPoi) {
+      continue;
+    }
     // Filter by allowed items
     if (settings.tradeItems.length > 0) {
       const match = settings.tradeItems.some(t =>
@@ -487,6 +512,265 @@ function getItemMarketCost(itemId: string): number {
     }
   }
   return cheapest === Infinity ? 0 : cheapest;
+}
+
+/**
+ * Process analyze_market insights to create trade opportunities.
+ * Returns an array of potential trade routes based on fresh market intelligence.
+ */
+function processMarketInsights(
+  insights: Array<Record<string, unknown>>,
+  currentSystem: string,
+  currentPoi: string,
+  settings: ReturnType<typeof getTraderSettings>,
+  cargoCapacity: number = 999
+): TradeRoute[] {
+  const routes: TradeRoute[] = [];
+
+  for (const insight of insights) {
+    const category = insight.category as string;
+    const itemId = insight.item_id as string;
+    const itemName = insight.item as string;
+    const message = insight.message as string;
+    const priority = insight.priority as number;
+
+    // Filter by allowed items if configured
+    if (settings.tradeItems.length > 0) {
+      const match = settings.tradeItems.some(t =>
+        itemId.toLowerCase().includes(t.toLowerCase()) ||
+        itemName.toLowerCase().includes(t.toLowerCase())
+      );
+      if (!match) continue;
+    }
+
+    // Only process high-priority insights (above 100,000 for significant opportunities)
+    if (priority < 100000) continue;
+
+    if (category === "arbitrage") {
+      // Parse arbitrage messages like: "Dark Matter Cell trades for ~96150cr in Nebula Trade Federation space but ~5000cr in Outer Rim Explorers space — 1823% spread."
+      const match = message.match(/(.+) trades for ~(\d+)cr in (.+) space but ~(\d+)cr in (.+) space/);
+      if (match) {
+        const [, item, highPriceStr, highFaction, lowPriceStr, lowFaction] = match;
+        const highPrice = parseInt(highPriceStr);
+        const lowPrice = parseInt(lowPriceStr);
+        const spread = highPrice - lowPrice;
+
+        // Find systems in these factions
+        const allSystems = mapStore.getAllSystems();
+        let sourceSystem = "";
+        let destSystem = "";
+        let sourcePoi = "";
+        let destPoi = "";
+        let sourcePoiName = "";
+        let destPoiName = "";
+
+        for (const [sysId, sys] of Object.entries(allSystems)) {
+          for (const poi of sys.pois) {
+            if (!poi.has_base) continue;
+
+            // Try to match faction or system names
+            const factionMatch = poi.faction?.toLowerCase().includes(lowFaction.toLowerCase().split(' ')[0]) ||
+                               sys.name.toLowerCase().includes(lowFaction.toLowerCase().split(' ')[0]);
+            if (factionMatch && lowPrice > 0) {
+              sourceSystem = sysId;
+              sourcePoi = poi.id;
+              sourcePoiName = poi.name;
+            }
+
+            const destMatch = poi.faction?.toLowerCase().includes(highFaction.toLowerCase().split(' ')[0]) ||
+                            sys.name.toLowerCase().includes(highFaction.toLowerCase().split(' ')[0]);
+            if (destMatch && highPrice > 0) {
+              destSystem = sysId;
+              destPoi = poi.id;
+              destPoiName = poi.name;
+            }
+          }
+        }
+
+        if (sourceSystem && destSystem) {
+          const toSource = estimateFuelCost(currentSystem, sourceSystem, settings.fuelCostPerJump);
+          const sourceToDest = estimateFuelCost(sourceSystem, destSystem, settings.fuelCostPerJump);
+          const totalJumps = toSource.jumps + sourceToDest.jumps;
+          const totalFuelCost = toSource.cost + sourceToDest.cost;
+
+          const profitPerUnit = spread - (totalJumps > 0 ? totalFuelCost : 0);
+          if (profitPerUnit >= settings.minProfitPerUnit) {
+            const tradeQty = maxItemsForCargo(cargoCapacity, itemId);
+
+            routes.push({
+              itemId,
+              itemName,
+              sourceSystem,
+              sourcePoi,
+              sourcePoiName,
+              buyPrice: lowPrice,
+              buyQty: tradeQty,
+              destSystem,
+              destPoi,
+              destPoiName,
+              sellPrice: highPrice,
+              sellQty: tradeQty,
+              jumps: totalJumps,
+              profitPerUnit,
+              totalProfit: profitPerUnit * tradeQty,
+            });
+          }
+        }
+      }
+    } else if (category === "opportunity") {
+      // Parse opportunity messages like: "Neutronium Ingot has buy orders at Crimson War Citadel: ~350 at ~7500cr, ~95 at ~6500cr, ~200 at ~5000cr, ~300 at ~3500cr (~5353Kcr total fill for 654 units)."
+      const match = message.match(/(.+) has buy orders at (.+): (.+)\((.+)Kcr total fill for (\d+) units\)/);
+      if (match) {
+        const [, item, stationName, , , qtyStr] = match;
+        const totalQty = parseInt(qtyStr);
+
+        // Find the station
+        const allSystems = mapStore.getAllSystems();
+        let stationSystem = "";
+        let stationPoi = "";
+        let stationPoiName = "";
+
+        for (const [sysId, sys] of Object.entries(allSystems)) {
+          for (const poi of sys.pois) {
+            if (poi.name.toLowerCase().includes(stationName.toLowerCase()) ||
+                stationName.toLowerCase().includes(poi.name.toLowerCase())) {
+              stationSystem = sysId;
+              stationPoi = poi.id;
+              stationPoiName = poi.name;
+              break;
+            }
+          }
+          if (stationSystem) break;
+        }
+
+        if (stationSystem && stationPoi) {
+          // Find cheapest buy price for this item
+          let bestBuyPrice = 0;
+          const sys = mapStore.getSystem(stationSystem);
+          if (sys) {
+            const poi = sys.pois.find(p => p.id === stationPoi);
+            if (poi) {
+              for (const market of poi.market) {
+                if (market.item_id === itemId && market.best_buy && market.best_buy > 0) {
+                  bestBuyPrice = market.best_buy;
+                  break;
+                }
+              }
+            }
+          }
+
+          if (bestBuyPrice > 0) {
+            // Find potential source stations with lower prices
+            const allBuys = mapStore.getAllBuyDemand();
+            const sources = allBuys
+              .filter(b => b.itemId === itemId && b.price < bestBuyPrice && b.quantity > 0)
+              .filter(b => {
+                const sys = mapStore.getSystem(b.systemId);
+                const poi = sys?.pois.find(p => p.id === b.poiId);
+                return poi?.has_base ?? false;
+              })
+              .sort((a, b) => a.price - b.price); // Cheapest first
+
+            if (sources.length > 0) {
+              const source = sources[0];
+              const toSource = estimateFuelCost(currentSystem, source.systemId, settings.fuelCostPerJump);
+              const sourceToDest = estimateFuelCost(source.systemId, stationSystem, settings.fuelCostPerJump);
+              const totalJumps = toSource.jumps + sourceToDest.jumps;
+              const totalFuelCost = toSource.cost + sourceToDest.cost;
+
+              const profitPerUnit = bestBuyPrice - source.price - (totalJumps > 0 ? totalFuelCost : 0);
+              if (profitPerUnit >= settings.minProfitPerUnit) {
+                const tradeQty = Math.min(maxItemsForCargo(cargoCapacity, itemId), source.quantity, totalQty);
+
+                routes.push({
+                  itemId,
+                  itemName,
+                  sourceSystem: source.systemId,
+                  sourcePoi: source.poiId,
+                  sourcePoiName: source.poiName,
+                  buyPrice: source.price,
+                  buyQty: tradeQty,
+                  destSystem: stationSystem,
+                  destPoi: stationPoi,
+                  destPoiName: stationPoiName,
+                  sellPrice: bestBuyPrice,
+                  sellQty: tradeQty,
+                  jumps: totalJumps,
+                  profitPerUnit,
+                  totalProfit: profitPerUnit * tradeQty,
+                });
+              }
+            }
+          }
+        }
+      }
+    } else if (category === "supply_imbalance") {
+      // Handle two types of supply imbalance:
+      // 1. Unfilled buy orders (opportunity to sell here)
+      // 2. Oversupply (items for sale with no buyers - avoid selling here)
+
+      if (message.includes("unfilled buy orders")) {
+        // Opportunity: unfilled buy orders mean we can sell here profitably
+        const match = message.match(/(.+) has (\d+) units of unfilled buy orders here at (\d+)cr/);
+        if (match) {
+          const [, item, qtyStr, priceStr] = match;
+          const qty = parseInt(qtyStr);
+          const price = parseInt(priceStr);
+
+          // Find sources with lower prices
+          const allBuys = mapStore.getAllBuyDemand();
+          const sources = allBuys
+            .filter(b => b.itemId === itemId && b.price < price && b.quantity > 0)
+            .filter(b => {
+              const sys = mapStore.getSystem(b.systemId);
+              const poi = sys?.pois.find(p => p.id === b.poiId);
+              return poi?.has_base ?? false;
+            })
+            .sort((a, b) => a.price - b.price);
+
+          if (sources.length > 0) {
+            const source = sources[0];
+            const toSource = estimateFuelCost(currentSystem, source.systemId, settings.fuelCostPerJump);
+            const sourceToDest = estimateFuelCost(source.systemId, currentSystem, settings.fuelCostPerJump);
+            const totalJumps = toSource.jumps + sourceToDest.jumps;
+            const totalFuelCost = toSource.cost + sourceToDest.cost;
+
+            const profitPerUnit = price - source.price - (totalJumps > 0 ? totalFuelCost : 0);
+            if (profitPerUnit >= settings.minProfitPerUnit) {
+              const tradeQty = Math.min(maxItemsForCargo(cargoCapacity, itemId), source.quantity, qty);
+
+              // For current station opportunities, we need to determine the POI
+              // This will be filtered later if we don't have a specific POI
+              routes.push({
+                itemId,
+                itemName,
+                sourceSystem: source.systemId,
+                sourcePoi: source.poiId,
+                sourcePoiName: source.poiName,
+                buyPrice: source.price,
+                buyQty: tradeQty,
+                destSystem: currentSystem,
+                destPoi: currentPoi,
+                destPoiName: "Current Station",
+                sellPrice: price,
+                sellQty: tradeQty,
+                jumps: totalJumps,
+                profitPerUnit,
+                totalProfit: profitPerUnit * tradeQty,
+              });
+            }
+          }
+        }
+      } else if (message.includes("units for sale here") && message.includes("no buyers")) {
+        // Oversupply: items available but no buy orders - this information is handled
+        // by the oversupplyItems filtering in findTradeOpportunities
+      }
+    }
+  }
+
+  // Sort by total profit descending
+  routes.sort((a, b) => b.totalProfit - a.totalProfit);
+  return routes;
 }
 
 
@@ -893,6 +1177,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     let route: TradeRoute | null = null; // Declare route early for recovered session handler
     let buyQty = 0;
     let investedCredits = 0;
+    let marketInsights: Array<Record<string, unknown>> = []; // Market insights from analyze_market
 
     // ── Handle recovered session ──
     // If we have a recovered session that's in transit, skip dock/maintenance and go directly to destination
@@ -1041,6 +1326,28 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     await ensureDocked(ctx);
     if (bot.docked) {
       await tryMissions(ctx);
+
+      // Get fresh market insights from analyze_market
+      const analyzeResp = await bot.exec("analyze_market");
+      if (!analyzeResp.error && analyzeResp.result && typeof analyzeResp.result === "object") {
+        const r = analyzeResp.result as Record<string, unknown>;
+        marketInsights = (r.insights as Array<Record<string, unknown>>) || [];
+        if (marketInsights.length > 0) {
+          ctx.log("trade", `Received ${marketInsights.length} market insights from analyze_market`);
+
+          // Log oversupply warnings
+          const oversupplyInsights = marketInsights.filter(i =>
+            i.category === "supply_imbalance" &&
+            typeof i.message === "string" &&
+            i.message.includes("units for sale here") &&
+            i.message.includes("no buyers")
+          );
+          if (oversupplyInsights.length > 0) {
+            const oversupplyItems = oversupplyInsights.map(i => i.item as string).join(", ");
+            ctx.log("trade", `Oversupply detected: ${oversupplyItems} - will avoid selling these at current station`);
+          }
+        }
+      }
     }
 
     // ── Fuel + hull check + mods ──
@@ -1291,7 +1598,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       const cargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
       const cargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
-      const marketRoutes = findTradeOpportunities(settings, bot.system, cargoCapacity);
+      const marketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, cargoCapacity, marketInsights);
       // Filter out routes that sell items we just sold at the current station (demand already filled)
       const currentPoi = bot.poi;
       let allRoutes = [...cargoRoutes, ...marketRoutes].filter(r => {
@@ -2586,7 +2893,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     }
     const nextCargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - nextFuelWeight);
     const nextCargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
-    const nextMarketRoutes = findTradeOpportunities(settings, bot.system, nextCargoCapacity);
+    const nextMarketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, nextCargoCapacity, marketInsights);
     const nextRoutes = [...nextCargoRoutes, ...nextMarketRoutes].sort((a, b) => b.totalProfit - a.totalProfit);
 
     // ── Deposit excess credits to faction storage ──

@@ -54,10 +54,12 @@ import {
   ensureModsFitted,
   readSettings,
   logStatus,
-  getBattleStatus,
-  fleeFromBattle,
-  checkAndFleeFromBattle,
-  checkBattleAfterCommand,
+   getBattleStatus,
+   fleeFromBattle,
+   checkAndFleeFromBattle,
+   checkBattleAfterCommand,
+   type BattleState,
+   handleBattleNotifications,
 } from "./common.js";
 
 import {
@@ -486,6 +488,17 @@ async function engageTargetFleet(
 export const fleetHunterCommanderRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
+  // Persistent battle state across cycles
+  const battleRef = { state: null as BattleState | null };
+  battleRef.state = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+    lastFleeTime: undefined,
+  };
+
   await bot.refreshStatus();
 
   let totalKills = 0;
@@ -527,6 +540,22 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
       yield "get_status";
       await bot.refreshStatus();
       logStatus(ctx);
+
+      // ── Battle detection ──
+      // Update battle state from current status
+      if (bot.isInBattle()) {
+        if (!battleRef.state!.inBattle) {
+          ctx.log("combat", "Battle detected - fleet commander coordinating combat!");
+          battleRef.state!.inBattle = true;
+          battleRef.state!.battleId = null; // Will be updated when available
+        }
+      } else {
+        if (battleRef.state!.inBattle) {
+          ctx.log("combat", "Battle cleared - fleet commander resuming patrol");
+          battleRef.state!.inBattle = false;
+          battleRef.state!.battleId = null;
+        }
+      }
 
       // ── Process pending web UI commands (ALWAYS process, even if hunting disabled) ──
       if (fleetState.currentCommand) {

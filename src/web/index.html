@@ -2709,6 +2709,8 @@ function renderManualControls(isFreshRender) {
     .filter(b => b.username !== bot.username)
     .map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`)
     .join('') || '<option value="">No other bots</option>';
+  const hasOtherBots = otherBotOpts !== '<option value="">No other bots</option>';
+  const giftBotOpts = hasOtherBots ? otherBotOpts + '<option value="__custom__">Enter name...</option>' : '<option value="__custom__">Enter name...</option>';
 
   // Build gift item options from both cargo and storage
   const giftItems = [];
@@ -3021,7 +3023,8 @@ function renderManualControls(isFreshRender) {
         <option value="cargo">From Cargo</option>
         <option value="storage" selected>From Storage</option>
       </select>
-      <select id="mc-gift-target">${otherBotOpts}</select>
+      <select id="mc-gift-target" onchange="handleGiftTargetSelect(this, 'mc-gift-custom-input')">${giftBotOpts}</select>
+      <input type="text" class="gift-custom-input" id="mc-gift-custom-input" placeholder="Bot name..." style="display:${hasOtherBots ? 'none' : 'inline-block'};width:120px;font-size:11px;padding:2px 6px;">
       <select id="mc-gift-item" onchange="syncQty(this,'mc-gift-qty')">${giftItemOpts}</select>
       <input type="number" id="mc-gift-qty" min="1" value="1">
       <button class="sm" onclick="mcSendGift()">Send</button>
@@ -3029,8 +3032,8 @@ function renderManualControls(isFreshRender) {
 
     <div class="cmd-group">
       <label>Gift Send All</label>
-      <select id="mc-giftall-target">${otherBotOpts}</select>
-      <input type="text" id="mc-giftall-custom" placeholder="Or enter player name..." style="width:140px;font-size:12px;padding:4px 8px">
+      <select id="mc-giftall-target" onchange="handleGiftTargetSelect(this, 'mc-giftall-custom-input')">${giftBotOpts}</select>
+      <input type="text" class="gift-custom-input" id="mc-giftall-custom-input" placeholder="Bot name..." style="display:${hasOtherBots ? 'none' : 'inline-block'};width:120px;font-size:11px;padding:2px 6px;">
       <button class="primary sm" onclick="mcGiftSendAll()">Start Queue</button>
       <button class="sm" onclick="mcStopGiftSendAll()">Stop</button>
     </div>
@@ -3043,9 +3046,10 @@ function renderManualControls(isFreshRender) {
 
     <div class="cmd-group">
       <label>Send Credits</label>
-      <select id="mc-credits-target">${otherBotOpts}</select>
+      <select id="mc-credits-target" onchange="handleGiftTargetSelect(this, 'mc-credits-custom-input')">${giftBotOpts}</select>
+      <input type="text" class="gift-custom-input" id="mc-credits-custom-input" placeholder="Bot name..." style="display:${hasOtherBots ? 'none' : 'inline-block'};width:120px;font-size:11px;padding:2px 6px;">
       <input type="number" id="mc-credits-amount" min="1" value="100" style="width:90px">
-      <button class="sm" onclick="mcExec('send_gift',{recipient:val('mc-credits-target'),credits:intVal('mc-credits-amount')})">Send</button>
+      <button class="sm" onclick="mcSendCredits()">Send</button>
     </div>
 
     <div class="cmd-group">
@@ -3168,28 +3172,27 @@ function mcFactionWithdraw() {
   mcExec('storage', { action: 'deposit', target: 'self', item_id: itemId, quantity: qty, source: 'faction' });
 }
 
-function mcRefreshFactionStorage() {
-  if (!profileBot) return;
-
-  const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
-  logResponse(`<span class="resp-cmd">${ts} > view_faction_storage</span>`);
-
-  sendExec(profileBot, 'view_faction_storage', {}, (result) => {
-    if (result.ok && result.data) {
-      const items = result.data.items || result.data.storage || [];
-      profileFactionStorage = items;
-      logResponse(`<span class="resp-ok">Loaded ${items.length} faction storage items</span>`);
-      renderManualControls();
-      // Also update dropdowns directly in case renderManualControls was blocked
-      updateStorageDropdowns();
-    } else {
-      profileFactionStorage = [];
-      logResponse(`<span class="resp-err">Failed to load faction storage: ${esc(result.error || 'not at station')}</span>`);
-      renderManualControls();
-      updateStorageDropdowns();
-    }
-  });
-}
+  function mcRefreshFactionStorage() {
+    if (!profileBot) return;
+    
+    const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+    logResponse(`<span class="resp-cmd">${ts} > refreshing faction storage</span>`);
+    
+    sendExec(profileBot, 'view_storage', { target: 'faction' }, (result) => {
+      if (result.ok && result.data) {
+        const items = result.data.items || result.data.storage || [];
+        profileFactionStorage = items;
+        logResponse(`<span class="resp-ok">Loaded ${items.length} faction storage items</span>`);
+        renderManualControls();
+        updateStorageDropdowns();
+      } else {
+        profileFactionStorage = [];
+        logResponse(`<span class="resp-err">Failed to load faction storage: ${esc(result.error || 'not at station')}</span>`);
+        renderManualControls();
+        updateStorageDropdowns();
+      }
+    });
+  }
 
 function toggleManualFactionWithdrawSort() {
   const checkbox = document.getElementById('mc-fac-wit-sort');
@@ -4046,8 +4049,8 @@ function mcRefreshStorageForDepositAll() {
         logResponse(`<span class="resp-ok">Station storage: ${storageData.length} items</span>`);
       }
       
-      // Refresh faction storage
-      sendExec(profileBot, 'view_faction_storage', {}, (factionResult) => {
+      // Refresh faction storage using view_storage with source: 'faction'
+      sendExec(profileBot, 'view_storage', { source: 'faction' }, (factionResult) => {
         if (factionResult.ok && factionResult.data) {
           const faction = factionResult.data.items || factionResult.data.storage || [];
           profileFactionStorage = faction;
@@ -4151,7 +4154,6 @@ function mcProcessDepositQueue() {
   const { items, index } = depositAllQueue;
   
   if (index >= items.length) {
-    // Queue complete
     logResponse(`<span class="resp-ok">Deposit All complete! All items transferred.</span>`);
     depositAllRunning = false;
     depositAllQueue = null;
@@ -4161,19 +4163,37 @@ function mcProcessDepositQueue() {
   
   const item = items[index];
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
+  
+
+  
+  // Normal processing for other modes
   const verb = item.action === 'withdraw' ? 'withdrawing' : 'depositing';
   logResponse(`<span class="resp-cmd">${ts} > ${verb} ${item.quantity}x ${item.item_id} (${index + 1}/${items.length})</span>`);
   
-  // All transfer operations use the storage command
-  // Format: storage action=X target=Y item_id=Z quantity=W source=V
-  const command = 'storage';
+  // All transfer operations use V2 API commands
+  let command;
   const params = {
-    action: item.action || 'deposit',  // 'deposit' or 'withdraw'
-    target: item.target,      // 'self' (station) or 'faction'
     item_id: item.item_id,
     quantity: item.quantity,
-    source: item.source       // 'cargo' or 'storage'
   };
+
+  if (item.action === 'withdraw') {
+    // Withdraw from storage to cargo
+    command = 'withdraw_items';
+    params.source = item.source;  // 'storage' or 'cargo'
+  } else {
+    // Deposit (default action)
+    if (item.target === 'faction') {
+      // Deposit to faction storage using deposit_items with target: 'faction'
+      command = 'deposit_items';
+      params.source = item.source;  // 'cargo' or 'storage'
+      params.target = item.target;  // 'faction'
+    } else {
+      // Deposit to station storage (target === 'self')
+      command = 'deposit_items';
+      params.source = item.source;  // 'cargo' or 'storage'
+    }
+  }
   
   sendExec(profileBot, command, params, (result) => {
     if (result.ok) {
@@ -4186,7 +4206,7 @@ function mcProcessDepositQueue() {
     mcUpdateQueueStatus();
     
     // Wait a bit before next item (respect tick rate)
-    setTimeout(mcProcessDepositQueue, TICK_COOLDOWN_MS + 500);
+     setTimeout(mcProcessDepositQueue, TICK_COOLDOWN_MS + 500);
   });
 }
 
@@ -4513,14 +4533,13 @@ function mcGiftSendAll() {
     return;
   }
 
-  // Get target: use custom input if provided, otherwise use dropdown
-  let targetName = val('mc-giftall-custom').trim();
-  if (!targetName) {
-    targetName = val('mc-giftall-target');
+  let targetName = val('mc-giftall-target');
+  if (targetName === '__custom__') {
+    targetName = val('mc-giftall-custom-input');
   }
 
   if (!targetName) {
-    logResponse('<span class="resp-err">Please select or enter a target recipient</span>');
+    logResponse('<span class="resp-err">Please select a recipient</span>');
     return;
   }
 
@@ -4560,7 +4579,10 @@ function mcSendGift() {
   if (!profileBot) return;
 
   const source = val('mc-gift-source');
-  const recipient = val('mc-gift-target');
+  let recipient = val('mc-gift-target');
+  if (recipient === '__custom__') {
+    recipient = val('mc-gift-custom-input');
+  }
   const itemId = val('mc-gift-item');
   const quantity = intVal('mc-gift-qty');
 
@@ -4597,6 +4619,23 @@ function mcSendGift() {
       logResponse(`<span class="resp-err">Failed: ${esc(result.error || 'unknown')}</span>`);
     }
   });
+}
+
+function mcSendCredits() {
+  if (!profileBot) return;
+
+  let recipient = val('mc-credits-target');
+  if (recipient === '__custom__') {
+    recipient = val('mc-credits-custom-input');
+  }
+  const credits = intVal('mc-credits-amount');
+
+  if (!recipient) {
+    logResponse('<span class="resp-err">Please select a recipient</span>');
+    return;
+  }
+
+  mcExec('send_gift', { recipient, credits });
 }
 
 function val(id) { return document.getElementById(id)?.value || ''; }
@@ -5099,9 +5138,9 @@ function mcExec(command, params) {
         checkAllDone();
       });
 
-      // Step 3: Fetch updated faction storage
+      // Step 3: Fetch updated faction storage using view_storage with source: 'faction'
       pendingFetches++;
-      sendExec(profileBot, 'view_faction_storage', {}, (factionResult) => {
+      sendExec(profileBot, 'view_storage', { source: 'faction' }, (factionResult) => {
         if (factionResult.ok && factionResult.data) {
           const freshFaction = factionResult.data.items || factionResult.data.storage || [];
           profileFactionStorage = freshFaction;
@@ -5588,9 +5627,9 @@ function fetchRecipes(username) {
   fetchRecipesPage(username, 1);
 }
 
-function fetchFactionStorage(username) {
-  profileFactionStorage = null; // reset to loading state
-  sendExec(username, 'view_faction_storage', {}, (result) => {
+  function fetchFactionStorage(username) {
+    profileFactionStorage = null; // reset to loading state
+    sendExec(username, 'view_storage', { source: 'faction' }, (result) => {
     if (profileBot !== username) return; // stale response
     if (!result.ok && !result.data) {
       profileFactionStorage = [];
@@ -10276,7 +10315,7 @@ function fetchFactionInfo(username) {
     }
     factionData = result.data;
     // faction_info doesn't include treasury — fetch it separately
-    sendExec(username, 'view_faction_storage', { station_id: 'any' }, (storageResult) => {
+    sendExec(username, 'view_storage', { source: 'faction', station_id: 'any' }, (storageResult) => {
       if (storageResult.ok && storageResult.data && storageResult.data.credits != null) {
         factionData.treasury = storageResult.data.credits;
       }
@@ -11101,7 +11140,7 @@ function factionDepositItems(username) {
   const itemId = document.getElementById('faction-dep-item')?.value;
   const qty = parseInt(document.getElementById('faction-dep-qty')?.value) || 1;
   if (!itemId) return;
-  sendExec(username, 'faction_deposit_items', { item_id: itemId, quantity: qty }, (result) => {
+  sendExec(username, 'deposit_items', { item_id: itemId, quantity: qty, target: 'faction', source: 'cargo' }, (result) => {
     if (result.ok) {
       appendLine('system', `${username} deposited ${qty}x ${itemId} to faction storage`);
       fetchFactionInfo(username);
@@ -11220,7 +11259,7 @@ function factionWithdrawItems(username) {
   const itemId = document.getElementById('faction-wit-item')?.value;
   const qty = parseInt(document.getElementById('faction-wit-qty')?.value) || 1;
   if (!itemId) return;
-  sendExec(username, 'faction_withdraw_items', { item_id: itemId, quantity: qty }, (result) => {
+  sendExec(username, 'withdraw_items', { item_id: itemId, quantity: qty, source: 'faction', target: 'cargo' }, (result) => {
     if (result.ok) {
       appendLine('system', `${username} withdrew ${qty}x ${itemId} from faction storage`);
     } else {
@@ -12778,9 +12817,9 @@ async function buildPersonalFacility(username, facilityType) {
       const mQty = m.quantity || m.count || m.amount || 1;
       setStatus(`Withdrawing ${mQty}x ${mName} (${matIndex}/${mats.length})...`);
       
-      // Use faction_withdraw_items to get from faction storage - needs item_id
+      // Use withdraw_items to get from faction storage to cargo
       const withdrawResult = await new Promise(resolve => {
-        sendExec(username, 'storage', { action: 'deposit', target: 'self', item_id: mId, quantity: mQty, source: 'faction' }, resolve);
+        sendExec(username, 'withdraw_items', { item_id: mId, quantity: mQty, source: 'faction', target: 'cargo' }, resolve);
       });
       
       if (!withdrawResult.ok) {
@@ -12827,9 +12866,9 @@ async function buildPersonalFacilityConfirm(username, facilityType, matsJson, co
     for (const m of mats) {
       const mId = m.item_id || m.name || m.resource || '?';
       const mQty = m.quantity || m.count || m.amount || 1;
-      await new Promise(resolve => {
-        sendExec(username, 'faction_withdraw_items', { item_id: mId, quantity: mQty }, () => resolve(true));
-      });
+        await new Promise(resolve => {
+          sendExec(username, 'withdraw_items', { item_id: mId, quantity: mQty, source: 'faction', target: 'cargo' }, () => resolve(true));
+        });
     }
   }
   
@@ -16572,6 +16611,19 @@ function handleGiftBotSelect(username, shipId, selectEl) {
   }
 }
 
+/** Handle gift target dropdown selection in manual controls - show/hide custom name input */
+function handleGiftTargetSelect(selectEl, inputId) {
+  const inputEl = document.getElementById(inputId);
+  if (!inputEl) return;
+  if (selectEl.value === '__custom__') {
+    inputEl.style.display = 'inline-block';
+    inputEl.focus();
+  } else {
+    inputEl.style.display = 'none';
+    inputEl.value = '';
+  }
+}
+
 /** Gift a ship to another bot or player */
 function shipGift(username, shipId, name) {
   if (!shipId) return;
@@ -17349,10 +17401,9 @@ function caGiftSendAll() {
     return;
   }
 
-  // Get target: use custom input if provided, otherwise use dropdown
-  let targetName = val('ca-giftall-custom').trim();
-  if (!targetName) {
-    targetName = val('ca-giftall-target');
+  let targetName = val('mc-giftall-target');
+  if (targetName === '__custom__') {
+    targetName = val('mc-giftall-custom-input');
   }
 
   if (!targetName) {

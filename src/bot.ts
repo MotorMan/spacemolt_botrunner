@@ -97,6 +97,7 @@ export class Bot {
   private _lastAction = "";
   private _error: string | null = null;
   private _abortController: AbortController | null = null;
+  private pendingCommands = new Map<string, AbortController>();
 
   // Cached game state from last get_status
   credits = 0;
@@ -246,17 +247,21 @@ export class Bot {
     payload: Record<string, unknown> | undefined,
     timeoutMs: number,
     targetId: string,
+    abortSignal?: AbortSignal,
   ): Promise<ApiResponse> {
-    // Race the API call against a timeout
-    const apiPromise = this.api.execute(command, payload);
+    // Race the API call against a timeout and abort
+    const apiPromise = this.api.execute(command, payload, abortSignal);
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error(`TIMEOUT`)), timeoutMs);
     });
+    const abortPromise = abortSignal ? new Promise<never>((_, reject) => {
+      abortSignal.addEventListener('abort', () => reject(new Error('ABORTED')));
+    }) : new Promise(() => {}); // Never resolves if no signal
 
     try {
-      return await Promise.race([apiPromise, timeoutPromise]);
+      return await Promise.race([apiPromise, timeoutPromise, abortPromise]) as ApiResponse;
     } catch (err) {
-      if (err instanceof Error && err.message === "TIMEOUT") {
+      if (err instanceof Error && (err.message === "TIMEOUT" || err.message === "ABORTED")) {
         this.log("warn", `${command} timed out after ${timeoutMs / 1000}s — checking position...`);
         // Refresh status to see where we actually are
         await this.refreshStatus();
@@ -299,6 +304,16 @@ export class Bot {
               notifications: [],
             };
           }
+        }
+
+        // For mine/jettison: check if interrupted by battle (timeout or abort)
+        if ((command === "mine" || command === "jettison") && this.currentBattle.inBattle) {
+          this.log("combat", `${command} interrupted by battle! Battle ID: ${this.currentBattle.battleId}`);
+          return {
+            error: { code: "battle_interrupt", message: `${command} interrupted by battle ${this.currentBattle.battleId}` },
+            result: undefined,
+            notifications: [],
+          };
         }
 
         // Not at target — return timeout error so caller can retry
@@ -379,160 +394,177 @@ export class Bot {
      // Capture skill snapshot before command to measure gains later
      this.captureSkillSnapshot();
 
-     // Apply 120s timeout to jump/travel commands to detect hangs
-    // Max normal jump time is 110s (without towing), so 120s is safe threshold
-    let resp: ApiResponse;
-    if (command === "jump" || command === "travel") {
-      const targetSystem = (payload?.target_system as string) || (payload?.target_poi as string) || "";
-      resp = await this.execWithTimeout(command, payload, 120_000, targetSystem);
-    } else {
-      resp = await this.api.execute(command, payload);
-    }
+      // Create AbortController for this command
+      const controller = new AbortController();
+      const key = command + (payload ? JSON.stringify(payload) : "");
+      this.pendingCommands.set(key, controller);
 
-    // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
-    // This prevents 502 errors from breaking routines mid-operation
-    if (resp.error && resp.error.message && resp.error.message.includes("502")) {
-      const MAX_502_RETRIES = 3;
-      for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
-        // CRITICAL: Check if we're in battle - if so, stop retrying immediately
-        if (this.currentBattle.inBattle) {
-          this.log("combat", `HTTP 502 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
-          break;
+      let resp: ApiResponse;
+      try {
+        // Timeout watchers disabled for jump/travel - relying on proper server-side interruption and system messages
+        // But keep a short timeout for quick 1-tick commands like mine/jettison to detect combat hangs
+        if (command === "mine" || command === "jettison") {
+          resp = await this.execWithTimeout(command, payload, 15_000, "", controller.signal);
+        } else {
+          resp = await this.api.execute(command, payload, controller.signal);
         }
-        
-        const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
-        this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1}/${MAX_502_RETRIES} after ${waitTime/1000}s...`);
-        await sleep(waitTime);
-        resp = await this.api.execute(command, payload);
-        if (!resp.error || !resp.error.message?.includes("502")) break;
-      }
-      if (resp.error && resp.error.message?.includes("502")) {
-        this.log("error", `HTTP 502: Bad Gateway (after ${MAX_502_RETRIES} retries)`);
-      }
-    }
 
-    // Handle HTTP 524 Timeout — server took too long to respond (common during battles)
-    // Retry with backoff since battle notifications may still be flowing via WebSocket
-    if (resp.error && resp.error.message && resp.error.message.includes("524")) {
-      const MAX_524_RETRIES = 3;
-      for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
-        // CRITICAL: Check if we're in battle - if so, stop retrying immediately
-        if (this.currentBattle.inBattle) {
-          this.log("combat", `HTTP 524 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
-          break;
+        // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
+        // This prevents 502 errors from breaking routines mid-operation
+        if (resp.error && resp.error.message && resp.error.message.includes("502")) {
+          const MAX_502_RETRIES = 3;
+          for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
+            // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+            if (this.currentBattle.inBattle) {
+              this.log("combat", `HTTP 502 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              break;
+            }
+
+            const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
+            this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1}/${MAX_502_RETRIES} after ${waitTime/1000}s...`);
+            await sleep(waitTime);
+            resp = await this.api.execute(command, payload);
+            if (!resp.error || !resp.error.message?.includes("502")) break;
+          }
+          if (resp.error && resp.error.message?.includes("502")) {
+            this.log("error", `HTTP 502: Bad Gateway (after ${MAX_502_RETRIES} retries)`);
+          }
         }
-        
-        const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
-        this.log("warn", `HTTP 524 Timeout — retry ${retry + 1}/${MAX_524_RETRIES} after ${waitTime/1000}s...`);
-        await sleep(waitTime);
-        resp = await this.api.execute(command, payload);
-        if (!resp.error || !resp.error.message?.includes("524")) break;
-      }
-      if (resp.error && resp.error.message?.includes("524")) {
-        this.log("error", `HTTP 524: Timeout (after ${MAX_524_RETRIES} retries)`);
-      }
-    }
 
-    // Handle full login required (after too many session recovery failures)
-    if (resp.error && resp.error.code === "full_login_required") {
-      this.log("system", "Full login required due to session recovery failures, performing login...");
-      const loggedIn = await this.login();
-      if (loggedIn) {
-        this.log("system", "Full login successful, retrying command...");
-        resp = await this.api.execute(command, payload);
-      } else {
-        this.log("error", "Full login failed");
-      }
-    }
+        // Handle HTTP 524 Timeout — server took too long to respond (common during battles)
+        // Retry with backoff since battle notifications may still be flowing via WebSocket
+        if (resp.error && resp.error.message && resp.error.message.includes("524")) {
+          const MAX_524_RETRIES = 3;
+          for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
+            // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+            if (this.currentBattle.inBattle) {
+              this.log("combat", `HTTP 524 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              break;
+            }
 
-    // After jump/travel commands in empire space, wait for customs messages
-    // This is the PROACTIVE check - wait 2 seconds minimum for customs to respond
-    // Only applies to customs empires (Voidborn, Nebula, Crimson, Solarian) in non-lawless systems
-    if (!resp.error && (command === "jump" || command === "travel")) {
-      await this.refreshStatus();
-      // Check if we're in an empire system with customs (not Frontier, not Outer Rim, not pirate, not lawless)
-      const sysData = mapStore.getSystem(this.system);
-      if (isEmpireSystem(this.system, this.getEmpire(), sysData?.security_level)) {
-        this.log("customs", `⏱️ Post-jump customs wait @ ${this.system} - 2 second delay...`);
-        await sleep(2000);
-      }
-    }
+            const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
+            this.log("warn", `HTTP 524 Timeout — retry ${retry + 1}/${MAX_524_RETRIES} after ${waitTime/1000}s...`);
+            await sleep(waitTime);
+            resp = await this.api.execute(command, payload);
+            if (!resp.error || !resp.error.message?.includes("524")) break;
+          }
+          if (resp.error && resp.error.message?.includes("524")) {
+            this.log("error", `HTTP 524: Timeout (after ${MAX_524_RETRIES} retries)`);
+          }
+        }
 
-    // Action pending — a previous game action is still resolving (10s tick).
-    // Wait for the tick to complete then retry once.
-    if (resp.error) {
-      const msg = resp.error.message || "";
-      if (resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress")) {
-        debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
-        this.log("system", "Action pending — waiting for server to process...");
-        await sleep(10_000);
-        // Refresh status before retry to ensure we're in a valid state
-        await this.refreshStatus();
-        resp = await this.api.execute(command, payload);
-        
-        // If still pending, wait a bit longer and try one more time
-        if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
-          this.log("system", "Action still pending — waiting additional 5s...");
-          await sleep(5_000);
+        // Handle full login required (after too many session recovery failures)
+        if (resp.error && resp.error.code === "full_login_required") {
+          this.log("system", "Full login required due to session recovery failures, performing login...");
+          const loggedIn = await this.login();
+          if (loggedIn) {
+            this.log("system", "Full login successful, retrying command...");
+            resp = await this.api.execute(command, payload);
+          } else {
+            this.log("error", "Full login failed");
+          }
+        }
+
+        // After jump/travel commands in empire space, wait for customs messages
+        // This is the PROACTIVE check - wait 2 seconds minimum for customs to respond
+        // Only applies to customs empires (Voidborn, Nebula, Crimson, Solarian) in non-lawless systems
+        if (!resp.error && (command === "jump" || command === "travel")) {
           await this.refreshStatus();
-          resp = await this.api.execute(command, payload);
+          // Check if we're in an empire system with customs (not Frontier, not Outer Rim, not pirate, not lawless)
+          const sysData = mapStore.getSystem(this.system);
+          if (isEmpireSystem(this.system, this.getEmpire(), sysData?.security_level)) {
+            this.log("customs", `⏱️ Post-jump customs wait @ ${this.system} - 2 second delay...`);
+            await sleep(2000);
+          }
         }
-      }
-    }
 
-    if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
-      logNotifications(resp.notifications);
-      await this.handleNotifications(resp.notifications);
-    }
+        // Action pending — a previous game action is still resolving (10s tick).
+        // Wait for the tick to complete then retry once.
+        if (resp.error) {
+          const msg = resp.error.message || "";
+          if (resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress")) {
+            debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
+            this.log("system", "Action pending — waiting for server to process...");
+            await sleep(10_000);
+            // Refresh status before retry to ensure we're in a valid state
+            await this.refreshStatus();
+            resp = await this.api.execute(command, payload);
 
-    if (resp.error) {
-      // Suppress noisy expected errors — callers handle these gracefully
-      const code = resp.error.code || "";
-      const quiet =
-        code === "mission_incomplete" ||
-        code === "not_in_battle" ||
-        (command === "view_faction_storage" && code !== "session_invalid") ||
-        (command === "get_missions" && code !== "session_invalid") ||
-        (command === "complete_mission" && code === "mission_incomplete") ||
-        (command === "get_insurance_quote" && code !== "session_invalid") ||
-        (command === "survey_system" && code === "no_scanner") ||
-        (command === "faction_deposit_items" && code === "no_faction_storage") ||
-        (command === "faction_deposit_credits" && code === "no_faction_storage") ||
-        (command === "withdraw_items" && code === "cargo_full") ||
-        (command === "faction_withdraw_items" && code === "cargo_full");
-      if (!quiet) {
-        this.log("error", `${command}: ${resp.error.message}`);
-      }
-    }
+            // If still pending, wait a bit longer and try one more time
+            if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
+              this.log("system", "Action still pending — waiting additional 5s...");
+              await sleep(5_000);
+              await this.refreshStatus();
+              resp = await this.api.execute(command, payload);
+            }
+          }
+        }
 
-     // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
-     // This helps collect player names faster as we move through the galaxy
-     if (!resp.error) {
-       const navigationCommands = ["travel", "jump", "dock", "undock"];
-       if (navigationCommands.includes(command)) {
-         // Small delay to let the navigation complete
-         await sleep(500);
-         const nearbyResp = await this.api.execute("get_nearby");
-         if (!nearbyResp.error && nearbyResp.result) {
-           this.trackNearbyPlayers(nearbyResp.result);
+        if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
+          logNotifications(resp.notifications);
+          await this.handleNotifications(resp.notifications);
+        }
+
+        if (resp.error) {
+          // Suppress noisy expected errors — callers handle these gracefully
+          const code = resp.error.code || "";
+          const quiet =
+            code === "mission_incomplete" ||
+            code === "not_in_battle" ||
+            (command === "view_storage" && code !== "session_invalid") ||
+            (command === "get_missions" && code !== "session_invalid") ||
+            (command === "complete_mission" && code === "mission_incomplete") ||
+            (command === "get_insurance_quote" && code !== "session_invalid") ||
+            (command === "survey_system" && code === "no_scanner") ||
+            ((command === "deposit_items" || command === "view_storage") && code === "no_faction_storage") ||
+            (command === "withdraw_items" && code === "cargo_full");
+          if (!quiet) {
+            this.log("error", `${command}: ${resp.error.message}`);
+          }
+        }
+
+         // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
+         // This helps collect player names faster as we move through the galaxy
+         if (!resp.error) {
+           const navigationCommands = ["travel", "jump", "dock", "undock"];
+           if (navigationCommands.includes(command)) {
+             // Small delay to let the navigation complete
+             await sleep(500);
+             const nearbyResp = await this.api.execute("get_nearby");
+             if (!nearbyResp.error && nearbyResp.result) {
+               this.trackNearbyPlayers(nearbyResp.result);
+             }
+           }
          }
-       }
-     }
 
-      // Track piloting XP after ship-based actions that grant exp
-      const PILOTING_EXP_COMMANDS = new Set([
-        'jump', 'travel', 'mine', 'attack', 'salvage_wreck', 'loot_wreck',
-        'refuel', 'repair', 'dock', 'undock', 'survey_system'
-      ]);
-      if (!resp.error && PILOTING_EXP_COMMANDS.has(command)) {
-         try {
-            await this.logSkillGains(command);
-         } catch (e) {
-            // ignore tracking errors
-         }
+          // Track piloting XP after ship-based actions that grant exp
+          const PILOTING_EXP_COMMANDS = new Set([
+            'jump', 'travel', 'mine', 'attack', 'salvage_wreck', 'loot_wreck',
+            'refuel', 'repair', 'dock', 'undock', 'survey_system'
+          ]);
+          if (!resp.error && PILOTING_EXP_COMMANDS.has(command)) {
+             try {
+                await this.logSkillGains(command);
+             } catch (e) {
+                // ignore tracking errors
+             }
+          }
+
+          return resp;
+      } catch (err) {
+        // Handle abort
+        if (err instanceof Error && err.name === "AbortError" && this.currentBattle.inBattle) {
+          this.log("combat", `${command} aborted due to battle detection`);
+          return {
+            error: { code: "battle_interrupt", message: `${command} aborted due to battle ${this.currentBattle.battleId}` },
+            result: undefined,
+            notifications: [],
+          };
+        }
+        throw err;
+      } finally {
+        this.pendingCommands.delete(key);
       }
-
-      return resp;
   }
 
   /** Login using stored credentials. Returns true on success. Prevents duplicate concurrent logins. */
@@ -619,18 +651,27 @@ export class Bot {
       const r = resp.result as Record<string, unknown>;
       debugLogForBot(this.username, "bot:refreshStatus", `${this.username} top-level keys`, Object.keys(r));
 
-      // Player data may be nested under r.player or flat at top level
+      // Location is now nested under `location` object in v2
+      const location = r.location as Record<string, unknown> | undefined;
       const player = r.player as Record<string, unknown> | undefined;
-      const p = player || r;
+      // Use location data first, then player, then root level
+      const p = location || player || r;
 
-      this.credits = (p.credits as number) ?? this.credits;
-      debugLogForBot(this.username, "bot:credits", `${this.username} credits=${this.credits} raw=${p.credits}`);
-      this.system = (p.current_system as string) ?? this.system;
-      this.poi = (p.current_poi as string) ?? (p.poi_id as string) ?? this.poi;
-      this.docked = p.docked_at_base != null
-        ? !!(p.docked_at_base)
-        : (p.docked as boolean) ?? (p.status === "docked");
+      this.credits = (player?.credits as number) ?? (p.credits as number) ?? this.credits;
+      debugLogForBot(this.username, "bot:credits", `${this.username} credits=${this.credits} raw=${player?.credits ?? p.credits}`);
+
+      // System and POI are now inside `location` object in v2
+      // location.system_id, location.system_name, location.poi_id, location.poi_name
+      this.system = (location?.system_id as string) || (location?.system_name as string) || (p.current_system as string) || this.system;
+      this.poi = (location?.poi_id as string) || (location?.poi_name as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+      this.docked = location?.docked_at != null
+        ? !!(location.docked_at)
+        : (p.docked_at_base != null
+          ? !!(p.docked_at_base)
+          : (p.docked as boolean) ?? (p.status === "docked"));
       this.location =
+        (location?.system_name as string) ||
+        (location?.system_id as string) ||
         (p.current_system as string) ||
         (p.location as string) ||
         this.location;
@@ -787,7 +828,7 @@ export class Bot {
       return;
     }
 
-    const resp = await this.exec("view_faction_storage");
+    const resp = await this.exec("view_storage", { source: "faction" });
     if (resp.error) {
       this.factionStorage = [];
       if (cached) {
@@ -1503,6 +1544,12 @@ export class Bot {
             this.currentBattle.battleId = battleIdMatch[1];
           }
           debugLogForBot(this.username, "bot:battle", `${this.username} battle detected via system message: ${message}`);
+
+          // Abort any pending mutation commands since we're now in battle
+          for (const controller of this.pendingCommands.values()) {
+            controller.abort();
+          }
+          this.pendingCommands.clear();
         }
       }
 

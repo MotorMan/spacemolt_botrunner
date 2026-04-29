@@ -37,19 +37,21 @@ import {
   ensureUndocked,
   tryRefuel,
   repairShip,
-  ensureFueled,
-  navigateToSystem,
-  fetchSecurityLevel,
-  getBattleStatus,
-  ensureFueled,
-  logStatus,
+   ensureFueled,
+   ensureInsured,
+   navigateToSystem,
+   fetchSecurityLevel,
+   getBattleStatus,
+   logStatus,
   detectAndRecoverFromDeath,
   ensureModsFitted,
   getModProfile,
   readSettings,
-  fleeFromBattle,
-  checkAndFleeFromBattle,
-  checkBattleAfterCommand,
+   fleeFromBattle,
+   checkAndFleeFromBattle,
+   checkBattleAfterCommand,
+   type BattleState,
+   handleBattleNotifications,
 } from "./common.js";
 import {
   type NearbyEntity,
@@ -250,9 +252,19 @@ async function executeAttackCommand(ctx: RoutineContext, params: string): Promis
   // - Advancing to engaged
   // - Tactical combat loop
   // - ONLY fleeing on hull <= fleeThreshold
+  // Create a NearbyEntity from targetData for engageTarget
+  const targetEntity: NearbyEntity = {
+    id: targetData.id,
+    name: targetData.name,
+    type: "pirate", // Assume pirate for fleet hunters
+    faction: "",
+    isNPC: true,
+    isPirate: true,
+  };
+
   const won = await engageTarget(
     ctx,
-    targetData,
+    targetEntity,
     settings.fleeThreshold,
     settings.fleeFromTier,
     settings.minPiratesToFlee,
@@ -364,6 +376,17 @@ async function executeDockCommand(ctx: RoutineContext): Promise<void> {
 export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
+  // Persistent battle state across cycles
+  const battleRef = { state: null as BattleState | null };
+  battleRef.state = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+    lastFleeTime: undefined,
+  };
+
   await bot.refreshStatus();
 
   const settings = getFleetHunterSettings();
@@ -400,6 +423,22 @@ export const fleetHunterSubordinateRoutine: Routine = async function* (ctx: Rout
       yield "get_status";
       await bot.refreshStatus();
       logStatus(ctx);
+
+      // ── Battle detection ──
+      // Update battle state from current status
+      if (bot.isInBattle()) {
+        if (!battleRef.state!.inBattle) {
+          ctx.log("combat", "Battle detected - fleet subordinate engaging!");
+          battleRef.state!.inBattle = true;
+          battleRef.state!.battleId = null; // Will be updated when available
+        }
+      } else {
+        if (battleRef.state!.inBattle) {
+          ctx.log("combat", "Battle cleared - fleet subordinate standing down");
+          battleRef.state!.inBattle = false;
+          battleRef.state!.battleId = null;
+        }
+      }
 
       // ── Process pending fleet commands (ALWAYS process commands, even if hunting disabled) ──
       yield "check_commands";

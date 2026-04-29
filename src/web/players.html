@@ -36,6 +36,12 @@
     .faction-NIFG { background:#fbe9e7; color:#bf360c; }
     .faction-NCOL { background:#f3e5f5; color:#4a148c; }
     .ship-badge { display:inline-block; padding:2px 6px; background:var(--card-bg); border:1px solid var(--border); border-radius:3px; font-size:11px; }
+    .ship-tier-0 { color: #00ffff; }
+    .ship-tier-1 { color: #808000; }
+    .ship-tier-2 { color: #0000ff; }
+    .ship-tier-3 { color: #800080; }
+    .ship-tier-4 { color: #ff0000; }
+    .ship-tier-5 { color: #ffff00; }
     .time-ago { color:var(--text-dim); font-size:11px; }
     .stat-card { background:var(--card-bg); border:1px solid var(--border); border-radius:6px; padding:12px; display:inline-block; margin:4px; min-width:120px; }
     .stat-card-label { font-size:11px; color:var(--text-dim); }
@@ -108,27 +114,44 @@
     let ws = null;
     let currentView = 'table';
     let filteredPlayers = [];
+    let shipTierMap = {};
 
     // ── WebSocket Connection ──────────────────────────────
     function connect() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
       ws = new WebSocket(`${proto}//${location.host}/ws`);
-      
+
       ws.onopen = () => {
+        loadCatalogData();
         loadPlayerData();
       };
-      
+
       ws.onclose = () => {
         setTimeout(connect, 2000);
       };
-      
+
       ws.onmessage = (ev) => {
         let msg;
         try { msg = JSON.parse(ev.data); } catch { return; }
         if (msg.type === 'init') {
+          loadCatalogData();
           loadPlayerData();
         }
       };
+    }
+
+    // ── Load Catalog Data ─────────────────────────────────
+    function loadCatalogData() {
+      fetch('/api/catalog').then(res => res.json()).then(catalog => {
+        for (let id in catalog.ships) {
+          let ship = catalog.ships[id];
+          if (ship.tier !== undefined && ship.id) {
+            shipTierMap[ship.id] = ship.tier;
+          }
+        }
+        // Re-render if view is already rendered
+        if (currentView) renderView();
+      }).catch(e => console.error('Failed to load catalog:', e));
     }
 
     // ── Load Player Data ──────────────────────────────────
@@ -319,7 +342,7 @@
       const content = document.getElementById('viewContent');
       const players = filteredPlayers.map(([k, p]) => p);
       const ships = {};
-      
+
       players.forEach(p => {
         const ship = p.ship || 'Unknown';
         if (!ships[ship]) ships[ship] = { count: 0, players: [], factions: new Set() };
@@ -327,17 +350,19 @@
         ships[ship].players.push(p.name);
         if (p.faction) ships[ship].factions.add(p.faction);
       });
-      
+
       const maxCount = Math.max(...Object.values(ships).map(s => s.count));
-      
+
       const html = Object.entries(ships)
         .sort((a, b) => b[1].count - a[1].count)
         .map(([ship, data]) => {
           const pct = (data.count / maxCount) * 100;
+          const tier = shipTierMap[ship] ?? -1;
+          const barColor = getTierColor(tier);
           return `<div class="chart-bar">
             <div class="chart-bar-label">${esc(ship)}</div>
             <div class="chart-bar-track">
-              <div class="chart-bar-fill" style="width:${pct}%"></div>
+              <div class="chart-bar-fill" style="width:${pct}%;background:${barColor}"></div>
             </div>
             <div class="chart-bar-value">${data.count}</div>
             <div style="font-size:11px;color:var(--text-dim);min-width:100px">
@@ -345,8 +370,21 @@
             </div>
           </div>`;
         }).join('');
-      
-      content.innerHTML = `<h4>Ship Popularity (Most Popular to Rarest)</h4>
+
+      const legend = `<div style="display:flex; gap:8px; font-size:12px; justify-content:center;">
+        <span><div style="width:16px; height:12px; background:#00ffff; border:1px solid var(--border); display:inline-block; margin-right:4px;"></div> T0</span>
+        <span><div style="width:16px; height:12px; background:#808000; border:1px solid var(--border); display:inline-block; margin-right:4px;"></div> T1</span>
+        <span><div style="width:16px; height:12px; background:#0000ff; border:1px solid var(--border); display:inline-block; margin-right:4px;"></div> T2</span>
+        <span><div style="width:16px; height:12px; background:#800080; border:1px solid var(--border); display:inline-block; margin-right:4px;"></div> T3</span>
+        <span><div style="width:16px; height:12px; background:#ff0000; border:1px solid var(--border); display:inline-block; margin-right:4px;"></div> T4</span>
+        <span><div style="width:16px; height:12px; background:#ffff00; border:1px solid var(--border); display:inline-block; margin-right:4px;"></div> T5</span>
+        <span><div style="width:16px; height:12px; background:#000000; border:1px solid var(--border); display:inline-block; margin-right:4px;"></div> Legacy</span>
+      </div>`;
+
+      content.innerHTML = `<div style="display:flex; align-items:center;">
+        <h4>Ship Popularity (Most Popular to Rarest)</h4>
+        <div style="flex:1; display:flex; justify-content:center;">${legend}</div>
+      </div>
         <div style="margin-top:12px">${html}</div>`;
     }
 
@@ -570,6 +608,18 @@
       if (diffMins < 60) return `${diffMins}m ago`;
       if (diffHours < 24) return `${diffHours}h ${diffMins % 60}m ago`;
       return `${diffDays}d ago`;
+    }
+
+    function getTierColor(tier) {
+      switch(tier) {
+        case 0: return '#00ffff'; // cyan
+        case 1: return '#808000'; // olive green
+        case 2: return '#0000ff'; // blue
+        case 3: return '#800080'; // purple
+        case 4: return '#ff0000'; // red
+        case 5: return '#ffff00'; // yellow
+        default: return '#000000'; // black for unknown/legacy
+      }
     }
 
     function esc(s) {

@@ -891,7 +891,7 @@ export class AiChatService {
     const triedBots = new Set<string>();
     for (const candidate of candidates) {
       triedBots.add(candidate.username);
-      const result = await this.handleResponse(candidate, msg, settings, msg.sender, true, triedBots);
+      const result = await this.handleResponse(candidate, msg, settings, msg.sender, false, triedBots);
       if (result === "sent") {
         break; // Success, stop trying
       }
@@ -970,6 +970,11 @@ export class AiChatService {
     // Record this response for conversation tracking (only if not traveling)
     if (result !== "traveling") {
       this.recordResponse(msg.channel, participants, isHumanSender);
+
+      // Increment faction chat rounds counter if response was sent
+      if (result === "sent" && msg.channel === "faction") {
+        this.incrementFactionChatRounds();
+      }
     }
 
     return result === "sent" ? "sent" : "failed";

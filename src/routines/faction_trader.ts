@@ -38,6 +38,13 @@ import {
   type TradeSession,
 } from "./traderActivity.js";
 import {
+  getBuyOrderLock,
+  acquireBuyOrderLock,
+  releaseBuyOrderLock,
+  cleanupStaleFactionLocks,
+  getBuyOrderKey,
+} from "./factionTraderCoordination.js";
+import {
   type BattleState,
   handleBattleNotifications,
   getBattleStatus,
@@ -107,6 +114,23 @@ function getFactionTraderSettings(username?: string): {
   };
 }
 
+/**
+ * Fail a faction trade session and release its buy order lock.
+ */
+async function failFactionSession(botUsername: string, reason: string): Promise<void> {
+  const session = getActiveSession(botUsername);
+  if (session) {
+    releaseBuyOrderLock(
+      botUsername,
+      session.itemId,
+      session.destPoi,
+      session.sellPricePerUnit,
+      reason
+    );
+  }
+  await failTradeSession(botUsername, reason);
+}
+
 // ── Trade Session Recovery ──────────────────────────────────
 
 /**
@@ -129,11 +153,11 @@ async function recoverFactionTradeSession(
     const cargoItem = bot.inventory.find(i => i.itemId === session.itemId);
     const cargoQty = cargoItem?.quantity ?? 0;
 
-    if (cargoQty <= 0) {
-      ctx.log("error", `Recovery failed: ${session.itemName} no longer in cargo`);
-      await failTradeSession(session.botUsername, "Items not in cargo");
-      return null;
-    }
+  if (cargoQty <= 0) {
+    ctx.log("error", `Recovery failed: ${session.itemName} no longer in cargo`);
+    await failFactionSession(session.botUsername, "Items not in cargo");
+    return null;
+  }
 
     if (cargoQty < session.quantityBought) {
       ctx.log("trade", `Recovered with partial cargo: ${cargoQty}/${session.quantityBought}x ${session.itemName}`);
@@ -163,11 +187,11 @@ async function recoverFactionTradeSession(
         .filter(b => b.itemId === session.itemId && b.price > 0)
         .sort((a, b) => b.price - a.price);
 
-      if (alternativeBuyers.length === 0) {
-        ctx.log("error", "No alternative buyers found — abandoning session");
-        await failTradeSession(session.botUsername, "No buyers available");
-        return null;
-      }
+    if (alternativeBuyers.length === 0) {
+      ctx.log("error", "No alternative buyers found — abandoning session");
+      await failFactionSession(session.botUsername, "No buyers available");
+      return null;
+    }
 
       const bestAlt = alternativeBuyers[0];
       ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
@@ -185,13 +209,56 @@ async function recoverFactionTradeSession(
       // For faction trades, buyPricePerUnit is 0 (no purchase cost), so check if price is still > 0
       if (destBuyer.price <= 0) {
         ctx.log("error", `Price dropped to ${destBuyer.price}cr — abandoning`);
-        await failTradeSession(session.botUsername, "Price too low");
+        await failFactionSession(session.botUsername, "Price too low");
         return null;
       }
     }
   }
 
   ctx.log("trade", `Session recovered: ${session.quantityBought}x ${session.itemName} → ${session.destPoiName}`);
+
+  // Reacquire buy order lock for recovered session
+  const lockKey = getBuyOrderKey(session.itemId, session.destPoi, session.sellPricePerUnit);
+  const existingLock = getBuyOrderLock(session.itemId, session.destPoi, session.sellPricePerUnit);
+  
+  if (existingLock && existingLock.lockedBy !== bot.username) {
+    ctx.log("trade", `Buy order lock held by ${existingLock.lockedBy} — attempting to reacquire`);
+    const reacquired = acquireBuyOrderLock({
+      botUsername: bot.username,
+      itemId: session.itemId,
+      itemName: session.itemName,
+      destSystem: session.destSystem,
+      destPoi: session.destPoi,
+      destPoiName: session.destPoiName,
+      pricePerUnit: session.sellPricePerUnit,
+      quantityCommitted: session.sellQuantity,
+      sessionId: session.sessionId,
+    });
+    if (!reacquired) {
+      ctx.log("error", "Failed to reacquire buy order lock — abandoning session");
+      await failFactionSession(session.botUsername, "Could not reacquire buy order lock");
+      return null;
+    }
+  } else if (!existingLock) {
+    // No lock exists — acquire new one
+    const acquired = acquireBuyOrderLock({
+      botUsername: bot.username,
+      itemId: session.itemId,
+      itemName: session.itemName,
+      destSystem: session.destSystem,
+      destPoi: session.destPoi,
+      destPoiName: session.destPoiName,
+      pricePerUnit: session.sellPricePerUnit,
+      quantityCommitted: session.sellQuantity,
+      sessionId: session.sessionId,
+    });
+    if (!acquired) {
+      ctx.log("error", "Failed to acquire buy order lock — abandoning session");
+      await failFactionSession(session.botUsername, "Could not acquire buy order lock");
+      return null;
+    }
+  }
+
   return session;
 }
 
@@ -401,6 +468,13 @@ function findFactionSellRoutes(
     for (const buy of buyers) {
       if (itemMinSellPrice > 0 && buy.price < itemMinSellPrice) continue;
 
+      // Check if this buy order is locked by another bot
+      const existingLock = getBuyOrderLock(item.itemId, buy.poiId, buy.price);
+      if (existingLock) {
+        ctx.log("trade", `Skipping buy order at ${buy.poiName} (${buy.price}cr) — locked by ${existingLock.lockedBy}`);
+        continue;
+      }
+
       // Round-trip fuel: current → dest + dest → home
       const toDest = estimateFuelCost(currentSystem, buy.systemId, costPerJump);
       const returnHome = estimateFuelCost(buy.systemId, homeSystem, costPerJump);
@@ -450,24 +524,76 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
   await bot.refreshStatus();
   const startSystem = bot.system;
 
+  // Persistent battle state across cycles
+  const battleState: BattleState = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+    lastFleeTime: undefined,
+  };
+
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await ctx.sleep(30000); continue; }
 
-    // ── Battle state tracking (per-cycle initialization) ──
-    const battleState: BattleState = {
-      inBattle: false,
-      battleId: null,
-      battleStartTick: null,
-      lastHitTick: null,
-      isFleeing: false,
-    };
-
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "faction_trader")) {
       await ctx.sleep(5000);
       continue;
+    }
+
+    // Periodic battle status check (backup detection in case notifications fail)
+    // Check every cycle for fast detection
+    if (bot.isInBattle()) {
+      const now = Date.now();
+      const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+      if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", `PERIODIC CHECK: IN BATTLE! - initiating IMMEDIATE flee!`);
+        battleState.inBattle = true;
+        battleState.isFleeing = false;
+
+        await bot.exec("battle", { action: "stance", stance: "flee" });
+        battleState.lastFleeTime = now;
+        ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
+      }
+    }
+
+    // If we're in battle, re-issue flee command to ensure we stay in flee stance
+    if (battleState.inBattle) {
+      const now = Date.now();
+      const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+      if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", "Re-issuing flee stance (ensuring we stay in flee mode)...");
+        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (fleeResp.error) {
+          ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+        } else {
+          battleState.lastFleeTime = now;
+        }
+      }
+      // Check if we've successfully disengaged
+      const currentBattleStatus = await getBattleStatus(ctx);
+      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+        ctx.log("combat", "Battle cleared - no longer in combat!");
+        battleState.inBattle = false;
+        battleState.battleId = null;
+        battleState.isFleeing = false;
+        battleState.lastFleeTime = undefined;
+        await ctx.sleep(2000); // Brief pause before next check
+        continue;
+      }
+      // Still in battle - continue to next cycle
+      await ctx.sleep(2000); // Brief pause before next check
+      continue;
+    }
+
+    // ── Buy order lock cleanup (periodic stale lock cleanup) ──
+    const cleanedLocks = cleanupStaleFactionLocks();
+    if (cleanedLocks > 0) {
+      ctx.log("trade", `Faction coordination: cleaned up ${cleanedLocks} stale buy order lock(s)`);
     }
 
     // ── Detect faction membership early ──
@@ -476,7 +602,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     let personalMode = false;
     let factionError: string | null = null;
     if (bot.docked) {
-      const factionResp = await bot.exec("view_faction_storage");
+      const factionResp = await bot.exec("view_storage", { source: "faction" });
       if (factionResp.error) {
         factionError = factionResp.error.message || "";
         // Only use personal mode if bot is truly not in a faction
@@ -721,7 +847,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         // Docking failed, keep personalMode assumption
       } else if (personalMode) {
         // We assumed personal mode because we were undocked - now re-check
-        const factionResp = await bot.exec("view_faction_storage");
+        const factionResp = await bot.exec("view_storage", { source: "faction" });
         if (factionResp.error) {
           factionError = factionResp.error.message || "";
           personalMode = factionError.includes("not_in_faction") || factionError.includes("not in a faction");
@@ -890,7 +1016,25 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
     // Use existing route if recovered session is being handled, otherwise pick the best found route
     if (!recoveredSessionHandled) {
-      route = foundRoutes[0];
+      // Iterate through found routes to find one with an available lock
+      for (const candidateRoute of foundRoutes) {
+        const lockKey = getBuyOrderKey(candidateRoute.itemId, candidateRoute.destPoi, candidateRoute.sellPrice);
+        const existingLock = getBuyOrderLock(candidateRoute.itemId, candidateRoute.destPoi, candidateRoute.sellPrice);
+        
+        if (existingLock) {
+          ctx.log("trade", `Skipping route to ${candidateRoute.destPoiName} — buy order locked by ${existingLock.lockedBy}`);
+          continue;
+        }
+        
+        route = candidateRoute;
+        break;
+      }
+      
+      if (!route) {
+        ctx.log("trade", "All found routes have locked buy orders — waiting 60s");
+        await ctx.sleep(60000);
+        continue;
+      }
     }
     // route is guaranteed to be non-null here: either from recoveredSession or from foundRoutes
     const routeLabel = route!.roundTripJumps > route!.jumps
@@ -1215,7 +1359,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           ctx.log("error", `No items were sold for ${route!.itemName} — failing session`);
           const session = getActiveSession(bot.username);
           if (session) {
-            await failTradeSession(bot.username, "No items were actually sold");
+            await failFactionSession(bot.username, "No items were actually sold");
           }
           break;
         } else {
@@ -1281,7 +1425,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         // No items sold - fail any existing session
         const session = getActiveSession(bot.username);
         if (session) {
-          await failTradeSession(bot.username, "No items were actually sold");
+          await failFactionSession(bot.username, "No items were actually sold");
         }
       }
     } else {
@@ -1423,6 +1567,26 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         investedCredits: 0,
       });
       session.state = isCargoRecovery ? "in_transit" : "buying"; // Cargo recovery is already past buying phase
+
+      // Acquire lock on the destination buy order
+      const lockAcquired = acquireBuyOrderLock({
+        botUsername: bot.username,
+        itemId: session.itemId,
+        itemName: session.itemName,
+        destSystem: session.destSystem,
+        destPoi: session.destPoi,
+        destPoiName: session.destPoiName,
+        pricePerUnit: session.sellPricePerUnit,
+        quantityCommitted: session.sellQuantity,
+        sessionId: session.sessionId,
+      });
+
+        if (!lockAcquired) {
+          ctx.log("trade", `Failed to acquire lock on buy order for ${session.itemName} at ${session.destPoiName} — picking next route`);
+          await failFactionSession(bot.username, "Buy order locked by another bot");
+          continue;
+        }
+
       await startTradeSession(session);
       ctx.log("trade", `Trade session started: ${session.sessionId}`);
 
@@ -1548,13 +1712,13 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
         if (marketCheck.sellQty <= 0) {
           ctx.log("trade", `No viable buy orders for ${route!.itemName} at ${route!.destPoiName} — skipping sell`);
-          await failTradeSession(bot.username, "No viable buy orders at destination");
+          await failFactionSession(bot.username, "No viable buy orders at destination");
         } else {
           ctx.log("trade", `Selling ${marketCheck.sellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
           const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: marketCheck.sellQty });
           if (sResp.error) {
             ctx.log("error", `Sell failed: ${sResp.error.message}`);
-            await failTradeSession(bot.username, `Sell failed: ${sResp.error.message}`);
+            await failFactionSession(bot.username, `Sell failed: ${sResp.error.message}`);
           } else {
             // Get actual revenue from sell result
             const sr = sResp.result as Record<string, unknown> | undefined;
@@ -1567,7 +1731,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
             if (actuallySold <= 0) {
               ctx.log("error", `Sell command succeeded but no items were sold - item still in cargo (${inCargo}x)`);
-              await failTradeSession(bot.username, "Sell command did not remove items from cargo");
+              await failFactionSession(bot.username, "Sell command did not remove items from cargo");
             } else {
               const revenue = actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice;
               bot.stats.totalTrades++;
@@ -1577,6 +1741,19 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               // Complete trade session
               const actualProfit = revenue; // No acquisition cost for faction items
               await completeTradeSession(bot.username, revenue, actualProfit);
+
+              // Release buy order lock
+              const completedSession = getActiveSession(bot.username);
+              if (completedSession) {
+                releaseBuyOrderLock(
+                  bot.username,
+                  completedSession.itemId,
+                  completedSession.destPoi,
+                  completedSession.sellPricePerUnit,
+                  "completed"
+                );
+              }
+
               ctx.log("trade", "Trade session completed successfully");
 
               // Update sold quantity tracking in settings
@@ -1603,7 +1780,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       } else {
         // No cargo - session recovery needed
         ctx.log("error", "No cargo found at destination — trade session may need recovery");
-        await failTradeSession(bot.username, "Cargo missing at destination");
+        await failFactionSession(bot.username, "Cargo missing at destination");
       }
       await recordMarketData(ctx);
     } // End else (cross-system)

@@ -330,7 +330,7 @@ async function withdrawFactionMaterials(ctx: RoutineContext, recipe: Recipe, bat
     if (!inFaction || inFaction.quantity <= 0) continue;
 
     const withdrawQty = Math.min(needed, inFaction.quantity);
-    const resp = await bot.exec("storage", { action: "deposit", target: "self", item_id: comp.item_id, quantity: withdrawQty, source: "faction" });
+    const resp = await bot.exec("withdraw_items", { storage_unit_id: bot.poi, item_id: comp.item_id, quantity: withdrawQty, source: "faction" });
     if (!resp.error) {
       ctx.log("craft", `Withdrew ${withdrawQty}x ${comp.name || comp.item_id} from faction storage`);
       logFactionActivity(ctx, "withdraw", `Withdrew ${withdrawQty}x ${comp.name || comp.item_id} from faction storage`);
@@ -699,10 +699,10 @@ async function craftPrerequisites(
       // Don't deposit items we need as components for this prereq
       if (prereqRecipe.components.some(c => c.item_id === item.itemId)) continue;
       // Use unified storage command: deposit from cargo to faction storage
-      const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+      const dResp = await bot.exec("faction_deposit_items", { faction_id: bot.faction, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
       if (dResp.error) {
         // Fallback: deposit to personal storage
-        await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+        await bot.exec("deposit_items", { storage_unit_id: bot.poi, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
       }
     }
     await bot.refreshCargo();
@@ -869,9 +869,9 @@ async function craftFromCategories(
       if (item.quantity <= 0) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-      const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+      const dResp = await bot.exec("faction_deposit_items", { faction_id: bot.faction, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
       if (dResp.error) {
-        await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+        await bot.exec("deposit_items", { storage_unit_id: bot.poi, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
       }
     }
   }
@@ -1393,7 +1393,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     // Check if bot is in a faction by attempting to view faction storage
     let personalMode = false;
     if (bot.docked) {
-      const factionResp = await bot.exec("view_faction_storage");
+      const factionResp = await bot.exec("view_storage", { source: "faction" });
       personalMode = !!factionResp.error;
     } else {
       personalMode = true;
@@ -1407,13 +1407,14 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         const lower = item.itemId.toLowerCase();
         if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
         // In faction mode, try faction storage first; in personal mode, use personal storage directly
+      // In faction mode, try faction storage first; in personal mode, use personal storage directly
         if (!personalMode) {
-          const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+          const dResp = await bot.exec("faction_deposit_items", { faction_id: bot.faction, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
           if (dResp.error) {
-            await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+            await bot.exec("deposit_items", { storage_unit_id: bot.poi, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
           }
         } else {
-          await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+          await bot.exec("deposit_items", { storage_unit_id: bot.poi, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
         }
       }
       await bot.refreshCargo();
@@ -1653,16 +1654,16 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
         
-        const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+        const dResp = await bot.exec("faction_deposit_items", { faction_id: bot.faction, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
         if (!dResp.error) {
-          depositedItems.push(`${item.quantity}x ${item.name}`);
+          depositedItems.push(`${item.quantity}x ${item.name} (crafted)`);
           logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (crafted)`);
         } else {
-          await bot.exec("storage", { action: "deposit", target: "self", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+          await bot.exec("deposit_items", { storage_unit_id: bot.poi, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
         }
       }
 
-      // Transfer items from personal storage to faction storage (skip materials needed by active facilities)
+        // Transfer items from personal storage to faction storage (skip materials needed by active facilities)
       await bot.refreshStorage();
       for (const item of [...bot.storage]) {
         if (item.quantity <= 0) continue;
@@ -1671,8 +1672,8 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
           skippedForFacility.push(`${item.quantity}x ${item.name}`);
           continue;
         }
-        
-        const transferResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "storage" });
+
+        const transferResp = await bot.exec("faction_deposit_items", { faction_id: bot.faction, item_id: item.itemId, quantity: item.quantity, source: "storage" });
         if (!transferResp.error) {
           depositedItems.push(`${item.quantity}x ${item.name} (from storage)`);
           logFactionActivity(ctx, "deposit", `Transferred ${item.quantity}x ${item.name} from personal storage to faction storage`);

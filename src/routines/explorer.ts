@@ -28,6 +28,8 @@ import {
   fleeFromBattle,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
+  getBattleStatus,
+  type BattleState,
 } from "./common.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
@@ -39,6 +41,7 @@ const FUEL_SAFETY_PCT = 40;
 
 const DATA_DIR = join(process.cwd(), "data");
 const MARKET_DETAILS_FILE = join(DATA_DIR, "marketDetails.json");
+const SHIPS_FOR_SALE_FILE = join(DATA_DIR, "shipsForSale.json");
 
 interface MarketOrderDetail {
   price: number;
@@ -59,6 +62,33 @@ interface MarketItemDetails {
 interface MarketDetailsData {
   lastSaved: string;
   items: MarketItemDetails[];
+}
+
+interface ShipListing {
+  systemId: string;
+  stationPoiId: string;
+  stationName: string;
+  listing_id: string;
+  ship_id: string;
+  class_id: string;
+  price: number;
+  listed_at: string;
+  seller: string;
+  ship_name: string;
+  tier: number;
+  hull: number;
+  max_hull: number;
+  shield: number;
+  modules_count: number;
+  scale: number;
+  category: string;
+  custom_name?: string;
+  last_updated: string;
+}
+
+interface ShipsForSaleData {
+  lastSaved: string;
+  listings: Record<string, ShipListing>;
 }
 
 function loadMarketDetails(): MarketDetailsData {
@@ -82,6 +112,29 @@ function saveMarketDetails(data: MarketDetailsData): void {
   }
   data.lastSaved = now();
   writeFileSync(MARKET_DETAILS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function loadShipsForSale(): ShipsForSaleData {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (existsSync(SHIPS_FOR_SALE_FILE)) {
+    try {
+      const raw = readFileSync(SHIPS_FOR_SALE_FILE, "utf-8");
+      return JSON.parse(raw) as ShipsForSaleData;
+    } catch {
+      // Corrupt file — start fresh
+    }
+  }
+  return { lastSaved: now(), listings: {} };
+}
+
+function saveShipsForSale(data: ShipsForSaleData): void {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  data.lastSaved = now();
+  writeFileSync(SHIPS_FOR_SALE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
 }
 
 function now(): string {
@@ -458,6 +511,16 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("system", "No station in current system — skipping startup prep");
   }
 
+  // Persistent battle state across cycles
+  const battleState: BattleState = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+    lastFleeTime: undefined,
+  };
+
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -466,18 +529,54 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Clean up expired temporary blacklists ──
     cleanupTemporaryBlacklist();
 
-    // ── Battle check — check global WebSocket battle state first (works during 524 timeouts) ──
+    // ── Battle check — check global battle state first ──
+    if (await checkAndFleeFromBattle(ctx, "explorer")) {
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // Periodic battle status check (backup detection in case notifications fail)
+    // Check every cycle for fast detection
     if (bot.isInBattle()) {
-      ctx.log("combat", "[WebSocket] Battle detected via WebSocket - fleeing immediately!");
-      if (await checkAndFleeFromBattle(ctx, "explorer")) {
-        await ctx.sleep(5000);
-        continue;
+      const now = Date.now();
+      const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+      if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", `PERIODIC CHECK: IN BATTLE! - initiating IMMEDIATE flee!`);
+        battleState.inBattle = true;
+        battleState.isFleeing = false;
+
+        await bot.exec("battle", { action: "stance", stance: "flee" });
+        battleState.lastFleeTime = now;
+        ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
       }
     }
 
-    // ── Battle check — also check via API (fallback) ──
-    if (await checkAndFleeFromBattle(ctx, "explorer")) {
-      await ctx.sleep(5000);
+    // If we're in battle, re-issue flee command to ensure we stay in flee stance
+    if (battleState.inBattle) {
+      const now = Date.now();
+      const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+      if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", "Re-issuing flee stance (ensuring we stay in flee mode)...");
+        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (fleeResp.error) {
+          ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+        } else {
+          battleState.lastFleeTime = now;
+        }
+      }
+      // Check if we've successfully disengaged
+      const currentBattleStatus = await getBattleStatus(ctx);
+      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+        ctx.log("combat", "Battle cleared - no longer in combat!");
+        battleState.inBattle = false;
+        battleState.battleId = null;
+        battleState.isFleeing = false;
+        battleState.lastFleeTime = undefined;
+        await ctx.sleep(2000); // Brief pause before next check
+        continue;
+      }
+      // Still in battle - continue to next cycle
+      await ctx.sleep(2000); // Brief pause before next check
       continue;
     }
 
@@ -1202,6 +1301,7 @@ async function* scanStation(
   poi: SystemPOI,
 ): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
+  const stationPoi = poi;
 
   yield `dock_${poi.id}`;
   const dockResp = await bot.exec("dock");
@@ -2126,6 +2226,67 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
             if (missions.length > 0) mapStore.updateMissions(target.systemId, target.stationPoi, missions);
           }
 
+          // Browse ships for sale if in trade_update mode
+          const settings = getExplorerSettings(bot.username);
+          if (settings.mode === "trade_update") {
+            const browseResp = await bot.exec("browse_ships");
+
+            // Check for battle after browse_ships
+            if (await checkBattleAfterCommand(ctx, browseResp.notifications, "browse_ships")) {
+              ctx.log("combat", "Battle detected during ship browsing - fleeing!");
+              await ctx.sleep(5000);
+              return;
+            }
+
+            if (browseResp.result && typeof browseResp.result === "object") {
+              const result = browseResp.result as Record<string, unknown>;
+              const listings = (
+                Array.isArray(result.listings) ? result.listings : []
+              ) as Array<Record<string, unknown>>;
+
+              if (listings.length > 0) {
+                ctx.log("info", `Saving ${listings.length} ship listings from ${target.stationName}...`);
+                const shipsData = loadShipsForSale();
+                let updated = 0;
+
+                for (const listing of listings) {
+                  const listing_id = (listing.listing_id as string) || "";
+                  if (!listing_id) continue;
+
+                  const shipListing: ShipListing = {
+                    systemId: target.systemId,
+                    stationPoiId: target.stationPoi,
+                    stationName: target.stationName,
+                    listing_id,
+                    ship_id: (listing.ship_id as string) || "",
+                    class_id: (listing.class_id as string) || "",
+                    price: (listing.price as number) || 0,
+                    listed_at: (listing.listed_at as string) || "",
+                    seller: (listing.seller as string) || "",
+                    ship_name: (listing.ship_name as string) || "",
+                    tier: (listing.tier as number) || 0,
+                    hull: (listing.hull as number) || 0,
+                    max_hull: (listing.max_hull as number) || 0,
+                    shield: (listing.shield as number) || 0,
+                    modules_count: (listing.modules_count as number) || 0,
+                    scale: (listing.scale as number) || 0,
+                    category: (listing.category as string) || "",
+                    custom_name: listing.custom_name as string,
+                    last_updated: now(),
+                  };
+
+                  shipsData.listings[listing_id] = shipListing;
+                  updated++;
+                }
+
+                if (updated > 0) {
+                  saveShipsForSale(shipsData);
+                  ctx.log("info", `Saved ${updated} ship listings to shipsForSale.json`);
+                }
+              }
+            }
+          }
+
           await tryRefuel(ctx);
 
           const undockResp = await bot.exec("undock");
@@ -2456,9 +2617,11 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   // Try to withdraw premium_fuel_cell first (higher priority, takes 2 space each)
   const premiumToWithdraw = Math.min(maxPremiumWithdraw, 402); // Cap at reasonable amount
   ctx.log("trade", `Loading ${premiumToWithdraw} premium fuel cells from faction storage for long-range exploration...`);
-  let withdrawResp = await bot.exec("faction_withdraw_items", {
+  let withdrawResp = await bot.exec("withdraw_items", {
     item_id: "premium_fuel_cell",
-    quantity: premiumToWithdraw
+    quantity: premiumToWithdraw,
+    source: "faction",
+    target: "cargo"
   });
 
   // Check for battle after faction_withdraw_items

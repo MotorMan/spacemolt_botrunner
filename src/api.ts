@@ -18,21 +18,275 @@ export interface ApiResponse {
   error?: { code: string; message: string; wait_seconds?: number } | null;
 }
 
-const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v1";
-const USER_AGENT = "SpaceMolt-BotRunner-LT1428-MODDED";
+const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-4-28-26";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;
 const RECONNECT_BASE_DELAY = 5_000;
-const MAX_SESSION_RECOVERIES = 10; // After this many failures, force full login
+const MAX_SESSION_RECOVERIES = 10;
 
-// Global session creation rate limiter - prevents rapid session spam
+// Global session creation rate limiter
 let lastSessionCreateTime = 0;
-const SESSION_CREATE_INTERVAL = 3000; // Minimum 3 seconds between any session creations
+const SESSION_CREATE_INTERVAL = 3000;
 
 // Global serial queue for ALL session creations across all bots
 let globalSessionQueue: Promise<void> = Promise.resolve();
-let globalV2SessionQueue: Promise<void> = Promise.resolve();
+
+// Command-to-Tool Mapping for V2 API
+const COMMAND_TOOL_MAP: Record<string, string> = {
+  // Auth commands
+  'login': 'spacemolt_auth',
+  'register': 'spacemolt_auth',
+  'claim': 'spacemolt_auth',
+  'logout': 'spacemolt_auth',
+
+  // Default spacemolt tool commands
+  'get_status': 'spacemolt',
+  'get_player': 'spacemolt',
+  'get_ship': 'spacemolt',
+  'get_cargo': 'spacemolt',
+  'get_skills': 'spacemolt',
+  'get_queue': 'spacemolt',
+  'get_missions': 'spacemolt',
+  'get_active_missions': 'spacemolt',
+  'completed_missions': 'spacemolt',
+  'view_completed_mission': 'spacemolt',
+  'get_commands': 'spacemolt',
+  'get_version': 'spacemolt',
+  'get_base': 'spacemolt',
+  'get_poi': 'spacemolt',
+  'get_system': 'spacemolt',
+  'get_system_agents': 'spacemolt',
+  'get_nearby': 'spacemolt',
+  'get_location': 'spacemolt',
+  'get_map': 'spacemolt',
+  'find_route': 'spacemolt',
+  'search_systems': 'spacemolt',
+  'survey_system': 'spacemolt',
+  'jump': 'spacemolt',
+  'travel': 'spacemolt',
+  'dock': 'spacemolt',
+  'undock': 'spacemolt',
+  'mine': 'spacemolt',
+  'sell': 'spacemolt',
+  'buy': 'spacemolt',
+  'jettison': 'spacemolt',
+  'use_item': 'spacemolt',
+  'craft': 'spacemolt',
+  'attack': 'spacemolt',
+  'cloak': 'spacemolt',
+  'scan': 'spacemolt',
+  'distress_signal': 'spacemolt',
+  'self_destruct': 'spacemolt',
+  'install_mod': 'spacemolt',
+  'uninstall_mod': 'spacemolt',
+  'repair': 'spacemolt',
+  'repair_module': 'spacemolt',
+  'refuel': 'spacemolt',
+  'accept_mission': 'spacemolt',
+  'complete_mission': 'spacemolt',
+  'abandon_mission': 'spacemolt',
+  'decline_mission': 'spacemolt',
+
+  // Ship commands
+  'browse_ships': 'spacemolt_ship',
+  'buy_listed_ship': 'spacemolt_ship',
+  'list_ships': 'spacemolt_ship',
+  'switch_ship': 'spacemolt_ship',
+  'sell_ship': 'spacemolt_ship',
+  'commission_ship': 'spacemolt_ship',
+  'claim_commission': 'spacemolt_ship',
+  'commission_status': 'spacemolt_ship',
+  'cancel_commission': 'spacemolt_ship',
+  'list_ship_for_sale': 'spacemolt_ship',
+  'cancel_ship_listing': 'spacemolt_ship',
+  'commission_quote': 'spacemolt_ship',
+  'refit_ship': 'spacemolt_ship',
+  'rename_ship': 'spacemolt_ship',
+  'supply_commission': 'spacemolt_ship',
+
+  // Storage commands (actions differ from command names)
+   'deposit_items': 'spacemolt_storage',
+   'withdraw_items': 'spacemolt_storage',
+   'view_storage': 'spacemolt_storage',
+   'view_faction_storage': 'spacemolt_storage',
+   'send_gift': 'spacemolt_storage',
+   'faction_deposit_items': 'spacemolt_storage',  // auto-add target: 'faction'
+   'faction_withdraw_items': 'spacemolt_storage', // auto-add source: 'faction'
+   'storage': 'spacemolt_storage',
+
+  // Market commands
+  'view_market': 'spacemolt_market',
+  'view_orders': 'spacemolt_market',
+  'create_buy_order': 'spacemolt_market',
+  'create_sell_order': 'spacemolt_market',
+  'cancel_order': 'spacemolt_market',
+  'modify_order': 'spacemolt_market',
+  'estimate_purchase': 'spacemolt_market',
+  'analyze_market': 'spacemolt_market',
+
+  // Faction commands
+  'create_faction': 'spacemolt_faction',
+  'join_faction': 'spacemolt_faction',
+  'leave_faction': 'spacemolt_faction',
+  'faction_info': 'spacemolt_faction',
+  'faction_list': 'spacemolt_faction',
+  'faction_invite': 'spacemolt_faction',
+  'faction_kick': 'spacemolt_faction',
+  'faction_accept_peace': 'spacemolt_faction',
+  'faction_declare_war': 'spacemolt_faction',
+  'faction_decline_invite': 'spacemolt_faction',
+  'faction_get_invites': 'spacemolt_faction',
+  'faction_set_ally': 'spacemolt_faction',
+  'faction_set_enemy': 'spacemolt_faction',
+  'faction_propose_peace': 'spacemolt_faction',
+  'faction_remove_ally': 'spacemolt_faction',
+  'faction_remove_enemy': 'spacemolt_faction',
+  'faction_rooms': 'spacemolt_faction',
+  'faction_visit_room': 'spacemolt_faction',
+  'faction_list_missions': 'spacemolt_faction',
+
+  // Faction commerce (only credits and orders)
+  'faction_deposit_credits': 'spacemolt_faction_commerce',
+  'faction_withdraw_credits': 'spacemolt_faction_commerce',
+  'faction_create_buy_order': 'spacemolt_faction_commerce',
+  'faction_create_sell_order': 'spacemolt_faction_commerce',
+  
+  // Faction admin
+  'faction_edit': 'spacemolt_faction_admin',
+  'faction_create_role': 'spacemolt_faction_admin',
+  'faction_edit_role': 'spacemolt_faction_admin',
+  'faction_delete_role': 'spacemolt_faction_admin',
+  'faction_post_mission': 'spacemolt_faction_admin',
+  'faction_cancel_mission': 'spacemolt_faction_admin',
+  'faction_promote': 'spacemolt_faction_admin',
+  'faction_write_room': 'spacemolt_faction_admin',
+  'faction_delete_room': 'spacemolt_faction_admin',
+
+  // Social commands
+  'chat': 'spacemolt_social',
+  'captains_log_add': 'spacemolt_social',
+  'captains_log_get': 'spacemolt_social',
+  'captains_log_list': 'spacemolt_social',
+  'create_note': 'spacemolt_social',
+  'read_note': 'spacemolt_social',
+  'write_note': 'spacemolt_social',
+  'get_action_log': 'spacemolt_social',
+  'get_chat_history': 'spacemolt_social',
+  'forum_create_thread': 'spacemolt_social',
+  'forum_reply': 'spacemolt_social',
+  'forum_list': 'spacemolt_social',
+  'forum_get_thread': 'spacemolt_social',
+  'forum_upvote': 'spacemolt_social',
+  'forum_delete_thread': 'spacemolt_social',
+  'forum_delete_reply': 'spacemolt_social',
+  'set_colors': 'spacemolt_social',
+  'set_status': 'spacemolt_social',
+
+  // Catalog
+  'catalog': 'spacemolt_catalog',
+
+  // Intel
+  'faction_submit_intel': 'spacemolt_intel',
+  'faction_query_intel': 'spacemolt_intel',
+  'faction_submit_trade_intel': 'spacemolt_intel',
+  'faction_query_trade_intel': 'spacemolt_intel',
+  'faction_intel_status': 'spacemolt_intel',
+  'faction_trade_intel_status': 'spacemolt_intel',
+
+  // Facility (special: uses /tool/{action} pattern)
+  'facility': 'spacemolt_facility',
+
+  // Battle
+  'battle': 'spacemolt_battle',
+  'get_battle_status': 'spacemolt_battle',
+  'reload': 'spacemolt_battle',
+
+  // Salvage
+  'get_wrecks': 'spacemolt_salvage',
+  'loot_wreck': 'spacemolt_salvage',
+  'salvage_wreck': 'spacemolt_salvage',
+  'scrap_wreck': 'spacemolt_salvage',
+  'tow_wreck': 'spacemolt_salvage',
+  'sell_wreck': 'spacemolt_salvage',
+  'release_tow': 'spacemolt_salvage',
+  'buy_insurance': 'spacemolt_salvage',
+  'claim_insurance': 'spacemolt_salvage',
+  'get_insurance_quote': 'spacemolt_salvage',
+  'view_insurance': 'spacemolt_salvage',
+  'set_home_base': 'spacemolt_salvage',
+
+  // Fleet
+  'fleet': 'spacemolt_fleet',
+};
+
+// Maps commands to their API action names (when different from command name)
+const COMMAND_ACTION_MAP: Record<string, string> = {
+  // Battle
+  'get_battle_status': 'status',      // spacemolt_battle_status -> action is 'status'
+  
+  // Storage (actions differ from command names)
+  'deposit_items': 'deposit',          // spacemolt_storage/deposit
+  'withdraw_items': 'withdraw',        // spacemolt_storage/withdraw
+  'view_storage': 'view',              // spacemolt_storage/view
+  'faction_deposit_items': 'deposit',    // auto-add target: 'faction'
+  'faction_withdraw_items': 'withdraw',   // auto-add source: 'faction'
+  
+  // Faction storage
+  'view_faction_storage': 'view',  // auto-add source: 'faction'
+  'create_faction': 'create',
+  'join_faction': 'join',
+  'leave_faction': 'leave',
+  'faction_info': 'info',
+  'faction_list': 'list',
+  'faction_invite': 'invite',
+  'faction_kick': 'kick',
+  'faction_accept_peace': 'accept_peace',
+  'faction_declare_war': 'declare_war',
+  'faction_decline_invite': 'decline_invite',
+  'faction_get_invites': 'get_invites',
+  'faction_set_ally': 'set_ally',
+  'faction_set_enemy': 'set_enemy',
+  'faction_propose_peace': 'propose_peace',
+  'faction_remove_ally': 'remove_ally',
+  'faction_remove_enemy': 'remove_enemy',
+  'faction_rooms': 'rooms',
+  'faction_visit_room': 'visit_room',
+  'faction_list_missions': 'list_missions',
+  
+  // Faction commerce (remove 'faction_' prefix)
+  'faction_deposit_credits': 'deposit_credits',
+  'faction_withdraw_credits': 'withdraw_credits',
+  'faction_create_buy_order': 'create_buy_order',
+  'faction_create_sell_order': 'create_sell_order',
+  
+  
+  // Faction admin (remove 'faction_' prefix)
+  'faction_edit': 'edit',
+  'faction_create_role': 'create_role',
+  'faction_edit_role': 'edit_role',
+  'faction_delete_role': 'delete_role',
+  'faction_post_mission': 'post_mission',
+  'faction_cancel_mission': 'cancel_mission',
+  'faction_promote': 'promote',
+  'faction_write_room': 'write_room',
+  'faction_delete_room': 'delete_room',
+  
+  // Intel (remove 'faction_' prefix)
+  'faction_submit_intel': 'submit_intel',
+  'faction_query_intel': 'query_intel',
+  'faction_submit_trade_intel': 'submit_trade_intel',
+  'faction_query_trade_intel': 'query_trade_intel',
+  'faction_intel_status': 'intel_status',
+  'faction_trade_intel_status': 'trade_intel_status',
+  
+  // Catalog
+  'catalog': 'catalog',
+};
+
+// Commands that use payload.action for the action (like facility and battle)
+const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage']);
 
 // ── Response cache ────────────────────────────────────────────
 
@@ -87,21 +341,15 @@ const COMMAND_TTL: Record<string, number> = {
   view_orders: 30_000,
   estimate_purchase: 30_000,
   get_wrecks: 15_000,
-  v2_get_ship: 60_000,
-  v2_get_cargo: 10_000,
-  v2_get_player: 30_000,
-  v2_get_skills: 120_000,
-  v2_get_queue: 5_000,
-  v2_get_missions: 60_000,
   catalog: 3600_000,
 };
 
-const INV_STATUS   = ["get_status", "v2_get_player", "get_queue", "v2_get_queue", "get_skills"];
+const INV_STATUS   = ["get_status", "get_player", "get_queue", "get_skills"];
 const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey_system", "find_route"];
-const INV_CARGO    = ["get_cargo", "v2_get_cargo"];
-const INV_SHIP     = ["get_ship", "v2_get_ship"];
-const INV_MISSIONS = ["get_missions", "v2_get_missions"];
-const INV_STORAGE  = ["view_storage", "view_faction_storage"];
+const INV_CARGO    = ["get_cargo"];
+const INV_SHIP     = ["get_ship"];
+const INV_MISSIONS = ["get_missions"];
+const INV_STORAGE  = ["view_storage"];
 const INV_MARKET   = ["view_market", "view_orders"];
 
 const MUTATION_INVALIDATIONS: Record<string, string[]> = {
@@ -112,49 +360,37 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   reload: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION, ...INV_CARGO, ...INV_SHIP],
   undock: INV_STATUS,
   mine: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
-  sell: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET],
-  buy: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET],
-  jettison: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
+  sell: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET, ...INV_STORAGE],
+  buy: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET, ...INV_STORAGE],
+  jettison: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION, ...INV_STORAGE],
   craft: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
-  loot: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
+  loot: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION, ...INV_STORAGE],
   salvage: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
-  storage: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
   withdraw_items: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
   deposit_items: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
-  faction_withdraw_items: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
-  faction_deposit_items: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
   faction_deposit_credits: INV_STATUS,
   faction_withdraw_credits: INV_STATUS,
   send_gift: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION, ...INV_CARGO, ...INV_SHIP],
-  create_sell_order: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET],
-  create_buy_order: [...INV_STATUS, ...INV_MARKET],
-  cancel_order: [...INV_STATUS, ...INV_MARKET],
-  install_mod: [...INV_STATUS, ...INV_SHIP, ...INV_CARGO],
-  uninstall_mod: [...INV_STATUS, ...INV_SHIP, ...INV_CARGO],
-  repair: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
-  refuel: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_CARGO],
-  accept_mission: [...INV_STATUS, ...INV_MISSIONS],
-  complete_mission: [...INV_STATUS, ...INV_MISSIONS],
-  abandon_mission: [...INV_STATUS, ...INV_MISSIONS],
-  decline_mission: [...INV_STATUS, ...INV_MISSIONS],
+  create_sell_order: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET, ...INV_STORAGE],
+  create_buy_order: [...INV_STATUS, ...INV_MARKET, ...INV_STORAGE],
+  cancel_order: [...INV_STATUS, ...INV_MARKET, ...INV_STORAGE],
+  install_mod: [...INV_STATUS, ...INV_SHIP, ...INV_CARGO, ...INV_STORAGE],
+  uninstall_mod: [...INV_STATUS, ...INV_SHIP, ...INV_CARGO, ...INV_STORAGE],
+  repair: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_STORAGE],
+  refuel: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_CARGO, ...INV_STORAGE],
+  accept_mission: [...INV_STATUS, ...INV_MISSIONS, ...INV_STORAGE, ...INV_CARGO],
+  complete_mission: [...INV_STATUS, ...INV_MISSIONS, ...INV_CARGO, ...INV_STORAGE],
+  abandon_mission: [...INV_STATUS, ...INV_MISSIONS, ...INV_CARGO, ...INV_STORAGE],
+  decline_mission: [...INV_STATUS, ...INV_MISSIONS, ...INV_CARGO, ...INV_STORAGE],
   cloak: INV_STATUS,
   attack: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
   battle: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
   catalog: [],
 };
 
-const V2_ROUTED_COMMANDS = new Set(["facility"]);
-
-const V2_DIRECT_COMMANDS = new Set([
-  "v2_get_ship", "v2_get_cargo", "v2_get_player",
-  "v2_get_queue", "v2_get_skills", "v2_get_missions",
-  "catalog",
-]);
-
 export class SpaceMoltAPI {
   readonly baseUrl: string;
   private session: ApiSession | null = null;
-  private v2Session: ApiSession | null = null;
   private credentials: { username: string; password: string } | null = null;
   private _rateLimitRetries = 0;
   private _cache = new ResponseCache();
@@ -190,20 +426,6 @@ export class SpaceMoltAPI {
       return false;
     }
 
-    // Check if saved sessions are expired
-    const now = Date.now();
-    const v2ExpiresAt = token.v2ExpiresAt ? new Date(token.v2ExpiresAt).getTime() : 0;
-    const v2Expired = token.v2SessionId && v2ExpiresAt <= now;
-
-    if (v2Expired && token.v2SessionId) {
-      debugLogForBot(botName, "api:restoreSession", `V2 session expired on disk, not restoring`, {
-        v2SessionId: token.v2SessionId.slice(0, 8),
-        expiresAt: token.v2ExpiresAt,
-        now: new Date(now).toISOString(),
-      });
-    }
-
-    const oldSession = this.session;
     this.session = {
       id: token.sessionId,
       expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
@@ -211,19 +433,8 @@ export class SpaceMoltAPI {
       createdAt: token.expiresAt || "",
     };
 
-    // Only restore V2 session if it's still valid
-    if (token.v2SessionId && !v2Expired) {
-      this.v2Session = {
-        id: token.v2SessionId,
-        expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
-        playerId: token.playerId,
-        createdAt: token.v2ExpiresAt || "",
-      };
-    }
-
     debugLogForBot(botName, "api:restoreSession", `${botName} session restored from disk`, {
       sessionId: this.session.id.slice(0, 8),
-      hasV2: !!this.v2Session,
     });
     return true;
   }
@@ -243,12 +454,7 @@ export class SpaceMoltAPI {
     this._recoveryCount = 0;
   }
 
-  private isV2Command(command: string, payload?: Record<string, unknown>): boolean {
-    return V2_DIRECT_COMMANDS.has(command)
-      || (V2_ROUTED_COMMANDS.has(command) && !!payload?.action && typeof payload.action === "string");
-  }
-
-  async execute(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
+  async execute(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
     debugLogForBot(botName, "api:execute", `${botName} > ${command}`, payload);
 
@@ -259,27 +465,22 @@ export class SpaceMoltAPI {
       if (cached) return cached;
     }
 
-    const needsV2 = this.isV2Command(command, payload);
-
     try {
       await this.ensureSession();
-      if (needsV2) await this.ensureV2Session();
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.startsWith("Login failed:")) {
         return { error: { code: "login_failed", message: msg } };
       }
-      return this.handleReconnection(command, payload, needsV2);
+      return this.handleReconnection(command, payload);
     }
 
     let resp: ApiResponse;
     try {
-      resp = await this.doRequest(command, payload);
+      resp = await this.doRequest(command, payload, abortSignal);
     } catch {
-      // Network error - server may have restarted or network hiccup
-      // DON'T nullify sessions - they might still be valid after reconnect!
       log("system", "Connection lost, reconnecting...");
-      return this.handleReconnection(command, payload, needsV2);
+      return this.handleReconnection(command, payload);
     }
 
     if (resp.error) {
@@ -298,62 +499,44 @@ export class SpaceMoltAPI {
         return this.execute(command, payload);
       }
 
-      // Session invalid - log full response and create new session
       if (code === "session_invalid" || code === "session_expired" || code === "not_authenticated") {
-        // Notify mass disconnect detector (tracks unique bots losing sessions)
         massDisconnectDetector.trackSessionLoss(botName);
 
-        // Check if recovery is already in progress - if so, wait for it to complete
         if (this._recoveryInProgress) {
-          debugLogForBot(botName, "api:execute", `${botName} recovery already in progress, waiting for completion...`);
-          // Wait longer to allow recovery to complete (session creation can take time due to rate limiting)
+          debugLogForBot(botName, "api:execute", `${botName} recovery already in progress, waiting...`);
           await sleep(5000);
-          // After waiting, just retry - the sessions should be refreshed now
           return this.execute(command, payload);
         }
 
         this._recoveryInProgress = true;
 
         try {
-          // Cap recovery attempts - force full login after too many failures
           if (this._recoveryCount >= MAX_SESSION_RECOVERIES) {
             log("system", `${botName} exceeded max session recoveries (${MAX_SESSION_RECOVERIES}), full login required`);
             this._forceFullLogin = true;
             this._recoveryCount = 0;
             this.session = null;
-            this.v2Session = null;
             return { error: { code: "full_login_required", message: "Session recovery failed too many times, full login required" } };
           }
 
           this._recoveryCount++;
           this._lastRecoveryTime = Date.now();
 
-          // If we've had too many recoveries in a short time, wait before trying again
           if (this._recoveryCount > 5) {
-            const waitTime = 5000; // Wait 5 seconds
+            const waitTime = 5000;
             log("wait", `${botName} too many session recoveries (${this._recoveryCount}), waiting ${waitTime}ms...`);
             await sleep(waitTime);
           }
 
-          // Clear BOTH sessions - they may both be expired (especially V2 expiring first)
-          // This prevents the loop where V1 is renewed but V2 stays expired
-          debugLogForBot(botName, "api:execute", `${botName} session invalid, clearing both V1 and V2 sessions`);
+          debugLogForBot(botName, "api:execute", `${botName} session invalid, clearing session`);
           const oldSessionId = this.session?.id;
-          const oldV2SessionId = this.v2Session?.id;
           this.session = null;
-          this.v2Session = null;
 
           try {
-            debugLogForBot(botName, "api:recovery", `${botName} starting session recovery (old V1: ${oldSessionId?.slice(0, 8) || "none"}, old V2: ${oldV2SessionId?.slice(0, 8) || "none"})`);
+            debugLogForBot(botName, "api:recovery", `${botName} starting session recovery (old: ${oldSessionId?.slice(0, 8) || "none"})`);
             await this.ensureSession();
-            // CRITICAL: Always ensure V2 session exists after recovery, even if the
-            // failing command was V1-only. V2 session expiration can cause V1 commands
-            // to fail indirectly, so we must renew both to break the recovery loop.
-            await this.ensureV2Session();
-            const newV1Id = (this.session as ApiSession | null)?.id?.slice(0, 8) || "none";
-            const newV2Id = (this.v2Session as ApiSession | null)?.id?.slice(0, 8) || "none";
-            debugLogForBot(botName, "api:recovery", `${botName} session recovery complete (new V1: ${newV1Id}, new V2: ${newV2Id})`);
-            // Reset recovery count on successful session creation
+            const newId = (this.session as ApiSession | null)?.id?.slice(0, 8) || "none";
+            debugLogForBot(botName, "api:recovery", `${botName} session recovery complete (new: ${newId})`);
             this._recoveryCount = 0;
             return this.execute(command, payload);
           } catch (err) {
@@ -371,15 +554,10 @@ export class SpaceMoltAPI {
     this._rateLimitRetries = 0;
 
     if (resp.session) {
-      if (needsV2) {
-        this.v2Session = resp.session;
-      } else {
-        this.session = resp.session;
-      }
+      this.session = resp.session;
     }
 
     if (!resp.error) {
-      // Success - reset recovery count
       this._recoveryCount = 0;
       if (cacheTtl !== undefined) {
         this._cache.set(cacheKey, resp, cacheTtl);
@@ -394,7 +572,6 @@ export class SpaceMoltAPI {
   private async handleReconnection(
     command: string,
     payload: Record<string, unknown> | undefined,
-    needsV2: boolean
   ): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
     log("system", `${botName} connection lost, adding to reconnection queue...`);
@@ -410,9 +587,6 @@ export class SpaceMoltAPI {
         log("system", `${botName} reconnection successful, retrying ${command}...`);
         try {
           await this.ensureSession();
-          // CRITICAL: Always ensure V2 session exists after reconnection, even for V1 commands.
-          // The V2 keepalive mechanism requires an active V2 session to function.
-          await this.ensureV2Session();
           return this.execute(command, payload);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
@@ -429,18 +603,14 @@ export class SpaceMoltAPI {
   }
 
   private async ensureSession(): Promise<void> {
-    if (this.session) return; // Session exists, use it
+    if (this.session) return;
 
-    // Use global serial queue - ensures only ONE session creation at a time across ALL bots
     globalSessionQueue = globalSessionQueue.then(async () => {
-      // Double-check after waiting in queue
       if (this.session) return;
 
-      // Small random jitter to stagger bots
       const jitter = Math.random() * 2000;
       await sleep(jitter);
 
-      // Check again after jitter
       if (this.session) return;
 
       await this.createSession();
@@ -455,7 +625,6 @@ export class SpaceMoltAPI {
 
     for (let attempt = 0; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
       try {
-        // Global rate limiting - wait if another session was just created
         const now = Date.now();
         const timeSinceLastCreate = now - lastSessionCreateTime;
         if (timeSinceLastCreate < SESSION_CREATE_INTERVAL) {
@@ -472,14 +641,13 @@ export class SpaceMoltAPI {
         });
 
         if (!resp.ok) {
-          const error = `Failed to create session: ${resp.status} ${resp.statusText}`;
-          throw new Error(error);
+          throw new Error(`Failed to create session: ${resp.status} ${resp.statusText}`);
         }
 
         const data = (await resp.json()) as ApiResponse;
         if (data.session) {
           this.session = data.session;
-          lastSessionCreateTime = Date.now(); // Update global rate limiter
+          lastSessionCreateTime = Date.now();
           log("system", `Session created for ${botName}: ${this.session.id.slice(0, 8)}...`);
         } else {
           throw new Error("No session in response");
@@ -503,7 +671,7 @@ export class SpaceMoltAPI {
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
-        debugLogForBot(botName, "api:createSession", `${botName} attempt ${attempt + 1} failed, retrying in ${delay}ms`);
+        debugLogForBot(botName, "api:createSession", `${botName} attempt ${attempt + 1} failed`);
         await sleep(delay);
       }
     }
@@ -514,170 +682,58 @@ export class SpaceMoltAPI {
   private saveSessionToken(): void {
     if (!this._sessionManager || !this.session) return;
 
-    // Check if v2 session is expired - don't save expired sessions!
-    let v2SessionId: string | undefined;
-    if (this.v2Session) {
-      const v2ExpiresAt = new Date(this.v2Session.expiresAt).getTime();
-      const now = Date.now();
-      if (v2ExpiresAt > now) {
-        // V2 session still valid, save it
-        v2SessionId = this.v2Session.id;
-      } else {
-        // V2 session expired, clear it
-        debugLogForBot(this._botName || "unknown", "api:saveSession", `V2 session expired, clearing from save`, {
-          v2SessionId: this.v2Session.id.slice(0, 8),
-          expiresAt: this.v2Session.expiresAt,
-          now: new Date(now).toISOString(),
-        });
-        this.v2Session = null;  // Clear expired v2 session
-      }
-    }
-
-    const token: import("./session.js").SessionToken = {
+    const token = {
       sessionId: this.session.id,
       expiresAt: this.session.expiresAt,
       playerId: this.session.playerId,
     };
-    if (v2SessionId) {
-      token.v2SessionId = v2SessionId;
-      token.v2ExpiresAt = this.v2Session?.expiresAt;
-    }
 
     this._sessionManager.saveSessionToken(token);
   }
 
-  private async ensureV2Session(): Promise<void> {
-    if (this.v2Session) return;
-
-    // Use global serial queue - ensures only ONE v2 session creation at a time across ALL bots
-    globalV2SessionQueue = globalV2SessionQueue.then(async () => {
-      // Double-check after waiting in queue
-      if (this.v2Session) return;
-
-      // Small random jitter to stagger bots
-      const jitter = Math.random() * 2000;
-      await sleep(jitter);
-
-      // Check again after jitter
-      if (this.v2Session) return;
-
-      await this.createV2Session();
-    });
-
-    return globalV2SessionQueue;
-  }
-
-  private async createV2Session(): Promise<void> {
-    const botName = this._botName || "unknown";
-    const v2Base = this.baseUrl.replace("/api/v1", "/api/v2");
-    let lastError: Error | null = null;
-
-    for (let attempt = 0; attempt < MAX_RECONNECT_ATTEMPTS; attempt++) {
-      try {
-        // Global rate limiting - wait if another session was just created
-        const now = Date.now();
-        const timeSinceLastCreate = now - lastSessionCreateTime;
-        if (timeSinceLastCreate < SESSION_CREATE_INTERVAL) {
-          const waitTime = SESSION_CREATE_INTERVAL - timeSinceLastCreate;
-          debugLogForBot(botName, "api:createV2Session", `${botName} rate limited, waiting ${waitTime}ms`);
-          await sleep(waitTime);
-        }
-
-        log("system", `Creating v2 session for ${botName}...`);
-        const resp = await fetch(`${v2Base}/session`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "User-Agent": USER_AGENT },
-        });
-
-        if (!resp.ok) {
-          throw new Error(`Failed to create v2 session: ${resp.status} ${resp.statusText}`);
-        }
-
-        const data = (await resp.json()) as ApiResponse;
-        if (data.session) {
-          const s = data.session as unknown as Record<string, unknown>;
-          if (s.created_at && !s.createdAt) {
-            s.createdAt = s.created_at;
-            s.expiresAt = s.expires_at;
-            s.playerId = s.player_id;
-          }
-          this.v2Session = data.session;
-          lastSessionCreateTime = Date.now(); // Update global rate limiter
-          log("system", `v2 session created for ${botName}: ${this.v2Session.id.slice(0, 8)}...`);
-        } else {
-          throw new Error("No session in v2 response");
-        }
-
-        if (this.credentials) {
-          const loginResp = await fetch(`${v2Base}/spacemolt_auth/login`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "User-Agent": USER_AGENT,
-              "X-Session-Id": this.v2Session.id,
-            },
-            body: JSON.stringify({
-              username: this.credentials.username,
-              password: this.credentials.password,
-            }),
-          });
-
-          const loginData = (await loginResp.json()) as ApiResponse & { structuredContent?: unknown };
-          if (loginData.structuredContent !== undefined) {
-            loginData.result = loginData.structuredContent;
-          }
-          if (loginData.error) {
-            logError(`v2 login failed: ${loginData.error.message}`);
-          } else {
-            log("system", "v2 session authenticated");
-          }
-        }
-
-        this.saveSessionToken();
-        return;
-      } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
-        const delay = RECONNECT_BASE_DELAY * Math.pow(2, attempt);
-        debugLogForBot(botName, "api:createV2Session", `${botName} attempt ${attempt + 1} failed`);
-        await sleep(delay);
-      }
-    }
-
-    throw lastError || new Error("Failed to create v2 session");
-  }
-
-  private async doRequest(command: string, payload?: Record<string, unknown>): Promise<ApiResponse> {
+  private async doRequest(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
+    const tool = COMMAND_TOOL_MAP[command] || 'spacemolt';
     let url: string;
-    let body = payload;
+    let body: Record<string, unknown> = payload ? { ...payload } : {};
 
-    if (V2_DIRECT_COMMANDS.has(command)) {
-      const v2Base = this.baseUrl.replace("/api/v1", "/api/v2");
-      const v2Command = command.replace(/^v2_/, "");
-      url = `${v2Base}/spacemolt_${v2Command}`;
-    } else if (payload?.action && typeof payload.action === "string" && V2_ROUTED_COMMANDS.has(command)) {
-      const action = payload.action as string;
-      const v2Base = this.baseUrl.replace("/api/v1", "/api/v2");
-      url = `${v2Base}/spacemolt_${command}/${action}`;
-      body = payload;
-    } else {
-      url = `${this.baseUrl}/${command}`;
+    // Auto-add target: 'faction' for faction_deposit_items (deposit TO faction)
+    if (command === 'faction_deposit_items' && !body.target) {
+      body.target = 'faction';
+    }
+    // Auto-add source: 'faction' for faction_withdraw_items (withdraw FROM faction)
+    if (command === 'faction_withdraw_items' && !body.source) {
+      body.source = 'faction';
+    }
+    // Auto-add target: 'faction' for view_faction_storage (view faction storage)
+    if (command === 'view_faction_storage' && !body.target) {
+      body.target = 'faction';
     }
 
-    const isV2 = url.includes("/api/v2/");
-    const activeSession = isV2 ? this.v2Session : this.session;
+    if (tool === 'spacemolt_catalog') {
+      url = `${this.baseUrl}/${tool}`;
+    } else if (COMMANDS_WITH_PAYLOAD_ACTION.has(command) && payload?.action) {
+      // Commands like facility and battle that use payload.action
+      const action = payload.action as string;
+      url = `${this.baseUrl}/${tool}/${action}`;
+    } else {
+      // For most commands, use the command name (or mapped action) as the action
+      const action = COMMAND_ACTION_MAP[command] || command;
+      url = `${this.baseUrl}/${tool}/${action}`;
+    }
 
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       "User-Agent": USER_AGENT,
     };
-    if (activeSession) {
-      headers["X-Session-Id"] = activeSession.id;
+    if (this.session) {
+      headers["X-Session-Id"] = this.session.id;
     }
 
     const resp = await fetch(url, {
       method: "POST",
       headers,
       body: body ? JSON.stringify(body) : undefined,
+      signal: abortSignal,
     });
 
     if (resp.status === 401) {
@@ -698,11 +754,7 @@ export class SpaceMoltAPI {
           s.expiresAt = s.expires_at;
           s.playerId = s.player_id;
         }
-        if (isV2) {
-          this.v2Session = data.session;
-        } else {
-          this.session = data.session;
-        }
+        this.session = data.session;
       }
       return data as ApiResponse;
     } catch {

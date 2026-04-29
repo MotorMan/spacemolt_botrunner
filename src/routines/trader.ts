@@ -100,7 +100,7 @@ async function canAffordRoute(
   // Also check faction storage if bot is in a faction
   let factionStoredCredits = 0;
   if (bot.faction) {
-    const factionStorageResp = await bot.exec("view_faction_storage");
+    const factionStorageResp = await bot.exec("view_storage", { source: "faction" });
     if (factionStorageResp.result && typeof factionStorageResp.result === "object") {
       const fsr = factionStorageResp.result as Record<string, unknown>;
       factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
@@ -172,7 +172,7 @@ async function withdrawCreditsForTrade(
   // Try faction storage if bot is in a faction
   if (bot.faction) {
     let factionStoredCredits = 0;
-    const factionStorageResp = await bot.exec("view_faction_storage");
+    const factionStorageResp = await bot.exec("view_storage", { source: "faction" });
     if (factionStorageResp.result && typeof factionStorageResp.result === "object") {
       const fsr = factionStorageResp.result as Record<string, unknown>;
       factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
@@ -795,6 +795,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     battleStartTick: null,
     lastHitTick: null,
     isFleeing: false,
+    lastFleeTime: undefined,
   };
 
   while (bot.state === "running") {
@@ -805,10 +806,15 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Battle check ──
     // If we're already in battle from previous cycle, re-issue flee command
     if (battleState.inBattle) {
-      ctx.log("combat", "Re-issuing flee stance during trade operations (ensuring we stay in flee mode)...");
-      const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
-      if (fleeResp.error) {
-        ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+      const now = Date.now();
+      if (!battleState.lastFleeTime || now - battleState.lastFleeTime > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", "Re-issuing flee stance during trade operations (ensuring we stay in flee mode)...");
+        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (fleeResp.error) {
+          ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+        } else {
+          battleState.lastFleeTime = now;
+        }
       }
 
       // Check battle status to see if we've escaped
@@ -826,6 +832,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         battleState.inBattle = false;
         battleState.battleId = null;
         battleState.isFleeing = false;
+        battleState.lastFleeTime = undefined;
       } else {
         // Still in battle - wait briefly and continue to next cycle to re-flee
         await ctx.sleep(2000);
@@ -837,8 +844,24 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         // Battle detected - set battle state and flee
         battleState.inBattle = true;
         battleState.isFleeing = false;
+        battleState.lastFleeTime = Date.now();
         await ctx.sleep(2000);
         continue;
+      }
+    }
+
+    // Periodic battle status check (backup detection in case notifications fail)
+    // Check every cycle for fast detection
+    if (bot.isInBattle()) {
+      const now = Date.now();
+      if (!battleState.lastFleeTime || now - battleState.lastFleeTime > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", `PERIODIC CHECK: IN BATTLE! - initiating IMMEDIATE flee!`);
+        battleState.inBattle = true;
+        battleState.isFleeing = false;
+
+        await bot.exec("battle", { action: "stance", stance: "flee" });
+        battleState.lastFleeTime = now;
+        ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
       }
     }
 

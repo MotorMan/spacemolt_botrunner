@@ -3223,15 +3223,20 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       // CRITICAL: Check WebSocket state FIRST for fastest detection (no API call needed)
       // FIX: Check EVERY cycle, not just every 8 seconds!
       if (bot.isInBattle()) {
-        ctx.log("combat", `PERIODIC CHECK [WebSocket]: IN BATTLE! - initiating IMMEDIATE flee!`);
-        battleState.inBattle = true;
-        battleState.isFleeing = false;
+        const now = Date.now();
+        const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+        if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+          ctx.log("combat", `PERIODIC CHECK: IN BATTLE! - initiating IMMEDIATE flee!`);
+          battleState.inBattle = true;
+          battleState.isFleeing = false;
 
-        // Issue flee stance and return immediately - DON'T wait for disengage!
-        // The harvest loop below will re-issue flee every cycle
-        await bot.exec("battle", { action: "stance", stance: "flee" });
-        ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
-        // Continue to the battle handling code below (lines 3290-3309)
+          // Issue flee stance and return immediately - DON'T wait for disengage!
+          // The harvest loop below will re-issue flee every cycle
+          await bot.exec("battle", { action: "stance", stance: "flee" });
+          battleState.lastFleeTime = now;
+          ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
+          // Continue to the battle handling code below (lines 3290-3309)
+        }
       }
 
       // Also check via API periodically (fallback)
@@ -3241,23 +3246,34 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
         const battleStatusCheck = await getBattleStatus(ctx);
         if (battleStatusCheck && battleStatusCheck.is_participant) {
-          ctx.log("combat", `PERIODIC CHECK [API]: IN BATTLE! Battle ID: ${battleStatusCheck.battle_id} - initiating IMMEDIATE flee!`);
-          battleState.inBattle = true;
-          battleState.battleId = battleStatusCheck.battle_id;
-          battleState.isFleeing = false;
+          const now = Date.now();
+          const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+          if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+            ctx.log("combat", `PERIODIC CHECK: IN BATTLE! Battle ID: ${battleStatusCheck.battle_id} - initiating IMMEDIATE flee!`);
+            battleState.inBattle = true;
+            battleState.battleId = battleStatusCheck.battle_id;
+            battleState.isFleeing = false;
 
-          // Issue flee stance and return immediately - DON'T wait for disengage!
-          await bot.exec("battle", { action: "stance", stance: "flee" });
-          ctx.log("combat", "Flee stance issued via API check - will re-issue every cycle until disengaged!");
+            // Issue flee stance and return immediately - DON'T wait for disengage!
+            await bot.exec("battle", { action: "stance", stance: "flee" });
+            battleState.lastFleeTime = now;
+            ctx.log("combat", "Flee stance issued via API check - will re-issue every cycle until disengaged!");
+          }
         }
       }
 
-      // If we're in battle, re-issue flee command every cycle to ensure we stay in flee stance
+      // If we're in battle, re-issue flee command to ensure we stay in flee stance
       if (battleState.inBattle) {
-        ctx.log("combat", "Re-issuing flee stance (ensuring we stay in flee mode)...");
-        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
-        if (fleeResp.error) {
-          ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+        const now = Date.now();
+        const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+        if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+          ctx.log("combat", "Re-issuing flee stance (ensuring we stay in flee mode)...");
+          const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+          if (fleeResp.error) {
+            ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+          } else {
+            battleState.lastFleeTime = now;
+          }
         }
         // Check if we've successfully disengaged
         const currentBattleStatus = await getBattleStatus(ctx);
@@ -3266,11 +3282,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           battleState.inBattle = false;
           battleState.battleId = null;
           battleState.isFleeing = false;
+          battleState.lastFleeTime = undefined;
           stopReason = "battle escaped successfully";
           break;
         }
-        // Still in battle - continue to next cycle to re-flee again
-        await ctx.sleep(2000); // Brief pause before next flee attempt
+        // Still in battle - continue to next cycle
+        await ctx.sleep(2000); // Brief pause before next check
         continue;
       }
 
@@ -3692,10 +3709,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       // CRITICAL: Check WebSocket state FIRST for fastest detection
       // FIX: Break immediately after detecting battle - DON'T try to mine!
       if (bot.isInBattle()) {
-        ctx.log("combat", `PRE-MINE CHECK [WebSocket]: IN BATTLE! - initiating flee and BREAKING!`);
+        ctx.log("combat", `PRE-MINE CHECK: IN BATTLE! - initiating flee and BREAKING!`);
         battleState.inBattle = true;
         battleState.isFleeing = false;
         await bot.exec("battle", { action: "stance", stance: "flee" }); // Issue flee immediately
+        battleState.lastFleeTime = Date.now();
         break; // BREAK out of harvest loop - don't try to mine!
       } else {
         const preMineBattleCheck = await getBattleStatus(ctx);
@@ -3705,6 +3723,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           battleState.battleId = preMineBattleCheck.battle_id;
           battleState.isFleeing = false;
           await bot.exec("battle", { action: "stance", stance: "flee" }); // Issue flee immediately
+          battleState.lastFleeTime = Date.now();
           break; // BREAK out of harvest loop - don't try to mine!
         }
       }

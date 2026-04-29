@@ -10,6 +10,9 @@ import {
   readSettings,
   checkAndFleeFromBattle,
   repairShip,
+  type BattleState,
+  getBattleStatus,
+  fleeFromBattle,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -81,6 +84,12 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   }
 
   ctx.log("travel", `Return Home initiated — destination: ${homeStation || "any station"} in ${homeSystem}`);
+
+  // Battle check before starting return home
+  if (await checkAndFleeFromBattle(ctx, "return_home")) {
+    ctx.log("combat", "Cannot return home while in battle — fleeing first");
+    return; // Cancel routine
+  }
 
   // Check if already at home
   await bot.refreshStatus();
@@ -203,6 +212,12 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
 
     const MAX_NAV_ATTEMPTS = 3;
     let navAttempts = 0;
+    // Final battle check before navigation
+    if (await checkAndFleeFromBattle(ctx, "return_home")) {
+      ctx.log("combat", "Cannot navigate while in battle — fleeing first");
+      return; // Cancel routine
+    }
+
     let arrived = false;
 
     while (navAttempts < MAX_NAV_ATTEMPTS && bot.state === "running") {

@@ -549,16 +549,18 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
         if (amt) server.logFaction(`${timestamp} [withdraw] ${botName}: Withdrew ${amt}cr from faction treasury`);
         break;
       }
-      case "faction_deposit_items": {
+      case "deposit_items": {
         const itemId = p?.item_id as string | undefined;
         const qty = p?.quantity as number | undefined;
-        if (itemId) server.logFaction(`${timestamp} [deposit] ${botName}: Deposited ${qty || 1}x ${itemId} to faction storage`);
+        const target = p?.target as string | undefined;
+        if (itemId) server.logFaction(`${timestamp} [deposit] ${botName}: Deposited ${qty || 1}x ${itemId} ${target === 'faction' ? 'to faction storage' : 'to station storage'}`);
         break;
       }
-      case "faction_withdraw_items": {
+      case "withdraw_items": {
         const itemId = p?.item_id as string | undefined;
         const qty = p?.quantity as number | undefined;
-        if (itemId) server.logFaction(`${timestamp} [withdraw] ${botName}: Withdrew ${qty || 1}x ${itemId} from faction storage`);
+        const source = p?.source as string | undefined;
+        if (itemId) server.logFaction(`${timestamp} [withdraw] ${botName}: Withdrew ${qty || 1}x ${itemId} ${source === 'faction' ? 'from faction storage' : 'from station storage'}`);
         break;
       }
     }

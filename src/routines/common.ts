@@ -497,10 +497,10 @@ export async function recordMarketData(ctx: RoutineContext): Promise<void> {
 export async function analyzeMarket(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   if (!bot.docked) return;
-  const resp = await bot.exec("analyze_market", { mode: "overview" });
+  const resp = await bot.exec("analyze_market");
   if (!resp.error && resp.result && typeof resp.result === "object") {
     const r = resp.result as Record<string, unknown>;
-    const insights = r.top_insights as Array<Record<string, unknown>> | undefined;
+    const insights = r.insights as Array<Record<string, unknown>> | undefined;
     if (Array.isArray(insights) && insights.length > 0) {
       const top = insights[0];
       ctx.log("trade", `Market intel: ${(top.message as string) ?? (top.category as string) ?? "no insights"}`);
@@ -3268,7 +3268,7 @@ export async function fleeFromBattle(
     return false;
   }
 
-  ctx.log("combat", "FLEEING BATTLE - issuing flee stance command!");
+   ctx.log("combat", "FLEEING BATTLE - issuing flee stance command!");
   const resp = await bot.exec("battle", { action: "stance", stance: "flee" });
 
   if (resp.error) {
@@ -3276,7 +3276,7 @@ export async function fleeFromBattle(
     return false;
   }
 
-  ctx.log("combat", "Flee stance engaged - escaping battle! (takes 3 ticks)");
+   ctx.log("combat", "Flee stance engaged - escaping battle! (takes 3 ticks)");
 
   // Wait for disengage confirmation if requested
   if (waitForDisengage) {
@@ -3328,6 +3328,7 @@ export interface BattleState {
   battleStartTick: number | null;
   lastHitTick: number | null;
   isFleeing: boolean;
+  lastFleeTime?: number; // Timestamp of last flee command issued
 }
 
 export async function handleBattleNotifications(

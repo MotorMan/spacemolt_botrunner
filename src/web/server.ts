@@ -436,6 +436,16 @@ export class WebServer {
         if (url.pathname === "/api/catalog") {
           return Response.json(catalogStore.getAll());
         }
+        if (url.pathname === "/data/catalog.json") {
+          const catalogPath = join(process.cwd(), "data", "catalog.json");
+          if (existsSync(catalogPath)) {
+            return new Response(readFileSync(catalogPath, "utf-8"), {
+              headers: { "Content-Type": "application/json" },
+            });
+          } else {
+            return Response.json({ error: "Catalog file not found" }, { status: 404 });
+          }
+        }
         if (url.pathname === "/api/logs/main") {
           // Return persisted main logs (activity, broadcast, system, faction)
           return Response.json({

@@ -283,8 +283,16 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
   'faction_intel_status': 'intel_status',
   'faction_trade_intel_status': 'trade_intel_status',
   
-  // Catalog
-  'catalog': 'catalog',
+   // Catalog
+   'catalog': 'catalog',
+
+   // Salvage (map command names to API action names)
+   'get_wrecks': 'wrecks',
+   'loot_wreck': 'loot',
+   'tow_wreck': 'tow',
+   'sell_wreck': 'sell',
+   'scrap_wreck': 'scrap',
+   'release_tow': 'release',
 };
 
 // Commands that use payload.action for the action (like facility and battle)

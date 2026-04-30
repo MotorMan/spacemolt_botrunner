@@ -266,6 +266,7 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
     },
     getAllBotNames: () => [...bots.keys()],
     getBotAssignments: () => server.getBotAssignments(),
+    log: (category: string, message: string) => server.logBot(botName, `[${category}] ${message}`),
   };
 
   bot.start(routineKey, routine.fn, chatStartOpts).then(() => {

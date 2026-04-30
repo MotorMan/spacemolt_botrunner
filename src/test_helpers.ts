@@ -14,7 +14,7 @@ import type { ApiResponse } from "./api.js";
 export function createMockBot(options: {
   username?: string;
   system?: string;
-  poi?: string | null;
+  poi?: string;
   docked?: boolean;
   fuel?: number;
   maxFuel?: number;
@@ -27,8 +27,9 @@ export function createMockBot(options: {
   maxShield?: number;
   isInBattle?: boolean;
   currentBattleId?: string | null;
-  state?: 'running' | 'stopped' | 'dead';
-} = {}): Bot {
+  state?: 'idle' | 'running' | 'stopping' | 'error';
+  api?: any;
+} = {}): any {
   const {
     username = "MockBot",
     system = "sol",
@@ -46,6 +47,7 @@ export function createMockBot(options: {
     isInBattle = false,
     currentBattleId = null,
     state = 'running',
+    api,
   } = options;
 
   return {
@@ -67,17 +69,18 @@ export function createMockBot(options: {
     state,
     // Mock other required properties
     inventory: [],
-    api: {} as any,
+    api: api || {} as any,
     session: {} as any,
     // Add mock methods as needed
     refreshStatus: vi.fn(),
     refreshCargo: vi.fn(),
-  } as Bot;
+  };
 }
 
 // Mock Context Factory
 export function createMockContext(bot: Bot): RoutineContext {
   return {
+    api: bot.api as any,
     bot,
     log: vi.fn(),
     sleep: vi.fn(),

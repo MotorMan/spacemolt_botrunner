@@ -437,13 +437,23 @@ export class WebServer {
           return Response.json(catalogStore.getAll());
         }
         if (url.pathname === "/data/catalog.json") {
-          const catalogPath = join(process.cwd(), "data", "catalog.json");
+          const catalogPath = join(DATA_DIR, "catalog.json");
           if (existsSync(catalogPath)) {
             return new Response(readFileSync(catalogPath, "utf-8"), {
               headers: { "Content-Type": "application/json" },
             });
           } else {
             return Response.json({ error: "Catalog file not found" }, { status: 404 });
+          }
+        }
+        if (url.pathname === "/data/map.json") {
+          const mapPath = join(DATA_DIR, "map.json");
+          if (existsSync(mapPath)) {
+            return new Response(readFileSync(mapPath, "utf-8"), {
+              headers: { "Content-Type": "application/json" },
+            });
+          } else {
+            return Response.json({ error: "Map file not found" }, { status: 404 });
           }
         }
         if (url.pathname === "/api/logs/main") {

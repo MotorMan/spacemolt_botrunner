@@ -99,8 +99,8 @@ async function canAffordRoute(
 
   // Also check faction storage if bot is in a faction
   let factionStoredCredits = 0;
-  if (bot.faction) {
-    const factionStorageResp = await bot.exec("view_storage", { source: "faction" });
+  if (bot.faction && bot.docked) {
+    const factionStorageResp = await bot.exec("view_storage", { target: "faction" });
     if (factionStorageResp.result && typeof factionStorageResp.result === "object") {
       const fsr = factionStorageResp.result as Record<string, unknown>;
       factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
@@ -170,9 +170,9 @@ async function withdrawCreditsForTrade(
   }
 
   // Try faction storage if bot is in a faction
-  if (bot.faction) {
+  if (bot.faction && bot.docked) {
     let factionStoredCredits = 0;
-    const factionStorageResp = await bot.exec("view_storage", { source: "faction" });
+    const factionStorageResp = await bot.exec("view_storage", { target: "faction" });
     if (factionStorageResp.result && typeof factionStorageResp.result === "object") {
       const fsr = factionStorageResp.result as Record<string, unknown>;
       factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
@@ -568,17 +568,15 @@ function processMarketInsights(
           for (const poi of sys.pois) {
             if (!poi.has_base) continue;
 
-            // Try to match faction or system names
-            const factionMatch = poi.faction?.toLowerCase().includes(lowFaction.toLowerCase().split(' ')[0]) ||
-                               sys.name.toLowerCase().includes(lowFaction.toLowerCase().split(' ')[0]);
-            if (factionMatch && lowPrice > 0) {
+            // Try to match system names (faction info not available in POI data)
+            const sourceMatch = sys.name.toLowerCase().includes(lowFaction.toLowerCase().split(' ')[0]);
+            if (sourceMatch && lowPrice > 0) {
               sourceSystem = sysId;
               sourcePoi = poi.id;
               sourcePoiName = poi.name;
             }
 
-            const destMatch = poi.faction?.toLowerCase().includes(highFaction.toLowerCase().split(' ')[0]) ||
-                            sys.name.toLowerCase().includes(highFaction.toLowerCase().split(' ')[0]);
+            const destMatch = sys.name.toLowerCase().includes(highFaction.toLowerCase().split(' ')[0]);
             if (destMatch && highPrice > 0) {
               destSystem = sysId;
               destPoi = poi.id;

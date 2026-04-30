@@ -602,7 +602,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     let personalMode = false;
     let factionError: string | null = null;
     if (bot.docked) {
-      const factionResp = await bot.exec("view_storage", { source: "faction" });
+      const factionResp = await bot.exec("view_storage", { target: "faction" });
       if (factionResp.error) {
         factionError = factionResp.error.message || "";
         // Only use personal mode if bot is truly not in a faction
@@ -847,7 +847,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         // Docking failed, keep personalMode assumption
       } else if (personalMode) {
         // We assumed personal mode because we were undocked - now re-check
-        const factionResp = await bot.exec("view_storage", { source: "faction" });
+        const factionResp = await bot.exec("view_storage", { target: "faction" });
         if (factionResp.error) {
           factionError = factionResp.error.message || "";
           personalMode = factionError.includes("not_in_faction") || factionError.includes("not in a faction");

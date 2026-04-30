@@ -646,27 +646,18 @@ let knownSystems = [];
 let knownOres = [];
 let mobileCapitol = null;     // { systemId, systemName, poiId, discoveredAt }
 let reconnectDelay = 1000;
+let mapData = {};
 let modalMode = 'add';
 let activeSettingsTab = 'general';
+let mapLoading = false;
+let profileBot = null;
+let activeOreFilters = new Set();
+let battleState = {};
+let catalog = { items: {}, ships: {}, skills: {}, recipes: {}, lastFetched: null };
+let globalFactionStorage = [];
+let statsDaily = {};
 
-// Global faction storage cache (populated from any bot's view_faction_storage)
-let globalFactionStorage = []; // Array of {item_id, name, quantity}
-
-// Battle state
-let battleState = {
-  inBattle: false,
-  loading: false,
-  battleId: null,
-  mySideId: null,
-  myZone: null,
-  myStance: null,
-  myTargetId: null,
-  participants: [],
-  combatLog: [],
-  lastPollTick: 0,
-  commanderBot: null,
-  expandedWeaponId: null
-};
+// ── Resolve a system ID + optional POI ID to display names using mapData. ──
 
 /** Resolve a system ID + optional POI ID to display names using mapData. */
 function resolveLocation(systemId, poiId) {
@@ -741,7 +732,7 @@ async function fetchInitialData() {
       fetch('/api/bots/discovered').then(r => r.json()),
       fetch('/api/routines').then(r => r.json()),
       fetch('/api/settings').then(r => r.json()),
-      fetch('/api/map').then(r => r.json()),
+      fetch('/data/map.json').then(r => r.json()),
       fetch('/api/stats').then(r => r.json()),
       fetch('/api/catalog').then(r => r.json()),
       fetch('/api/logs/main').then(r => r.json()),
@@ -874,7 +865,7 @@ function connect() {
         knownOres = msg.knownOres || [];
         mobileCapitol = msg.mobileCapitol || null;
         if (msg.catalog) catalog = msg.catalog;
-        mapData = msg.mapData || {};
+        if (msg.mapData) mapData = msg.mapData;
         statsDaily = msg.statsDaily || {};
         renderBots();
         renderStats();
@@ -1004,7 +995,7 @@ function connect() {
         handleExecResult(msg);
         break;
       case 'mapUpdate':
-        mapData = msg.mapData || {};
+        if (msg.mapData) mapData = msg.mapData;
         knownOres = msg.knownOres || knownOres;
         // Re-render map tab if it's active
         if (document.getElementById('page-map')?.classList.contains('active')) {
@@ -6386,6 +6377,20 @@ function renderMap() {
   if (!container) return;
 
   const systems = Object.values(mapData);
+  if (systems.length === 0 && !mapLoading) {
+    mapLoading = true;
+    container.innerHTML = '<div class="map-empty">Loading map data...</div>';
+  fetch('/data/map.json').then(r => r.json()).then(data => {
+    mapData = data.systems || {};
+    mapLoading = false;
+    renderMap();
+  }).catch(err => {
+    console.error('Failed to load map data:', err);
+    mapLoading = false;
+    container.innerHTML = '<div class="map-empty">Failed to load map data</div>';
+  });
+    return;
+  }
   if (systems.length === 0) {
     container.innerHTML = '<div class="map-empty">No map data yet. Start a bot to begin exploring!</div>';
     return;

@@ -43,19 +43,18 @@ describe("Fleet Hunter Commander - Battle Integration", () => {
   let mockApi: any;
 
   beforeEach(() => {
+    mockApi = {
+      execute: vi.fn(),
+    };
     mockBot = createMockBot({
       username: "TestCommander",
       system: "test_system",
       poi: "test_poi",
       isInBattle: false,
+      api: mockApi,
     });
 
     mockCtx = createMockContext(mockBot);
-
-    mockApi = {
-      execute: vi.fn(),
-    };
-    mockBot.api = mockApi;
   });
 
   describe("Battle Detection", () => {

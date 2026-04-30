@@ -114,6 +114,8 @@ const COMMAND_TOOL_MAP: Record<string, string> = {
    'send_gift': 'spacemolt_storage',
    'faction_deposit_items': 'spacemolt_storage',  // auto-add target: 'faction'
    'faction_withdraw_items': 'spacemolt_storage', // auto-add source: 'faction'
+   'faction_deposit_credits': 'spacemolt_storage', // auto-add item_id: 'credits', target: 'faction'
+   'faction_withdraw_credits': 'spacemolt_storage', // auto-add item_id: 'credits', source: 'faction'
    'storage': 'spacemolt_storage',
 
   // Market commands
@@ -147,9 +149,9 @@ const COMMAND_TOOL_MAP: Record<string, string> = {
   'faction_visit_room': 'spacemolt_faction',
   'faction_list_missions': 'spacemolt_faction',
 
-  // Faction commerce (only credits and orders)
-  'faction_deposit_credits': 'spacemolt_faction_commerce',
-  'faction_withdraw_credits': 'spacemolt_faction_commerce',
+  // Faction commerce (only orders - credits moved to storage)
+  // 'faction_deposit_credits': moved to spacemolt_storage
+  // 'faction_withdraw_credits': moved to spacemolt_storage
   'faction_create_buy_order': 'spacemolt_faction_commerce',
   'faction_create_sell_order': 'spacemolt_faction_commerce',
   
@@ -230,8 +232,10 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
   'deposit_items': 'deposit',          // spacemolt_storage/deposit
   'withdraw_items': 'withdraw',        // spacemolt_storage/withdraw
   'view_storage': 'view',              // spacemolt_storage/view
-  'faction_deposit_items': 'deposit',    // auto-add target: 'faction'
-  'faction_withdraw_items': 'withdraw',   // auto-add source: 'faction'
+   'faction_deposit_items': 'deposit',    // auto-add target: 'faction'
+   'faction_withdraw_items': 'withdraw',   // auto-add source: 'faction'
+   'faction_deposit_credits': 'deposit',   // auto-add item_id: 'credits', target: 'faction'
+   'faction_withdraw_credits': 'withdraw', // auto-add item_id: 'credits', source: 'faction'
   
   // Faction storage
   'view_faction_storage': 'view',  // auto-add source: 'faction'
@@ -255,11 +259,9 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
   'faction_visit_room': 'visit_room',
   'faction_list_missions': 'list_missions',
   
-  // Faction commerce (remove 'faction_' prefix)
-  'faction_deposit_credits': 'deposit_credits',
-  'faction_withdraw_credits': 'withdraw_credits',
-  'faction_create_buy_order': 'create_buy_order',
-  'faction_create_sell_order': 'create_sell_order',
+   // Faction commerce (remove 'faction_' prefix) - orders only, credits moved to storage
+   'faction_create_buy_order': 'create_buy_order',
+   'faction_create_sell_order': 'create_sell_order',
   
   
   // Faction admin (remove 'faction_' prefix)
@@ -707,6 +709,28 @@ export class SpaceMoltAPI {
     // Auto-add target: 'faction' for view_faction_storage (view faction storage)
     if (command === 'view_faction_storage' && !body.target) {
       body.target = 'faction';
+    }
+    // Auto-add item_id: 'credits' and target: 'faction' for faction_deposit_credits
+    if (command === 'faction_deposit_credits') {
+      body.item_id = 'credits';
+      if (body.amount !== undefined) {
+        body.quantity = body.amount;
+        delete body.amount;
+      }
+      if (!body.target) {
+        body.target = 'faction';
+      }
+    }
+    // Auto-add item_id: 'credits' and source: 'faction' for faction_withdraw_credits
+    if (command === 'faction_withdraw_credits') {
+      body.item_id = 'credits';
+      if (body.amount !== undefined) {
+        body.quantity = body.amount;
+        delete body.amount;
+      }
+      if (!body.source) {
+        body.source = 'faction';
+      }
     }
 
     if (tool === 'spacemolt_catalog') {

@@ -608,12 +608,22 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
             const targetData = parseAttackTarget(params);
             if (!targetData) break;
 
-            ctx.log("combat", `🎯 Commander engaging ${targetData.name}...`);
+            // Create a NearbyEntity from targetData for engageTargetFleet
+            const targetEntity: NearbyEntity = {
+              id: targetData.id,
+              name: targetData.name,
+              type: "pirate", // Assume pirate for fleet hunters
+              faction: "",
+              isNPC: true,
+              isPirate: true,
+            };
+
+            ctx.log("combat", `🎯 Commander engaging ${targetEntity.name}...`);
 
             // Use engageTargetFleet which handles everything
             const won = await engageTargetFleet(
               ctx,
-              targetData,
+              targetEntity,
               currentSettings.fleeThreshold,
               currentSettings.fleeFromTier,
               currentSettings.minPiratesToFlee,
@@ -629,7 +639,7 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
             await orderFleetMove(ctx, bot.system, bot.poi || undefined);
             await ctx.sleep(1000);
             yield "fleeing";
-            await fleeFromBattle(ctx, "fleet FLEE command received");
+            await fleeFromBattle(ctx);
             break;
           }
 

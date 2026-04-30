@@ -770,15 +770,23 @@ export class Bot {
       Array.isArray(r.items) ? r.items :
       Array.isArray(r.cargo) ? r.cargo :
       Array.isArray(r.storage) ? r.storage :
+      Array.isArray(r.stored_items) ? r.stored_items :
+      Array.isArray(r.faction_items) ? r.faction_items :
+      Array.isArray(r.faction_storage) ? r.faction_storage :
+      Array.isArray(r.data) ? r.data :
       []
     ) as Array<Record<string, unknown>>;
 
     return items
-      .map((item) => ({
-        itemId: (item.item_id as string) || (item.resource_id as string) || (item.id as string) || "",
-        name: (item.name as string) || (item.item_name as string) || (item.resource_name as string) || (item.item_id as string) || "",
-        quantity: (item.quantity as number) || (item.count as number) || 0,
-      }))
+      .map((item) => {
+        const parsedItem = {
+          itemId: (item.item_id as string) || (item.resource_id as string) || (item.id as string) || "",
+          name: (item.name as string) || (item.item_name as string) || (item.resource_name as string) || (item.item_id as string) || "",
+          quantity: (item.quantity as number) || (item.count as number) || (item.amount as number) || 0,
+        };
+
+        return parsedItem;
+      })
       .filter((i) => i.itemId && i.quantity > 0);
   }
 
@@ -822,18 +830,16 @@ export class Bot {
       return;
     }
 
-    const cached = getFactionStorageCache(factionName);
-    if (cached && !isFactionStorageCacheStale(factionName, 2 * 60 * 1000)) {
-      this.factionStorage = cached.entries as unknown as CargoItem[];
-      return;
-    }
+    // Temporarily disable cache to debug
+    // const cached = getFactionStorageCache(factionName);
+    // if (cached && !isFactionStorageCacheStale(factionName, 2 * 60 * 1000)) {
+    //   this.factionStorage = cached.entries as unknown as CargoItem[];
+    //   return;
+    // }
 
-    const resp = await this.exec("view_storage", { source: "faction" });
+    const resp = await this.exec("view_faction_storage");
     if (resp.error) {
       this.factionStorage = [];
-      if (cached) {
-        this.factionStorage = cached.entries as unknown as CargoItem[];
-      }
       return;
     }
     const entries = this.parseItemList(resp.result);

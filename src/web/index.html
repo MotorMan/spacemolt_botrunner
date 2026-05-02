@@ -822,8 +822,8 @@ async function fetchInitialData() {
   }
 }
 
-function connect() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
   ws = new WebSocket(`${proto}//${location.host}/ws`);
 
   // Fallback: if WebSocket doesn't connect quickly, fetch data via REST
@@ -864,12 +864,7 @@ function connect() {
         knownSystems = msg.knownSystems || [];
         knownOres = msg.knownOres || [];
         mobileCapitol = msg.mobileCapitol || null;
-        if (msg.catalog) catalog = msg.catalog;
-        if (msg.mapData) mapData = msg.mapData;
-        statsDaily = msg.statsDaily || {};
         renderBots();
-        renderStats();
-        renderMapStats();
         setTimeout(refreshFactionFunds, 2000);
         updateChatBotSelect();
         // Only re-render settings if settings tab is not active (to avoid clearing unsaved changes)
@@ -892,6 +887,18 @@ function connect() {
         }
         // Load faction log
         factionLogLines = msg.logs?.faction || [];
+        break;
+      case 'mapData':
+        mapData = msg.data.systems || msg.data || {};
+        renderMapStats();
+        break;
+      case 'catalog':
+        catalog = msg.data;
+        break;
+      case 'statsDaily':
+        statsDaily = msg.data;
+        renderStats();
+        break;
 
         // Re-initialize rescue systems dropdown if profile is open
         if (profileBot) mcInitRescueSystems();

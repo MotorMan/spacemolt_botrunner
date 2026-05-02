@@ -1603,6 +1603,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("debug", `Radioactive capability: basic=${hasBasicRadioactive}, deepCore=${hasDeepCore}, fullCap=${hasFullRadioactiveCap}, hiddenPOI=${canMineHiddenRadioactive}`);
     }
 
+    // Ice mining: check if we can access hidden POIs (requires deep core extractor)
+    const hasDeepCoreExtractorForIce = await hasDeepCoreExtractor(ctx);
+    const canMineHiddenIce = miningType === "ice" && hasDeepCoreExtractorForIce;
+
     // Smart target selection: when mining type is auto-detected, only use the
     // matching target field (no cross-type fallback). A gas harvester should
     // never be forced to mine ore just because targetGas is empty.
@@ -2121,7 +2125,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           return isOreBeltPoi(poi.type) || poi.hidden === true;
         }
         if (miningType === "gas") return isGasCloudPoi(poi.type);
-        if (miningType === "ice") return isIceFieldPoi(poi.type);
+        if (miningType === "ice") {
+          if (poi.hidden === true && !canMineHiddenIce) {
+            return false;
+          }
+          return isIceFieldPoi(poi.type);
+        }
         return true;
       }).filter(loc => {
         // Skip depleted ores (unless depletion has expired or ignoreDepletion is enabled)

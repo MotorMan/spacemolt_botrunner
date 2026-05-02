@@ -752,17 +752,28 @@ async function main(): Promise<void> {
 
   // Periodic UI push (cached data → websocket clients)
   intervals.push(setInterval(() => {
-    refreshStatusTable();
+    try {
+      refreshStatusTable();
+    } catch (err) {
+      console.error('Error in periodic status update:', err);
+    }
   }, 2000));
 
   // Periodic live refresh (hit API for all logged-in bots)
   intervals.push(setInterval(async () => {
-    for (const [, bot] of bots) {
-      if (bot.api.getSession()) {
-        await bot.refreshStatus().catch(() => {});
+    try {
+      // Run all refreshStatus calls in parallel to avoid blocking the event loop
+      const refreshPromises = [];
+      for (const [, bot] of bots) {
+        if (bot.api.getSession()) {
+          refreshPromises.push(bot.refreshStatus().catch(() => {}));
+        }
       }
+      await Promise.allSettled(refreshPromises);
+      refreshStatusTable();
+    } catch (err) {
+      console.error('Error in periodic live refresh:', err);
     }
-    refreshStatusTable();
   }, 30000));
 
   // Periodic map data push (every 15s so dashboard stays current)

@@ -236,6 +236,7 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
    'faction_withdraw_items': 'withdraw',   // auto-add source: 'faction'
    'faction_deposit_credits': 'deposit',   // auto-add item_id: 'credits', target: 'faction'
    'faction_withdraw_credits': 'withdraw', // auto-add item_id: 'credits', source: 'faction'
+   'send_gift': 'withdraw',               // auto-add item_id: 'credits'
   
   // Faction storage
   'view_faction_storage': 'view',  // auto-add source: 'faction'
@@ -738,6 +739,19 @@ export class SpaceMoltAPI {
       }
       if (!body.source) {
         body.source = 'faction';
+      }
+    }
+
+    // Auto-add item_id: 'credits' for send_gift
+    if (command === 'send_gift') {
+      body.item_id = 'credits';
+      if (body.credits !== undefined) {
+        body.quantity = body.credits;
+        delete body.credits;
+      }
+      if (body.recipient !== undefined) {
+        body.target = body.recipient;
+        delete body.recipient;
       }
     }
 

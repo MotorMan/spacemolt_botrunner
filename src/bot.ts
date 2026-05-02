@@ -764,7 +764,13 @@ export class Bot {
   private parseItemList(result: unknown): CargoItem[] {
     if (!result || typeof result !== "object") return [];
 
-    const r = result as Record<string, unknown>;
+    let r = result as Record<string, unknown>;
+
+    // If response has a data wrapper, use that
+    if (r.data && typeof r.data === "object") {
+      r = r.data as Record<string, unknown>;
+    }
+
     const items = (
       Array.isArray(r) ? r :
       Array.isArray(r.items) ? r.items :
@@ -830,14 +836,7 @@ export class Bot {
       return;
     }
 
-    // Temporarily disable cache to debug
-    // const cached = getFactionStorageCache(factionName);
-    // if (cached && !isFactionStorageCacheStale(factionName, 2 * 60 * 1000)) {
-    //   this.factionStorage = cached.entries as unknown as CargoItem[];
-    //   return;
-    // }
-
-    const resp = await this.exec("view_faction_storage");
+    const resp = await this.exec("view_storage", { target: "faction" });
     if (resp.error) {
       this.factionStorage = [];
       return;

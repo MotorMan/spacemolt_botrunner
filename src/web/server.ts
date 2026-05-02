@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, writeFile } from "fs";
 import { join } from "path";
 import os from "os";
 import type { BotStatus } from "../bot.js";
@@ -173,7 +173,9 @@ function loadStats(): StatsFile {
 
 function saveStats(s: StatsFile): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(STATS_FILE, JSON.stringify(s, null, 2) + "\n", "utf-8");
+  writeFile(STATS_FILE, JSON.stringify(s, null, 2) + "\n", "utf-8", (err) => {
+    if (err) console.warn(`Warning: failed to save stats.json —`, err);
+  });
 }
 
 function todayStr(): string {
@@ -333,8 +335,13 @@ export class WebServer {
         // WebSocket upgrade
         if (url.pathname === "/ws") {
           const id = this.nextClientId++;
+          console.log(`WebSocket upgrade attempt from ${req.headers.get('user-agent') || 'unknown'} (id: ${id})`);
           const ok = server.upgrade(req, { data: { id } });
-          if (ok) return undefined as unknown as Response;
+          if (ok) {
+            console.log(`WebSocket upgrade successful (id: ${id})`);
+            return undefined as unknown as Response;
+          }
+          console.log(`WebSocket upgrade failed (id: ${id})`);
           return new Response("WebSocket upgrade failed", { status: 400 });
         }
 
@@ -845,38 +852,65 @@ export class WebServer {
 
       websocket: {
         open: (ws: ServerWebSocket<WSData>) => {
+          console.log(`WebSocket connection opened (id: ${ws.data.id})`);
           this.clients.add(ws);
 
-          // Build known systems list for settings dropdowns
-          const knownSystems = this.getKnownSystemsList();
-          const knownOres = mapStore.getAllKnownOres();
+          // Defer sending init to avoid blocking the event loop
+          setImmediate(() => {
+            try {
+              // Build known systems list for settings dropdowns
+              const knownSystems = this.getKnownSystemsList();
+              const knownOres = mapStore.getAllKnownOres();
 
-          // Send scrollback and current state
-          // Serialize per-bot logs as { username: lines[] }
-          const botLogsObj: Record<string, string[]> = {};
-          for (const [name, lines] of this.botLogs) {
-            botLogsObj[name] = lines;
-          }
+              // Serialize per-bot logs as { username: lines[] }
+              const botLogsObj: Record<string, string[]> = {};
+              for (const [name, lines] of this.botLogs) {
+                botLogsObj[name] = lines;
+              }
 
-          ws.send(JSON.stringify({
-            type: "init",
-            bots: this.latestStatuses,
-            routines: this.routines,
-            settings: this.settings,
-            knownSystems,
-            knownOres,
-            mobileCapitol: this.getMobileCapitolLocation(),
-            catalog: catalogStore.getAll(),
-            mapData: mapStore.getAllSystems(),
-            statsDaily: this.statsData.daily,
-            logs: {
-              activity: this.activityLog,
-              broadcast: this.broadcastLog,
-              system: this.systemLog,
-              faction: this.factionLog,
-            },
-            botLogs: botLogsObj,
-          }));
+              // Send basic init data first (small)
+              ws.send(JSON.stringify({
+                type: "init",
+                bots: this.latestStatuses,
+                routines: this.routines,
+                settings: this.settings,
+                knownSystems,
+                knownOres,
+                mobileCapitol: this.getMobileCapitolLocation(),
+                logs: {
+                  activity: this.activityLog,
+                  broadcast: this.broadcastLog,
+                  system: this.systemLog,
+                  faction: this.factionLog,
+                },
+                botLogs: botLogsObj,
+              }));
+
+              // Send large data separately to avoid blocking with JSON serialization
+              setImmediate(() => {
+                try {
+                  const mapData = mapStore.getAllSystems();
+                  const mapJson = JSON.stringify({ type: "mapData", data: mapData });
+                  console.log(`Sending mapData, size: ${mapJson.length} chars`);
+                  ws.send(mapJson);
+
+                  const catalogData = catalogStore.getAll();
+                  const catalogJson = JSON.stringify({ type: "catalog", data: catalogData });
+                  console.log(`Sending catalog, size: ${catalogJson.length} chars`);
+                  ws.send(catalogJson);
+
+                  const statsJson = JSON.stringify({ type: "statsDaily", data: this.statsData.daily });
+                  console.log(`Sending statsDaily, size: ${statsJson.length} chars`);
+                  ws.send(statsJson);
+                } catch (err) {
+                  console.warn('Failed to send large data:', err);
+                }
+              });
+            } catch (err) {
+              console.warn('Failed to send init message:', err);
+              this.clients.delete(ws);
+            }
+          });
         },
 
         message: async (ws: ServerWebSocket<WSData>, msg: string | Buffer) => {
@@ -887,6 +921,9 @@ export class WebServer {
             seq = raw._seq;
             isExec = raw.type === "exec";
             const data = raw as WebAction;
+
+
+
             if (this.onAction) {
               const result = await this.onAction(data);
               const resType = isExec ? "execResult" : "actionResult";

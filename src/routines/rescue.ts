@@ -1122,14 +1122,16 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       const needed = targetAmount - currentCredits;
       ctx.log("rescue", `💰 ${member.username} has ${currentCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
 
-      const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+      //const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+      const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); //fixed by human!
       if (withdrawResp.error) {
         ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
         return false;
       }
 
       ctx.log("rescue", `💰 Successfully withdrew ${needed}cr, sending to ${member.username}...`);
-      const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
+      //const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
+      const giftResp = await bot.exec("storage", { action: 'deposit', target: member.username, item_id: 'credits', quantity: needed }); //fixed by human!
       if (giftResp.error) {
         ctx.log("rescue", `💰 Gift to ${member.username} failed: ${giftResp.error.message}`);
         await bot.exec("faction_deposit_credits", { amount: needed });

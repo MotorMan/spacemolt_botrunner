@@ -2,7 +2,7 @@
  * Tests for faction_trader.ts V2 API integration
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import type { Bot, RoutineContext } from "../bot.js";
+import type { Bot, RoutineContext } from "../../bot";
 import { parseFactionStorageItems } from "../faction_trader.js";
 
 // ── Mock Bot Factory ─────────────────────────────────────────

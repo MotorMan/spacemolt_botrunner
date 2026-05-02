@@ -677,7 +677,9 @@ export class Bot {
         this.location;
 
       // Faction membership
-      this.faction = (p.faction_id as string) ?? (p.faction as string) ?? null;
+      if (!this.faction) {
+        this.faction = (p.faction_id as string) ?? (p.faction as string) ?? null;
+      }
 
       // Ship fields
       const ship = r.ship as Record<string, unknown> | undefined;
@@ -769,6 +771,14 @@ export class Bot {
     // If response has a data wrapper, use that
     if (r.data && typeof r.data === "object") {
       r = r.data as Record<string, unknown>;
+    }
+
+    // Check structuredContent first (V2 API format)
+    if (r.structuredContent && typeof r.structuredContent === "object") {
+      const sc = r.structuredContent as Record<string, unknown>;
+      if (Array.isArray(sc.items)) {
+        r = sc;
+      }
     }
 
     const items = (

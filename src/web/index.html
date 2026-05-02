@@ -4633,7 +4633,8 @@ function mcSendCredits() {
     return;
   }
 
-  mcExec('send_gift', { recipient, credits });
+  //mcExec('send_gift', { recipient, credits });
+  mcExec('storage', { 'action': 'deposit', 'target': recipient, 'item_id': 'credits', quantity: credits }); //fixed by human!
 }
 
 function val(id) { return document.getElementById(id)?.value || ''; }
@@ -16666,7 +16667,8 @@ function shipGift(username, shipId, name) {
   
   if (!confirm(`Gift ${name || 'this ship'} to ${recipient}? This cannot be undone.`)) return;
 
-  sendExec(username, 'send_gift', { recipient: recipient, ship_id: shipId }, (result) => {
+  //sendExec(username, 'send_gift', { recipient: recipient, ship_id: shipId }, (result) => {
+  sendExec(username, 'storage', { action: 'deposit', target: recipient,  quantity: 1, item_id: shipId }, (result) => { //fixed by human!
     if (result.ok) {
       appendLine('system', `${username} gifted ${name || 'a ship'} to ${recipient}`);
       if (shipyardActivePanel === 'fleet') fetchFleetList(username);

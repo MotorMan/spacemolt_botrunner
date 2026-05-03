@@ -8663,6 +8663,17 @@ function renderTraderSettings(panel) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Enable Missions</div>
+        <div class="setting-hint">Allow the trader to accept and complete market/trade missions. Note: Missions often expire before completion and can waste valuable trading time. Default: enabled for backwards compatibility.</div>
+      </div>
+      <select id="set-trader-enableMissions">
+        <option value="true" ${t.enableMissions !== false ? 'selected' : ''}>Enabled</option>
+        <option value="false" ${t.enableMissions === false ? 'selected' : ''}>Disabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Min Profit Per Unit (credits)</div>
         <div class="setting-hint">Only run trade routes where per-item profit exceeds this amount after fuel costs.</div>
       </div>
@@ -8732,6 +8743,7 @@ function saveTraderSettings() {
     refuelThreshold: parseInt(document.getElementById('set-trader-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-trader-repairThreshold').value) || 40,
     homeSystem: document.getElementById('set-trader-homeSystem').value.trim(),
+    enableMissions: document.getElementById('set-trader-enableMissions').value === 'true',
   };
   send({ type: 'saveSettings', routine: 'trader', settings: s });
   settings.trader = s;

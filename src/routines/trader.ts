@@ -240,6 +240,7 @@ function getTraderSettings(username?: string): {
   stationPriority: boolean;
   autoCloak: boolean;
   maxFactionCreditsToUse: number;
+  enableMissions: boolean;
 } {
   const all = readSettings();
   const t = all.trader || {};
@@ -256,6 +257,7 @@ function getTraderSettings(username?: string): {
     stationPriority: (botOverrides.stationPriority as boolean) || false,
     autoCloak: (t.autoCloak as boolean) ?? false,
     maxFactionCreditsToUse: (t.maxFactionCreditsToUse as number) ?? 0, // 0 = unlimited
+    enableMissions: (t.enableMissions as boolean) !== false,
   };
 }
 
@@ -1329,58 +1331,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Ensure docked (also records market data + analyzes market) ──
     yield "dock";
     await ensureDocked(ctx);
-    if (bot.docked) {
-      await tryMissions(ctx);
-
-      // Get fresh market insights from analyze_market
-      const analyzeResp = await bot.exec("analyze_market");
-      if (!analyzeResp.error && analyzeResp.result && typeof analyzeResp.result === "object") {
-        const r = analyzeResp.result as Record<string, unknown>;
-        marketInsights = (r.insights as Array<Record<string, unknown>>) || [];
-        if (marketInsights.length > 0) {
-          ctx.log("trade", `Received ${marketInsights.length} market insights from analyze_market`);
-
-          // Log oversupply warnings
-          const oversupplyInsights = marketInsights.filter(i =>
-            i.category === "supply_imbalance" &&
-            typeof i.message === "string" &&
-            i.message.includes("units for sale here") &&
-            i.message.includes("no buyers")
-          );
-          if (oversupplyInsights.length > 0) {
-            const oversupplyItems = oversupplyInsights.map(i => i.item as string).join(", ");
-            ctx.log("trade", `Oversupply detected: ${oversupplyItems} - will avoid selling these at current station`);
-          }
-        }
-      }
-    }
-
-    // ── Fuel + hull check + mods ──
-    yield "maintenance";
-    await tryRefuel(ctx);
-    await repairShip(ctx);
-    const modProfile = getModProfile("trader");
-    if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
-
-    // ── Priority 1: Handle leftover cargo items ──
-    // Instead of auto-selling at random stations, we:
-    // 1. Check if current station has good buy orders
-    // 2. If yes, sell here
-    // 3. If no, travel home and deposit to faction storage for later sale
-    // This handles: corrupt session data, human-placed trade items, failed trades
-    // IMPORTANT: Skip items that are part of an active/recovered trade session!
-    yield "handle_cargo";
-    await bot.refreshStatus();
+    
+    // ── Priority 0: Sell trade items immediately after docking ──
+    // This is the most time-critical operation - sell before anything else
+    yield "sell_trade_items";
     await bot.refreshCargo();
-
+    
     // Get the active trade session to protect those items
-    // (activeSession already declared above for recovery check)
     const protectedItemId = activeSession?.itemId || recoveredSession?.itemId;
-
+    
     if (protectedItemId) {
       ctx.log("trade", `Protecting trade session item: ${protectedItemId} (not selling in cargo phase)`);
     }
-
+    
     // Track items sold locally so we don't plan routes to sell them here again
     const soldLocallyIds = new Set<string>();
     
@@ -1395,26 +1358,25 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       return true;
     });
-
+    
     if (cargoItems.length > 0 && bot.docked) {
       const allBuys = mapStore.getAllBuyDemand();
       const homeSystem = settings.homeSystem || startSystem;
       const itemsToDeposit: Array<{ itemId: string; name: string; quantity: number }> = [];
       const itemsToSell: Array<{ itemId: string; name: string; quantity: number; price: number }> = [];
-      const soldLocallyIds = new Set<string>(); // Track items sold at current station
-
+      
       for (const item of cargoItems) {
         // Find best buy order for this item
         const buyers = allBuys
           .filter(b => b.itemId === item.itemId && b.price > 0 && b.quantity > 0)
           .sort((a, b) => b.price - a.price);
-
+        
         if (buyers.length === 0) {
           // No buyers at all - deposit to faction storage
           itemsToDeposit.push(item);
           continue;
         }
-
+        
         const bestBuyer = buyers[0];
         const isCurrentStation = bestBuyer.systemId === bot.system && bestBuyer.poiId === bot.poi;
         
@@ -1429,7 +1391,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         // OR if it's the best price available (we're already at the best station)
         const isBestPrice = !buyers.some(b => b.systemId !== bot.system || b.poiId !== bot.poi);
         const isGoodPrice = priceRatio >= 0.8 || isBestPrice || isCurrentStation;
-
+        
         if (isGoodPrice) {
           // Sell at current station
           itemsToSell.push({
@@ -1443,12 +1405,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           itemsToDeposit.push(item);
         }
       }
-
+      
       // Sell items with good prices
       if (itemsToSell.length > 0) {
         const cargoSellCreditsBefore = bot.credits;
         const soldHere: string[] = [];
-
+        
         for (const item of itemsToSell) {
           const sResp = await bot.exec("sell", { item_id: item.itemId, quantity: item.quantity });
           if (!sResp.error) {
@@ -1459,7 +1421,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             itemsToDeposit.push({ itemId: item.itemId, name: item.name, quantity: item.quantity });
           }
         }
-
+        
         if (soldHere.length > 0) {
           await bot.refreshCargo();
           await bot.refreshStatus();
@@ -1469,7 +1431,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           await recordMarketData(ctx);
         }
       }
-
+      
       // Deposit items with no good price to faction storage
       if (itemsToDeposit.length > 0) {
         // Check if bot is in a faction
@@ -1512,7 +1474,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             }
           }
         }
-
+        
         // Deposit items to faction storage (only if in a faction and docked)
         if (bot.faction && bot.docked) {
           const deposited: string[] = [];
@@ -1530,6 +1492,47 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
     }
+    
+    // ── Get fresh market insights from analyze_market ──
+    const analyzeResp = await bot.exec("analyze_market");
+    if (!analyzeResp.error && analyzeResp.result && typeof analyzeResp.result === "object") {
+      const r = analyzeResp.result as Record<string, unknown>;
+      marketInsights = (r.insights as Array<Record<string, unknown>>) || [];
+      if (marketInsights.length > 0) {
+        ctx.log("trade", `Received ${marketInsights.length} market insights from analyze_market`);
+        
+        // Log oversupply warnings
+        const oversupplyInsights = marketInsights.filter(i =>
+          i.category === "supply_imbalance" &&
+          typeof i.message === "string" &&
+          i.message.includes("units for sale here") &&
+          i.message.includes("no buyers")
+        );
+        if (oversupplyInsights.length > 0) {
+          const oversupplyItems = oversupplyInsights.map(i => i.item as string).join(", ");
+          ctx.log("trade", `Oversupply detected: ${oversupplyItems} - will avoid selling these at current station`);
+        }
+      }
+    }
+    
+    // ── Try missions (if enabled) ──
+    if (settings.enableMissions !== false) {
+      await tryMissions(ctx);
+    }
+    
+    // ── Fuel + hull check + mods ──
+    yield "maintenance";
+    // Only refuel if actually below threshold - tryRefuel always tries to reach 95%
+    await bot.refreshStatus();
+    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelPct < settings.refuelThreshold) {
+      await tryRefuel(ctx);
+    } else {
+      ctx.log("trade", `Fuel at ${fuelPct}% (above ${settings.refuelThreshold}% threshold) - skipping refuel`);
+    }
+    await repairShip(ctx);
+    const modProfile = getModProfile("trader");
+    if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
 
     await bot.refreshStatus();
 

@@ -107,6 +107,103 @@ function saveFCStationsData(data: FCStationsData): void {
   writeFileSync(FC_STATIONS_FILE, JSON.stringify(data, null, 2));
 }
 
+/**
+ * Check orders at a specific station remotely using view_orders with station_id.
+ * Updates the station entry with current active orders.
+ * Returns true if successful.
+ */
+async function checkStationOrdersRemote(
+  ctx: RoutineContext,
+  data: FCStationsData,
+  stationEntry: FCStationEntry,
+  delayMs: number = 5000,
+): Promise<boolean> {
+  const { bot } = ctx;
+  
+  // Wait the specified delay before checking (to avoid spamming server)
+  await ctx.sleep(delayMs);
+  
+  try {
+    // Use station_id parameter to check orders at this station remotely
+    const ordersResp = await bot.exec("view_orders", { station_id: stationEntry.poiId });
+    
+    if (ordersResp.error || !ordersResp.result || typeof ordersResp.result !== "object") {
+      ctx.log("fc", `Remote check failed for ${stationEntry.poiName}: ${ordersResp.error?.message || "no result"}`);
+      return false;
+    }
+    
+    const ordersData = ordersResp.result as Record<string, unknown>;
+    const orders = Array.isArray(ordersData.orders) ? ordersData.orders : [];
+    
+    // Filter for fuel_cell sell orders
+    const fcOrders = orders.filter((o: any) => o.item_id === FUEL_CELL_ITEM_ID && o.side === "sell");
+    
+    const activeOrders = fcOrders.map((o: any) => ({
+      orderId: o.order_id,
+      quantity: o.quantity,
+      remaining: o.remaining,
+      filledQuantity: o.filled_quantity,
+      priceEach: o.price_each,
+      createdAt: o.created_at,
+    }));
+    
+    // Update station entry
+    stationEntry.activeOrders = activeOrders;
+    stationEntry.ordersUnsold = activeOrders.reduce((sum: number, o: any) => sum + o.remaining, 0);
+    stationEntry.lastVisit = new Date().toISOString();
+    
+    const totalPlaced = activeOrders.reduce((sum: any, o: any) => sum + o.quantity, 0);
+    if (totalPlaced > 0) {
+      stationEntry.ordersPlaced = totalPlaced;
+    }
+    
+    ctx.log("fc", `Remote check: ${stationEntry.poiName} - ${activeOrders.length} active orders, ${stationEntry.ordersUnsold} unsold`);
+    return true;
+  } catch (error) {
+    ctx.log("error", `Remote check error for ${stationEntry.poiName}: ${error}`);
+    return false;
+  }
+}
+
+/**
+ * Check all stations' orders remotely and update fcStations.json.
+ * Processes stations sequentially with a delay between each to avoid spamming.
+ */
+async function updateAllStationsFromRemote(
+  ctx: RoutineContext,
+  data: FCStationsData,
+  minDelayMs: number = 5000,
+): Promise<void> {
+  ctx.log("fc", `Starting remote update of all ${data.stations.length} stations (min delay: ${minDelayMs}ms)...`);
+  
+  let successCount = 0;
+  let failCount = 0;
+  
+  for (let i = 0; i < data.stations.length; i++) {
+    if (ctx.bot.state !== "running") {
+      ctx.log("fc", "Bot stopped, aborting remote update");
+      break;
+    }
+    
+    const station = data.stations[i];
+    ctx.log("fc", `Checking ${station.poiName}... (${i + 1}/${data.stations.length})`);
+    
+    const success = await checkStationOrdersRemote(ctx, data, station, i === 0 ? 0 : minDelayMs);
+    
+    if (success) {
+      successCount++;
+    } else {
+      failCount++;
+    }
+    
+    // Save after each station so we don't lose progress
+    saveFCStationsData(data);
+  }
+  
+  ctx.log("fc", `Remote update complete: ${successCount} succeeded, ${failCount} failed`);
+  saveFCStationsData(data);
+}
+
 function getFuelCellSellerSettings(username?: string): {
   homeSystem: string;
   homeStation: string;
@@ -239,21 +336,36 @@ function getNextStation(
     }
   }
 
-  // All stations visited: sort by sales volume (ordersPlaced - ordersUnsold) descending
-  const stationSales = data.stations.map((station, idx) => ({
-    idx,
-    sales: station.ordersPlaced - station.ordersUnsold,
-    lastVisit: station.lastVisit ? new Date(station.lastVisit).getTime() : 0,
-  }));
+  // All stations visited: prioritize stations with higher unsold ratio (lower fill rate)
+  // This targets stations that need more fuel cells
+  const stationPriority = data.stations.map((station, idx) => {
+    const sales = station.ordersPlaced - station.ordersUnsold;
+    const fillRate = station.ordersPlaced > 0 ? (sales / station.ordersPlaced) * 100 : 0;
+    const lastVisit = station.lastVisit ? new Date(station.lastVisit).getTime() : 0;
+    // Higher priority = should visit sooner
+    // We want to visit stations with lower fill rates (more unsold) first
+    // Also consider absolute unsold count for stations with similar fill rates
+    return {
+      idx,
+      fillRate,
+      unsold: station.ordersUnsold,
+      sales,
+      lastVisit,
+      // Priority score: lower fill rate = higher priority (more negative = visit sooner)
+      // Also factor in unsold count for tie-breaking
+      priorityScore: (fillRate * 1000) - station.ordersUnsold,
+    };
+  });
 
-  // Sort by sales descending, then lastVisit ascending (oldest first)
-  stationSales.sort((a, b) => {
-    if (b.sales !== a.sales) return b.sales - a.sales;
+  // Sort by priorityScore ascending (lower fill rate / more unsold = higher priority)
+  // Then by lastVisit ascending (oldest first)
+  stationPriority.sort((a, b) => {
+    if (a.priorityScore !== b.priorityScore) return a.priorityScore - b.priorityScore;
     return a.lastVisit - b.lastVisit;
   });
 
   // Find next station in sorted order after currentIndex
-  const sortedIndices = stationSales.map(s => s.idx);
+  const sortedIndices = stationPriority.map(s => s.idx);
   const currentSortedPos = sortedIndices.indexOf(currentIndex);
   const nextSortedPos = (currentSortedPos + 1) % sortedIndices.length;
   return sortedIndices[nextSortedPos];
@@ -279,6 +391,11 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     fcData.lastStarted = new Date().toISOString();
     saveFCStationsData(fcData);
   }
+
+  // Track last remote update time for periodic checks
+  let lastRemoteUpdate: number = 0;
+  const REMOTE_UPDATE_INTERVAL = 60 * 60 * 1000; // 1 hour in milliseconds
+  const MIN_DELAY_BETWEEN_STATION_CHECKS = 5000; // 5 seconds
 
   // Persistent battle state across cycles
   const battleState: BattleState = {
@@ -316,6 +433,16 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         battleState.lastFleeTime = now;
         ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
       }
+    }
+
+    // Periodic remote update of station orders (every hour)
+    const now = Date.now();
+    if (now - lastRemoteUpdate >= REMOTE_UPDATE_INTERVAL) {
+      ctx.log("fc", "Time for periodic remote update of station orders...");
+      await updateAllStationsFromRemote(ctx, fcData, MIN_DELAY_BETWEEN_STATION_CHECKS);
+      lastRemoteUpdate = now;
+      // Reload data after update to ensure we have latest
+      fcData = loadFCStationsData();
     }
 
     // If we're in battle, re-issue flee command to ensure we stay in flee stance
@@ -385,10 +512,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         ctx.log("fc", "Arrived home but no cargo — attempting to withdraw from faction storage");
         
         const freeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
-        const withdrawResp = await bot.exec("faction_withdraw_items", {
-          item_id: FUEL_CELL_ITEM_ID,
-          quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID),
-        });
+        //const withdrawResp = await bot.exec("faction_withdraw_items", { item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), });
+        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), }); //fixed by human!
 
         if (withdrawResp.error) {
           ctx.log("error", `Withdraw failed: ${withdrawResp.error.message} — waiting for cargo`);
@@ -425,10 +550,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
         ctx.log("fc", "No cargo at home station — attempting to withdraw from faction storage");
         
         const freeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
-        const withdrawResp = await bot.exec("faction_withdraw_items", {
-          item_id: FUEL_CELL_ITEM_ID,
-          quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID),
-        });
+        //const withdrawResp = await bot.exec("faction_withdraw_items", { item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), });
+        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction',  item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), }); //fixed by human!
 
         if (withdrawResp.error) {
           ctx.log("error", `Withdraw failed: ${withdrawResp.error.message} — waiting for cargo`);
@@ -675,10 +798,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     if (checkCargo && checkCargo.quantity > 0) {
       ctx.log("fc", `Depositing ${checkCargo.quantity}x remaining fuel cells`);
       await ensureDocked(ctx);
-      await bot.exec("faction_deposit_items", {
-        item_id: FUEL_CELL_ITEM_ID,
-        quantity: checkCargo.quantity,
-      });
+      //await bot.exec("faction_deposit_items", { item_id: FUEL_CELL_ITEM_ID, quantity: checkCargo.quantity, });
+      await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: FUEL_CELL_ITEM_ID, quantity: checkCargo.quantity, }); //fixed by human!
     }
 
     targetIdx = (targetIdx + 1) % fcData.stations.length;

@@ -604,6 +604,13 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     if (bot.docked) {
       //const factionResp = await bot.exec("view_storage", { target: "faction" });
       const factionResp = await bot.exec("storage", { action: 'view', target: "faction" }); //fixed by human!
+      if (!factionResp.error) {
+        // Set faction if not set
+        const result = factionResp.result as any;
+        if (result.faction_id && !bot.faction) {
+          bot.faction = result.faction_id;
+        }
+      }
       if (factionResp.error) {
         factionError = factionResp.error.message || "";
         // Only use personal mode if bot is truly not in a faction

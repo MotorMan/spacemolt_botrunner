@@ -344,16 +344,16 @@ export class Bot {
     const generalSettings = settings.general || {};
     
     const jumpTimes: Record<number, number> = {
-      1: generalSettings.jumpSpeed1 || 120,
-      2: generalSettings.jumpSpeed2 || 110,
-      3: generalSettings.jumpSpeed3 || 100,
-      4: generalSettings.jumpSpeed4 || 80,
-      5: generalSettings.jumpSpeed5 || 50,
+      1: generalSettings.jumpSpeed1 || 80,
+      2: generalSettings.jumpSpeed2 || 70,
+      3: generalSettings.jumpSpeed3 || 60,
+      4: generalSettings.jumpSpeed4 || 50,
+      5: generalSettings.jumpSpeed5 || 40,
       6: generalSettings.jumpSpeed6 || 30,
     };
     
     const buffer = generalSettings.jumpBuffer || 10;
-    let baseTime = jumpTimes[this.shipSpeed] || 120;
+    let baseTime = jumpTimes[this.shipSpeed] || 80;
 
     // Apply 50% speed penalty if towing a wreck
     if (this.towingWreck) {
@@ -516,7 +516,7 @@ export class Bot {
           const sysData = mapStore.getSystem(this.system);
           if (isEmpireSystem(this.system, this.getEmpire(), sysData?.security_level)) {
             this.log("customs", `⏱️ Post-jump customs wait @ ${this.system} - 2 second delay...`);
-            await sleep(2000);
+            await sleep(250); //human says it does not need to be much because the cusoms know you are coming the instant you issue the jump command.
           }
         }
 

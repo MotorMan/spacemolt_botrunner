@@ -75,33 +75,84 @@ export async function hasRadHarvester(ctx: RoutineContext): Promise<boolean> {
 }
 
 /**
- * Check if the ship has full radioactive mining capability.
- * Requires both lead-lined cargo and rad harvester modules.
- * Returns an object with detailed capability info.
+ * Check if the ship has radioactive mining capability.
+ * Returns detailed capability levels for different setups:
+ * - Basic: rad harvester + lead-lined cargo (basic rad ores in public areas)
+ * - Enhanced: Basic + deep core extractor (deep core rad ores in visible POIs)
+ * - Full: Enhanced + deep core survey scanner (rad ores in hidden POIs)
  */
 export async function getRadioactiveCapability(ctx: RoutineContext): Promise<{
   hasLeadLinedCargo: boolean;
   hasRadHarvester: boolean;
-  canMineRadioactive: boolean;
+  hasDeepCoreExtractor: boolean;
+  hasDeepCoreScanner: boolean;
+  canMineBasicRadioactive: boolean; // Basic rad ores in public areas
+  canMineDeepCoreRadioactive: boolean; // Deep core rad ores in visible POIs
+  canMineHiddenRadioactive: boolean; // Rad ores in hidden POIs
 }> {
   const hasLLCargo = await hasLeadLinedCargo(ctx);
   const hasRadHarv = await hasRadHarvester(ctx);
-  const canMine = hasLLCargo && hasRadHarv;
+
+  // Check for deep core equipment
+  const shipResp = await ctx.bot.exec("get_ship");
+  let hasDeepCoreExtractor = false;
+  let hasDeepCoreScanner = false;
+
+  if (!shipResp.error && shipResp.result) {
+    const shipData = shipResp.result as Record<string, unknown>;
+    const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+
+    for (const mod of modules) {
+      const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+      const modId = (modObj?.id as string) || (modObj?.type_id as string) || "";
+      const modName = (modObj?.name as string) || "";
+      const modSpecial = (modObj?.special as string) || "";
+
+      const checkStr = `${modId} ${modName} ${modSpecial}`.toLowerCase();
+
+      if (checkStr.includes("deep_core_extractor_mki") ||
+          checkStr.includes("deep_core_extractor_mkii") ||
+          checkStr.includes("deep_core_extractor_ii") ||
+          checkStr.includes("deep_core_extractor") ||
+          checkStr.includes("deep core extractor") ||
+          modSpecial.includes("rare_ore_access")) {
+        hasDeepCoreExtractor = true;
+      }
+
+      if (checkStr.includes("deep_core_survey_scanner") ||
+          checkStr.includes("deep core survey scanner") ||
+          modSpecial.includes("deep_core_detection")) {
+        hasDeepCoreScanner = true;
+      }
+    }
+  }
+
+  const canMineBasic = hasLLCargo && hasRadHarv;
+  const canMineDeepCore = canMineBasic && hasDeepCoreExtractor;
+  const canMineHidden = canMineDeepCore && hasDeepCoreScanner;
 
   return {
     hasLeadLinedCargo: hasLLCargo,
     hasRadHarvester: hasRadHarv,
-    canMineRadioactive: canMine,
+    hasDeepCoreExtractor: hasDeepCoreExtractor,
+    hasDeepCoreScanner: hasDeepCoreScanner,
+    canMineBasicRadioactive: canMineBasic,
+    canMineDeepCoreRadioactive: canMineDeepCore,
+    canMineHiddenRadioactive: canMineHidden,
   };
 }
 
 /**
- * Check if the ship has equipment for radioactive mining.
- * Cached version that accepts pre-fetched modules.
+ * Check radioactive mining capability levels from cached modules.
+ * Returns detailed capability info.
  */
-export function hasRadioactiveEquipmentCached(
+export function getRadioactiveCapabilityCached(
   modules: unknown[],
-): boolean {
+): {
+  canMineBasicRadioactive: boolean;
+  canMineDeepCoreRadioactive: boolean;
+  canMineHiddenRadioactive: boolean;
+} {
   const moduleStr = modules.map(m => {
     const obj = typeof m === "object" && m !== null ? m as Record<string, unknown> : {};
     return `${obj.id || ""} ${obj.name || ""} ${obj.type || ""} ${obj.special || ""}`.toLowerCase();
@@ -109,8 +160,36 @@ export function hasRadioactiveEquipmentCached(
 
   const hasLLCargo = moduleStr.includes("lead_lined_cargo") || moduleStr.includes("lead lined cargo");
   const hasRadHarv = moduleStr.includes("rad_harvester") || moduleStr.includes("rad harvester");
+  const hasDeepCoreExtractor = moduleStr.includes("deep_core_extractor_mki") ||
+                               moduleStr.includes("deep_core_extractor_mkii") ||
+                               moduleStr.includes("deep_core_extractor_ii") ||
+                               moduleStr.includes("deep_core_extractor") ||
+                               moduleStr.includes("deep core extractor");
+  const hasDeepCoreScanner = moduleStr.includes("deep_core_survey_scanner") ||
+                             moduleStr.includes("deep core survey scanner") ||
+                             moduleStr.includes("deep_core_detection");
 
-  return hasLLCargo && hasRadHarv;
+  const canMineBasic = hasLLCargo && hasRadHarv;
+  const canMineDeepCore = canMineBasic && hasDeepCoreExtractor;
+  const canMineHidden = canMineDeepCore && hasDeepCoreScanner;
+
+  return {
+    canMineBasicRadioactive: canMineBasic,
+    canMineDeepCoreRadioactive: canMineDeepCore,
+    canMineHiddenRadioactive: canMineHidden,
+  };
+}
+
+/**
+ * Check if the ship has basic radioactive mining equipment.
+ * Cached version that accepts pre-fetched modules.
+ * @deprecated Use getRadioactiveCapabilityCached instead
+ */
+export function hasRadioactiveEquipmentCached(
+  modules: unknown[],
+): boolean {
+  const cap = getRadioactiveCapabilityCached(modules);
+  return cap.canMineBasicRadioactive;
 }
 
 /**
@@ -126,27 +205,24 @@ export function hasDeepCoreExtractorCached(
     return `${obj.id || ""} ${obj.name || ""} ${obj.type || ""} ${obj.special || ""}`.toLowerCase();
   }).join(" ");
 
-  return moduleStr.includes("deep_core_extractor") || moduleStr.includes("deep core extractor");
+  return moduleStr.includes("deep_core_extractor_mki") ||
+         moduleStr.includes("deep_core_extractor_mkii") ||
+         moduleStr.includes("deep_core_extractor_ii") ||
+         moduleStr.includes("deep_core_extractor") ||
+         moduleStr.includes("deep core extractor");
 }
 
 /**
- * Check if the ship has full radioactive mining equipment including deep core extractor.
+ * Check if the ship has full radioactive mining equipment including deep core extractor and scanner.
  * This is required to mine radioactive ores from hidden POIs.
  * Cached version that accepts pre-fetched modules.
+ * @deprecated Use getRadioactiveCapabilityCached instead
  */
 export function hasFullRadioactiveCapabilityCached(
   modules: unknown[],
 ): boolean {
-  const moduleStr = modules.map(m => {
-    const obj = typeof m === "object" && m !== null ? m as Record<string, unknown> : {};
-    return `${obj.id || ""} ${obj.name || ""} ${obj.type || ""} ${obj.special || ""}`.toLowerCase();
-  }).join(" ");
-
-  const hasLLCargo = moduleStr.includes("lead_lined_cargo") || moduleStr.includes("lead lined cargo");
-  const hasRadHarv = moduleStr.includes("rad_harvester") || moduleStr.includes("rad harvester");
-  const hasDeepCore = moduleStr.includes("deep_core_extractor") || moduleStr.includes("deep core extractor");
-
-  return hasLLCargo && hasRadHarv && hasDeepCore;
+  const cap = getRadioactiveCapabilityCached(modules);
+  return cap.canMineHiddenRadioactive;
 }
 
 /**
@@ -158,9 +234,16 @@ export async function logRadioactiveCapability(ctx: RoutineContext): Promise<voi
     const parts: string[] = [];
     if (radCap.hasLeadLinedCargo) parts.push("lead-lined cargo");
     if (radCap.hasRadHarvester) parts.push("rad harvester");
+    if (radCap.hasDeepCoreExtractor) parts.push("deep core extractor");
+    if (radCap.hasDeepCoreScanner) parts.push("deep core scanner");
     ctx.log("mining", `Radioactive mining equipment detected: ${parts.join(" + ")}`);
-    if (radCap.canMineRadioactive) {
-      ctx.log("mining", "Radioactive mining capability: FULL (can mine radioactive ores)");
+
+    if (radCap.canMineHiddenRadioactive) {
+      ctx.log("mining", "Radioactive mining capability: FULL (can mine radioactive ores in hidden POIs)");
+    } else if (radCap.canMineDeepCoreRadioactive) {
+      ctx.log("mining", "Radioactive mining capability: ENHANCED (can mine deep core radioactive ores in visible POIs)");
+    } else if (radCap.canMineBasicRadioactive) {
+      ctx.log("mining", "Radioactive mining capability: BASIC (can mine basic radioactive ores in public areas)");
     } else {
       if (!radCap.hasLeadLinedCargo) ctx.log("warn", "Radioactive mining INCOMPLETE: missing lead-lined cargo");
       if (!radCap.hasRadHarvester) ctx.log("warn", "Radioactive mining INCOMPLETE: missing rad harvester");

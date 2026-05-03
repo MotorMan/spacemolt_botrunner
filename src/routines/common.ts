@@ -1995,6 +1995,9 @@ export async function fullSalvageWrecks(
 
   const wrecksResp = await bot.exec("get_wrecks");
   const wrecks = parseWrecks(wrecksResp.result);
+  if (wrecks.length > 0) {
+    ctx.log("scavenge", `get_wrecks found ${wrecks.length} wreck(s)`);
+  }
   if (wrecks.length === 0) return { itemsLooted: 0, isTowing: bot.towingWreck };
 
   let totalLooted = 0;
@@ -2070,6 +2073,7 @@ export async function fullSalvageWrecks(
         break; // Exit the wrecks loop entirely
       }
 
+      ctx.log("scavenge", `Attempting to tow wreck ${wreck.wreck_id} (${wreck.name})`);
       const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
       // Check for battle notifications after tow
       if (battleState && towResp.notifications && Array.isArray(towResp.notifications)) {
@@ -2084,6 +2088,7 @@ export async function fullSalvageWrecks(
         ctx.log("debug", `tow_wreck response: ${JSON.stringify(tr)}`);
         const salvageValue = (tr.salvage_value as number) || 0;
         const shipClass = (tr.ship_class as string) || "unknown";
+        ctx.log("scavenge", `tow_wreck successful for ${wreck.name} (${shipClass}, value: ${salvageValue}cr)`);
 
         if (salvageValue >= minTowValue) {
           // Log modules from the wreck's modules array
@@ -2110,7 +2115,7 @@ export async function fullSalvageWrecks(
           ctx.log("scavenge", `Set bot.towingWreck=true after successful tow`);
           break;
         } else {
-          ctx.log("scavenge", `Skipped towing ${wreck.name} - value ${salvageValue}cr below threshold ${minTowValue}cr`);
+          ctx.log("scavenge", `tow_wreck successful but skipped towing ${wreck.name} - value ${salvageValue}cr below threshold ${minTowValue}cr`);
         }
       } else if (towResp.error) {
         const msg = towResp.error.message.toLowerCase();
@@ -2132,7 +2137,7 @@ export async function fullSalvageWrecks(
             continue; // Try the next wreck
           }
         } else {
-          ctx.log("error", `Failed to tow ${wreck.name}: ${towResp.error.message}`);
+          ctx.log("scavenge", `tow_wreck failed for ${wreck.name}: ${towResp.error.message}`);
         }
       }
     }

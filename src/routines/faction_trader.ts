@@ -1185,6 +1185,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             ctx.log("error", `Cargo recovery sell failed: ${sResp.error.message}`);
             break;
           }
+          // Wait for cargo update after sell
+          await ctx.sleep(12000);
           // Verify sale by checking cargo after sell
           await bot.refreshCargo();
           const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
@@ -1222,15 +1224,18 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             );
 
             if (marketCheck.sellQty > 0) {
-              ctx.log("trade", `Selling ${marketCheck.sellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
-              const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: marketCheck.sellQty });
-              if (!sResp.error) {
-                // Get actual revenue from sell result
-                const sr = sResp.result as Record<string, unknown> | undefined;
-                const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+            ctx.log("trade", `Selling ${marketCheck.sellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);
+            const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: marketCheck.sellQty });
+            if (!sResp.error) {
+              // Wait for cargo update after sell
+              await ctx.sleep(12000);
 
-                // Verify sale
-                await bot.refreshCargo();
+              // Get actual revenue from sell result
+              const sr = sResp.result as Record<string, unknown> | undefined;
+              const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+
+              // Verify sale
+              await bot.refreshCargo();
                 const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
                 const actuallySold = marketCheck.sellQty - afterSell;
                 if (actuallySold > 0) {
@@ -1433,6 +1438,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               await ctx.sleep(1000);
               continue;
             }
+
+            // Wait for cargo update after successful sell
+            await ctx.sleep(12000);
 
             // Verify sale
             await bot.refreshCargo();
@@ -1844,6 +1852,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             ctx.log("error", `Sell failed: ${sResp.error.message}`);
             await failFactionSession(bot.username, `Sell failed: ${sResp.error.message}`);
           } else {
+            // Wait for cargo update after sell
+            await ctx.sleep(12000);
+
             // Get actual revenue from sell result
             const sr = sResp.result as Record<string, unknown> | undefined;
             const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;

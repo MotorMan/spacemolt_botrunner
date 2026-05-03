@@ -23,8 +23,8 @@ import {
 } from "./common.js";
 import {
   getRadioactiveCapability,
+  getRadioactiveCapabilityCached,
   hasRadioactiveEquipmentCached,
-  hasDeepCoreExtractorCached,
   hasFullRadioactiveCapabilityCached,
   logRadioactiveCapability,
   isRadioactiveOre,
@@ -117,7 +117,10 @@ async function hasDeepCoreExtractor(ctx: RoutineContext): Promise<boolean> {
     const modSpecial = (modObj?.special as string) || "";
 
     const checkStr = `${modId} ${modName} ${modSpecial}`.toLowerCase();
-    if (checkStr.includes("deep_core_extractor") ||
+    if (checkStr.includes("deep_core_extractor_mki") ||
+        checkStr.includes("deep_core_extractor_mkii") ||
+        checkStr.includes("deep_core_extractor_ii") ||
+        checkStr.includes("deep_core_extractor") ||
         checkStr.includes("deep core extractor") ||
         modSpecial.includes("rare_ore_access")) {
       return true;
@@ -130,23 +133,28 @@ async function hasDeepCoreExtractor(ctx: RoutineContext): Promise<boolean> {
  * Check if the ship has full deep core mining capability (both scanner and extractor).
  * Returns an object with detailed capability info.
  * During field_test mission, only extractor is required.
+ * Miners with only extractor can mine deep core ores in visible POIs.
  */
 async function getDeepCoreCapability(ctx: RoutineContext, fieldTestActive: boolean = false): Promise<{
   hasScanner: boolean;
   hasExtractor: boolean;
-  canMine: boolean;
+  canMineHidden: boolean;
+  canMineVisibleDeepCore: boolean;
 }> {
   const hasScanner = await hasDeepCoreSurveyScanner(ctx);
   const hasExtractor = await hasDeepCoreExtractor(ctx);
-  
-  // During field_test mission, we can mine with just the extractor
-  // (no scanner required since we're using directional jump method)
-  const canMine = fieldTestActive ? hasExtractor : (hasScanner && hasExtractor);
-  
+
+  // Can mine hidden POIs: requires scanner + extractor (or extractor only during field_test)
+  const canMineHidden = fieldTestActive ? hasExtractor : (hasScanner && hasExtractor);
+
+  // Can mine deep core ores in visible POIs: requires extractor (even without scanner)
+  const canMineVisibleDeepCore = hasExtractor;
+
   return {
     hasScanner,
     hasExtractor,
-    canMine,
+    canMineHidden,
+    canMineVisibleDeepCore,
   };
 }
 
@@ -413,9 +421,11 @@ function getMinerSettings(username?: string): {
 async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]): Promise<"ore" | "gas" | "ice" | "radioactive" | null> {
   const { bot } = ctx;
   let shipData: Record<string, unknown>;
+  let usingCachedModules = false;
 
   if (cachedModules) {
     shipData = { modules: cachedModules };
+    usingCachedModules = true;
   } else {
     const shipResp = await bot.exec("get_ship");
     if (shipResp.error) {
@@ -499,16 +509,108 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   }
 
   // Check for deep core equipment (survey scanner + extractor) — counts as ore mining
-  // During field_test mission, only extractor is required
+  // Even with only extractor (no scanner), it's still ore mining capability
   const fieldTestActive = await hasFieldTestMission(ctx);
   const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
-  if (deepCoreCap.canMine) {
-    if (fieldTestActive) {
-      ctx.log("info", "Deep core mining equipment detected — ore mining mode (extractor only, field_test mission)");
+  if (deepCoreCap.canMineVisibleDeepCore) {
+    if (deepCoreCap.canMineHidden) {
+      if (fieldTestActive) {
+        ctx.log("info", "Deep core mining equipment detected — ore mining mode (extractor only, field_test mission)");
+      } else {
+        ctx.log("info", "Deep core mining equipment detected — ore mining mode (full capability - can access hidden POIs)");
+      }
     } else {
-      ctx.log("info", "Deep core mining equipment detected — ore mining mode (hidden POIs)");
+      ctx.log("info", "Deep core mining equipment detected — ore mining mode (limited capability - visible POIs only)");
     }
     return "ore";
+  }
+
+  // CRITICAL FIX: If using cached modules and no equipment detected, try fresh get_ship call
+  // This prevents failures when cached modules are incomplete after client restart/timeout
+  if (usingCachedModules && !hasMiningLaser && !hasStripMiner && !hasGasHarvester && !hasIceHarvester && !hasRadioactiveEquipment && !deepCoreCap.canMineHidden) {
+    ctx.log("warn", "Cached modules incomplete — retrying with fresh ship data");
+    const freshResp = await bot.exec("get_ship");
+    if (!freshResp.error && freshResp.result) {
+      const freshShipData = freshResp.result as Record<string, unknown>;
+      const freshModules = Array.isArray(freshShipData.modules) ? freshShipData.modules : [];
+
+      // Reset detection flags
+      hasMiningLaser = false;
+      hasStripMiner = false;
+      hasGasHarvester = false;
+      hasIceHarvester = false;
+      hasLeadLinedCargo = false;
+      hasRadHarvester = false;
+
+      for (const mod of freshModules) {
+        const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+        const modId = (modObj?.id as string) || (modObj?.type_id as string) || "";
+        const modName = (modObj?.name as string) || "";
+        const modType = (modObj?.type as string) || "";
+        const modSpecial = (modObj?.special as string) || "";
+
+        const checkStr = `${modId} ${modName} ${modType} ${modSpecial}`.toLowerCase();
+
+        if (checkStr.includes("mining_laser") || checkStr.includes("mining laser")) {
+          hasMiningLaser = true;
+        }
+        if (checkStr.includes("strip_miner") || checkStr.includes("strip miner")) {
+          hasStripMiner = true;
+        }
+        if (checkStr.includes("gas_harvester") || checkStr.includes("gas harvester")) {
+          hasGasHarvester = true;
+        }
+        if (checkStr.includes("ice_harvester") || checkStr.includes("ice harvester")) {
+          hasIceHarvester = true;
+        }
+        if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo")) {
+          hasLeadLinedCargo = true;
+        }
+        if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester")) {
+          hasRadHarvester = true;
+        }
+      }
+
+      const freshHasRadioactiveEquipment = hasLeadLinedCargo && hasRadHarvester;
+
+      // Re-check deep core with fresh data
+      const freshDeepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
+
+      // Re-evaluate with fresh data
+      if (freshHasRadioactiveEquipment) {
+        ctx.log("info", "Radioactive mining equipment detected (fresh data) — radioactive mining mode");
+        return "radioactive";
+      }
+      if (hasIceHarvester) {
+        ctx.log("info", "Ice harvester detected (fresh data) — ice mining mode");
+        return "ice";
+      }
+      if (hasGasHarvester) {
+        ctx.log("info", "Gas harvester detected (fresh data) — gas harvesting mode");
+        return "gas";
+      }
+      if (hasStripMiner) {
+        ctx.log("info", "Strip miner detected (fresh data) — ore mining mode (limited to common ores: carbon, copper, iron, lead, silicon, aluminum)");
+        ctx.log("warn", "Strip miners can only mine common rarity ores — will only target carbon/copper/iron/lead/silicon/aluminum");
+        return "ore";
+      }
+      if (hasMiningLaser) {
+        ctx.log("info", "Mining laser detected (fresh data) — ore mining mode");
+        return "ore";
+      }
+      if (freshDeepCoreCap.canMineVisibleDeepCore) {
+        if (freshDeepCoreCap.canMineHidden) {
+          if (fieldTestActive) {
+            ctx.log("info", "Deep core mining equipment detected (fresh data) — ore mining mode (extractor only, field_test mission)");
+          } else {
+            ctx.log("info", "Deep core mining equipment detected (fresh data) — ore mining mode (full capability - can access hidden POIs)");
+          }
+        } else {
+          ctx.log("info", "Deep core mining equipment detected (fresh data) — ore mining mode (limited capability - visible POIs only)");
+        }
+        return "ore";
+      }
+    }
   }
 
   ctx.log("error", "No mining equipment detected on ship");
@@ -780,14 +882,16 @@ async function logDeepCoreCapability(ctx: RoutineContext, fieldTestActive: boole
     if (deepCoreCap.hasExtractor) parts.push("deep core extractor");
     ctx.log("mining", `Deep core equipment detected: ${parts.join(" + ")}`);
     if (fieldTestActive) {
-      if (deepCoreCap.canMine) {
+      if (deepCoreCap.canMineHidden) {
         ctx.log("mining", "Deep core mining capability: EXTRACTOR ONLY (field_test mission active - using directional jump method)");
       } else {
         ctx.log("warn", "Deep core mining INCOMPLETE: missing extractor");
       }
     } else {
-      if (deepCoreCap.canMine) {
+      if (deepCoreCap.canMineHidden) {
         ctx.log("mining", "Deep core mining capability: FULL (can mine hidden POIs)");
+      } else if (deepCoreCap.canMineVisibleDeepCore) {
+        ctx.log("mining", "Deep core mining capability: LIMITED (extractor only - visible deep core POIs only)");
       } else {
         if (!deepCoreCap.hasScanner) ctx.log("warn", "Deep core mining INCOMPLETE: missing survey scanner");
         if (!deepCoreCap.hasExtractor) ctx.log("warn", "Deep core mining INCOMPLETE: missing extractor");
@@ -1526,7 +1630,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         // Deep core miner restriction for flock leaders: if this miner has deep core equipment,
         // only accept deep core ore targets. Ignore regular ore targets from settings.
         const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
-        if (deepCoreCap.canMine && flockTargetResource && !isDeepCoreOre(flockTargetResource)) {
+        if (deepCoreCap.canMineVisibleDeepCore && flockTargetResource && !isDeepCoreOre(flockTargetResource)) {
           ctx.log("flock", `Deep core miner — ignoring regular ore target "${flockTargetResource}", will search for deep core ores`);
           flockTargetResource = "";
         }
@@ -1570,19 +1674,27 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // ── Re-evaluate mining type and target from settings each cycle ──
-    let miningType: "ore" | "gas" | "ice" | "radioactive" = "ore";
-    if (settings.miningType === "auto") {
-      const detected = await detectMiningType(ctx, cachedModules || undefined);
-      if (!detected) {
-        ctx.log("error", "Cannot determine mining type — please check ship equipment");
-        await ctx.sleep(30000);
-        continue;
-      }
-      miningType = detected;
-    } else {
-      miningType = settings.miningType;
-    }
+     // ── Re-evaluate mining type and target from settings each cycle ──
+     let miningType: "ore" | "gas" | "ice" | "radioactive" = "ore";
+     if (settings.miningType === "auto") {
+       const detected = await detectMiningType(ctx, cachedModules || undefined);
+       if (!detected) {
+         // CRITICAL FIX: Refresh cached modules and try again
+         ctx.log("warn", "Mining type detection failed — refreshing cached modules and retrying");
+         cachedModules = await cacheShipModules(ctx);
+         const retryDetected = await detectMiningType(ctx, cachedModules || undefined);
+         if (!retryDetected) {
+           ctx.log("error", "Cannot determine mining type even after refreshing modules — please check ship equipment");
+           await ctx.sleep(30000);
+           continue;
+         }
+         miningType = retryDetected;
+       } else {
+         miningType = detected;
+       }
+     } else {
+       miningType = settings.miningType;
+     }
 
     // Deep core capability check - needed for quota selection below
     const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
@@ -1590,17 +1702,18 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Check for strip miner (limited to basic ores only)
     const usingStripMiner = await hasStripMiner(ctx, cachedModules || undefined);
 
-    // Radioactive mining: check if we can access hidden POIs (requires deep core extractor)
-    // Without extractor, can only mine regular ore belts
-    // Use full capability check (all 3 modules) to avoid false positives from detection
-    const hasFullRadioactiveCap = hasFullRadioactiveCapabilityCached(cachedModules || []);
-    const canMineHiddenRadioactive = miningType === "radioactive" && hasFullRadioactiveCap;
-    
+    // Radioactive mining: check capability levels
+    // Basic: can mine basic rad ores in public areas
+    // Enhanced: can mine deep core rad ores in visible POIs
+    // Full: can mine rad ores in hidden POIs
+    const radioactiveCap = getRadioactiveCapabilityCached(cachedModules || []);
+    const canMineBasicRadioactive = miningType === "radioactive" && radioactiveCap.canMineBasicRadioactive;
+    const canMineDeepCoreRadioactive = miningType === "radioactive" && radioactiveCap.canMineDeepCoreRadioactive;
+    const canMineHiddenRadioactive = miningType === "radioactive" && radioactiveCap.canMineHiddenRadioactive;
+
     // Debug: log the capability check for troubleshooting
     if (miningType === "radioactive") {
-      const hasBasicRadioactive = hasRadioactiveEquipmentCached(cachedModules || []);
-      const hasDeepCore = hasDeepCoreExtractorCached(cachedModules || []);
-      ctx.log("debug", `Radioactive capability: basic=${hasBasicRadioactive}, deepCore=${hasDeepCore}, fullCap=${hasFullRadioactiveCap}, hiddenPOI=${canMineHiddenRadioactive}`);
+      ctx.log("debug", `Radioactive capability: basic=${radioactiveCap.canMineBasicRadioactive}, deepCore=${radioactiveCap.canMineDeepCoreRadioactive}, hiddenPOI=${radioactiveCap.canMineHiddenRadioactive}`);
     }
 
     // Ice mining: check if we can access hidden POIs (requires deep core extractor)
@@ -1652,7 +1765,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Select quotas based on mining type ──
     // CRITICAL FIX: Deep core miners should use deepCoreQuotas, not oreQuotas
     // STRIP MINER: Use iron/copper specific quotas (basic ores only)
-    const useDeepCore = deepCoreCap.canMine;
+    const useDeepCore = deepCoreCap.canMineVisibleDeepCore;
     let quotas = useDeepCore 
       ? settings.deepCoreQuotas 
       : (miningType === "ice" ? settings.iceQuotas : (miningType === "ore" ? settings.oreQuotas : (miningType === "radioactive" ? settings.radioactiveQuotas : settings.gasQuotas)));
@@ -1846,10 +1959,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let targetPoiName = recoveredSession ? recoveredSession.targetPoiName : "";
 
     // ── Deep core miner restriction ──
-    // If the miner has full deep core capability, restrict mining to deep core ores only
+    // If the miner has deep core capability, restrict mining to deep core ores only
     // This prevents deep core miners from being assigned to mundane regular ores
     // During field_test mission, only extractor is required
-    if (deepCoreCap.canMine) {
+    if (deepCoreCap.canMineVisibleDeepCore) {
       // If current target is not a deep core ore, search for one
       if (effectiveTarget && !isDeepCoreOre(effectiveTarget)) {
         ctx.log("mining", `Deep core miner detected — restricting to deep core ores only`);
@@ -2000,18 +2113,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // If the target is a deep core ore, verify we have the proper equipment
     if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
       const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
-      if (!deepCoreCap.canMine) {
-        if (fieldTestActive) {
-          ctx.log("error", `Target ${effectiveTarget} is a deep core ore — requires deep core extractor (field_test mission)`);
-        } else {
-          ctx.log("error", `Target ${effectiveTarget} is a deep core ore — requires deep core survey scanner + extractor`);
-        }
-        if (!deepCoreCap.hasScanner && !fieldTestActive) {
-          ctx.log("error", "  Missing: Deep Core Survey Scanner (detection capability)");
-        }
-        if (!deepCoreCap.hasExtractor) {
-          ctx.log("error", "  Missing: Deep Core Extractor (mining capability)");
-        }
+      if (!deepCoreCap.canMineVisibleDeepCore) {
+        ctx.log("error", `Target ${effectiveTarget} is a deep core ore — requires deep core extractor`);
         ctx.log("error", "  Skipping deep core target — selecting alternative target");
         // Clear the target so we fall back to non-deep-core mining
         effectiveTarget = "";
@@ -2021,10 +2124,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           recoveredSession = null;
         }
       } else {
-        if (fieldTestActive) {
-          ctx.log("mining", `Deep core target validated: ${effectiveTarget} (extractor only - field_test mission)`);
+        if (deepCoreCap.canMineHidden) {
+          ctx.log("mining", `Deep core target validated: ${effectiveTarget} (full capability - can access hidden POIs)`);
         } else {
-          ctx.log("mining", `Deep core target validated: ${effectiveTarget} (scanner + extractor equipped)`);
+          ctx.log("mining", `Deep core target validated: ${effectiveTarget} (limited capability - visible POIs only)`);
         }
       }
     }
@@ -2037,13 +2140,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         miningType = flockMiningType;
         ctx.log("flock", `Using flock target: ${flockTargetResource} (${miningType})`);
       }
-      
+
       // Deep core validation for flock target
       if (isDeepCoreOre(flockTargetResource)) {
         const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
-        if (!deepCoreCap.canMine) {
+        if (!deepCoreCap.canMineVisibleDeepCore) {
           ctx.log("error", `Flock target ${flockTargetResource} is a deep core ore — skipping (missing equipment)`);
-          if (!deepCoreCap.hasScanner && !fieldTestActive) ctx.log("error", "  Missing: Deep Core Survey Scanner");
           if (!deepCoreCap.hasExtractor) ctx.log("error", "  Missing: Deep Core Extractor");
           // Don't override effectiveTarget — continue with solo mining instead
         } else {
@@ -2502,7 +2604,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
           ctx.log("mining", "Re-validating deep core equipment after jump failure...");
           const deepCoreCapRecheck = await getDeepCoreCapability(ctx, fieldTestActive);
-          if (!deepCoreCapRecheck.canMine) {
+          if (!deepCoreCapRecheck.canMineVisibleDeepCore) {
             ctx.log("error", "Deep core equipment not detected after jump failure — cannot mine deep core ore");
             ctx.log("error", "  Clearing deep core target to prevent mining wrong ore type");
             effectiveTarget = "";
@@ -2584,7 +2686,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       const match = pois.find(p => p.id === targetPoiId);
       if (match) {
         miningPoi = { id: match.id, name: match.name };
-      } else if (effectiveTarget && isDeepCoreOre(effectiveTarget) && deepCoreCap.canMine) {
+      } else if (effectiveTarget && isDeepCoreOre(effectiveTarget) && deepCoreCap.canMineHidden) {
         // Deep core ore hidden POI not visible in system POI list — use map store
         // (unrelated to radioactive mining - deep core uses separate equipment check)
         const sysData = mapStore.getSystem(bot.system);
@@ -2593,20 +2695,29 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           miningPoi = { id: storedPoi.id, name: storedPoi.name };
           ctx.log("mining", `Using known deep core POI from map: ${storedPoi.name} (${storedPoi.hidden ? "hidden" : "visible"})`);
         }
-      } else if (!canMineHiddenRadioactive) {
-        // Radioactive miner without deep core extractor cannot use hidden POIs
-        // Skip this - radioactive miner doesn't have the required modules
-      }
+        } else if (!deepCoreCap.canMineHidden) {
+          // Miner without full deep core capability cannot use hidden POIs
+          // Skip this - miner doesn't have the required modules
+        }
     }
 
     // Fallback: find POI with target resource (skip depleted unless expired)
     if (!miningPoi && effectiveTarget) {
-      for (const poi of pois) {
-        const isMatchingType =
-          (miningType === "ice" && isIceFieldPoi(poi.type)) ||
-          (miningType === "ore" && (isOreBeltPoi(poi.type) || poi.hidden === true)) ||
-          (miningType === "radioactive" && (poi.hidden === true && !canMineHiddenRadioactive ? false : (isOreBeltPoi(poi.type) || poi.hidden === true))) ||
-          (miningType === "gas" && isGasCloudPoi(poi.type));
+            for (const poi of pois) {
+              const isMatchingType =
+                (miningType === "ice" && isIceFieldPoi(poi.type)) ||
+          (miningType === "ore" && (isOreBeltPoi(poi.type) || (poi.hidden === true && deepCoreCap.canMineHidden))) ||
+          (miningType === "radioactive" && (
+            // Basic: only visible ore belts
+            // Enhanced: visible ore belts + visible POIs
+            // Full: all POIs (visible ore belts, visible POIs, hidden POIs)
+            canMineBasicRadioactive && (
+              isOreBeltPoi(poi.type) ||
+              (!poi.hidden && canMineDeepCoreRadioactive) ||
+              (poi.hidden && canMineHiddenRadioactive)
+            )
+          )) ||
+                (miningType === "gas" && isGasCloudPoi(poi.type));
 
         if (!isMatchingType) continue;
 
@@ -2646,9 +2757,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
 
-    // For radioactive mining with deep core extractor: check map store for known hidden POIs
+    // For mining with deep core capability: check map store for known hidden POIs
     // not yet visible in the system POI list
-    if (!miningPoi && canMineHiddenRadioactive && effectiveTarget) {
+    if (!miningPoi && deepCoreCap.canMineHidden && effectiveTarget) {
       const sysData = mapStore.getSystem(bot.system);
       for (const storedPoi of (sysData?.pois || [])) {
         if (!storedPoi.hidden) continue;
@@ -2665,7 +2776,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // For deep core ore mining: check map store for known deep core POIs
     // not yet visible in the system POI list
-    if (!miningPoi && effectiveTarget && isDeepCoreOre(effectiveTarget) && deepCoreCap.canMine) {
+    if (!miningPoi && effectiveTarget && isDeepCoreOre(effectiveTarget) && deepCoreCap.canMineHidden) {
       const sysData = mapStore.getSystem(bot.system);
       for (const storedPoi of (sysData?.pois || [])) {
         const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
@@ -2768,7 +2879,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
         if (miningType === "ore") return isOreBeltPoi(p.type) || p.hidden === true;
-        if (miningType === "radioactive") return (p.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(p.type) || p.hidden === true);
+              if (miningType === "radioactive") return canMineBasicRadioactive && (
+                isOreBeltPoi(p.type) ||
+                (!p.hidden && canMineDeepCoreRadioactive) ||
+                (p.hidden && canMineHiddenRadioactive)
+              );
         if (miningType === "gas") return isGasCloudPoi(p.type);
         if (miningType === "ice") return isIceFieldPoi(p.type);
         return false;
@@ -2783,7 +2898,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
           if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-          if (miningType === "radioactive") return (poi?.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(poi?.type || "") || poi?.hidden === true);
+                if (miningType === "radioactive") return canMineBasicRadioactive && (
+                  isOreBeltPoi(poi?.type || "") ||
+                  (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                  (poi?.hidden && canMineHiddenRadioactive)
+                );
           if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
           return true;
@@ -2869,7 +2988,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               bot.system = chosen.systemId;
               const newMiningPoi = pois.find(p => {
                 if (miningType === "ore") return isOreBeltPoi(p.type) || p.hidden === true;
-                if (miningType === "radioactive") return (p.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(p.type) || p.hidden === true);
+        if (miningType === "radioactive") return canMineBasicRadioactive && (
+          isOreBeltPoi(p.type) ||
+          (!p.hidden && canMineDeepCoreRadioactive) ||
+          (p.hidden && canMineHiddenRadioactive)
+        );
                 if (miningType === "gas") return isGasCloudPoi(p.type);
                 if (miningType === "ice") return isIceFieldPoi(p.type);
                 return false;
@@ -3349,9 +3472,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
         // DEEP CORE GUARD: Verify we're still mining a deep core ore if we have deep core equipment
         const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
-        if (deepCoreCap.canMine && isDeepCoreOre(effectiveTarget)) {
+        if (deepCoreCap.canMineVisibleDeepCore && isDeepCoreOre(effectiveTarget)) {
           ctx.log("mining", `Deep core guard check: confirming still on deep core task (${effectiveTarget})`);
-        } else if (deepCoreCap.canMine && !isDeepCoreOre(effectiveTarget)) {
+        } else if (deepCoreCap.canMineVisibleDeepCore && !isDeepCoreOre(effectiveTarget)) {
           ctx.log("warn", `Deep core miner is NOT on a deep core target! Current target: ${effectiveTarget} — this should not happen, will re-select target`);
           // Force re-selection of target on next cycle
           targetResource = "";
@@ -3389,7 +3512,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             const sys = mapStore.getSystem(loc.systemId);
             const poi = sys?.pois.find(p => p.id === loc.poiId);
             if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-            if (miningType === "radioactive") return (poi?.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(poi?.type || "") || poi?.hidden === true);
+              if (miningType === "radioactive") return canMineBasicRadioactive && (
+                isOreBeltPoi(poi?.type || "") ||
+                (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                (poi?.hidden && canMineHiddenRadioactive)
+              );
             if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
             return true;
@@ -3586,7 +3713,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                       const sys = mapStore.getSystem(loc.systemId);
                       const poi = sys?.pois.find(p => p.id === loc.poiId);
                       if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-                      if (miningType === "radioactive") return (poi?.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(poi?.type || "") || poi?.hidden === true);
+              if (miningType === "radioactive") return canMineBasicRadioactive && (
+                isOreBeltPoi(poi?.type || "") ||
+                (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                (poi?.hidden && canMineHiddenRadioactive)
+              );
                       if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                       if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                       return true;
@@ -3858,7 +3989,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           // 3. If all hidden POIs depleted, switch to NEXT deep core ore in quota
           // 4. Only mine low richness POIs when all hidden POIs are on timer
           const currentDeepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
-          const isDeepCoreMiner = currentDeepCoreCap.canMine;
+          const isDeepCoreMiner = currentDeepCoreCap.canMineVisibleDeepCore;
           let searchTarget = targetResource;
 
           if (isDeepCoreMiner && effectiveTarget && isDeepCoreOre(effectiveTarget)) {
@@ -4135,7 +4266,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-              if (miningType === "radioactive") return (poi?.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(poi?.type || "") || poi?.hidden === true);
+                      if (miningType === "radioactive") return canMineBasicRadioactive && (
+                        isOreBeltPoi(poi?.type || "") ||
+                        (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                        (poi?.hidden && canMineHiddenRadioactive)
+                      );
               if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
               return true;
@@ -4190,7 +4325,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 const sys = mapStore.getSystem(loc.systemId);
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
                 if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-                if (miningType === "radioactive") return (poi?.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(poi?.type || "") || poi?.hidden === true);
+            if (miningType === "radioactive") return canMineBasicRadioactive && (
+              isOreBeltPoi(poi?.type || "") ||
+              (!poi?.hidden && canMineDeepCoreRadioactive) ||
+              (poi?.hidden && canMineHiddenRadioactive)
+            );
                 if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                 if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                 return true;
@@ -4249,7 +4388,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             // First try current system
             const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                            miningType === "ore" ? pois.filter(p => isOreBeltPoi(p.type) || p.hidden === true) :
-miningType === "radioactive" ? pois.filter(p => (p.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(p.type) || p.hidden === true)) :
+miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
+  isOreBeltPoi(p.type) ||
+  (!p.hidden && canMineDeepCoreRadioactive) ||
+  (p.hidden && canMineHiddenRadioactive)
+)) :
                             pois.filter(p => isGasCloudPoi(p.type));
 
             for (const poi of allPois) {
@@ -4294,7 +4437,11 @@ miningType === "radioactive" ? pois.filter(p => (p.hidden === true && !canMineHi
 
                   // Verify POI type matches
                   if (miningType === "ore" && !isOreBeltPoi(poi.type) && !poi.hidden) continue;
-                  if (miningType === "radioactive" && (poi.hidden === true && !canMineHiddenRadioactive ? true : (!isOreBeltPoi(poi.type) && !poi.hidden))) continue;
+                  if (miningType === "radioactive" && !(canMineBasicRadioactive && (
+                    isOreBeltPoi(poi.type) ||
+                    (!poi.hidden && canMineDeepCoreRadioactive) ||
+                    (poi.hidden && canMineHiddenRadioactive)
+                  ))) continue;
                   if (miningType === "gas" && !isGasCloudPoi(poi.type)) continue;
                   if (miningType === "ice" && !isIceFieldPoi(poi.type)) continue;
 
@@ -4466,7 +4613,11 @@ miningType === "radioactive" ? pois.filter(p => (p.hidden === true && !canMineHi
             // Search for correct POI type in current system
             const altPoi = pois.find(p => {
               if (miningType === "ore") return isOreBeltPoi(p.type);
-              if (miningType === "radioactive") return (p.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(p.type) || p.hidden === true);
+                if (miningType === "radioactive") return canMineBasicRadioactive && (
+                  isOreBeltPoi(p.type) ||
+                  (!p.hidden && canMineDeepCoreRadioactive) ||
+                  (p.hidden && canMineHiddenRadioactive)
+                );
               if (miningType === "gas") return isGasCloudPoi(p.type);
               if (miningType === "ice") return isIceFieldPoi(p.type);
               return false;

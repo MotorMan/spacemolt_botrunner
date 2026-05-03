@@ -280,10 +280,7 @@ export async function ensureAmmoLoaded(
     ctx.log("combat", `Found ${ammoItem.quantity}x ${ammoItem.itemId} (${weapon.ammoType}) — reloading "${weapon.name}"...`);
 
     for (let i = 0; i < maxAttempts; i++) {
-      const resp = await bot.exec("reload", {
-        weapon_instance_id: weapon.instanceId,
-        ammo_item_id: ammoItem.itemId,
-      });
+      const resp = await bot.exec("reload", { weapon_instance_id: weapon.instanceId, ammo_item_id: ammoItem.itemId, });
 
       if (resp.error) {
         const msg = resp.error.message.toLowerCase();
@@ -390,10 +387,10 @@ export async function emergencyFleeSpam(ctx: RoutineContext, reason: string): Pr
   // If still in battle, try retreat commands
   status = await getBattleStatus(ctx);
   if (status) {
-    ctx.log("combat", `⚠️ Still in battle after flee wait - trying retreat commands...`);
+    ctx.log("combat", `⚠️ Still in battle after flee wait - trying retreat commands...`); //human note, retreat is not the FLEE command it only moves you from engaged/inner/mid to a maximum of outer. it will NOT leave the battle!
     for (let i = 0; i < 3; i++) {
       ctx.log("combat", `Attempting retreat (${i + 1}/3)...`);
-      const retreatResp = await bot.exec("battle", { action: "retreat" });
+      const retreatResp = await bot.exec("battle", { action: "retreat" }); //human side note, you may need to be in the outer zone to enable flee though.
       
       if (retreatResp.error) {
         const errMsg = retreatResp.error.message.toLowerCase();
@@ -548,7 +545,7 @@ export async function engageTarget(
   // If sideId is provided (e.g., from fleet commander), directly join that side
   if (sideId !== undefined) {
     ctx.log("combat", `🎯 Direct engage on side ${sideId} (sideId provided)`);
-    const engageResp = await bot.exec("battle", { action: "engage", side_id: sideId.toString() });
+    const engageResp = await bot.exec("battle", { action: "engage", side_id: sideId.toString() }); //human we will need to test this as i wasn't able to get this to workj with the terminal client, but it MAY work here.
     if (engageResp.error) {
       ctx.log("error", `Failed to join battle side ${sideId}: ${engageResp.error.message}`);
       return false;

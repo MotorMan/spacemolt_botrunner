@@ -137,6 +137,9 @@ export class Bot {
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
+  /** Cached ship speed from last get_status (1-6, where 1 is slowest, 6 is fastest). */
+  shipSpeed = 1;
+
   /** Cached installed mod IDs from last refreshShipMods(). */
   installedMods: string[] = [];
 
@@ -329,6 +332,40 @@ export class Bot {
     }
   }
 
+  /**
+   * Calculate the appropriate timeout for a jump command based on ship speed.
+   * Uses configurable jump times from settings (with defaults if not set).
+   * If towing a wreck, speed is reduced by 50% (timeout increased accordingly).
+   * Adds configurable buffer (default 10s = 1 game tick) to the base jump time.
+   */
+  private calculateJumpTimeout(): number {
+    // Get jump times from settings or use defaults
+    const settings = (this as any).settings || {};
+    const generalSettings = settings.general || {};
+    
+    const jumpTimes: Record<number, number> = {
+      1: generalSettings.jumpSpeed1 || 120,
+      2: generalSettings.jumpSpeed2 || 110,
+      3: generalSettings.jumpSpeed3 || 100,
+      4: generalSettings.jumpSpeed4 || 80,
+      5: generalSettings.jumpSpeed5 || 50,
+      6: generalSettings.jumpSpeed6 || 30,
+    };
+    
+    const buffer = generalSettings.jumpBuffer || 10;
+    let baseTime = jumpTimes[this.shipSpeed] || 120;
+
+    // Apply 50% speed penalty if towing a wreck
+    if (this.towingWreck) {
+      baseTime = Math.round(baseTime * 1.5);
+    }
+
+    // Add buffer (1 game tick = 10s by default)
+    const timeoutWithBuffer = baseTime + buffer;
+
+    return timeoutWithBuffer * 1000; // Convert to milliseconds
+  }
+
   log(category: string, message: string): void {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
     const line = `${timestamp} [${category}] ${message}`;
@@ -399,15 +436,20 @@ export class Bot {
       const key = command + (payload ? JSON.stringify(payload) : "");
       this.pendingCommands.set(key, controller);
 
-      let resp: ApiResponse;
-      try {
-        // Timeout watchers disabled for jump/travel - relying on proper server-side interruption and system messages
-        // But keep a short timeout for quick 1-tick commands like mine/jettison to detect combat hangs
-        if (command === "mine" || command === "jettison") {
-          resp = await this.execWithTimeout(command, payload, 15_000, "", controller.signal);
-        } else {
-          resp = await this.api.execute(command, payload, controller.signal);
-        }
+       let resp: ApiResponse;
+       try {
+         // Use timeout for jump commands to prevent indefinite hangs
+         // Timeout is calculated based on ship speed (with tow penalty if applicable)
+         if (command === "jump") {
+           const timeoutMs = this.calculateJumpTimeout();
+           const targetSystem = (payload as Record<string, unknown>)?.target_system as string | undefined;
+           this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+           resp = await this.execWithTimeout(command, payload, timeoutMs, targetSystem || "", controller.signal);
+         } else if (command === "mine" || command === "jettison") {
+           resp = await this.execWithTimeout(command, payload, 15_000, "", controller.signal);
+         } else {
+           resp = await this.api.execute(command, payload, controller.signal);
+         }
 
         // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
         // This prevents 502 errors from breaking routines mid-operation
@@ -681,7 +723,7 @@ export class Bot {
         this.faction = (p.faction_id as string) ?? (p.faction as string) ?? null;
       }
 
-      // Ship fields
+       // Ship fields
       const ship = r.ship as Record<string, unknown> | undefined;
       debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
       if (ship) {
@@ -696,6 +738,8 @@ export class Bot {
         this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
         this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
         this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
+        // Cache ship speed (1-6, where 1=slowest at 120s/jump, 6=fastest at 30s/jump)
+        this.shipSpeed = (ship.speed as number) || 1;
         
         // Ammo is stored per-weapon-module, not at ship level.
         // get_status may return modules as full objects or just IDs.

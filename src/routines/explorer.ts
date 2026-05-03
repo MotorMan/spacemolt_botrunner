@@ -422,6 +422,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   const visitedSystems = new Set<string>();
+  const visitedSystemTimes = new Map<string, number>(); // Track when each system was last visited (timestamp)
   const fledFromSystems = new Set<string>(); // Track systems we've fled from due to pirates
   const path: string[] = []; // Track the path of systems visited to enable reverse fleeing
   let lastSystem: string | null = null;
@@ -606,6 +607,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
     visitedSystems.add(systemId);
+    visitedSystemTimes.set(systemId, Date.now());
     if (path.length === 0) {
       path.push(systemId); // Initialize path with starting system
     }
@@ -1075,7 +1077,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     const validConns = connections.filter(c => c.id);
-    const nextSystem = pickNextSystem(validConns, visitedSystems, lastSystem, fledFromSystems);
+    const nextSystem = pickNextSystem(validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems);
     if (!nextSystem) {
       ctx.log("info", "All connected systems explored! Picking a random connection...");
       if (validConns.length > 0) {
@@ -1087,7 +1089,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
         // Smart selection: avoid dead-ends and pirate systems
-        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, fledFromSystems);
+        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems);
         await ensureUndocked(ctx);
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
         const jumpResp = await bot.exec("jump", { target_system: random.id });
@@ -2617,12 +2619,8 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   // Try to withdraw premium_fuel_cell first (higher priority, takes 2 space each)
   const premiumToWithdraw = Math.min(maxPremiumWithdraw, 402); // Cap at reasonable amount
   ctx.log("trade", `Loading ${premiumToWithdraw} premium fuel cells from faction storage for long-range exploration...`);
-  let withdrawResp = await bot.exec("withdraw_items", {
-    item_id: "premium_fuel_cell",
-    quantity: premiumToWithdraw,
-    source: "faction",
-    target: "cargo"
-  });
+  //let withdrawResp = await bot.exec("withdraw_items", { item_id: "premium_fuel_cell", quantity: premiumToWithdraw, source: "faction", target: "cargo" });
+  let withdrawResp = await bot.exec("storage", { action: 'withdraw', item_id: "premium_fuel_cell", quantity: premiumToWithdraw, target: "faction"}); //fixed by human! this should be working!
 
   // Check for battle after faction_withdraw_items
   if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
@@ -2642,10 +2640,8 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
   // If premium withdraw failed, try regular fuel_cell
   ctx.log("warn", `Could not withdraw premium fuel cells: ${withdrawResp.error.message} — trying regular fuel cells...`);
-  withdrawResp = await bot.exec("faction_withdraw_items", {
-    item_id: "fuel_cell",
-    quantity: maxRegularWithdraw
-  });
+  //withdrawResp = await bot.exec("faction_withdraw_items", { item_id: "fuel_cell", quantity: maxRegularWithdraw });
+  withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: maxRegularWithdraw }); //fixed by human!
 
   // Check for battle after faction_withdraw_items
   if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
@@ -2663,10 +2659,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
   // If faction withdraw failed, try to buy premium fuel cells from station market as fallback
   ctx.log("warn", `Could not withdraw regular fuel cells: ${withdrawResp.error.message} — trying to buy premium fuel cells from market...`);
-  const buyResp = await bot.exec("buy", {
-    item_id: "premium_fuel_cell",
-    quantity: premiumToWithdraw
-  });
+  const buyResp = await bot.exec("buy", { item_id: "premium_fuel_cell", quantity: premiumToWithdraw });
 
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
@@ -2684,10 +2677,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
   // If premium buy failed, try regular fuel_cell
   ctx.log("warn", `Could not buy premium fuel cells: ${buyResp.error.message} — trying regular fuel cells...`);
-  const buyRegularResp = await bot.exec("buy", {
-    item_id: "fuel_cell",
-    quantity: maxRegularWithdraw
-  });
+  const buyRegularResp = await bot.exec("buy", { item_id: "fuel_cell", quantity: maxRegularWithdraw });
 
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
@@ -2719,10 +2709,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
     if (!withdrawCreditsResp.error) {
       await bot.refreshStatus();
       ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying premium fuel cell purchase...`);
-      const retryResp = await bot.exec("buy", {
-        item_id: "premium_fuel_cell",
-        quantity: premiumToWithdraw
-      });
+      const retryResp = await bot.exec("buy", { item_id: "premium_fuel_cell", quantity: premiumToWithdraw });
 
       // Check for battle after retry buy
       if (await checkBattleAfterCommand(ctx, retryResp.notifications, "buy")) {
@@ -2740,10 +2727,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
       // If premium retry failed, try regular
       ctx.log("warn", `Could not buy premium fuel cells: ${retryResp.error.message} — trying regular...`);
-      const retryRegularResp = await bot.exec("buy", {
-        item_id: "fuel_cell",
-        quantity: maxRegularWithdraw
-      });
+      const retryRegularResp = await bot.exec("buy", { item_id: "fuel_cell", quantity: maxRegularWithdraw });
 
       // Check for battle after retry buy
       if (await checkBattleAfterCommand(ctx, retryRegularResp.notifications, "buy")) {
@@ -3037,8 +3021,10 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  * 3. Among unvisited, prefer systems with fewer POIs (less explored)
  * Always avoids pirate systems, blacklisted systems, and systems we've fled from.
  */
-function pickNextSystem(connections: Connection[], visited: Set<string>, lastSystem: string | null, fledFromSystems: Set<string>): Connection | null {
+function pickNextSystem(connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>): Connection | null {
   const blacklist = getSystemBlacklist();
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const now = Date.now();
 
   // Filter out blacklisted systems, systems we've fled from, and temporarily blacklisted systems
   const nonBlacklistedConns = connections.filter(c =>
@@ -3066,7 +3052,16 @@ function pickNextSystem(connections: Connection[], visited: Set<string>, lastSys
   }
 
   // Priority 2: Systems in map.json but not visited this session
-  const unvisited = candidates.filter(c => !visited.has(c.id));
+  // Apply penalty to systems visited in the last hour to avoid loops
+  const unvisited = candidates.filter(c => {
+    if (visited.has(c.id)) {
+      const lastVisit = visitedTimes.get(c.id);
+      if (lastVisit && (now - lastVisit) < ONE_HOUR_MS) {
+        return false; // Skip systems visited in the last hour
+      }
+    }
+    return true;
+  });
   if (unvisited.length > 0) {
     // Sort by POI count (prefer less explored systems)
     unvisited.sort((a, b) => {
@@ -3077,7 +3072,7 @@ function pickNextSystem(connections: Connection[], visited: Set<string>, lastSys
     return unvisited[0];
   }
 
-  // All connected systems have been visited this session
+  // All connected systems have been visited this session or recently
   // If no valid candidates, fall back to any non-blacklisted connection
   if (candidates.length === 0 && nonBlacklistedConns.length > 0) {
     return nonBlacklistedConns[0];
@@ -3097,8 +3092,10 @@ function pickNextSystem(connections: Connection[], visited: Set<string>, lastSys
  * 5. Systems with more connections (not a dead-end)
  * 6. Unexplored systems (not in map.json) over explored ones
  */
-function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, fledFromSystems: Set<string>): Connection {
+function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>): Connection {
   const blacklist = getSystemBlacklist();
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const now = Date.now();
   
   // First, filter out the system we came from (if possible)
   let candidates = lastSystem ? connections.filter(c => c.id !== lastSystem) : connections;
@@ -3126,6 +3123,8 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     const connectionCount = sys?.connections?.length ?? 1;
     const isInMap = conn.id ? mapStore.getSystem(conn.id) != null : false;
     const isExploredThisSession = conn.id ? visited.has(conn.id) : false;
+    const lastVisit = conn.id ? visitedTimes.get(conn.id) : null;
+    const visitedRecently = lastVisit && (now - lastVisit) < ONE_HOUR_MS;
 
     // Higher score = better
     let score = 0;
@@ -3141,6 +3140,11 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     // Small penalty for already explored this session
     if (isExploredThisSession) {
       score -= 50;
+    }
+
+    // Significant penalty for systems visited in the last hour (avoid loops)
+    if (visitedRecently) {
+      score -= 500;
     }
 
     return { conn, score };

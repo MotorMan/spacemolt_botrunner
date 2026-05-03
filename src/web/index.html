@@ -6826,22 +6826,99 @@ function renderGeneralSettings(panel) {
       <input type="number" id="set-general-maxTier0Ships" min="1" max="20" value="${maxTier0Ships}" style="width:80px" />
     </div>
 
-    <div class="setting-row">
-      <div>
-        <div class="setting-label">Combat: Hull Flee Threshold %</div>
-        <div class="setting-hint">If hull drops below this percentage during battle, initiate flee. Set to 0 to never flee based on hull damage.</div>
-      </div>
-      <div style="display:flex;align-items:center;gap:8px">
-        <input type="range" id="set-general-hullFleeThreshold" min="0" max="50" step="5" value="${hullFleeThreshold}"
-          oninput="document.getElementById('hullFleeLabel').textContent = this.value + '%'" style="width:120px" />
-        <span id="hullFleeLabel" style="min-width:36px;text-align:right;font-variant-numeric:tabular-nums">${hullFleeThreshold}%</span>
-      </div>
-    </div>
+     <div class="setting-row">
+       <div>
+         <div class="setting-label">Combat: Hull Flee Threshold %</div>
+         <div class="setting-hint">If hull drops below this percentage during battle, initiate flee. Set to 0 to never flee based on hull damage.</div>
+       </div>
+       <div style="display:flex;align-items:center;gap:8px">
+         <input type="range" id="set-general-hullFleeThreshold" min="0" max="50" step="5" value="${hullFleeThreshold}"
+           oninput="document.getElementById('hullFleeLabel').textContent = this.value + '%'" style="width:120px" />
+         <span id="hullFleeLabel" style="min-width:36px;text-align:right;font-variant-numeric:tabular-nums">${hullFleeThreshold}%</span>
+       </div>
+     </div>
 
-    <div class="settings-save-bar">
-      <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
-    </div>
-  `;
+     <div class="setting-row">
+       <div>
+         <div class="setting-label">Jump Timeout: Speed 1 (Slowest)</div>
+         <div class="setting-hint">Base jump time for speed 1 ships (120s default). +10s buffer added automatically. Towing adds 50% penalty.</div>
+       </div>
+       <div style="display:flex;align-items:center;gap:8px">
+         <input type="number" id="set-general-jumpSpeed1" min="30" max="300" step="10" value="${general.jumpSpeed1 ?? 120}" style="width:80px" />
+         <span style="color:var(--text-secondary);font-size:12px">s base</span>
+       </div>
+     </div>
+
+     <div class="setting-row">
+       <div>
+         <div class="setting-label">Jump Timeout: Speed 2</div>
+         <div class="setting-hint">Base jump time for speed 2 ships (110s default).</div>
+       </div>
+       <div style="display:flex;align-items:center;gap:8px">
+         <input type="number" id="set-general-jumpSpeed2" min="30" max="300" step="10" value="${general.jumpSpeed2 ?? 110}" style="width:80px" />
+         <span style="color:var(--text-secondary);font-size:12px">s base</span>
+       </div>
+     </div>
+
+     <div class="setting-row">
+       <div>
+         <div class="setting-label">Jump Timeout: Speed 3</div>
+         <div class="setting-hint">Base jump time for speed 3 ships (100s default).</div>
+       </div>
+       <div style="display:flex;align-items:center;gap:8px">
+         <input type="number" id="set-general-jumpSpeed3" min="30" max="300" step="10" value="${general.jumpSpeed3 ?? 100}" style="width:80px" />
+         <span style="color:var(--text-secondary);font-size:12px">s base</span>
+       </div>
+     </div>
+
+     <div class="setting-row">
+       <div>
+         <div class="setting-label">Jump Timeout: Speed 4</div>
+         <div class="setting-hint">Base jump time for speed 4 ships (80s default).</div>
+       </div>
+       <div style="display:flex;align-items:center;gap:8px">
+         <input type="number" id="set-general-jumpSpeed4" min="30" max="300" step="10" value="${general.jumpSpeed4 ?? 80}" style="width:80px" />
+         <span style="color:var(--text-secondary);font-size:12px">s base</span>
+       </div>
+     </div>
+
+     <div class="setting-row">
+       <div>
+         <div class="setting-label">Jump Timeout: Speed 5</div>
+         <div class="setting-hint">Base jump time for speed 5 ships (50s default).</div>
+       </div>
+       <div style="display:flex;align-items:center;gap:8px">
+         <input type="number" id="set-general-jumpSpeed5" min="30" max="300" step="10" value="${general.jumpSpeed5 ?? 50}" style="width:80px" />
+         <span style="color:var(--text-secondary);font-size:12px">s base</span>
+       </div>
+     </div>
+
+     <div class="setting-row">
+       <div>
+         <div class="setting-label">Jump Timeout: Speed 6 (Fastest)</div>
+         <div class="setting-hint">Base jump time for speed 6 ships (30s default).</div>
+       </div>
+       <div style="display:flex;align-items:center;gap:8px">
+         <input type="number" id="set-general-jumpSpeed6" min="30" max="300" step="10" value="${general.jumpSpeed6 ?? 30}" style="width:80px" />
+         <span style="color:var(--text-secondary);font-size:12px">s base</span>
+       </div>
+     </div>
+
+     <div class="setting-row">
+       <div>
+         <div class="setting-label">Jump Timeout Buffer</div>
+         <div class="setting-hint">Additional buffer time added to all jump timeouts (10s = 1 game tick default).</div>
+       </div>
+       <div style="display:flex;align-items:center;gap:8px">
+         <input type="number" id="set-general-jumpBuffer" min="0" max="60" step="5" value="${general.jumpBuffer ?? 10}" style="width:80px" />
+         <span style="color:var(--text-secondary);font-size:12px">s buffer</span>
+       </div>
+     </div>
+
+     <div class="settings-save-bar">
+       <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
+     </div>
+   `;
 }
 
 function saveGeneralSettings() {
@@ -6856,6 +6933,13 @@ function saveGeneralSettings() {
     fightTier1Ships: document.getElementById('set-general-fightTier1').checked,
     maxTier0Ships: parseInt(document.getElementById('set-general-maxTier0Ships').value) || 8,
     hullFleeThreshold: parseInt(document.getElementById('set-general-hullFleeThreshold').value) || 20,
+    jumpSpeed1: parseInt(document.getElementById('set-general-jumpSpeed1').value) || 120,
+    jumpSpeed2: parseInt(document.getElementById('set-general-jumpSpeed2').value) || 110,
+    jumpSpeed3: parseInt(document.getElementById('set-general-jumpSpeed3').value) || 100,
+    jumpSpeed4: parseInt(document.getElementById('set-general-jumpSpeed4').value) || 80,
+    jumpSpeed5: parseInt(document.getElementById('set-general-jumpSpeed5').value) || 50,
+    jumpSpeed6: parseInt(document.getElementById('set-general-jumpSpeed6').value) || 30,
+    jumpBuffer: parseInt(document.getElementById('set-general-jumpBuffer').value) || 10,
   };
   send({ type: 'saveSettings', routine: 'general', settings: s });
 }

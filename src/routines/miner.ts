@@ -2150,12 +2150,55 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       });
 
       if (locations.length === 0) {
-        ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in map — mining locally in ${bot.system}`);
-        targetSystemId = bot.system;
+        ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in map — searching for alternative target`);
         // Clear session if target not found
         if (recoveredSession) {
           await failMiningSession(bot.username, "Target resource not found in map");
           recoveredSession = null;
+        }
+        // If this was a global target, fall back to quota target
+        if (hasGlobalTarget) {
+          ctx.log("mining", `Global target "${effectiveTarget}" not available — falling back to quota target`);
+          effectiveTarget = quotaTargetResource;
+          // Re-check locations with new target
+          if (effectiveTarget) {
+            const newLocations = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+              const sys = mapStore.getSystem(loc.systemId);
+              const poi = sys?.pois.find(p => p.id === loc.poiId);
+              if (!poi) return true;
+              if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+              if (miningType === "radioactive") {
+                if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+                return isOreBeltPoi(poi.type) || poi.hidden === true;
+              }
+              if (miningType === "gas") return isGasCloudPoi(poi.type);
+              if (miningType === "ice") {
+                if (poi.hidden === true && !canMineHiddenIce) return false;
+                return isIceFieldPoi(poi.type);
+              }
+              return true;
+            }).filter(loc => {
+              if (settings.ignoreDepletion) {
+                if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+                  return false;
+                }
+                return true;
+              }
+              const sys = mapStore.getSystem(loc.systemId);
+              const poi = sys?.pois.find(p => p.id === loc.poiId);
+              const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+              if (!oreEntry?.depleted) return true;
+              return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+            });
+            if (newLocations.length > 0) {
+              locations.push(...newLocations);
+              ctx.log("mining", `Found ${newLocations.length} locations for quota target "${effectiveTarget}"`);
+            }
+          }
+        }
+        // If still no locations, target locally
+        if (locations.length === 0) {
+          targetSystemId = bot.system;
         }
       } else {
         // Use new scoring system that factors in remaining resources, depletion, and distance
@@ -2587,29 +2630,20 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // Fallback: any matching POI type
+    // No fallback to any POI type - if target resource not found, search for alternatives
+    // This prevents miners from traveling to POIs that don't have the right resources
     if (!miningPoi) {
-      // CRITICAL FIX: For deep core miners, don't fall back to mining regular ores
-      // if the deep core target isn't available in the current system.
+      // For deep core miners, wait for next cycle to retry target
       if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
         ctx.log("mining", `Deep core miner: ${effectiveTarget} not found in current system — waiting for next cycle to retry target`);
         await ctx.sleep(30000);
         continue;
       }
       
-      if (miningType === "ice") {
-        const iceField = pois.find(p => isIceFieldPoi(p.type));
-        if (iceField) miningPoi = { id: iceField.id, name: iceField.name };
-      } else if (miningType === "ore") {
-        const oreBelt = pois.find(p => isOreBeltPoi(p.type) || p.hidden === true);
-        if (oreBelt) miningPoi = { id: oreBelt.id, name: oreBelt.name };
-      } else if (miningType === "radioactive") {
-        const oreBelt = pois.find(p => (p.hidden === true && !canMineHiddenRadioactive) ? false : (isOreBeltPoi(p.type) || p.hidden === true));
-        if (oreBelt) miningPoi = { id: oreBelt.id, name: oreBelt.name };
-      } else if (miningType === "gas") {
-        const gasCloud = pois.find(p => isGasCloudPoi(p.type));
-        if (gasCloud) miningPoi = { id: gasCloud.id, name: gasCloud.name };
-      }
+      // For other miners, log and wait - will search for new target in next cycle
+      ctx.log("mining", `No ${resourceLabel} POI with target resource '${effectiveTarget}' found in current system — searching for alternatives`);
+      await ctx.sleep(10000);
+      continue;
     }
 
     // For radioactive mining with deep core extractor: check map store for known hidden POIs
@@ -2840,12 +2874,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                 if (miningType === "ice") return isIceFieldPoi(p.type);
                 return false;
               });
-              if (newMiningPoi) {
-                miningPoi = { id: newMiningPoi.id, name: newMiningPoi.name };
-                ctx.log("mining", `Will travel to ${newMiningPoi.name}`);
-              } else {
-                ctx.log("error", `No suitable ${resourceLabel} POI found in ${chosen.systemName} — returning home to retry next cycle`);
-                await ensureUndocked(ctx);
+               if (newMiningPoi) {
+                 miningPoi = { id: newMiningPoi.id, name: newMiningPoi.name };
+                 ctx.log("mining", `Will travel to ${newMiningPoi.name}`);
+               } else {
+                 ctx.log("error", `No suitable ${resourceLabel} POI found in ${chosen.systemName} — clearing target and returning home to retry next cycle`);
+                 effectiveTarget = "";
+                 targetResource = "";
+                 await ensureUndocked(ctx);
                 const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
                 if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
                 await ensureDocked(ctx);
@@ -2861,18 +2897,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               await dumpCargo(ctx, settings);
               continue;
             }
-          } else {
-            ctx.log("error", `No alternative ${resourceLabel} within ${maxJumps} jumps — returning home to retry next cycle`);
-            await ensureUndocked(ctx);
+           } else {
+             ctx.log("error", `No alternative ${resourceLabel} within ${maxJumps} jumps — clearing target and returning home to retry next cycle`);
+             effectiveTarget = "";
+             targetResource = "";
+             await ensureUndocked(ctx);
             const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
             if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
             await ensureDocked(ctx);
             await dumpCargo(ctx, settings);
             continue;
           }
-        } else {
-          ctx.log("error", `No alternative ${resourceLabel} found anywhere — returning home to retry next cycle`);
-          await ensureUndocked(ctx);
+         } else {
+           ctx.log("error", `No alternative ${resourceLabel} found anywhere — clearing target and returning home to retry next cycle`);
+           effectiveTarget = "";
+           targetResource = "";
+           await ensureUndocked(ctx);
           const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
           if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
           await ensureDocked(ctx);
@@ -4463,10 +4503,12 @@ miningType === "radioactive" ? pois.filter(p => (p.hidden === true && !canMineHi
               }
             }
             
-            // No alternative found - return to station
-            ctx.log("error", `No correct POI type found — returning to station`);
-            stopReason = "POI type mismatch (no alternatives)";
-            break;
+             // No alternative found - clear target and return to station to pick a new one
+             ctx.log("error", `No correct POI type found — clearing target and returning to station`);
+             effectiveTarget = "";
+             targetResource = "";
+             stopReason = "POI type mismatch (no alternatives)";
+             break;
           }
           
           // GENUINE EQUIPMENT ERROR: No resources at all or truly missing equipment

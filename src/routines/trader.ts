@@ -91,7 +91,8 @@ async function canAffordRoute(
   let storedCredits = 0;
 
   // Check personal station storage
-  const storageResp = await bot.exec("view_storage");
+  //const storageResp = await bot.exec("view_storage");
+  const storageResp = await bot.exec("storage", { action: 'view'}); //fixed by human.
   if (storageResp.result && typeof storageResp.result === "object") {
     const sr = storageResp.result as Record<string, unknown>;
     storedCredits = (sr.credits as number) || (sr.stored_credits as number) || 0;
@@ -100,7 +101,8 @@ async function canAffordRoute(
   // Also check faction storage if bot is in a faction
   let factionStoredCredits = 0;
   if (bot.faction && bot.docked) {
-    const factionStorageResp = await bot.exec("view_storage", { target: "faction" });
+    //const factionStorageResp = await bot.exec("view_storage", { target: "faction" });
+    const factionStorageResp = await bot.exec("storage", { action: 'view', target: "faction" }); //fixed by human!
     if (factionStorageResp.result && typeof factionStorageResp.result === "object") {
       const fsr = factionStorageResp.result as Record<string, unknown>;
       factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
@@ -151,7 +153,8 @@ async function withdrawCreditsForTrade(
 
   // Try personal station storage first
   let storedCredits = 0;
-  const storageResp = await bot.exec("view_storage");
+  //const storageResp = await bot.exec("view_storage");
+  const storageResp = await bot.exec("storage", { action: 'view'}); //fixed by human.
   if (storageResp.result && typeof storageResp.result === "object") {
     const sr = storageResp.result as Record<string, unknown>;
     storedCredits = (sr.credits as number) || (sr.stored_credits as number) || 0;
@@ -160,7 +163,8 @@ async function withdrawCreditsForTrade(
   if (storedCredits > 0) {
     const withdrawAmount = Math.min(needed, storedCredits);
     if (withdrawAmount > 0) {
-      const wResp = await bot.exec("withdraw_credits", { amount: withdrawAmount });
+      //const wResp = await bot.exec("withdraw_credits", { amount: withdrawAmount });
+      const wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: withdrawAmount }); //fixed by human!
       if (!wResp.error) {
         await bot.refreshStatus();
         ctx.log("trade", `Withdrew ${withdrawAmount}cr from station storage for trade (now ${bot.credits}cr)`);
@@ -172,7 +176,8 @@ async function withdrawCreditsForTrade(
   // Try faction storage if bot is in a faction
   if (bot.faction && bot.docked) {
     let factionStoredCredits = 0;
-    const factionStorageResp = await bot.exec("view_storage", { target: "faction" });
+    //const factionStorageResp = await bot.exec("view_storage", { target: "faction" });
+    const factionStorageResp = await bot.exec("storage", { action: 'view', target: "faction" }); //fixed by human!
     if (factionStorageResp.result && typeof factionStorageResp.result === "object") {
       const fsr = factionStorageResp.result as Record<string, unknown>;
       factionStoredCredits = (fsr.credits as number) || (fsr.stored_credits as number) || 0;
@@ -188,7 +193,8 @@ async function withdrawCreditsForTrade(
       const remainingNeeded = needed - (storedCredits > 0 ? Math.min(needed, storedCredits) : 0);
       const withdrawAmount = Math.min(remainingNeeded, usableFactionCredits);
       if (withdrawAmount > 0) {
-        const wResp = await bot.exec("faction_withdraw_credits", { amount: withdrawAmount });
+        //const wResp = await bot.exec("faction_withdraw_credits", { amount: withdrawAmount });
+        const wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: withdrawAmount }); //fixed by human!
         if (!wResp.error) {
           await bot.refreshStatus();
           ctx.log("trade", `Withdrew ${withdrawAmount}cr from faction storage for trade (now ${bot.credits}cr)`);
@@ -972,13 +978,14 @@ function findCargoSellRoutes(
   return routes;
 }
 
-// ── Missions ─────────────────────────────────────────────────
+// ── Missions ───────────────────────────────────────────────── //disable this!
 
 /**
  * Complete any active missions that are ready, then accept new market/trade
  * missions at the current station (up to 2 per visit, respecting the 5-mission cap).
  * Must be docked.
  */
+
 async function tryMissions(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   if (!bot.docked) return;
@@ -1050,7 +1057,7 @@ async function tryMissions(ctx: RoutineContext): Promise<void> {
       accepted++;
     }
   }
-}
+} 
 
 // ── Trader routine ───────────────────────────────────────────
 
@@ -1510,7 +1517,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         if (bot.faction && bot.docked) {
           const deposited: string[] = [];
           for (const item of itemsToDeposit) {
-            const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+            //const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+            const dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
             if (!dResp.error) {
               deposited.push(`${item.quantity}x ${item.name}`);
               logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} from cargo (no good sell price found)`);
@@ -1525,7 +1533,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     await bot.refreshStatus();
 
-    // ── Priority 2: Sell station storage items at current market ──
+    // ── Priority 2: Sell station storage items at current market ── // this should be disabled! we should not sell items from storage at UNKNOWN prices, just take it home!!!! this WILL BE RESPONSABLE for selling a 500k item at 1 credit!!!!!!!!!!!!!!!
     if (bot.docked) {
       // Sell station storage items that this market buys
       await bot.refreshStatus();
@@ -1557,13 +1565,14 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             if (freeSpace <= 0) break;
             const qty = Math.min(item.quantity, maxItemsForCargo(freeSpace, item.itemId));
             if (qty <= 0) continue;
-            const wResp = await bot.exec("withdraw_items", { item_id: item.itemId, quantity: qty });
+            //const wResp = await bot.exec("withdraw_items", { item_id: item.itemId, quantity: qty });
+            const wResp = await bot.exec("storage", { action: 'withdraw', target: 'storage', item_id: item.itemId, quantity: qty }); //fixed by human!
             if (wResp.error) continue;
             const sResp = await bot.exec("sell", { item_id: item.itemId, quantity: qty });
             if (!sResp.error) {
               soldFromStorage.push(`${qty}x ${item.name}`);
             } else {
-              await bot.exec("deposit_items", { item_id: item.itemId, quantity: qty });
+              await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: qty }); //fixed by human!
             }
           }
           await bot.refreshStatus();
@@ -1907,7 +1916,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Withdraw credits from storage only if below working balance
       await bot.refreshStorage();
-      const storageResp = await bot.exec("view_storage");
+      //const storageResp = await bot.exec("view_storage");
+      const storageResp = await bot.exec("storage", { action: 'view', target: 'faction' }); //fixed by human!
       if (storageResp.result && typeof storageResp.result === "object") {
         const sr = storageResp.result as Record<string, unknown>;
         const storedCredits = (sr.credits as number) || (sr.stored_credits as number) || 0;
@@ -1915,7 +1925,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           // Only withdraw what's needed to reach working balance
           const needed = Math.min(storedCredits, TRADER_WORKING_BALANCE - bot.credits);
           if (needed > 0) {
-            await bot.exec("withdraw_credits", { amount: needed });
+            //await bot.exec("withdraw_credits", { amount: needed });
+            await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); //fixed by human!
             ctx.log("trade", `Withdrew ${needed} credits from storage (working balance: ${bot.credits + needed}cr)`);
           }
         }
@@ -1954,11 +1965,13 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         if (isFuel) {
           const excess = item.quantity - RESERVE_FUEL_CELLS;
           if (excess > 0) {
-            await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
+            //await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
+            await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: excess }); //fixed by human!
             depositSummary.push(`${excess}x ${item.name}`);
           }
         } else {
-          await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+          //await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+          await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
           depositSummary.push(`${item.quantity}x ${item.name}`);
         }
       }
@@ -1974,12 +1987,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const lower = item.itemId.toLowerCase();
         if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
       }
-      if (fuelInCargo < RESERVE_FUEL_CELLS) {
+      if (fuelInCargo < RESERVE_FUEL_CELLS) { //why are we not checking if we are at home base first???
         const freeSpace = getFreeSpace(bot);
         const needed = Math.min(RESERVE_FUEL_CELLS - fuelInCargo, maxItemsForCargo(freeSpace, "fuel_cell"));
         if (needed > 0) {
           ctx.log("trade", `Buying ${needed} fuel cells for ${candidate.jumps}-jump route...`);
-          await bot.exec("buy", { item_id: "fuel_cell", quantity: needed });
+          await bot.exec("buy", { item_id: "fuel_cell", quantity: needed }); //this needs to be changed to check if it's at home base, and if so, withdraw the premium_fuel_cell's!
         }
       }
 
@@ -2153,7 +2166,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             if (freeSpace <= 0) break;
             const wQty = Math.min(si.qty, maxItemsForCargo(freeSpace, si.itemId));
             if (wQty <= 0) continue;
-            const wResp = await bot.exec("withdraw_items", { item_id: si.itemId, quantity: wQty });
+            //const wResp = await bot.exec("withdraw_items", { item_id: si.itemId, quantity: wQty });
+            const wResp = await bot.exec("storage", { action: 'withdraw', target: 'storage', item_id: si.itemId, quantity: wQty }); //fixed by human! but are we doing station storage or faction?
             if (!wResp.error) {
               withdrawnItems.push(`${wQty}x ${si.name}`);
             }
@@ -2182,12 +2196,13 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
       if (bot.docked) {
         await bot.refreshCargo();
-        for (const item of [...bot.inventory]) {
+        for (const item of [...bot.inventory]) { //this needs to be changed to a GO HOME and then deposit, we do NOT want random items scattered!
           if (item.quantity <= 0) continue;
           const lower = item.itemId.toLowerCase();
           if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
           ctx.log("trade", `No buyer for ${item.quantity}x ${item.name} — depositing to storage`);
-          await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+          //await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+          await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: item.quantity }); //fixed by human! needs to be going to home first!
         }
       }
       ctx.log("trade", "All routes failed — waiting 60s before re-scanning");
@@ -2289,7 +2304,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
                   return true;
                 }
                 
-                ctx.log("trade", `Mid-route check (jump ${jumpNum}): No profitable alternative found — will deposit at destination`);
+                ctx.log("trade", `Mid-route check (jump ${jumpNum}): No profitable alternative found — will deposit at destination`); //NO! go home instead!!!! arg! we don't want scattered crap!
                 return true;
               }
 
@@ -2663,7 +2678,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             }
           }
         } else {
-          ctx.log("trade", `No profitable buyers found — will deposit unsold items at home`);
+          ctx.log("trade", `No profitable buyers found — will deposit unsold items at home`); //yes this is good!
         }
       }
       
@@ -2796,7 +2811,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           await bot.refreshCargo();
           remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
           if (remaining > 0) {
-            await bot.exec("deposit_items", { item_id: route!.itemId, quantity: remaining });
+            //await bot.exec("deposit_items", { item_id: route!.itemId, quantity: remaining });
+            await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining }); //fixed by human!
             ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to faction storage at ${homeStation.name} (will sell when prices improve)`);
             logFactionActivity(ctx, "deposit", `Deposited ${remaining}x ${route!.itemName} from unprofitable trade (cost: ${investedCredits}cr)`);
           }
@@ -2840,7 +2856,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         await bot.refreshCargo();
         remaining = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
         if (remaining > 0) {
-          await bot.exec("deposit_items", { item_id: route!.itemId, quantity: remaining });
+          //await bot.exec("deposit_items", { item_id: route!.itemId, quantity: remaining });
+          await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remaining }); //fixed by human! since it's SOL, may as well do faction deposit.
           ctx.log("trade", `Deposited ${remaining}x ${route!.itemName} to Sol Central storage`);
         }
       }
@@ -2910,7 +2927,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       if (isAtHomeStation) {
         // We're at home station - deposit immediately
         ctx.log("trade", `At home station with ${bot.credits}cr — depositing ${excessCredits}cr to faction storage`);
-        const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+        //const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+        const depositResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits',  quantity: excessCredits }); //fixed by human.
         if (!depositResp.error) {
           ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
           logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);
@@ -2947,7 +2965,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               await ensureDocked(ctx, true);
 
               // Deposit excess credits to faction storage
-              const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+              //const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+              const depositResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits',  quantity: excessCredits }); //fixed by human.
               if (!depositResp.error) {
                 ctx.log("trade", `Deposited ${excessCredits}cr to faction storage (kept ${TRADER_WORKING_BALANCE}cr working balance)`);
                 logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr excess trading profits to faction storage`);

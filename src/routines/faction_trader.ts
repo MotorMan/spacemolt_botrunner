@@ -131,6 +131,29 @@ async function failFactionSession(botUsername: string, reason: string): Promise<
   await failTradeSession(botUsername, reason);
 }
 
+/** Verify that a destination POI exists as a valid station with a market. */
+function isValidDestination(ctx: RoutineContext, systemId: string, poiId: string): boolean {
+  const sys = mapStore.getSystem(systemId);
+  if (!sys) {
+    ctx.log("error", `Destination system ${systemId} not found in map data`);
+    return false;
+  }
+  const poi = sys.pois.find(p => p.id === poiId);
+  if (!poi) {
+    ctx.log("error", `Destination POI ${poiId} not found in system ${systemId}`);
+    return false;
+  }
+  if (!poi.has_base) {
+    ctx.log("error", `Destination ${poi.name} (${poiId}) in ${systemId} is not a valid station (no dock)`);
+    return false;
+  }
+  if (!poi.market || poi.market.length === 0) {
+    ctx.log("error", `Destination ${poi.name} (${poiId}) in ${systemId} has no market data`);
+    return false;
+  }
+  return true;
+}
+
 // ── Trade Session Recovery ──────────────────────────────────
 
 /**
@@ -185,15 +208,24 @@ async function recoverFactionTradeSession(
       // Find alternative buyer
       const alternativeBuyers = allBuys
         .filter(b => b.itemId === session.itemId && b.price > 0)
+        .filter(b => settings.minSellPrice === 0 || b.price >= settings.minSellPrice)
         .sort((a, b) => b.price - a.price);
 
-    if (alternativeBuyers.length === 0) {
-      ctx.log("error", "No alternative buyers found — abandoning session");
-      await failFactionSession(session.botUsername, "No buyers available");
-      return null;
-    }
+      if (alternativeBuyers.length === 0) {
+        ctx.log("error", "No alternative buyers found — abandoning session");
+        await failFactionSession(session.botUsername, "No buyers available");
+        return null;
+      }
 
       const bestAlt = alternativeBuyers[0];
+
+      // Verify alternative destination is valid
+      if (!isValidDestination(ctx, bestAlt.systemId, bestAlt.poiId)) {
+        ctx.log("error", `Alternative destination invalid: ${bestAlt.poiName} — abandoning session`);
+        await failFactionSession(session.botUsername, "Invalid destination");
+        return null;
+      }
+
       ctx.log("trade", `New destination: ${bestAlt.poiName} in ${bestAlt.systemId} (${bestAlt.price}cr/ea)`);
       const updated = await updateTradeSession(session.botUsername, {
         destSystem: bestAlt.systemId,
@@ -468,6 +500,12 @@ function findFactionSellRoutes(
     for (const buy of buyers) {
       if (itemMinSellPrice > 0 && buy.price < itemMinSellPrice) continue;
 
+      // Verify destination is a valid station with a market
+      if (!isValidDestination(ctx, buy.systemId, buy.poiId)) {
+        ctx.log("error", `Skipping corrupt destination: ${buy.poiName} (${buy.systemId})`);
+        continue;
+      }
+
       // Check if this buy order is locked by another bot
       const existingLock = getBuyOrderLock(item.itemId, buy.poiId, buy.price);
       if (existingLock) {
@@ -604,13 +642,6 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     if (bot.docked) {
       //const factionResp = await bot.exec("view_storage", { target: "faction" });
       const factionResp = await bot.exec("storage", { action: 'view', target: "faction" }); //fixed by human!
-      if (!factionResp.error) {
-        // Set faction if not set
-        const result = factionResp.result as any;
-        if (result.faction_id && !bot.faction) {
-          bot.faction = result.faction_id;
-        }
-      }
       if (factionResp.error) {
         factionError = factionResp.error.message || "";
         // Only use personal mode if bot is truly not in a faction
@@ -649,26 +680,32 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     if (recoveredSession && (recoveredSession.state === "in_transit" || recoveredSession.state === "at_destination" || recoveredSession.state === "selling")) {
       ctx.log("trade", `Recovered session is ${recoveredSession.state} — proceeding directly to destination`);
 
-      // Quick fuel check only if we're at a station
-      if (bot.docked) {
-        await tryRefuel(ctx);
-      }
+      // Verify the destination is still valid
+      if (!isValidDestination(ctx, recoveredSession.destSystem, recoveredSession.destPoi)) {
+        ctx.log("error", `Cannot recover session: destination ${recoveredSession.destPoiName} is invalid`);
+        await failFactionSession(bot.username, "Invalid destination in recovered session");
+        recoveredSession = null;
+      } else {
+        // Quick fuel check only if we're at a station
+        if (bot.docked) {
+          await tryRefuel(ctx);
+        }
 
-      // Set up route for immediate execution
-      route = {
-        itemId: recoveredSession.itemId,
-        itemName: recoveredSession.itemName,
-        availableQty: recoveredSession.quantityBought,
-        destSystem: recoveredSession.destSystem,
-        destPoi: recoveredSession.destPoi,
-        destPoiName: recoveredSession.destPoiName,
-        sellPrice: recoveredSession.sellPricePerUnit,
-        sellQty: recoveredSession.sellQuantity,
-        jumps: recoveredSession.totalJumps - recoveredSession.jumpsCompleted,
-        roundTripJumps: recoveredSession.totalJumps,
-        totalRevenue: recoveredSession.expectedRevenue,
-        totalProfit: recoveredSession.expectedProfit,
-      };
+        // Set up route for immediate execution
+        route = {
+          itemId: recoveredSession!.itemId,
+          itemName: recoveredSession!.itemName,
+          availableQty: recoveredSession!.quantityBought,
+          destSystem: recoveredSession!.destSystem,
+          destPoi: recoveredSession!.destPoi,
+          destPoiName: recoveredSession!.destPoiName,
+          sellPrice: recoveredSession!.sellPricePerUnit,
+          sellQty: recoveredSession!.sellQuantity,
+          jumps: recoveredSession!.totalJumps - recoveredSession!.jumpsCompleted,
+          roundTripJumps: recoveredSession!.totalJumps,
+          totalRevenue: recoveredSession!.expectedRevenue,
+          totalProfit: recoveredSession!.expectedProfit,
+        };
       withdrawQty = recoveredSession.quantityBought;
       recoveredSessionHandled = true;
 
@@ -682,8 +719,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       }
 
       // Jump directly to destination
-      ctx.log("travel", `Resuming route to ${recoveredSession.destPoiName}...`);
-      const arrived = await navigateToSystem(ctx, recoveredSession.destSystem, {
+      ctx.log("travel", `Resuming route to ${recoveredSession!.destPoiName}...`);
+      const arrived = await navigateToSystem(ctx, recoveredSession!.destSystem, {
         ...safetyOpts,
         noJettison: true,
         onJump: async (jumpNum) => {
@@ -704,12 +741,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
       // Arrived at destination - update session state and continue to sell phase
       await updateTradeSession(bot.username, { state: "at_destination" });
-      bot.system = recoveredSession.destSystem;
+      bot.system = recoveredSession!.destSystem;
 
       // Travel to destination POI and dock
-      if (bot.poi !== recoveredSession.destPoi) {
-        ctx.log("travel", `Traveling to ${recoveredSession.destPoiName}...`);
-        const travelResp = await bot.exec("travel", { target_poi: recoveredSession.destPoi });
+      if (bot.poi !== recoveredSession!.destPoi) {
+        ctx.log("travel", `Traveling to ${recoveredSession!.destPoiName}...`);
+        const travelResp = await bot.exec("travel", { target_poi: recoveredSession!.destPoi });
 
         // Check for battle after travel
         if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
@@ -728,7 +765,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           }
         }
 
-        bot.poi = recoveredSession.destPoi;
+        bot.poi = recoveredSession!.destPoi;
 
         // Check for pirates at destination
         const nearbyResp = await bot.exec("get_nearby");
@@ -754,96 +791,104 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // ── Handle recovered session in "buying" state with cargo already loaded ──
     // This happens when the session was created but the bot was interrupted before traveling
     if (!recoveredSessionHandled && recoveredSession && recoveredSession.state === "buying") {
-      // Check if cargo is already loaded (from previous interrupted attempt)
-      await bot.refreshCargo();
-      const cargoItem = bot.inventory.find(i => i.itemId === recoveredSession.itemId);
-      const cargoQty = cargoItem?.quantity ?? 0;
+      // Verify the destination is still valid
+      if (!isValidDestination(ctx, recoveredSession.destSystem, recoveredSession.destPoi)) {
+        ctx.log("error", `Cannot recover session: destination ${recoveredSession.destPoiName} is invalid`);
+        await failFactionSession(bot.username, "Invalid destination in recovered session");
+        recoveredSession = null;
+      } else {
+        // Check if cargo is already loaded (from previous interrupted attempt)
+        await bot.refreshCargo();
+        const cargoItem = bot.inventory.find(i => i.itemId === recoveredSession!.itemId);
+        const cargoQty = cargoItem?.quantity ?? 0;
 
-      if (cargoQty > 0) {
-        ctx.log("trade", `Recovered session in "buying" state with cargo already loaded: ${cargoQty}x ${recoveredSession.itemName}`);
+          if (cargoQty > 0) {
+            ctx.log("trade", `Recovered session in "buying" state with cargo already loaded: ${cargoQty}x ${recoveredSession!.itemName}`);
 
-        // Set up route from session
-        route = {
-          itemId: recoveredSession.itemId,
-          itemName: recoveredSession.itemName,
-          availableQty: cargoQty,
-          destSystem: recoveredSession.destSystem,
-          destPoi: recoveredSession.destPoi,
-          destPoiName: recoveredSession.destPoiName,
-          sellPrice: recoveredSession.sellPricePerUnit,
-          sellQty: recoveredSession.sellQuantity,
-          jumps: recoveredSession.totalJumps,
-          roundTripJumps: recoveredSession.totalJumps,
-          totalRevenue: recoveredSession.expectedRevenue,
-          totalProfit: recoveredSession.expectedProfit,
-        };
-        withdrawQty = cargoQty;
-        recoveredSessionHandled = true;
+            // Set up route from session
+            route = {
+              itemId: recoveredSession!.itemId,
+              itemName: recoveredSession!.itemName,
+              availableQty: cargoQty,
+              destSystem: recoveredSession!.destSystem,
+              destPoi: recoveredSession!.destPoi,
+              destPoiName: recoveredSession!.destPoiName,
+              sellPrice: recoveredSession!.sellPricePerUnit,
+              sellQty: recoveredSession!.sellQuantity,
+              jumps: recoveredSession!.totalJumps,
+              roundTripJumps: recoveredSession!.totalJumps,
+              totalRevenue: recoveredSession!.expectedRevenue,
+              totalProfit: recoveredSession!.expectedProfit,
+            };
+            withdrawQty = cargoQty;
+            recoveredSessionHandled = true;
 
-        // Skip dock/maintenance and go straight to travel
-        await ensureUndocked(ctx);
-        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-        if (!fueled) {
-          ctx.log("error", "Cannot refuel for recovered session — will retry next cycle");
-          await ctx.sleep(30000);
-          continue;
-        }
-
-        // Jump directly to destination
-        ctx.log("travel", `Resuming route to ${recoveredSession.destPoiName}...`);
-        const arrived = await navigateToSystem(ctx, recoveredSession.destSystem, {
-          ...safetyOpts,
-          noJettison: true,
-          onJump: async (jumpNum) => {
-            const session = getActiveSession(bot.username);
-            if (session) {
-              await updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
-            }
-            return true;
-          },
-        });
-
-        if (!arrived) {
-          ctx.log("error", "Failed to reach destination for recovered session — will retry");
-          await ensureDocked(ctx);
-          await ctx.sleep(60000);
-          continue;
-        }
-
-        // Arrived at destination - update session state and continue to sell phase
-        await updateTradeSession(bot.username, { state: "at_destination" });
-        bot.system = recoveredSession.destSystem;
-
-        // Travel to destination POI and dock
-        if (bot.poi !== recoveredSession.destPoi) {
-          ctx.log("travel", `Traveling to ${recoveredSession.destPoiName}...`);
-          const travelResp = await bot.exec("travel", { target_poi: recoveredSession.destPoi });
-
-          // Check for battle after travel
-          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
-            ctx.log("combat", "Battle detected during travel - fleeing!");
-            await ctx.sleep(5000);
-            continue;
-          }
-
-          // CRITICAL: Check for battle interrupt error
-          if (travelResp.error) {
-            const errMsg = travelResp.error.message.toLowerCase();
-            if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
-              ctx.log("combat", `Travel to destination interrupted by battle! ${travelResp.error.message} - fleeing!`);
-              await ctx.sleep(5000);
+            // Skip dock/maintenance and go straight to travel
+            await ensureUndocked(ctx);
+            const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+            if (!fueled) {
+              ctx.log("error", "Cannot refuel for recovered session — will retry next cycle");
+              await ctx.sleep(30000);
               continue;
             }
+
+            // Jump directly to destination
+            ctx.log("travel", `Resuming route to ${recoveredSession!.destPoiName}...`);
+            const arrived = await navigateToSystem(ctx, recoveredSession!.destSystem, {
+              ...safetyOpts,
+              noJettison: true,
+              onJump: async (jumpNum) => {
+                const session = getActiveSession(bot.username);
+                if (session) {
+                  await updateTradeSession(bot.username, { jumpsCompleted: jumpNum });
+                }
+                return true;
+              },
+            });
+
+            if (!arrived) {
+              ctx.log("error", "Failed to reach destination for recovered session — will retry");
+              await ensureDocked(ctx);
+              await ctx.sleep(60000);
+              continue;
+            }
+
+            // Arrived at destination - update session state and continue to sell phase
+            await updateTradeSession(bot.username, { state: "at_destination" });
+            bot.system = recoveredSession!.destSystem;
+
+            // Travel to destination POI and dock
+            if (bot.poi !== recoveredSession!.destPoi) {
+              ctx.log("travel", `Traveling to ${recoveredSession!.destPoiName}...`);
+              const travelResp = await bot.exec("travel", { target_poi: recoveredSession!.destPoi });
+
+              // Check for battle after travel
+              if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
+                ctx.log("combat", "Battle detected during travel - fleeing!");
+                await ctx.sleep(5000);
+                continue;
+              }
+
+              // CRITICAL: Check for battle interrupt error
+              if (travelResp.error) {
+                const errMsg = travelResp.error.message.toLowerCase();
+                if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+                  ctx.log("combat", `Travel to destination interrupted by battle! ${travelResp.error.message} - fleeing!`);
+                  await ctx.sleep(5000);
+                  continue;
+                }
+              }
+
+              bot.poi = recoveredSession!.destPoi;
+            }
+
+            await ensureDocked(ctx);
+            ctx.log("trade", "Arrived at destination — proceeding to sell trade items");
+            // route, withdrawQty already set - will proceed to sell phase
           }
-
-          bot.poi = recoveredSession.destPoi;
         }
-
-        await ensureDocked(ctx);
-        ctx.log("trade", "Arrived at destination — proceeding to sell trade items");
-        // route, withdrawQty already set - will proceed to sell phase
       }
-    }
+  }
 
     // ── Dock (also records market data + analyzes market) ──
     if (!recoveredSessionHandled) {
@@ -931,34 +976,52 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         const cargoCapacity = bot.cargoMax > 0 ? bot.cargoMax : 50;
         
         for (const item of nonFuelCargo) {
+          const itemConfig = settings.tradeItems.find(t => t.itemId === item.itemId);
+          const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
+
           const buyers = allBuys
             .filter(b => b.itemId === item.itemId && b.price > 0 && b.quantity > 0)
+            .filter(b => itemMinSellPrice === 0 || b.price >= itemMinSellPrice)
             .sort((a, b) => b.price - a.price);
-          
-          if (buyers.length > 0) {
-            const bestBuyer = buyers[0];
-            const toDest = estimateFuelCost(bot.system, bestBuyer.systemId, settings.fuelCostPerJump);
-            const returnHome = estimateFuelCost(bestBuyer.systemId, settings.homeSystem || bot.system, settings.fuelCostPerJump);
-            const roundTripJumps = toDest.jumps + (returnHome.jumps < 999 ? returnHome.jumps : 0);
-            const qty = Math.min(item.quantity, bestBuyer.quantity, maxItemsForCargo(cargoCapacity, item.itemId));
-            
-            cargoRoutes.push({
-              itemId: item.itemId,
-              itemName: item.name,
-              availableQty: item.quantity,
-              destSystem: bestBuyer.systemId,
-              destPoi: bestBuyer.poiId,
-              destPoiName: bestBuyer.poiName,
-              sellPrice: bestBuyer.price,
-              sellQty: qty,
-              jumps: toDest.jumps,
-              roundTripJumps,
-              totalRevenue: qty * bestBuyer.price,
-              totalProfit: qty * bestBuyer.price, // No acquisition cost for recovered cargo
-            });
+
+          if (buyers.length === 0) {
+            if (itemMinSellPrice > 0) {
+              ctx.log("trade", `No buyers meet min price (${itemMinSellPrice}cr) for ${item.quantity}x ${item.name} in cargo`);
+            } else {
+              ctx.log("trade", `No buyers found for ${item.quantity}x ${item.name} in cargo`);
+            }
+            continue;
           }
+
+          const bestBuyer = buyers[0];
+
+          // Verify destination is a valid station with a market
+          if (!isValidDestination(ctx, bestBuyer.systemId, bestBuyer.poiId)) {
+            ctx.log("error", `Skipping corrupt destination: ${bestBuyer.poiName} (${bestBuyer.systemId})`);
+            continue;
+          }
+
+          const toDest = estimateFuelCost(bot.system, bestBuyer.systemId, settings.fuelCostPerJump);
+          const returnHome = estimateFuelCost(bestBuyer.systemId, settings.homeSystem || bot.system, settings.fuelCostPerJump);
+          const roundTripJumps = toDest.jumps + (returnHome.jumps < 999 ? returnHome.jumps : 0);
+          const qty = Math.min(item.quantity, bestBuyer.quantity, maxItemsForCargo(cargoCapacity, item.itemId));
+
+          cargoRoutes.push({
+            itemId: item.itemId,
+            itemName: item.name,
+            availableQty: item.quantity,
+            destSystem: bestBuyer.systemId,
+            destPoi: bestBuyer.poiId,
+            destPoiName: bestBuyer.poiName,
+            sellPrice: bestBuyer.price,
+            sellQty: qty,
+            jumps: toDest.jumps,
+            roundTripJumps,
+            totalRevenue: qty * bestBuyer.price,
+            totalProfit: qty * bestBuyer.price, // No acquisition cost for recovered cargo
+          });
         }
-        
+
         if (cargoRoutes.length > 0) {
           cargoRoutes.sort((a, b) => b.totalRevenue - a.totalRevenue);
           route = cargoRoutes[0];
@@ -1027,14 +1090,20 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     if (!recoveredSessionHandled) {
       // Iterate through found routes to find one with an available lock
       for (const candidateRoute of foundRoutes) {
+        // Verify destination is still valid
+        if (!isValidDestination(ctx, candidateRoute.destSystem, candidateRoute.destPoi)) {
+          ctx.log("error", `Skipping route to invalid destination: ${candidateRoute.destPoiName}`);
+          continue;
+        }
+
         const lockKey = getBuyOrderKey(candidateRoute.itemId, candidateRoute.destPoi, candidateRoute.sellPrice);
         const existingLock = getBuyOrderLock(candidateRoute.itemId, candidateRoute.destPoi, candidateRoute.sellPrice);
-        
+
         if (existingLock) {
           ctx.log("trade", `Skipping route to ${candidateRoute.destPoiName} — buy order locked by ${existingLock.lockedBy}`);
           continue;
         }
-        
+
         route = candidateRoute;
         break;
       }
@@ -1108,7 +1177,13 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           const actuallySold = inCargo.quantity - afterSell;
           
           if (actuallySold <= 0) {
-            ctx.log("error", `Cargo recovery: Sell command succeeded but no items were sold!`);
+            const itemConfig = settings.tradeItems.find(t => t.itemId === route!.itemId);
+            const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
+            if (itemMinSellPrice > 0 && inCargo.quantity > 0) {
+              ctx.log("error", `Cargo recovery: Sell command succeeded but no items were sold! (price ${route!.sellPrice}cr may be below minimum ${itemMinSellPrice}cr)`);
+            } else {
+              ctx.log("error", `Cargo recovery: Sell command succeeded but no items were sold!`);
+            }
             break;
           }
           
@@ -1151,7 +1226,11 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
                 }
               }
             } else {
-              ctx.log("trade", `No viable buy orders for ${route!.itemName} — skipping`);
+              if (itemMinSellPrice > 0) {
+                ctx.log("trade", `No viable buy orders for ${route!.itemName} — all below minimum price of ${itemMinSellPrice}cr`);
+              } else {
+                ctx.log("trade", `No viable buy orders for ${route!.itemName} — skipping`);
+              }
             }
             continue;
           }
@@ -1250,7 +1329,11 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         );
 
         if (initialMarketCheck.buyOrders.length === 0) {
-          ctx.log("trade", `No viable buy orders for ${route!.itemName} — skipping`);
+          if (itemMinSellPrice > 0) {
+            ctx.log("trade", `No viable buy orders for ${route!.itemName} — all below minimum price of ${itemMinSellPrice}cr`);
+          } else {
+            ctx.log("trade", `No viable buy orders for ${route!.itemName} — skipping`);
+          }
           continue;
         }
 
@@ -1726,7 +1809,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         );
 
         if (marketCheck.sellQty <= 0) {
-          ctx.log("trade", `No viable buy orders for ${route!.itemName} at ${route!.destPoiName} — skipping sell`);
+          const minPrice = itemMinSellPrice > 0 ? ` (minimum: ${itemMinSellPrice}cr)` : "";
+          ctx.log("trade", `No viable buy orders for ${route!.itemName} at ${route!.destPoiName}${minPrice} — skipping sell`);
           await failFactionSession(bot.username, "No viable buy orders at destination");
         } else {
           ctx.log("trade", `Selling ${marketCheck.sellQty}x ${route!.itemName} (${marketCheck.priceBreakdown})...`);

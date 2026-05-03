@@ -959,6 +959,89 @@ function pickTargetFromQuotas(
 }
 
 /**
+ * Find the first quota target that has available locations in the map.
+ * Returns the resource ID of the first quota ore that can actually be mined.
+ */
+function findFirstAvailableQuotaTarget(
+  quotas: Record<string, number>,
+  factionStorage: Array<{ itemId: string; quantity: number }>,
+  miningType: "ore" | "gas" | "ice" | "radioactive",
+  settings: ReturnType<typeof getMinerSettings>,
+  mapStore: any,
+  depletionTimeoutMs: number,
+  canMineHiddenRadioactive: boolean,
+  canMineHiddenIce: boolean,
+): string {
+  const entries: Array<{ resourceId: string; deficit: number; current: number; target: number }> = [];
+
+  for (const [resourceId, target] of Object.entries(quotas)) {
+    if (target <= 0) continue;
+    const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
+    const deficit = target - current;
+    if (deficit > 0) {
+      entries.push({ resourceId, deficit, current, target });
+    }
+  }
+
+  // Also include ores with no deficit but still in quotas (for cycling when all quotas met)
+  for (const [resourceId, target] of Object.entries(quotas)) {
+    if (target <= 0) continue;
+    const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
+    const deficit = target - current;
+    if (deficit <= 0 && !entries.some(e => e.resourceId === resourceId)) {
+      entries.push({ resourceId, deficit, current, target });
+    }
+  }
+
+  if (entries.length === 0) return "";
+
+  // Sort: biggest deficit first, then smallest surplus (closest to deficit)
+  entries.sort((a, b) => b.deficit - a.deficit);
+
+  // Check each ore in priority order to see if it has available locations
+  for (const entry of entries) {
+    const locations = mapStore.findOreLocations(entry.resourceId).filter((loc: any) => {
+      const sys = mapStore.getSystem(loc.systemId);
+      const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
+      if (!poi) return true; // keep if type unknown
+      if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+      if (miningType === "radioactive") {
+        if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+        return isOreBeltPoi(poi.type) || poi.hidden === true;
+      }
+      if (miningType === "gas") return isGasCloudPoi(poi.type);
+      if (miningType === "ice") {
+        if (poi.hidden === true && !canMineHiddenIce) return false;
+        return isIceFieldPoi(poi.type);
+      }
+      return true;
+    }).filter((loc: any) => {
+      // Skip depleted ores (unless depletion has expired or ignoreDepletion is enabled)
+      if (settings.ignoreDepletion) {
+        // Even with ignoreDepletion, skip completely exhausted POIs (0 remaining)
+        if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+          return false;
+        }
+        return true;
+      }
+      const sys = mapStore.getSystem(loc.systemId);
+      const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
+      const oreEntry = poi?.ores_found.find((o: any) => o.item_id === entry.resourceId);
+      if (!oreEntry?.depleted) return true;
+      // Depleted but expired - can re-check
+      return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+    });
+
+    if (locations.length > 0) {
+      return entry.resourceId;
+    }
+  }
+
+  // No quota targets have available locations
+  return "";
+}
+
+/**
  * Enhanced quota picker that always returns a target, even when all quotas are met.
  * When all quotas are met, picks the resource closest to deficit (smallest surplus).
  * This ensures the miner keeps cycling through ores based on quota priorities.
@@ -2258,12 +2341,18 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           await failMiningSession(bot.username, "Target resource not found in map");
           recoveredSession = null;
         }
-        // If this was a global target, fall back to quota target
-        if (hasGlobalTarget) {
-          ctx.log("mining", `Global target "${effectiveTarget}" not available — falling back to quota target`);
-          effectiveTarget = quotaTargetResource;
-          // Re-check locations with new target
-          if (effectiveTarget) {
+        // If we have quotas configured, try to find an alternative quota target
+        if (Object.keys(quotas).length > 0) {
+          const originalTarget = effectiveTarget;
+          ctx.log("mining", `Target "${originalTarget}" not available — searching for first available quota target`);
+          const availableQuotaTarget = findFirstAvailableQuotaTarget(
+            quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
+            canMineHiddenRadioactive, canMineHiddenIce
+          );
+          if (availableQuotaTarget && availableQuotaTarget !== originalTarget) {
+            effectiveTarget = availableQuotaTarget;
+            ctx.log("mining", `Switching to available quota target: "${effectiveTarget}"`);
+            // Re-check locations with new target
             const newLocations = mapStore.findOreLocations(effectiveTarget).filter(loc => {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
@@ -2296,9 +2385,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               locations.push(...newLocations);
               ctx.log("mining", `Found ${newLocations.length} locations for quota target "${effectiveTarget}"`);
             }
+          } else if (availableQuotaTarget === originalTarget) {
+            ctx.log("mining", `Quota target "${originalTarget}" is the only available option — proceeding`);
+          } else {
+            ctx.log("warn", `No quota targets have available locations — mining locally without specific target`);
           }
         }
-        // If still no locations, target locally
+        // If still no locations, target locally (either no quotas configured or no available quota targets)
         if (locations.length === 0) {
           targetSystemId = bot.system;
         }
@@ -4579,6 +4672,21 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
               ctx.log("mining", `POI resource check at ${miningPoi?.name || 'unknown'}: ${poiResourceTypes.length > 0 ? poiResourceTypes.join(', ') : 'none detected'}`);
               if (effectiveTarget) {
                 ctx.log("mining", `Target resource ${effectiveTarget}: ${poiHasTargetResource ? 'AVAILABLE' : 'NOT FOUND'}`);
+              }
+
+              // STRIP MINER FIX: If using strip miner and target ore not available,
+              // switch to mining whichever common ore IS available at this POI
+              if (usingStripMiner && !poiHasTargetResource && effectiveTarget) {
+                const availableCommonOres = poiResourceTypes.filter(oreId => isStripMinerOre(oreId));
+                if (availableCommonOres.length > 0) {
+                  // Switch target to the first available common ore
+                  const newTarget = availableCommonOres[0];
+                  ctx.log("mining", `Strip miner: ${effectiveTarget} not available — switching to ${newTarget} (available at current POI)`);
+                  effectiveTarget = newTarget;
+                  poiHasTargetResource = true; // Now the target is available
+                } else {
+                  ctx.log("warn", `Strip miner: No common ores available at ${miningPoi?.name || 'current POI'} — cannot mine here`);
+                }
               }
             }
           } catch (e) {

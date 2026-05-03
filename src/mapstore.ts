@@ -432,14 +432,57 @@ class MapStore {
       if (!itemId) continue;
       freshItemIds.add(itemId);
 
-      const buyPrice = item.buy_price as number ?? item.buy as number ?? null;
-      const sellPrice = item.sell_price as number ?? item.sell as number ?? null;
       const prev = existingMarket.get(itemId);
 
-      // Extract order quantities from order book data — use fresh values as-is,
-      // don't fall back to stale cached quantities (they may no longer be available)
-      const buyQty = (item.buy_quantity as number) ?? (item.buy_volume as number) ?? (item.buy_orders as number) ?? 0;
-      const sellQty = (item.sell_quantity as number) ?? (item.sell_volume as number) ?? (item.sell_orders as number) ?? 0;
+      // Calculate best buy price (highest price from buy orders, or use provided buy_price)
+      let buyPrice = item.buy_price as number ?? item.buy as number ?? null;
+      let buyQty = (item.buy_quantity as number) ?? (item.buy_volume as number) ?? 0;
+
+      // If we have buy_orders array, calculate best price and total quantity from it
+      if (Array.isArray(item.buy_orders)) {
+        let maxBuyPrice = 0;
+        let totalBuyQty = 0;
+        for (const order of item.buy_orders) {
+          const price = (order.price as number) ?? (order.unit_price as number) ?? 0;
+          const qty = (order.quantity as number) ?? (order.remaining as number) ?? 0;
+          if (price > 0 && qty > 0) {
+            maxBuyPrice = Math.max(maxBuyPrice, price);
+            totalBuyQty += qty;
+          }
+        }
+        if (maxBuyPrice > 0) {
+          buyPrice = buyPrice ?? maxBuyPrice;
+          buyQty = buyQty || totalBuyQty;
+        }
+      } else if ((item.buy_orders as number) > 0) {
+        // Fallback for cases where buy_orders is a number (count of orders)
+        buyQty = buyQty || (item.buy_orders as number);
+      }
+
+      // Calculate best sell price (lowest price from sell orders, or use provided sell_price)
+      let sellPrice = item.sell_price as number ?? item.sell as number ?? null;
+      let sellQty = (item.sell_quantity as number) ?? (item.sell_volume as number) ?? 0;
+
+      // If we have sell_orders array, calculate best price and total quantity from it
+      if (Array.isArray(item.sell_orders)) {
+        let minSellPrice = Infinity;
+        let totalSellQty = 0;
+        for (const order of item.sell_orders) {
+          const price = (order.price as number) ?? (order.unit_price as number) ?? 0;
+          const qty = (order.quantity as number) ?? (order.remaining as number) ?? 0;
+          if (price > 0 && qty > 0) {
+            minSellPrice = Math.min(minSellPrice, price);
+            totalSellQty += qty;
+          }
+        }
+        if (minSellPrice !== Infinity) {
+          sellPrice = sellPrice ?? minSellPrice;
+          sellQty = sellQty || totalSellQty;
+        }
+      } else if ((item.sell_orders as number) > 0) {
+        // Fallback for cases where sell_orders is a number (count of orders)
+        sellQty = sellQty || (item.sell_orders as number);
+      }
 
       existingMarket.set(itemId, {
         item_id: itemId,

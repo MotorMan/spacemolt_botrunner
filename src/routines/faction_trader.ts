@@ -1241,12 +1241,15 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             let dResp;
             if (personalMode) {
               // Personal storage - use deposit_items command
-              dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+              //dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+              dResp = await bot.exec("storage", { action: 'deposit', target: 'station', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
             } else {
               // Faction storage
-              dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+              //dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+              dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
               if (dResp.error) {
-                dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+                //dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+                dResp = await bot.exec("storage", { action: 'deposit', target: 'station', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
               }
             }
             if (!dResp.error) {
@@ -1467,9 +1470,11 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             ctx.log("trade", `Depositing ${remainingCargo}x unsold ${route!.itemName} back to storage`);
             let dResp;
             if (personalMode) {
-              dResp = await bot.exec("deposit_items", { item_id: route!.itemId, quantity: remainingCargo });
+              //dResp = await bot.exec("deposit_items", { item_id: route!.itemId, quantity: remainingCargo });
+              dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: route!.itemId, quantity: remainingCargo }); //fixed by human!
             } else {
-              dResp = await bot.exec("faction_deposit_items", { item_id: route!.itemId, quantity: remainingCargo });
+              //dResp = await bot.exec("faction_deposit_items", { item_id: route!.itemId, quantity: remainingCargo });
+              dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: route!.itemId, quantity: remainingCargo }); //fixed by human!
             }
             if (dResp.error) {
               ctx.log("error", `Failed to deposit unsold items: ${dResp.error.message}`);
@@ -1554,11 +1559,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               // Deposit to storage based on mode
               let dResp;
               if (personalMode) {
-                dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
+                //dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
+                dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: excess }); //fixed by human!
               } else {
-                dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: excess });
+                //dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: excess });
+                dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: item.itemId, quantity: excess }); //fixed by human!
                 if (dResp.error) {
-                  dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
+                  //dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: excess });
+                  dResp = await bot.exec("storage", { action: '', target: 'storage', item_id: item.itemId, quantity: excess }); //fixed by human!
                 }
               }
               deposited.push(`${excess}x ${item.name}`);
@@ -1566,11 +1574,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               // Deposit to storage based on mode
               let dResp;
               if (personalMode) {
-                dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+                //dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+                dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
               } else {
-                dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+                //dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+                dResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
                 if (dResp.error) {
-                  dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+                  //dResp = await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+                  dResp = await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: item.quantity }); //fixed by human!
                 }
               }
               deposited.push(`${item.quantity}x ${item.name}`);
@@ -1939,7 +1950,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     const BOT_WORKING_BALANCE = 10_000;
     if (bot.credits > BOT_WORKING_BALANCE) {
       const excessCredits = bot.credits - BOT_WORKING_BALANCE;
-      const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+      //const depositResp = await bot.exec("faction_deposit_credits", { amount: excessCredits });
+      const depositResp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: excessCredits }); //fixed by human!
       if (!depositResp.error) {
         ctx.log("trade", `Deposited ${excessCredits}cr to faction treasury (retained ${BOT_WORKING_BALANCE}cr)`);
         logFactionActivity(ctx, "deposit", `Deposited ${excessCredits}cr (excess credits above ${BOT_WORKING_BALANCE}cr)`);

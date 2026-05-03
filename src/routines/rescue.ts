@@ -3763,14 +3763,20 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       }
       ctx.log("mayday", `✓ Fuel check passed: ${nextMayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
-      // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
-      const rescueDecision = shouldRescuePlayer(nextMayday.sender, settings.ghostThreshold);
-      if (!rescueDecision.shouldRescue) {
-        ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - ${rescueDecision.reason}`);
-        markMaydayHandled(nextMayday);
-        continue;
-      }
-      ctx.log("mayday", `✓ BlackBook check passed: ${rescueDecision.reason}`);
+          // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
+          const rescueDecision = shouldRescuePlayer(nextMayday.sender, settings.ghostThreshold);
+          if (!rescueDecision.shouldRescue) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - ${rescueDecision.reason}`);
+            // Check if decline is due to ghost threshold
+            const record = getPlayerRecord(nextMayday.sender);
+            if (record.ghostCount >= settings.ghostThreshold) {
+              ctx.log("mayday", `🚫 ${nextMayday.sender} is blacklisted due to ${record.ghostCount} ghost incidents (threshold: ${settings.ghostThreshold})`);
+              ctx.log("mayday", `📢 "if you wish to have your MAYDAY blacklist reviewed, please ask the BUSY represenative on the SpaceMolt Discord channel. Thank You."`);
+            }
+            markMaydayHandled(nextMayday);
+            continue;
+          }
+          ctx.log("mayday", `✓ BlackBook check passed: ${rescueDecision.reason}`);
 
       // Record rescue request for blackbook tracking
       recordRescueRequest(nextMayday.sender);
@@ -5760,33 +5766,40 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             // Don't fail the session permanently - just continue the loop
             await ctx.sleep(10000);
             continue;
-          }
-          
-          // For non-own bots, record ghost and fail normally
-          recordGhost(target.username);
-          const currentGhosts = getPlayerRecord(target.username).ghostCount;
-          ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
-          
-          // Send grumpy faction chat message about being ghosted
-          const aiChatService = (globalThis as any).aiChatService;
-          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-            try {
-              const result = await aiChatService.sendFactionMessage(bot, {
-                messageType: "rescue_no_show",
-                targetName: target.username,
-                isMayday: isMaydayTarget,
-                isBot: !isMaydayTarget,
-                currentSystem: bot.system,
-                targetSystem: target.system,
-                targetPoi: target.poi || undefined,
-              });
-              if (!result.ok) {
-                ctx.log("ai_chat_debug", `Faction announcement (no_show) skipped: ${result.error}`);
+           } else {
+            // For non-own bots, record ghost and fail normally
+            recordGhost(target.username);
+            const currentGhosts = getPlayerRecord(target.username).ghostCount;
+            if (currentGhosts < 0) {
+              ctx.log("rescue", `👻 Skipped ghost recording for ${target.username} (our own bot)`);
+            } else {
+              ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
+              if (currentGhosts >= 5) {
+                ctx.log("rescue", `⚠️ ${target.username} has ${currentGhosts} ghost incidents (>=5 threshold). Continued ghosting will result in permanent blacklist!`);
               }
-            } catch (e) {
-              ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
             }
-          }
+
+            // Send grumpy faction chat message about being ghosted
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+              try {
+                const result = await aiChatService.sendFactionMessage(bot, {
+                  messageType: "rescue_no_show",
+                  targetName: target.username,
+                  isMayday: isMaydayTarget,
+                  isBot: !isMaydayTarget,
+                  currentSystem: bot.system,
+                  targetSystem: target.system,
+                  targetPoi: target.poi || undefined,
+                });
+                if (!result.ok) {
+                  ctx.log("ai_chat_debug", `Faction announcement (no_show) skipped: ${result.error}`);
+                }
+              } catch (e) {
+                ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
+              }
+            }
+           }
           
           if (recoveredSession || getActiveRescueSession(bot.username)) {
             await failRescueSession(bot.username, "Could not reach target - all attempts failed");
@@ -5921,8 +5934,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (currentGhosts < 0) {
             ctx.log("rescue", `👻 Skipped ghost recording for ${target.username} (our own bot)`);
           } else {
-            ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
-          }
+             ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
+             if (currentGhosts >= 5) {
+               ctx.log("rescue", `⚠️ ${target.username} has ${currentGhosts} ghost incidents (>=5 threshold). Continued ghosting will result in permanent blacklist!`);
+             }
+           }
 
           // Send grumpy faction chat message about being ghosted
           const aiChatService = (globalThis as any).aiChatService;

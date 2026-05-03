@@ -3,7 +3,7 @@
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import type { Bot, RoutineContext } from "../../bot";
-import { parseFactionStorageItems } from "../faction_trader.js";
+import { parseFactionStorageItems } from "../temp_helpers.js";
 
 // ── Mock Bot Factory ─────────────────────────────────────────
 

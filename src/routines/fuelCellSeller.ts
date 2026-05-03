@@ -508,31 +508,6 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       await bot.refreshCargo();
       const postReturnCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
       cargoQty = postReturnCargo?.quantity ?? 0;
-      if (cargoQty <= 0) {
-        ctx.log("fc", "Arrived home but no cargo — attempting to withdraw from faction storage");
-        
-        const freeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
-        //const withdrawResp = await bot.exec("faction_withdraw_items", { item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), });
-        const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: FUEL_CELL_ITEM_ID, quantity: maxItemsForCargo(freeSpace, FUEL_CELL_ITEM_ID), }); //fixed by human!
-
-        if (withdrawResp.error) {
-          ctx.log("error", `Withdraw failed: ${withdrawResp.error.message} — waiting for cargo`);
-          await ctx.sleep(60000);
-          continue;
-        }
-
-        await bot.refreshCargo();
-        const afterWithdraw = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
-        cargoQty = afterWithdraw?.quantity ?? 0;
-
-        if (cargoQty <= 0) {
-          ctx.log("fc", "Withdraw returned no cargo — waiting for cargo");
-          await ctx.sleep(60000);
-          continue;
-        }
-
-        ctx.log("fc", `Withdrew ${cargoQty}x fuel cells from faction storage`);
-      }
       ctx.log("fc", "Returned home with cargo");
     }
 
@@ -559,6 +534,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
           continue;
         }
 
+        // Wait for potential caching delays before refreshing cargo
+        await ctx.sleep(2000);
         await bot.refreshCargo();
         const afterWithdraw = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
         const newCargoQty = afterWithdraw?.quantity ?? 0;

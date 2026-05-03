@@ -4047,8 +4047,8 @@ function mcRefreshStorageForDepositAll() {
         logResponse(`<span class="resp-ok">Station storage: ${storageData.length} items</span>`);
       }
       
-      // Refresh faction storage using view_storage with source: 'faction'
-      sendExec(profileBot, 'view_storage', { source: 'faction' }, (factionResult) => {
+      // Refresh faction storage using view_storage with target: 'faction'
+      sendExec(profileBot, 'view_storage', { target: 'faction' }, (factionResult) => {
         if (factionResult.ok && factionResult.data) {
           const faction = factionResult.data.items || factionResult.data.storage || [];
           profileFactionStorage = faction;
@@ -5137,9 +5137,8 @@ function mcExec(command, params) {
         checkAllDone();
       });
 
-      // Step 3: Fetch updated faction storage using view_storage with source: 'faction'
-      pendingFetches++;
-      sendExec(profileBot, 'view_storage', { source: 'faction' }, (factionResult) => {
+      // Step 3: Fetch updated faction storage using view_storage with target: 'faction'
+      sendExec(profileBot, 'view_storage', { target: 'faction' }, (factionResult) => {
         if (factionResult.ok && factionResult.data) {
           const freshFaction = factionResult.data.items || factionResult.data.storage || [];
           profileFactionStorage = freshFaction;
@@ -5628,7 +5627,7 @@ function fetchRecipes(username) {
 
   function fetchFactionStorage(username) {
     profileFactionStorage = null; // reset to loading state
-    sendExec(username, 'view_storage', { source: 'faction' }, (result) => {
+    sendExec(username, 'view_storage', { target: 'faction' }, (result) => {
     if (profileBot !== username) return; // stale response
     if (!result.ok && !result.data) {
       profileFactionStorage = [];

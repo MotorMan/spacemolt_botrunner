@@ -46,6 +46,9 @@ const bots: Map<string, Bot> = new Map();
 let server: WebServer;
 let aiChatService: AiChatService | null = null;
 
+// Track failed session restore attempts per bot (timestamps in ms)
+const sessionRestoreFailures: Map<string, number[]> = new Map();
+
 /** Get list of discovered bot usernames (for API use). */
 export function getDiscoveredBots(): string[] {
   return [...bots.keys()];
@@ -685,6 +688,8 @@ async function main(): Promise<void> {
         bot.resumeSession().then(async (ok) => {
           refreshStatusTable();
           if (ok) {
+            // Clear failure counter on success
+            sessionRestoreFailures.delete(name);
             server.logSystem(`${name} session resumed (no login delay)`);
             // Session resumed, start routine if assigned
             const routineKey = assignments[name];
@@ -695,17 +700,25 @@ async function main(): Promise<void> {
             return;
           }
 
-          // Session resume failed, need full login with rate-limited delay
-          const loginDelay = loginIndex * FULL_LOGIN_DELAY_MS;
-          server.logSystem(`${name} session expired, scheduling full login in ${loginDelay / 1000}s...`);
-          server.logSystem(`DEBUG: ${name} login scheduled with delay ${loginDelay}ms (index=${loginIndex})`);
-          setTimeout(() => {
-            server.logSystem(`DEBUG: ${name} login timeout fired, calling bot.login()`);
+          // Session resume failed, record the failure
+          const now = Date.now();
+          const failures = sessionRestoreFailures.get(name) || [];
+          failures.push(now);
+          // Keep only failures from the last minute
+          const recentFailures = failures.filter(ts => now - ts < 60000);
+          sessionRestoreFailures.set(name, recentFailures);
+
+          // Check if excessive failures (3 in past minute)
+          if (recentFailures.length >= 3) {
+            server.logSystem(`${name} session restore failed 3+ times in past minute, forcing immediate full login...`);
+            // Force full login immediately (no delay)
             bot.login().then(async (loginOk) => {
-              server.logSystem(`DEBUG: ${name} login completed, ok=${loginOk}`);
+              // Clear failure counter on successful login
+              sessionRestoreFailures.delete(name);
+              server.logSystem(`DEBUG: ${name} forced login completed, ok=${loginOk}`);
               refreshStatusTable();
               if (!loginOk) {
-                server.logSystem(`${name} login failed`);
+                server.logSystem(`${name} forced login failed`);
                 return;
               }
               // Fetch catalog data if stale (first logged-in bot triggers it)
@@ -726,10 +739,48 @@ async function main(): Promise<void> {
               server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
               await handleStart({ type: "start", bot: name, routine: routineKey });
             }).catch((err) => {
-              server.logSystem(`Login failed for ${name}: ${err}`);
+              server.logSystem(`Forced login failed for ${name}: ${err}`);
               refreshStatusTable();
             });
-          }, loginDelay);
+          } else {
+            // Normal case: schedule full login with rate-limited delay
+            const loginDelay = loginIndex * FULL_LOGIN_DELAY_MS;
+            server.logSystem(`${name} session expired (${recentFailures.length}/3 failures in past minute), scheduling full login in ${loginDelay / 1000}s...`);
+            server.logSystem(`DEBUG: ${name} login scheduled with delay ${loginDelay}ms (index=${loginIndex})`);
+            setTimeout(() => {
+              server.logSystem(`DEBUG: ${name} login timeout fired, calling bot.login()`);
+              bot.login().then(async (loginOk) => {
+                // Clear failure counter on successful login
+                sessionRestoreFailures.delete(name);
+                server.logSystem(`DEBUG: ${name} login completed, ok=${loginOk}`);
+                refreshStatusTable();
+                if (!loginOk) {
+                  server.logSystem(`${name} login failed`);
+                  return;
+                }
+                // Fetch catalog data if stale (first logged-in bot triggers it)
+                if (catalogStore.isStale()) {
+                  try {
+                    await catalogStore.fetchAll(bot.api);
+                    server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                  } catch (err) {
+                    server.logSystem(`Catalog fetch failed: ${err}`);
+                  }
+                }
+                const routineKey = assignments[name];
+                server.logSystem(`DEBUG: ${name} routine assignment: ${routineKey || 'none'}`);
+                if (!routineKey || !ROUTINES[routineKey]) {
+                  server.logSystem(`${name} logged in but no routine assigned`);
+                  return;
+                }
+                server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+                await handleStart({ type: "start", bot: name, routine: routineKey });
+              }).catch((err) => {
+                server.logSystem(`Login failed for ${name}: ${err}`);
+                refreshStatusTable();
+              });
+            }, loginDelay);
+          }
         }).catch((err) => {
           server.logSystem(`Session resume failed for ${name}: ${err}`);
           refreshStatusTable();

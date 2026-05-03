@@ -1185,14 +1185,18 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             ctx.log("error", `Cargo recovery sell failed: ${sResp.error.message}`);
             break;
           }
+          // Get actual revenue from sell result
+          const sr = sResp.result as Record<string, unknown> | undefined;
+          const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+
           // Wait for cargo update after sell
           await ctx.sleep(12000);
           // Verify sale by checking cargo after sell
           await bot.refreshCargo();
           const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
           const actuallySold = inCargo.quantity - afterSell;
-          
-          if (actuallySold <= 0) {
+
+          if (actuallySold <= 0 && actualRevenue <= 0) {
             const itemConfig = settings.tradeItems.find(t => t.itemId === route!.itemId);
             const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
             if (itemMinSellPrice > 0 && inCargo.quantity > 0) {
@@ -1201,8 +1205,22 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               ctx.log("error", `Cargo recovery: Sell command succeeded but no items were sold!`);
             }
             break;
+          } else if (actuallySold <= 0 && actualRevenue > 0) {
+            // Sale succeeded but cargo not updated - manually update
+            ctx.log("warn", `Cargo recovery: Sell command succeeded and revenue earned (${actualRevenue}cr) but cargo not updated yet - manually updating inventory`);
+            const item = bot.inventory.find(i => i.itemId === route!.itemId);
+            if (item) {
+              item.quantity -= sellQty;
+              if (item.quantity <= 0) {
+                bot.inventory = bot.inventory.filter(i => i.itemId !== route!.itemId);
+              }
+            }
+            totalSold += sellQty;
+            remaining -= sellQty;
+            ctx.log("trade", `Cargo recovery: Sold ${sellQty}x ${route!.itemName} (${totalSold} total, ${remaining} remaining)`);
+            continue;
           }
-          
+
           totalSold += actuallySold;
           remaining -= actuallySold;
           ctx.log("trade", `Cargo recovery: Sold ${actuallySold}x ${route!.itemName} (${totalSold} total, ${remaining} remaining)`);
@@ -1242,6 +1260,18 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
                   totalSold += actuallySold;
                   const revenue = actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice;
                   ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} from full cargo — ${revenue}cr revenue (actual)`);
+                } else if (actualRevenue > 0) {
+                  // Sale succeeded but cargo not updated - manually update and count as sold
+                  ctx.log("warn", `Sell command succeeded and revenue earned (${actualRevenue}cr) but cargo not updated yet - manually updating inventory`);
+                  const item = bot.inventory.find(i => i.itemId === route!.itemId);
+                  if (item) {
+                    item.quantity -= marketCheck.sellQty;
+                    if (item.quantity <= 0) {
+                      bot.inventory = bot.inventory.filter(i => i.itemId !== route!.itemId);
+                    }
+                  }
+                  totalSold += marketCheck.sellQty;
+                  ctx.log("trade", `Sold ${marketCheck.sellQty}x ${route!.itemName} from full cargo — ${actualRevenue}cr revenue (actual)`);
                 }
               }
             } else {
@@ -1439,6 +1469,10 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               continue;
             }
 
+            // Get actual revenue from sell result
+            const sr = sResp.result as Record<string, unknown> | undefined;
+            const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+
             // Wait for cargo update after successful sell
             await ctx.sleep(12000);
 
@@ -1447,18 +1481,32 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             const afterQty = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
             const soldThisAttempt = cargoQty - afterQty;
 
-            if (soldThisAttempt <= 0) {
-              ctx.log("error", `Sell succeeded but no items sold (retry ${retry + 1}/${maxRetries})`);
+            if (soldThisAttempt <= 0 && actualRevenue <= 0) {
+              ctx.log("error", `Sell succeeded but no items sold and no revenue earned (retry ${retry + 1}/${maxRetries})`);
               await ctx.sleep(1000);
               continue;
+            } else if (soldThisAttempt <= 0 && actualRevenue > 0) {
+              // Sale succeeded but cargo not updated - manually update and count as sold
+              ctx.log("warn", `Sell succeeded and revenue earned (${actualRevenue}cr) but cargo not updated yet - manually updating inventory`);
+              const item = bot.inventory.find(i => i.itemId === route!.itemId);
+              if (item) {
+                item.quantity -= sellNow;
+                if (item.quantity <= 0) {
+                  bot.inventory = bot.inventory.filter(i => i.itemId !== route!.itemId);
+                }
+              }
+              orderTotalSold += sellNow;
+              totalSold += sellNow;
+              totalRevenue += actualRevenue;
+              ctx.log("trade", `Sold ${sellNow}x ${route!.itemName} at ${currentPrice}cr — ${actualRevenue}cr (order total: ${orderTotalSold}/${targetQty}, overall total: ${totalSold})`);
+            } else {
+              // Success
+              orderTotalSold += soldThisAttempt;
+              const revenue = actualRevenue > 0 ? actualRevenue : soldThisAttempt * currentPrice;
+              totalSold += soldThisAttempt;
+              totalRevenue += revenue;
+              ctx.log("trade", `Sold ${soldThisAttempt}x ${route!.itemName} at ${currentPrice}cr — ${revenue}cr (order total: ${orderTotalSold}/${targetQty}, overall total: ${totalSold})`);
             }
-
-            // Success
-            orderTotalSold += soldThisAttempt;
-            const revenue = soldThisAttempt * currentPrice;
-            totalSold += soldThisAttempt;
-            totalRevenue += revenue;
-            ctx.log("trade", `Sold ${soldThisAttempt}x ${route!.itemName} at ${currentPrice}cr — ${revenue}cr (order total: ${orderTotalSold}/${targetQty}, overall total: ${totalSold})`);
 
             // If we've sold the target quantity for this order, break
             if (orderTotalSold >= targetQty) {
@@ -1864,9 +1912,27 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
             const actuallySold = marketCheck.sellQty - afterSell;
 
-            if (actuallySold <= 0) {
-              ctx.log("error", `Sell command succeeded but no items were sold - item still in cargo (${inCargo}x)`);
+            if (actuallySold <= 0 && actualRevenue <= 0) {
+              ctx.log("error", `Sell command succeeded but no items were sold and no revenue earned - item still in cargo (${inCargo}x)`);
               await failFactionSession(bot.username, "Sell command did not remove items from cargo");
+            } else if (actuallySold <= 0 && actualRevenue > 0) {
+              // Sale succeeded (revenue earned) but cargo API not updated yet - manually update inventory
+              ctx.log("warn", `Sell command succeeded and revenue earned (${actualRevenue}cr) but cargo not updated yet - manually updating inventory`);
+              const item = bot.inventory.find(i => i.itemId === route!.itemId);
+              if (item) {
+                item.quantity -= marketCheck.sellQty;
+                if (item.quantity <= 0) {
+                  bot.inventory = bot.inventory.filter(i => i.itemId !== route!.itemId);
+                }
+              }
+              const revenue = actualRevenue;
+              bot.stats.totalTrades++;
+              bot.stats.totalProfit += revenue;
+              ctx.log("trade", `Sold ${marketCheck.sellQty}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue (actual)`);
+              await factionDonateProfit(ctx, revenue);
+              // Complete trade session
+              const actualProfit = revenue; // No acquisition cost for faction items
+              await completeTradeSession(bot.username, revenue, actualProfit);
             } else {
               const revenue = actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice;
               bot.stats.totalTrades++;

@@ -4028,21 +4028,28 @@ function mcRefreshStorageForDepositAll() {
   const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
   logResponse(`<span class="resp-cmd">${ts} > refreshing storage for deposit all</span>`);
   
-  // Refresh cargo (get_cargo returns inventory)
-  sendExec(profileBot, 'get_cargo', {}, (cargoResult) => {
-    if (cargoResult.ok && cargoResult.data) {
-      // get_cargo returns { cargo: [...], cargoMax: N } or { items: [...] }
-      const cargoData = cargoResult.data.cargo || cargoResult.data.items || [];
-      // The cargo items have itemId (camelCase) format
-      bot.inventory = cargoData;
-      logResponse(`<span class="resp-ok">Cargo: ${cargoData.length} items</span>`);
-    }
+    // Refresh cargo (get_cargo returns inventory)
+    sendExec(profileBot, 'get_cargo', {}, (cargoResult) => {
+      if (cargoResult.ok && cargoResult.data) {
+        // get_cargo returns { cargo: [...], cargoMax: N } or { items: [...] }
+        const cargoData = (cargoResult.data.cargo || cargoResult.data.items || []).map(item => ({
+          itemId: item.item_id || item.itemId,
+          name: item.name || catalogName(item.item_id || item.itemId),
+          quantity: item.quantity
+        }));
+        bot.inventory = cargoData;
+        logResponse(`<span class="resp-ok">Cargo: ${cargoData.length} items</span>`);
+      }
     
     // Refresh station storage
     sendExec(profileBot, 'view_storage', {}, (storageResult) => {
       if (storageResult.ok && storageResult.data) {
         // view_storage returns { storage: [...] } or { items: [...] }
-        const storageData = storageResult.data.storage || storageResult.data.items || [];
+        const storageData = (storageResult.data.storage || storageResult.data.items || []).map(item => ({
+          itemId: item.item_id || item.itemId,
+          name: item.name || catalogName(item.item_id || item.itemId),
+          quantity: item.quantity
+        }));
         bot.storage = storageData;
         logResponse(`<span class="resp-ok">Station storage: ${storageData.length} items</span>`);
       }
@@ -4050,7 +4057,11 @@ function mcRefreshStorageForDepositAll() {
       // Refresh faction storage using view_storage with target: 'faction'
       sendExec(profileBot, 'view_storage', { target: 'faction' }, (factionResult) => {
         if (factionResult.ok && factionResult.data) {
-          const faction = factionResult.data.items || factionResult.data.storage || [];
+          const faction = (factionResult.data.items || factionResult.data.storage || []).map(item => ({
+            item_id: item.item_id || item.itemId,
+            name: item.name || catalogName(item.item_id || item.itemId),
+            quantity: item.quantity
+          }));
           profileFactionStorage = faction;
           logResponse(`<span class="resp-ok">Faction storage: ${faction.length} items</span>`);
         }
@@ -5116,7 +5127,11 @@ function mcExec(command, params) {
       sendExec(profileBot, 'get_cargo', {}, (cargoResult) => {
         const bot = getFreshBot();
         if (bot && cargoResult.ok && cargoResult.data) {
-          const freshCargo = cargoResult.data.cargo || cargoResult.data.items || [];
+          const freshCargo = (cargoResult.data.cargo || cargoResult.data.items || []).map(item => ({
+            itemId: item.item_id || item.itemId,
+            name: item.name || catalogName(item.item_id || item.itemId),
+            quantity: item.quantity
+          }));
           bot.inventory = freshCargo;
           window._freshCargo = freshCargo;
         }
@@ -5129,7 +5144,11 @@ function mcExec(command, params) {
       sendExec(profileBot, 'view_storage', {}, (storageResult) => {
         const bot = getFreshBot();
         if (bot && storageResult.ok && storageResult.data) {
-          const freshStorage = storageResult.data.storage || storageResult.data.items || [];
+          const freshStorage = (storageResult.data.storage || storageResult.data.items || []).map(item => ({
+            itemId: item.item_id || item.itemId,
+            name: item.name || catalogName(item.item_id || item.itemId),
+            quantity: item.quantity
+          }));
           bot.storage = freshStorage;
           window._freshStorage = freshStorage;
         }
@@ -5140,7 +5159,11 @@ function mcExec(command, params) {
       // Step 3: Fetch updated faction storage using view_storage with target: 'faction'
       sendExec(profileBot, 'view_storage', { target: 'faction' }, (factionResult) => {
         if (factionResult.ok && factionResult.data) {
-          const freshFaction = factionResult.data.items || factionResult.data.storage || [];
+          const freshFaction = (factionResult.data.items || factionResult.data.storage || []).map(item => ({
+            item_id: item.item_id || item.itemId,
+            name: item.name || catalogName(item.item_id || item.itemId),
+            quantity: item.quantity
+          }));
           profileFactionStorage = freshFaction;
           window._freshFactionStorage = freshFaction;
         }
@@ -5637,7 +5660,11 @@ function fetchRecipes(username) {
       return;
     }
     const d = result.data || {};
-    profileFactionStorage = d.items || d.storage || [];
+    profileFactionStorage = (d.items || d.storage || []).map(item => ({
+      item_id: item.item_id || item.itemId,
+      name: item.name || catalogName(item.item_id || item.itemId),
+      quantity: item.quantity
+    }));
     // Also update global faction storage for market tab
     globalFactionStorage = profileFactionStorage;
     renderManualControls();

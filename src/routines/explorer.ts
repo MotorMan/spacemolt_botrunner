@@ -1484,6 +1484,67 @@ async function* scanStation(
     await checkAndAcceptMissions(ctx);
   }
 
+  // Browse ships for sale while docked
+  yield `browse_ships_${poi.id}`;
+  const browseResp = await bot.exec("browse_ships");
+
+  // Check for battle after browse_ships
+  if (await checkBattleAfterCommand(ctx, browseResp.notifications, "browse_ships")) {
+    ctx.log("combat", "Battle detected during ship browsing - fleeing!");
+    await ctx.sleep(5000);
+    return;
+  }
+
+  if (browseResp.error) {
+    ctx.log("error", `browse_ships failed: ${browseResp.error.message}`);
+  } else if (browseResp.result && typeof browseResp.result === "object") {
+    const result = browseResp.result as Record<string, unknown>;
+    const listings = (
+      Array.isArray(result.listings) ? result.listings : []
+    ) as Array<Record<string, unknown>>;
+
+    if (listings.length > 0) {
+      ctx.log("info", `Saving ${listings.length} ship listings from ${poi.name}...`);
+      const shipsData = loadShipsForSale();
+      let updated = 0;
+
+      for (const listing of listings) {
+        const listing_id = (listing.listing_id as string) || "";
+        if (!listing_id) continue;
+
+        const shipListing: ShipListing = {
+          systemId: systemId,
+          stationPoiId: poi.id,
+          stationName: poi.name,
+          listing_id,
+          ship_id: (listing.ship_id as string) || "",
+          class_id: (listing.class_id as string) || "",
+          price: (listing.price as number) || 0,
+          listed_at: (listing.listed_at as string) || "",
+          seller: (listing.seller as string) || "",
+          ship_name: (listing.ship_name as string) || "",
+          tier: (listing.tier as number) || 0,
+          hull: (listing.hull as number) || 0,
+          max_hull: (listing.max_hull as number) || 0,
+          shield: (listing.shield as number) || 0,
+          modules_count: (listing.modules_count as number) || 0,
+          scale: (listing.scale as number) || 0,
+          category: (listing.category as string) || "",
+          custom_name: listing.custom_name as string,
+          last_updated: now(),
+        };
+
+        shipsData.listings[listing_id] = shipListing;
+        updated++;
+      }
+
+      if (updated > 0) {
+        saveShipsForSale(shipsData);
+        ctx.log("info", `Saved ${updated} ship listings to shipsForSale.json`);
+      }
+    }
+  }
+
   // Undock
   yield `undock_${poi.id}`;
   const undockResp = await bot.exec("undock");
@@ -2208,14 +2269,25 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
             }
           }
 
-          const missResp = await bot.exec("get_missions");
+           const missResp = await bot.exec("get_missions");
 
-          // Check for battle after get_missions
-          if (await checkBattleAfterCommand(ctx, missResp.notifications, "get_missions")) {
-            ctx.log("combat", "Battle detected during mission scan - fleeing!");
-            await ctx.sleep(5000);
-            continue;
-          }
+           // Check for battle after get_missions
+           if (await checkBattleAfterCommand(ctx, missResp.notifications, "get_missions")) {
+             ctx.log("combat", "Battle detected during mission scan - fleeing!");
+             await ctx.sleep(5000);
+             continue;
+           }
+
+           if (missResp.result && typeof missResp.result === "object") {
+             const mData = missResp.result as Record<string, unknown>;
+             const missions = (
+               Array.isArray(mData) ? mData :
+               Array.isArray(mData.missions) ? mData.missions :
+               Array.isArray(mData.available) ? mData.available :
+               []
+             ) as Array<Record<string, unknown>>;
+             if (missions.length > 0) mapStore.updateMissions(target.systemId, target.stationPoi, missions);
+           }
 
           if (missResp.result && typeof missResp.result === "object") {
             const mData = missResp.result as Record<string, unknown>;

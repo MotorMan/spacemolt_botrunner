@@ -2066,6 +2066,12 @@ export async function fullSalvageWrecks(
 
     // Step 2: Optionally tow high-value wrecks
     if (enableTow) {
+      // Skip jettison wrecks - they cannot be towed
+      if (wreck.name === "jettison") {
+        ctx.log("scavenge", `Skipping tow attempt for jettison wreck ${wreck.wreck_id} (${wreck.name}) - jettison wrecks cannot be towed`);
+        continue;
+      }
+
       // Check if we already have a tow attached
       await bot.refreshStatus();
       if (bot.towingWreck) {

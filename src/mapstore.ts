@@ -1158,17 +1158,17 @@ class MapStore {
   /**
    * Estimate minutes until a resource regenerates based on availability level.
    * Model: resources regen ~25% every 3 hours (180 minutes).
-   * depletion_percent from game API means "% available" (100 = full, 0 = empty).
+   * depletion_percent from game API means "% depleted" (0 = full, 100 = empty).
    * Returns 0 if resource is not depleted enough to need regen.
    */
   estimateRegenTime(depletionPercent: number, minutesSinceScan: number): number {
-    // If more than 75% available, no regen needed
-    if (depletionPercent > 75) return 0;
+    // If less than 25% depleted (more than 75% available), no regen needed
+    if (depletionPercent < 25) return 0;
 
     // Base regen: 25% per 180 minutes
-    // For every 25% missing beyond 75% threshold, need 180 more minutes
-    const missingPercent = 100 - depletionPercent;
-    const regenCycles = Math.ceil(missingPercent / 25);
+    // For every 25% depleted beyond 25% threshold, need 180 more minutes
+    const depletedBeyondThreshold = depletionPercent - 25;
+    const regenCycles = Math.ceil(depletedBeyondThreshold / 25);
     return regenCycles * 180;
   }
 
@@ -1240,14 +1240,15 @@ class MapStore {
         // This way, 19K remaining beats 8K remaining regardless of percentage mined
         // Capped at 100 points (equivalent to maxRemaining >= 10000)
         let abundanceScore = Math.min(100, Math.log10(loc.remaining + 1) * 15);
-        
+
         // But also give bonus for high percentage (virgin systems)
-        if (loc.depletionPercent >= 95) {
+        const percentAvailable = 100 - loc.depletionPercent;
+        if (percentAvailable >= 95) {
           abundanceScore += 20; // Virgin system bonus
         }
 
         // 2. Availability bonus (0-30 points) — lower weight, just to prefer healthier systems
-        const availabilityScore = (loc.depletionPercent / 100) * 30;
+        const availabilityScore = (percentAvailable / 100) * 30;
 
         // 3. Distance penalty — Adjusted for ship speed and cargo capacity
         // Faster ships can travel further efficiently, larger cargo means fewer returns
@@ -1284,9 +1285,9 @@ class MapStore {
         // This discourages selecting systems that are nearly empty
         // Even if they pass the 10% threshold, we still want to prefer healthier systems
         let depletionPenalty = 0;
-        if (loc.depletionPercent < 25) {
+        if (percentAvailable < 25) {
           // Linear penalty: 0% at 25% availability, -30 points at 10%
-          depletionPenalty = -30 * ((25 - loc.depletionPercent) / 15);
+          depletionPenalty = -30 * ((25 - percentAvailable) / 15);
         }
 
         // 6. HIDDEN POI BONUS (CRITICAL for deep core mining)

@@ -6602,20 +6602,13 @@ function renderMap() {
         html += `<div class="poi-section-title">Resource Scan</div>`;
         html += `<div class="poi-resource-grid">`;
         for (const res of poi.resources) {
-          // depletion_percent = % available (100 = full, 0 = empty)
-          const availColor = res.depletion_percent >= 80 ? '#2196f3' : 
-                            res.depletion_percent >= 50 ? '#4caf50' : 
-                            res.depletion_percent >= 20 ? '#ff9800' : '#f44336';
-          html += `<div class="resource-card">`;
-          html += `<div class="resource-name">${esc(res.name)}</div>`;
-          html += `<div class="resource-stats">`;
-          html += `<div class="resource-row"><span class="resource-label">Richness:</span><span class="resource-value">${res.richness}</span></div>`;
-          html += `<div class="resource-row"><span class="resource-label">Remaining:</span><span class="resource-value">${res.remaining.toLocaleString()}</span></div>`;
-          html += `<div class="resource-row"><span class="resource-label">Max:</span><span class="resource-value">${res.max_remaining.toLocaleString()}</span></div>`;
-          html += `</div>`;
-          html += `<div class="resource-depletion-bar">`;
-          html += `<div class="resource-depletion-fill" style="width:${res.depletion_percent}%;background:${availColor}"></div>`;
-          html += `<span class="resource-depletion-text">${res.depletion_percent.toFixed(1)}% available</span>`;
+          // depletion_percent = % depleted (0 = full, 100 = empty)
+          const percentAvailable = 100 - res.depletion_percent;
+          const availColor = percentAvailable >= 80 ? '#2196f3' :
+                            percentAvailable >= 50 ? '#4caf50' :
+                            percentAvailable >= 20 ? '#ff9800' : '#f44336';
+          html += `<div class="resource-depletion-fill" style="width:${percentAvailable}%;background:${availColor}"></div>`;
+          html += `<span class="resource-depletion-text">${percentAvailable.toFixed(1)}% available</span>`;
           html += `</div>`;
           if (res.last_scanned) {
             html += `<div class="resource-scanned">Scanned ${timeAgo(res.last_scanned)}</div>`;

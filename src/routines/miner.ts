@@ -3588,13 +3588,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const currentRichness = (currentResourceData?.richness as number) ?? 0;
         const currentRemaining = (currentResourceData?.remaining as number) ?? 0;
 
-        // Only search for upgrades if current POI has low richness (< 20) OR has been significantly depleted
-        const richnessThreshold = 20;
-        const depletionThreshold = 0.5; // 50% depleted
+        // Only search for upgrades if current POI is 100% depleted
         const maxRemaining = (currentResourceData?.max_remaining as number) ?? 0;
         const depletionPercent = maxRemaining > 0 ? currentRemaining / maxRemaining : 1;
 
-        const shouldSearchForUpgrade = currentRichness < richnessThreshold || depletionPercent < depletionThreshold;
+        const shouldSearchForUpgrade = depletionPercent <= 0; // 100% depleted
 
         if (shouldSearchForUpgrade) {
           ctx.log("mining", `Richness check: current POI has richness ${currentRichness}, ${((1 - depletionPercent) * 100).toFixed(1)}% depleted — searching for better options...`);
@@ -3652,8 +3650,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
               let upgradeReason = "";
 
               if (bestLoc.isHidden && !currentPoi?.hidden) {
-                shouldUpgrade = true;
-                upgradeReason = `hidden POI upgrade (${bestLoc.poiName} vs ${currentPoi?.name})`;
+                const canMineHiddenForType = miningType === "ore" ? deepCoreCap.canMineHidden :
+                  miningType === "radioactive" ? canMineHiddenRadioactive :
+                  miningType === "ice" ? canMineHiddenIce : false;
+                if (canMineHiddenForType) {
+                  shouldUpgrade = true;
+                  upgradeReason = `hidden POI upgrade (${bestLoc.poiName} vs ${currentPoi?.name})`;
+                }
               } else if (bestRichness >= currentRichness * 2 && bestRichness > 10) {
                 shouldUpgrade = true;
                 upgradeReason = `much higher richness (${bestRichness} vs ${currentRichness})`;
@@ -3709,7 +3712,21 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
                     continue;
                   }
 
-                  const arrived = await navigateToSystem(ctx, bestLoc.systemId, safetyOpts);
+                  const travelOpts = {
+                    ...safetyOpts,
+                    onJump: async (jumpNumber: number) => {
+                      // Check if target POI is still available
+                      const sys = mapStore.getSystem(bestLoc.systemId);
+                      const poi = sys?.pois.find(p => p.id === bestLoc.poiId);
+                      const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+                      if (oreEntry && oreEntry.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+                        ctx.log("mining", `Target POI ${bestLoc.poiName} depleted by another bot during travel (jump ${jumpNumber}) — aborting richness upgrade`);
+                        return false;
+                      }
+                      return true;
+                    }
+                  };
+                  const arrived = await navigateToSystem(ctx, bestLoc.systemId, travelOpts);
                   if (arrived) {
                     const { pois: newPois } = await getSystemInfo(ctx);
                     pois = newPois;
@@ -3889,7 +3906,21 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
                         // Travel to new system if needed
                         if (chosen.systemId !== bot.system) {
-                          const arrived = await navigateToSystem(ctx, chosen.systemId, safetyOpts);
+                          const travelOpts = {
+                            ...safetyOpts,
+                            onJump: async (jumpNumber: number) => {
+                              // Check if target POI is still available
+                              const sys = mapStore.getSystem(chosen.systemId);
+                              const poi = sys?.pois.find(p => p.id === chosen.poiId);
+                              const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+                              if (oreEntry && oreEntry.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+                                ctx.log("mining", `Target POI ${chosen.poiName} depleted by another bot during travel (jump ${jumpNumber}) — aborting travel`);
+                                return false;
+                              }
+                              return true;
+                            }
+                          };
+                          const arrived = await navigateToSystem(ctx, chosen.systemId, travelOpts);
                           if (arrived) {
                             const { pois: newPois } = await getSystemInfo(ctx);
                             pois = newPois;
@@ -4582,7 +4613,21 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
             if (newSystemId && newSystemId !== bot.system) {
               // Need to jump to new system first
               ctx.log("mining", `Traveling to ${newTarget} in ${newSystemId} (${newPoiName}) - stayOutUntilFull`);
-              const arrived = await navigateToSystem(ctx, newSystemId, safetyOpts);
+              const travelOpts = {
+                ...safetyOpts,
+                onJump: async (jumpNumber: number) => {
+                  // Check if target POI is still available
+                  const sys = mapStore.getSystem(newSystemId);
+                  const poi = sys?.pois.find(p => p.id === newPoiId);
+                  const oreEntry = poi?.ores_found.find(o => o.item_id === targetResource);
+                  if (oreEntry && oreEntry.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
+                    ctx.log("mining", `Target POI ${newPoiName} depleted by another bot during travel (jump ${jumpNumber}) — aborting travel`);
+                    return false;
+                  }
+                  return true;
+                }
+              };
+              const arrived = await navigateToSystem(ctx, newSystemId, travelOpts);
               if (!arrived) {
                 ctx.log("error", "Failed to reach new system — returning home");
                 stopReason = `${resourceLabel} field depleted (travel failed)`;

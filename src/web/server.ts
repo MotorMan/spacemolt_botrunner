@@ -463,6 +463,16 @@ export class WebServer {
             return Response.json({ error: "Map file not found" }, { status: 404 });
           }
         }
+        if (url.pathname === "/data/shipsForSale.json") {
+          const shipsForSalePath = join(DATA_DIR, "shipsForSale.json");
+          if (existsSync(shipsForSalePath)) {
+            return new Response(readFileSync(shipsForSalePath, "utf-8"), {
+              headers: { "Content-Type": "application/json" },
+            });
+          } else {
+            return Response.json({ error: "Ships for sale file not found" }, { status: 404 });
+          }
+        }
         if (url.pathname === "/api/logs/main") {
           // Return persisted main logs (activity, broadcast, system, faction)
           return Response.json({
@@ -834,6 +844,17 @@ export class WebServer {
         if (url.pathname === "/players.html") {
           const playersPath = join(import.meta.dir, "players.html");
           return new Response(readFileSync(playersPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve shipsforsale.html for ships for sale route
+        if (url.pathname === "/shipsforsale.html") {
+          const shipsforsalePath = join(import.meta.dir, "shipsforsale.html");
+          return new Response(readFileSync(shipsforsalePath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",

@@ -113,7 +113,7 @@ main {
 #page-players.active {
   display: flex;
 }
-#playersFrame {
+#playersFrame, #shipsforsaleFrame {
   flex: 1;
   width: 100%;
   border: none;

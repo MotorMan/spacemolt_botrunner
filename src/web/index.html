@@ -21,8 +21,9 @@
       <div class="top-tab" data-tab="faction" onclick="switchTab('faction')">Faction</div>
       <div class="top-tab" data-tab="shipyard" onclick="switchTab('shipyard')">Shipyard</div>
       <div class="top-tab" data-tab="stats" onclick="switchTab('stats')">Stats</div>
-      <div class="top-tab" data-tab="players" onclick="switchTab('players')">Players</div>
-      <div class="top-tab" data-tab="settings" onclick="switchTab('settings')">Settings</div>
+       <div class="top-tab" data-tab="players" onclick="switchTab('players')">Players</div>
+       <div class="top-tab" data-tab="shipsforsale" onclick="switchTab('shipsforsale')">Ships For Sale</div>
+       <div class="top-tab" data-tab="settings" onclick="switchTab('settings')">Settings</div>
     </div>
   </div>
   <div class="header-right">
@@ -385,9 +386,9 @@
         <!-- filled by JS -->
       </div>
     </div>
-  </div>
+   </div>
 
-  <!-- ══ Map Tab ══ -->
+   <!-- ══ Map Tab ══ -->
   <div class="tab-page" id="page-map">
     <div class="map-layout">
       <div class="map-filters">
@@ -497,12 +498,17 @@
     </div>
   </div>
 
-  <!-- ══ Players Tab ══ -->
-  <div class="tab-page" id="page-players">
-    <iframe id="playersFrame" src="/players.html"></iframe>
-  </div>
+   <!-- ══ Players Tab ══ -->
+   <div class="tab-page" id="page-players">
+     <iframe id="playersFrame" src="/players.html"></iframe>
+   </div>
 
-  <!-- ══ Stats Tab ══ -->
+   <!-- ══ Ships For Sale Tab ══ -->
+   <div class="tab-page" id="page-shipsforsale">
+     <iframe id="shipsforsaleFrame" src="/shipsforsale.html"></iframe>
+   </div>
+
+   <!-- ══ Stats Tab ══ -->
   <div class="tab-page" id="page-stats">
     <div class="stats-page-header">
       <h3>Fleet Statistics</h3>
@@ -717,6 +723,11 @@ function switchTab(name) {
   if (name === 'players') {
     // Refresh the iframe to get latest data
     const frame = document.getElementById('playersFrame');
+    if (frame) frame.src = frame.src;
+  }
+  if (name === 'shipsforsale') {
+    // Refresh the iframe to get latest data
+    const frame = document.getElementById('shipsforsaleFrame');
     if (frame) frame.src = frame.src;
   }
 }
@@ -9336,6 +9347,7 @@ function renderFuelCellSellerSettings(panel) {
   const baseTargetPrice = fc.baseTargetPrice || 40;
   const autoMinPrice = fc.autoMinPrice || 30;
   const autoMaxPrice = fc.autoMaxPrice || 50;
+  const maxFuelCellsPerStation = fc.maxFuelCellsPerStation || 20000;
 
   // Build home system dropdown options from mapData
   const sysOpts = ['<option value="">(select home system)</option>'];
@@ -9439,6 +9451,14 @@ function renderFuelCellSellerSettings(panel) {
       <input type="number" id="set-fc-baseTargetPrice" min="1" max="10000" value="${baseTargetPrice}">
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max Fuel Cells Per Station</div>
+        <div class="setting-hint">Maximum number of fuel cells to have listed for sale at each station.</div>
+      </div>
+      <input type="number" id="set-fc-maxFuelCellsPerStation" min="1" max="100000" value="${maxFuelCellsPerStation}">
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveFuelCellSellerSettings()">Save Settings</button>
     </div>
@@ -9481,6 +9501,7 @@ function saveFuelCellSellerSettings() {
     baseTargetPrice: parseInt(document.getElementById('set-fc-baseTargetPrice').value) || 40,
     autoMinPrice: parseInt(document.getElementById('set-fc-autoMinPrice').value) || 30,
     autoMaxPrice: parseInt(document.getElementById('set-fc-autoMaxPrice').value) || 50,
+    maxFuelCellsPerStation: parseInt(document.getElementById('set-fc-maxFuelCellsPerStation').value) || 20000,
   };
   send({ type: 'saveSettings', routine: 'fuel_cell_seller', settings: s });
   settings.fuel_cell_seller = s;

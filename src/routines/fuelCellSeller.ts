@@ -214,6 +214,7 @@ function getFuelCellSellerSettings(username?: string): {
   baseTargetPrice: number;
   autoMinPrice: number;
   autoMaxPrice: number;
+  maxFuelCellsPerStation: number;
 } {
   const all = readSettings();
   const general = (all.general as Record<string, unknown>) || {};
@@ -232,6 +233,7 @@ function getFuelCellSellerSettings(username?: string): {
     baseTargetPrice: (fc.baseTargetPrice as number) || 40,
     autoMinPrice: (fc.autoMinPrice as number) || 30,
     autoMaxPrice: (fc.autoMaxPrice as number) || 50,
+    maxFuelCellsPerStation: (fc.maxFuelCellsPerStation as number) || 20000,
   };
 }
 
@@ -690,6 +692,25 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     // Calculate current unsold from active orders
     const currentUnsold = currentStationOrders.reduce((sum, o) => sum + o.remaining, 0);
 
+    // Check if station is already at or above cap
+    if (currentUnsold >= settings.maxFuelCellsPerStation) {
+      ctx.log("fc", `Station ${target.poiName} already has ${currentUnsold} unsold fuel cells (cap: ${settings.maxFuelCellsPerStation}) — skipping`);
+      targetIdx = (targetIdx + 1) % fcData.stations.length;
+      fcData.currentStationIndex = targetIdx;
+      saveFCStationsData(fcData);
+      continue;
+    }
+
+    // Calculate how many to place
+    const quantityToPlace = Math.min(availableQty, settings.maxFuelCellsPerStation - currentUnsold);
+    if (quantityToPlace <= 0) {
+      ctx.log("fc", `Cannot place orders at ${target.poiName}: ${currentUnsold} unsold, cap ${settings.maxFuelCellsPerStation}, available ${availableQty} — skipping`);
+      targetIdx = (targetIdx + 1) % fcData.stations.length;
+      fcData.currentStationIndex = targetIdx;
+      saveFCStationsData(fcData);
+      continue;
+    }
+
     // Get market data for pricing
     let marketData: unknown = null;
     const marketResp = await bot.exec("view_market", { item_id: FUEL_CELL_ITEM_ID });
@@ -698,24 +719,22 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
     }
 
     let price: number | null = null;
-    if (availableQty > 0) {
-      price = await getOptimalPrice(ctx, marketData, settings);
-      ctx.log("fc", `Creating sell orders: ${availableQty}x @ ${price}cr each`);
-    }
+    price = await getOptimalPrice(ctx, marketData, settings);
+    ctx.log("fc", `Creating sell orders: ${quantityToPlace}x @ ${price}cr each (cap: ${settings.maxFuelCellsPerStation}, current unsold: ${currentUnsold})`);
 
     let ordersPlacedCount = 0;
 
-    if (availableQty > 0) {
+    if (quantityToPlace > 0) {
       const createResp = await bot.exec("create_sell_order", {
         item_id: FUEL_CELL_ITEM_ID,
-        quantity: availableQty,
+        quantity: quantityToPlace,
         price_each: price!,
       });
 
       if (createResp.error) {
         ctx.log("error", `Create sell order failed: ${createResp.error.message}`);
       } else {
-        ctx.log("fc", `Listed ${availableQty}x ${FUEL_CELL_ITEM_NAME} @ ${price!}cr`);
+        ctx.log("fc", `Listed ${quantityToPlace}x ${FUEL_CELL_ITEM_NAME} @ ${price!}cr`);
 
         // Refresh orders after creating new one
         const updatedOrdersResp = await bot.exec("view_orders", { scope: "personal" });
@@ -733,7 +752,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
           }));
         }
 
-        ordersPlacedCount = availableQty;
+        ordersPlacedCount = quantityToPlace;
       }
     }
 

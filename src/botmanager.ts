@@ -721,15 +721,15 @@ async function main(): Promise<void> {
                 server.logSystem(`${name} forced login failed`);
                 return;
               }
-              // Fetch catalog data if stale (first logged-in bot triggers it)
-              if (catalogStore.isStale()) {
-                try {
-                  await catalogStore.fetchAll(bot.api);
-                  server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
-                } catch (err) {
-                  server.logSystem(`Catalog fetch failed: ${err}`);
+                // Fetch catalog data if stale (first logged-in bot triggers it)
+                if (catalogStore.isStale()) {
+                  try {
+                    await catalogStore.fetchAll(bot.api);
+                    server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                  } catch (err) {
+                    server.logSystem(`Catalog fetch failed: ${err}`);
+                  }
                 }
-              }
               const routineKey = assignments[name];
               server.logSystem(`DEBUG: ${name} routine assignment: ${routineKey || 'none'}`);
               if (!routineKey || !ROUTINES[routineKey]) {
@@ -758,15 +758,15 @@ async function main(): Promise<void> {
                   server.logSystem(`${name} login failed`);
                   return;
                 }
-                // Fetch catalog data if stale (first logged-in bot triggers it)
-                if (catalogStore.isStale()) {
-                  try {
-                    await catalogStore.fetchAll(bot.api);
-                    server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
-                  } catch (err) {
-                    server.logSystem(`Catalog fetch failed: ${err}`);
-                  }
+              // Fetch catalog data if stale (first logged-in bot triggers it)
+              if (catalogStore.isStale()) {
+                try {
+                  await catalogStore.fetchAll(bot.api);
+                  server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                } catch (err) {
+                  server.logSystem(`Catalog fetch failed: ${err}`);
                 }
+              }
                 const routineKey = assignments[name];
                 server.logSystem(`DEBUG: ${name} routine assignment: ${routineKey || 'none'}`);
                 if (!routineKey || !ROUTINES[routineKey]) {

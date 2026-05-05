@@ -1,3 +1,5 @@
+import { appendFileSync, existsSync, mkdirSync } from "fs";
+import { join } from "path";
 import { SpaceMoltAPI, type ApiResponse } from "./api.js";
 import { SessionManager, type Credentials } from "./session.js";
 import { log, logError, logNotifications } from "./ui.js";
@@ -91,6 +93,7 @@ export class Bot {
   readonly username: string;
   readonly api: SpaceMoltAPI;
   readonly session: SessionManager;
+  private baseDir: string;
   private color: string;
   private _state: BotState = "idle";
   private _routine: string | null = null;
@@ -98,6 +101,8 @@ export class Bot {
   private _error: string | null = null;
   private _abortController: AbortController | null = null;
   private pendingCommands = new Map<string, AbortController>();
+  private lastSystem = "unknown";
+  private lastPoi = "";
 
   // Cached game state from last get_status
   credits = 0;
@@ -215,6 +220,7 @@ export class Bot {
 
   constructor(username: string, baseDir: string) {
     this.username = username;
+    this.baseDir = baseDir;
     this.api = new SpaceMoltAPI();
     this.api.setBotName(username);
     this.session = new SessionManager(username, baseDir);
@@ -222,9 +228,24 @@ export class Bot {
     this.api.setSessionManager(this.session);
     this.color = BOT_COLORS[colorIndex % BOT_COLORS.length];
     colorIndex++;
-    
+
     // Initialize player name tracking
     playerNameStore.setBotName(username);
+  }
+
+  private logPosition(): void {
+    const dataDir = join(this.baseDir, "data");
+    if (!existsSync(dataDir)) {
+      mkdirSync(dataDir, { recursive: true });
+    }
+    const logFile = join(dataDir, "bot_positions.csv");
+    const header = "bot_name,time,system_id,poi_id\n";
+    if (!existsSync(logFile)) {
+      appendFileSync(logFile, header);
+    }
+    const time = new Date().toISOString();
+    const line = `${this.username},${time},${this.system},${this.poi}\n`;
+    appendFileSync(logFile, line);
   }
 
   get state(): BotState {
@@ -795,6 +816,14 @@ export class Bot {
 
       // Fallback: fuel at top level
       if (typeof r.fuel === "number") this.fuel = r.fuel;
+    }
+
+    // Log position change if system or poi updated
+    if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
+      this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
+      this.logPosition();
+      this.lastSystem = this.system;
+      this.lastPoi = this.poi;
     }
 
     // Also refresh cargo inventory (and storage only if docked)
@@ -2163,12 +2192,17 @@ export class Bot {
     }
   }
 
-  /** Signal the bot to stop after the current action. */
+  /** Signal the bot to stop immediately, canceling all pending operations. */
   stop(): void {
     if (this._state !== "running") return;
     this._state = "stopping";
     this._abortController?.abort();
-    this.log("system", "Stop requested — will halt after current action");
+    // Abort all pending API commands immediately
+    for (const controller of this.pendingCommands.values()) {
+      controller.abort();
+    }
+    this.pendingCommands.clear();
+    this.log("system", "Stop requested — canceling all pending operations immediately");
   }
 
   /** Get a summary of the bot's current state. */

@@ -7438,6 +7438,15 @@ function renderCrafterSettings(panel) {
       <div id="craft-add-detail" style="font-size:0.75em;color:var(--dim);margin-top:4px"></div>
     </div>
 
+    <div style="margin-top:10px;padding:8px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">➕ Bulk Add Category</div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="craft-bulk-cat" style="flex:1;min-width:100px">${catOpts}</select>
+        <input type="number" id="craft-bulk-qty" min="1" value="10" style="width:70px">
+        <button class="primary sm" onclick="addCraftCategory()">Add All from Category</button>
+      </div>
+    </div>
+
     <!-- Ship Loadout Management Section -->
     <div style="margin-top:16px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
       <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🚀 Ship Commission Loadouts</div>
@@ -7650,6 +7659,36 @@ function addCraftItem() {
   if (!settings.crafter.craftLimits) settings.crafter.craftLimits = {};
   settings.crafter.craftLimits[id] = qty;
   renderCrafterSettings(document.getElementById('settingsContent'));
+}
+
+function addCraftCategory() {
+  const catSel = document.getElementById('craft-bulk-cat');
+  const qtyEl = document.getElementById('craft-bulk-qty');
+  const category = catSel?.value;
+  const qty = parseInt(qtyEl?.value) || 10;
+  if (!category) return;
+
+  if (!settings.crafter) settings.crafter = {};
+  if (!settings.crafter.craftLimits) settings.crafter.craftLimits = {};
+
+  const recipes = cachedSettingsRecipes || [];
+  let addedCount = 0;
+  for (const r of recipes) {
+    const cat = r.category || 'Other';
+    if (category === '__all__' || cat === category) {
+      const id = r.recipe_id || r.id || r.name;
+      if (id) {
+        settings.crafter.craftLimits[id] = qty;
+        addedCount++;
+      }
+    }
+  }
+
+  if (addedCount > 0) {
+    renderCrafterSettings(document.getElementById('settingsContent'));
+  } else {
+    alert(`No items found in category "${category}".`);
+  }
 }
 
 function removeCraftItem(id) {

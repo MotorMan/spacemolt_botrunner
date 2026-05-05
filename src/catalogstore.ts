@@ -90,7 +90,12 @@ class CatalogStore {
     if (!existsSync(DATA_DIR)) {
       mkdirSync(DATA_DIR, { recursive: true });
     }
-    writeFileSync(CATALOG_FILE, JSON.stringify(this.data, null, 2) + "\n", "utf-8");
+    try {
+      writeFileSync(CATALOG_FILE, JSON.stringify(this.data, null, 2) + "\n", "utf-8");
+    } catch (err) {
+      // Log error but don't throw - catalog is still usable from memory
+      console.error("Error writing catalog:", err);
+    }
     this.dirty = false;
   }
 
@@ -146,7 +151,6 @@ class CatalogStore {
         const data = resp.result as Record<string, unknown> | undefined;
         if (!data) break;
 
-        // Extract items array from various response shapes
         const entries = extractArray(data, type);
 
         for (const entry of entries) {
@@ -281,6 +285,11 @@ class CatalogStore {
 
 /** Extract an array of entries from a catalog API response. */
 function extractArray(data: Record<string, unknown>, type: string): Array<Record<string, unknown>> {
+  if (!data) return [];
+  // V2 format: { type: "ships", items: [...] }
+  if (typeof data.type === 'string' && Array.isArray(data.items)) {
+    return data.items as Array<Record<string, unknown>>;
+  }
   // Direct array response
   if (Array.isArray(data)) return data as Array<Record<string, unknown>>;
   // Keyed by type name

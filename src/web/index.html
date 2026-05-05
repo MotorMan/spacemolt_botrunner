@@ -11314,7 +11314,7 @@ function factionDepositCredits(username) {
 
 function factionWithdrawCredits(username) {
   const amt = parseInt(document.getElementById('faction-credits-amt')?.value) || 100;
-  sendExec(username, 'faction_withdraw_credits', { amount: amt }, (result) => {
+  sendExec(username, 'storage', { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: amt }, (result) => {
     if (result.ok) {
       appendLine('system', `${username} withdrew ${amt}cr from faction treasury`);
       fetchFactionInfo(username);
@@ -13046,7 +13046,7 @@ async function buildPersonalFacilityConfirm(username, facilityType, matsJson, co
   
   if (cost > 0) {
     await new Promise(resolve => {
-      sendExec(username, 'faction_withdraw_credits', { amount: cost }, () => resolve(true));
+      sendExec(username, 'storage', { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: cost }, () => resolve(true));
     });
   }
   

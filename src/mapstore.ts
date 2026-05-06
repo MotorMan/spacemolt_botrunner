@@ -228,6 +228,7 @@ const BACKUP_FILES = [
   'fcStations.json',
   'fullPlayerInfo.json',
   'marketDetails.json',
+  'rawMissions.json',
   'rescueActivity.json',
   'rescueBlackBook.json',
   'settings.json',

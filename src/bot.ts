@@ -571,6 +571,12 @@ export class Bot {
           await this.handleNotifications(resp.notifications);
         }
 
+        // Update faction storage cache whenever view_storage is called for faction
+        if (command === "view_storage" && payload?.target === "faction" && !resp.error && this.faction) {
+          const entries = this.parseItemList(resp.result);
+          updateFactionStorageCache(this.faction, entries);
+        }
+
         if (resp.error) {
           // Suppress noisy expected errors — callers handle these gracefully
           const code = resp.error.code || "";
@@ -883,7 +889,7 @@ export class Bot {
     return items
       .map((item) => {
         const parsedItem = {
-          itemId: (item.item_id as string) || (item.resource_id as string) || (item.id as string) || "",
+          itemId: ((item.item_id as string) || (item.resource_id as string) || (item.id as string) || "").replace(/ /g, '_').toLowerCase(),
           name: (item.name as string) || (item.item_name as string) || (item.resource_name as string) || (item.item_id as string) || "",
           quantity: (item.quantity as number) || (item.count as number) || (item.amount as number) || 0,
         };
@@ -927,18 +933,39 @@ export class Bot {
 
   /** Fetch faction storage contents and cache them. Silently returns empty on error. */
   async refreshFactionStorage(): Promise<void> {
-    const factionName = this.faction;
+    let factionName = this.faction;
     if (!factionName) {
+      // Try to load from cache to get faction name and storage
+      try {
+        const { existsSync, readFileSync } = await import("fs");
+        const { join } = await import("path");
+        const cacheFile = join(process.cwd(), "data", "factionStorage.json");
+        if (existsSync(cacheFile)) {
+          const content = readFileSync(cacheFile, "utf-8");
+          const cached = JSON.parse(content) as { factionName: string; entries: any[] };
+          this.faction = cached.factionName;
+          this.factionStorage = cached.entries;
+          this.log("info", `Loaded faction storage from cache: ${cached.factionName} (${cached.entries.length} items)`);
+          return;
+        }
+      } catch (e) {
+        this.log("warn", "Failed to load faction storage from cache");
+      }
+      this.log("warn", "No faction name set and no cache, skipping faction storage refresh");
       this.factionStorage = [];
       return;
     }
 
     const resp = await this.exec("view_storage", { target: "faction" });
     if (resp.error) {
+      this.log("error", `Error refreshing faction storage: ${resp.error.message}`);
       this.factionStorage = [];
       return;
     }
     const entries = this.parseItemList(resp.result);
+    if (entries.length === 0) {
+      this.log("warn", "Faction storage refresh returned 0 items");
+    }
     this.factionStorage = entries;
     updateFactionStorageCache(factionName, entries);
   }

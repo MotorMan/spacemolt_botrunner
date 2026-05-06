@@ -1572,14 +1572,18 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("mining", `Warning: Cargo full (${Math.round(startCargoFill * 100)}%) at routine start`);
   }
 
-  // ── Cache ship modules at routine start ──
-  // This avoids repeated get_ship calls that may return incomplete data
-  // when the server is still processing (e.g. after a jump timeout).
-  let cachedModules: unknown[] | null = await cacheShipModules(ctx);
+   // ── Cache ship modules at routine start ──
+   // This avoids repeated get_ship calls that may return incomplete data
+   // when the server is still processing (e.g. after a jump timeout).
+   let cachedModules: unknown[] | null = await cacheShipModules(ctx);
 
-  // ── Mining session recovery ──
-  const activeSession = getActiveMiningSession(bot.username);
-  let recoveredSession: MiningSession | null = null;
+   // ── CRITICAL FIX: Refresh faction storage at startup for accurate quota checks ──
+   ctx.log("miner", "Refreshing faction storage at startup...");
+   await bot.refreshFactionStorage();
+
+   // ── Mining session recovery ──
+   const activeSession = getActiveMiningSession(bot.username);
+   let recoveredSession: MiningSession | null = null;
   let sessionWasReturningHome = false;
   if (activeSession) {
     ctx.log("mining", `Found incomplete mining session: ${activeSession.targetResourceName} (${activeSession.state})`);
@@ -1781,6 +1785,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // Deep core capability check - needed for quota selection below
     const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
+    const useDeepCore = deepCoreCap.canMineVisibleDeepCore;
 
     // Check for strip miner (limited to basic ores only)
     const usingStripMiner = await hasStripMiner(ctx, cachedModules || undefined);
@@ -1825,7 +1830,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       targetResource = isAutoDetected ? settings.targetIce : (settings.targetIce || settings.targetOre || settings.targetGas);
       resourceLabel = targetResource === settings.targetGas ? "gas" : (targetResource === settings.targetOre ? "ore" : "ice");
     } else if (miningType === "ore") {
-      targetResource = isAutoDetected ? settings.targetOre : (settings.targetOre || settings.targetGas || settings.targetIce);
+      targetResource = isAutoDetected ? (useDeepCore ? settings.targetDeepCore : settings.targetOre) : ( (useDeepCore ? settings.targetDeepCore : settings.targetOre) || settings.targetGas || settings.targetIce);
       resourceLabel = targetResource === settings.targetGas ? "gas" : (targetResource === settings.targetIce ? "ice" : "ore");
     } else if (miningType === "radioactive") {
       targetResource = isAutoDetected ? settings.targetRadioactive : (settings.targetRadioactive || settings.targetOre || settings.targetGas);
@@ -1858,7 +1863,6 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Select quotas based on mining type ──
     // CRITICAL FIX: Deep core miners should use deepCoreQuotas, not oreQuotas
     // STRIP MINER: Use iron/copper specific quotas (basic ores only)
-    const useDeepCore = deepCoreCap.canMineVisibleDeepCore;
     let quotas = useDeepCore 
       ? settings.deepCoreQuotas 
       : (miningType === "ice" ? settings.iceQuotas : (miningType === "ore" ? settings.oreQuotas : (miningType === "radioactive" ? settings.radioactiveQuotas : settings.gasQuotas)));
@@ -2079,6 +2083,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log("mining", "Abandoning recovered session: not a deep core ore");
           await failMiningSession(bot.username, "Not a deep core ore");
           recoveredSession = null;
+        }
+      } else if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
+        // Check if deep core quota is met
+        const settings = getMinerSettings(bot.username);
+        const quotas = settings.deepCoreQuotas;
+        const targetQuota = quotas[effectiveTarget];
+        if (targetQuota !== undefined) {
+          const current = bot.factionStorage.find(i => i.itemId === effectiveTarget)?.quantity || 0;
+          const deficit = targetQuota - current;
+          if (deficit <= 0) {
+            ctx.log("mining", `Deep core quota met for ${effectiveTarget} (${current}/${targetQuota}) — abandoning session and searching for new target`);
+            if (recoveredSession) {
+              await failMiningSession(bot.username, "Deep core quota met");
+              recoveredSession = null;
+            }
+            effectiveTarget = "";
+          }
         }
       }
 

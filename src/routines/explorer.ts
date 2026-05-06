@@ -42,6 +42,7 @@ const FUEL_SAFETY_PCT = 40;
 const DATA_DIR = join(process.cwd(), "data");
 const MARKET_DETAILS_FILE = join(DATA_DIR, "marketDetails.json");
 const SHIPS_FOR_SALE_FILE = join(DATA_DIR, "shipsForSale.json");
+const RAW_MISSIONS_FILE = join(DATA_DIR, "rawMissions.json");
 
 interface MarketOrderDetail {
   price: number;
@@ -91,6 +92,24 @@ interface ShipsForSaleData {
   listings: Record<string, ShipListing>;
 }
 
+interface RawMissionRecord {
+  missionId: string;
+  data: Record<string, unknown>; // Full raw mission data
+  stations: Array<{
+    systemId: string;
+    stationPoiId: string;
+    stationName: string;
+    lastSeen: string;
+  }>;
+  firstSeen: string;
+  lastSeen: string;
+}
+
+interface RawMissionsData {
+  lastSaved: string;
+  missions: Record<string, RawMissionRecord>; // key: mission_id
+}
+
 function loadMarketDetails(): MarketDetailsData {
   if (!existsSync(DATA_DIR)) {
     mkdirSync(DATA_DIR, { recursive: true });
@@ -135,6 +154,29 @@ function saveShipsForSale(data: ShipsForSaleData): void {
   }
   data.lastSaved = now();
   writeFileSync(SHIPS_FOR_SALE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function loadRawMissions(): RawMissionsData {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (existsSync(RAW_MISSIONS_FILE)) {
+    try {
+      const raw = readFileSync(RAW_MISSIONS_FILE, "utf-8");
+      return JSON.parse(raw) as RawMissionsData;
+    } catch {
+      // Corrupt file — start fresh
+    }
+  }
+  return { lastSaved: now(), missions: {} };
+}
+
+function saveRawMissions(data: RawMissionsData): void {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  data.lastSaved = now();
+  writeFileSync(RAW_MISSIONS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
 }
 
 function now(): string {
@@ -1431,6 +1473,57 @@ async function* scanStation(
     if (missions.length > 0) {
       mapStore.updateMissions(systemId, poi.id, missions);
       missionCount = missions.length;
+
+      // Save raw mission data for collection with deduplication
+      const rawMissions = loadRawMissions();
+      let newMissions = 0;
+      let updatedMissions = 0;
+
+      for (const mission of missions) {
+        const missionId = (mission.mission_id as string) || (mission.id as string) || "";
+        if (!missionId) continue;
+
+        const stationInfo = {
+          systemId,
+          stationPoiId: poi.id,
+          stationName: poi.name,
+          lastSeen: now(),
+        };
+
+        if (rawMissions.missions[missionId]) {
+          // Mission already exists, check if this station is already recorded
+          const existing = rawMissions.missions[missionId];
+          const stationExists = existing.stations.some(s =>
+            s.systemId === systemId && s.stationPoiId === poi.id
+          );
+
+          if (!stationExists) {
+            existing.stations.push(stationInfo);
+            updatedMissions++;
+          }
+
+          // Update last seen globally
+          existing.lastSeen = now();
+        } else {
+          // New mission
+          rawMissions.missions[missionId] = {
+            missionId,
+            data: mission,
+            stations: [stationInfo],
+            firstSeen: now(),
+            lastSeen: now(),
+          };
+          newMissions++;
+        }
+      }
+
+      if (newMissions > 0 || updatedMissions > 0) {
+        saveRawMissions(rawMissions);
+        const updateMsg = [];
+        if (newMissions > 0) updateMsg.push(`${newMissions} new`);
+        if (updatedMissions > 0) updateMsg.push(`${updatedMissions} updated`);
+        ctx.log("info", `Collected raw mission data: ${updateMsg.join(", ")} at ${poi.name} (${missions.length} total available)`);
+      }
     }
   }
 

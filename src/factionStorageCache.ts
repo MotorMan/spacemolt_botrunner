@@ -43,7 +43,7 @@ function saveToDisk(data: FactionStorageCache): void {
   try {
     writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2), "utf-8");
   } catch (e) {
-    // Silently fail on write error
+    console.log("Error writing faction storage cache:", e);
   }
 }
 

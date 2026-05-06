@@ -3531,3 +3531,29 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 .fc-nav-btn system {
   color: var(--cyan);
 }
+
+/* ── Weapon Status Styles ────────────────────────────────── */
+.weapon-full {
+  color: var(--green);
+  font-weight: 600;
+}
+
+.weapon-partial {
+  color: var(--yellow);
+  font-weight: 500;
+}
+
+.weapon-empty {
+  color: var(--red);
+  font-weight: 500;
+}
+
+.weapon-unknown {
+  color: var(--orange);
+  font-weight: 500;
+}
+
+.weapon-energy {
+  color: var(--cyan);
+  font-weight: 500;
+}

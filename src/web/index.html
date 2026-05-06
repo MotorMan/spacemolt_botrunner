@@ -2041,6 +2041,21 @@ function renderProfileTopbar() {
     }
   }
 
+  // Per-bot hunter mode selector (visible when hunter is selected or running)
+  const isHunter = (bot.state === 'running' && bot.routine === 'hunter')
+    || (bot.state !== 'running' && bot.state !== 'stopping' && getProfileSelectedRoutine() === 'hunter');
+  if (isHunter) {
+    const botSettings = settings[bot.username] || {};
+    const hunterMode = botSettings.hunterMode || 'roam_systems';
+    actions += `
+      <span class="profile-ore-label">Mode:</span>
+      <select id="profile-hunterMode" onchange="saveProfileHunterMode()">
+        <option value="roam_systems"${hunterMode === 'roam_systems' ? ' selected' : ''}>Roam systems</option>
+        <option value="roam_system"${hunterMode === 'roam_system' ? ' selected' : ''}>Roam current system</option>
+        <option value="stationary"${hunterMode === 'stationary' ? ' selected' : ''}>Stationary</option>
+      </select>`;
+  }
+
   // Per-bot missions toggle (visible for miner and explorer)
   const isMinerOrExplorer = isMiner || isExplorer;
   if (isMinerOrExplorer) {
@@ -2189,6 +2204,18 @@ function saveProfileExplorerMode() {
   const explorerMode = sel.value;
   const existing = settings[bot.username] || {};
   const updated = Object.assign({}, existing, { explorerMode });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfileHunterMode() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const sel = document.getElementById('profile-hunterMode');
+  if (!sel) return;
+  const hunterMode = sel.value;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { hunterMode });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
 }
@@ -3240,29 +3267,57 @@ function mcLoadWeaponData() {
     if (result.ok && result.data) {
       const data = result.data;
 
-      // get_ship returns modules at top level: { ship, modules: [...], cargo_used, cargo_max, class }
+      // Debug: log the full response structure
+      console.log('get_ship response data:', JSON.stringify(data, null, 2));
+
+      // V2 API: get_ship returns structuredContent with { ship, modules: [...], cargo: [...] }
       const modules = Array.isArray(data.modules) ? data.modules : [];
-      
-      // Also get cargo from the ship data
-      const shipCargo = (data.ship && data.ship.cargo) || [];
+
+      // Cargo is at top level in V2 API, not inside ship
+      const shipCargo = Array.isArray(data.cargo) ? data.cargo : [];
 
       if (modules.length === 0) {
         logResponse('<span class="resp-warn">No modules found on ship</span>');
         return;
       }
 
-      // Filter to weapon modules
+      // Filter to weapon modules (same logic as battle.ts)
       const weapons = modules.filter(mod => {
-        const modType = ((mod.type || mod.slot || '') + '').toLowerCase();
-        return modType.includes('weapon');
-      }).map(mod => ({
-        instanceId: mod.id || '',
-        typeId: mod.type_id || '',
-        name: mod.name || mod.type_id || 'Unknown Weapon',
-        currentAmmo: mod.current_ammo || 0,
-        maxAmmo: mod.magazine_size || 0,
-        ammoType: mod.ammo_type || null
-      })).filter(w => w.instanceId);
+        const modType = (mod.type || mod.module_type || "").toLowerCase();
+        const modId = (mod.module_id || mod.mod_id || mod.id || "").toLowerCase();
+        const isWeapon = modType.includes("weapon") || modType.includes("missile") || modType.includes("launcher") || modType.includes("torpedo") || modId.includes("weapon") || modId.includes("missile") || modId.includes("launcher");
+        return isWeapon;
+      }).map(mod => {
+        let ammoType = mod.ammo_type || mod.ammo_item_id || mod.ammo || null;
+        // If no ammo type in module data, look it up in catalog
+        if (!ammoType && mod.module_id) {
+          const catalogModule = catalog.items?.[mod.module_id];
+          if (catalogModule && catalogModule.ammo_type) {
+            ammoType = catalogModule.ammo_type;
+          }
+        }
+
+        // For weapons with ammo, assume they're empty if we don't have current ammo data
+        // This is safer than assuming they're full, since reloading dumps existing ammo
+        let currentAmmo = mod.current_ammo || 0;
+        let maxAmmo = mod.max_ammo || mod.magazine_size || 0;
+
+        // If we don't have ammo data but the weapon uses ammo, assume it needs loading
+        if (ammoType && maxAmmo === 0 && currentAmmo === 0) {
+          // We have ammo type but no capacity info - assume it needs ammo
+          maxAmmo = 1; // Placeholder to indicate it uses ammo
+          currentAmmo = 0;
+        }
+
+        return {
+          instanceId: mod.module_id || mod.instance_id || mod.weapon_instance_id || mod.id || '',
+          typeId: mod.module_id || mod.mod_id || mod.id || '',
+          name: mod.name || mod.type_id || 'Unknown Weapon',
+          currentAmmo: currentAmmo,
+          maxAmmo: maxAmmo,
+          ammoType: ammoType
+        };
+      }).filter(w => w.instanceId);
 
       cachedWeaponData = weapons;
 
@@ -3285,9 +3340,32 @@ function mcLoadWeaponData() {
           logResponse('<span class="resp-warn">No weapon modules detected on ship</span>');
         } else {
           weaponSelect.innerHTML = weapons.map(w => {
-            const ammoStatus = w.maxAmmo > 0 ? ` [${w.currentAmmo}/${w.maxAmmo}]` : '';
+            let ammoStatus = '';
+            let statusClass = '';
+            if (w.maxAmmo > 0 && w.currentAmmo !== undefined) {
+              // We have ammo data from API
+              ammoStatus = ` [${w.currentAmmo}/${w.maxAmmo}]`;
+              if (w.currentAmmo >= w.maxAmmo) {
+                statusClass = 'weapon-full';
+                ammoStatus += ' (FULL)';
+              } else if (w.currentAmmo > 0) {
+                statusClass = 'weapon-partial';
+                ammoStatus += ' (PARTIAL)';
+              } else {
+                statusClass = 'weapon-empty';
+                ammoStatus += ' (EMPTY)';
+              }
+            } else if (w.ammoType) {
+              // Weapon uses ammo but we don't know status
+              statusClass = 'weapon-unknown';
+              ammoStatus = ' (?)';
+            } else {
+              // Energy weapon
+              statusClass = 'weapon-energy';
+              ammoStatus = ' (ENERGY)';
+            }
             const ammoType = w.ammoType ? ` (${w.ammoType})` : ' (no ammo type)';
-            return `<option value="${esc(w.instanceId)}">${esc(w.name)}${esc(ammoStatus)}${esc(ammoType)}</option>`;
+            return `<option value="${esc(w.instanceId)}" class="${esc(statusClass)}">${esc(w.name)}${esc(ammoStatus)}${esc(ammoType)}</option>`;
           }).join('');
 
           // Update ammo dropdown
@@ -3304,7 +3382,10 @@ function mcLoadWeaponData() {
 
           // Show the reload controls
           const controls = document.getElementById('mc-weapon-reload-controls');
-          if (controls) controls.style.display = 'block';
+          if (controls) {
+            controls.style.display = 'block';
+            showWeaponReloadControls();
+          }
 
           // Hide the load button
           const loadBtn = document.getElementById('mc-load-weapons-btn');
@@ -3344,12 +3425,71 @@ function mcReloadWeapon() {
     return;
   }
 
+  // Check weapon ammo status
+  const selectedWeapon = cachedWeaponData.find(w => w.instanceId === weaponId);
+  if (selectedWeapon) {
+    if (selectedWeapon.maxAmmo > 0 && selectedWeapon.currentAmmo >= selectedWeapon.maxAmmo) {
+      // Weapon is confirmed full
+      if (!confirm(`⚠️ WARNING: This weapon is already fully loaded (${selectedWeapon.currentAmmo}/${selectedWeapon.maxAmmo}). Reloading will dump all existing ammo and replace it with new ammo. This action cannot be undone!\n\nAre you sure you want to continue?`)) {
+        return;
+      }
+    } else if (selectedWeapon.ammoType) {
+      // Weapon uses ammo but status is unknown - always warn
+      if (!confirm(`⚠️ WARNING: Ammo status is unknown for this weapon. Reloading may dump existing ammo if the weapon is already loaded. This action cannot be undone!\n\nOnly proceed if you're sure the weapon needs ammo.\n\nContinue with reload?`)) {
+        return;
+      }
+    }
+  }
+
   // Execute reload command with weapon instance ID and ammo item ID
   // 1 ammo box = full reload, so no quantity needed
-  mcExec('reload', { 
-    weapon_instance_id: weaponId, 
+  mcExec('reload', {
+    weapon_instance_id: weaponId,
     ammo_item_id: ammoId
   });
+}
+
+/** Update reload button state based on selected weapon */
+function updateReloadButtonState() {
+  const weaponSelect = document.getElementById('mc-weapon-select');
+  const reloadBtn = document.getElementById('mc-reload-btn');
+  if (!weaponSelect || !reloadBtn) return;
+
+  const weaponId = weaponSelect.value;
+  const selectedWeapon = cachedWeaponData.find(w => w.instanceId === weaponId);
+
+  if (selectedWeapon) {
+    if (selectedWeapon.maxAmmo > 0 && selectedWeapon.currentAmmo >= selectedWeapon.maxAmmo) {
+      // Confirmed full
+      reloadBtn.textContent = 'Force Reload (⚠️ Dumps Ammo)';
+      reloadBtn.style.backgroundColor = '#d32f2f';
+    } else if (selectedWeapon.ammoType) {
+      // Uses ammo but status unknown
+      reloadBtn.textContent = 'Reload (⚠️ May Dump Ammo)';
+      reloadBtn.style.backgroundColor = '#f57c00';
+    } else {
+      // Energy weapon
+      reloadBtn.textContent = 'Reload (Not Needed)';
+      reloadBtn.style.backgroundColor = '#666';
+      reloadBtn.disabled = true;
+      return;
+    }
+  }
+
+  reloadBtn.disabled = false;
+}
+
+// Weapon select change handler
+document.addEventListener('DOMContentLoaded', () => {
+  const weaponSelect = document.getElementById('mc-weapon-select');
+  if (weaponSelect) {
+    weaponSelect.addEventListener('change', updateReloadButtonState);
+  }
+});
+
+// Also call when controls are shown
+function showWeaponReloadControls() {
+  updateReloadButtonState();
 }
 
 // ── Wreck Salvage Commands ──────────────────────────────────
@@ -5189,13 +5329,16 @@ function mcExec(command, params) {
         // Refresh weapon data after reload to update ammo counts
         if (command === 'reload' && result.ok) {
           cachedWeaponData = [];
-          const loadBtn = document.getElementById('mc-load-weapons-btn');
           const controls = document.getElementById('mc-weapon-reload-controls');
-          if (loadBtn) loadBtn.style.display = 'inline-block';
-          if (controls) controls.style.display = 'none';
-        }
+          if (controls) {
+            controls.style.display = 'block';
+            // Update ammo dropdown
+            updateAmmoDropdown(ammoItems);
+            // Update reload button state based on selected weapon
+            updateReloadButtonState();
+          }
         renderManualControls();
-      }, 500);
+    }}, 500);
 
       // Refresh system/market data after location or trade changes
       if (['jump', 'dock', 'undock', 'travel', 'buy', 'sell'].includes(command) && result.ok) {
@@ -5378,7 +5521,7 @@ function mcSurveySystem() {
       sendExec(profileBot, 'get_system', {}, () => {
         setTimeout(() => {
           renderProfileSidebar();
-          renderManualControls();
+        renderManualControls(false);
         }, 500);
       });
     } else {

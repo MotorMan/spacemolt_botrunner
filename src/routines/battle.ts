@@ -180,12 +180,8 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
   }
 
   const result = shipResp.result as Record<string, unknown>;
-  const ship = (result.ship as Record<string, unknown>) || result;
-  const modulesArray = (
-    Array.isArray(ship.modules) ? ship.modules :
-    Array.isArray(result.modules) ? result.modules :
-    []
-  ) as Array<Record<string, unknown>>;
+  // V2 API: modules are at top level, not inside ship
+  const modulesArray = Array.isArray(result.modules) ? result.modules : [];
 
   const weapons: WeaponModule[] = [];
   for (const mod of modulesArray) {
@@ -204,7 +200,8 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
       }
     }
 
-    const instanceId = (mod.instance_id as string) ||
+    const instanceId = (mod.module_id as string) ||
+                       (mod.instance_id as string) ||
                        (mod.weapon_instance_id as string) ||
                        (mod.module_instance_id as string) ||
                        (mod.id as string) || "";

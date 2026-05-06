@@ -959,7 +959,7 @@ export class Bot {
     const resp = await this.exec("view_storage", { target: "faction" });
     if (resp.error) {
       this.log("error", `Error refreshing faction storage: ${resp.error.message}`);
-      this.factionStorage = [];
+      // Don't reset factionStorage to empty on error - keep cached data
       return;
     }
     const entries = this.parseItemList(resp.result);

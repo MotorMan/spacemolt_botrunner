@@ -1939,6 +1939,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       await recordMarketData(ctx);
       await tryMissions(ctx);
 
+      // Check if item is still available in fresh market data
+      const sys = mapStore.getSystem(candidate.sourceSystem);
+      const poi = sys?.pois.find(p => p.id === candidate.sourcePoi);
+      const marketItem = poi?.market.find(m => m.item_id === candidate.itemId);
+      if (!marketItem || marketItem.sell_quantity <= 0) {
+        failedSources.add(sourceKey);
+        ctx.log("trade", `${candidate.itemName} not available at ${candidate.sourcePoiName} (no sell orders) — trying next route`);
+        releaseTradeLock(bot.username, candidate.itemId, "aborted:no_sell_orders");
+        pendingLockItemId = null;
+        pendingLockReleased = true;
+        continue;
+      }
+
       // Verify item is actually available via estimate_purchase
       yield "verify_availability";
       const estResp = await bot.exec("estimate_purchase", { item_id: candidate.itemId, quantity: 1 });

@@ -343,24 +343,12 @@ export function calculateMultiGoalPlan(
 
   // Calculate plans in order
   for (const goal of goals) {
-    // Find the best recipe for this goal item, considering current materials
-    // If user specified a recipe, try that first, but fall back to better alternatives if no materials
+    // Use the specified recipe if provided, otherwise find the best recipe for the goal item
     let goalRecipe: Recipe | null = null;
-    
+
     if (goal.recipe) {
-      // Check if the specified recipe has materials available
-      const hasMaterials = hasRecipeMaterials(goal.recipe, (itemId) => inventory.get(itemId) || 0);
-      if (hasMaterials) {
-        goalRecipe = goal.recipe;
-      } else {
-        // Specified recipe has no materials - find better alternative
-        const alternatives = findAllRecipesForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0);
-        if (alternatives.length > 0 && alternatives[0] !== goal.recipe) {
-          goalRecipe = alternatives[0];
-        } else {
-          goalRecipe = goal.recipe;
-        }
-      }
+      // Always use the specified recipe exactly as requested
+      goalRecipe = goal.recipe;
     } else {
       goalRecipe = findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0);
     }

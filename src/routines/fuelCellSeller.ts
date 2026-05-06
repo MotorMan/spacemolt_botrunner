@@ -319,58 +319,50 @@ async function getOptimalPrice(
 function getNextStation(
   data: FCStationsData,
   currentIndex: number,
+  settings: ReturnType<typeof getFuelCellSellerSettings>,
 ): number {
   const totalStations = data.stations.length;
   if (totalStations === 0) return -1;
 
-  // Prioritize unvisited stations first
-  const unvisited = data.stations
-    .map((station, idx) => ({ station, idx }))
-    .filter(({ station }) => station.ordersPlaced === 0);
-
-  if (unvisited.length > 0) {
-    const startIdx = (currentIndex + 1) % totalStations;
-    for (let i = 0; i < totalStations; i++) {
-      const idx = (startIdx + i) % totalStations;
-      if (data.stations[idx].ordersPlaced === 0) {
-        return idx;
-      }
+  // Always prioritize the home station if it can accept more orders
+  const homeStationIdx = data.stations.findIndex(station =>
+    station.systemId === data.homeSystem && station.poiId === data.homeStation
+  );
+  if (homeStationIdx >= 0) {
+    const homeStation = data.stations[homeStationIdx];
+    if (homeStation.ordersUnsold < settings.maxFuelCellsPerStation) {
+      return homeStationIdx;
     }
   }
 
-  // All stations visited: prioritize stations with higher unsold ratio (lower fill rate)
-  // This targets stations that need more fuel cells
+  // Prioritize stations with lowest unsold (highest demand), then closest, then oldest visit
   const stationPriority = data.stations.map((station, idx) => {
-    const sales = station.ordersPlaced - station.ordersUnsold;
-    const fillRate = station.ordersPlaced > 0 ? (sales / station.ordersPlaced) * 100 : 0;
+    const cost = estimateFuelCost(data.homeSystem, station.systemId, settings.fuelCostPerJump).cost;
     const lastVisit = station.lastVisit ? new Date(station.lastVisit).getTime() : 0;
-    // Higher priority = should visit sooner
-    // We want to visit stations with lower fill rates (more unsold) first
-    // Also consider absolute unsold count for stations with similar fill rates
+    const isNearCap = station.ordersUnsold >= settings.maxFuelCellsPerStation;
     return {
       idx,
-      fillRate,
-      unsold: station.ordersUnsold,
-      sales,
+      ordersUnsold: station.ordersUnsold,
+      cost,
       lastVisit,
-      // Priority score: lower fill rate = higher priority (more negative = visit sooner)
-      // Also factor in unsold count for tie-breaking
-      priorityScore: (fillRate * 1000) - station.ordersUnsold,
+      isNearCap,
+      // Priority: low unsold first, then low cost, then old lastVisit
+      // But skip near cap stations
+      priorityScore: isNearCap ? 999999 : station.ordersUnsold,
+      tieBreaker: cost,
+      lastTie: lastVisit,
     };
   });
 
-  // Sort by priorityScore ascending (lower fill rate / more unsold = higher priority)
-  // Then by lastVisit ascending (oldest first)
+  // Sort by priorityScore ascending (low unsold first), then cost ascending, then lastVisit ascending
   stationPriority.sort((a, b) => {
     if (a.priorityScore !== b.priorityScore) return a.priorityScore - b.priorityScore;
-    return a.lastVisit - b.lastVisit;
+    if (a.tieBreaker !== b.tieBreaker) return a.tieBreaker - b.tieBreaker;
+    return a.lastTie - b.lastTie;
   });
 
-  // Find next station in sorted order after currentIndex
-  const sortedIndices = stationPriority.map(s => s.idx);
-  const currentSortedPos = sortedIndices.indexOf(currentIndex);
-  const nextSortedPos = (currentSortedPos + 1) % sortedIndices.length;
-  return sortedIndices[nextSortedPos];
+  // Always pick the best (first in sorted)
+  return stationPriority[0].idx;
 }
 
 export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -556,7 +548,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       }
     }
 
-    let targetIdx = getNextStation(fcData, fcData.currentStationIndex);
+    let targetIdx = getNextStation(fcData, fcData.currentStationIndex, settings);
     if (targetIdx < 0 || fcData.stations.length === 0) {
       ctx.log("fc", "No stations available to visit");
       ctx.log("fc", "Initializing station list from mapStore...");
@@ -798,8 +790,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       await bot.exec("storage", { action: 'deposit', source: 'cargo', target: 'faction', item_id: FUEL_CELL_ITEM_ID, quantity: checkCargo.quantity, }); //fixed by human!
     }
 
-    targetIdx = (targetIdx + 1) % fcData.stations.length;
-    fcData.currentStationIndex = targetIdx;
+
     saveFCStationsData(fcData);
 
     ctx.log("fc", `Loop complete. Next station index: ${targetIdx}`);

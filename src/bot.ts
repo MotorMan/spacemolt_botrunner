@@ -42,8 +42,9 @@ export interface BotStatus {
   docked: boolean;
   lastAction: string;
   error: string | null;
-  shipName: string;
-  hull: number;
+   shipName: string;
+   shipClass: string;
+   hull: number;
   maxHull: number;
   shield: number;
   maxShield: number;
@@ -114,8 +115,9 @@ export class Bot {
   system = "unknown";
   poi = "";
   docked = false;
-  shipName = "";
-  hull = 0;
+   shipName = "";
+   shipClass = "";
+   hull = 0;
   maxHull = 0;
   shield = 0;
   maxShield = 0;
@@ -452,25 +454,26 @@ export class Bot {
      // Capture skill snapshot before command to measure gains later
      this.captureSkillSnapshot();
 
-      // Create AbortController for this command
-      const controller = new AbortController();
-      const key = command + (payload ? JSON.stringify(payload) : "");
-      this.pendingCommands.set(key, controller);
+       // Create AbortController for this command
+       const controller = new AbortController();
+       const key = command + (payload ? JSON.stringify(payload) : "");
+       this.pendingCommands.set(key, controller);
 
-       let resp: ApiResponse;
-       try {
-         // Use timeout for jump commands to prevent indefinite hangs
-         // Timeout is calculated based on ship speed (with tow penalty if applicable)
-         if (command === "jump") {
-           const timeoutMs = this.calculateJumpTimeout();
-           const targetSystem = (payload as Record<string, unknown>)?.target_system as string | undefined;
-           this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
-           resp = await this.execWithTimeout(command, payload, timeoutMs, targetSystem || "", controller.signal);
-         } else if (command === "mine" || command === "jettison") {
-           resp = await this.execWithTimeout(command, payload, 15_000, "", controller.signal);
-         } else {
-           resp = await this.api.execute(command, payload, controller.signal);
-         }
+        let resp: ApiResponse;
+        try {
+          // Use timeout for all commands to prevent indefinite hangs
+          let timeoutMs = 60000; // default 60s
+          let targetId = "";
+          if (command === "jump") {
+            timeoutMs = this.calculateJumpTimeout();
+            targetId = (payload as Record<string, unknown>)?.target_system as string || "";
+            this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+          } else if (command === "mine" || command === "jettison") {
+            timeoutMs = 15000; // 15s for mining/jettison
+          } else if (command === "travel") {
+            targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
+          }
+          resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
 
         // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
         // This prevents 502 errors from breaking routines mid-operation
@@ -586,19 +589,26 @@ export class Bot {
           }
         }
 
-         // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
-         // This helps collect player names faster as we move through the galaxy
-         if (!resp.error) {
-           const navigationCommands = ["travel", "jump", "dock", "undock"];
-           if (navigationCommands.includes(command)) {
-             // Small delay to let the navigation complete
-             await sleep(500);
-             const nearbyResp = await this.api.execute("get_nearby");
-             if (!nearbyResp.error && nearbyResp.result) {
-               this.trackNearbyPlayers(nearbyResp.result);
-             }
-           }
-         }
+          // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
+          // This helps collect player names faster as we move through the galaxy
+          if (!resp.error) {
+            const navigationCommands = ["travel", "jump", "dock", "undock"];
+            if (navigationCommands.includes(command)) {
+              // Small delay to let the navigation complete
+              await sleep(500);
+              const nearbyResp = await this.api.execute("get_nearby");
+              if (!nearbyResp.error && nearbyResp.result) {
+                this.trackNearbyPlayers(nearbyResp.result);
+              }
+              // For jump commands, also scan the entire system for players
+              if (command === "jump") {
+                const systemResp = await this.api.execute("get_system_agents");
+                if (!systemResp.error && systemResp.result) {
+                  this.trackSystemAgents(systemResp.result);
+                }
+              }
+            }
+          }
 
           // Track piloting XP after ship-based actions that grant exp
           const PILOTING_EXP_COMMANDS = new Set([
@@ -751,6 +761,7 @@ export class Bot {
         const rawName = (ship.name as string) || "";
         const shipType = (ship.ship_type as string) || (ship.type as string) || "";
         this.shipName = (rawName && rawName.toLowerCase() !== "unnamed" ? rawName : shipType) || this.shipName;
+        this.shipClass = shipType;
         this.fuel = (ship.fuel as number) ?? this.fuel;
         this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
         this.cargo = (ship.cargo_used as number) ?? this.cargo;
@@ -800,7 +811,10 @@ export class Bot {
           this.towingWreck = shipTowing;
         }
       }
-      
+
+      // Add this bot to the player tracking so it appears in the web UI players tab
+      playerNameStore.add(this.username, this.faction || "", this.shipClass, this.system, this.poi);
+
       // Debug: log tow-related fields from status
       if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
           (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
@@ -2119,6 +2133,44 @@ export class Bot {
   }
 
   /**
+   * Extract and track player names from a get_system_agents response.
+   */
+  trackSystemAgents(systemAgentsResult: unknown): void {
+    if (!systemAgentsResult || typeof systemAgentsResult !== "object") {
+      this.log("debug", "trackSystemAgents: no result or not object");
+      return;
+    }
+
+    const data = systemAgentsResult as Record<string, unknown>;
+
+    // Debug: log what keys we have
+    debugLogForBot(this.username, "playernames:track_system", `${this.username}`, `get_system_agents result keys: ${Object.keys(data).join(", ")}`);
+
+    const agentsArray = Array.isArray(data.agents) ? data.agents : [];
+    let agentCount = 0;
+
+    for (const agent of agentsArray as Array<Record<string, unknown>>) {
+      const name = agent.username as string;
+      if (name && name.trim()) {
+        const trimmedName = name.trim();
+        // Extract faction info - prefer faction_tag over faction_id
+        let faction = "";
+        if (typeof agent.faction_tag === "string" && agent.faction_tag) {
+          faction = agent.faction_tag;
+        } else if (typeof agent.faction_id === "string" && agent.faction_id) {
+          faction = agent.faction_id;
+        }
+        // Ship class is directly available
+        const ship = (agent.ship_class as string) || "";
+        // System-wide, no specific POI
+        if (playerNameStore.add(trimmedName, faction, ship, this.system, "")) {
+          agentCount++;
+        }
+      }
+    }
+  }
+
+  /**
    * Track faction member names from faction data.
    * Call this after loading faction info to record all members.
    */
@@ -2222,8 +2274,9 @@ export class Bot {
       docked: this.docked,
       lastAction: this._lastAction,
       error: this._error,
-      shipName: this.shipName,
-      hull: this.hull,
+       shipName: this.shipName,
+       shipClass: this.shipClass,
+       hull: this.hull,
       maxHull: this.maxHull,
       shield: this.shield,
       maxShield: this.maxShield,

@@ -1649,7 +1649,8 @@ skipToReturnHome = true;
           ctx.log("mayday", `✓ Fuel check passed: ${mayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
-          const rescueDecision = shouldRescuePlayer(mayday.sender, settings.ghostThreshold);
+          const ghostThresholdOverride = normalizeSystemName(mayday.system) === normalizeSystemName(bot.system) ? Infinity : settings.ghostThreshold;
+          const rescueDecision = shouldRescuePlayer(mayday.sender, ghostThresholdOverride);
           if (!rescueDecision.shouldRescue) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - ${rescueDecision.reason}`);
             markMaydayHandled(mayday);
@@ -3764,7 +3765,8 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       ctx.log("mayday", `✓ Fuel check passed: ${nextMayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
-          const rescueDecision = shouldRescuePlayer(nextMayday.sender, settings.ghostThreshold);
+          const ghostThresholdOverride = normalizeSystemName(nextMayday.system) === normalizeSystemName(bot.system) ? Infinity : settings.ghostThreshold;
+          const rescueDecision = shouldRescuePlayer(nextMayday.sender, ghostThresholdOverride);
           if (!rescueDecision.shouldRescue) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - ${rescueDecision.reason}`);
             // Check if decline is due to ghost threshold
@@ -4600,7 +4602,8 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log("mayday", `✓ Fuel check passed: ${mayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
-          const rescueDecision = shouldRescuePlayer(mayday.sender, settings.ghostThreshold);
+          const ghostThresholdOverride = normalizeSystemName(mayday.system) === normalizeSystemName(bot.system) ? Infinity : settings.ghostThreshold;
+          const rescueDecision = shouldRescuePlayer(mayday.sender, ghostThresholdOverride);
           if (!rescueDecision.shouldRescue) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - ${rescueDecision.reason}`);
             markMaydayHandled(mayday);

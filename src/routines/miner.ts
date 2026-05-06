@@ -3513,6 +3513,76 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "scavenge";
     await scavengeWrecks(ctx);
 
+    // ── CRITICAL FIX: Verify target resource is available at current POI before mining ──
+    // This prevents mining at depleted POIs that cause endless equipment errors
+    if (effectiveTarget && bot.poi) {
+      const poiCheckResp = await bot.exec("get_poi", { poi_id: bot.poi });
+      if (!poiCheckResp.error && poiCheckResp.result) {
+        const poiData = poiCheckResp.result as Record<string, unknown>;
+        const resources = Array.isArray(poiData.resources)
+          ? (poiData.resources as Array<Record<string, unknown>>)
+          : Array.isArray(poiData.resources)
+          ? poiData.resources
+          : [];
+
+        let targetAvailable = false;
+        let targetRemaining = 0;
+
+        for (const res of resources) {
+          const resId = (res.resource_id as string) || (res.id as string) || "";
+          const remaining = (res.remaining as number) ?? (res.quantity as number) ?? 0;
+          const maxRemaining = (res.max_remaining as number) ?? 0;
+
+          if (resId === effectiveTarget) {
+            targetRemaining = remaining;
+            // Resource is available if it has remaining > 0
+            targetAvailable = remaining > 0 && maxRemaining > 0;
+            break;
+          }
+        }
+
+        if (!targetAvailable) {
+          ctx.log("mining", `Target resource ${effectiveTarget} not available at ${miningPoi?.name || bot.poi} (remaining: ${targetRemaining})`);
+
+          // Mark as depleted if it was actually depleted (not just temporarily unavailable)
+          if (targetRemaining <= 0) {
+            mapStore.markOreDepleted(bot.system, bot.poi, effectiveTarget);
+            ctx.log("mining", `Marked ${effectiveTarget} as depleted at ${bot.poi}`);
+          }
+
+          // For strip miners, try to switch to another available common ore
+          let switchedTarget = false;
+          if (usingStripMiner && targetRemaining <= 0) {
+            const availableCommonOres = resources
+              .map(res => ({
+                id: (res.resource_id as string) || (res.id as string) || "",
+                remaining: (res.remaining as number) ?? (res.quantity as number) ?? 0
+              }))
+              .filter(ore => ore.remaining > 0 && isStripMinerOre(ore.id));
+
+            if (availableCommonOres.length > 0) {
+              const newTarget = availableCommonOres[0].id;
+              ctx.log("mining", `Strip miner: switching from depleted ${effectiveTarget} to available ${newTarget}`);
+              effectiveTarget = newTarget;
+              switchedTarget = true;
+            }
+          }
+
+          if (!switchedTarget) {
+            // No alternative available - this POI is depleted for our target
+            ctx.log("mining", `POI ${miningPoi?.name || bot.poi} depleted for ${effectiveTarget} — will search for new target next cycle`);
+            await ctx.sleep(5000);
+            continue; // Skip mining, go back to target selection
+          }
+        } else {
+          ctx.log("mining", `Resource check passed: ${effectiveTarget} available (remaining: ${targetRemaining})`);
+        }
+      } else {
+        ctx.log("warn", `Failed to check POI resources: ${poiCheckResp.error?.message || "unknown error"}`);
+        // Continue anyway - don't block mining on verification failure
+      }
+    }
+
     // ── Harvest loop: mine until cargo threshold ──
     yield "harvest_loop";
     let harvestCycles = 0;

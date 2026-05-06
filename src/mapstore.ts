@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "fs";
 import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
 import { log } from "./ui.js";
@@ -220,14 +220,33 @@ export interface MapData {
 const DATA_DIR = join(process.cwd(), "data");
 const MAP_FILE = join(DATA_DIR, "map.json");
 const SAVE_DEBOUNCE_MS = 5000;
+const BACKUP_DIR = join(DATA_DIR, "Backups");
+const BACKUP_FILES = [
+  'map.json',
+  'customsStops.json',
+  'factionTradeCoordination.json',
+  'fcStations.json',
+  'fullPlayerInfo.json',
+  'marketDetails.json',
+  'rescueActivity.json',
+  'rescueBlackBook.json',
+  'settings.json',
+  'shipsForSale.json',
+  'traderActivity.json',
+];
 
 class MapStore {
   private data: MapData;
   private dirty = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private backupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     this.data = this.load();
+    if (!existsSync(BACKUP_DIR)) {
+      mkdirSync(BACKUP_DIR, { recursive: true });
+    }
+    this.backupTimer = setInterval(() => this.performBackup(), 30 * 60 * 1000);
   }
 
   // ── Pirate System Check ─────────────────────────────────
@@ -291,7 +310,36 @@ class MapStore {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
+    if (this.backupTimer) {
+      clearInterval(this.backupTimer);
+      this.backupTimer = null;
+    }
     this.writeToDisk();
+  }
+
+  private getTimestamp(): string {
+    const now = new Date();
+    return now.getFullYear() + '-' +
+      (now.getMonth() + 1).toString().padStart(2, '0') + '-' +
+      now.getDate().toString().padStart(2, '0') + '_' +
+      now.getHours().toString().padStart(2, '0') + '-' +
+      now.getMinutes().toString().padStart(2, '0') + '-' +
+      now.getSeconds().toString().padStart(2, '0');
+  }
+
+  private performBackup(): void {
+    const timestamp = this.getTimestamp();
+    for (const file of BACKUP_FILES) {
+      const src = join(DATA_DIR, file);
+      if (existsSync(src)) {
+        const dest = join(BACKUP_DIR, `${file}_${timestamp}`);
+        try {
+          copyFileSync(src, dest);
+        } catch (e) {
+          log("error", `Failed to backup ${file}: ${e}`);
+        }
+      }
+    }
   }
 
   // ── Update methods ──────────────────────────────────────

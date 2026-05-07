@@ -720,10 +720,24 @@ export class WebServer {
         // Crafting Loadouts endpoints
         const LOADOUTS_FILE = join(DATA_DIR, "craftingLoadouts.json");
 
+        interface CraftingLoadoutFile {
+          crafting?: Record<string, Record<string, number>>;
+          ship?: Record<string, ShipLoadout>;
+        }
+
+        interface ShipLoadout {
+          shipId: string;
+          shipName: string;
+          buildMaterials: Array<{ item_id: string; quantity: number }>;
+          defaultModules: string[];
+          savedAt: string;
+        }
+
         function loadCraftingLoadouts(): Record<string, Record<string, number>> {
           if (existsSync(LOADOUTS_FILE)) {
             try {
-              return JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              const data: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              return data.crafting || {};
             } catch (err) {
               console.warn(`Warning: corrupt craftingLoadouts.json, starting fresh —`, err);
             }
@@ -733,7 +747,44 @@ export class WebServer {
 
         function saveCraftingLoadouts(loadouts: Record<string, Record<string, number>>): void {
           if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-          writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+          let fileData: CraftingLoadoutFile = { crafting: loadouts, ship: {} };
+          if (existsSync(LOADOUTS_FILE)) {
+            try {
+              const existing: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              fileData.ship = existing.ship || {};
+            } catch (err) {
+              // ignore, use empty ship section
+            }
+          }
+          fileData.crafting = loadouts;
+          writeFileSync(LOADOUTS_FILE, JSON.stringify(fileData, null, 2) + "\n", "utf-8");
+        }
+
+        function loadShipLoadouts(): Record<string, ShipLoadout> {
+          if (existsSync(LOADOUTS_FILE)) {
+            try {
+              const data: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              return data.ship || {};
+            } catch (err) {
+              console.warn(`Warning: corrupt craftingLoadouts.json (ship section) —`, err);
+            }
+          }
+          return {};
+        }
+
+        function saveShipLoadouts(loadouts: Record<string, ShipLoadout>): void {
+          if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+          let fileData: CraftingLoadoutFile = { crafting: {}, ship: loadouts };
+          if (existsSync(LOADOUTS_FILE)) {
+            try {
+              const existing: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              fileData.crafting = existing.crafting || {};
+            } catch (err) {
+              // ignore, use empty crafting section
+            }
+          }
+          fileData.ship = loadouts;
+          writeFileSync(LOADOUTS_FILE, JSON.stringify(fileData, null, 2) + "\n", "utf-8");
         }
 
         // GET /api/facilities - Get cached facility types
@@ -779,19 +830,55 @@ export class WebServer {
           return Response.json({ ok: true, name: body.name });
         }
 
-        // DELETE /api/crafting-loadouts/:name - Delete a loadout
-        if (url.pathname.startsWith("/api/crafting-loadouts/") && req.method === "DELETE") {
-          const name = decodeURIComponent(url.pathname.slice("/api/crafting-loadouts/".length));
-          const loadouts = loadCraftingLoadouts();
-          if (!(name in loadouts)) {
-            return Response.json({ error: "Loadout not found" }, { status: 404 });
-          }
-          delete loadouts[name];
-          saveCraftingLoadouts(loadouts);
-          return Response.json({ ok: true, name });
-        }
+         // DELETE /api/crafting-loadouts/:name - Delete a loadout
+         if (url.pathname.startsWith("/api/crafting-loadouts/") && req.method === "DELETE") {
+           const name = decodeURIComponent(url.pathname.slice("/api/crafting-loadouts/".length));
+           const loadouts = loadCraftingLoadouts();
+           if (!(name in loadouts)) {
+             return Response.json({ error: "Loadout not found" }, { status: 404 });
+           }
+           delete loadouts[name];
+           saveCraftingLoadouts(loadouts);
+           return Response.json({ ok: true, name });
+         }
 
-        // Serve index.css
+         // GET /api/ship-loadouts - Load all ship loadouts
+         if (url.pathname === "/api/ship-loadouts" && req.method === "GET") {
+           const loadouts = loadShipLoadouts();
+           return Response.json({ loadouts });
+         }
+
+         // POST /api/ship-loadouts - Save a ship loadout
+         if (url.pathname === "/api/ship-loadouts" && req.method === "POST") {
+           const body = await req.json() as { name: string; shipId: string; shipName: string; buildMaterials: Array<{item_id: string; quantity: number}>; defaultModules: string[] };
+           if (!body?.name || !body?.shipId || !body?.buildMaterials) {
+             return Response.json({ error: "Missing required fields" }, { status: 400 });
+           }
+           const loadouts = loadShipLoadouts();
+           loadouts[body.name] = {
+             shipId: body.shipId,
+             shipName: body.shipName,
+             buildMaterials: body.buildMaterials,
+             defaultModules: body.defaultModules || [],
+             savedAt: new Date().toISOString()
+           };
+           saveShipLoadouts(loadouts);
+           return Response.json({ ok: true, name: body.name });
+         }
+
+         // DELETE /api/ship-loadouts/:name - Delete a ship loadout
+         if (url.pathname.startsWith("/api/ship-loadouts/") && req.method === "DELETE") {
+           const name = decodeURIComponent(url.pathname.slice("/api/ship-loadouts/".length));
+           const loadouts = loadShipLoadouts();
+           if (!(name in loadouts)) {
+             return Response.json({ error: "Loadout not found" }, { status: 404 });
+           }
+           delete loadouts[name];
+           saveShipLoadouts(loadouts);
+           return Response.json({ ok: true, name });
+         }
+
+         // Serve index.css
         if (url.pathname === "/index.css") {
           const cssPath = join(import.meta.dir, "index.css");
           return new Response(readFileSync(cssPath, "utf-8"), {

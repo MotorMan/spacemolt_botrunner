@@ -2659,7 +2659,7 @@ function updateStorageDropdowns() {
   }
 }
 
-function renderManualControls(isFreshRender) {
+async function renderManualControls(isFreshRender) {
   // Block re-render if we just rendered with fresh data from storage refresh
   if (!isFreshRender && window._blockRenderUntil && Date.now() < window._blockRenderUntil) {
     return;
@@ -4402,7 +4402,7 @@ function mcStopDepositAll() {
 // ── Ship Loadout Withdrawal Queue System ───────────────────────
 
 /** Build the loadout withdrawal queue from selected loadout + multiplier */
-function mcBuildLoadoutWithdrawalQueue() {
+async function mcBuildLoadoutWithdrawalQueue() {
   const bot = bots.find(b => b.username === profileBot);
   if (!bot) return null;
   
@@ -4417,7 +4417,7 @@ function mcBuildLoadoutWithdrawalQueue() {
   }
   
   const multiplier = Math.max(1, Math.min(99, parseInt(multiplierInput.value) || 1));
-  const loadouts = getShipLoadouts();
+  const loadouts = await getShipLoadouts();
   const loadout = loadouts[loadoutName];
   
   if (!loadout) {
@@ -4520,14 +4520,14 @@ function mcProcessLoadoutWithdrawal() {
 }
 
 /** Start the loadout withdrawal queue */
-function mcStartLoadoutWithdrawal() {
+async function mcStartLoadoutWithdrawal() {
   if (!profileBot) return;
   if (loadoutWithdrawalRunning) {
     logResponse('<span class="resp-err">Loadout withdrawal already running</span>');
     return;
   }
   
-  const queue = mcBuildLoadoutWithdrawalQueue();
+  const queue = await mcBuildLoadoutWithdrawalQueue();
   if (!queue) return;
   
   loadoutWithdrawalQueue = queue;
@@ -7374,7 +7374,7 @@ function fetchSettingsRecipesPage(username, page, panel) {
   });
 }
 
-function renderCrafterSettings(panel) {
+async function renderCrafterSettings(panel) {
   const crafter = settings.crafter || {};
   const craftLimits = crafter.craftLimits || {};
   const enabledCategories = crafter.enabledCategories || ["Refining", "Components", "Consumables"];
@@ -8072,34 +8072,49 @@ function renderShipDetails(ship) {
 }
 
 // Ship loadout storage (localStorage)
-function getShipLoadouts() {
+async function getShipLoadouts() {
   try {
-    const data = localStorage.getItem('spacemolt_ship_loadouts');
-    return data ? JSON.parse(data) : {};
+    const response = await fetch('/api/ship-loadouts');
+    if (!response.ok) {
+      console.warn('Failed to fetch ship loadouts:', response.status);
+      return {};
+    }
+    const data = await response.json();
+    return data.loadouts || {};
   } catch (e) {
     console.warn('Failed to load ship loadouts:', e);
     return {};
   }
 }
 
-function saveShipLoadoutToStorage(name, data) {
+async function saveShipLoadoutToStorage(name, data) {
   try {
-    const loadouts = getShipLoadouts();
-    loadouts[name] = data;
-    localStorage.setItem('spacemolt_ship_loadouts', JSON.stringify(loadouts));
-    return true;
+    const response = await fetch('/api/ship-loadouts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        name: name,
+        shipId: data.shipId,
+        shipName: data.shipName,
+        buildMaterials: data.buildMaterials,
+        defaultModules: data.defaultModules
+      })
+    });
+    const result = await response.json();
+    return result.ok === true;
   } catch (e) {
     console.warn('Failed to save ship loadout:', e);
     return false;
   }
 }
 
-function deleteShipLoadoutFromStorage(name) {
+async function deleteShipLoadoutFromStorage(name) {
   try {
-    const loadouts = getShipLoadouts();
-    delete loadouts[name];
-    localStorage.setItem('spacemolt_ship_loadouts', JSON.stringify(loadouts));
-    return true;
+    const response = await fetch('/api/ship-loadouts/' + encodeURIComponent(name), {
+      method: 'DELETE'
+    });
+    const result = await response.json();
+    return result.ok === true;
   } catch (e) {
     console.warn('Failed to delete ship loadout:', e);
     return false;
@@ -8107,14 +8122,14 @@ function deleteShipLoadoutFromStorage(name) {
 }
 
 // Update ship loadout dropdown
-function updateShipLoadoutSelect() {
+async function updateShipLoadoutSelect() {
   const select = document.getElementById('ship-loadout-select');
   const countEl = document.getElementById('ship-loadout-count');
   const loadBtn = document.getElementById('ship-load-load-btn');
   const deleteBtn = document.getElementById('ship-load-delete-btn');
   if (!select) return;
   
-  const loadouts = getShipLoadouts();
+  const loadouts = await getShipLoadouts();
   const loadoutNames = Object.keys(loadouts).sort();
   
   select.innerHTML = '<option value="">-- Select Ship Loadout --</option>' +
@@ -8131,11 +8146,11 @@ function updateShipLoadoutSelect() {
 }
 
 // Populate ship loadout dropdown in manual controls
-function mcPopulateLoadoutSelect() {
+async function mcPopulateLoadoutSelect() {
   const select = document.getElementById('mc-loadout-select');
   if (!select) return;
   
-  const loadouts = getShipLoadouts();
+  const loadouts = await getShipLoadouts();
   const loadoutNames = Object.keys(loadouts).sort();
   
   select.innerHTML = '<option value="">-- Select Loadout --</option>' +
@@ -8156,7 +8171,7 @@ function saveShipLoadoutPrompt() {
   saveShipLoadout(name.trim());
 }
 
-function saveShipLoadout(name) {
+async function saveShipLoadout(name) {
   const shipSelect = document.getElementById('ship-select');
   const shipId = shipSelect?.value;
   if (!shipId || !catalog.ships?.[shipId]) {
@@ -8173,10 +8188,10 @@ function saveShipLoadout(name) {
     savedAt: new Date().toISOString()
   };
   
-  const success = saveShipLoadoutToStorage(name, loadoutData);
+  const success = await saveShipLoadoutToStorage(name, loadoutData);
   if (success) {
-    updateShipLoadoutSelect();
-    mcPopulateLoadoutSelect();
+    await updateShipLoadoutSelect();
+    await mcPopulateLoadoutSelect();
     alert(`Ship loadout "${name}" saved successfully!`);
   } else {
     alert('Failed to save ship loadout.');
@@ -8241,15 +8256,15 @@ function addShipToCraftingList() {
 }
 
 // Load ship loadout - adds all materials and modules to the crafting recipe list
-function loadShipLoadout() {
+async function loadShipLoadout() {
   const select = document.getElementById('ship-loadout-select');
   const name = select?.value;
   if (!name) {
     alert('Please select a ship loadout to load.');
     return;
   }
-
-  const loadouts = getShipLoadouts();
+  
+  const loadouts = await getShipLoadouts();
   const loadout = loadouts[name];
   if (!loadout) {
     alert(`Ship loadout "${name}" not found!`);

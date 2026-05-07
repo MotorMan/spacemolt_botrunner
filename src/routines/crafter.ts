@@ -1552,7 +1552,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Build list of goal items to craft ──
     ctx.log("craft", `🎯 Processing ${effectiveQuotas.size} crafting goals...`);
-    const goalItems: Array<{ itemId: string; quantity: number; recipe: Recipe }> = [];
+    const goalItems: Array<{ itemId: string; quantity: number; recipe?: Recipe }> = [];
 
     for (const [recipeId, limit] of Array.from(effectiveQuotas.entries())) {
       if (bot.state !== "running") break;

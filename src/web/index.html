@@ -2647,13 +2647,10 @@ function updateStorageDropdowns() {
   const ammoSelect = document.getElementById('mc-ammo-select');
   if (ammoSelect) {
     const currentValue = ammoSelect.value;
-    const ammoItems = cargoItems.filter(i =>
-      i.itemId.toLowerCase().includes('ammo') ||
-      i.itemId.toLowerCase().includes('missile') ||
-      i.itemId.toLowerCase().includes('rocket') ||
-      i.itemId.toLowerCase().includes('torpedo') ||
-      i.itemId.toLowerCase().includes('plasma')
-    );
+    const ammoItems = cargoItems.filter(i => {
+      const catalogItem = catalog.items?.[i.itemId];
+      return catalogItem?.effect?.type === 'ammo';
+    });
     let opts = ammoItems.map(a =>
       `<option value="${esc(a.itemId)}" data-max="${a.quantity}"${a.itemId === currentValue ? ' selected' : ''}>${esc(a.name)} (${a.quantity})</option>`
     ).join('');
@@ -2814,13 +2811,10 @@ function renderManualControls(isFreshRender) {
   let weaponReloadSection = '';
   
   // Check if bot has ammo items in cargo
-  const ammoItems = (freshCargo).filter(i => 
-    i.itemId.toLowerCase().includes('ammo') ||
-    i.itemId.toLowerCase().includes('missile') ||
-    i.itemId.toLowerCase().includes('rocket') ||
-    i.itemId.toLowerCase().includes('torpedo') ||
-    i.itemId.toLowerCase().includes('plasma')
-  );
+  const ammoItems = (freshCargo).filter(i => {
+    const catalogItem = catalog.items?.[i.itemId];
+    return catalogItem?.effect?.type === 'ammo';
+  });
   
   // Show weapon reload section if:
   // 1. Bot is a hunter routine, OR
@@ -3288,8 +3282,8 @@ function mcLoadWeaponData() {
         const isWeapon = modType.includes("weapon") || modType.includes("missile") || modType.includes("launcher") || modType.includes("torpedo") || modId.includes("weapon") || modId.includes("missile") || modId.includes("launcher");
         return isWeapon;
       }).map(mod => {
-        let ammoType = mod.ammo_type || mod.ammo_item_id || mod.ammo || null;
-        // If no ammo type in module data, look it up in catalog
+        // V2 API provides ammo_type directly, but fall back to catalog lookup if needed
+        let ammoType = mod.ammo_type || null;
         if (!ammoType && mod.module_id) {
           const catalogModule = catalog.items?.[mod.module_id];
           if (catalogModule && catalogModule.ammo_type) {
@@ -3297,17 +3291,9 @@ function mcLoadWeaponData() {
           }
         }
 
-        // For weapons with ammo, assume they're empty if we don't have current ammo data
-        // This is safer than assuming they're full, since reloading dumps existing ammo
-        let currentAmmo = mod.current_ammo || 0;
-        let maxAmmo = mod.max_ammo || mod.magazine_size || 0;
-
-        // If we don't have ammo data but the weapon uses ammo, assume it needs loading
-        if (ammoType && maxAmmo === 0 && currentAmmo === 0) {
-          // We have ammo type but no capacity info - assume it needs ammo
-          maxAmmo = 1; // Placeholder to indicate it uses ammo
-          currentAmmo = 0;
-        }
+        // V2 API now includes ammo data: magazine_size, current_ammo, ammo_type, loaded_ammo_id, loaded_ammo_name
+        let currentAmmo = mod.current_ammo;
+        let maxAmmo = mod.magazine_size || 0;
 
         return {
           instanceId: mod.module_id || mod.instance_id || mod.weapon_instance_id || mod.id || '',
@@ -3315,22 +3301,18 @@ function mcLoadWeaponData() {
           name: mod.name || mod.type_id || 'Unknown Weapon',
           currentAmmo: currentAmmo,
           maxAmmo: maxAmmo,
-          ammoType: ammoType
+          ammoType: ammoType,
+          loadedAmmoName: mod.loaded_ammo_name || null
         };
       }).filter(w => w.instanceId);
 
       cachedWeaponData = weapons;
 
       // Get ammo items from ship cargo
-      const ammoItems = shipCargo.filter(i => 
-        i.item_id && (
-          i.item_id.toLowerCase().includes('ammo') ||
-          i.item_id.toLowerCase().includes('missile') ||
-          i.item_id.toLowerCase().includes('rocket') ||
-          i.item_id.toLowerCase().includes('torpedo') ||
-          i.item_id.toLowerCase().includes('plasma')
-        )
-      );
+      const ammoItems = shipCargo.filter(i => {
+        const catalogItem = catalog.items?.[i.item_id];
+        return catalogItem?.effect?.type === 'ammo';
+      });
 
       // Update weapon dropdown
       const weaponSelect = document.getElementById('mc-weapon-select');
@@ -3342,8 +3324,8 @@ function mcLoadWeaponData() {
           weaponSelect.innerHTML = weapons.map(w => {
             let ammoStatus = '';
             let statusClass = '';
-            if (w.maxAmmo > 0 && w.currentAmmo !== undefined) {
-              // We have ammo data from API
+            if (w.maxAmmo > 0) {
+              // Weapon uses ammo
               ammoStatus = ` [${w.currentAmmo}/${w.maxAmmo}]`;
               if (w.currentAmmo >= w.maxAmmo) {
                 statusClass = 'weapon-full';
@@ -3355,17 +3337,15 @@ function mcLoadWeaponData() {
                 statusClass = 'weapon-empty';
                 ammoStatus += ' (EMPTY)';
               }
-            } else if (w.ammoType) {
-              // Weapon uses ammo but we don't know status
-              statusClass = 'weapon-unknown';
-              ammoStatus = ' (?)';
             } else {
               // Energy weapon
               statusClass = 'weapon-energy';
               ammoStatus = ' (ENERGY)';
             }
-            const ammoType = w.ammoType ? ` (${w.ammoType})` : ' (no ammo type)';
-            return `<option value="${esc(w.instanceId)}" class="${esc(statusClass)}">${esc(w.name)}${esc(ammoStatus)}${esc(ammoType)}</option>`;
+            // Show loaded ammo name if available, otherwise ammo type
+            const ammoDisplay = w.loadedAmmoName ? ` (${w.loadedAmmoName})` :
+                              w.ammoType ? ` (${w.ammoType})` : ' (no ammo type)';
+            return `<option value="${esc(w.instanceId)}" class="${esc(statusClass)}">${esc(w.name)}${esc(ammoStatus)}${esc(ammoDisplay)}</option>`;
           }).join('');
 
           // Update ammo dropdown
@@ -3427,15 +3407,17 @@ function mcReloadWeapon() {
 
   // Check weapon ammo status
   const selectedWeapon = cachedWeaponData.find(w => w.instanceId === weaponId);
-  if (selectedWeapon) {
-    if (selectedWeapon.maxAmmo > 0 && selectedWeapon.currentAmmo >= selectedWeapon.maxAmmo) {
+  if (selectedWeapon && selectedWeapon.maxAmmo > 0) {
+    if (selectedWeapon.currentAmmo >= selectedWeapon.maxAmmo) {
       // Weapon is confirmed full
-      if (!confirm(`⚠️ WARNING: This weapon is already fully loaded (${selectedWeapon.currentAmmo}/${selectedWeapon.maxAmmo}). Reloading will dump all existing ammo and replace it with new ammo. This action cannot be undone!\n\nAre you sure you want to continue?`)) {
+      const ammoName = selectedWeapon.loadedAmmoName || selectedWeapon.ammoType || 'ammo';
+      if (!confirm(`⚠️ WARNING: This weapon is already fully loaded (${selectedWeapon.currentAmmo}/${selectedWeapon.maxAmmo} ${ammoName}). Reloading will dump all existing ammo and replace it with new ammo. This action cannot be undone!\n\nAre you sure you want to continue?`)) {
         return;
       }
-    } else if (selectedWeapon.ammoType) {
-      // Weapon uses ammo but status is unknown - always warn
-      if (!confirm(`⚠️ WARNING: Ammo status is unknown for this weapon. Reloading may dump existing ammo if the weapon is already loaded. This action cannot be undone!\n\nOnly proceed if you're sure the weapon needs ammo.\n\nContinue with reload?`)) {
+    } else if (selectedWeapon.currentAmmo > 0) {
+      // Weapon has some ammo but not full
+      const ammoName = selectedWeapon.loadedAmmoName || selectedWeapon.ammoType || 'ammo';
+      if (!confirm(`⚠️ WARNING: This weapon already has ammo (${selectedWeapon.currentAmmo}/${selectedWeapon.maxAmmo} ${ammoName}). Reloading will dump all existing ammo and replace it with new ammo. This action cannot be undone!\n\nAre you sure you want to continue?`)) {
         return;
       }
     }
@@ -3459,14 +3441,20 @@ function updateReloadButtonState() {
   const selectedWeapon = cachedWeaponData.find(w => w.instanceId === weaponId);
 
   if (selectedWeapon) {
-    if (selectedWeapon.maxAmmo > 0 && selectedWeapon.currentAmmo >= selectedWeapon.maxAmmo) {
-      // Confirmed full
-      reloadBtn.textContent = 'Force Reload (⚠️ Dumps Ammo)';
-      reloadBtn.style.backgroundColor = '#d32f2f';
-    } else if (selectedWeapon.ammoType) {
-      // Uses ammo but status unknown
-      reloadBtn.textContent = 'Reload (⚠️ May Dump Ammo)';
-      reloadBtn.style.backgroundColor = '#f57c00';
+    if (selectedWeapon.maxAmmo > 0) {
+      if (selectedWeapon.currentAmmo >= selectedWeapon.maxAmmo) {
+        // Confirmed full
+        reloadBtn.textContent = 'Force Reload (⚠️ Dumps Ammo)';
+        reloadBtn.style.backgroundColor = '#d32f2f';
+      } else if (selectedWeapon.currentAmmo > 0) {
+        // Has some ammo
+        reloadBtn.textContent = 'Reload (⚠️ Dumps Ammo)';
+        reloadBtn.style.backgroundColor = '#f57c00';
+      } else {
+        // Empty
+        reloadBtn.textContent = 'Reload Weapon';
+        reloadBtn.style.backgroundColor = '';
+      }
     } else {
       // Energy weapon
       reloadBtn.textContent = 'Reload (Not Needed)';
@@ -15883,28 +15871,55 @@ let shipyardActivePanel = 'overview';
 let shipyardShipData = null;
 let shipyardFleetData = null;
 let shipyardCatalogData = null;
+let shipyardMode = 'bots'; // 'bots' or 'simulator'
 
 function renderShipyardPage() {
+  // Default to bots mode when opening shipyard tab
+  shipyardMode = 'bots';
   renderShipyardSidebar();
-  if (shipyardSelectedBot) {
-    fetchShipDetails(shipyardSelectedBot);
+  renderShipyardContent();
+}
+
+function renderShipyardContent() {
+  if (shipyardMode === 'simulator') {
+    // Show simulator in main content area
+    document.getElementById('shipyardContent').innerHTML = `
+      <iframe id="shipSimFrame" src="/shipSim.html" style="width:100%;height:100%;border:none;border-radius:4px;"></iframe>
+    `;
   } else {
-    document.getElementById('shipyardContent').innerHTML =
-      '<div class="faction-no-data">Select a bot to manage ships.</div>';
+    // Show bot management
+    if (shipyardSelectedBot) {
+      fetchShipDetails(shipyardSelectedBot);
+    } else {
+      document.getElementById('shipyardContent').innerHTML =
+        '<div class="faction-no-data">Select a bot to manage ships.</div>';
+    }
   }
 }
 
 function renderShipyardSidebar() {
   const body = document.getElementById('shipyardSidebarBody');
   if (!body) return;
-  let html = '';
-  for (const bot of bots) {
-    const active = shipyardSelectedBot === bot.username ? ' active' : '';
-    html += `<button class="faction-nav-btn${active}" onclick="selectShipyardBot('${esc(bot.username)}')">${esc(bot.username)}</button>`;
+
+  // Add sub-tabs
+  let html = `
+    <div style="border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:8px;">
+      <button class="faction-nav-btn${shipyardMode === 'bots' ? ' active' : ''}" onclick="switchShipyardMode('bots')" style="width:100%;margin-bottom:4px;">Bot Management</button>
+      <button class="faction-nav-btn${shipyardMode === 'simulator' ? ' active' : ''}" onclick="switchShipyardMode('simulator')" style="width:100%;">Loadout Simulator</button>
+    </div>
+  `;
+
+  // Always show bot list in sidebar for bot management mode
+  if (shipyardMode === 'bots') {
+    for (const bot of bots) {
+      const active = shipyardSelectedBot === bot.username ? ' active' : '';
+      html += `<button class="faction-nav-btn${active}" onclick="selectShipyardBot('${esc(bot.username)}')">${esc(bot.username)}</button>`;
+    }
+    if (bots.length === 0) {
+      html += '<div class="faction-no-data">No bots available</div>';
+    }
   }
-  if (bots.length === 0) {
-    html = '<div class="faction-no-data">No bots available</div>';
-  }
+
   body.innerHTML = html;
 }
 
@@ -15915,6 +15930,26 @@ function selectShipyardBot(username) {
   shipyardActivePanel = 'overview';
   renderShipyardSidebar();
   fetchShipDetails(username);
+}
+
+function switchShipyardMode(mode) {
+  shipyardMode = mode;
+  renderShipyardSidebar();
+
+  if (mode === 'bots') {
+    // Show bot management
+    if (shipyardSelectedBot) {
+      fetchShipDetails(shipyardSelectedBot);
+    } else {
+      document.getElementById('shipyardContent').innerHTML =
+        '<div class="faction-no-data">Select a bot to manage ships.</div>';
+    }
+  } else if (mode === 'simulator') {
+    // Show simulator in main content area
+    document.getElementById('shipyardContent').innerHTML = `
+      <iframe id="shipSimFrame" src="/shipSim.html" style="width:100%;height:100%;border:none;border-radius:4px;"></iframe>
+    `;
+  }
 }
 
 function fetchShipDetails(username) {
@@ -15930,11 +15965,11 @@ function fetchShipDetails(username) {
       return;
     }
     shipyardShipData = result.data;
-    renderShipyardContent(username);
+    renderShipyardBotContent(username);
   });
 }
 
-function renderShipyardContent(username) {
+function renderShipyardBotContent(username) {
   const content = document.getElementById('shipyardContent');
   const panels = ['overview', 'fleet', 'shipyard', 'modules'];
   const panelNav = panels.map(p => {
@@ -15977,7 +16012,7 @@ function renderShipyardContent(username) {
 
 function switchShipyardPanel(panel) {
   shipyardActivePanel = panel;
-  if (shipyardSelectedBot) renderShipyardContent(shipyardSelectedBot);
+  if (shipyardSelectedBot) renderShipyardBotContent(shipyardSelectedBot);
 }
 
 // ── Overview panel ──────────────────────────────────────────
@@ -19481,10 +19516,9 @@ function renderBattleWeapons() {
     const compatAmmo = (commander.cargoItems || []).filter(c => {
       const ammoType = weapon.ammo_type;
       if (c.effect?.subtype === ammoType) return true;
-      // Fallback: check item_id patterns
-      if (ammoType === 'autocannon' && c.item_id?.startsWith('rounds_')) return true;
-      if (ammoType === 'railgun' && c.item_id?.startsWith('slugs_')) return true;
-      if (ammoType === 'torpedo' && c.item_id?.startsWith('torpedoes_')) return true;
+      // Check catalog for ammo type
+      const catalogItem = catalog.items?.[c.item_id];
+      if (catalogItem?.effect?.subtype === ammoType) return true;
       return false;
     });
     

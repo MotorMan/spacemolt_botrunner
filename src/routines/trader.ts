@@ -474,6 +474,10 @@ function findTradeOpportunities(
     const profitPerUnit = sp.spread - (totalJumps > 0 ? totalFuelCost / Math.min(sp.buyQty, sp.sellQty) : 0);
     if (profitPerUnit < settings.minProfitPerUnit) continue;
 
+    // Stupidity check: if item normally sells for >50k, but buy price <100, it's likely a buy/sell order mixup
+    const marketCost = getItemMarketCost(sp.itemId);
+    if (marketCost > 50000 && sp.buyAt < 100) continue;
+
     const tradeQty = Math.min(sp.buyQty, sp.sellQty, maxItemsForCargo(cargoCapacity, sp.itemId));
     const totalProfit = profitPerUnit * tradeQty;
 
@@ -601,6 +605,9 @@ function processMarketInsights(
 
           const profitPerUnit = spread - (totalJumps > 0 ? totalFuelCost : 0);
           if (profitPerUnit >= settings.minProfitPerUnit) {
+            // Stupidity check
+            const marketCost = getItemMarketCost(itemId);
+            if (marketCost > 50000 && lowPrice < 100) continue;
             const tradeQty = maxItemsForCargo(cargoCapacity, itemId);
 
             routes.push({
@@ -667,8 +674,8 @@ function processMarketInsights(
 
           if (bestBuyPrice > 0) {
             // Find potential source stations with lower prices
-            const allBuys = mapStore.getAllBuyDemand();
-            const sources = allBuys
+            const allSells = mapStore.getAllSellSupply();
+            const sources = allSells
               .filter(b => b.itemId === itemId && b.price < bestBuyPrice && b.quantity > 0)
               .filter(b => {
                 const sys = mapStore.getSystem(b.systemId);
@@ -686,6 +693,9 @@ function processMarketInsights(
 
               const profitPerUnit = bestBuyPrice - source.price - (totalJumps > 0 ? totalFuelCost : 0);
               if (profitPerUnit >= settings.minProfitPerUnit) {
+                // Stupidity check
+                const marketCost = getItemMarketCost(itemId);
+                if (marketCost > 50000 && source.price < 100) continue;
                 const tradeQty = Math.min(maxItemsForCargo(cargoCapacity, itemId), source.quantity, totalQty);
 
                 routes.push({
@@ -724,8 +734,8 @@ function processMarketInsights(
           const price = parseInt(priceStr);
 
           // Find sources with lower prices
-          const allBuys = mapStore.getAllBuyDemand();
-          const sources = allBuys
+          const allSells = mapStore.getAllSellSupply();
+          const sources = allSells
             .filter(b => b.itemId === itemId && b.price < price && b.quantity > 0)
             .filter(b => {
               const sys = mapStore.getSystem(b.systemId);
@@ -743,6 +753,9 @@ function processMarketInsights(
 
             const profitPerUnit = price - source.price - (totalJumps > 0 ? totalFuelCost : 0);
             if (profitPerUnit >= settings.minProfitPerUnit) {
+              // Stupidity check
+              const marketCost = getItemMarketCost(itemId);
+              if (marketCost > 50000 && source.price < 100) continue;
               const tradeQty = Math.min(maxItemsForCargo(cargoCapacity, itemId), source.quantity, qty);
 
               // For current station opportunities, we need to determine the POI
@@ -2064,6 +2077,19 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       if (qty <= 0 && alreadyHave <= 0) {
         ctx.log("trade", "Cannot afford any items or cargo full — trying next route");
         releaseTradeLock(bot.username, candidate.itemId, "aborted:cannot_afford");
+        pendingLockItemId = null;
+        pendingLockReleased = true;
+        continue;
+      }
+
+      // Verify market data is current before buying
+      await recordMarketData(ctx);
+      const currentSys = mapStore.getSystem(bot.system);
+      const currentPoi = currentSys?.pois.find(p => p.id === bot.poi);
+      const currentMarket = currentPoi?.market.find(m => m.item_id === candidate.itemId);
+      if (!currentMarket || !currentMarket.best_sell || currentMarket.best_sell > candidate.buyPrice * 1.1 || currentMarket.sell_quantity < qty) {
+        ctx.log("trade", `Market data stale or price changed — skipping buy of ${candidate.itemName}`);
+        releaseTradeLock(bot.username, candidate.itemId, "aborted:stale_data");
         pendingLockItemId = null;
         pendingLockReleased = true;
         continue;

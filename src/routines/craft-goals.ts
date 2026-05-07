@@ -117,20 +117,26 @@ function findRecipeForItem(
 ): Recipe | null {
   // Find all recipes that produce this item
   const candidates = recipes.filter(r => r.output_item_id === itemId);
-  
+
   if (candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
-  
+
   // Score each recipe by material availability
   const scored = candidates.map(recipe => ({
     recipe,
+    canCraft: hasRecipeMaterials(recipe, countItemFn),
     score: scoreRecipeAvailability(recipe, countItemFn),
   }));
-  
-  // Sort by score descending - prefer recipes with more materials available
-  scored.sort((a, b) => b.score - a.score);
-  
-  // Return the recipe with highest material availability score
+
+  // Sort by score descending (higher material availability first), then by canCraft descending
+  scored.sort((a, b) => {
+    if (a.score !== b.score) {
+      return b.score - a.score;
+    }
+    return a.canCraft ? -1 : 1; // canCraft true comes first among equal scores
+  });
+
+  // Return the recipe with highest priority
   return scored[0].recipe;
 }
 
@@ -303,10 +309,18 @@ export function findAllRecipesForItem(
 
   const scored = candidates.map(recipe => ({
     recipe,
+    canCraft: hasRecipeMaterials(recipe, countItemFn),
     score: scoreRecipeAvailability(recipe, countItemFn),
   }));
 
-  scored.sort((a, b) => b.score - a.score);
+  // Sort by score descending (higher material availability first), then by canCraft descending
+  scored.sort((a, b) => {
+    if (a.score !== b.score) {
+      return b.score - a.score;
+    }
+    return a.canCraft ? -1 : 1; // canCraft true comes first among equal scores
+  });
+
   return scored.map(s => s.recipe);
 }
 

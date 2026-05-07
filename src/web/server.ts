@@ -862,6 +862,17 @@ export class WebServer {
           });
         }
 
+        // Serve shipSim.html for ship simulator route
+        if (url.pathname === "/shipSim.html") {
+          const shipSimPath = join(import.meta.dir, "shipSim.html");
+          return new Response(readFileSync(shipSimPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve index.html for all other routes (read fresh for dev, no cache)
         return new Response(readFileSync(indexPath, "utf-8"), {
           headers: {

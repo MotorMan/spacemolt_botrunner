@@ -334,14 +334,14 @@ class ResponseCache {
 }
 
 const COMMAND_TTL: Record<string, number> = {
-  get_status: 15_000,
+  get_status: 10_000, //doesn't need to be 15s.
   get_system: 30_000,
   get_ship: 60_000,
   get_cargo: 10_000,
-  get_nearby: 15_000,
-  get_poi: 30_000,
+  get_nearby: 10_000, //1 tick! must always know who is nearby!
+  get_poi: 10_000, //doesn't need to be 30s
   get_base: 120_000,
-  get_skills: 120_000,
+  get_skills: 30_000, //doesn't need to be 2 min.
   get_missions: 60_000,
   view_storage: 30_000,
   view_faction_storage: 120_000,
@@ -351,7 +351,7 @@ const COMMAND_TTL: Record<string, number> = {
   view_market: 30_000,
   view_orders: 30_000,
   estimate_purchase: 30_000,
-  get_wrecks: 15_000,
+  get_wrecks: 10_000, //doesn't need to be 15.
   catalog: 3600_000,
 };
 

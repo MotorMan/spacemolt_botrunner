@@ -1571,6 +1571,34 @@ class MapStore {
     return results;
   }
 
+  getAllSellSupply(): Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> {
+    const results: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
+
+    for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      // Skip pirate systems
+      if (this.isPirateSystem(sysId)) continue;
+      for (const poi of sys.pois) {
+        // Only include POIs with a dockable station (has_base)
+        if (!poi.has_base) continue;
+        for (const m of poi.market) {
+          if (m.best_sell !== null && m.sell_quantity > 0) {
+            results.push({
+              itemId: m.item_id,
+              itemName: m.item_name,
+              systemId: sysId,
+              poiId: poi.id,
+              poiName: poi.name,
+              price: m.best_sell,
+              quantity: m.sell_quantity,
+            });
+          }
+        }
+      }
+    }
+
+    return results;
+  }
+
   /** Find price spreads for an item or all items between stations (excluding pirate systems).
    *  Returns opportunities where an item can be bought cheaply and sold at a higher price. */
   findPriceSpreads(itemId?: string): Array<{

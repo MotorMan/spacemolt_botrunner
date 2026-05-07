@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ship Loadout Simulator - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background: var(--bg); color: var(--text); }
+    body { padding: 16px; display:flex; flex-direction:column; overflow:hidden; }
+    .shipsim-layout { flex:1; min-height:0; display:flex; flex-direction:column; }
+    .shipsim-header { display:flex; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+    .shipsim-header h3 { margin:0; color:var(--text-bright); }
+    .shipsim-stats { color:var(--text-dim); font-size:12px; }
+    .shipsim-content { flex:1; min-height:0; overflow:auto; display:flex; flex-direction:column; gap:16px; }
+    .shipsim-section { background:var(--bg-card); border:1px solid var(--border); border-radius:6px; padding:16px; }
+    .shipsim-section-title { color:var(--text-bright); font-weight:600; margin-bottom:12px; display:flex; align-items:center; gap:8px; }
+    .shipsim-ship-select { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+    .shipsim-ship-select label { font-size:12px; color:var(--text-dim); }
+    .shipsim-skill-select { display:flex; align-items:center; gap:8px; margin-bottom:16px; }
+    .shipsim-skill-select label { font-size:12px; color:var(--text-dim); }
+    .shipsim-skill-select select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .shipsim-ship-select select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .shipsim-stats-grid { display:grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap:8px; margin-bottom:16px; }
+    .shipsim-stat-item { display:flex; justify-content:space-between; align-items:center; padding:8px 12px; background:var(--bg-row); border-radius:4px; }
+    .shipsim-stat-label { font-weight:500; }
+    .shipsim-stat-value { color:var(--accent); }
+    .shipsim-resource-budget { background:var(--bg-card); border:1px solid var(--border); border-radius:6px; padding:16px; margin-bottom:16px; }
+    .shipsim-resource-title { color:var(--text-bright); font-weight:600; margin-bottom:12px; }
+    .shipsim-stat-grid { display:grid; grid-template-columns: auto 1fr; gap:8px 12px; align-items: start; }
+    .shipsim-stat-label { font-weight:500; color:var(--text-dim); }
+    .shipsim-stat-value { color:var(--accent); }
+    .shipsim-bar { height:6px; background:var(--bg-input); border-radius:3px; overflow:hidden; margin-top:4px; }
+    .shipsim-bar-fill { height:100%; transition: width 0.3s ease; }
+    .shipsim-modules { display:flex; flex-direction:column; gap:12px; }
+    .shipsim-module-category { background:var(--bg-row); border:1px solid var(--border); border-radius:4px; padding:12px; }
+    .shipsim-module-category-title { font-weight:500; margin-bottom:8px; display:flex; align-items:center; gap:8px; }
+    .shipsim-module-slots { font-size:11px; color:var(--text-dim); }
+    .shipsim-module-list { display:flex; flex-direction:column; gap:6px; }
+    .shipsim-module-item { display:flex; align-items:center; gap:8px; padding:6px; background:var(--bg); border-radius:3px; }
+    .shipsim-module-item input[type="checkbox"] { margin:0; }
+    .shipsim-module-info { flex:1; min-width:0; }
+    .shipsim-module-name { font-weight:500; font-size:12px; }
+    .shipsim-module-details { font-size:11px; color:var(--text-dim); margin-top:2px; }
+    .shipsim-loadout { background:var(--bg-row); border:1px solid var(--border); border-radius:4px; padding:12px; }
+    .shipsim-loadout-title { font-weight:500; margin-bottom:8px; }
+    .shipsim-loadout-list { display:flex; flex-direction:column; gap:8px; }
+    .shipsim-loadout-item { display:flex; justify-content:space-between; align-items:center; padding:6px 8px; background:var(--bg); border-radius:3px; }
+    .shipsim-loadout-remove { color:var(--red); cursor:pointer; padding:2px 6px; border-radius:2px; align-self:flex-start; }
+    .shipsim-loadout-remove:hover { background:var(--bg-input); }
+    .shipsim-module-select { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
+    .shipsim-module-select select { flex:1; padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .empty-state { text-align:center; padding:40px; color:var(--text-dim); }
+  </style>
+</head>
+<body>
+  <div class="shipsim-layout">
+    <div class="shipsim-header">
+      <h3>Ship Loadout Simulator</h3>
+      <span class="shipsim-stats" id="shipsimStats">Select a ship and set Engineering skill level for accurate CPU/Power calculations.</span>
+    </div>
+
+    <div class="shipsim-content">
+      <div class="shipsim-section">
+        <div class="shipsim-section-title">Ship Selection</div>
+        <div class="shipsim-ship-select">
+          <label>Ship:</label>
+          <select id="shipSelect" onchange="selectShip()">
+            <option value="">Choose a ship...</option>
+          </select>
+        </div>
+        <div class="shipsim-skill-select">
+          <label>Engineering Skill Level:</label>
+          <select id="engineeringSkillSelect" onchange="setEngineeringSkillLevel(this.value)">
+            <!-- Options populated by JavaScript -->
+          </select>
+        </div>
+        <div class="shipsim-resource-budget" id="resourceBudget" style="display:none;">
+          <!-- Resource budget with bars like regular shipyard -->
+        </div>
+        <div class="shipsim-stats-grid" id="shipDetails" style="display:none;">
+          <!-- Ship details like hull, shield, speed will be populated here -->
+        </div>
+      </div>
+
+      <div class="shipsim-section" id="loadoutSection" style="display:none;">
+        <div class="shipsim-section-title">Current Loadout</div>
+        <div class="shipsim-loadout" id="currentLoadout">
+          <!-- Current loadout will be shown here -->
+        </div>
+      </div>
+
+      <div class="shipsim-section" id="modulesSection" style="display:none;">
+        <div class="shipsim-section-title">Module Selection</div>
+        <div class="shipsim-modules" id="modulesContainer">
+          <!-- Module categories will be populated here -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let catalog = { ships: {}, items: {} };
+    let selectedShip = null;
+    let currentLoadout = { weapons: [], defense: [], utility: [] };
+    let engineeringSkillLevel = 0;
+
+    // ── Load Data ──────────────────────────────────────────
+    async function loadData() {
+      try {
+        const catalogRes = await fetch('/api/catalog');
+        const catalogData = await catalogRes.json();
+        catalog = catalogData;
+        populateShipSelect();
+        populateSkillSelect();
+      } catch (e) {
+        console.error('Failed to load catalog:', e);
+        document.getElementById('shipsimStats').textContent = 'Failed to load catalog data';
+      }
+    }
+
+    // ── Ship Selection ─────────────────────────────────────
+    function populateShipSelect() {
+      const select = document.getElementById('shipSelect');
+      const ships = Object.values(catalog.ships || {}).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+      ships.forEach(ship => {
+        const option = document.createElement('option');
+        option.value = ship.id || ship.ship_id || ship.class_id;
+        option.textContent = ship.name || ship.ship_name || ship.id;
+        select.appendChild(option);
+      });
+    }
+
+    function populateSkillSelect() {
+      const select = document.getElementById('engineeringSkillSelect');
+      for (let i = 0; i <= 50; i++) {
+        const option = document.createElement('option');
+        option.value = i.toString();
+        const reduction = i > 0 ? ` (-${i}% CPU/Power)` : ' (No bonus)';
+        option.textContent = i + reduction;
+        select.appendChild(option);
+      }
+      select.value = engineeringSkillLevel.toString();
+    }
+
+function selectShip() {
+  const shipId = document.getElementById('shipSelect').value;
+  if (!shipId) {
+    selectedShip = null;
+    document.getElementById('resourceBudget').style.display = 'none';
+    document.getElementById('shipDetails').style.display = 'none';
+    document.getElementById('modulesSection').style.display = 'none';
+    document.getElementById('loadoutSection').style.display = 'none';
+    return;
+  }
+
+  selectedShip = catalog.ships[shipId];
+  if (!selectedShip) return;
+
+  // Debug: show ship properties in console
+  console.log('Selected ship:', selectedShip);
+
+      renderShipStats();
+      renderShipDetails();
+      renderModules();
+      updateLoadout();
+
+      document.getElementById('resourceBudget').style.display = 'block';
+      document.getElementById('shipDetails').style.display = 'grid';
+      document.getElementById('modulesSection').style.display = 'block';
+      document.getElementById('loadoutSection').style.display = 'block';
+    }
+
+    function renderShipStats() {
+      if (!selectedShip) return;
+
+      const budget = document.getElementById('resourceBudget');
+      const baseCpuUsed = currentLoadout.weapons.concat(currentLoadout.defense, currentLoadout.utility)
+        .reduce((sum, mod) => sum + (mod.cpu_usage || mod.cpu_cost || mod.cpu || 0), 0);
+      const basePowerUsed = currentLoadout.weapons.concat(currentLoadout.defense, currentLoadout.utility)
+        .reduce((sum, mod) => sum + (mod.power_usage || mod.power_cost || mod.power || 0), 0);
+
+      // Apply engineering skill efficiency bonus (1% reduction per level)
+      const efficiencyBonus = engineeringSkillLevel * 0.01; // Convert to decimal
+      const cpuUsed = Math.ceil(baseCpuUsed * (1 - efficiencyBonus));
+      const powerUsed = Math.ceil(basePowerUsed * (1 - efficiencyBonus));
+
+      const baseMaxCpu = selectedShip.cpu_capacity || selectedShip.max_cpu || 80;
+      const baseMaxPower = selectedShip.power_capacity || selectedShip.max_power || 100;
+      const cpuBonus = currentLoadout.utility.reduce((sum, mod) => sum + (mod.cpu_bonus || 0), 0);
+      const maxCpu = baseMaxCpu + cpuBonus;
+
+      let weaponSlots = selectedShip.weapon_slots || 0;
+      let defenseSlots = selectedShip.defense_slots || 0;
+      let utilitySlots = selectedShip.utility_slots || 0;
+
+      // If no slot info in catalog, use defaults
+      if (weaponSlots === 0 && defenseSlots === 0 && utilitySlots === 0) {
+        const shipName = selectedShip.name || selectedShip.id || '';
+        const defaults = getShipSlotDefaults(shipName.toLowerCase());
+        weaponSlots = defaults.weapon;
+        defenseSlots = defaults.defense;
+        utilitySlots = defaults.utility;
+      }
+
+      const cpuPct = maxCpu > 0 ? Math.round((cpuUsed / maxCpu) * 100) : 0;
+      const powerPct = baseMaxPower > 0 ? Math.round((powerUsed / baseMaxPower) * 100) : 0;
+      const slotsUsed = currentLoadout.weapons.length + currentLoadout.defense.length + currentLoadout.utility.length;
+      const totalSlots = weaponSlots + defenseSlots + utilitySlots;
+
+      budget.innerHTML = `
+        <div class="shipsim-resource-title">Resource Budget</div>
+        <div class="shipsim-stat-grid">
+          <span class="shipsim-stat-label">CPU</span><span class="shipsim-stat-value">${cpuUsed}${engineeringSkillLevel > 0 ? ` (was ${baseCpuUsed})` : ''} / ${maxCpu}${cpuBonus > 0 ? ` (+${cpuBonus})` : ''}<div class="shipsim-bar"><div class="shipsim-bar-fill" style="width:${cpuPct}%;background:var(--magenta)"></div></div></span>
+          <span class="shipsim-stat-label">Power</span><span class="shipsim-stat-value">${powerUsed}${engineeringSkillLevel > 0 ? ` (was ${basePowerUsed})` : ''} / ${baseMaxPower}<div class="shipsim-bar"><div class="shipsim-bar-fill" style="width:${powerPct}%;background:var(--accent)"></div></div></span>
+          <span class="shipsim-stat-label">Slots</span><span class="shipsim-stat-value">${slotsUsed} / ${totalSlots} used${weaponSlots ? ` (W:${currentLoadout.weapons.length}/${weaponSlots}` : ''}${defenseSlots ? ` D:${currentLoadout.defense.length}/${defenseSlots}` : ''}${utilitySlots ? ` U:${currentLoadout.utility.length}/${utilitySlots}` : ''}${totalSlots > 0 ? ')' : ''}</span>
+        </div>
+      `;
+    }
+
+    // ── Module Selection ───────────────────────────────────
+    function renderModules() {
+      if (!selectedShip) return;
+
+      const container = document.getElementById('modulesContainer');
+
+      // Get slot values from catalog or use defaults for known ships
+      let weaponSlots = selectedShip.weapon_slots || 0;
+      let defenseSlots = selectedShip.defense_slots || 0;
+      let utilitySlots = selectedShip.utility_slots || 0;
+
+      // If no slot info in catalog, use defaults based on ship name/class
+      if (weaponSlots === 0 && defenseSlots === 0 && utilitySlots === 0) {
+        const shipName = selectedShip.name || selectedShip.id || '';
+        const defaults = getShipSlotDefaults(shipName.toLowerCase());
+        weaponSlots = defaults.weapon;
+        defenseSlots = defaults.defense;
+        utilitySlots = defaults.utility;
+      }
+
+      // Get available modules from catalog
+      const modules = Object.values(catalog.items || {}).filter(item => {
+        const category = item.category || item.type || '';
+        return category.toLowerCase().includes('weapon') ||
+               category.toLowerCase().includes('defense') ||
+               category.toLowerCase().includes('utility') ||
+               category.toLowerCase().includes('module');
+      });
+
+      // Group modules by category
+      const categories = {
+        weapons: modules.filter(m => (m.category || m.type || '').toLowerCase().includes('weapon')),
+        defense: modules.filter(m => (m.category || m.type || '').toLowerCase().includes('defense') || (m.category || m.type || '').toLowerCase().includes('shield') || (m.category || m.type || '').toLowerCase().includes('armor')),
+        utility: modules.filter(m => (m.category || m.type || '').toLowerCase().includes('utility') || (m.category || m.type || '').toLowerCase().includes('mining') || (m.category || m.type || '').toLowerCase().includes('cargo'))
+      };
+
+      // Add special modules not in catalog
+      categories.utility.push({
+        id: 'fuel_optimizer',
+        name: 'Fuel Optimizer',
+        category: 'utility',
+        cpu_usage: 3,
+        power_usage: 2,
+        wear: 0,
+        fuel_efficiency: 15
+      });
+      categories.utility.push({
+        id: 'cpu_co_processor',
+        name: 'CPU Co-Processor',
+        category: 'utility',
+        cpu_usage: 0,
+        power_usage: 3,
+        wear: 0,
+        cpu_bonus: 5
+      });
+
+      container.innerHTML = '';
+
+      // Weapons
+      if (weaponSlots > 0) {
+        container.appendChild(createModuleCategory('Weapons', categories.weapons, 'weapons', weaponSlots));
+      }
+
+      // Defense
+      if (defenseSlots > 0) {
+        container.appendChild(createModuleCategory('Defense', categories.defense, 'defense', defenseSlots));
+      }
+
+      // Utility
+      if (utilitySlots > 0) {
+        container.appendChild(createModuleCategory('Utility', categories.utility, 'utility', utilitySlots));
+      }
+    }
+
+    function createModuleCategory(title, modules, category, maxSlots) {
+      const div = document.createElement('div');
+      div.className = 'shipsim-module-category';
+
+      const titleDiv = document.createElement('div');
+      titleDiv.className = 'shipsim-module-category-title';
+      titleDiv.innerHTML = `<span>${title}</span><span class="shipsim-module-slots">${currentLoadout[category].length}/${maxSlots} slots</span>`;
+      div.appendChild(titleDiv);
+
+      // Create dropdown for module selection
+      const selectDiv = document.createElement('div');
+      selectDiv.className = 'shipsim-module-select';
+
+      const select = document.createElement('select');
+      select.id = `moduleSelect_${category}`;
+      select.innerHTML = '<option value="">Select a module to add...</option>';
+
+      modules.forEach(module => {
+        const option = document.createElement('option');
+        option.value = module.id;
+        const details = [];
+        if (module.cpu_usage || module.cpu_cost || module.cpu) details.push(`CPU: ${module.cpu_usage || module.cpu_cost || module.cpu || 0}`);
+        if (module.power_usage || module.power_cost || module.power) details.push(`Pwr: ${module.power_usage || module.power_cost || module.power || 0}`);
+        if (module.damage) details.push(`Dmg: ${module.damage}`);
+        if (module.mining_power) details.push(`Mining: ${module.mining_power}`);
+        if (module.shield_bonus) details.push(`Shield: +${module.shield_bonus}`);
+        if (module.armor_bonus) details.push(`Armor: +${module.armor_bonus}`);
+        if (module.fuel_efficiency) details.push(`Fuel: ${module.fuel_efficiency}`);
+        if (module.cpu_bonus) details.push(`CPU+: ${module.cpu_bonus}`);
+
+        option.textContent = `${module.name || module.item_name || module.id}${details.length > 0 ? ' (' + details.join(', ') + ')' : ''}`;
+        select.appendChild(option);
+      });
+
+      const addButton = document.createElement('button');
+      addButton.className = 'primary sm';
+      addButton.textContent = 'Add Module';
+      addButton.onclick = () => addModuleFromDropdown(category);
+
+      selectDiv.appendChild(select);
+      selectDiv.appendChild(addButton);
+      div.appendChild(selectDiv);
+
+      return div;
+    }
+
+    function setEngineeringSkillLevel(level) {
+      engineeringSkillLevel = parseInt(level) || 0;
+      document.getElementById('engineeringSkillSelect').value = engineeringSkillLevel;
+      if (selectedShip) {
+        renderShipStats(); // Recalculate with new skill level
+      }
+    }
+
+    function addModuleFromDropdown(category) {
+      const select = document.getElementById(`moduleSelect_${category}`);
+      const moduleId = select.value;
+      if (!moduleId) return;
+
+      // Find the module
+      const modules = Object.values(catalog.items || {}).filter(item => {
+        const categoryMatch = (item.category || item.type || '').toLowerCase().includes(category.slice(0, -1)); // Remove 's' from category
+        return categoryMatch;
+      });
+
+      // Add special modules
+      if (category === 'utility') {
+        modules.push({
+          id: 'fuel_optimizer',
+          name: 'Fuel Optimizer',
+          category: 'utility',
+          cpu_usage: 3,
+          power_usage: 2,
+          wear: 0,
+          fuel_efficiency: 15
+        });
+        modules.push({
+          id: 'cpu_co_processor',
+          name: 'CPU Co-Processor',
+          category: 'utility',
+          cpu_usage: 0,
+          power_usage: 3,
+          wear: 0,
+          cpu_bonus: 5
+        });
+      }
+
+      const module = modules.find(m => m.id === moduleId);
+      if (!module) return;
+
+      // Check slot limits
+      const maxSlots = getSlotCount(category);
+      if (currentLoadout[category].length >= maxSlots) {
+        alert(`Cannot add more ${category} modules. Maximum ${maxSlots} slots.`);
+        return;
+      }
+
+      currentLoadout[category].push(module);
+      updateLoadout();
+      renderShipStats();
+      renderModules(); // Update slot counts in titles
+    }
+
+    function removeModuleFromLoadout(category, index) {
+      currentLoadout[category].splice(index, 1);
+      updateLoadout();
+      renderShipStats();
+      renderModules(); // Update slot counts in titles
+    }
+
+    function renderShipDetails() {
+      if (!selectedShip) return;
+
+      const details = document.getElementById('shipDetails');
+      const hull = selectedShip.base_hull || selectedShip.hull || 0;
+      const shield = selectedShip.base_shield || selectedShip.shield || 0;
+      const speed = selectedShip.base_speed || selectedShip.speed || 0;
+      const cargo = selectedShip.cargo_capacity || selectedShip.cargo || 0;
+      const mass = selectedShip.mass || 0;
+      const tier = selectedShip.tier !== undefined ? (selectedShip.tier === 0 ? 'T0' : `T${selectedShip.tier}`) : 'Legacy';
+
+      details.innerHTML = `
+        <div class="shipsim-stat-item">
+          <span class="shipsim-stat-label">Hull</span>
+          <span class="shipsim-stat-value">${hull}</span>
+        </div>
+        <div class="shipsim-stat-item">
+          <span class="shipsim-stat-label">Shield</span>
+          <span class="shipsim-stat-value">${shield}</span>
+        </div>
+        <div class="shipsim-stat-item">
+          <span class="shipsim-stat-label">Speed</span>
+          <span class="shipsim-stat-value">${speed}</span>
+        </div>
+        <div class="shipsim-stat-item">
+          <span class="shipsim-stat-label">Cargo</span>
+          <span class="shipsim-stat-value">${cargo}</span>
+        </div>
+        <div class="shipsim-stat-item">
+          <span class="shipsim-stat-label">Mass</span>
+          <span class="shipsim-stat-value">${mass}</span>
+        </div>
+        <div class="shipsim-stat-item">
+          <span class="shipsim-stat-label">Tier</span>
+          <span class="shipsim-stat-value">${tier}</span>
+        </div>
+      `;
+    }
+
+    function getSlotCount(category) {
+      let weaponSlots = selectedShip.weapon_slots || 0;
+      let defenseSlots = selectedShip.defense_slots || 0;
+      let utilitySlots = selectedShip.utility_slots || 0;
+
+      // If no slot info in catalog, use defaults
+      if (weaponSlots === 0 && defenseSlots === 0 && utilitySlots === 0) {
+        const shipName = selectedShip.name || selectedShip.id || '';
+        const defaults = getShipSlotDefaults(shipName.toLowerCase());
+        weaponSlots = defaults.weapon;
+        defenseSlots = defaults.defense;
+        utilitySlots = defaults.utility;
+      }
+
+      switch (category) {
+        case 'weapons': return weaponSlots;
+        case 'defense': return defenseSlots;
+        case 'utility': return utilitySlots;
+        default: return 0;
+      }
+    }
+
+    // ── Loadout Display ────────────────────────────────────
+    function updateLoadout() {
+      const container = document.getElementById('currentLoadout');
+
+      let html = '<div class="shipsim-loadout-list">';
+
+      ['weapons', 'defense', 'utility'].forEach(category => {
+        if (currentLoadout[category].length > 0) {
+          html += `<div class="shipsim-loadout-title">${category.charAt(0).toUpperCase() + category.slice(1)}</div>`;
+          currentLoadout[category].forEach((module, index) => {
+            html += `<div class="shipsim-loadout-item">
+              <span>${module.name || module.item_name || module.id}</span>
+              <span class="shipsim-loadout-remove" onclick="removeModuleFromLoadout('${category}', ${index})">✕</span>
+            </div>`;
+          });
+        }
+      });
+
+      if (html === '<div class="shipsim-loadout-list">') {
+        html += '<div class="empty-state" style="padding:20px;">No modules selected</div>';
+      }
+
+      html += '</div>';
+      container.innerHTML = html;
+    }
+
+
+
+    // ── Helpers ────────────────────────────────────────────
+    function getShipSlotDefaults(shipName) {
+      // Default slot configurations for known ships
+      const defaults = {
+        // Common ships - these are educated guesses based on typical ship classes
+        'axiomata': { weapon: 3, defense: 2, utility: 2 },
+        'hermes': { weapon: 2, defense: 2, utility: 3 },
+        'pegasus': { weapon: 4, defense: 1, utility: 1 },
+        'mule': { weapon: 1, defense: 1, utility: 4 },
+        'courier': { weapon: 1, defense: 1, utility: 3 },
+        'freighter': { weapon: 1, defense: 1, utility: 3 },
+        'hauler': { weapon: 1, defense: 2, utility: 2 },
+        'shuttle': { weapon: 0, defense: 1, utility: 2 },
+        'fighter': { weapon: 4, defense: 1, utility: 1 },
+        'bomber': { weapon: 3, defense: 1, utility: 2 },
+        'destroyer': { weapon: 6, defense: 3, utility: 2 },
+        'cruiser': { weapon: 5, defense: 4, utility: 3 },
+        'battleship': { weapon: 8, defense: 5, utility: 4 },
+        'default': { weapon: 2, defense: 2, utility: 2 }
+      };
+
+      // Try exact match first
+      if (defaults[shipName]) {
+        return defaults[shipName];
+      }
+
+      // Try partial matches
+      for (const [key, value] of Object.entries(defaults)) {
+        if (shipName.includes(key) && key !== 'default') {
+          return value;
+        }
+      }
+
+      return defaults.default;
+    }
+
+    function num(n) {
+      return n ? n.toLocaleString() : '0';
+    }
+
+    function esc(s) {
+      if (!s) return '';
+      const d = document.createElement('div');
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    // ── Initialize ─────────────────────────────────────────
+    loadData();
+  </script>
+</body>
+</html>

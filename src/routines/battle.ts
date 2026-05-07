@@ -11,10 +11,10 @@ export type PirateTier = "small" | "medium" | "large" | "capitol" | "boss";
 /**
  * Battle commands (advance, retreat, stance, target, flee) LOCK until the server
  * processes them at the next tick (every ~10 seconds).
- * 
- * IMPORTANT: bot.exec("battle", ...) ALREADY BLOCKS until the server responds.
- * Do NOT try to "wait for tick" manually - just await the exec() call.
- * 
+ *
+ * IMPORTANT: bot.exec("battle", ...) may not fully block in practice, so we add
+ * manual sleeps to ensure tick timing is respected.
+ *
  * This function is kept for backward compatibility but simply waits 10s.
  * The real "wait" happens inside bot.exec() when it awaits the server response.
  */
@@ -23,8 +23,7 @@ export async function waitForServerTick(
   _lastTick: number | undefined,
   timeoutMs: number = 15000,
 ): Promise<void> {
-  // bot.exec("battle") already waits for server tick (~10s).
-  // This function is just a safety net - wait up to timeoutMs.
+  // Wait for server tick (~10s) as safety net.
   ctx.log("combat", `Waiting for server response (max ${timeoutMs}ms)...`);
   await ctx.sleep(Math.min(timeoutMs, 10000));
 }
@@ -192,7 +191,8 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
     const isWeapon = modType.includes("weapon") || modType.includes("missile") || modType.includes("launcher") || modType.includes("torpedo") || modId.includes("weapon") || modId.includes("missile") || modId.includes("launcher");
     if (!isWeapon) continue;
 
-    let ammoType = (mod.ammo_type as string) || (mod.ammo_item_id as string) || (mod.ammo as string);
+    // V2 API provides ammo_type directly, fall back to catalog lookup
+    let ammoType = (mod.ammo_type as string) || (mod.loaded_ammo_id as string);
     if (!ammoType && modId) {
       const catalogModule = catalogStore.getItem(modId);
       if (catalogModule) {
@@ -206,8 +206,9 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
                        (mod.module_instance_id as string) ||
                        (mod.id as string) || "";
     const moduleId = (mod.module_id as string) || (mod.mod_id as string) || (mod.id as string) || "";
+    // V2 API now provides current_ammo and magazine_size directly
     const currentAmmo = (mod.current_ammo as number) ?? 0;
-    const maxAmmo = (mod.max_ammo as number) ?? 0;
+    const maxAmmo = (mod.magazine_size as number) ?? 0;
 
     if (instanceId && moduleId) {
       weapons.push({
@@ -334,27 +335,27 @@ export async function emergencyFleeSpam(ctx: RoutineContext, reason: string): Pr
     return;
   }
 
-  // Send flee stance - this will block until server tick (10s)
-  // because battle commands lock until the server processes them
+  // Send flee stance - wait for tick completion
   ctx.log("combat", `Setting flee stance (waiting for server tick)...`);
   const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
-  
+  await ctx.sleep(10000);
+
   if (fleeResp.error) {
     const errMsg = fleeResp.error.message.toLowerCase();
     if (errMsg.includes("in_battle") || errMsg.includes("in combat")) {
       ctx.log("combat", `⚠️ Flee stance blocked - waiting for current action to complete...`);
-      // bot.exec() already waited for server tick
       await ctx.sleep(2000);
-      
+
       // Retry flee after tick
       status = await getBattleStatus(ctx);
       if (!status) {
         ctx.log("combat", `✅ Battle ended during flee attempt`);
         return;
       }
-      
+
       ctx.log("combat", `Retrying flee stance...`);
       await bot.exec("battle", { action: "stance", stance: "flee" });
+      await ctx.sleep(10000);
     } else {
       ctx.log("error", `Flee stance failed: ${fleeResp.error.message}`);
     }
@@ -388,7 +389,8 @@ export async function emergencyFleeSpam(ctx: RoutineContext, reason: string): Pr
     for (let i = 0; i < 3; i++) {
       ctx.log("combat", `Attempting retreat (${i + 1}/3)...`);
       const retreatResp = await bot.exec("battle", { action: "retreat" }); //human side note, you may need to be in the outer zone to enable flee though.
-      
+      await ctx.sleep(10000);
+
       if (retreatResp.error) {
         const errMsg = retreatResp.error.message.toLowerCase();
         if (errMsg.includes("in_battle") || errMsg.includes("in combat")) {
@@ -397,10 +399,10 @@ export async function emergencyFleeSpam(ctx: RoutineContext, reason: string): Pr
           ctx.log("error", `Retreat failed: ${retreatResp.error.message}`);
         }
       }
-      
-      // Brief pause before next check (bot.exec() already waited)
+
+      // Brief pause before next check
       await ctx.sleep(2000);
-      
+
       status = await getBattleStatus(ctx);
       if (!status) {
         ctx.log("combat", `✅ Successfully disengaged after retreat`);
@@ -637,7 +639,7 @@ export async function fightFreshBattle(
       return false;
     }
 
-    // Battle commands LOCK until server tick - bot.exec() will block for ~10s
+    // Battle commands LOCK until server tick - wait for tick completion
     ctx.log("combat", `Advancing to zone ${zone + 1}/3...`);
     const advResp = await bot.exec("battle", { action: "advance" });
     if (advResp.error) {
@@ -645,7 +647,8 @@ export async function fightFreshBattle(
       break;
     }
 
-    // Log progress (bot.exec already waited for server tick)
+    // Wait for tick to complete
+    await ctx.sleep(10000);
     const postAdvanceStatus = await getBattleStatus(ctx);
     if (postAdvanceStatus) {
       const zoneNames = ["mid", "inner", "engaged"];
@@ -659,9 +662,10 @@ export async function fightFreshBattle(
   let tickCount = 0;
   let lastHull = bot.hull;
 
-  // Set initial stance - bot.exec() blocks until server tick (~10s)
+  // Set initial stance - wait for tick completion
   ctx.log("combat", `Setting initial stance to FIRE...`);
   await bot.exec("battle", { action: "stance", stance: "fire" });
+  await ctx.sleep(10000);
   const initialStatus = await getBattleStatus(ctx);
   let ourCurrentZone = initialStatus?.your_zone || "outer";
 
@@ -710,24 +714,24 @@ export async function fightFreshBattle(
     if (shieldsCritical && consecutiveBraceTicks < 3) {
       ctx.log("combat", `🛡️ BRACE (${isHighDamageEnemy ? 'high-damage enemy' : 'shields critical'})`);
       await bot.exec("battle", { action: "stance", stance: "brace" });
-      // bot.exec() already waited for server tick
+      await ctx.sleep(10000);
       consecutiveBraceTicks++;
     } else if (shieldsCritical && consecutiveBraceTicks >= 3) {
       ctx.log("combat", `⚔️ FIRE (braced ${consecutiveBraceTicks} ticks, switching back)`);
       await bot.exec("battle", { action: "stance", stance: "fire" });
-      // bot.exec() already waited for server tick
+      await ctx.sleep(10000);
       consecutiveBraceTicks = 0;
     } else if (consecutiveBraceTicks > 0) {
       ctx.log("combat", `⚔️ FIRE (resuming after brace)`);
       await bot.exec("battle", { action: "stance", stance: "fire" });
-      // bot.exec() already waited for server tick
+      await ctx.sleep(10000);
       consecutiveBraceTicks = 0;
     } else {
       if (enemyZoneNum > ourZoneNum) {
         ctx.log("combat", `⚔️ ADVANCING (enemy in ${enemyZone}, we're in ${ourCurrentZone})`);
         const advResp = await bot.exec("battle", { action: "advance" });
         if (!advResp.error) {
-          // bot.exec() already waited for server tick
+          await ctx.sleep(10000);
           const newZoneNum = Math.min(3, ourZoneNum + 1);
           ourCurrentZone = (["outer", "mid", "inner", "engaged"][newZoneNum]) as typeof ourCurrentZone;
         }
@@ -735,18 +739,17 @@ export async function fightFreshBattle(
         ctx.log("combat", `🔄 RETREAT (maintaining position in ${ourCurrentZone})`);
         const retResp = await bot.exec("battle", { action: "retreat" });
         if (!retResp.error) {
-          // bot.exec() already waited for server tick
+          await ctx.sleep(10000);
           const newZoneNum = Math.max(0, ourZoneNum - 1);
           ourCurrentZone = (["outer", "mid", "inner", "engaged"][newZoneNum]) as typeof ourCurrentZone;
         }
       } else {
         ctx.log("combat", `⚔️ ADVANCING to engage`);
         await bot.exec("battle", { action: "advance" });
-        // bot.exec() already waited for server tick
+        await ctx.sleep(10000);
         ourCurrentZone = "mid";
       }
     }
-    // NO manual sleep or waitForServerTick needed - bot.exec() already blocks for server tick
   }
 }
 
@@ -761,10 +764,12 @@ export async function fightJoinedBattle(
 
   ctx.log("combat", `🎯 Fighting in joined battle — targeting ${target.name}`);
 
-  // Set target and fire stance - bot.exec() BLOCKS until server tick (~10s)
+  // Set target and fire stance - wait for tick completion
   ctx.log("combat", `Setting target and stance...`);
   await bot.exec("battle", { action: "target", target_id: target.id });
+  await ctx.sleep(10000);
   await bot.exec("battle", { action: "stance", stance: "fire" });
+  await ctx.sleep(10000);
 
   // Tactical combat loop
   let consecutiveBraceTicks = 0;
@@ -837,33 +842,32 @@ export async function fightJoinedBattle(
     if (shieldsCritical && consecutiveBraceTicks < 3) {
       ctx.log("combat", `🛡️ BRACE (${isHighDamageEnemy ? 'high-damage enemy' : 'shields critical'})`);
       await bot.exec("battle", { action: "stance", stance: "brace" });
-      // bot.exec() already waited for server tick (~10s)
+      await ctx.sleep(10000);
       consecutiveBraceTicks++;
     } else if (shieldsCritical && consecutiveBraceTicks >= 3) {
       ctx.log("combat", `⚔️ FIRE (braced ${consecutiveBraceTicks} ticks, switching back)`);
       await bot.exec("battle", { action: "stance", stance: "fire" });
-      // bot.exec() already waited for server tick
+      await ctx.sleep(10000);
       consecutiveBraceTicks = 0;
     } else if (consecutiveBraceTicks > 0) {
       ctx.log("combat", `⚔️ FIRE (resuming after brace)`);
       await bot.exec("battle", { action: "stance", stance: "fire" });
-      // bot.exec() already waited for server tick
+      await ctx.sleep(10000);
       consecutiveBraceTicks = 0;
     } else {
       if (enemyZoneNum > ourZoneNum) {
         ctx.log("combat", `⚔️ ADVANCING (enemy in ${enemyZone}, we're in ${ourZone})`);
         await bot.exec("battle", { action: "advance" });
-        // bot.exec() already waited for server tick
+        await ctx.sleep(10000);
       } else if (enemyZoneNum <= ourZoneNum && ourZoneNum > 0) {
         ctx.log("combat", `🔄 RETREAT (maintaining position)`);
         await bot.exec("battle", { action: "retreat" });
-        // bot.exec() already waited for server tick
+        await ctx.sleep(10000);
       } else {
         ctx.log("combat", `⚔️ ADVANCING to engage`);
         await bot.exec("battle", { action: "advance" });
-        // bot.exec() already waited for server tick
+        await ctx.sleep(10000);
       }
     }
-    // NO manual sleep or waitForServerTick needed - bot.exec() blocks for server tick
   }
 }

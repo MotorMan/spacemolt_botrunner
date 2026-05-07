@@ -1575,6 +1575,9 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
+      // If the match was on output_item_id, treat it as an item goal, not a specific recipe
+      const isItemGoal = recipe.output_item_id === recipeId || recipe.output_item_id.toLowerCase() === recipeId.toLowerCase();
+
       // Skip recipes that cannot be crafted manually (ship-only or facility-only)
       const craftableCheck = isRecipeCraftable(recipe);
       if (!craftableCheck.ok) {
@@ -1615,7 +1618,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         const factionQty = facItem?.quantity || 0;
         ctx.log("craft", `   Inventory: cargo=${cargoQty}, storage=${storageQty}, faction=${factionQty} (total: ${currentStock})`);
       }
-      goalItems.push({ itemId: recipe.output_item_id, quantity: needed, recipe });
+      goalItems.push({ itemId: recipe.output_item_id, quantity: needed, recipe: isItemGoal ? undefined : recipe });
     }
 
     // ── If no goals configured, craft from enabled categories ──

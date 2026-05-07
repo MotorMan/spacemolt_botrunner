@@ -1410,15 +1410,25 @@ async function* scanStation(
 
         if (!itemId) continue;
 
-        const buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map(order => ({
+        let buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map(order => ({
           price: (order.price_each as number) || (order.price as number) || 0,
           quantity: (order.quantity as number) || 0,
         })).filter(order => order.price > 0 && order.quantity > 0);
 
-        const sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map(order => ({
+        let sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map(order => ({
           price: (order.price_each as number) || (order.price as number) || 0,
           quantity: (order.quantity as number) || 0,
         })).filter(order => order.price > 0 && order.quantity > 0);
+
+        // Stricter check: if buy orders and sell orders appear swapped (max buy < min sell), correct it
+        if (buyOrders.length > 0 && sellOrders.length > 0) {
+          const maxBuy = Math.max(...buyOrders.map(o => o.price));
+          const minSell = Math.min(...sellOrders.map(o => o.price));
+          if (maxBuy < minSell) {
+            ctx.log("warn", `Detected potentially swapped buy/sell orders for ${itemName} at ${poi.name} — correcting`);
+            [buyOrders, sellOrders] = [sellOrders, buyOrders];
+          }
+        }
 
         // Update or add to market details
         const existingIndex = marketDetails.items.findIndex(

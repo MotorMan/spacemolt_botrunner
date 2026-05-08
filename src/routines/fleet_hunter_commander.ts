@@ -699,12 +699,12 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
 
     // Branch based on patrol mode
     if (initialSettings.mode === "stationary") {
-      await stationaryRoutine(ctx, totalKillsRef, battleRef);
+      yield* stationaryRoutine(ctx, totalKillsRef, battleRef);
     } else if (initialSettings.mode === "roam_system") {
-      await roamSystemRoutine(ctx, totalKillsRef, battleRef);
+      yield* roamSystemRoutine(ctx, totalKillsRef, battleRef);
     } else {
       // Default to roam_systems
-      await roamSystemsRoutine(ctx, totalKillsRef, battleRef);
+      yield* roamSystemsRoutine(ctx, totalKillsRef, battleRef);
     }
   } finally {
     // Clean up handlers

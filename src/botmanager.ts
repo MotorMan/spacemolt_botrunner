@@ -691,6 +691,15 @@ async function main(): Promise<void> {
             // Clear failure counter on success
             sessionRestoreFailures.delete(name);
             server.logSystem(`${name} session resumed (no login delay)`);
+            // Fetch catalog data if stale (first bot with active session triggers it)
+            if (catalogStore.isStale()) {
+              try {
+                await catalogStore.fetchAll(bot.api);
+                server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+              } catch (err) {
+                server.logSystem(`Catalog fetch failed: ${err}`);
+              }
+            }
             // Session resumed, start routine if assigned
             const routineKey = assignments[name];
             if (routineKey && ROUTINES[routineKey]) {

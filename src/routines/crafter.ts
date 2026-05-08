@@ -1168,20 +1168,25 @@ async function executeCraftingPlan(
     // ── Round-robin: craft in rotation, using full skill-based batches ──
     let iterations = 0;
     const MAX_ITERATIONS = 100; // Safety limit
+    const failedThisIteration = new Set<string>(); // Track recipes that failed materials check
 
     while (planItems.some(item => item.quantityToCraft > 0) && iterations < MAX_ITERATIONS && bot.state === "running") {
       iterations++;
+      failedThisIteration.clear();
 
       for (const planItem of planItems) {
         if (bot.state !== "running") break;
-        
+
         if (planItem.quantityToCraft <= 0) continue;
+
+        // Skip recipes that already failed materials check this iteration
+        if (failedThisIteration.has(planItem.recipe.recipe_id)) continue;
 
         // Calculate batch size: limited by remaining batches and skill level
         const itemsPerBatch = planItem.recipe.output_quantity || 1;
         const maxBatchesByRemaining = planItem.quantityToCraft; // remaining batches
         const maxBatchesBySkill = Math.max(1, Math.floor(craftingSkillLevel || 1));
-        
+
         const batchSize = Math.min(maxBatchesByRemaining, maxBatchesBySkill);
 
         const result = await craftRecipeWithPrereqs(
@@ -1199,6 +1204,10 @@ async function executeCraftingPlan(
           const batchesCompleted = Math.floor(itemsCrafted / itemsPerBatch);
           planItem.quantityToCraft = Math.max(0, planItem.quantityToCraft - batchesCompleted);
           crafted.push(`${itemsCrafted}x ${planItem.recipe.output_name}`);
+        } else {
+          // Mark as permanently failed for this cycle — no materials available
+          failedThisIteration.add(planItem.recipe.recipe_id);
+          planItem.quantityToCraft = 0;
         }
         if (result.prereqsCrafted.length > 0) {
           prereqs.push(...result.prereqsCrafted);

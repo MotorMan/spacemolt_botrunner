@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 import type { SpaceMoltAPI } from "./api.js";
+import { debugLog } from "./debug.js";
 
 // ── Data model ──────────────────────────────────────────────
 
@@ -91,10 +92,13 @@ class CatalogStore {
       mkdirSync(DATA_DIR, { recursive: true });
     }
     try {
-      writeFileSync(CATALOG_FILE, JSON.stringify(this.data, null, 2) + "\n", "utf-8");
+      const json = JSON.stringify(this.data, null, 2) + "\n";
+      writeFileSync(CATALOG_FILE, json, "utf-8");
+      debugLog("catalog", `Catalog written to ${CATALOG_FILE} (${json.length} bytes)`);
     } catch (err) {
       // Log error but don't throw - catalog is still usable from memory
       console.error("Error writing catalog:", err);
+      debugLog("catalog", `Error writing catalog: ${err}`);
     }
     this.dirty = false;
   }
@@ -125,6 +129,7 @@ class CatalogStore {
     // concurrent fetch that would partially overwrite results.
     if (this._fetchPromise) return this._fetchPromise;
 
+    debugLog("catalog", `Starting catalog fetch (lastFetched: ${this.data.lastFetched})`);
     this._fetchPromise = this._doFetchAll(api).finally(() => {
       this._fetchPromise = null;
     });
@@ -145,13 +150,25 @@ class CatalogStore {
       let totalPages = 1;
 
       while (page <= totalPages) {
+        debugLog("catalog", `Fetching ${type} page ${page}/${totalPages}`);
         const resp = await api.execute("catalog", { type, page, page_size: 50 });
-        if (resp.error) break;
+        if (resp.error) {
+          debugLog("catalog", `Fetch error for ${type} page ${page}: ${resp.error.message}`);
+          break;
+        }
 
         const data = resp.result as Record<string, unknown> | undefined;
-        if (!data) break;
+        if (!data) {
+          debugLog("catalog", `No result data for ${type} page ${page}`);
+          break;
+        }
+
+        // Log the shape of the response for debugging
+        const dataKeys = Object.keys(data);
+        debugLog("catalog", `Response keys for ${type} page ${page}: ${dataKeys.join(", ")}`);
 
         const entries = extractArray(data, type);
+        debugLog("catalog", `Extracted ${entries.length} entries for ${type} page ${page}`);
 
         for (const entry of entries) {
           const id = (entry.id as string) || (entry.item_id as string) || (entry.recipe_id as string) || (entry.skill_id as string) || (entry.ship_id as string) || "";
@@ -165,6 +182,7 @@ class CatalogStore {
         totalPages = (data.total_pages as number) || (data.totalPages as number) || 1;
         page++;
       }
+      debugLog("catalog", `Finished ${type}: ${Object.keys(results[type]).length} total entries`);
     }
 
     this.data.items = results.items as Record<string, CatalogItem>;
@@ -182,6 +200,7 @@ class CatalogStore {
       `${Object.keys(this.data.skills).length} skills`,
       `${Object.keys(this.data.recipes).length} recipes`,
     ];
+    debugLog("catalog", `Fetch complete: ${counts.join(", ")}`);
     return void counts; // logged by caller
   }
 
@@ -219,6 +238,14 @@ class CatalogStore {
       recipes: this.data.recipes,
       lastFetched: this.data.lastFetched,
     };
+  }
+
+  /** Check if catalog is empty (no data loaded at all). */
+  isEmpty(): boolean {
+    return Object.keys(this.data.items).length === 0
+      && Object.keys(this.data.ships).length === 0
+      && Object.keys(this.data.skills).length === 0
+      && Object.keys(this.data.recipes).length === 0;
   }
 
   /** Check if an item appears as a component in any crafting recipe. */

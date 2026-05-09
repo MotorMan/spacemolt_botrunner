@@ -778,6 +778,16 @@ export class AiChatService {
 
       this.logFn("ai_chat_debug", `Private message to ${receivingBot} from ${msg.sender}`);
 
+      // For bot-to-bot private messages, use faction chat rounds limit
+      const bots = AiChatService.getBots();
+      const isFromAiBot = bots?.some(b => b.username === msg.sender);
+      if (isFromAiBot) {
+        if (this.checkFactionChatRoundsLimit(settings)) {
+          this.logFn("ai_chat", `Faction chat rounds limit reached (${this.factionChatRounds}/${settings.factionChatRoundsLimit}), skipping private message from bot`);
+          return;
+        }
+      }
+
       // Check if message mentions a different bot - if so, still let the receiving bot respond
       // (the player DM'd this bot, so this bot should respond regardless of mentions)
       const responder = this.selectResponderByMention(receivingBot);
@@ -972,7 +982,9 @@ export class AiChatService {
       this.recordResponse(msg.channel, participants, isHumanSender);
 
       // Increment faction chat rounds counter if response was sent
-      if (result === "sent" && msg.channel === "faction") {
+      const bots = AiChatService.getBots();
+      const isFromAiBot = bots?.some(b => b.username === msg.sender);
+      if (result === "sent" && (msg.channel === "faction" || (msg.channel === "private" && isFromAiBot))) {
         this.incrementFactionChatRounds();
       }
     }

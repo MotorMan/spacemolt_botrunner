@@ -960,6 +960,17 @@ export class WebServer {
           });
         }
 
+        // Serve engineeringCalc.html for engineering calculator route
+        if (url.pathname === "/engineeringCalc.html") {
+          const engineeringCalcPath = join(import.meta.dir, "engineeringCalc.html");
+          return new Response(readFileSync(engineeringCalcPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve index.html for all other routes (read fresh for dev, no cache)
         return new Response(readFileSync(indexPath, "utf-8"), {
           headers: {

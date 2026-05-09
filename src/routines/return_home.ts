@@ -300,7 +300,12 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
       return; // Cancel routine
     }
-    bot.poi = targetStation.id;
+    // Verify travel succeeded by checking position
+    await bot.refreshStatus();
+    if (bot.poi !== targetStation.id) {
+      ctx.log("error", `Travel to station failed: not at target ${targetStation.id} (currently at ${bot.poi})`);
+      return; // Cancel routine
+    }
   }
 
   // Dock at station (skip storage collection - return home doesn't need to manage items)

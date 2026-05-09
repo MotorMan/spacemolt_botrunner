@@ -16034,7 +16034,8 @@ function renderShipyardSidebar() {
   let html = `
     <div style="border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:8px;">
       <button class="faction-nav-btn${shipyardMode === 'bots' ? ' active' : ''}" onclick="switchShipyardMode('bots')" style="width:100%;margin-bottom:4px;">Bot Management</button>
-      <button class="faction-nav-btn${shipyardMode === 'simulator' ? ' active' : ''}" onclick="switchShipyardMode('simulator')" style="width:100%;">Loadout Simulator</button>
+      <button class="faction-nav-btn${shipyardMode === 'simulator' ? ' active' : ''}" onclick="switchShipyardMode('simulator')" style="width:100%;margin-bottom:4px;">Loadout Simulator</button>
+      <button class="faction-nav-btn${shipyardMode === 'engineeringCalc' ? ' active' : ''}" onclick="switchShipyardMode('engineeringCalc')" style="width:100%;">Engineering Calculator</button>
     </div>
   `;
 
@@ -16077,6 +16078,11 @@ function switchShipyardMode(mode) {
     // Show simulator in main content area
     document.getElementById('shipyardContent').innerHTML = `
       <iframe id="shipSimFrame" src="/shipSim.html" style="width:100%;height:100%;border:none;border-radius:4px;"></iframe>
+    `;
+  } else if (mode === 'engineeringCalc') {
+    // Show engineering calculator in main content area
+    document.getElementById('shipyardContent').innerHTML = `
+      <iframe id="engineeringCalcFrame" src="/engineeringCalc.html" style="width:100%;height:100%;border:none;border-radius:4px;"></iframe>
     `;
   }
 }

@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Engineering Loadout Calculator - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background: var(--bg); color: var(--text); }
+    body { padding: 16px; display:flex; flex-direction:column; overflow:hidden; }
+    .engcalc-layout { flex:1; min-height:0; display:flex; flex-direction:column; }
+    .engcalc-header { display:flex; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+    .engcalc-header h3 { margin:0; color:var(--text-bright); }
+    .engcalc-stats { color:var(--text-dim); font-size:12px; }
+    .engcalc-content { flex:1; min-height:0; overflow:auto; display:flex; flex-direction:column; gap:16px; }
+    .engcalc-section { background:var(--bg-card); border:1px solid var(--border); border-radius:6px; padding:16px; }
+    .engcalc-section-title { color:var(--text-bright); font-weight:600; margin-bottom:12px; display:flex; align-items:center; gap:8px; }
+    .engcalc-ship-select { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+    .engcalc-ship-select label { font-size:12px; color:var(--text-dim); }
+    .engcalc-skill-select { display:flex; align-items:center; gap:8px; margin-bottom:16px; }
+    .engcalc-skill-select label { font-size:12px; color:var(--text-dim); }
+    .engcalc-skill-select select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .engcalc-ship-select select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .engcalc-resource-budget { background:var(--bg-card); border:1px solid var(--border); border-radius:6px; padding:16px; margin-bottom:16px; }
+    .engcalc-resource-title { color:var(--text-bright); font-weight:600; margin-bottom:12px; }
+    .engcalc-stat-grid { display:grid; grid-template-columns: auto 1fr; gap:8px 12px; align-items: start; }
+    .engcalc-stat-label { font-weight:500; color:var(--text-dim); }
+    .engcalc-stat-value { color:var(--accent); }
+    .engcalc-bar { height:6px; background:var(--bg-input); border-radius:3px; overflow:hidden; margin-top:4px; }
+    .engcalc-bar-fill { height:100%; transition: width 0.3s ease; }
+    .engcalc-must-haves { display:flex; flex-direction:column; gap:12px; }
+    .engcalc-module-category { background:var(--bg-row); border:1px solid var(--border); border-radius:4px; padding:12px; }
+    .engcalc-module-category-title { font-weight:500; margin-bottom:8px; display:flex; align-items:center; gap:8px; }
+    .engcalc-module-list { display:flex; flex-direction:column; gap:6px; }
+    .engcalc-module-item { display:flex; align-items:center; gap:8px; padding:6px; background:var(--bg); border-radius:3px; }
+    .engcalc-module-item input[type="checkbox"] { margin:0; }
+    .engcalc-module-info { flex:1; min-width:0; }
+    .engcalc-module-name { font-weight:500; font-size:12px; }
+    .engcalc-module-details { font-size:11px; color:var(--text-dim); margin-top:2px; }
+    .engcalc-loadout { background:var(--bg-row); border:1px solid var(--border); border-radius:4px; padding:12px; }
+    .engcalc-loadout-title { font-weight:500; margin-bottom:8px; }
+    .engcalc-loadout-list { display:flex; flex-direction:column; gap:8px; }
+    .engcalc-loadout-item { display:flex; justify-content:space-between; align-items:center; padding:6px 8px; background:var(--bg); border-radius:3px; }
+    .engcalc-module-select { display:flex; gap:8px; align-items:center; margin-bottom:12px; }
+    .engcalc-module-select select { flex:1; padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .empty-state { text-align:center; padding:40px; color:var(--text-dim); }
+    .engcalc-calc-btn { padding:8px 16px; background:var(--accent); color:white; border:none; border-radius:4px; cursor:pointer; }
+    .engcalc-calc-btn:hover { background:var(--accent-hover); }
+  </style>
+</head>
+<body>
+  <div class="engcalc-layout">
+    <div class="engcalc-header">
+      <h3>Engineering Loadout Calculator</h3>
+      <span class="engcalc-stats">Calculate optimal loadouts for passive engineering EXP gain (>90% power usage).</span>
+    </div>
+
+    <div class="engcalc-content">
+      <div class="engcalc-section">
+        <div class="engcalc-section-title">Ship Selection</div>
+        <div class="engcalc-ship-select">
+          <label>Ship:</label>
+          <select id="shipSelect" onchange="selectShip()">
+            <option value="">Choose a ship...</option>
+          </select>
+        </div>
+        <div class="engcalc-skill-select">
+          <label>Engineering Skill Level:</label>
+          <select id="engineeringSkillSelect" onchange="setEngineeringSkillLevel(this.value)">
+            <!-- Options populated by JavaScript -->
+          </select>
+        </div>
+        <div class="engcalc-resource-budget" id="resourceBudget" style="display:none;">
+          <!-- Resource budget with bars like regular shipyard -->
+        </div>
+      </div>
+
+      <div class="engcalc-section" id="mustHavesSection" style="display:none;">
+        <div class="engcalc-section-title">Must-Have Modules</div>
+        <div class="engcalc-must-haves" id="mustHavesContainer">
+          <!-- Must-have modules dropdowns will be populated here -->
+        </div>
+        <div class="engcalc-loadout" id="mustHaveLoadout">
+          <div class="engcalc-loadout-title">Selected Must-Haves</div>
+          <div class="engcalc-loadout-list" id="mustHaveList">
+            <!-- Selected must-haves will be shown here -->
+          </div>
+        </div>
+      </div>
+
+      <div class="engcalc-section" id="calcSection" style="display:none;">
+        <div class="engcalc-section-title">Calculation</div>
+        <button class="engcalc-calc-btn" onclick="calculateLoadout()">Calculate Optimal Loadout</button>
+        <div id="calcResult" style="margin-top:12px;"></div>
+      </div>
+
+      <div class="engcalc-section" id="loadoutSection" style="display:none;">
+        <div class="engcalc-section-title">Calculated Loadout</div>
+        <div class="engcalc-loadout" id="calculatedLoadout">
+          <!-- Calculated loadout will be shown here -->
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let catalog = { ships: {}, items: {} };
+    let selectedShip = null;
+    let engineeringSkillLevel = 0;
+    let mustHaveModules = [];
+
+    function getModuleCat(mod) {
+      const category = (mod.category || mod.type || '').toLowerCase();
+      if (category.includes('weapon')) return 'weapons';
+      if (category.includes('defense') || category.includes('shield') || category.includes('armor')) return 'defense';
+      return 'utility';
+    }
+
+    function optimizeCategory(modules, maxSlots, cpuBudget, powerLimit) {
+      const n = modules.length;
+      const maxC = Math.floor(cpuBudget);
+      const dp = Array(maxSlots + 1).fill().map(() => Array(maxC + 1).fill(-Infinity));
+      dp[0][0] = 0;
+      const choices = Array(maxSlots + 1).fill().map(() => Array(maxC + 1).fill().map(() => []));
+
+      for (let i = 0; i < n; i++) {
+        const mod = modules[i];
+        for (let s = 0; s < maxSlots; s++) {
+          for (let c = mod.cpu; c <= maxC; c++) {
+            if (dp[s][c - mod.cpu] !== -Infinity) {
+              const newPower = dp[s][c - mod.cpu] + mod.power;
+              if (newPower > dp[s + 1][c] && newPower <= powerLimit) {
+                dp[s + 1][c] = newPower;
+                choices[s + 1][c] = [...choices[s][c - mod.cpu], i];
+              }
+            }
+          }
+        }
+      }
+
+      let maxP = -Infinity;
+      let bestS = 0;
+      let bestC = 0;
+      for (let s = 0; s <= maxSlots; s++) {
+        for (let c = 0; c <= maxC; c++) {
+          if (dp[s][c] > maxP) {
+            maxP = dp[s][c];
+            bestS = s;
+            bestC = c;
+          }
+        }
+      }
+
+      const selectedIndices = choices[bestS][bestC];
+      const loadout = selectedIndices.map(idx => modules[idx]);
+
+      return { power: maxP === -Infinity ? 0 : maxP, cpu: bestC, loadout: loadout };
+    }
+
+    function getShipSlotDefaults(shipName) {
+      const defaults = {
+        'axiomata': { weapon: 3, defense: 2, utility: 2 },
+        'hermes': { weapon: 2, defense: 2, utility: 3 },
+        'pegasus': { weapon: 4, defense: 1, utility: 1 },
+        'mule': { weapon: 1, defense: 1, utility: 4 },
+        'courier': { weapon: 1, defense: 1, utility: 3 },
+        'freighter': { weapon: 1, defense: 1, utility: 3 },
+        'hauler': { weapon: 1, defense: 2, utility: 2 },
+        'shuttle': { weapon: 0, defense: 1, utility: 2 },
+        'fighter': { weapon: 4, defense: 1, utility: 1 },
+        'bomber': { weapon: 3, defense: 1, utility: 2 },
+        'destroyer': { weapon: 6, defense: 3, utility: 2 },
+        'cruiser': { weapon: 5, defense: 4, utility: 3 },
+        'battleship': { weapon: 8, defense: 5, utility: 4 },
+        'default': { weapon: 2, defense: 2, utility: 2 }
+      };
+
+      if (defaults[shipName]) {
+        return defaults[shipName];
+      }
+
+      for (const key in defaults) {
+        if (key !== 'default' && shipName.includes(key)) {
+          return defaults[key];
+        }
+      }
+
+      return defaults.default;
+    }
+
+    function getSlotCount(category) {
+      if (!selectedShip) return 0;
+      let weaponSlots = selectedShip.weapon_slots || 0;
+      let defenseSlots = selectedShip.defense_slots || 0;
+      let utilitySlots = selectedShip.utility_slots || 0;
+
+      if (weaponSlots === 0 && defenseSlots === 0 && utilitySlots === 0) {
+        const shipName = selectedShip.name || selectedShip.id || '';
+        const defaults = getShipSlotDefaults(shipName.toLowerCase());
+        weaponSlots = defaults.weapon;
+        defenseSlots = defaults.defense;
+        utilitySlots = defaults.utility;
+      }
+
+      switch (category) {
+        case 'weapons': return weaponSlots;
+        case 'defense': return defenseSlots;
+        case 'utility': return utilitySlots;
+        default: return 0;
+      }
+    }
+
+    async function loadData() {
+      try {
+        const catalogRes = await fetch('/api/catalog');
+        const catalogData = await catalogRes.json();
+        catalog = catalogData;
+        populateShipSelect();
+        populateSkillSelect();
+      } catch (e) {
+        console.error('Failed to load catalog:', e);
+        document.getElementById('engcalc-stats').textContent = 'Failed to load catalog data';
+      }
+    }
+
+    function populateShipSelect() {
+      const select = document.getElementById('shipSelect');
+      const ships = Object.values(catalog.ships || {}).sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+
+      ships.forEach(ship => {
+        const option = document.createElement('option');
+        option.value = ship.id || ship.ship_id || ship.class_id;
+        option.textContent = ship.name || ship.ship_name || ship.id;
+        select.appendChild(option);
+      });
+    }
+
+    function populateSkillSelect() {
+      const select = document.getElementById('engineeringSkillSelect');
+      for (let i = 0; i <= 50; i++) {
+        const option = document.createElement('option');
+        option.value = i.toString();
+        const reduction = i > 0 ? ` (-${i}% CPU/Power)` : ' (No bonus)';
+        option.textContent = i + reduction;
+        select.appendChild(option);
+      }
+      select.value = engineeringSkillLevel.toString();
+    }
+
+    function selectShip() {
+      const shipId = document.getElementById('shipSelect').value;
+      if (!shipId) {
+        selectedShip = null;
+        document.getElementById('resourceBudget').style.display = 'none';
+        document.getElementById('mustHavesSection').style.display = 'none';
+        document.getElementById('calcSection').style.display = 'none';
+        document.getElementById('loadoutSection').style.display = 'none';
+        return;
+      }
+
+      selectedShip = catalog.ships[shipId];
+      if (!selectedShip) return;
+
+      renderShipStats();
+      renderMustHaves();
+      updateMustHaveList();
+
+      document.getElementById('resourceBudget').style.display = 'block';
+      document.getElementById('mustHavesSection').style.display = 'block';
+      document.getElementById('calcSection').style.display = 'block';
+    }
+
+    function renderShipStats() {
+      if (!selectedShip) return;
+
+      const budget = document.getElementById('resourceBudget');
+      const baseMaxCpu = selectedShip.cpu_capacity || selectedShip.max_cpu || 80;
+      const baseMaxPower = selectedShip.power_capacity || selectedShip.max_power || 100;
+      const maxWeaponSlots = getSlotCount('weapons');
+      const maxDefenseSlots = getSlotCount('defense');
+      const maxUtilitySlots = getSlotCount('utility');
+
+      budget.innerHTML = `
+        <div class="engcalc-resource-title">Ship Resources</div>
+        <div class="engcalc-stat-grid">
+          <span class="engcalc-stat-label">Max CPU</span><span class="engcalc-stat-value">${baseMaxCpu}</span>
+          <span class="engcalc-stat-label">Max Power</span><span class="engcalc-stat-value">${baseMaxPower}</span>
+          <span class="engcalc-stat-label">Slots</span><span class="engcalc-stat-value">W:${maxWeaponSlots} D:${maxDefenseSlots} U:${maxUtilitySlots}</span>
+        </div>
+      `;
+    }
+
+    function renderMustHaves() {
+      if (!selectedShip) return;
+
+      const container = document.getElementById('mustHavesContainer');
+
+      const modules = Object.values(catalog.items || {}).filter(item => {
+        const hasCpu = (item.cpu_usage || item.cpu_cost || item.cpu || 0) > 0;
+        const hasPower = (item.power_usage || item.power_cost || item.power || 0) > 0;
+        return hasCpu || hasPower;
+      });
+
+      // Add special modules not in catalog
+      modules.push({
+        id: 'cpu_co_processor',
+        name: 'CPU Co-Processor',
+        category: 'utility',
+        cpu_usage: 0,
+        power_usage: 3,
+        wear: 0,
+        cpu_bonus: 5
+      });
+      modules.push({
+        id: 'fuel_optimizer',
+        name: 'Fuel Optimizer',
+        category: 'utility',
+        cpu_usage: 3,
+        power_usage: 2,
+        wear: 0,
+        fuel_efficiency: 15
+      });
+
+      // Group by category
+      const categories = {
+        weapons: modules.filter(m => getModuleCat(m) === 'weapons'),
+        defense: modules.filter(m => getModuleCat(m) === 'defense'),
+        utility: modules.filter(m => getModuleCat(m) === 'utility')
+      };
+
+      console.log('categories.utility length:', categories.utility.length);
+      console.log('sample utility modules:', categories.utility.slice(0,5).map(m => ({name: m.name, category: m.category, type: m.type})));
+
+      container.innerHTML = '';
+
+      ['weapons', 'defense', 'utility'].forEach(cat => {
+        if (categories[cat].length > 0) {
+          const div = document.createElement('div');
+          div.className = 'engcalc-module-category';
+
+          const title = document.createElement('div');
+          title.className = 'engcalc-module-category-title';
+          title.textContent = cat.charAt(0).toUpperCase() + cat.slice(1);
+          div.appendChild(title);
+
+          const selectDiv = document.createElement('div');
+          selectDiv.className = 'engcalc-module-select';
+
+          const select = document.createElement('select');
+          select.id = `mustHaveSelect_${cat}`;
+          select.innerHTML = '<option value="">Select a must-have module...</option>';
+
+          categories[cat].forEach(module => {
+            const option = document.createElement('option');
+            option.value = module.id;
+            const details = [];
+            if (module.cpu_usage || module.cpu_cost || module.cpu) details.push(`CPU: ${module.cpu_usage || module.cpu_cost || module.cpu || 0}`);
+            if (module.power_usage || module.power_cost || module.power) details.push(`Pwr: ${module.power_usage || module.power_cost || module.power || 0}`);
+            if (module.cpu_bonus) details.push(`CPU+: ${module.cpu_bonus}`);
+            if (module.fuel_efficiency) details.push(`Fuel: ${module.fuel_efficiency}`);
+
+            option.textContent = `${module.name || module.item_name || module.id}${details.length > 0 ? ' (' + details.join(', ') + ')' : ''}`;
+            select.appendChild(option);
+          });
+
+          const addButton = document.createElement('button');
+          addButton.className = 'primary sm';
+          addButton.textContent = 'Add Must-Have';
+          addButton.onclick = () => addMustHave(cat);
+
+          selectDiv.appendChild(select);
+          selectDiv.appendChild(addButton);
+          div.appendChild(selectDiv);
+
+          container.appendChild(div);
+        }
+      });
+    }
+
+    function addMustHave(cat) {
+      const select = document.getElementById(`mustHaveSelect_${cat}`);
+      const moduleId = select.value;
+      if (!moduleId) return;
+
+      mustHaveModules.push(moduleId);
+      updateMustHaveList();
+      select.value = '';
+    }
+
+    function removeMustHave(index) {
+      mustHaveModules.splice(index, 1);
+      updateMustHaveList();
+    }
+
+    function updateMustHaveList() {
+      const listDiv = document.getElementById('mustHaveList');
+      if (mustHaveModules.length === 0) {
+        listDiv.innerHTML = '<div class="empty-state">No must-have modules selected</div>';
+        return;
+      }
+
+      listDiv.innerHTML = mustHaveModules.map((id, index) => {
+        let mod = Object.values(catalog.items || {}).find(m => m.id === id);
+        if (!mod && id === 'cpu_co_processor') {
+          mod = {
+            id: 'cpu_co_processor',
+            name: 'CPU Co-Processor',
+            category: 'utility',
+            cpu_usage: 0,
+            power_usage: 3,
+            wear: 0,
+            cpu_bonus: 5
+          };
+        }
+        if (!mod && id === 'fuel_optimizer') {
+          mod = {
+            id: 'fuel_optimizer',
+            name: 'Fuel Optimizer',
+            category: 'utility',
+            cpu_usage: 3,
+            power_usage: 2,
+            wear: 0,
+            fuel_efficiency: 15
+          };
+        }
+        if (!mod) return '';
+        const details = [];
+        if (mod.cpu_usage || mod.cpu_cost || mod.cpu) details.push(`CPU: ${mod.cpu_usage || mod.cpu_cost || mod.cpu || 0}`);
+        if (mod.power_usage || mod.power_cost || mod.power) details.push(`Pwr: ${mod.power_usage || mod.power_cost || mod.power || 0}`);
+        if (mod.cpu_bonus) details.push(`CPU+: ${mod.cpu_bonus}`);
+        if (mod.fuel_efficiency) details.push(`Fuel: ${mod.fuel_efficiency}`);
+        return `<div class="engcalc-loadout-item">
+          <span>${mod.name || mod.item_name || mod.id}${details.length > 0 ? ' (' + details.join(', ') + ')' : ''}</span>
+          <span class="engcalc-loadout-remove" onclick="removeMustHave(${index})">✕</span>
+        </div>`;
+      }).join('');
+    }
+
+    function setEngineeringSkillLevel(level) {
+      engineeringSkillLevel = parseInt(level) || 0;
+      document.getElementById('engineeringSkillSelect').value = engineeringSkillLevel;
+    }
+
+    function calculateLoadout() {
+      if (!selectedShip) return;
+      console.log("Calculating loadout");
+
+      const resultDiv = document.getElementById('calcResult');
+      const loadoutDiv = document.getElementById('calculatedLoadout');
+
+      let mustHaves = mustHaveModules.map(id => {
+        let mod = Object.values(catalog.items || {}).find(m => m.id === id);
+        if (!mod && id === 'cpu_co_processor') {
+          mod = {
+            id: 'cpu_co_processor',
+            name: 'CPU Co-Processor',
+            category: 'utility',
+            cpu_usage: 0,
+            power_usage: 3,
+            wear: 0,
+            cpu_bonus: 5
+          };
+        }
+        if (!mod && id === 'fuel_optimizer') {
+          mod = {
+            id: 'fuel_optimizer',
+            name: 'Fuel Optimizer',
+            category: 'utility',
+            cpu_usage: 3,
+            power_usage: 2,
+            wear: 0,
+            fuel_efficiency: 15
+          };
+        }
+        return mod;
+      }).filter(m => m);
+
+      mustHaves = mustHaves.map(m => ({ ...m, cat: getModuleCat(m) }));
+
+      const allModules = Object.values(catalog.items || {}).filter(item => {
+        const hasCpu = (item.cpu_usage || item.cpu_cost || item.cpu || 0) > 0;
+        const hasPower = (item.power_usage || item.power_cost || item.power || 0) > 0;
+        return hasCpu || hasPower;
+      });
+
+      allModules.push({
+        id: 'cpu_co_processor',
+        name: 'CPU Co-Processor',
+        category: 'utility',
+        cpu_usage: 0,
+        power_usage: 3,
+        wear: 0,
+        cpu_bonus: 5
+      });
+      allModules.push({
+        id: 'fuel_optimizer',
+        name: 'Fuel Optimizer',
+        category: 'utility',
+        cpu_usage: 3,
+        power_usage: 2,
+        wear: 0,
+        fuel_efficiency: 15
+      });
+
+      const powerModules = allModules.filter(m => (m.power_usage || m.power_cost || m.power || 0) > 0);
+
+      const baseMaxCpu = selectedShip.cpu_capacity || selectedShip.max_cpu || 80;
+      const baseMaxPower = selectedShip.power_capacity || selectedShip.max_power || 100;
+      const efficiencyBonus = engineeringSkillLevel * 0.01;
+      const maxWeaponSlots = getSlotCount('weapons');
+      const maxDefenseSlots = getSlotCount('defense');
+      const maxUtilitySlots = getSlotCount('utility');
+
+      let loadout = [];
+      let slotsUsed = { weapons: 0, defense: 0, utility: 0 };
+      let cpuUsed = 0;
+      let powerUsed = 0;
+      let cpuBonus = 0;
+
+      for (const mod of mustHaves) {
+        const cat = mod.cat;
+        if (slotsUsed[cat] < (cat === 'weapons' ? maxWeaponSlots : cat === 'defense' ? maxDefenseSlots : maxUtilitySlots)) {
+          loadout.push(mod);
+          slotsUsed[cat]++;
+          cpuUsed += mod.cpu_usage || mod.cpu_cost || mod.cpu || 0;
+          powerUsed += mod.power_usage || mod.power_cost || mod.power || 0;
+          cpuBonus += mod.cpu_bonus || 0;
+        }
+      }
+
+      let maxCpu = baseMaxCpu + cpuBonus;
+
+      const categoryModules = {
+        weapons: powerModules.filter(m => getModuleCat(m) === 'weapons' && !mustHaveModules.includes(m.id)),
+        defense: powerModules.filter(m => getModuleCat(m) === 'defense' && !mustHaveModules.includes(m.id)),
+        utility: powerModules.filter(m => getModuleCat(m) === 'utility' && !mustHaveModules.includes(m.id))
+      };
+
+      const remainingSlots = {
+        weapons: maxWeaponSlots - slotsUsed.weapons,
+        defense: maxDefenseSlots - slotsUsed.defense,
+        utility: maxUtilitySlots - slotsUsed.utility
+      };
+
+      const totalRemainingSlots = remainingSlots.weapons + remainingSlots.defense + remainingSlots.utility;
+
+      ['weapons', 'defense', 'utility'].forEach(cat => {
+        const modules = categoryModules[cat].map(m => ({
+          ...m,
+          cpu: m.cpu_usage || m.cpu_cost || m.cpu || 0,
+          power: m.power_usage || m.power_cost || m.power || 0,
+          cat: cat
+        }));
+
+        const cpuBudget = maxCpu - cpuUsed;
+
+        const result = optimizeCategory(modules, remainingSlots[cat], cpuBudget, baseMaxPower);
+
+        loadout.push(...result.loadout);
+        slotsUsed[cat] += result.loadout.length;
+        cpuUsed += result.cpu;
+        powerUsed += result.power;
+        cpuBonus += result.loadout.reduce((sum, mod) => sum + (mod.cpu_bonus || 0), 0);
+        maxCpu = baseMaxCpu + cpuBonus;
+      });
+
+      const effectivePower = Math.min(powerUsed, baseMaxPower);
+      const finalCpuUsed = Math.ceil(cpuUsed * (1 - efficiencyBonus));
+      const finalPowerUsed = Math.ceil(effectivePower * (1 - efficiencyBonus));
+      const finalMaxCpu = baseMaxCpu + cpuBonus;
+      const powerPct = baseMaxPower > 0 ? Math.round((finalPowerUsed / baseMaxPower) * 100) : 0;
+
+      resultDiv.innerHTML = `
+        <div>CPU Used: ${finalCpuUsed} / ${finalMaxCpu} (${Math.round((finalCpuUsed / finalMaxCpu) * 100)}%)</div>
+        <div>Power Used: ${finalPowerUsed} / ${baseMaxPower} (${powerPct}%)</div>
+        <div>Slots Used: W:${slotsUsed.weapons}/${maxWeaponSlots} D:${slotsUsed.defense}/${maxDefenseSlots} U:${slotsUsed.utility}/${maxUtilitySlots}</div>
+        <div class="engcalc-bar"><div class="engcalc-bar-fill" style="width:${powerPct}%;background:var(--accent)"></div></div>
+        ${powerPct >= 90 ? '<div style="color:green;">✓ Meets >90% power requirement</div>' : '<div style="color:red;">✗ Does not meet >90% power requirement</div>'}
+      `;
+
+      const loadoutByType = {};
+      loadout.forEach(mod => {
+        const type = mod.cat;
+        if (!loadoutByType[type]) loadoutByType[type] = [];
+        loadoutByType[type].push(mod);
+      });
+
+      let html = '';
+      ['weapons', 'defense', 'utility'].forEach(type => {
+        if (loadoutByType[type] && loadoutByType[type].length > 0) {
+          html += `<div class="engcalc-loadout-title">${type.charAt(0).toUpperCase() + type.slice(1)}</div>`;
+          const counts = {};
+          loadoutByType[type].forEach(mod => {
+            counts[mod.name] = (counts[mod.name] || 0) + 1;
+          });
+          Object.keys(counts).forEach(function(name) {
+            const count = counts[name];
+            html += `<div class="engcalc-loadout-item">
+              <span>${name}${count > 1 ? ` (x${count})` : ''}</span>
+            </div>`;
+          });
+        }
+      });
+
+      if (html === '') {
+        html = '<div class="empty-state">No modules in loadout</div>';
+      }
+
+      loadoutDiv.innerHTML = '<div class="engcalc-loadout-list">' + html + '</div>';
+      document.getElementById('loadoutSection').style.display = 'block';
+    }
+
+    function num(n) {
+      return n ? n.toLocaleString() : '0';
+    }
+
+    function esc(s) {
+      if (!s) return '';
+      const d = document.createElement('div');
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    loadData();
+  </script>
+</body>
+</html>

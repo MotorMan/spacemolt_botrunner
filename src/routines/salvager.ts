@@ -1,5 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import { getBotChatChannel } from "../botmanager.js";
 import {
   isMinablePoi,
   isStationPoi,
@@ -52,6 +53,8 @@ function getSalvagerSettings(username?: string): {
   maxRoamJumps: number;
   roamBaseSystems: string[];
   depositAtSalvageYard: boolean;
+  escortName: string;
+  escortSignalChannel: "faction" | "local" | "file" | "chat";
 } {
   const all = readSettings();
   const m = all.salvager || {};
@@ -87,7 +90,38 @@ function getSalvagerSettings(username?: string): {
     maxRoamJumps: (m.maxRoamJumps as number) || 0, // 0 = no roaming beyond neighbors
     roamBaseSystems: parseStringArray(botOverrides.roamBaseSystems ?? m.roamBaseSystems),
     depositAtSalvageYard: (m.depositAtSalvageYard as boolean) ?? false,
+    escortName: (botOverrides.escortName as string) || (m.escortName as string) || "",
+    escortSignalChannel: ((botOverrides.escortSignalChannel as string) || (m.escortSignalChannel as string) || "chat") as "faction" | "local" | "file" | "chat",
   };
+}
+
+// ── Escort signaling ──────────────────────────────────────────
+
+async function signalEscort(
+  ctx: RoutineContext,
+  action: "jump" | "travel" | "dock" | "undock",
+  systemId?: string,
+  channel: "faction" | "local" | "file" | "chat" = "faction",
+): Promise<void> {
+  const { bot } = ctx;
+  const message = `[ESCORT] ${action}${systemId ? ` ${systemId}` : ""}`;
+
+  if (channel === "faction") {
+    await bot.exec("chat", { channel: "faction", content: message });
+  } else if (channel === "local") {
+    ctx.log("escort", `Signal: ${message}`);
+  } else if (channel === "chat") {
+    // Use non-API chat channel for instant coordination
+    ctx.sendBotChat?.(message, "escort");
+  } else {
+    // File-based signaling for cross-bot coordination on same machine
+    const { writeFileSync, existsSync, mkdirSync } = await import("fs");
+    const { join } = await import("path");
+    const escortDir = join(process.cwd(), "data", "escort_signals");
+    if (!existsSync(escortDir)) mkdirSync(escortDir, { recursive: true });
+    const signalFile = join(escortDir, `${bot.username}.signal`);
+    writeFileSync(signalFile, JSON.stringify({ action, systemId, timestamp: Date.now() }));
+  }
 }
 
 // ── BFS helpers for roaming ──────────────────────────────────
@@ -306,8 +340,26 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Navigate to target system if configured ──
     const targetSystemId = settings.system || "";
     if (targetSystemId && targetSystemId !== bot.system) {
+      // Announce destination and signal escorts before traveling
+      if (settings.escortName) {
+        const chatChannel = getBotChatChannel();
+        chatChannel.send(`Going to ${targetSystemId}`, "escort");
+
+        ctx.log("escort", `Signaling escorts to travel to ${targetSystemId}...`);
+        await signalEscort(ctx, "travel", targetSystemId, settings.escortSignalChannel);
+        await ctx.sleep(2000); // Brief pause to let escorts read the signal
+      }
+
       yield "navigate_to_target";
-      const arrived = await navigateToSystem(ctx, targetSystemId, safetyOpts);
+      const travelOpts = settings.escortName ? {
+        ...safetyOpts,
+          onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
+            const chatChannel = getBotChatChannel();
+            chatChannel.send(`Jumping to ${nextSystem}`, "escort");
+          }
+      } : safetyOpts;
+
+      const arrived = await navigateToSystem(ctx, targetSystemId, travelOpts);
       if (!arrived) {
         ctx.log("error", "Failed to reach target system — salvaging locally instead");
       }
@@ -486,10 +538,26 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
 
         yield "roam_system";
         ctx.log("travel", `Jumping to ${roamSystemId} to check for wrecks...`);
+
+        // Announce destination if escort present
+        if (settings.escortName) {
+          const chatChannel = getBotChatChannel();
+          chatChannel.send(`Going to ${roamSystemId}`, "escort");
+          await signalEscort(ctx, "travel", roamSystemId, settings.escortSignalChannel);
+          await ctx.sleep(1000); // Brief pause
+        }
+
         await ensureUndocked(ctx);
         const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!fueled) break;
-        const arrived = await navigateToSystem(ctx, roamSystemId, safetyOpts);
+        const travelOpts = settings.escortName ? {
+          ...safetyOpts,
+          onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
+            const chatChannel = getBotChatChannel();
+            chatChannel.send(`Jumping to ${nextSystem}`, "escort", bot.username);
+          }
+        } : safetyOpts;
+        const arrived = await navigateToSystem(ctx, roamSystemId, travelOpts);
         if (!arrived) continue;
 
         // Scan roam system POIs (all non-station POIs — wrecks can spawn anywhere)
@@ -627,12 +695,25 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Navigate to salvage yard system if not already there
       if (targetSystem && bot.system !== targetSystem) {
+        // Announce destination if escort present
+        if (settings.escortName) {
+          const chatChannel = getBotChatChannel();
+          chatChannel.send(`Going to ${targetSystem}`, "escort");
+          await signalEscort(ctx, "travel", targetSystem, settings.escortSignalChannel);
+          await ctx.sleep(1000);
+        }
+
         yield "navigate_to_salvage_yard";
         ctx.log("travel", `Traveling to salvage yard system: ${targetSystem}...`);
-        const arrived = await navigateToSystem(ctx, targetSystem, {
+        const travelOpts = settings.escortName ? {
           ...safetyOpts,
           autoCloak: settings.autoCloak,
-        });
+          onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
+            const chatChannel = getBotChatChannel();
+            chatChannel.send(`Jumping to ${nextSystem}`, "escort", bot.username);
+          }
+        } : { ...safetyOpts, autoCloak: settings.autoCloak };
+        const arrived = await navigateToSystem(ctx, targetSystem, travelOpts);
         if (!arrived) {
           ctx.log("error", "Failed to reach salvage yard system — docking at nearest station");
         }

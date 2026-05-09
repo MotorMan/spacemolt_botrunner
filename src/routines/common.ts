@@ -1353,7 +1353,7 @@ export async function depositNonFuelCargo(ctx: RoutineContext): Promise<boolean>
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; skipBlacklist?: boolean },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
@@ -1516,6 +1516,10 @@ export async function navigateToSystem(
     let inBattleDuringJump = false;
     while (!jumpSuccess && retries < MAX_RETRIES_PER_JUMP && bot.state === "running") {
       retries++;
+      // Call onBeforeJump callback before jumping
+      if (opts.onBeforeJump) {
+        await opts.onBeforeJump(nextSystem, attempt + 1);
+      }
       ctx.log("travel", `Jumping to ${nextSystem} from ${bot.system}... (attempt ${retries}/${MAX_RETRIES_PER_JUMP})`);
       const jumpResp = await bot.exec("jump", { target_system: nextSystem });
 

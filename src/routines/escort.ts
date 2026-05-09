@@ -557,12 +557,22 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       for (let i = recentMessages.length - 1; i >= 0; i--) {
         const msg = recentMessages[i];
         if (msg.sender === minerName) {
-          const match = msg.content.match(/\[ESCORT\]\s*(jump|travel|dock|undock)\s*(\S+)?/i);
+          let match = msg.content.match(/\[ESCORT\]\s*(jump|travel|dock|undock)\s*(\S+)?/i);
           if (match) {
             chatSignal = {
               action: match[1].toLowerCase(),
               systemId: match[2] || undefined
             };
+          } else {
+            // Check for general announcements
+            match = msg.content.match(/(?:Going to|Jumping to)\s*(sys_[a-z0-9_]+)/i);
+            if (match) {
+              const action = match[1].toLowerCase().replace(' ', '_');
+              chatSignal = {
+                action: action as "going_to" | "jumping_to",
+                systemId: match[2]
+              };
+            }
           }
           break; // Use the most recent message
         }
@@ -596,6 +606,11 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       } else if (escortSignal.action === "undock") {
         ctx.log("escort", "Miner signaling undock — preparing to follow");
         await ensureUndocked(ctx);
+      } else if (escortSignal.systemId && (escortSignal.action === "going_to" || escortSignal.action === "jumping_to")) {
+        // Miner announced destination or jump
+        minerSystem = escortSignal.systemId;
+        setMinerLocation(minerName, escortSignal.systemId);
+        ctx.log("escort", `Miner announced ${escortSignal.action.replace('_', ' ')} ${escortSignal.systemId}`);
       } else if (escortSignal.systemId && (escortSignal.action === "jump" || escortSignal.action === "travel")) {
         const targetSystem = escortSignal.systemId;
         if (targetSystem !== bot.system) {

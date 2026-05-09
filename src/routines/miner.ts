@@ -1,5 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore, isDepletionExpired } from "../mapstore.js";
+import { getBotChatChannel } from "../botmanager.js";
 import { getSystemBlacklist } from "../web/server.js";
 import {
   isOreBeltPoi,
@@ -2721,15 +2722,27 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
-      // Signal escorts before jumping
+      // Announce destination and signal escorts before jumping
       const minerSettings = getMinerSettings(bot.username);
       if (minerSettings.escortName) {
+        // Send chat message to escort channel
+        const chatChannel = getBotChatChannel();
+        chatChannel.send(`Going to ${targetSystemId}`, "escort");
+
         ctx.log("escort", `Signaling escorts to jump to ${targetSystemId}...`);
         await signalEscort(ctx, "jump", targetSystemId, minerSettings.escortSignalChannel);
         await ctx.sleep(2000); // Brief pause to let escorts read the signal
       }
 
-      const arrived = await navigateToSystem(ctx, targetSystemId, safetyOpts);
+      const travelOpts = minerSettings.escortName ? {
+        ...safetyOpts,
+        onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
+          const chatChannel = getBotChatChannel();
+          chatChannel.send(`Jumping to ${nextSystem}`, "escort");
+        }
+      } : safetyOpts;
+
+      const arrived = await navigateToSystem(ctx, targetSystemId, travelOpts);
       if (!arrived) {
         ctx.log("error", "Failed to reach target system — mining locally instead");
         targetSystemId = bot.system;

@@ -916,17 +916,6 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
           continue;
         }
 
-          // ── Branch based on patrol mode ──
-          if (currentSettings.mode === "stationary") {
-            await stationaryRoutine(ctx, totalKillsRef, battleRef);
-            continue;
-          }
-          if (currentSettings.mode === "roam_system") {
-            await roamSystemRoutine(ctx, totalKillsRef, battleRef);
-            continue;
-          }
-          // Default to roam_systems patrol logic - execute below
-
         // ── Navigate to patrol system ──
         yield "find_patrol_system";
 
@@ -1114,6 +1103,172 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
         autoCloak: currentSettings.autoCloak,
         skipBlacklist: true,
       };
+
+      // ── Check for pending commands from fleet comm or web UI ──
+      if (fleetState.currentCommand) {
+        const cmd = fleetState.currentCommand;
+        const params = fleetState.commandParams || "";
+        const targetSystem = parseMoveParams(params)?.systemId || "";
+        const targetPoi = parseMoveParams(params)?.poiId || "";
+
+        switch (cmd) {
+        case "MOVE": {
+              fleetState.targetSystem = targetSystem;
+            fleetState.targetPoi = targetPoi;
+
+            ctx.log("fleet", `Executing MOVE to ${targetSystem}${targetPoi ? "/" + targetPoi : ""}`);
+
+            if (bot.system !== targetSystem) {
+              await orderFleetMove(ctx, targetSystem, targetPoi || undefined);
+              const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
+              if (!arrived) {
+                ctx.log("error", `Could not reach ${targetSystem}`);
+              }
+            }
+
+            if (targetPoi && bot.poi !== targetPoi) {
+              await ensureUndocked(ctx);
+              const travelResp = await bot.exec("travel", { target_poi: targetPoi });
+              if (!travelResp.error || travelResp.error.message.includes("already")) {
+                bot.poi = targetPoi;
+              }
+            }
+            break;
+          }
+
+          case "ATTACK": {
+            yield "exec_attack";
+            const targetData = parseAttackTarget(params);
+            if (!targetData) break;
+
+            const targetEntity: NearbyEntity = {
+              id: targetData.id,
+              name: targetData.name,
+              type: "pirate",
+              faction: "",
+              isNPC: true,
+              isPirate: true,
+            };
+
+            ctx.log("combat", `🎯 Commander engaging ${targetEntity.name}...`);
+
+            const won = await engageTargetFleet(
+              ctx,
+              targetEntity,
+              currentSettings.fleeThreshold,
+              currentSettings.fleeFromTier,
+              currentSettings.minPiratesToFlee,
+            );
+            if (won) totalKillsRef.value++;
+            break;
+          }
+
+          case "FLEE": {
+            yield "exec_flee";
+            ctx.log("fleet", "Executing FLEE — retreating immediately!");
+            await orderFleetMove(ctx, bot.system, bot.poi || undefined);
+            await ctx.sleep(1000);
+            yield "fleeing";
+            await fleeFromBattle(ctx);
+            break;
+          }
+
+          case "REGROUP": {
+            yield "exec_regroup";
+            const moveData = parseMoveParams(params);
+            if (!moveData) break;
+
+            ctx.log("fleet", `Executing REGROUP at ${moveData.systemId}${moveData.poiId ? "/" + moveData.poiId : ""}`);
+            await orderFleetRegroup(ctx, moveData.systemId, moveData.poiId);
+            await ctx.sleep(1000);
+
+            if (bot.system !== moveData.systemId) {
+              await navigateToSystem(ctx, moveData.systemId, safetyOpts);
+            }
+            break;
+          }
+
+          case "HOLD": {
+            yield "exec_hold";
+            ctx.log("fleet", "Executing HOLD — maintaining position");
+            break;
+          }
+
+          case "PATROL": {
+            yield "exec_patrol";
+            ctx.log("fleet", "Executing PATROL — resuming patrol pattern");
+            fleetState.currentTargetId = null;
+            break;
+          }
+
+          case "DOCK": {
+            yield "exec_dock";
+            ctx.log("fleet", "Executing DOCK — docking at current station");
+            if (!bot.docked) {
+              const dockResp = await bot.exec("dock");
+              if (dockResp.error) {
+                ctx.log("error", `Failed to dock: ${dockResp.error.message}`);
+              } else {
+                bot.docked = true;
+                ctx.log("fleet", "Successfully docked");
+              }
+            }
+            break;
+          }
+
+          case "BATTLE_ADVANCE": {
+            yield "battle_advance";
+            await bot.exec("battle", { action: "advance" });
+            break;
+          }
+
+          case "BATTLE_RETREAT": {
+            yield "battle_retreat";
+            await bot.exec("battle", { action: "retreat" });
+            break;
+          }
+
+          case "BATTLE_STANCE": {
+            yield "battle_stance";
+            const stance = params || "fire";
+            await bot.exec("battle", { action: "stance", stance });
+            break;
+          }
+
+          case "BATTLE_TARGET": {
+            yield "battle_target";
+            if (params) {
+              await bot.exec("battle", { action: "target", target_id: params });
+            }
+            break;
+          }
+
+          default:
+            ctx.log("warn", `Unknown fleet command: ${cmd}`);
+          }
+
+          fleetState.currentCommand = null;
+          fleetState.commandParams = null;
+
+          const updatedSettings = getFleetHunterSettings();
+          if (!updatedSettings.huntingEnabled) {
+            ctx.log("fleet", "Hunting is disabled — executed command, now waiting...");
+            await ctx.sleep(2000);
+            continue;
+          }
+        }
+
+        if (!currentSettings.huntingEnabled) {
+          ctx.log("fleet", "Hunting is disabled — waiting for commands...");
+          await ctx.sleep(5000);
+          continue;
+        }
+
+        if (currentSettings.manualMode) {
+          ctx.log("fleet", "Manual mode active — awaiting commands");
+          await ctx.sleep(2000);
+          continue;
+        }
 
       // ── Fuel check ──
       yield "fuel_check";
@@ -1431,6 +1586,172 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
       autoCloak: currentSettings.autoCloak,
       skipBlacklist: true,
     };
+
+      // ── Check for pending commands from fleet comm or web UI ──
+      if (fleetState.currentCommand) {
+        const cmd = fleetState.currentCommand;
+        const params = fleetState.commandParams || "";
+        const targetSystem = parseMoveParams(params)?.systemId || "";
+        const targetPoi = parseMoveParams(params)?.poiId || "";
+
+        switch (cmd) {
+        case "MOVE": {
+              fleetState.targetSystem = targetSystem;
+            fleetState.targetPoi = targetPoi;
+
+            ctx.log("fleet", `Executing MOVE to ${targetSystem}${targetPoi ? "/" + targetPoi : ""}`);
+
+            if (bot.system !== targetSystem) {
+              await orderFleetMove(ctx, targetSystem, targetPoi || undefined);
+              const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
+              if (!arrived) {
+                ctx.log("error", `Could not reach ${targetSystem}`);
+              }
+            }
+
+            if (targetPoi && bot.poi !== targetPoi) {
+              await ensureUndocked(ctx);
+              const travelResp = await bot.exec("travel", { target_poi: targetPoi });
+              if (!travelResp.error || travelResp.error.message.includes("already")) {
+                bot.poi = targetPoi;
+              }
+            }
+            break;
+          }
+
+          case "ATTACK": {
+            yield "exec_attack";
+            const targetData = parseAttackTarget(params);
+            if (!targetData) break;
+
+            const targetEntity: NearbyEntity = {
+              id: targetData.id,
+              name: targetData.name,
+              type: "pirate",
+              faction: "",
+              isNPC: true,
+              isPirate: true,
+            };
+
+            ctx.log("combat", `🎯 Commander engaging ${targetEntity.name}...`);
+
+            const won = await engageTargetFleet(
+              ctx,
+              targetEntity,
+              currentSettings.fleeThreshold,
+              currentSettings.fleeFromTier,
+              currentSettings.minPiratesToFlee,
+            );
+            if (won) totalKillsRef.value++;
+            break;
+          }
+
+          case "FLEE": {
+            yield "exec_flee";
+            ctx.log("fleet", "Executing FLEE — retreating immediately!");
+            await orderFleetMove(ctx, bot.system, bot.poi || undefined);
+            await ctx.sleep(1000);
+            yield "fleeing";
+            await fleeFromBattle(ctx);
+            break;
+          }
+
+          case "REGROUP": {
+            yield "exec_regroup";
+            const moveData = parseMoveParams(params);
+            if (!moveData) break;
+
+            ctx.log("fleet", `Executing REGROUP at ${moveData.systemId}${moveData.poiId ? "/" + moveData.poiId : ""}`);
+            await orderFleetRegroup(ctx, moveData.systemId, moveData.poiId);
+            await ctx.sleep(1000);
+
+            if (bot.system !== moveData.systemId) {
+              await navigateToSystem(ctx, moveData.systemId, safetyOpts);
+            }
+            break;
+          }
+
+          case "HOLD": {
+            yield "exec_hold";
+            ctx.log("fleet", "Executing HOLD — maintaining position");
+            break;
+          }
+
+          case "PATROL": {
+            yield "exec_patrol";
+            ctx.log("fleet", "Executing PATROL — resuming patrol pattern");
+            fleetState.currentTargetId = null;
+            break;
+          }
+
+          case "DOCK": {
+            yield "exec_dock";
+            ctx.log("fleet", "Executing DOCK — docking at current station");
+            if (!bot.docked) {
+              const dockResp = await bot.exec("dock");
+              if (dockResp.error) {
+                ctx.log("error", `Failed to dock: ${dockResp.error.message}`);
+              } else {
+                bot.docked = true;
+                ctx.log("fleet", "Successfully docked");
+              }
+            }
+            break;
+          }
+
+          case "BATTLE_ADVANCE": {
+            yield "battle_advance";
+            await bot.exec("battle", { action: "advance" });
+            break;
+          }
+
+          case "BATTLE_RETREAT": {
+            yield "battle_retreat";
+            await bot.exec("battle", { action: "retreat" });
+            break;
+          }
+
+          case "BATTLE_STANCE": {
+            yield "battle_stance";
+            const stance = params || "fire";
+            await bot.exec("battle", { action: "stance", stance });
+            break;
+          }
+
+          case "BATTLE_TARGET": {
+            yield "battle_target";
+            if (params) {
+              await bot.exec("battle", { action: "target", target_id: params });
+            }
+            break;
+          }
+
+          default:
+            ctx.log("warn", `Unknown fleet command: ${cmd}`);
+          }
+
+          fleetState.currentCommand = null;
+          fleetState.commandParams = null;
+
+          const updatedSettings = getFleetHunterSettings();
+          if (!updatedSettings.huntingEnabled) {
+            ctx.log("fleet", "Hunting is disabled — executed command, now waiting...");
+            await ctx.sleep(2000);
+            continue;
+          }
+        }
+
+        if (!currentSettings.huntingEnabled) {
+          ctx.log("fleet", "Hunting is disabled — waiting for commands...");
+          await ctx.sleep(5000);
+          continue;
+        }
+
+        if (currentSettings.manualMode) {
+          ctx.log("fleet", "Manual mode active — awaiting commands");
+          await ctx.sleep(2000);
+          continue;
+        }
 
     // ── Fuel check ──
     yield "fuel_check";

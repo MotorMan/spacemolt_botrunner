@@ -51,6 +51,9 @@ function getReturnHomeSettings(username?: string): {
 export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
+  const routineParams = (bot as unknown as Record<string, unknown>).routineParams as Record<string, unknown> | undefined;
+  const ignoreBlacklist = routineParams?.ignoreBlacklist === true;
+
   // Wait for any pending action from previous routine to clear
   // This is especially important for emergency return home scenarios
   yield "wait_idle";
@@ -226,6 +229,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
         arrived = await navigateToSystem(ctx, homeSystem, {
           fuelThresholdPct: 30,
           hullThresholdPct: 40,
+          skipBlacklist: ignoreBlacklist,
         });
 
         if (arrived) {

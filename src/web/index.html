@@ -1132,9 +1132,13 @@ function renderBots() {
       const prevSel = document.getElementById(`routine-${bot.username}`);
       const prevRoutine = prevSel ? prevSel.value : (bot.routine || 'miner');
       actions = `
-        <select id="routine-${esc(bot.username)}" onclick="event.stopPropagation()">
+        <select id="routine-${esc(bot.username)}" onclick="event.stopPropagation()" onchange="toggleReturnHomeOptions('${esc(bot.username)}')">
           ${routines.map(r => `<option value="${esc(r)}"${r === prevRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
         </select>
+        <label class="rh-ignore-label" id="routine-returnhome-lbl-${esc(bot.username)}" style="display:${prevRoutine === 'return_home' ? 'inline-flex' : 'none'};align-items:center;gap:3px;font-size:11px;color:var(--text-dim);white-space:nowrap">
+          <input type="checkbox" id="routine-returnhome-ignore-${esc(bot.username)}" onclick="event.stopPropagation()">
+          Ignore blacklist
+        </label>
         <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>
         <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕</button>`;
     } else if (bot.state === 'running') {
@@ -1870,6 +1874,7 @@ function openProfile(username) {
   profileSkills = {};
   profileSkillsList = null;
   profileFactionStorage = null;
+  profileStandings = null;
   nearbyPlayersCache = [];
   window._profileActionsOpen = false;
 
@@ -1910,6 +1915,7 @@ function openProfile(username) {
   if (botObj && botObj.docked) fetchMarket(username);
   // Fetch faction storage (will fail gracefully if not at station)
   fetchFactionStorage(username);
+  fetchStandings(username);
 
   // Refresh nearby players list for manual refuel control
   mcRefreshNearbyPlayers();
@@ -1924,6 +1930,7 @@ function closeProfile() {
   profileSkills = {};
   profileSkillsList = null;
   profileFactionStorage = null;
+  profileStandings = null;
   document.getElementById('page-profile').classList.remove('active');
   switchTab('dashboard');
 }
@@ -2142,6 +2149,14 @@ function renderProfileTopbar() {
     actions += `
       <span class="profile-ore-label" style="margin-left:8px">Home:</span>
       <select id="profile-homeSystem" onchange="saveProfileHomeSystem()">${sysOpts.join('')}</select>`;
+  }
+
+  if (currentRoutine === 'return_home') {
+    actions += `
+      <label class="profile-ore-label" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:8px">
+        <input type="checkbox" id="profile-returnhome-ignore-blacklist">
+        Ignore blacklist
+      </label>`;
   }
 
   // Per-bot miner to follow (for escort routine)
@@ -2475,6 +2490,13 @@ function renderProfileSidebar() {
       </div>
     </div>
 
+    <div class="profile-card">
+      <div class="profile-card-header">Empire Reputation</div>
+      <div class="profile-card-body">
+        <div class="inv-list">${renderStandingsList()}</div>
+      </div>
+    </div>
+
     ${renderPerBotSettings(bot)}
   `;
 }
@@ -2529,6 +2551,10 @@ function updateProfileSidebar() {
     // Update skills card if skills are loaded
     const skillsCard = sidebar.querySelector('.profile-card:nth-child(4) .inv-list');
     if (skillsCard) skillsCard.innerHTML = renderSkillsList();
+
+    // Update standings card
+    const standingsCard = sidebar.querySelector('.profile-card:nth-child(5) .inv-list');
+    if (standingsCard) standingsCard.innerHTML = renderStandingsList();
 
     // Update topbar (skip if a profile actions dropdown is open)
     if (!window._profileActionsOpen) {
@@ -5786,6 +5812,33 @@ function fetchSkills(username) {
   });
 }
 
+function fetchStandings(username) {
+  profileStandings = null;
+  renderProfileSidebar();
+
+  sendExec(username, 'get_status', undefined, (result) => {
+    if (profileBot !== username) return;
+    if (!result.ok || !result.data) {
+      profileStandings = { error: true };
+      renderProfileSidebar();
+      return;
+    }
+    const d = result.data;
+    const player = d.player || d;
+    const standings = player.standings || {};
+    const empire = player.empire || '';
+    const bounties = {};
+    for (const [faction, data] of Object.entries(standings)) {
+      if (data.outstanding_bounty && data.outstanding_bounty > 0) {
+        bounties[faction] = data.outstanding_bounty;
+      }
+    }
+    profileStandings = { empire, standings, bounties };
+    renderProfileSidebar();
+    renderManualControls();
+  });
+}
+
 function fetchRecipes(username) {
   profileRecipes = [];
   fetchRecipesPage(username, 1);
@@ -5896,7 +5949,12 @@ function getOwnedItems(bot) {
 function startBotFromProfile() {
   const sel = document.getElementById('profile-routine');
   const routine = sel ? sel.value : 'miner';
-  send({ type: 'start', bot: profileBot, routine });
+  const params = {};
+  if (routine === 'return_home') {
+    const cb = document.getElementById('profile-returnhome-ignore-blacklist');
+    if (cb && cb.checked) params.ignoreBlacklist = true;
+  }
+  send({ type: 'start', bot: profileBot, routine, params: Object.keys(params).length ? params : undefined });
 }
 
 // ── Map ────────────────────────────────────────────────────
@@ -7947,7 +8005,50 @@ function populateShipDropdown() {
       const category = ship.category ? ` - ${ship.category}` : '';
       const shipClass = ship.class ? ` (${ship.class})` : '';
       return `<option value="${esc(id)}">${esc(name)}${esc(faction)}${esc(category)}${esc(shipClass)}</option>`;
-    }).join('');
+  }).join('');
+}
+
+function renderStandingsList() {
+  if (profileStandings === null || profileStandings === undefined) {
+    return `<div class="inv-empty">Loading... <button class="sm" style="margin-left:8px;font-size:10px" onclick="if(profileBot)fetchStandings(profileBot)">Retry</button></div>`;
+  }
+  if (profileStandings.error) {
+    return '<div class="inv-empty">Failed to load standings</div>';
+  }
+  const { empire, standings, bounties } = profileStandings;
+  const lines = [];
+
+  if (empire) {
+    lines.push(`<div class="inv-item"><span class="inv-name" style="color:var(--cyan)">Empire</span><span class="inv-qty">${esc(empire)}</span></div>`);
+  }
+
+  const factionOrder = ['crimson', 'nebula', 'outerrim', 'solarian', 'voidborn', 'pirates'];
+  const sortedFactions = Object.keys(standings).sort((a, b) => {
+    const ai = factionOrder.indexOf(a);
+    const bi = factionOrder.indexOf(b);
+    if (ai !== -1 && bi !== -1) return ai - bi;
+    if (ai !== -1) return -1;
+    if (bi !== -1) return 1;
+    return a.localeCompare(b);
+  });
+
+  for (const faction of sortedFactions) {
+    const s = standings[faction];
+    if (!s) continue;
+    const rep = s.reputation != null ? s.reputation : 0;
+    const repColor = rep > 0 ? 'var(--green)' : rep < 0 ? 'var(--red)' : 'var(--text-dim)';
+    lines.push(`<div class="inv-item"><span class="inv-name">${esc(faction)}</span><span class="inv-qty" style="color:${repColor}">${rep > 0 ? '+' : ''}${rep}</span></div>`);
+  }
+
+  const bountyKeys = Object.keys(bounties);
+  if (bountyKeys.length > 0) {
+    lines.push(`<div class="inv-item" style="border-top:1px solid var(--border);margin-top:4px;padding-top:6px"><span class="inv-name" style="color:var(--red);font-weight:600">⚠ Bounties</span><span class="inv-qty"></span></div>`);
+    for (const faction of bountyKeys) {
+      lines.push(`<div class="inv-item"><span class="inv-name" style="padding-left:12px">${esc(faction)}</span><span class="inv-qty" style="color:var(--red)">${Number(bounties[faction]).toLocaleString()} cr</span></div>`);
+    }
+  }
+
+  return lines.join('') || '<div class="inv-empty">No standings data</div>';
 }
 
 // Handle ship selection change
@@ -10001,7 +10102,20 @@ function makeLogLine(text) {
 function startBot(username) {
   const sel = document.getElementById(`routine-${username}`);
   const routine = sel ? sel.value : 'miner';
-  send({ type: 'start', bot: username, routine });
+  const params = {};
+  if (routine === 'return_home') {
+    const cb = document.getElementById(`routine-returnhome-ignore-${username}`);
+    if (cb && cb.checked) params.ignoreBlacklist = true;
+  }
+  send({ type: 'start', bot: username, routine, params: Object.keys(params).length ? params : undefined });
+}
+
+function toggleReturnHomeOptions(username) {
+  const sel = document.getElementById(`routine-${username}`);
+  const lbl = document.getElementById(`routine-returnhome-lbl-${username}`);
+  if (sel && lbl) {
+    lbl.style.display = sel.value === 'return_home' ? 'inline-flex' : 'none';
+  }
 }
 
 function stopBot(username) {
@@ -13068,7 +13182,7 @@ async function buildPersonalFacility(username, facilityType) {
       
       // Use withdraw_items to get from faction storage to cargo
       const withdrawResult = await new Promise(resolve => {
-        sendExec(username, 'withdraw_items', { item_id: mId, quantity: mQty, source: 'faction', target: 'cargo' }, resolve);
+        sendExec(username, 'withdraw_items', { item_id: mId, quantity: mQty, source: 'self', target: 'faction' }, resolve); //fixed by human!
       });
       
       if (!withdrawResult.ok) {
@@ -13116,7 +13230,7 @@ async function buildPersonalFacilityConfirm(username, facilityType, matsJson, co
       const mId = m.item_id || m.name || m.resource || '?';
       const mQty = m.quantity || m.count || m.amount || 1;
         await new Promise(resolve => {
-          sendExec(username, 'withdraw_items', { item_id: mId, quantity: mQty, source: 'faction', target: 'cargo' }, () => resolve(true));
+          sendExec(username, 'withdraw_items', { item_id: mId, quantity: mQty, source: 'self', target: 'faction' }, () => resolve(true)); //fixed by human!
         });
     }
   }
@@ -13124,7 +13238,7 @@ async function buildPersonalFacilityConfirm(username, facilityType, matsJson, co
   await new Promise(resolve => setTimeout(resolve, 500));
   
   const buildResult = await new Promise(resolve => {
-    sendExec(username, 'facility', { action: 'build', facility_type: facilityType }, resolve);
+    sendExec(username, 'facility', { action: 'personal_build', facility_type: facilityType }, resolve);
   });
   
   if (buildResult.ok) {

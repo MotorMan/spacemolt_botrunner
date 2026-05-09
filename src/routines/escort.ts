@@ -50,6 +50,12 @@ import {
   ensureModsFitted,
   readSettings,
   logStatus,
+  getBattleStatus,
+  fleeFromBattle,
+  checkAndFleeFromBattle,
+  checkBattleAfterCommand,
+  type BattleState,
+  handleBattleNotifications,
 } from "./common.js";
 import {
   type NearbyEntity,
@@ -60,8 +66,28 @@ import {
   emergencyFleeSpam,
   analyzeExistingBattle,
   engageTarget as battleEngageTarget,
+  fightJoinedBattle,
 } from "./battle.js";
-import { getBattleStatus } from "./common.js";
+
+// ── Tier helpers ─────────────────────────────────────────────
+
+const TIER_ORDER: Record<PirateTier, number> = {
+  "small": 1,
+  "medium": 2,
+  "large": 3,
+  "capitol": 4,
+  "boss": 5,
+};
+
+function getTierLevel(tier: PirateTier | undefined | null): number {
+  if (!tier) return 1;
+  return TIER_ORDER[tier] ?? 1;
+}
+
+function isTierTooHigh(pirateTier: PirateTier | undefined, maxTier: PirateTier): boolean {
+  if (!pirateTier) return false;
+  return getTierLevel(pirateTier) > getTierLevel(maxTier);
+}
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -249,6 +275,95 @@ async function checkFileEscortSignals(
 // ── Combat ─────────────────────────────────────────────────
 // Using battle.ts functions for combat detection and engagement
 
+// ── Battle analysis for escort ───────────────────────────────
+
+async function analyzeEscortBattle(
+  ctx: RoutineContext,
+  maxAttackTier: PirateTier,
+  minPiratesToFlee: number,
+): Promise<{ shouldJoin: boolean; sideId?: number; reason: string; pirateCount: number }> {
+  const battleStatus = await getBattleStatus(ctx);
+  if (!battleStatus) {
+    return { shouldJoin: false, reason: "No active battle detected", pirateCount: 0 };
+  }
+
+  ctx.log("combat", `📊 Escort battle analysis: ${battleStatus.battle_id}`);
+  ctx.log("combat", `   Sides: ${battleStatus.sides.length} | Participants: ${battleStatus.participants.length}`);
+
+  interface SideInfo {
+    sideId: number;
+    playerCount: number;
+    pirateCount: number;
+    playerNames: string[];
+    pirateNames: string[];
+  }
+
+  const sideInfo: SideInfo[] = battleStatus.sides.map(side => {
+    const members = battleStatus.participants.filter(p => p.side_id === side.side_id);
+    const players = members.filter(p => {
+      const u = (p.username || "").toLowerCase();
+      return !u.includes("pirate") && !u.includes("drifter") &&
+             !u.includes("executioner") && !u.includes("sentinel") &&
+             !u.includes("prowler") && !u.includes("apex") &&
+             !u.includes("razor") && !u.includes("striker") &&
+             !u.includes("rampart") && !u.includes("stalwart") &&
+             !u.includes("bastion") && !u.includes("onslaught") &&
+             !u.includes("iron") && !u.includes("strike") &&
+             !p.username?.startsWith("[POLICE]");
+    });
+    const pirates = members.filter(p => {
+      const u = (p.username || "").toLowerCase();
+      return u.includes("pirate") || u.includes("drifter") ||
+             u.includes("executioner") || u.includes("sentinel") ||
+             u.includes("prowler") || u.includes("apex") ||
+             u.includes("razor") || u.includes("striker") ||
+             u.includes("rampart") || u.includes("stalwart") ||
+             u.includes("bastion") || u.includes("onslaught") ||
+             u.includes("iron") || u.includes("strike");
+    });
+
+    return {
+      sideId: side.side_id,
+      playerCount: players.length,
+      pirateCount: pirates.length,
+      playerNames: players.map(p => p.username || p.player_id),
+      pirateNames: pirates.map(p => p.username || p.player_id),
+    };
+  });
+
+  ctx.log("combat", `   ${sideInfo.map(s =>
+    `Side ${s.sideId}: ${s.playerCount}p [${s.playerNames.join(",")}] vs ${s.pirateCount}pir [${s.pirateNames.join(",")}]`
+  ).join(" | ")}`);
+
+  const playerVsPirateSides = sideInfo.filter(s => s.playerCount > 0 && s.pirateCount > 0);
+
+  if (playerVsPirateSides.length === 0) {
+    const nonPirateParticipants = battleStatus.participants.filter(p => {
+      const u = (p.username || "").toLowerCase();
+      return !u.includes("pirate") && !u.includes("drifter") && !p.username?.startsWith("[POLICE]");
+    });
+    if (nonPirateParticipants.length >= 2 && battleStatus.sides.length >= 2) {
+      return { shouldJoin: false, reason: "PvP battle — escort staying out", pirateCount: 0 };
+    }
+    return { shouldJoin: false, reason: "Pirate vs pirate — escort not engaging", pirateCount: 0 };
+  }
+
+  const sideToJoin = playerVsPirateSides.find(s => s.playerCount > 0);
+  if (!sideToJoin) {
+    return { shouldJoin: false, reason: "Could not determine escort's side", pirateCount: 0 };
+  }
+
+  const opposingSide = sideInfo.find(s => s.sideId !== sideToJoin.sideId);
+  const opposingPirateCount = opposingSide?.pirateCount || 0;
+
+  return {
+    shouldJoin: true,
+    sideId: sideToJoin.sideId,
+    reason: `Escort joining side ${sideToJoin.sideId} (${sideToJoin.playerCount} player(s)) vs ${opposingPirateCount} pirate(s)`,
+    pirateCount: opposingPirateCount,
+  };
+}
+
 // ── Safe-system docking (reused from hunter) ─────────────────
 
 function isSafeSystem(securityLevel: string | undefined): boolean {
@@ -330,18 +445,35 @@ async function navigateToSafeStation(ctx: RoutineContext, safetyOpts: { fuelThre
 export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
+  // Persistent battle state across cycles (from hunter pattern)
+  const battleRef = { state: null as BattleState | null };
+  battleRef.state = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+    lastFleeTime: undefined,
+  };
+
   await bot.refreshStatus();
   let totalKills = 0;
   let lastMinerSystemCheck = 0;
-  const MINER_CHECK_INTERVAL_MS = 10_000; // Check miner location every 10 seconds
+  const MINER_CHECK_INTERVAL_MS = 10_000;
   let minerSystem: string | null = null;
   let consecutiveFailedChecks = 0;
-  const MAX_FAILED_CHECKS = 5; // After this many failures, dock and wait
+  const MAX_FAILED_CHECKS = 5;
 
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await ctx.sleep(30000); continue; }
+
+    // ── Fast battle detection via WebSocket (no API call) ──
+    if (bot.isInBattle()) {
+      battleRef.state.inBattle = true;
+      ctx.log("combat", "[WebSocket] Battle detected — will handle in combat section");
+    }
 
     const settings = getEscortSettings(bot.username);
     const safetyOpts = {
@@ -689,18 +821,143 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     // to be available for combat when the miner is attacked
     yield "standby";
     ctx.log("escort", `Standing by at ${validPoi ? minerPoiName : bot.system} — monitoring for threats to miner...`);
-    
+
     // Scan for nearby hostiles that might threaten the miner
     yield "scan_system";
     await fetchSecurityLevel(ctx, bot.system);
 
-    // Check if we're already in battle (from protecting miner)
+    // ── Check if we're already in battle (miner pulled us in) ──
     const existingBattle = await getBattleStatus(ctx);
-    if (existingBattle) {
-      ctx.log("combat", `⚔️ Already in battle (${existingBattle.battle_id}) — continuing fight...`);
-      // battle.ts functions will handle the ongoing battle
+    if (existingBattle && battleRef.state.inBattle) {
+      ctx.log("combat", `⚔️ Already in battle (${existingBattle.battle_id}) — running combat loop...`);
+
+      const analysis = await analyzeEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee);
+      if (analysis.shouldJoin && analysis.sideId !== undefined) {
+        ctx.log("combat", `✅ Escort joining side ${analysis.sideId}: ${analysis.reason}`);
+
+        // Pick a target from the opposing side
+        const opposingPirates = existingBattle.participants.filter(p => {
+          const u = (p.username || "").toLowerCase();
+          return (u.includes("pirate") || u.includes("drifter") ||
+                  u.includes("executioner") || u.includes("sentinel") ||
+                  u.includes("prowler") || u.includes("apex") ||
+                  u.includes("razor") || u.includes("striker") ||
+                  u.includes("rampart") || u.includes("stalwart") ||
+                  u.includes("bastion") || u.includes("onslaught") ||
+                  u.includes("iron") || u.includes("strike")) &&
+                 p.side_id !== analysis.sideId;
+        });
+
+        if (opposingPirates.length > 0) {
+          // Target highest tier pirate
+          const targetPirate = opposingPirates.reduce((a, b) => {
+            const aLevel = getTierLevel((a as any).tier as PirateTier);
+            const bLevel = getTierLevel((b as any).tier as PirateTier);
+            return aLevel >= bLevel ? a : b;
+          });
+
+          const targetEntity: NearbyEntity = {
+            id: targetPirate.player_id,
+            name: targetPirate.username || targetPirate.player_id,
+            type: "pirate",
+            faction: "pirate",
+            isNPC: true,
+            isPirate: true,
+            tier: (targetPirate as any).tier as PirateTier,
+          };
+
+          const won = await fightJoinedBattle(ctx, targetEntity, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier);
+          if (won) {
+            totalKills++;
+            ctx.log("combat", `Kill #${totalKills} — escort protected the miner!`);
+            yield "loot";
+            await scavengeWrecks(ctx);
+          } else {
+            ctx.log("combat", "Escort retreated from battle — docking to repair");
+          }
+        } else {
+          ctx.log("combat", "No opposing pirates found in battle — standing by");
+        }
+      } else {
+        ctx.log("combat", `Not joining battle: ${analysis.reason}`);
+      }
+
+      // Check if battle is over
+      const postBattleCheck = await getBattleStatus(ctx);
+      if (!postBattleCheck) {
+        battleRef.state.inBattle = false;
+        battleRef.state.battleId = null;
+        battleRef.state.isFleeing = false;
+        ctx.log("combat", "Battle ended");
+      }
+    } else if (existingBattle && !battleRef.state.inBattle) {
+      // New battle detected that we weren't tracking — start tracking and join
+      ctx.log("combat", `⚔️ New battle detected (${existingBattle.battle_id}) — analyzing...`);
+      battleRef.state.inBattle = true;
+      battleRef.state.battleId = existingBattle.battle_id;
+
+      const analysis = await analyzeEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee);
+      if (analysis.shouldJoin && analysis.sideId !== undefined) {
+        ctx.log("combat", `✅ Escort joining side ${analysis.sideId}: ${analysis.reason}`);
+
+        const engageResp = await bot.exec("battle", { action: "engage", side_id: analysis.sideId.toString() });
+        if (engageResp.error) {
+          ctx.log("error", `Failed to join battle: ${engageResp.error.message}`);
+        } else {
+          // Find target and fight
+          const opposingPirates = existingBattle.participants.filter(p => {
+            const u = (p.username || "").toLowerCase();
+            return (u.includes("pirate") || u.includes("drifter") ||
+                    u.includes("executioner") || u.includes("sentinel") ||
+                    u.includes("prowler") || u.includes("apex") ||
+                    u.includes("razor") || u.includes("striker") ||
+                    u.includes("rampart") || u.includes("stalwart") ||
+                    u.includes("bastion") || u.includes("onslaught") ||
+                    u.includes("iron") || u.includes("strike")) &&
+                   p.side_id !== analysis.sideId;
+          });
+
+          if (opposingPirates.length > 0) {
+            const targetPirate = opposingPirates.reduce((a, b) => {
+              const aLevel = getTierLevel((a as any).tier as PirateTier);
+              const bLevel = getTierLevel((b as any).tier as PirateTier);
+              return aLevel >= bLevel ? a : b;
+            });
+
+            const targetEntity: NearbyEntity = {
+              id: targetPirate.player_id,
+              name: targetPirate.username || targetPirate.player_id,
+              type: "pirate",
+              faction: "pirate",
+              isNPC: true,
+              isPirate: true,
+              tier: (targetPirate as any).tier as PirateTier,
+            };
+
+            // Re-fetch battle state after joining
+            const joinedBattle = await getBattleStatus(ctx);
+            if (joinedBattle) {
+              const won = await fightJoinedBattle(ctx, targetEntity, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier);
+              if (won) {
+                totalKills++;
+                ctx.log("combat", `Kill #${totalKills} — escort protected the miner!`);
+                yield "loot";
+                await scavengeWrecks(ctx);
+              }
+            }
+          }
+        }
+
+        // Check if battle is over
+        const postBattleCheck = await getBattleStatus(ctx);
+        if (!postBattleCheck) {
+          battleRef.state.inBattle = false;
+          battleRef.state.battleId = null;
+        }
+      }
     }
 
+    // ── Scan for nearby threats to engage proactively ──
     const nearbyResp = await bot.exec("get_nearby");
     if (!nearbyResp.error && nearbyResp.result) {
       bot.trackNearbyPlayers(nearbyResp.result);
@@ -708,52 +965,71 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       const targets = entities.filter(e => isPirateTarget(e, false, settings.maxAttackTier));
 
       if (targets.length > 0) {
-        ctx.log("combat", `Found ${targets.length} hostile(s) in system: ${targets.map(t => t.name).join(", ")}`);
+        // Don't engage new targets if we just came out of a battle
+        if (battleRef.state.inBattle) {
+          ctx.log("combat", `Battle still active — ${targets.length} hostiles nearby but staying in current fight`);
+        } else {
+          ctx.log("combat", `Found ${targets.length} hostile(s) in system: ${targets.map(t => t.name).join(", ")}`);
 
-        // Engage threats
-        for (const target of targets) {
-          if (bot.state !== "running") break;
+          for (const target of targets) {
+            if (bot.state !== "running") break;
 
-          await bot.refreshStatus();
-          const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-          if (preHull <= settings.repairThreshold) {
-            ctx.log("system", `Hull at ${preHull}% — too low for combat, docking...`);
-            break;
-          }
-
-          // Pre-fight ammo check - use ensureAmmoLoaded since bot.ammo may not reflect module-level ammo
-          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
-          if (!hasAmmo) {
-            ctx.log("combat", "Out of ammo — docking to resupply");
-            break;
-          }
-
-          yield "engage";
-          const won = await battleEngageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier);
-
-          if (won) {
-            totalKills++;
-            ctx.log("combat", `Kill #${totalKills} — looting wreck...`);
-
-            yield "loot";
-            await scavengeWrecks(ctx);
-
-            // Post-kill reload
-            const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
-            if (!hasAmmo) {
-              ctx.log("combat", "No ammo after kill — docking to resupply");
+            await bot.refreshStatus();
+            const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+            if (preHull <= settings.repairThreshold) {
+              ctx.log("system", `Hull at ${preHull}% — too low for combat, docking...`);
               break;
             }
 
-            await bot.refreshStatus();
-            ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
-          } else {
-            ctx.log("combat", "Retreated — docking to repair");
-            break;
+            const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+            if (!hasAmmo) {
+              ctx.log("combat", "Out of ammo — docking to resupply");
+              break;
+            }
+
+            yield "engage";
+            const won = await battleEngageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier);
+
+            if (won) {
+              totalKills++;
+              battleRef.state.inBattle = false;
+              battleRef.state.battleId = null;
+              ctx.log("combat", `Kill #${totalKills} — looting wreck...`);
+
+              yield "loot";
+              await scavengeWrecks(ctx);
+
+              const hasAmmoAfter = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+              if (!hasAmmoAfter) {
+                ctx.log("combat", "No ammo after kill — docking to resupply");
+                break;
+              }
+
+              await bot.refreshStatus();
+              ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
+            } else {
+              battleRef.state.inBattle = false;
+              battleRef.state.battleId = null;
+              ctx.log("combat", "Retreated — docking to repair");
+              break;
+            }
           }
         }
       } else {
         ctx.log("escort", `No threats in ${bot.system} — standing by`);
+      }
+    } else if (nearbyResp.error) {
+      ctx.log("warn", `get_nearby failed: ${nearbyResp.error.message}`);
+    }
+
+    // ── Reset battle state if no longer in battle ──
+    if (battleRef.state.inBattle) {
+      const stillInBattle = await getBattleStatus(ctx);
+      if (!stillInBattle) {
+        battleRef.state.inBattle = false;
+        battleRef.state.battleId = null;
+        battleRef.state.isFleeing = false;
+        ctx.log("combat", "Battle state cleared — no longer in combat");
       }
     }
 
@@ -860,6 +1136,11 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
       yield "undock";
       await ensureUndocked(ctx);
+
+      // Reset battle state after docking cycle
+      battleRef.state.inBattle = false;
+      battleRef.state.battleId = null;
+      battleRef.state.isFleeing = false;
 
       ctx.log("info", `Escort cycle complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
     } else {

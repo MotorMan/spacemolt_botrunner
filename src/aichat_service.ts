@@ -558,12 +558,14 @@ export class AiChatService {
 
   /**
    * Check if faction chat rounds limit has been reached.
-   * Returns true if we should skip responding due to round limit.
+   * Returns { shouldSkip: boolean, isLastRound: boolean }
+   * shouldSkip: true if we've exceeded the limit and should not respond
+   * isLastRound: true if this response would be the last allowed (for adding goodbye message)
    */
-  private checkFactionChatRoundsLimit(settings: ReturnType<typeof getAiChatSettings>): boolean {
+  private checkFactionChatRoundsLimit(settings: ReturnType<typeof getAiChatSettings>): { shouldSkip: boolean; isLastRound: boolean } {
     // If limit is 0 or not set, no limit applied
     if (!settings.factionChatRoundsLimit || settings.factionChatRoundsLimit <= 0) {
-      return false;
+      return { shouldSkip: false, isLastRound: false };
     }
 
     const now = Date.now();
@@ -575,10 +577,13 @@ export class AiChatService {
 
     // Check if we've hit the limit
     if (this.factionChatRounds >= settings.factionChatRoundsLimit) {
-      return true;
+      return { shouldSkip: true, isLastRound: false };
     }
 
-    return false;
+    // Check if this would be the last round
+    const isLastRound = this.factionChatRounds + 1 >= settings.factionChatRoundsLimit;
+
+    return { shouldSkip: false, isLastRound };
   }
 
   /**
@@ -762,6 +767,8 @@ export class AiChatService {
     // Log message details for debugging
     this.logFn("ai_chat_debug", `Processing message: channel=${msg.channel}, sender=${msg.sender}, botUsername=${msg.botUsername}, botSystem=${msg.botSystem}, botPoi=${msg.botPoi}`);
 
+    let isLastRound = false;
+
     // Monitor local, faction, system, and private chat
     if (msg.channel !== "local" && msg.channel !== "faction" && msg.channel !== "system" && msg.channel !== "private") {
       return;
@@ -782,10 +789,12 @@ export class AiChatService {
       const bots = AiChatService.getBots();
       const isFromAiBot = bots?.some(b => b.username === msg.sender);
       if (isFromAiBot) {
-        if (this.checkFactionChatRoundsLimit(settings)) {
+        const limitCheck = this.checkFactionChatRoundsLimit(settings);
+        if (limitCheck.shouldSkip) {
           this.logFn("ai_chat", `Faction chat rounds limit reached (${this.factionChatRounds}/${settings.factionChatRoundsLimit}), skipping private message from bot`);
           return;
         }
+        isLastRound = limitCheck.isLastRound;
       }
 
       // Check if message mentions a different bot - if so, still let the receiving bot respond
@@ -796,7 +805,7 @@ export class AiChatService {
         return;
       }
 
-      await this.handleResponse(responder, msg, settings, msg.sender, true);
+      await this.handleResponse(responder, msg, settings, msg.sender, true, new Set(), isLastRound);
       return;
     }
 
@@ -881,10 +890,12 @@ export class AiChatService {
 
     // Check faction chat rounds limit (only for faction channel)
     if (msg.channel === "faction") {
-      if (this.checkFactionChatRoundsLimit(settings)) {
+      const limitCheck = this.checkFactionChatRoundsLimit(settings);
+      if (limitCheck.shouldSkip) {
         this.logFn("ai_chat", `Faction chat rounds limit reached (${this.factionChatRounds}/${settings.factionChatRoundsLimit}), skipping`);
         return;
       }
+      isLastRound = limitCheck.isLastRound;
     }
 
     // Select responder(s) for non-mention messages
@@ -901,7 +912,7 @@ export class AiChatService {
     const triedBots = new Set<string>();
     for (const candidate of candidates) {
       triedBots.add(candidate.username);
-      const result = await this.handleResponse(candidate, msg, settings, msg.sender, false, triedBots);
+      const result = await this.handleResponse(candidate, msg, settings, msg.sender, false, triedBots, isLastRound);
       if (result === "sent") {
         break; // Success, stop trying
       }
@@ -919,7 +930,8 @@ export class AiChatService {
     settings: ReturnType<typeof getAiChatSettings>,
     humanSender: string,
     isHumanSender: boolean,
-    triedBots: Set<string> = new Set()
+    triedBots: Set<string> = new Set(),
+    isLastRound: boolean = false
   ): Promise<"sent" | "failed"> {
     // Check conversation limits (cooldown, consecutive responses)
     // Use channel + human sender as key (not responder) so only one bot responds per conversation
@@ -969,7 +981,7 @@ export class AiChatService {
     }
 
     // Generate and send response (may fail if traveling for local chat)
-    const result = await this.sendResponse(responder, msg, settings, humanSender, triedBots);
+    const result = await this.sendResponse(responder, msg, settings, humanSender, triedBots, isLastRound);
 
     if (result === "traveling" && msg.channel === "local") {
       // Bot was traveling, return failed so caller tries next candidate
@@ -1487,7 +1499,8 @@ export class AiChatService {
     msg: ChatMessage,
     settings: ReturnType<typeof getAiChatSettings>,
     humanSender: string,
-    triedBots: Set<string>
+    triedBots: Set<string>,
+    isLastRound: boolean = false
   ): Promise<"sent" | "traveling" | "error"> {
     const mem = loadMemory();
     mem.responseCount++;
@@ -1504,7 +1517,8 @@ export class AiChatService {
     this.logFn("ai_chat_debug", `Gathering real-time context for ${bot.username}...`);
     const botContext = await this.gatherBotContext(bot);
 
-    const systemPrompt = `${personality}
+    const lastRoundInstruction = isLastRound ? "\n\nThis is your last response in this conversation. End with a natural goodbye in your personality style, like 'see ya!' or 'talk to you later', to wrap up the chat nicely." : "";
+    const systemPrompt = `${personality}${lastRoundInstruction}
 
 ## Galaxy Map Data (Real Game Data)
 Use this information to help answer questions about systems, stations, resources, and connections.

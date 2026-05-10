@@ -42,14 +42,30 @@ interface CraftingPlan {
   totalSteps: number;
 }
 
+/** Recipes that should NEVER be used - they are inefficient/wasteful */
+const BLACKLISTED_RECIPES = new Set([
+  "basic_silicon_refinement", // Noob trap - severe waste of basic materials
+]);
+
+/** Recipes that should be heavily penalized - only use as absolute last resort */
+const PENALTY_RECIPES: Record<string, number> = {
+  "synthesize_bio_polymer": -1000, // Massive penalty - materials better suited for other recipes
+};
+
 /**
  * Score a recipe based on material availability.
  * Returns a score from 0-100 where higher means more materials are available.
+ * Blacklisted recipes return -Infinity. Penalized recipes get a massive score reduction.
  */
 function scoreRecipeAvailability(
   recipe: Recipe,
   countItemFn: (itemId: string) => number,
 ): number {
+  // Check if recipe is blacklisted
+  if (BLACKLISTED_RECIPES.has(recipe.recipe_id)) {
+    return -Infinity;
+  }
+
   if (recipe.components.length === 0) return 50; // No ingredients needed
 
   let totalAvailability = 0;
@@ -66,7 +82,28 @@ function scoreRecipeAvailability(
   if (totalNeeded === 0) return 50;
   
   // Return percentage of materials available (0-100)
-  return Math.round((totalAvailability / totalNeeded) * 100);
+  let score = Math.round((totalAvailability / totalNeeded) * 100);
+  
+  // Apply penalties for undesirable recipes
+  if (recipe.recipe_id in PENALTY_RECIPES) {
+    score += PENALTY_RECIPES[recipe.recipe_id];
+  }
+  
+  return score;
+}
+
+/**
+ * Check if a recipe has all materials available (at least 1 batch worth).
+ */
+function hasRecipeMaterials(
+  recipe: Recipe,
+  countItemFn: (itemId: string) => number,
+): boolean {
+  for (const comp of recipe.components) {
+    const have = countItemFn(comp.item_id);
+    if (have < comp.quantity) return false;
+  }
+  return true;
 }
 
 /**
@@ -80,20 +117,26 @@ function findRecipeForItem(
 ): Recipe | null {
   // Find all recipes that produce this item
   const candidates = recipes.filter(r => r.output_item_id === itemId);
-  
+
   if (candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
-  
+
   // Score each recipe by material availability
   const scored = candidates.map(recipe => ({
     recipe,
+    canCraft: hasRecipeMaterials(recipe, countItemFn),
     score: scoreRecipeAvailability(recipe, countItemFn),
   }));
-  
-  // Sort by score descending - prefer recipes with more materials available
-  scored.sort((a, b) => b.score - a.score);
-  
-  // Return the recipe with highest material availability score
+
+  // Sort by score descending (higher material availability first), then by canCraft descending
+  scored.sort((a, b) => {
+    if (a.score !== b.score) {
+      return b.score - a.score;
+    }
+    return a.canCraft ? -1 : 1; // canCraft true comes first among equal scores
+  });
+
+  // Return the recipe with highest priority
   return scored[0].recipe;
 }
 
@@ -253,12 +296,42 @@ export function calculateCraftingPlan(
 }
 
 /**
+ * Find all recipes that produce a given item and return them sorted by material availability.
+ * This allows callers to pick the best recipe based on current materials.
+ */
+export function findAllRecipesForItem(
+  itemId: string,
+  recipes: Recipe[],
+  countItemFn: (itemId: string) => number,
+): Recipe[] {
+  const candidates = recipes.filter(r => r.output_item_id === itemId);
+  if (candidates.length === 0) return [];
+
+  const scored = candidates.map(recipe => ({
+    recipe,
+    canCraft: hasRecipeMaterials(recipe, countItemFn),
+    score: scoreRecipeAvailability(recipe, countItemFn),
+  }));
+
+  // Sort by score descending (higher material availability first), then by canCraft descending
+  scored.sort((a, b) => {
+    if (a.score !== b.score) {
+      return b.score - a.score;
+    }
+    return a.canCraft ? -1 : 1; // canCraft true comes first among equal scores
+  });
+
+  return scored.map(s => s.recipe);
+}
+
+/**
  * Calculate crafting plans for multiple goal items.
  * Plans are calculated in order (FIFO), and inventory is updated
  * after each plan to account for items that will be crafted.
  * 
  * Each goal can specify either a specific recipe or just an item ID.
- * When a recipe is specified, that exact recipe will be used.
+ * When a recipe is specified, that exact recipe will be used UNLESS
+ * materials are not available - then it will try alternatives.
  */
 export function calculateMultiGoalPlan(
   goals: Array<{ itemId: string; quantity: number; recipe?: Recipe }>,
@@ -284,8 +357,15 @@ export function calculateMultiGoalPlan(
 
   // Calculate plans in order
   for (const goal of goals) {
-    // Use the specified recipe if provided, otherwise find best recipe for the item
-    const goalRecipe = goal.recipe || findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0);
+    // Use the specified recipe if provided, otherwise find the best recipe for the goal item
+    let goalRecipe: Recipe | null = null;
+
+    if (goal.recipe) {
+      // Always use the specified recipe exactly as requested
+      goalRecipe = goal.recipe;
+    } else {
+      goalRecipe = findRecipeForItem(goal.itemId, recipes, (itemId) => inventory.get(itemId) || 0);
+    }
     
     if (!goalRecipe) continue;
     

@@ -1,0 +1,203 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Ships For Sale - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background: var(--bg); color: var(--text); }
+    body { padding: 16px; display:flex; flex-direction:column; overflow:hidden; }
+    .shipsforsale-layout { flex:1; min-height:0; display:flex; flex-direction:column; }
+    .shipsforsale-header { display:flex; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+    .shipsforsale-header h3 { margin:0; color:var(--text-bright); }
+    .shipsforsale-stats { color:var(--text-dim); font-size:12px; }
+    .shipsforsale-filters { display:flex; gap:12px; align-items:center; margin-bottom:12px; flex-wrap:wrap; }
+    .shipsforsale-filters label { font-size:12px; color:var(--text-dim); margin-right:4px; }
+    .shipsforsale-filters select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .shipsforsale-content { flex:1; min-height:0; overflow:auto; }
+    .shipsforsale-station { margin-bottom:24px; }
+    .shipsforsale-station h4 { color:var(--text-bright); margin-bottom:8px; border-bottom:1px solid var(--border); padding-bottom:4px; }
+    .shipsforsale-table { width:100%; border-collapse:collapse; font-size:12px; background:var(--bg-card); border-radius:6px; overflow:hidden; }
+    .shipsforsale-table th { text-align:left; padding:8px 12px; background:var(--bg-row-hover); border-bottom:1px solid var(--border); color:var(--text-bright); font-weight:600; }
+    .shipsforsale-table td { padding:6px 12px; border-bottom:1px solid var(--border); }
+    .shipsforsale-table tr:hover td { background:var(--bg-row-hover); }
+    .tier-badge { display:inline-block; padding:2px 6px; background:var(--bg-input); border:1px solid var(--border); border-radius:3px; font-size:11px; }
+    .tier-0 { color: #00ffff; }
+    .tier-1 { color: #808000; }
+    .tier-2 { color: #0000ff; }
+    .tier-3 { color: #800080; }
+    .tier-4 { color: #ff0000; }
+    .tier-5 { color: #ffff00; }
+    .tier-legacy { color: #666; }
+    .empty-state { text-align:center; padding:40px; color:var(--text-dim); }
+  </style>
+</head>
+<body>
+  <div class="shipsforsale-layout">
+    <div class="shipsforsale-header">
+      <h3>Ships For Sale</h3>
+      <span class="shipsforsale-stats" id="shipsforsaleStats"></span>
+    </div>
+
+    <div class="shipsforsale-filters">
+      <label>Tier Filter:</label>
+      <select id="tierFilter" onchange="renderShips()">
+        <option value="">All Tiers</option>
+        <option value="legacy">Legacy</option>
+        <option value="0">T0</option>
+        <option value="1">T1</option>
+        <option value="2">T2</option>
+        <option value="3">T3</option>
+        <option value="4">T4</option>
+        <option value="5">T5</option>
+      </select>
+      <label>Sort By:</label>
+      <select id="sortBy" onchange="renderShips()">
+        <option value="name">Name</option>
+        <option value="price">Price</option>
+        <option value="tier">Tier</option>
+      </select>
+    </div>
+
+    <div class="shipsforsale-content" id="shipsforsaleContent">
+      <div class="empty-state">Loading ships for sale...</div>
+    </div>
+  </div>
+
+  <script>
+    let shipsForSale = [];
+    let catalog = { ships: {} };
+
+    // ── Load Data ──────────────────────────────────────────
+    async function loadData() {
+      try {
+        const shipsRes = await fetch('/data/shipsForSale.json');
+        const shipsData = await shipsRes.json();
+        shipsForSale = Object.values(shipsData.listings || {});
+      } catch (e) {
+        console.error('Failed to load ships for sale:', e);
+        shipsForSale = [];
+      }
+
+      try {
+        const catalogRes = await fetch('/api/catalog');
+        const catalogData = await catalogRes.json();
+        catalog = catalogData;
+      } catch (e) {
+        console.error('Failed to load catalog:', e);
+      }
+
+      updateStats();
+      renderShips();
+    }
+
+    // ── Update Stats ───────────────────────────────────────
+    function updateStats() {
+      const total = shipsForSale.length;
+      const stations = new Set(shipsForSale.map(s => s.stationName)).size;
+      const tiers = {};
+      shipsForSale.forEach(s => {
+        const t = s.tier !== undefined ? s.tier : 'legacy';
+        tiers[t] = (tiers[t] || 0) + 1;
+      });
+      document.getElementById('shipsforsaleStats').textContent = 
+        `${total} ships | ${stations} stations | ${Object.keys(tiers).length} tiers`;
+    }
+
+    // ── Render Ships ───────────────────────────────────────
+    function renderShips() {
+      const content = document.getElementById('shipsforsaleContent');
+      const tierFilter = document.getElementById('tierFilter').value;
+      const sortBy = document.getElementById('sortBy').value;
+
+      // Filter
+      let filtered = shipsForSale.filter(ship => {
+        if (tierFilter === '') return true;
+        if (tierFilter === 'legacy') return ship.tier === undefined || ship.tier === null;
+        return ship.tier == tierFilter;
+      });
+
+      // Group by station
+      const grouped = {};
+      filtered.forEach(ship => {
+        const station = ship.stationName;
+        if (!grouped[station]) grouped[station] = [];
+        grouped[station].push(ship);
+      });
+
+      // Sort groups and within groups
+      const sortedStations = Object.keys(grouped).sort();
+      sortedStations.forEach(station => {
+        grouped[station].sort((a, b) => {
+          if (sortBy === 'price') return a.price - b.price;
+          if (sortBy === 'tier') return (a.tier || -1) - (b.tier || -1);
+          return a.ship_name.localeCompare(b.ship_name);
+        });
+      });
+
+      if (filtered.length === 0) {
+        content.innerHTML = '<div class="empty-state">No ships match your filters</div>';
+        return;
+      }
+
+      let html = '';
+      sortedStations.forEach(station => {
+        html += `<div class="shipsforsale-station">
+          <h4>${esc(station)}</h4>
+          <table class="shipsforsale-table">
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Tier</th>
+                <th>Price</th>
+                <th>Weapons</th>
+                <th>Defense</th>
+                <th>Utility</th>
+                <th>Cargo</th>
+                <th>Hull</th>
+                <th>Shield</th>
+                <th>Speed</th>
+              </tr>
+            </thead>
+            <tbody>`;
+        grouped[station].forEach(ship => {
+          const spec = catalog.ships[ship.class_id] || {};
+          const tierClass = ship.tier !== undefined ? `tier-${ship.tier}` : 'tier-legacy';
+          const tierText = ship.tier !== undefined ? (ship.tier === 0 ? 'T0' : 'T' + ship.tier) : 'Legacy';
+          html += `<tr>
+            <td><strong>${esc(ship.ship_name)}</strong></td>
+            <td><span class="tier-badge ${tierClass}">${tierText}</span></td>
+            <td>${num(ship.price)}cr</td>
+            <td>${spec.weapon_slots || 0}</td>
+            <td>${spec.defense_slots || 0}</td>
+            <td>${spec.utility_slots || 0}</td>
+            <td>${spec.cargo_capacity || 0}</td>
+            <td>${spec.base_hull || 0}</td>
+            <td>${spec.base_shield || 0}</td>
+            <td>${spec.base_speed || 0}</td>
+          </tr>`;
+        });
+        html += `</tbody></table></div>`;
+      });
+
+      content.innerHTML = html;
+    }
+
+    // ── Helpers ────────────────────────────────────────────
+    function num(n) {
+      return n ? n.toLocaleString() : '0';
+    }
+
+    function esc(s) {
+      if (!s) return '';
+      const d = document.createElement('div');
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    // ── Initialize ─────────────────────────────────────────
+    loadData();
+  </script>
+</body>
+</html>

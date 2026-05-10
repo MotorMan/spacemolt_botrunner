@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from "fs";
 import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
 import { log } from "./ui.js";
@@ -220,14 +220,34 @@ export interface MapData {
 const DATA_DIR = join(process.cwd(), "data");
 const MAP_FILE = join(DATA_DIR, "map.json");
 const SAVE_DEBOUNCE_MS = 5000;
+const BACKUP_DIR = join(DATA_DIR, "Backups");
+const BACKUP_FILES = [
+  'map.json',
+  'customsStops.json',
+  'factionTradeCoordination.json',
+  'fcStations.json',
+  'fullPlayerInfo.json',
+  'marketDetails.json',
+  'rawMissions.json',
+  'rescueActivity.json',
+  'rescueBlackBook.json',
+  'settings.json',
+  'shipsForSale.json',
+  'traderActivity.json',
+];
 
 class MapStore {
   private data: MapData;
   private dirty = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
+  private backupTimer: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     this.data = this.load();
+    if (!existsSync(BACKUP_DIR)) {
+      mkdirSync(BACKUP_DIR, { recursive: true });
+    }
+    this.backupTimer = setInterval(() => this.performBackup(), 30 * 60 * 1000);
   }
 
   // ── Pirate System Check ─────────────────────────────────
@@ -291,7 +311,36 @@ class MapStore {
       clearTimeout(this.saveTimer);
       this.saveTimer = null;
     }
+    if (this.backupTimer) {
+      clearInterval(this.backupTimer);
+      this.backupTimer = null;
+    }
     this.writeToDisk();
+  }
+
+  private getTimestamp(): string {
+    const now = new Date();
+    return now.getFullYear() + '-' +
+      (now.getMonth() + 1).toString().padStart(2, '0') + '-' +
+      now.getDate().toString().padStart(2, '0') + '_' +
+      now.getHours().toString().padStart(2, '0') + '-' +
+      now.getMinutes().toString().padStart(2, '0') + '-' +
+      now.getSeconds().toString().padStart(2, '0');
+  }
+
+  private performBackup(): void {
+    const timestamp = this.getTimestamp();
+    for (const file of BACKUP_FILES) {
+      const src = join(DATA_DIR, file);
+      if (existsSync(src)) {
+        const dest = join(BACKUP_DIR, `${file}_${timestamp}`);
+        try {
+          copyFileSync(src, dest);
+        } catch (e) {
+          log("error", `Failed to backup ${file}: ${e}`);
+        }
+      }
+    }
   }
 
   // ── Update methods ──────────────────────────────────────
@@ -432,14 +481,57 @@ class MapStore {
       if (!itemId) continue;
       freshItemIds.add(itemId);
 
-      const buyPrice = item.buy_price as number ?? item.buy as number ?? null;
-      const sellPrice = item.sell_price as number ?? item.sell as number ?? null;
       const prev = existingMarket.get(itemId);
 
-      // Extract order quantities from order book data — use fresh values as-is,
-      // don't fall back to stale cached quantities (they may no longer be available)
-      const buyQty = (item.buy_quantity as number) ?? (item.buy_volume as number) ?? (item.buy_orders as number) ?? 0;
-      const sellQty = (item.sell_quantity as number) ?? (item.sell_volume as number) ?? (item.sell_orders as number) ?? 0;
+      // Calculate best buy price (highest price from buy orders, or use provided buy_price)
+      let buyPrice = item.buy_price as number ?? item.buy as number ?? null;
+      let buyQty = (item.buy_quantity as number) ?? (item.buy_volume as number) ?? 0;
+
+      // If we have buy_orders array, calculate best price and total quantity from it
+      if (Array.isArray(item.buy_orders)) {
+        let maxBuyPrice = 0;
+        let totalBuyQty = 0;
+        for (const order of item.buy_orders) {
+          const price = (order.price as number) ?? (order.unit_price as number) ?? 0;
+          const qty = (order.quantity as number) ?? (order.remaining as number) ?? 0;
+          if (price > 0 && qty > 0) {
+            maxBuyPrice = Math.max(maxBuyPrice, price);
+            totalBuyQty += qty;
+          }
+        }
+        if (maxBuyPrice > 0) {
+          buyPrice = buyPrice ?? maxBuyPrice;
+          buyQty = buyQty || totalBuyQty;
+        }
+      } else if ((item.buy_orders as number) > 0) {
+        // Fallback for cases where buy_orders is a number (count of orders)
+        buyQty = buyQty || (item.buy_orders as number);
+      }
+
+      // Calculate best sell price (lowest price from sell orders, or use provided sell_price)
+      let sellPrice = item.sell_price as number ?? item.sell as number ?? null;
+      let sellQty = (item.sell_quantity as number) ?? (item.sell_volume as number) ?? 0;
+
+      // If we have sell_orders array, calculate best price and total quantity from it
+      if (Array.isArray(item.sell_orders)) {
+        let minSellPrice = Infinity;
+        let totalSellQty = 0;
+        for (const order of item.sell_orders) {
+          const price = (order.price as number) ?? (order.unit_price as number) ?? 0;
+          const qty = (order.quantity as number) ?? (order.remaining as number) ?? 0;
+          if (price > 0 && qty > 0) {
+            minSellPrice = Math.min(minSellPrice, price);
+            totalSellQty += qty;
+          }
+        }
+        if (minSellPrice !== Infinity) {
+          sellPrice = sellPrice ?? minSellPrice;
+          sellQty = sellQty || totalSellQty;
+        }
+      } else if ((item.sell_orders as number) > 0) {
+        // Fallback for cases where sell_orders is a number (count of orders)
+        sellQty = sellQty || (item.sell_orders as number);
+      }
 
       existingMarket.set(itemId, {
         item_id: itemId,
@@ -1115,17 +1207,17 @@ class MapStore {
   /**
    * Estimate minutes until a resource regenerates based on availability level.
    * Model: resources regen ~25% every 3 hours (180 minutes).
-   * depletion_percent from game API means "% available" (100 = full, 0 = empty).
+   * depletion_percent from game API means "% depleted" (0 = full, 100 = empty).
    * Returns 0 if resource is not depleted enough to need regen.
    */
   estimateRegenTime(depletionPercent: number, minutesSinceScan: number): number {
-    // If more than 75% available, no regen needed
-    if (depletionPercent > 75) return 0;
+    // If less than 25% depleted (more than 75% available), no regen needed
+    if (depletionPercent < 25) return 0;
 
     // Base regen: 25% per 180 minutes
-    // For every 25% missing beyond 75% threshold, need 180 more minutes
-    const missingPercent = 100 - depletionPercent;
-    const regenCycles = Math.ceil(missingPercent / 25);
+    // For every 25% depleted beyond 25% threshold, need 180 more minutes
+    const depletedBeyondThreshold = depletionPercent - 25;
+    const regenCycles = Math.ceil(depletedBeyondThreshold / 25);
     return regenCycles * 180;
   }
 
@@ -1133,8 +1225,15 @@ class MapStore {
    * Find the best mining location for a resource, scored by abundance and accessibility.
    * Prefers POIs with high remaining resources, low depletion, and recent scans.
    * HEAVILY priorit hidden POIs (deep core mining) over regular POIs.
+   * 
+   * @param oreId - The ore/resource ID to find locations for
+   * @param fromSystem - System to calculate distance from (default: faction home)
+   * @param blacklist - Systems to exclude
+   * @param shipSpeed - Ship jump speed (1-6, default 1). Speed 1=120s/jump, 2=110s, 3=100s, 4=80s, 5=50s, 6=30s
+   * @param shipCargo - Ship cargo capacity (default 8000)
+   * @param isMiningShip - Whether ship has mining ship double-cargo bonus (default false)
    */
-  findBestMiningLocation(oreId: string, fromSystem?: string, blacklist?: string[]): Array<{
+  findBestMiningLocation(oreId: string, fromSystem?: string, blacklist?: string[], shipSpeed?: number, shipCargo?: number, isMiningShip?: boolean): Array<{
     systemId: string;
     systemName: string;
     poiId: string;
@@ -1157,6 +1256,16 @@ class MapStore {
     const locations = this.findOreLocations(oreId);
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+    
+    // Ship parameters with defaults
+    const speed = shipSpeed || 1;
+    const cargo = shipCargo || 8000;
+    const isMining = isMiningShip || false;
+    const effectiveCargo = isMining ? cargo * 2 : cargo;
+    
+    // Jump times lookup for later use
+    const jumpTimes: Record<number, number> = { 1: 120, 2: 110, 3: 100, 4: 80, 5: 50, 6: 30 };
+    const jumpTime = jumpTimes[speed] || 120;
 
     const scored = locations
       .filter(loc => !blacklistSet.has(loc.systemId.toLowerCase()))
@@ -1176,23 +1285,42 @@ class MapStore {
         }
 
         // Score components:
-        // 1. Resource abundance (0-100 points) — based on remaining/max ratio
-        let abundanceScore = 0;
-        if (loc.maxRemaining > 0) {
-          abundanceScore = (loc.remaining / loc.maxRemaining) * 100;
-        } else if (loc.totalMined > 0) {
-          // No scan data — use historical yield as proxy (capped at 50)
-          abundanceScore = Math.min(50, Math.log10(loc.totalMined) * 10);
+        // 1. Resource abundance — based on TOTAL remaining, not percentage
+        // This way, 19K remaining beats 8K remaining regardless of percentage mined
+        // Capped at 100 points (equivalent to maxRemaining >= 10000)
+        let abundanceScore = Math.min(100, Math.log10(loc.remaining + 1) * 15);
+
+        // But also give bonus for high percentage (virgin systems)
+        const percentAvailable = 100 - loc.depletionPercent;
+        if (percentAvailable >= 95) {
+          abundanceScore += 20; // Virgin system bonus
         }
 
-        // 2. Availability bonus (0-50 points) — depletion_percent from game API means
-        // "% available" (100 = full, 0 = empty), despite the misleading name
-        const availabilityScore = (loc.depletionPercent / 100) * 50;
+        // 2. Availability bonus (0-30 points) — lower weight, just to prefer healthier systems
+        const availabilityScore = (percentAvailable / 100) * 30;
 
-        // 3. Distance penalty (0-40 points) — gentler slope: 2 points per jump
-        // This ensures distance still matters even for far systems
-        // 0 jumps: 40, 10 jumps: 20, 20 jumps: 0
-        const distanceScore = Math.max(0, 40 - jumpsAway * 2);
+        // 3. Distance penalty — Adjusted for ship speed and cargo capacity
+        // Faster ships can travel further efficiently, larger cargo means fewer returns
+        // Speed bonus: speed 6 is ~4x faster than speed 1, so reduce penalty by up to 60%
+        // Cargo bonus: larger cargo = fewer trips back, reduce penalty proportionally
+        const speedFactor = speed >= 5 ? 0.4 : speed >= 4 ? 0.6 : speed >= 3 ? 0.75 : speed >= 2 ? 0.85 : 1.0;
+        const cargoFactor = Math.min(1.5, effectiveCargo / 8000); // Up to 1.5x bonus for large cargo
+        
+        // Base penalty (for speed 1, cargo 8000), then apply factors
+        let basePenalty = 50 - jumpsAway * 3;
+        if (jumpsAway > 10) {
+          basePenalty -= (jumpsAway - 10) * 4;
+        }
+        // Apply ship bonuses
+        const adjustedPenalty = basePenalty * speedFactor * (2 - cargoFactor * 0.5);
+        const distanceScore = Math.max(-60, Math.round(adjustedPenalty));
+
+        // 3b. Richness efficiency bonus (0-35 points) — rewards high richness CLOSE to current position
+        // Faster ships get bonus for distant rich POIs
+        const maxEfficiencyJumps = speed >= 5 ? 18 : speed >= 4 ? 15 : speed >= 3 ? 14 : 12;
+        const richnessEfficiencyScore = jumpsAway <= maxEfficiencyJumps && loc.richness > 25
+          ? Math.min(35, (loc.richness - 25) * (1 - jumpsAway / maxEfficiencyJumps) * 0.6)
+          : 0;
 
         // 4. Scan freshness bonus (0-20 points)
         let freshnessScore = 20;
@@ -1206,9 +1334,9 @@ class MapStore {
         // This discourages selecting systems that are nearly empty
         // Even if they pass the 10% threshold, we still want to prefer healthier systems
         let depletionPenalty = 0;
-        if (loc.depletionPercent < 25) {
+        if (percentAvailable < 25) {
           // Linear penalty: 0% at 25% availability, -30 points at 10%
-          depletionPenalty = -30 * ((25 - loc.depletionPercent) / 15);
+          depletionPenalty = -30 * ((25 - percentAvailable) / 15);
         }
 
         // 6. HIDDEN POI BONUS (CRITICAL for deep core mining)
@@ -1217,12 +1345,14 @@ class MapStore {
         // Score bonus: +200 points (guarantees they beat regular POIs)
         const hiddenPoiBonus = loc.isHidden ? 200 : 0;
 
-        // 7. Richness bonus (0-30 points)
+        // 7. Richness bonus (0-60 points)
         // Higher richness = more efficient mining (more ore per action)
-        // Richness ranges from ~1-100+, so scale accordingly
-        const richnessScore = Math.min(30, loc.richness * 0.3);
+        // Key insight: richness 34 is ~2x better than 15, not just additive
+        // Use stronger scaling: richness * 1.5, capped at 60
+        const richnessScore = Math.min(60, loc.richness * 1.5);
 
-        const score = abundanceScore + availabilityScore + distanceScore + freshnessScore + depletionPenalty + hiddenPoiBonus + richnessScore;
+        const score = abundanceScore + availabilityScore + distanceScore + freshnessScore + 
+                   depletionPenalty + hiddenPoiBonus + richnessScore + richnessEfficiencyScore;
 
         return {
           ...loc,
@@ -1420,6 +1550,8 @@ class MapStore {
       // Skip pirate systems
       if (this.isPirateSystem(sysId)) continue;
       for (const poi of sys.pois) {
+        // Only include POIs with a dockable station (has_base)
+        if (!poi.has_base) continue;
         for (const m of poi.market) {
           if (m.best_buy !== null && m.buy_quantity > 0) {
             results.push({
@@ -1430,6 +1562,34 @@ class MapStore {
               poiName: poi.name,
               price: m.best_buy,
               quantity: m.buy_quantity,
+            });
+          }
+        }
+      }
+    }
+
+    return results;
+  }
+
+  getAllSellSupply(): Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> {
+    const results: Array<{ itemId: string; itemName: string; systemId: string; poiId: string; poiName: string; price: number; quantity: number }> = [];
+
+    for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      // Skip pirate systems
+      if (this.isPirateSystem(sysId)) continue;
+      for (const poi of sys.pois) {
+        // Only include POIs with a dockable station (has_base)
+        if (!poi.has_base) continue;
+        for (const m of poi.market) {
+          if (m.best_sell !== null && m.sell_quantity > 0) {
+            results.push({
+              itemId: m.item_id,
+              itemName: m.item_name,
+              systemId: sysId,
+              poiId: poi.id,
+              poiName: poi.name,
+              price: m.best_sell,
+              quantity: m.sell_quantity,
             });
           }
         }
@@ -1622,6 +1782,39 @@ class MapStore {
     if (!this.data.mobile_capitol) return false;
     return this.data.mobile_capitol.system_id === systemId && 
            this.data.mobile_capitol.poi_id === poiId;
+  }
+
+  findStationInSystem(systemId: string, stationIdPattern?: string): { poiId: string; poiName: string; baseId: string } | null {
+    const sys = this.data.systems[systemId];
+    if (!sys) return null;
+    
+    for (const poi of sys.pois) {
+      if (!poi.has_base) continue;
+      
+      if (stationIdPattern) {
+        const normalizedPattern = stationIdPattern.toLowerCase().replace(/_/g, ' ');
+        const normalizedPoiId = poi.id.toLowerCase().replace(/_/g, ' ');
+        const normalizedBaseId = (poi.base_id || '').toLowerCase().replace(/_/g, ' ');
+        
+        if (normalizedPoiId.includes(normalizedPattern) || 
+            normalizedBaseId.includes(normalizedPattern) ||
+            poi.name.toLowerCase().replace(/_/g, ' ').includes(normalizedPattern)) {
+          return {
+            poiId: poi.id,
+            poiName: poi.name,
+            baseId: poi.base_id || poi.id,
+          };
+        }
+      } else {
+        return {
+          poiId: poi.id,
+          poiName: poi.name,
+          baseId: poi.base_id || poi.id,
+        };
+      }
+    }
+    
+    return null;
   }
 
   /** Formatted summary string for menu display. */

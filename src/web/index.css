@@ -106,6 +106,19 @@ main {
 .tab-page.active {
   display: flex;
 }
+#page-players {
+  padding: 0;
+  gap: 0;
+}
+#page-players.active {
+  display: flex;
+}
+#playersFrame, #shipsforsaleFrame {
+  flex: 1;
+  width: 100%;
+  border: none;
+  min-height: 0;
+}
 #page-dashboard { flex: 1 0 auto; overflow: visible; }
 
 /* ── Bot table ──────────────────────────────────── */
@@ -1274,6 +1287,17 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   padding: 12px 14px;
 }
 .sys-card.expanded .sys-body { display: block; }
+
+/* System POIs and actions */
+.sys-pois {
+  margin-top: 12px;
+}
+.sys-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
 .sys-connections {
   font-size: 12px;
   color: var(--text-dim);
@@ -3506,4 +3530,27 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 
 .fc-nav-btn system {
   color: var(--cyan);
+}
+
+/* ── Weapon Status Styles ────────────────────────────────── */
+.weapon-full {
+  color: var(--green);
+  font-weight: 600;
+}
+
+.weapon-partial {
+  color: var(--yellow);
+  font-weight: 500;
+}
+
+.weapon-empty {
+  color: var(--red);
+  font-weight: 500;
+}
+
+
+
+.weapon-energy {
+  color: var(--cyan);
+  font-weight: 500;
 }

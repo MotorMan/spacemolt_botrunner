@@ -14,7 +14,7 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
-import { readSettings, sleep } from "./common.js";
+import { readSettings } from "./common.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 
@@ -695,7 +695,7 @@ export const aiRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (!settings.baseUrl) {
       ctx.log("error", "OPENAI_COMPAT_BASE_URL not set and Ollama default unreachable — set env var to enable AI routine");
-      await sleep(60_000);
+      await ctx.sleep(60_000);
       continue;
     }
 
@@ -888,7 +888,7 @@ export const aiRoutine: Routine = async function* (ctx: RoutineContext) {
         if (cutIdx < window.length) window = window.slice(cutIdx);
 
         yield "ai_tool";
-        await sleep(500); // brief pause between tool batches
+        await ctx.sleep(500); // brief pause between tool batches
       }
 
       if (toolCallCount >= settings.maxToolCallsPerCycle) {
@@ -914,6 +914,6 @@ export const aiRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     ctx.log("ai", `Cycle #${mem.cycleCount} complete. Sleeping ${settings.cycleIntervalSec}s...`);
-    await sleep(settings.cycleIntervalSec * 1000);
+    await ctx.sleep(settings.cycleIntervalSec * 1000);
   }
 };

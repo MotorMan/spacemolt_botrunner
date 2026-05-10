@@ -33,14 +33,14 @@ interface LlmMessage {
 }
 
 export interface ChatMessage {
-  sender: string;
-  channel: "local" | "faction" | "system" | "private";
-  content: string;
-  timestamp: number;
-  botUsername?: string; // Which bot received this
-  botSystem?: string;   // System where message was received (for local chat)
-  botPoi?: string;      // POI where message was received (for local chat)
-  targetId?: string;    // Target player for private messages
+   sender: string;
+   channel: "local" | "faction" | "system" | "private";
+   content: string;
+   timestamp: number;
+   botUsername?: string; // Which bot received this
+   botSystem?: string;   // System where message was received (for local chat)
+   botPoi?: string;      // POI where message was received (for local chat)
+   targetId?: string;    // Target player for private messages
 }
 
 interface BotLockInfo {
@@ -157,25 +157,26 @@ function getBotPersonality(botName: string): string {
 }
 
 function getAiChatSettings(): {
-  enabled: boolean;
-  model: string;
-  baseUrl: string;
-  apiKey: string;
-  cycleIntervalSec: number;
-  respondToMentions: boolean;
-  respondToQuestions: boolean;
-  respondToAll: boolean;
-  respondToSystem: boolean;
-  respondToMayday: boolean;
-  respondToCustoms: boolean;
-  customsResponseChance: number; // 1 in X chance to respond
-  karenModeChance: number; // 1 in X chance for Karen mode (0 = disabled)
-  personality: string;
-  lockDurationSec: number;
-  conversationCooldownSec: number;
-  factionChatRoundsLimit: number; // Max rounds of AI responses in faction chat (0 = unlimited)
-  llmTimeoutSec: number; // Timeout for LLM API calls in seconds
-  maxTokens: number; // Maximum tokens for LLM response
+   enabled: boolean;
+   model: string;
+   baseUrl: string;
+   apiKey: string;
+   cycleIntervalSec: number;
+   respondToMentions: boolean;
+   respondToQuestions: boolean;
+   respondToAll: boolean;
+   respondToSystem: boolean;
+   respondToMayday: boolean;
+   respondToCustoms: boolean;
+   customsResponseChance: number; // 1 in X chance to respond
+   karenModeChance: number; // 1 in X chance for Karen mode (0 = disabled)
+   respondToBattleMessages: boolean; // Whether to respond to battle messages
+   personality: string;
+   lockDurationSec: number;
+   conversationCooldownSec: number;
+   factionChatRoundsLimit: number; // Max rounds of AI responses in faction chat (0 = unlimited)
+   llmTimeoutSec: number; // Timeout for LLM API calls in seconds
+   maxTokens: number; // Maximum tokens for LLM response
 } {
   const all = readSettings();
   const s = (all.ai_chat || {}) as Record<string, unknown>;
@@ -195,27 +196,28 @@ function getAiChatSettings(): {
     (s.model as string) ||
     "llama3.2";
 
-  return {
-    enabled: (s.enabled as boolean) ?? false,
-    model,
-    baseUrl,
-    apiKey,
-    cycleIntervalSec: (s.cycleIntervalSec as number) || 5,
-    respondToMentions: (s.respondToMentions as boolean) ?? true,
-    respondToQuestions: (s.respondToQuestions as boolean) ?? false,
-    respondToAll: (s.respondToAll as boolean) ?? false,
-    respondToSystem: (s.respondToSystem as boolean) ?? false,
-    respondToMayday: (s.respondToMayday as boolean) ?? true,
-    respondToCustoms: (s.respondToCustoms as boolean) ?? true,
-    customsResponseChance: (s.customsResponseChance as number) ?? 10,
-    karenModeChance: (s.karenModeChance as number) ?? 100,
-    personality: (s.personality as string) || DEFAULT_PERSONALITY,
-    lockDurationSec: (s.lockDurationSec as number) || 60,
-    conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
-    factionChatRoundsLimit: (s.factionChatRoundsLimit as number) ?? 5,
-    llmTimeoutSec: (s.llmTimeoutSec as number) ?? 30,
-    maxTokens: (s.maxTokens as number) ?? 1000,
-  };
+   return {
+     enabled: (s.enabled as boolean) ?? false,
+     model,
+     baseUrl,
+     apiKey,
+     cycleIntervalSec: (s.cycleIntervalSec as number) || 5,
+     respondToMentions: (s.respondToMentions as boolean) ?? true,
+     respondToQuestions: (s.respondToQuestions as boolean) ?? false,
+     respondToAll: (s.respondToAll as boolean) ?? false,
+     respondToSystem: (s.respondToSystem as boolean) ?? false,
+     respondToMayday: (s.respondToMayday as boolean) ?? true,
+     respondToCustoms: (s.respondToCustoms as boolean) ?? true,
+     customsResponseChance: (s.customsResponseChance as number) ?? 10,
+     karenModeChance: (s.karenModeChance as number) ?? 100,
+     respondToBattleMessages: (s.respondToBattleMessages as boolean) ?? true,
+     personality: (s.personality as string) || DEFAULT_PERSONALITY,
+     lockDurationSec: (s.lockDurationSec as number) || 60,
+     conversationCooldownSec: (s.conversationCooldownSec as number) ?? 15,
+     factionChatRoundsLimit: (s.factionChatRoundsLimit as number) ?? 5,
+     llmTimeoutSec: (s.llmTimeoutSec as number) ?? 30,
+     maxTokens: (s.maxTokens as number) ?? 1000,
+   };
 }
 
 // ── Memory ────────────────────────────────────────────────────
@@ -556,12 +558,14 @@ export class AiChatService {
 
   /**
    * Check if faction chat rounds limit has been reached.
-   * Returns true if we should skip responding due to round limit.
+   * Returns { shouldSkip: boolean, isLastRound: boolean }
+   * shouldSkip: true if we've exceeded the limit and should not respond
+   * isLastRound: true if this response would be the last allowed (for adding goodbye message)
    */
-  private checkFactionChatRoundsLimit(settings: ReturnType<typeof getAiChatSettings>): boolean {
+  private checkFactionChatRoundsLimit(settings: ReturnType<typeof getAiChatSettings>): { shouldSkip: boolean; isLastRound: boolean } {
     // If limit is 0 or not set, no limit applied
     if (!settings.factionChatRoundsLimit || settings.factionChatRoundsLimit <= 0) {
-      return false;
+      return { shouldSkip: false, isLastRound: false };
     }
 
     const now = Date.now();
@@ -573,10 +577,13 @@ export class AiChatService {
 
     // Check if we've hit the limit
     if (this.factionChatRounds >= settings.factionChatRoundsLimit) {
-      return true;
+      return { shouldSkip: true, isLastRound: false };
     }
 
-    return false;
+    // Check if this would be the last round
+    const isLastRound = this.factionChatRounds + 1 >= settings.factionChatRoundsLimit;
+
+    return { shouldSkip: false, isLastRound };
   }
 
   /**
@@ -760,6 +767,8 @@ export class AiChatService {
     // Log message details for debugging
     this.logFn("ai_chat_debug", `Processing message: channel=${msg.channel}, sender=${msg.sender}, botUsername=${msg.botUsername}, botSystem=${msg.botSystem}, botPoi=${msg.botPoi}`);
 
+    let isLastRound = false;
+
     // Monitor local, faction, system, and private chat
     if (msg.channel !== "local" && msg.channel !== "faction" && msg.channel !== "system" && msg.channel !== "private") {
       return;
@@ -776,6 +785,18 @@ export class AiChatService {
 
       this.logFn("ai_chat_debug", `Private message to ${receivingBot} from ${msg.sender}`);
 
+      // For bot-to-bot private messages, use faction chat rounds limit
+      const bots = AiChatService.getBots();
+      const isFromAiBot = bots?.some(b => b.username === msg.sender);
+      if (isFromAiBot) {
+        const limitCheck = this.checkFactionChatRoundsLimit(settings);
+        if (limitCheck.shouldSkip) {
+          this.logFn("ai_chat", `Faction chat rounds limit reached (${this.factionChatRounds}/${settings.factionChatRoundsLimit}), skipping private message from bot`);
+          return;
+        }
+        isLastRound = limitCheck.isLastRound;
+      }
+
       // Check if message mentions a different bot - if so, still let the receiving bot respond
       // (the player DM'd this bot, so this bot should respond regardless of mentions)
       const responder = this.selectResponderByMention(receivingBot);
@@ -784,7 +805,7 @@ export class AiChatService {
         return;
       }
 
-      await this.handleResponse(responder, msg, settings, msg.sender, true);
+      await this.handleResponse(responder, msg, settings, msg.sender, true, new Set(), isLastRound);
       return;
     }
 
@@ -794,11 +815,21 @@ export class AiChatService {
       return;
     }
 
-    // Skip MAYDAY messages if disabled (player won't see responses anyway)
-    if (msg.content.includes("MAYDAY") && !settings.respondToMayday) {
-      this.logFn("ai_chat_debug", `MAYDAY response disabled, ignoring: ${msg.sender} - ${msg.content.slice(0, 50)}`);
-      return;
-    }
+     // Skip MAYDAY messages if disabled (player won't see responses anyway)
+     if (msg.content.includes("MAYDAY") && !settings.respondToMayday) {
+       this.logFn("ai_chat_debug", `MAYDAY response disabled, ignoring: ${msg.sender} - ${msg.content.slice(0, 50)}`);
+       return;
+     }
+     
+     // Skip battle messages if disabled
+     if (msg.sender === "System" && 
+         (msg.content.includes("just hit me for") || 
+          msg.content.includes("Whoa! Friendly fire!") || 
+          msg.content.includes("I'm under attack!")) && 
+         !settings.respondToBattleMessages) {
+       this.logFn("ai_chat_debug", `Battle response disabled, ignoring: ${msg.sender} - ${msg.content.slice(0, 50)}`);
+       return;
+     }
 
     // Skip messages from AI bots (prevent self-talk loops)
     // Note: Self-messages are already filtered in addChatMessage(), so this is extra safety
@@ -859,10 +890,12 @@ export class AiChatService {
 
     // Check faction chat rounds limit (only for faction channel)
     if (msg.channel === "faction") {
-      if (this.checkFactionChatRoundsLimit(settings)) {
+      const limitCheck = this.checkFactionChatRoundsLimit(settings);
+      if (limitCheck.shouldSkip) {
         this.logFn("ai_chat", `Faction chat rounds limit reached (${this.factionChatRounds}/${settings.factionChatRoundsLimit}), skipping`);
         return;
       }
+      isLastRound = limitCheck.isLastRound;
     }
 
     // Select responder(s) for non-mention messages
@@ -879,7 +912,7 @@ export class AiChatService {
     const triedBots = new Set<string>();
     for (const candidate of candidates) {
       triedBots.add(candidate.username);
-      const result = await this.handleResponse(candidate, msg, settings, msg.sender, true, triedBots);
+      const result = await this.handleResponse(candidate, msg, settings, msg.sender, false, triedBots, isLastRound);
       if (result === "sent") {
         break; // Success, stop trying
       }
@@ -897,7 +930,8 @@ export class AiChatService {
     settings: ReturnType<typeof getAiChatSettings>,
     humanSender: string,
     isHumanSender: boolean,
-    triedBots: Set<string> = new Set()
+    triedBots: Set<string> = new Set(),
+    isLastRound: boolean = false
   ): Promise<"sent" | "failed"> {
     // Check conversation limits (cooldown, consecutive responses)
     // Use channel + human sender as key (not responder) so only one bot responds per conversation
@@ -947,7 +981,7 @@ export class AiChatService {
     }
 
     // Generate and send response (may fail if traveling for local chat)
-    const result = await this.sendResponse(responder, msg, settings, humanSender, triedBots);
+    const result = await this.sendResponse(responder, msg, settings, humanSender, triedBots, isLastRound);
 
     if (result === "traveling" && msg.channel === "local") {
       // Bot was traveling, return failed so caller tries next candidate
@@ -958,6 +992,13 @@ export class AiChatService {
     // Record this response for conversation tracking (only if not traveling)
     if (result !== "traveling") {
       this.recordResponse(msg.channel, participants, isHumanSender);
+
+      // Increment faction chat rounds counter if response was sent
+      const bots = AiChatService.getBots();
+      const isFromAiBot = bots?.some(b => b.username === msg.sender);
+      if (result === "sent" && (msg.channel === "faction" || (msg.channel === "private" && isFromAiBot))) {
+        this.incrementFactionChatRounds();
+      }
     }
 
     return result === "sent" ? "sent" : "failed";
@@ -1458,7 +1499,8 @@ export class AiChatService {
     msg: ChatMessage,
     settings: ReturnType<typeof getAiChatSettings>,
     humanSender: string,
-    triedBots: Set<string>
+    triedBots: Set<string>,
+    isLastRound: boolean = false
   ): Promise<"sent" | "traveling" | "error"> {
     const mem = loadMemory();
     mem.responseCount++;
@@ -1475,7 +1517,8 @@ export class AiChatService {
     this.logFn("ai_chat_debug", `Gathering real-time context for ${bot.username}...`);
     const botContext = await this.gatherBotContext(bot);
 
-    const systemPrompt = `${personality}
+    const lastRoundInstruction = isLastRound ? "\n\nThis is your last response in this conversation. End with a natural goodbye in your personality style, like 'see ya!' or 'talk to you later', to wrap up the chat nicely." : "";
+    const systemPrompt = `${personality}${lastRoundInstruction}
 
 ## Galaxy Map Data (Real Game Data)
 Use this information to help answer questions about systems, stations, resources, and connections.

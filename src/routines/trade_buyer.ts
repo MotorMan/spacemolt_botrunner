@@ -20,7 +20,6 @@ import {
   maxItemsForCargo,
   getItemSize,
   readSettings,
-  sleep,
   logFactionActivity,
   isPirateSystem,
   type BaseServices,
@@ -415,6 +414,17 @@ async function tryMissions(ctx: RoutineContext): Promise<void> {
 export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
+  // Persistent battle state across cycles
+  const battleRef = { state: null as BattleState | null };
+  battleRef.state = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+    lastFleeTime: undefined,
+  };
+
   await bot.refreshStatus();
   const startSystem = bot.system;
 
@@ -424,7 +434,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
   // Validate home system is configured
   if (!settings.homeSystem) {
     ctx.log("error", "No home system configured for trade buyer — please set homeSystem in settings");
-    await sleep(60000);
+    await ctx.sleep(60000);
     return;
   }
 
@@ -432,7 +442,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
   const homeStation = getHomeStation(settings.homeSystem);
   if (!homeStation) {
     ctx.log("error", `Cannot find station in home system ${settings.homeSystem}`);
-    await sleep(60000);
+    await ctx.sleep(60000);
     return;
   }
 
@@ -444,11 +454,54 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "trade_buyer")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // Periodic battle status check (backup detection in case notifications fail)
+    // Check every cycle for fast detection
+    if (bot.isInBattle()) {
+      const now = Date.now();
+      if (!battleRef.state!.lastFleeTime || now - battleRef.state!.lastFleeTime > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", `PERIODIC CHECK: IN BATTLE! - initiating IMMEDIATE flee!`);
+        battleRef.state!.inBattle = true;
+        battleRef.state!.isFleeing = false;
+
+        await bot.exec("battle", { action: "stance", stance: "flee" });
+        battleRef.state!.lastFleeTime = now;
+        ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
+      }
+    }
+
+    // If we're in battle, re-issue flee command to ensure we stay in flee stance
+    if (battleRef.state!.inBattle) {
+      const now = Date.now();
+      if (!battleRef.state!.lastFleeTime || now - battleRef.state!.lastFleeTime > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", "Re-issuing flee stance (ensuring we stay in flee mode)...");
+        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (fleeResp.error) {
+          ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+        } else {
+          battleRef.state!.lastFleeTime = now;
+        }
+      }
+      // Check if we've successfully disengaged
+      const currentBattleStatus = await getBattleStatus(ctx);
+      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+        ctx.log("combat", "Battle cleared - no longer in combat!");
+        battleRef.state!.inBattle = false;
+        battleRef.state!.battleId = null;
+        battleRef.state!.isFleeing = false;
+        battleRef.state!.lastFleeTime = undefined;
+        await ctx.sleep(2000); // Brief pause before next check
+        continue;
+      }
+      // Still in battle - continue to next cycle
+      await ctx.sleep(2000); // Brief pause before next check
       continue;
     }
 
@@ -502,7 +555,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!fueled) {
         ctx.log("error", "Cannot refuel for recovered session — will retry next cycle");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
 
@@ -522,7 +575,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       if (!arrived) {
         ctx.log("error", "Failed to reach home system — will retry");
         await ensureDocked(ctx);
-        await sleep(60000);
+        await ctx.sleep(60000);
         continue;
       }
 
@@ -627,7 +680,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
     if (routes.length === 0 && !recoveredSession) {
       ctx.log("trade", "No profitable buy opportunities found — waiting 60s before re-scanning");
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -694,7 +747,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
             battleState.isFleeing = false;
           } else {
             // Still in battle - wait briefly and continue to next cycle to re-flee
-            await sleep(2000);
+            await ctx.sleep(2000);
             continue;
           }
         }
@@ -725,7 +778,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
           const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
           if (!fueled) {
             ctx.log("error", "Cannot refuel for buy run — waiting 30s");
-            await sleep(30000);
+            await ctx.sleep(30000);
             break;
           }
 
@@ -784,7 +837,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
             const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
             if (fled) {
               ctx.log("error", "Pirates detected at source - fled, will retry");
-              await sleep(30000);
+              await ctx.sleep(30000);
               continue;
             }
           }
@@ -983,7 +1036,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       }
 
       ctx.log("trade", "All routes failed — waiting 60s before re-scanning");
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -1000,7 +1053,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       battleState.isFleeing = false;
       await fleeFromBattle(ctx, false, 5000);
       await ensureDocked(ctx);
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -1009,7 +1062,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     if (!fueled2) {
       ctx.log("error", "Cannot refuel for delivery — will retry next cycle");
       await ensureDocked(ctx);
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -1057,7 +1110,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
 
         await ensureDocked(ctx);
         ctx.log("trade", "Docked and waiting for network recovery — buy session preserved");
-        await sleep(60000);
+        await ctx.sleep(60000);
         continue;
       }
     }
@@ -1073,7 +1126,7 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
       battleState.battleId = preHomeStationBattleCheck.battle_id;
       battleState.isFleeing = false;
       await fleeFromBattle(ctx, false, 5000);
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
     

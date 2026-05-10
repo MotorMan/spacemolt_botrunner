@@ -8,7 +8,15 @@
     "skipLibCheck": true,
     "outDir": "dist",
     "rootDir": "src",
-    "types": ["bun-types"]
+    "types": ["bun-types", "node"]
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts"],
+  "exclude": [
+    "src/routines/fleet_hunter_commander.ts",
+    "src/routines/fleet_hunter_commander_clean.ts",
+    "src/routines/fleet_hunter_subordinate.ts",
+    "src/routines/fleet_hunter_subordinate_clean.ts",
+    "src/routines/__tests__/battle_tick.test.ts",
+    "src/**/*_temp.ts"
+  ]
 }

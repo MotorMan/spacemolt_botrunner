@@ -26,10 +26,11 @@ import {
   detectAndRecoverFromDeath,
   readSettings,
   writeSettings,
-  sleep,
   logFactionActivity,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
+  getBattleStatus,
+  fleeFromBattle,
   getItemSize,
   maxItemsForCargo,
   type BattleState,
@@ -662,22 +663,24 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     location: `${bot.system}/${bot.poi}`,
   });
 
+  // Persistent battle state across cycles
+  const battleState: BattleState = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+    lastFleeTime: undefined,
+  };
+
   while (bot.state === "running") {
-    // Initialize battle state for this cycle
-    const battleState: BattleState = {
-      inBattle: false,
-      battleId: null,
-      battleStartTick: null,
-      lastHitTick: null,
-      isFleeing: false,
-    };
 
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) {
       logCargoActivity(bot.username, "death_recovery", "Bot died, recovering...", {
         location: `${bot.system}/${bot.poi}`,
       });
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -686,7 +689,55 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       logCargoActivity(bot.username, "battle_encounter", "Encountered battle, fleeing", {
         location: `${bot.system}/${bot.poi}`,
       });
-      await sleep(5000);
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // Periodic battle status check (backup detection in case notifications fail)
+    // Check every cycle for fast detection
+    if (bot.isInBattle()) {
+      const now = Date.now();
+      const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+      if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", `PERIODIC CHECK: IN BATTLE! - initiating IMMEDIATE flee!`);
+        battleState.inBattle = true;
+        battleState.isFleeing = false;
+
+        await bot.exec("battle", { action: "stance", stance: "flee" });
+        battleState.lastFleeTime = now;
+        ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
+      }
+    }
+
+    // If we're in battle, re-issue flee command to ensure we stay in flee stance
+    if (battleState.inBattle) {
+      const now = Date.now();
+      const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+      if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", "Re-issuing flee stance (ensuring we stay in flee mode)...");
+        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (fleeResp.error) {
+          ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+        } else {
+          battleState.lastFleeTime = now;
+        }
+      }
+      // Check if we've successfully disengaged
+      const currentBattleStatus = await getBattleStatus(ctx);
+      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+        ctx.log("combat", "Battle cleared - no longer in combat!");
+        battleState.inBattle = false;
+        battleState.battleId = null;
+        battleState.isFleeing = false;
+        battleState.lastFleeTime = undefined;
+        logCargoActivity(bot.username, "battle_escaped", "Successfully escaped battle", {
+          location: `${bot.system}/${bot.poi}`,
+        });
+        await ctx.sleep(2000); // Brief pause before next check
+        continue;
+      }
+      // Still in battle - continue to next cycle
+      await ctx.sleep(2000); // Brief pause before next check
       continue;
     }
 
@@ -711,25 +762,25 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     if (settings.items.length === 0) {
       ctx.log("error", "No items configured — check Cargo Mover settings");
       logCargoActivity(bot.username, "error", "No items configured in cargo mover settings");
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
     if (!settings.sourceStation) {
       ctx.log("error", "No source station configured");
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
     if (!settings.destinationStation) {
       ctx.log("error", "No destination station configured");
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
     if (settings.destinationStorageType === "send_gift" && !settings.destinationBotName) {
       ctx.log("error", "destinationBotName required for send_gift");
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -738,13 +789,13 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
     if (!sourceSystem) {
       ctx.log("error", `Unknown source station: ${settings.sourceStation}`);
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
     if (!destSystem) {
       ctx.log("error", `Unknown destination station: ${settings.destinationStation}`);
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -785,7 +836,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         logCargoActivity(bot.username, "error", "Cannot refuel for cargo recovery delivery", {
           location: `${bot.system}/${bot.poi}`,
         });
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
 
@@ -805,7 +856,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           logCargoActivity(bot.username, "error", `Failed to reach destination for cargo recovery`, {
             location: `${bot.system}/${bot.poi}`,
           });
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
         ctx.log("cargo", `✅ Arrived at destination system ${destSystem}`);
@@ -830,7 +881,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           logCargoActivity(bot.username, "battle_encounter", "Battle detected during travel to destination (cargo recovery)", {
             location: `${bot.system}/${bot.poi}`,
           });
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
         if (tResp.error) {
@@ -842,12 +893,12 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
               location: `${bot.system}/${bot.poi}`,
               error: tResp.error.message,
             });
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
           if (!errMsg.includes("already")) {
             ctx.log("error", `Travel to destination failed: ${tResp.error.message}`);
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -858,7 +909,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       yield "dock_dest";
       if (!await dockAtStation(ctx)) {
         ctx.log("error", "Could not dock at destination for cargo delivery");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
       ctx.log("cargo", `✅ Docked at destination station ${settings.destinationStation}`);
@@ -904,7 +955,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       });
 
       // After recovery, continue to next cycle (which will go back to source for more)
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -950,7 +1001,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         logCargoActivity(bot.username, "error", "Cannot refuel to reach source system", {
           location: `${bot.system}/${bot.poi}`,
         });
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
       ctx.log("travel", `Heading to source system ${sourceSystem}...`);
@@ -967,7 +1018,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         logCargoActivity(bot.username, "error", `Failed to reach source system ${sourceSystem}`, {
           location: `${bot.system}/${bot.poi}`,
         });
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
       ctx.log("cargo", `✅ Arrived at source system ${sourceSystem}`);
@@ -1012,7 +1063,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           logCargoActivity(bot.username, "battle_encounter", "Battle detected during travel to source station", {
             location: `${bot.system}/${bot.poi}`,
           });
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
         if (tResp.error) {
@@ -1024,7 +1075,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
               location: `${bot.system}/${bot.poi}`,
               error: tResp.error.message,
             });
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
           if (!errMsg.includes("already")) {
@@ -1032,7 +1083,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             logCargoActivity(bot.username, "error", `Travel to source station failed: ${tResp.error.message}`, {
               location: `${bot.system}/${bot.poi}`,
             });
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -1045,7 +1096,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         logCargoActivity(bot.username, "error", "Could not dock at source station", {
           location: `${bot.system}/${settings.sourceStation}`,
         });
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
       ctx.log("cargo", `✅ Docked at source station ${settings.sourceStation}`);
@@ -1109,7 +1160,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       logCargoActivity(bot.username, "session_end", "No items available to move, waiting", {
         location: `${bot.system}/${bot.poi}`,
       });
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -1357,7 +1408,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           location: `${bot.system}/${bot.poi}`,
         });
         allJobsCompleted = false;
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
       if (tResp.error) {
@@ -1370,7 +1421,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             error: tResp.error.message,
           });
           allJobsCompleted = false;
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
         if (!errMsg.includes("already")) {
@@ -1484,7 +1535,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         releaseQuantityLock(bot.username, job.itemId, "completed");
       }
       
-      await sleep(300000);
+      await ctx.sleep(300000);
       continue;
     }
 
@@ -1508,7 +1559,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         logCargoActivity(bot.username, "error", "Cannot refuel for return to source", {
           location: `${bot.system}/${bot.poi}`,
         });
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
       ctx.log("travel", `Heading back to ${sourceSystem}...`);
@@ -1528,7 +1579,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         logCargoActivity(bot.username, "error", `Failed to return to source system ${sourceSystem}`, {
           location: `${bot.system}/${bot.poi}`,
         });
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
       ctx.log("cargo", `✅ Returned to source system ${sourceSystem}`);
@@ -1562,7 +1613,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         logCargoActivity(bot.username, "battle_encounter", "Battle detected during return travel to source station", {
           location: `${bot.system}/${bot.poi}`,
         });
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
       if (tResp.error) {
@@ -1574,7 +1625,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             location: `${bot.system}/${bot.poi}`,
             error: tResp.error.message,
           });
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
         if (!errMsg.includes("already")) {
@@ -1582,7 +1633,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           logCargoActivity(bot.username, "error", `Failed to travel back to source station: ${tResp.error.message}`, {
             location: `${bot.system}/${bot.poi}`,
           });
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
       }
@@ -1594,7 +1645,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       logCargoActivity(bot.username, "error", "Could not dock at source station for next cycle", {
         location: `${bot.system}/${settings.sourceStation}`,
       });
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
     
@@ -1616,6 +1667,6 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       true
     );
     
-    await sleep(5000);
+    await ctx.sleep(5000);
   }
 };

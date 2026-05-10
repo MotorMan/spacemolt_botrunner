@@ -13,9 +13,9 @@ export interface GameCommandInfo {
  * tool schemas to save tokens.
  */
 export async function fetchGameCommands(baseUrl: string): Promise<GameCommandInfo[]> {
-  // baseUrl is like https://game.spacemolt.com/api/v1
-  // OpenAPI spec is at   https://game.spacemolt.com/api/openapi.json
-  const specUrl = baseUrl.replace(/\/v\d+\/?$/, "/openapi.json");
+  // baseUrl is like https://game.spacemolt.com/api/v2
+  // OpenAPI spec is at https://game.spacemolt.com/api/v2/openapi.json
+  const specUrl = baseUrl + "/openapi.json";
 
   let spec: any;
   try {

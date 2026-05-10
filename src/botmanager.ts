@@ -20,8 +20,10 @@ import { commandReceiverRoutine } from "./routines/command_receiver.js";
 import { fleetHunterCommanderRoutine } from "./routines/fleet_hunter_commander.js";
 import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordinate.js";
 import { escortRoutine } from "./routines/escort.js";
+import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
+import { flushFactionStorageCache } from "./factionStorageCache.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
@@ -30,6 +32,7 @@ import { AiChatService } from "./aichat_service.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
 import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_chat_channel.js";
+import { flushMinerActivity } from "./routines/minerActivity.js";
 
 interface BotState {
   wasRunning: boolean;
@@ -42,6 +45,9 @@ const SESSIONS_DIR = join(BASE_DIR, "sessions");
 const bots: Map<string, Bot> = new Map();
 let server: WebServer;
 let aiChatService: AiChatService | null = null;
+
+// Track failed session restore attempts per bot (timestamps in ms)
+const sessionRestoreFailures: Map<string, number[]> = new Map();
 
 /** Get list of discovered bot usernames (for API use). */
 export function getDiscoveredBots(): string[] {
@@ -88,6 +94,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   fleet_hunter_subordinate: { name: "FleetHunterWing", fn: fleetHunterSubordinateRoutine },
   faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },
   trade_buyer: { name: "TradeBuyer", fn: tradeBuyerRoutine },
+  fuel_cell_seller: { name: "FuelCellSeller", fn: fuelCellSellerRoutine },
   cleanup: { name: "Cleanup", fn: cleanupRoutine },
   ai: { name: "AI", fn: aiRoutine },
   cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },
@@ -262,6 +269,7 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
     },
     getAllBotNames: () => [...bots.keys()],
     getBotAssignments: () => server.getBotAssignments(),
+    log: (category: string, message: string) => server.logBot(botName, `[${category}] ${message}`),
   };
 
   bot.start(routineKey, routine.fn, chatStartOpts).then(() => {
@@ -545,16 +553,18 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
         if (amt) server.logFaction(`${timestamp} [withdraw] ${botName}: Withdrew ${amt}cr from faction treasury`);
         break;
       }
-      case "faction_deposit_items": {
+      case "deposit_items": {
         const itemId = p?.item_id as string | undefined;
         const qty = p?.quantity as number | undefined;
-        if (itemId) server.logFaction(`${timestamp} [deposit] ${botName}: Deposited ${qty || 1}x ${itemId} to faction storage`);
+        const target = p?.target as string | undefined;
+        if (itemId) server.logFaction(`${timestamp} [deposit] ${botName}: Deposited ${qty || 1}x ${itemId} ${target === 'faction' ? 'to faction storage' : 'to station storage'}`);
         break;
       }
-      case "faction_withdraw_items": {
+      case "withdraw_items": {
         const itemId = p?.item_id as string | undefined;
         const qty = p?.quantity as number | undefined;
-        if (itemId) server.logFaction(`${timestamp} [withdraw] ${botName}: Withdrew ${qty || 1}x ${itemId} from faction storage`);
+        const source = p?.source as string | undefined;
+        if (itemId) server.logFaction(`${timestamp} [withdraw] ${botName}: Withdrew ${qty || 1}x ${itemId} ${source === 'faction' ? 'from faction storage' : 'from station storage'}`);
         break;
       }
     }
@@ -666,7 +676,7 @@ async function main(): Promise<void> {
 
     // Session resume is fast (5s delay to match renewal queue), full login requires rate limiting (25s delay)
     const SESSION_RESUME_DELAY_MS = 5000;
-    const FULL_LOGIN_DELAY_MS = 25000;
+    const FULL_LOGIN_DELAY_MS = 13000;
     let botIndex = 0;
 
     for (const [name, bot] of bots) {
@@ -678,7 +688,18 @@ async function main(): Promise<void> {
         bot.resumeSession().then(async (ok) => {
           refreshStatusTable();
           if (ok) {
+            // Clear failure counter on success
+            sessionRestoreFailures.delete(name);
             server.logSystem(`${name} session resumed (no login delay)`);
+            // Fetch catalog data if stale (first bot with active session triggers it)
+            if (catalogStore.isStale()) {
+              try {
+                await catalogStore.fetchAll(bot.api);
+                server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+              } catch (err) {
+                server.logSystem(`Catalog fetch failed: ${err}`);
+              }
+            }
             // Session resumed, start routine if assigned
             const routineKey = assignments[name];
             if (routineKey && ROUTINES[routineKey]) {
@@ -688,28 +709,36 @@ async function main(): Promise<void> {
             return;
           }
 
-          // Session resume failed, need full login with rate-limited delay
-          const loginDelay = loginIndex * FULL_LOGIN_DELAY_MS;
-          server.logSystem(`${name} session expired, scheduling full login in ${loginDelay / 1000}s...`);
-          server.logSystem(`DEBUG: ${name} login scheduled with delay ${loginDelay}ms (index=${loginIndex})`);
-          setTimeout(() => {
-            server.logSystem(`DEBUG: ${name} login timeout fired, calling bot.login()`);
+          // Session resume failed, record the failure
+          const now = Date.now();
+          const failures = sessionRestoreFailures.get(name) || [];
+          failures.push(now);
+          // Keep only failures from the last minute
+          const recentFailures = failures.filter(ts => now - ts < 60000);
+          sessionRestoreFailures.set(name, recentFailures);
+
+          // Check if excessive failures (3 in past minute)
+          if (recentFailures.length >= 3) {
+            server.logSystem(`${name} session restore failed 3+ times in past minute, forcing immediate full login...`);
+            // Force full login immediately (no delay)
             bot.login().then(async (loginOk) => {
-              server.logSystem(`DEBUG: ${name} login completed, ok=${loginOk}`);
+              // Clear failure counter on successful login
+              sessionRestoreFailures.delete(name);
+              server.logSystem(`DEBUG: ${name} forced login completed, ok=${loginOk}`);
               refreshStatusTable();
               if (!loginOk) {
-                server.logSystem(`${name} login failed`);
+                server.logSystem(`${name} forced login failed`);
                 return;
               }
-              // Fetch catalog data if stale (first logged-in bot triggers it)
-              if (catalogStore.isStale()) {
-                try {
-                  await catalogStore.fetchAll(bot.api);
-                  server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
-                } catch (err) {
-                  server.logSystem(`Catalog fetch failed: ${err}`);
+                // Fetch catalog data if stale (first logged-in bot triggers it)
+                if (catalogStore.isStale()) {
+                  try {
+                    await catalogStore.fetchAll(bot.api);
+                    server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                  } catch (err) {
+                    server.logSystem(`Catalog fetch failed: ${err}`);
+                  }
                 }
-              }
               const routineKey = assignments[name];
               server.logSystem(`DEBUG: ${name} routine assignment: ${routineKey || 'none'}`);
               if (!routineKey || !ROUTINES[routineKey]) {
@@ -719,10 +748,48 @@ async function main(): Promise<void> {
               server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
               await handleStart({ type: "start", bot: name, routine: routineKey });
             }).catch((err) => {
-              server.logSystem(`Login failed for ${name}: ${err}`);
+              server.logSystem(`Forced login failed for ${name}: ${err}`);
               refreshStatusTable();
             });
-          }, loginDelay);
+          } else {
+            // Normal case: schedule full login with rate-limited delay
+            const loginDelay = loginIndex * FULL_LOGIN_DELAY_MS;
+            server.logSystem(`${name} session expired (${recentFailures.length}/3 failures in past minute), scheduling full login in ${loginDelay / 1000}s...`);
+            server.logSystem(`DEBUG: ${name} login scheduled with delay ${loginDelay}ms (index=${loginIndex})`);
+            setTimeout(() => {
+              server.logSystem(`DEBUG: ${name} login timeout fired, calling bot.login()`);
+              bot.login().then(async (loginOk) => {
+                // Clear failure counter on successful login
+                sessionRestoreFailures.delete(name);
+                server.logSystem(`DEBUG: ${name} login completed, ok=${loginOk}`);
+                refreshStatusTable();
+                if (!loginOk) {
+                  server.logSystem(`${name} login failed`);
+                  return;
+                }
+              // Fetch catalog data if stale (first logged-in bot triggers it)
+              if (catalogStore.isStale()) {
+                try {
+                  await catalogStore.fetchAll(bot.api);
+                  server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                } catch (err) {
+                  server.logSystem(`Catalog fetch failed: ${err}`);
+                }
+              }
+                const routineKey = assignments[name];
+                server.logSystem(`DEBUG: ${name} routine assignment: ${routineKey || 'none'}`);
+                if (!routineKey || !ROUTINES[routineKey]) {
+                  server.logSystem(`${name} logged in but no routine assigned`);
+                  return;
+                }
+                server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+                await handleStart({ type: "start", bot: name, routine: routineKey });
+              }).catch((err) => {
+                server.logSystem(`Login failed for ${name}: ${err}`);
+                refreshStatusTable();
+              });
+            }, loginDelay);
+          }
         }).catch((err) => {
           server.logSystem(`Session resume failed for ${name}: ${err}`);
           refreshStatusTable();
@@ -745,17 +812,28 @@ async function main(): Promise<void> {
 
   // Periodic UI push (cached data → websocket clients)
   intervals.push(setInterval(() => {
-    refreshStatusTable();
+    try {
+      refreshStatusTable();
+    } catch (err) {
+      console.error('Error in periodic status update:', err);
+    }
   }, 2000));
 
   // Periodic live refresh (hit API for all logged-in bots)
   intervals.push(setInterval(async () => {
-    for (const [, bot] of bots) {
-      if (bot.api.getSession()) {
-        await bot.refreshStatus().catch(() => {});
+    try {
+      // Run all refreshStatus calls in parallel to avoid blocking the event loop
+      const refreshPromises = [];
+      for (const [, bot] of bots) {
+        if (bot.api.getSession()) {
+          refreshPromises.push(bot.refreshStatus().catch(() => {}));
+        }
       }
+      await Promise.allSettled(refreshPromises);
+      refreshStatusTable();
+    } catch (err) {
+      console.error('Error in periodic live refresh:', err);
     }
-    refreshStatusTable();
   }, 30000));
 
   // Periodic map data push (every 15s so dashboard stays current)
@@ -812,6 +890,17 @@ async function main(): Promise<void> {
     // Flush persistent data
     mapStore.flush();
     catalogStore.flush();
+    flushFactionStorageCache();
+    // Flush miner activity data to ensure no data loss
+    flushMinerActivity().then(success => {
+      if (success) {
+        server.logSystem("Miner activity data flushed successfully");
+      } else {
+        server.logSystem("WARNING: Failed to flush miner activity data");
+      }
+    }).catch(err => {
+      server.logSystem(`ERROR flushing miner activity data: ${err}`);
+    });
     server.stop();
     
     // If restarting due to mass session loss, clear all session files

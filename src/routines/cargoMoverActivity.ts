@@ -129,6 +129,7 @@ export type CargoActivityType =
   | "refuel"
   | "repair"
   | "battle_encounter"
+  | "battle_escaped"
   | "death_recovery"
   | "error"
   | "lock_acquired"

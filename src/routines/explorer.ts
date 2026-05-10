@@ -22,17 +22,166 @@ import {
   detectAndRecoverFromDeath,
   readSettings,
   writeSettings,
-  sleep,
   isPirateSystem,
   checkCustomsInspection,
   checkAndFleeFromPirates,
   fleeFromBattle,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
+  getBattleStatus,
+  type BattleState,
 } from "./common.js";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
+import { join } from "path";
 
 /** Minimum fuel % before heading back to refuel. */
 const FUEL_SAFETY_PCT = 40;
+
+// ── Market Details Storage ──────────────────────────────────
+
+const DATA_DIR = join(process.cwd(), "data");
+const MARKET_DETAILS_FILE = join(DATA_DIR, "marketDetails.json");
+const SHIPS_FOR_SALE_FILE = join(DATA_DIR, "shipsForSale.json");
+const RAW_MISSIONS_FILE = join(DATA_DIR, "rawMissions.json");
+
+interface MarketOrderDetail {
+  price: number;
+  quantity: number;
+}
+
+interface MarketItemDetails {
+  systemId: string;
+  stationPoiId: string;
+  stationName: string;
+  itemId: string;
+  itemName: string;
+  buyOrders: MarketOrderDetail[];
+  sellOrders: MarketOrderDetail[];
+  lastUpdated: string;
+}
+
+interface MarketDetailsData {
+  lastSaved: string;
+  items: MarketItemDetails[];
+}
+
+interface ShipListing {
+  systemId: string;
+  stationPoiId: string;
+  stationName: string;
+  listing_id: string;
+  ship_id: string;
+  class_id: string;
+  price: number;
+  listed_at: string;
+  seller: string;
+  ship_name: string;
+  tier: number;
+  hull: number;
+  max_hull: number;
+  shield: number;
+  modules_count: number;
+  scale: number;
+  category: string;
+  custom_name?: string;
+  last_updated: string;
+}
+
+interface ShipsForSaleData {
+  lastSaved: string;
+  listings: Record<string, ShipListing>;
+}
+
+interface RawMissionRecord {
+  missionId: string;
+  data: Record<string, unknown>; // Full raw mission data
+  stations: Array<{
+    systemId: string;
+    stationPoiId: string;
+    stationName: string;
+    lastSeen: string;
+  }>;
+  firstSeen: string;
+  lastSeen: string;
+}
+
+interface RawMissionsData {
+  lastSaved: string;
+  missions: Record<string, RawMissionRecord>; // key: mission_id
+}
+
+function loadMarketDetails(): MarketDetailsData {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (existsSync(MARKET_DETAILS_FILE)) {
+    try {
+      const raw = readFileSync(MARKET_DETAILS_FILE, "utf-8");
+      return JSON.parse(raw) as MarketDetailsData;
+    } catch {
+      // Corrupt file — start fresh
+    }
+  }
+  return { lastSaved: now(), items: [] };
+}
+
+function saveMarketDetails(data: MarketDetailsData): void {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  data.lastSaved = now();
+  writeFileSync(MARKET_DETAILS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function loadShipsForSale(): ShipsForSaleData {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (existsSync(SHIPS_FOR_SALE_FILE)) {
+    try {
+      const raw = readFileSync(SHIPS_FOR_SALE_FILE, "utf-8");
+      return JSON.parse(raw) as ShipsForSaleData;
+    } catch {
+      // Corrupt file — start fresh
+    }
+  }
+  return { lastSaved: now(), listings: {} };
+}
+
+function saveShipsForSale(data: ShipsForSaleData): void {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  data.lastSaved = now();
+  writeFileSync(SHIPS_FOR_SALE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function loadRawMissions(): RawMissionsData {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  if (existsSync(RAW_MISSIONS_FILE)) {
+    try {
+      const raw = readFileSync(RAW_MISSIONS_FILE, "utf-8");
+      return JSON.parse(raw) as RawMissionsData;
+    } catch {
+      // Corrupt file — start fresh
+    }
+  }
+  return { lastSaved: now(), missions: {} };
+}
+
+function saveRawMissions(data: RawMissionsData): void {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
+  }
+  data.lastSaved = now();
+  writeFileSync(RAW_MISSIONS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function now(): string {
+  return new Date().toISOString();
+}
 /** Default minimum fuel % required before attempting a system jump. */
 const DEFAULT_JUMP_FUEL_PCT = 50;
 
@@ -303,6 +452,10 @@ export function setExplorerReturnToHomeOnFuelCellDepletion(username: string, ret
 export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
+  // DEBUG: Log system blacklist at startup
+  const systemBlacklist = getSystemBlacklist();
+  ctx.log("info", `Explorer starting - System blacklist contains ${systemBlacklist.length} systems: ${systemBlacklist.length > 0 ? systemBlacklist.join(', ') : 'none'}`);
+
   // Check per-bot mode
   const initialSettings = getExplorerSettings(bot.username);
   if (initialSettings.mode === "trade_update") {
@@ -315,7 +468,9 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   const visitedSystems = new Set<string>();
+  const visitedSystemTimes = new Map<string, number>(); // Track when each system was last visited (timestamp)
   const fledFromSystems = new Set<string>(); // Track systems we've fled from due to pirates
+  const path: string[] = []; // Track the path of systems visited to enable reverse fleeing
   let lastSystem: string | null = null;
 
   // ── Startup: dock at local station to clear cargo & refuel ──
@@ -334,7 +489,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check for battle after travel
       if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
         ctx.log("combat", "Battle detected during startup travel - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         // Continue to main loop which will handle battle
       } else if (tResp.error && !tResp.error.message.includes("already")) {
         ctx.log("error", `Could not reach station: ${tResp.error.message}`);
@@ -348,7 +503,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check for battle after dock
       if (await checkBattleAfterCommand(ctx, dResp.notifications, "dock")) {
         ctx.log("combat", "Battle detected during startup dock - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         // Continue to main loop which will handle battle
       } else if (!dResp.error || dResp.error.message.includes("already")) {
         bot.docked = true;
@@ -403,26 +558,72 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("system", "No station in current system — skipping startup prep");
   }
 
+  // Persistent battle state across cycles
+  const battleState: BattleState = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+    lastFleeTime: undefined,
+  };
+
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Clean up expired temporary blacklists ──
     cleanupTemporaryBlacklist();
 
-    // ── Battle check — check global WebSocket battle state first (works during 524 timeouts) ──
+    // ── Battle check — check global battle state first ──
+    if (await checkAndFleeFromBattle(ctx, "explorer")) {
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // Periodic battle status check (backup detection in case notifications fail)
+    // Check every cycle for fast detection
     if (bot.isInBattle()) {
-      ctx.log("combat", "[WebSocket] Battle detected via WebSocket - fleeing immediately!");
-      if (await checkAndFleeFromBattle(ctx, "explorer")) {
-        await sleep(5000);
-        continue;
+      const now = Date.now();
+      const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+      if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", `PERIODIC CHECK: IN BATTLE! - initiating IMMEDIATE flee!`);
+        battleState.inBattle = true;
+        battleState.isFleeing = false;
+
+        await bot.exec("battle", { action: "stance", stance: "flee" });
+        battleState.lastFleeTime = now;
+        ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
       }
     }
 
-    // ── Battle check — also check via API (fallback) ──
-    if (await checkAndFleeFromBattle(ctx, "explorer")) {
-      await sleep(5000);
+    // If we're in battle, re-issue flee command to ensure we stay in flee stance
+    if (battleState.inBattle) {
+      const now = Date.now();
+      const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+      if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", "Re-issuing flee stance (ensuring we stay in flee mode)...");
+        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (fleeResp.error) {
+          ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+        } else {
+          battleState.lastFleeTime = now;
+        }
+      }
+      // Check if we've successfully disengaged
+      const currentBattleStatus = await getBattleStatus(ctx);
+      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+        ctx.log("combat", "Battle cleared - no longer in combat!");
+        battleState.inBattle = false;
+        battleState.battleId = null;
+        battleState.isFleeing = false;
+        battleState.lastFleeTime = undefined;
+        await ctx.sleep(2000); // Brief pause before next check
+        continue;
+      }
+      // Still in battle - continue to next cycle
+      await ctx.sleep(2000); // Brief pause before next check
       continue;
     }
 
@@ -448,10 +649,14 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     let { pois, connections, systemId } = await getSystemInfo(ctx);
     if (!systemId) {
       ctx.log("error", "Could not determine current system — waiting 30s");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
     visitedSystems.add(systemId);
+    visitedSystemTimes.set(systemId, Date.now());
+    if (path.length === 0) {
+      path.push(systemId); // Initialize path with starting system
+    }
 
     // Try to capture security level
     await fetchSecurityLevel(ctx, systemId);
@@ -470,7 +675,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
         ctx.log("combat", "Battle detected during proximity check - fleeing immediately!");
         if (await checkAndFleeFromBattle(ctx, "explorer")) {
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
       }
@@ -487,7 +692,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           await recordPirateSighting(ctx, systemId, pirateResult.pirates);
 
           // Add temporary blacklist for this system
-          addTemporaryPirateBlacklist(systemId, 30); // 30 minutes
+          addTemporaryPirateBlacklist(systemId, 10); // 10 minutes
 
           // CRITICAL: Verify actual current system before fleeing
           // During cascade emergency jumps, lastSystem can get out of sync
@@ -495,48 +700,53 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           const actualSystemId = bot.system;
           ctx.log("combat", `Verified actual position before flee: system=${actualSystemId}, lastSystem=${lastSystem}`);
 
-          // Flee back the way we came - BUT only if lastSystem is actually connected
-          const lastSystemConnected = lastSystem && connections.some(c => c.id === lastSystem);
-          
-          if (lastSystem && lastSystemConnected) {
-            ctx.log("combat", `Fleeing back to ${lastSystem} (the way we came)...`);
-            await ensureUndocked(ctx);
-            const fleeJump = await bot.exec("jump", { target_system: lastSystem });
+          // Flee back the way we came using the path stack
+          if (path.length > 1) {
+            const fleeTarget = path[path.length - 2]; // The system before the current one
+            const fleeTargetConnected = connections.some(c => c.id === fleeTarget);
 
-            // Check for battle interrupt on flee jump
-            if (fleeJump.error) {
-              const fleeMsg = fleeJump.error.message.toLowerCase();
-              if (fleeJump.error.code === "battle_interrupt" || fleeMsg.includes("interrupted by battle") || fleeMsg.includes("interrupted by combat")) {
-                ctx.log("combat", `Flee jump interrupted by battle! ${fleeJump.error.message} - using emergency flee!`);
-                const { emergencyFleeFromPirates } = await import("./common.js");
-                await emergencyFleeFromPirates(ctx, pirateResult);
+            if (fleeTargetConnected) {
+              ctx.log("combat", `Fleeing back to ${fleeTarget} (exact reverse path)...`);
+              await ensureUndocked(ctx);
+              const fleeJump = await bot.exec("jump", { target_system: fleeTarget });
+
+              // Check for battle interrupt on flee jump
+              if (fleeJump.error) {
+                const fleeMsg = fleeJump.error.message.toLowerCase();
+                if (fleeJump.error.code === "battle_interrupt" || fleeMsg.includes("interrupted by battle") || fleeMsg.includes("interrupted by combat")) {
+                  ctx.log("combat", `Flee jump interrupted by battle! ${fleeJump.error.message} - using emergency flee!`);
+                  const { emergencyFleeFromPirates } = await import("./common.js");
+                  await emergencyFleeFromPirates(ctx, pirateResult);
+                } else {
+                  ctx.log("error", `Failed to flee to ${fleeTarget}: ${fleeJump.error.message}`);
+                  // Try emergency flee if jump fails
+                  const { emergencyFleeFromPirates } = await import("./common.js");
+                  await emergencyFleeFromPirates(ctx, pirateResult);
+                }
               } else {
-                ctx.log("error", `Failed to flee to ${lastSystem}: ${fleeJump.error.message}`);
-                // Try emergency flee if jump fails
-                const { emergencyFleeFromPirates } = await import("./common.js");
-                await emergencyFleeFromPirates(ctx, pirateResult);
+                ctx.log("combat", `Successfully fled to ${fleeTarget}`);
+                bot.stats.totalSystems++;
+                // Update path: remove the current system from path since we fled from it
+                path.pop();
+                // Update lastSystem to the system we fled from (for avoidance logic)
+                lastSystem = actualSystemId;
+                // Continue to next iteration to rescan new system
+                await ctx.sleep(5000);
+                continue;
               }
             } else {
-              ctx.log("combat", `Successfully fled to ${lastSystem}`);
-              bot.stats.totalSystems++;
-              // Update lastSystem to reflect actual position after successful jump
-              lastSystem = actualSystemId;
-              // Continue to next iteration to rescan new system
-              await sleep(5000);
-              continue;
+              ctx.log("error", `Flee target ${fleeTarget} is not connected to current system (${actualSystemId}) - using emergency flee.`);
+              const { emergencyFleeFromPirates } = await import("./common.js");
+              await emergencyFleeFromPirates(ctx, pirateResult);
             }
           } else {
-            // lastSystem is not connected or not available - use emergency flee
-            if (lastSystem && !lastSystemConnected) {
-              ctx.log("error", `lastSystem (${lastSystem}) is not connected to current system (${actualSystemId}) - cannot flee that way! Using emergency flee.`);
-            } else {
-              ctx.log("combat", "No previous system to flee to - using emergency flee");
-            }
+            // No previous system in path - use emergency flee
+            ctx.log("combat", "No previous system in path to flee to - using emergency flee");
             const { emergencyFleeFromPirates } = await import("./common.js");
             await emergencyFleeFromPirates(ctx, pirateResult);
           }
           
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
       }
@@ -553,7 +763,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check for battle after survey
       if (await checkBattleAfterCommand(ctx, surveyResp.notifications, "survey_system")) {
         ctx.log("combat", "Battle detected during survey - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -670,7 +880,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const fueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
     if (!fueled) {
       ctx.log("error", "Could not refuel — waiting 30s before retry...");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -715,7 +925,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check for battle after travel
       if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
         ctx.log("combat", "Battle detected during travel - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -732,7 +942,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
         // Check battle status after scavenge (it makes multiple commands)
         if (await checkAndFleeFromBattle(ctx, "scavenge")) {
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
       }
@@ -819,7 +1029,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Direct to Unknown mode: jump directly to nearest unknown or stale system ──
     if (currentSettings.directToUnknown) {
       const blacklist = getSystemBlacklist();
-      const unknowns = findUnknownSystems(ctx, systemId, blacklist);
+      const unknowns = findUnknownSystems(ctx, systemId, blacklist, fledFromSystems);
 
       if (unknowns.length > 0) {
         // Pick the nearest high-priority target (unknown first, then stale)
@@ -852,14 +1062,14 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         const directFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
         if (!directFueled) {
           ctx.log("error", "Could not refuel for direct jump — waiting 30s...");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
         
         // If grouping is enabled, find nearby unknowns to visit after the target
         let nearbyUnknowns: string[] = [];
         if (currentSettings.groupUnknowns) {
-          nearbyUnknowns = findNearbyUnknowns(ctx, target.id, 2, blacklist);
+          nearbyUnknowns = findNearbyUnknowns(ctx, target.id, 2, blacklist, fledFromSystems);
           if (nearbyUnknowns.length > 0) {
             ctx.log("exploration", `Grouping enabled: ${nearbyUnknowns.length} additional unknown(s) near ${target.name}`);
           }
@@ -871,19 +1081,20 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         const arrived = await navigateToSystem(ctx, target.id, { fuelThresholdPct: currentSettings.refuelThreshold, hullThresholdPct: 30 });
         if (!arrived) {
           ctx.log("error", `Could not reach ${target.name || target.id} — will retry next loop`);
-          await sleep(10000);
+          await ctx.sleep(10000);
           continue;
         }
 
         ctx.log("travel", `Arrived at ${target.name || target.id}`);
         bot.stats.totalSystems++;
+        path.push(target.id); // Track the arrived system in path
         await checkCustomsInspection(ctx, systemId);
 
         // Check for pirates and battle
         const nearbyResp = await bot.exec("get_nearby");
         if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
           ctx.log("error", "Battle detected after arrival - fleeing!");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
         if (nearbyResp.result && typeof nearbyResp.result === "object") {
@@ -891,7 +1102,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           if (fled) {
             ctx.log("error", "Pirates detected - fled, will retry");
             fledFromSystems.add(systemId);
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -907,12 +1118,20 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     const jumpFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
     if (!jumpFueled) {
       ctx.log("error", "Could not refuel before jump — waiting 30s...");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
     const validConns = connections.filter(c => c.id);
-    const nextSystem = pickNextSystem(validConns, visitedSystems, lastSystem, fledFromSystems);
+
+    // DEBUG: Check for any blacklisted systems in connections
+    const blacklist = getSystemBlacklist();
+    const blacklistedInConnections = validConns.filter(c => blacklist.some(b => b.toLowerCase() === c.id.toLowerCase()));
+    if (blacklistedInConnections.length > 0) {
+      ctx.log("warning", `Found ${blacklistedInConnections.length} blacklisted systems in current connections: ${blacklistedInConnections.map(c => c.id).join(', ')}`);
+    }
+
+    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems);
     if (!nextSystem) {
       ctx.log("info", "All connected systems explored! Picking a random connection...");
       if (validConns.length > 0) {
@@ -920,11 +1139,16 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         const rndFueled = await ensureFueled(ctx, currentSettings.refuelThreshold);
         if (!rndFueled) {
           ctx.log("error", "Cannot refuel for random jump — waiting 30s...");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
         // Smart selection: avoid dead-ends and pirate systems
-        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, fledFromSystems);
+        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems);
+        if (!random) {
+          ctx.log("error", "No valid non-blacklisted connections available! Explorer is trapped. Waiting before retry...");
+          await ctx.sleep(60000); // Wait 1 minute before retry
+          continue;
+        }
         await ensureUndocked(ctx);
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
         const jumpResp = await bot.exec("jump", { target_system: random.id });
@@ -934,7 +1158,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
             ctx.log("combat", `Jump interrupted by battle! ${jumpResp.error.message} - fleeing!`);
             await fleeFromBattle(ctx);
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
           // Check if we're in battle - need to flee immediately
@@ -944,15 +1168,16 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             if (!fled) {
               ctx.log("error", "Flee command failed - battle engagement active");
             }
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
-          await sleep(10000);
+          await ctx.sleep(10000);
           continue;
         }
         ctx.log("travel", `Jumped to ${random.name || random.id}`);
         bot.stats.totalSystems++;
+        path.push(random.id); // Track the new system in path
         await checkCustomsInspection(ctx, systemId);
         // Check for pirates
         const nearbyResp = await bot.exec("get_nearby");
@@ -961,7 +1186,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           if (fled) {
             ctx.log("error", "Pirates detected - fled, will retry");
             fledFromSystems.add(systemId); // Mark this system as hostile
-            await sleep(30000);
+            await ctx.sleep(30000);
             continue;
           }
         }
@@ -969,7 +1194,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       } else {
         ctx.log("error", "No connections from this system — stuck! Waiting 60s...");
-        await sleep(60000);
+        await ctx.sleep(60000);
       }
       continue;
     }
@@ -982,7 +1207,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       const jf = await ensureFueled(ctx, currentSettings.refuelThreshold);
       if (!jf) {
         ctx.log("error", "Cannot refuel — waiting 30s...");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
     }
@@ -996,7 +1221,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
         ctx.log("combat", `Jump interrupted by battle! ${jumpResp.error.message} - fleeing!`);
         await fleeFromBattle(ctx);
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
       // Check if we're in battle - need to flee immediately
@@ -1006,7 +1231,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (!fled) {
           ctx.log("error", "Flee command failed - battle engagement active");
         }
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
       if (msg.includes("fuel")) {
@@ -1014,12 +1239,13 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       } else {
         ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
       }
-      await sleep(10000);
+      await ctx.sleep(10000);
       continue;
     }
 
     ctx.log("travel", `Jumped to ${nextSystem.name || nextSystem.id}`);
     bot.stats.totalSystems++;
+    path.push(nextSystem.id); // Track the new system in path
 
     // Check for customs inspection after jump
     await checkCustomsInspection(ctx, systemId);
@@ -1030,7 +1256,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (fled) {
         ctx.log("error", "Pirates detected - fled, will retry");
         fledFromSystems.add(systemId); // Mark this system as hostile
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
     }
@@ -1056,7 +1282,7 @@ async function* scanResourcePoi(
   // Check for battle after get_poi
   if (await checkBattleAfterCommand(ctx, poiResp.notifications, "get_poi")) {
     ctx.log("combat", "Battle detected at POI scan - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -1136,6 +1362,7 @@ async function* scanStation(
   poi: SystemPOI,
 ): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
+  const stationPoi = poi;
 
   yield `dock_${poi.id}`;
   const dockResp = await bot.exec("dock");
@@ -1143,7 +1370,7 @@ async function* scanStation(
   // Check for battle after dock (unlikely at station, but possible if interrupted)
   if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
     ctx.log("combat", "Battle detected during docking - fleeing!");
-    await sleep(3000);
+    await ctx.sleep(3000);
     return;
   }
 
@@ -1172,7 +1399,7 @@ async function* scanStation(
   // Check for battle after view_market
   if (await checkBattleAfterCommand(ctx, marketResp.notifications, "view_market")) {
     ctx.log("combat", "Battle detected during market scan - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -1184,8 +1411,72 @@ async function* scanStation(
       Array.isArray(result.items) ? result.items :
       Array.isArray(result.market) ? result.market :
       []
-    ) as unknown[];
+    ) as Array<Record<string, unknown>>;
     marketCount = items.length;
+
+    // Extract detailed order book data from view_market response and save to marketDetails.json
+    if (items.length > 0) {
+      const marketDetails = loadMarketDetails();
+      let detailsUpdated = false;
+
+      ctx.log("info", `Saving detailed market data for ${items.length} items...`);
+
+      for (const item of items) {
+        const itemId = (item.item_id as string) || (item.id as string) || "";
+        const itemName = (item.name as string) || (item.item_name as string) || itemId;
+
+        if (!itemId) continue;
+
+        let buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map(order => ({
+          price: (order.price_each as number) || (order.price as number) || 0,
+          quantity: (order.quantity as number) || 0,
+        })).filter(order => order.price > 0 && order.quantity > 0);
+
+        let sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map(order => ({
+          price: (order.price_each as number) || (order.price as number) || 0,
+          quantity: (order.quantity as number) || 0,
+        })).filter(order => order.price > 0 && order.quantity > 0);
+
+        // Stricter check: if buy orders and sell orders appear swapped (max buy < min sell), correct it
+        if (buyOrders.length > 0 && sellOrders.length > 0) {
+          const maxBuy = Math.max(...buyOrders.map(o => o.price));
+          const minSell = Math.min(...sellOrders.map(o => o.price));
+          if (maxBuy < minSell) {
+            ctx.log("warn", `Detected potentially swapped buy/sell orders for ${itemName} at ${poi.name} — correcting`);
+            [buyOrders, sellOrders] = [sellOrders, buyOrders];
+          }
+        }
+
+        // Update or add to market details
+        const existingIndex = marketDetails.items.findIndex(
+          m => m.systemId === systemId && m.stationPoiId === poi.id && m.itemId === itemId
+        );
+
+        const marketItemDetail: MarketItemDetails = {
+          systemId,
+          stationPoiId: poi.id,
+          stationName: poi.name,
+          itemId,
+          itemName,
+          buyOrders,
+          sellOrders,
+          lastUpdated: now(),
+        };
+
+        if (existingIndex >= 0) {
+          marketDetails.items[existingIndex] = marketItemDetail;
+        } else {
+          marketDetails.items.push(marketItemDetail);
+        }
+
+        detailsUpdated = true;
+      }
+
+      if (detailsUpdated) {
+        saveMarketDetails(marketDetails);
+        ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
+      }
+    }
   }
 
   const missionsResp = await bot.exec("get_missions");
@@ -1193,7 +1484,7 @@ async function* scanStation(
   // Check for battle after get_missions
   if (await checkBattleAfterCommand(ctx, missionsResp.notifications, "get_missions")) {
     ctx.log("combat", "Battle detected during mission scan - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -1209,6 +1500,57 @@ async function* scanStation(
     if (missions.length > 0) {
       mapStore.updateMissions(systemId, poi.id, missions);
       missionCount = missions.length;
+
+      // Save raw mission data for collection with deduplication
+      const rawMissions = loadRawMissions();
+      let newMissions = 0;
+      let updatedMissions = 0;
+
+      for (const mission of missions) {
+        const missionId = (mission.mission_id as string) || (mission.id as string) || "";
+        if (!missionId) continue;
+
+        const stationInfo = {
+          systemId,
+          stationPoiId: poi.id,
+          stationName: poi.name,
+          lastSeen: now(),
+        };
+
+        if (rawMissions.missions[missionId]) {
+          // Mission already exists, check if this station is already recorded
+          const existing = rawMissions.missions[missionId];
+          const stationExists = existing.stations.some(s =>
+            s.systemId === systemId && s.stationPoiId === poi.id
+          );
+
+          if (!stationExists) {
+            existing.stations.push(stationInfo);
+            updatedMissions++;
+          }
+
+          // Update last seen globally
+          existing.lastSeen = now();
+        } else {
+          // New mission
+          rawMissions.missions[missionId] = {
+            missionId,
+            data: mission,
+            stations: [stationInfo],
+            firstSeen: now(),
+            lastSeen: now(),
+          };
+          newMissions++;
+        }
+      }
+
+      if (newMissions > 0 || updatedMissions > 0) {
+        saveRawMissions(rawMissions);
+        const updateMsg = [];
+        if (newMissions > 0) updateMsg.push(`${newMissions} new`);
+        if (updatedMissions > 0) updateMsg.push(`${updatedMissions} updated`);
+        ctx.log("info", `Collected raw mission data: ${updateMsg.join(", ")} at ${poi.name} (${missions.length} total available)`);
+      }
     }
   }
 
@@ -1262,6 +1604,67 @@ async function* scanStation(
     await checkAndAcceptMissions(ctx);
   }
 
+  // Browse ships for sale while docked
+  yield `browse_ships_${poi.id}`;
+  const browseResp = await bot.exec("browse_ships");
+
+  // Check for battle after browse_ships
+  if (await checkBattleAfterCommand(ctx, browseResp.notifications, "browse_ships")) {
+    ctx.log("combat", "Battle detected during ship browsing - fleeing!");
+    await ctx.sleep(5000);
+    return;
+  }
+
+  if (browseResp.error) {
+    ctx.log("error", `browse_ships failed: ${browseResp.error.message}`);
+  } else if (browseResp.result && typeof browseResp.result === "object") {
+    const result = browseResp.result as Record<string, unknown>;
+    const listings = (
+      Array.isArray(result.listings) ? result.listings : []
+    ) as Array<Record<string, unknown>>;
+
+    if (listings.length > 0) {
+      ctx.log("info", `Saving ${listings.length} ship listings from ${poi.name}...`);
+      const shipsData = loadShipsForSale();
+      let updated = 0;
+
+      for (const listing of listings) {
+        const listing_id = (listing.listing_id as string) || "";
+        if (!listing_id) continue;
+
+        const shipListing: ShipListing = {
+          systemId: systemId,
+          stationPoiId: poi.id,
+          stationName: poi.name,
+          listing_id,
+          ship_id: (listing.ship_id as string) || "",
+          class_id: (listing.class_id as string) || "",
+          price: (listing.price as number) || 0,
+          listed_at: (listing.listed_at as string) || "",
+          seller: (listing.seller as string) || "",
+          ship_name: (listing.ship_name as string) || "",
+          tier: (listing.tier as number) || 0,
+          hull: (listing.hull as number) || 0,
+          max_hull: (listing.max_hull as number) || 0,
+          shield: (listing.shield as number) || 0,
+          modules_count: (listing.modules_count as number) || 0,
+          scale: (listing.scale as number) || 0,
+          category: (listing.category as string) || "",
+          custom_name: listing.custom_name as string,
+          last_updated: now(),
+        };
+
+        shipsData.listings[listing_id] = shipListing;
+        updated++;
+      }
+
+      if (updated > 0) {
+        saveShipsForSale(shipsData);
+        ctx.log("info", `Saved ${updated} ship listings to shipsForSale.json`);
+      }
+    }
+  }
+
   // Undock
   yield `undock_${poi.id}`;
   const undockResp = await bot.exec("undock");
@@ -1269,7 +1672,7 @@ async function* scanStation(
   // Check for battle after undock
   if (await checkBattleAfterCommand(ctx, undockResp.notifications, "undock")) {
     ctx.log("combat", "Battle detected during undock - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -1293,7 +1696,7 @@ async function* visitOtherPoi(
   // Check for battle notifications first
   if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby")) {
     ctx.log("combat", "Battle detected at POI - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -1330,17 +1733,26 @@ async function* visitOtherPoi(
  */
 async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
+  const visitedHiddenPois = new Set<string>(); // Track visited hidden POIs this cycle
+  const path: string[] = []; // Track the path of systems visited
+  let lastSystem: string | null = null;
 
   // ── Check for deep core survey scanner ──
   const scannerCap = await hasDeepCoreSurveyScanner(ctx);
   if (!scannerCap) {
     ctx.log("error", "Deep core scan mode requires a deep core survey scanner module!");
     ctx.log("error", "Please equip a deep core survey scanner and try again.");
-    await sleep(30000);
+    await ctx.sleep(30000);
     return;
   }
 
   ctx.log("system", "Deep Core Scan mode — refreshing known hidden POIs...");
+
+  // Initialize path with current system
+  await bot.refreshStatus();
+  if (path.length === 0 && bot.system) {
+    path.push(bot.system);
+  }
 
   // ── Startup: dock at local station to clear cargo & refuel ──
   yield "startup_prep";
@@ -1375,25 +1787,22 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
     }
   }
 
-  const visitedHiddenPois = new Set<string>(); // Track visited hidden POIs this cycle
-  let lastSystem: string | null = null;
-
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (bot.isInBattle()) {
       ctx.log("combat", "[WebSocket] Battle detected via WebSocket - fleeing immediately!");
       if (await checkAndFleeFromBattle(ctx, "deep_core_scan")) {
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
     }
 
     if (await checkAndFleeFromBattle(ctx, "deep_core_scan")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -1413,7 +1822,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
     if (hiddenPois.length === 0) {
       ctx.log("info", "No hidden POIs found to scan — run explorer mode first to discover them!");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -1428,7 +1837,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
       const fueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
       if (!fueled) {
         ctx.log("error", "Cannot refuel — waiting 30s...");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
 
@@ -1436,11 +1845,17 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
         yield "navigate";
         await ensureUndocked(ctx);
         const blacklist = getSystemBlacklist();
+        // Skip blacklisted systems (persistent + temporary)
+        if (blacklist.some(b => b.toLowerCase() === hiddenPoi.systemId.toLowerCase()) || isTemporarilyBlacklisted(hiddenPoi.systemId)) {
+          ctx.log("info", `Skipping blacklisted system: ${hiddenPoi.systemName}`);
+          continue;
+        }
         const arrived = await navigateToSystem(ctx, hiddenPoi.systemId, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
         if (!arrived) {
           ctx.log("error", `Could not reach ${hiddenPoi.systemName} — skipping POI`);
           continue;
         }
+        path.push(hiddenPoi.systemId); // Track the arrived system in path
         lastSystem = bot.system;
       }
 
@@ -1452,7 +1867,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
       if (await checkBattleAfterCommand(ctx, surveyResp.notifications, "survey_system")) {
         ctx.log("combat", "Battle detected during survey - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -1472,7 +1887,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
       if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
         ctx.log("combat", "Battle detected during travel - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -1482,7 +1897,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
         if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
           ctx.log("combat", `Travel to hidden POI interrupted by battle! ${tResp.error.message} - fleeing!`);
           await fleeFromBattle(ctx);
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
         ctx.log("error", `Travel to ${hiddenPoi.poiName} failed: ${tResp.error.message}`);
@@ -1496,7 +1911,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
       if (await checkBattleAfterCommand(ctx, poiResp.notifications, "get_poi")) {
         ctx.log("combat", "Battle detected at POI scan - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -1604,7 +2019,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
     const cycleFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Deep core scan cycle done — visited ${visitedHiddenPois.size} POI(s), ${bot.credits} cr, ${cycleFuel}% fuel`);
     visitedHiddenPois.clear(); // Reset for next cycle
-    await sleep(5000);
+    await ctx.sleep(5000);
   }
 }
 
@@ -1703,9 +2118,14 @@ async function hasDeepCoreSurveyScanner(ctx: RoutineContext): Promise<boolean> {
  */
 async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
+  const fledFromSystems = new Set<string>(); // Track systems we've fled from due to pirates
+  const path: string[] = []; // Track the path of systems visited
 
   await bot.refreshStatus();
   const homeSystem = bot.system;
+  if (homeSystem) {
+    path.push(homeSystem);
+  }
 
   ctx.log("system", "Trade Update mode — cycling known stations to refresh market data...");
 
@@ -1727,11 +2147,11 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive2 = await detectAndRecoverFromDeath(ctx);
-    if (!alive2) { await sleep(30000); continue; }
+    if (!alive2) { await ctx.sleep(30000); continue; }
 
     // ── Battle check — if in battle, flee immediately ──
     if (await checkAndFleeFromBattle(ctx, "trade_update")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -1756,8 +2176,10 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     for (const [sysId, sys] of Object.entries(allSystems)) {
       // Skip pirate systems — they are hostile!
       if (isPirateSystem(sysId)) continue;
-      // Skip blacklisted systems
+      // Skip blacklisted systems (persistent + temporary + fled from)
       if (blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(sysId)) continue;
+      if (fledFromSystems.has(sysId)) continue;
 
       // If focus area is set, check if this system is within range
       if (focusAreaSystem) {
@@ -1795,7 +2217,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     if (stationSystems.length === 0) {
       const focusMsg = focusAreaSystem ? ` within ${maxJumps} jumps of ${focusAreaSystem}` : '';
       ctx.log("info", `No known stations${focusMsg} — run an explorer in 'explore' mode first. Waiting 60s...`);
-      await sleep(60000);
+      await ctx.sleep(60000);
       continue;
     }
 
@@ -1824,7 +2246,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const fueled = await ensureFueled(ctx, FUEL_SAFETY_PCT);
       if (!fueled) {
         ctx.log("error", "Cannot refuel — waiting 30s...");
-        await sleep(30000);
+        await ctx.sleep(30000);
         continue;
       }
 
@@ -1836,6 +2258,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           ctx.log("error", `Could not reach ${target.systemName} — skipping`);
           continue;
         }
+        path.push(target.systemId); // Track the arrived system in path
       }
 
       if (bot.state !== "running") break;
@@ -1848,7 +2271,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       // Check for battle after travel
       if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
         ctx.log("combat", "Battle detected during travel - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -1866,7 +2289,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
         // Check battle status after scavenge
         if (await checkAndFleeFromBattle(ctx, "scavenge")) {
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
       }
@@ -1884,7 +2307,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         // Check for battle after dock
         if (await checkBattleAfterCommand(ctx, dResp.notifications, "dock")) {
           ctx.log("combat", "Battle detected during docking - fleeing!");
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
 
@@ -1897,22 +2320,94 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           // Check for battle after view_market
           if (await checkBattleAfterCommand(ctx, marketResp.notifications, "view_market")) {
             ctx.log("combat", "Battle detected during market scan - fleeing!");
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
 
           if (marketResp.result && typeof marketResp.result === "object") {
             mapStore.updateMarket(target.systemId, target.stationPoi, marketResp.result as Record<string, unknown>);
+
+            // Extract detailed order book data from view_market response and save to marketDetails.json
+            const result = marketResp.result as Record<string, unknown>;
+            const items = (
+              Array.isArray(result) ? result :
+              Array.isArray(result.items) ? result.items :
+              Array.isArray(result.market) ? result.market :
+              []
+            ) as Array<Record<string, unknown>>;
+
+            if (items.length > 0) {
+              ctx.log("info", `Saving detailed market data for ${items.length} items...`);
+              const marketDetails = loadMarketDetails();
+              let detailsUpdated = false;
+
+              for (const item of items) {
+                const itemId = (item.item_id as string) || (item.id as string) || "";
+                const itemName = (item.name as string) || (item.item_name as string) || itemId;
+
+                if (!itemId) continue;
+
+                const buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map(order => ({
+                  price: (order.price_each as number) || (order.price as number) || 0,
+                  quantity: (order.quantity as number) || 0,
+                })).filter(order => order.price > 0 && order.quantity > 0);
+
+                const sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map(order => ({
+                  price: (order.price_each as number) || (order.price as number) || 0,
+                  quantity: (order.quantity as number) || 0,
+                })).filter(order => order.price > 0 && order.quantity > 0);
+
+                // Update or add to market details
+                const existingIndex = marketDetails.items.findIndex(
+                  m => m.systemId === target.systemId && m.stationPoiId === target.stationPoi && m.itemId === itemId
+                );
+
+                const marketItemDetail: MarketItemDetails = {
+                  systemId: target.systemId,
+                  stationPoiId: target.stationPoi,
+                  stationName: target.stationName,
+                  itemId,
+                  itemName,
+                  buyOrders,
+                  sellOrders,
+                  lastUpdated: now(),
+                };
+
+                if (existingIndex >= 0) {
+                  marketDetails.items[existingIndex] = marketItemDetail;
+                } else {
+                  marketDetails.items.push(marketItemDetail);
+                }
+
+                detailsUpdated = true;
+              }
+
+              if (detailsUpdated) {
+                saveMarketDetails(marketDetails);
+                ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
+              }
+            }
           }
 
-          const missResp = await bot.exec("get_missions");
+           const missResp = await bot.exec("get_missions");
 
-          // Check for battle after get_missions
-          if (await checkBattleAfterCommand(ctx, missResp.notifications, "get_missions")) {
-            ctx.log("combat", "Battle detected during mission scan - fleeing!");
-            await sleep(5000);
-            continue;
-          }
+           // Check for battle after get_missions
+           if (await checkBattleAfterCommand(ctx, missResp.notifications, "get_missions")) {
+             ctx.log("combat", "Battle detected during mission scan - fleeing!");
+             await ctx.sleep(5000);
+             continue;
+           }
+
+           if (missResp.result && typeof missResp.result === "object") {
+             const mData = missResp.result as Record<string, unknown>;
+             const missions = (
+               Array.isArray(mData) ? mData :
+               Array.isArray(mData.missions) ? mData.missions :
+               Array.isArray(mData.available) ? mData.available :
+               []
+             ) as Array<Record<string, unknown>>;
+             if (missions.length > 0) mapStore.updateMissions(target.systemId, target.stationPoi, missions);
+           }
 
           if (missResp.result && typeof missResp.result === "object") {
             const mData = missResp.result as Record<string, unknown>;
@@ -1925,6 +2420,67 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
             if (missions.length > 0) mapStore.updateMissions(target.systemId, target.stationPoi, missions);
           }
 
+          // Browse ships for sale if in trade_update mode
+          const settings = getExplorerSettings(bot.username);
+          if (settings.mode === "trade_update") {
+            const browseResp = await bot.exec("browse_ships");
+
+            // Check for battle after browse_ships
+            if (await checkBattleAfterCommand(ctx, browseResp.notifications, "browse_ships")) {
+              ctx.log("combat", "Battle detected during ship browsing - fleeing!");
+              await ctx.sleep(5000);
+              return;
+            }
+
+            if (browseResp.result && typeof browseResp.result === "object") {
+              const result = browseResp.result as Record<string, unknown>;
+              const listings = (
+                Array.isArray(result.listings) ? result.listings : []
+              ) as Array<Record<string, unknown>>;
+
+              if (listings.length > 0) {
+                ctx.log("info", `Saving ${listings.length} ship listings from ${target.stationName}...`);
+                const shipsData = loadShipsForSale();
+                let updated = 0;
+
+                for (const listing of listings) {
+                  const listing_id = (listing.listing_id as string) || "";
+                  if (!listing_id) continue;
+
+                  const shipListing: ShipListing = {
+                    systemId: target.systemId,
+                    stationPoiId: target.stationPoi,
+                    stationName: target.stationName,
+                    listing_id,
+                    ship_id: (listing.ship_id as string) || "",
+                    class_id: (listing.class_id as string) || "",
+                    price: (listing.price as number) || 0,
+                    listed_at: (listing.listed_at as string) || "",
+                    seller: (listing.seller as string) || "",
+                    ship_name: (listing.ship_name as string) || "",
+                    tier: (listing.tier as number) || 0,
+                    hull: (listing.hull as number) || 0,
+                    max_hull: (listing.max_hull as number) || 0,
+                    shield: (listing.shield as number) || 0,
+                    modules_count: (listing.modules_count as number) || 0,
+                    scale: (listing.scale as number) || 0,
+                    category: (listing.category as string) || "",
+                    custom_name: listing.custom_name as string,
+                    last_updated: now(),
+                  };
+
+                  shipsData.listings[listing_id] = shipListing;
+                  updated++;
+                }
+
+                if (updated > 0) {
+                  saveShipsForSale(shipsData);
+                  ctx.log("info", `Saved ${updated} ship listings to shipsForSale.json`);
+                }
+              }
+            }
+          }
+
           await tryRefuel(ctx);
 
           const undockResp = await bot.exec("undock");
@@ -1932,7 +2488,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           // Check for battle after undock
           if (await checkBattleAfterCommand(ctx, undockResp.notifications, "undock")) {
             ctx.log("combat", "Battle detected during undock - fleeing!");
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
 
@@ -2002,7 +2558,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     await bot.refreshStatus();
     const cycleFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Trade update cycle done — ${stationSystems.length} stations, ${bot.credits} cr, ${cycleFuel}% fuel`);
-    await sleep(5000);
+    await ctx.sleep(5000);
   }
 }
 
@@ -2020,7 +2576,7 @@ const STALE_POI_DAYS = 7;
  *
  * Within each tier, systems are sorted by jump distance ascending (nearest first).
  */
-function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklist: string[]): Array<{
+function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklist: string[], fledFromSystems: Set<string>): Array<{
   id: string;
   name: string;
   distance: number;
@@ -2055,8 +2611,10 @@ function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklis
       const connId = conn.system_id;
       if (!connId) continue;
       if (visited.has(connId)) continue;
-      // Skip blacklisted systems
+      // Skip blacklisted systems, temporarily blacklisted systems, and systems we've fled from
       if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(connId)) continue;
+      if (fledFromSystems.has(connId)) continue;
 
       visited.add(connId);
       const newRoute = [...route, connId];
@@ -2139,7 +2697,7 @@ function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklis
  * Find unknown or stale systems near a target system (for grouping).
  * Returns systems within maxJumps that have 0 POIs or all-stale POIs.
  */
-function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps: number, blacklist: string[]): string[] {
+function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps: number, blacklist: string[], fledFromSystems: Set<string>): string[] {
   const nearby: string[] = [];
   const staleThreshold = Date.now() - STALE_POI_DAYS * 24 * 60 * 60 * 1000;
 
@@ -2162,6 +2720,8 @@ function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps:
       if (!connId) continue;
       if (visited.has(connId)) continue;
       if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(connId)) continue;
+      if (fledFromSystems.has(connId)) continue;
 
       visited.add(connId);
 
@@ -2204,7 +2764,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   // Check for battle after get_cargo
   if (await checkBattleAfterCommand(ctx, cargoResp.notifications, "get_cargo")) {
     ctx.log("combat", "Battle detected during cargo check - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
@@ -2227,7 +2787,8 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   for (const item of cargoItems) {
     const itemId = (item.item_id as string) || "";
     const quantity = (item.quantity as number) || 0;
-    currentCargo += quantity;
+    const spacePerItem = itemId === "premium_fuel_cell" ? 2 : 1;
+    currentCargo += quantity * spacePerItem;
     if (itemId === "premium_fuel_cell") {
       premiumFuelCells = quantity;
     } else if (itemId === "fuel_cell") {
@@ -2241,44 +2802,48 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
     return true;
   }
 
-  // Try to withdraw premium_fuel_cell first (higher priority)
-  ctx.log("trade", `Loading ${availableSpace} premium fuel cells from faction storage for long-range exploration...`);
-  let withdrawResp = await bot.exec("faction_withdraw_items", {
-    item_id: "premium_fuel_cell",
-    quantity: availableSpace
-  });
+  // Premium fuel cells take 2 cargo space each, regular take 1
+  // Calculate max we can withdraw: premium uses 2 space, so use floor division
+  const maxPremiumWithdraw = Math.floor(availableSpace / 2);
+  // For regular, we can use all available space since they take 1 each
+  const maxRegularWithdraw = availableSpace;
+
+  // Try to withdraw premium_fuel_cell first (higher priority, takes 2 space each)
+  const premiumToWithdraw = Math.min(maxPremiumWithdraw, 402); // Cap at reasonable amount
+  ctx.log("trade", `Loading ${premiumToWithdraw} premium fuel cells from faction storage for long-range exploration...`);
+  //let withdrawResp = await bot.exec("withdraw_items", { item_id: "premium_fuel_cell", quantity: premiumToWithdraw, source: "faction", target: "cargo" });
+  let withdrawResp = await bot.exec("storage", { action: 'withdraw', item_id: "premium_fuel_cell", quantity: premiumToWithdraw, target: "faction"}); //fixed by human! this should be working!
 
   // Check for battle after faction_withdraw_items
   if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
     ctx.log("combat", "Battle detected during fuel cell withdraw - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
   let loadedCount = 0;
   if (!withdrawResp.error) {
-    loadedCount = availableSpace;
+    loadedCount = premiumToWithdraw;
     const newPremium = premiumFuelCells + loadedCount;
-    ctx.log("trade", `Loaded ${loadedCount} premium fuel cells from faction storage (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    const actualCargoUsed = loadedCount * 2;
+    ctx.log("trade", `Loaded ${loadedCount} premium fuel cells from faction storage (${actualCargoUsed} cargo space, ${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
   // If premium withdraw failed, try regular fuel_cell
   ctx.log("warn", `Could not withdraw premium fuel cells: ${withdrawResp.error.message} — trying regular fuel cells...`);
-  withdrawResp = await bot.exec("faction_withdraw_items", {
-    item_id: "fuel_cell",
-    quantity: availableSpace
-  });
+  //withdrawResp = await bot.exec("faction_withdraw_items", { item_id: "fuel_cell", quantity: maxRegularWithdraw });
+  withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: maxRegularWithdraw }); //fixed by human!
 
   // Check for battle after faction_withdraw_items
   if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
     ctx.log("combat", "Battle detected during fuel cell withdraw - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
   if (!withdrawResp.error) {
-    loadedCount = availableSpace;
+    loadedCount = maxRegularWithdraw;
     const newRegular = regularFuelCells + loadedCount;
     ctx.log("trade", `Loaded ${loadedCount} regular fuel cells from faction storage (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
@@ -2286,20 +2851,17 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
   // If faction withdraw failed, try to buy premium fuel cells from station market as fallback
   ctx.log("warn", `Could not withdraw regular fuel cells: ${withdrawResp.error.message} — trying to buy premium fuel cells from market...`);
-  const buyResp = await bot.exec("buy", {
-    item_id: "premium_fuel_cell",
-    quantity: availableSpace
-  });
+  const buyResp = await bot.exec("buy", { item_id: "premium_fuel_cell", quantity: premiumToWithdraw });
 
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
     ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
   if (!buyResp.error) {
-    loadedCount = availableSpace;
+    loadedCount = premiumToWithdraw;
     const newPremium = premiumFuelCells + loadedCount;
     ctx.log("trade", `Bought ${loadedCount} premium fuel cells from market (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
@@ -2307,20 +2869,17 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
   // If premium buy failed, try regular fuel_cell
   ctx.log("warn", `Could not buy premium fuel cells: ${buyResp.error.message} — trying regular fuel cells...`);
-  const buyRegularResp = await bot.exec("buy", {
-    item_id: "fuel_cell",
-    quantity: availableSpace
-  });
+  const buyRegularResp = await bot.exec("buy", { item_id: "fuel_cell", quantity: maxRegularWithdraw });
 
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
     ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
   if (!buyRegularResp.error) {
-    loadedCount = availableSpace;
+    loadedCount = maxRegularWithdraw;
     const newRegular = regularFuelCells + loadedCount;
     ctx.log("trade", `Bought ${loadedCount} regular fuel cells from market (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
@@ -2335,27 +2894,24 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
     // Check for battle after withdraw_credits
     if (await checkBattleAfterCommand(ctx, withdrawCreditsResp.notifications, "withdraw_credits")) {
       ctx.log("combat", "Battle detected during credits withdraw - fleeing!");
-      await sleep(5000);
+      await ctx.sleep(5000);
       return false;
     }
 
     if (!withdrawCreditsResp.error) {
       await bot.refreshStatus();
       ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying premium fuel cell purchase...`);
-      const retryResp = await bot.exec("buy", {
-        item_id: "premium_fuel_cell",
-        quantity: availableSpace
-      });
+      const retryResp = await bot.exec("buy", { item_id: "premium_fuel_cell", quantity: premiumToWithdraw });
 
       // Check for battle after retry buy
       if (await checkBattleAfterCommand(ctx, retryResp.notifications, "buy")) {
         ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         return false;
       }
 
       if (!retryResp.error) {
-        loadedCount = availableSpace;
+        loadedCount = premiumToWithdraw;
         const newPremium = premiumFuelCells + loadedCount;
         ctx.log("trade", `Loaded ${loadedCount} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
         return true;
@@ -2363,20 +2919,17 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
       // If premium retry failed, try regular
       ctx.log("warn", `Could not buy premium fuel cells: ${retryResp.error.message} — trying regular...`);
-      const retryRegularResp = await bot.exec("buy", {
-        item_id: "fuel_cell",
-        quantity: availableSpace
-      });
+      const retryRegularResp = await bot.exec("buy", { item_id: "fuel_cell", quantity: maxRegularWithdraw });
 
       // Check for battle after retry buy
       if (await checkBattleAfterCommand(ctx, retryRegularResp.notifications, "buy")) {
         ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
-        await sleep(5000);
+        await ctx.sleep(5000);
         return false;
       }
 
       if (!retryRegularResp.error) {
-        loadedCount = availableSpace;
+        loadedCount = maxRegularWithdraw;
         const newRegular = regularFuelCells + loadedCount;
         ctx.log("trade", `Loaded ${loadedCount} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
         return true;
@@ -2457,7 +3010,7 @@ async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolea
     // Check for battle after travel
     if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
       ctx.log("combat", "Battle detected during travel - fleeing!");
-      await sleep(5000);
+      await ctx.sleep(5000);
       return false;
     }
 
@@ -2475,7 +3028,7 @@ async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolea
     // Check for battle after dock
     if (await checkBattleAfterCommand(ctx, dResp.notifications, "dock")) {
       ctx.log("combat", "Battle detected during dock - fleeing!");
-      await sleep(5000);
+      await ctx.sleep(5000);
       return false;
     }
 
@@ -2526,7 +3079,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
     // Check for battle after travel
     if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel")) {
       log("combat", "Battle detected during travel - fleeing!");
-      await sleep(5000);
+      await ctx.sleep(5000);
       return false;
     }
 
@@ -2549,7 +3102,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
     // Check for battle after dock
     if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
       log("combat", "Battle detected during dock - fleeing!");
-      await sleep(5000);
+      await ctx.sleep(5000);
       return false;
     }
 
@@ -2566,7 +3119,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   // Check for battle after get_cargo
   if (await checkBattleAfterCommand(ctx, cargoResp.notifications, "get_cargo")) {
     log("combat", "Battle detected during cargo check - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
@@ -2589,7 +3142,8 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   for (const item of cargoItems) {
     const itemId = (item.item_id as string) || "";
     const quantity = (item.quantity as number) || 0;
-    currentCargo += quantity;
+    const spacePerItem = itemId === "premium_fuel_cell" ? 2 : 1;
+    currentCargo += quantity * spacePerItem;
     if (itemId === "premium_fuel_cell") {
       premiumFuelCells = quantity;
     } else if (itemId === "fuel_cell") {
@@ -2603,23 +3157,27 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
     return true;
   }
 
+  // Premium fuel cells take 2 cargo space each, regular take 1
+  const maxPremiumWithdraw = Math.floor(availableSpace / 2);
+  const maxRegularWithdraw = availableSpace;
+
   // Try to buy premium fuel cells first
-  log("trade", `Loading ${availableSpace} premium fuel cells for long journey...`);
+  log("trade", `Loading ${maxPremiumWithdraw} premium fuel cells for long journey...`);
   const buyResp = await bot.exec("buy", {
     item_id: "premium_fuel_cell",
-    quantity: availableSpace
+    quantity: maxPremiumWithdraw
   });
 
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
     log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
   if (!buyResp.error) {
-    const newPremium = premiumFuelCells + availableSpace;
-    log("trade", `Bought ${availableSpace} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    const newPremium = premiumFuelCells + maxPremiumWithdraw;
+    log("trade", `Bought ${maxPremiumWithdraw} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
@@ -2627,13 +3185,13 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   log("warn", `Could not buy premium fuel cells: ${buyResp.error.message} — trying regular fuel cells...`);
   const buyRegularResp = await bot.exec("buy", {
     item_id: "fuel_cell",
-    quantity: availableSpace
+    quantity: maxRegularWithdraw
   });
 
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
     log("combat", "Battle detected during fuel cell purchase - fleeing!");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return false;
   }
 
@@ -2642,8 +3200,8 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
     return false;
   }
 
-  const newRegular = regularFuelCells + availableSpace;
-  log("trade", `Bought ${availableSpace} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+  const newRegular = regularFuelCells + maxRegularWithdraw;
+  log("trade", `Bought ${maxRegularWithdraw} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
   return true;
 }
 
@@ -2655,15 +3213,36 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  * 3. Among unvisited, prefer systems with fewer POIs (less explored)
  * Always avoids pirate systems, blacklisted systems, and systems we've fled from.
  */
-function pickNextSystem(connections: Connection[], visited: Set<string>, lastSystem: string | null, fledFromSystems: Set<string>): Connection | null {
+function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>): Connection | null {
   const blacklist = getSystemBlacklist();
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const now = Date.now();
+
+  // DEBUG: Log blacklist contents and filtering
+  if (blacklist.length > 0) {
+    ctx.log("debug", `System blacklist contains ${blacklist.length} systems: ${blacklist.join(', ')}`);
+  } else {
+    ctx.log("debug", "System blacklist is empty");
+  }
 
   // Filter out blacklisted systems, systems we've fled from, and temporarily blacklisted systems
-  const nonBlacklistedConns = connections.filter(c =>
-    !blacklist.some(b => b.toLowerCase() === c.id.toLowerCase()) &&
-    !fledFromSystems.has(c.id) &&
-    !isTemporarilyBlacklisted(c.id)
-  );
+  const nonBlacklistedConns = connections.filter(c => {
+    const isBlacklisted = blacklist.some(b => b.toLowerCase() === c.id.toLowerCase());
+    const hasFledFrom = fledFromSystems.has(c.id);
+    const isTempBlacklisted = isTemporarilyBlacklisted(c.id);
+
+    if (isBlacklisted) {
+      ctx.log("debug", `Filtering out blacklisted system: ${c.id}`);
+    }
+    if (hasFledFrom) {
+      ctx.log("debug", `Filtering out fled-from system: ${c.id}`);
+    }
+    if (isTempBlacklisted) {
+      ctx.log("debug", `Filtering out temporarily blacklisted system: ${c.id}`);
+    }
+
+    return !isBlacklisted && !hasFledFrom && !isTempBlacklisted;
+  });
   
   // Separate connections into pirate and non-pirate
   const nonPirateConns = nonBlacklistedConns.filter(c => !isPirateSystem(c.id));
@@ -2684,7 +3263,16 @@ function pickNextSystem(connections: Connection[], visited: Set<string>, lastSys
   }
 
   // Priority 2: Systems in map.json but not visited this session
-  const unvisited = candidates.filter(c => !visited.has(c.id));
+  // Apply penalty to systems visited in the last hour to avoid loops
+  const unvisited = candidates.filter(c => {
+    if (visited.has(c.id)) {
+      const lastVisit = visitedTimes.get(c.id);
+      if (lastVisit && (now - lastVisit) < ONE_HOUR_MS) {
+        return false; // Skip systems visited in the last hour
+      }
+    }
+    return true;
+  });
   if (unvisited.length > 0) {
     // Sort by POI count (prefer less explored systems)
     unvisited.sort((a, b) => {
@@ -2695,7 +3283,7 @@ function pickNextSystem(connections: Connection[], visited: Set<string>, lastSys
     return unvisited[0];
   }
 
-  // All connected systems have been visited this session
+  // All connected systems have been visited this session or recently
   // If no valid candidates, fall back to any non-blacklisted connection
   if (candidates.length === 0 && nonBlacklistedConns.length > 0) {
     return nonBlacklistedConns[0];
@@ -2715,21 +3303,48 @@ function pickNextSystem(connections: Connection[], visited: Set<string>, lastSys
  * 5. Systems with more connections (not a dead-end)
  * 6. Unexplored systems (not in map.json) over explored ones
  */
-function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, fledFromSystems: Set<string>): Connection {
+function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>): Connection | null {
   const blacklist = getSystemBlacklist();
-  
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const now = Date.now();
+
+  // DEBUG: Log blacklist contents and filtering
+  if (blacklist.length > 0) {
+    ctx.log("debug", `Smart connection picker - System blacklist contains ${blacklist.length} systems: ${blacklist.join(', ')}`);
+  } else {
+    ctx.log("debug", "Smart connection picker - System blacklist is empty");
+  }
+
   // First, filter out the system we came from (if possible)
   let candidates = lastSystem ? connections.filter(c => c.id !== lastSystem) : connections;
   if (candidates.length === 0) candidates = connections;
 
   // Filter out blacklisted systems, systems we've fled from, and temporarily blacklisted systems
-  const nonBlacklisted = candidates.filter(c =>
-    !blacklist.some(b => b.toLowerCase() === c.id.toLowerCase()) &&
-    !fledFromSystems.has(c.id) &&
-    !isTemporarilyBlacklisted(c.id)
-  );
-  // If all are blacklisted, use original candidates (trapped situation)
-  candidates = nonBlacklisted.length > 0 ? nonBlacklisted : candidates;
+  const nonBlacklisted = candidates.filter(c => {
+    const isBlacklisted = blacklist.some(b => b.toLowerCase() === c.id.toLowerCase());
+    const hasFledFrom = fledFromSystems.has(c.id);
+    const isTempBlacklisted = isTemporarilyBlacklisted(c.id);
+
+    if (isBlacklisted) {
+      ctx.log("debug", `Smart connection picker - Filtering out blacklisted system: ${c.id}`);
+    }
+    if (hasFledFrom) {
+      ctx.log("debug", `Smart connection picker - Filtering out fled-from system: ${c.id}`);
+    }
+    if (isTempBlacklisted) {
+      ctx.log("debug", `Smart connection picker - Filtering out temporarily blacklisted system: ${c.id}`);
+    }
+
+    return !isBlacklisted && !hasFledFrom && !isTempBlacklisted;
+  });
+
+  // CRITICAL: Never use blacklisted systems, even in trapped situations
+  if (nonBlacklisted.length === 0) {
+    ctx.log("error", `Smart connection picker - ALL connected systems are blacklisted/fled-from/temp-blacklisted! Cannot proceed with exploration.`);
+    return null; // Return null to indicate no valid connections
+  }
+
+  candidates = nonBlacklisted;
 
   // Separate into pirate and non-pirate
   const nonPirate = candidates.filter(c => !isPirateSystem(c.id));
@@ -2744,6 +3359,8 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     const connectionCount = sys?.connections?.length ?? 1;
     const isInMap = conn.id ? mapStore.getSystem(conn.id) != null : false;
     const isExploredThisSession = conn.id ? visited.has(conn.id) : false;
+    const lastVisit = conn.id ? visitedTimes.get(conn.id) : null;
+    const visitedRecently = lastVisit && (now - lastVisit) < ONE_HOUR_MS;
 
     // Higher score = better
     let score = 0;
@@ -2759,6 +3376,11 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     // Small penalty for already explored this session
     if (isExploredThisSession) {
       score -= 50;
+    }
+
+    // Significant penalty for systems visited in the last hour (avoid loops)
+    if (visitedRecently) {
+      score -= 500;
     }
 
     return { conn, score };

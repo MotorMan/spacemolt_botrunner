@@ -1,11 +1,26 @@
-import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, writeFile } from "fs";
 import { join } from "path";
+import os from "os";
 import type { BotStatus } from "../bot.js";
 import { getBot } from "../botmanager.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
+
+function getLocalIp(): string | null {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    const addrs = interfaces[name];
+    if (!addrs) continue;
+    for (const iface of addrs) {
+      if (iface.family === "IPv4" && !iface.internal) {
+        return iface.address;
+      }
+    }
+  }
+  return null;
+}
 
 // ── Types ──────────────────────────────────────────────────
 
@@ -45,6 +60,31 @@ const DATA_DIR = join(process.cwd(), "data");
 const SETTINGS_FILE = join(DATA_DIR, "settings.json");
 const STATS_FILE = join(DATA_DIR, "stats.json");
 const MAIN_LOG_FILE = join(DATA_DIR, "main_logs.json");
+const FACILITIES_FILE = join(DATA_DIR, "facilities.json");
+
+interface CachedFacilities {
+  version: string;
+  lastUpdated: string;
+  personal: { facility_type: string; name: string; description: string; category: string; level?: number }[];
+  production: { facility_type: string; name: string; description: string; category: string; level?: number }[];
+  details: Record<string, unknown>;
+}
+
+function loadFacilities(): CachedFacilities {
+  if (existsSync(FACILITIES_FILE)) {
+    try {
+      return JSON.parse(readFileSync(FACILITIES_FILE, "utf-8")) as CachedFacilities;
+    } catch (err) {
+      console.warn(`Warning: corrupt facilities.json, starting fresh —`, err);
+    }
+  }
+  return { version: "", lastUpdated: "", personal: [], production: [], details: {} };
+}
+
+function saveFacilities(data: CachedFacilities): void {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(FACILITIES_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
 
 interface MainLogs {
   activity: string[];
@@ -133,7 +173,9 @@ function loadStats(): StatsFile {
 
 function saveStats(s: StatsFile): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-  writeFileSync(STATS_FILE, JSON.stringify(s, null, 2) + "\n", "utf-8");
+  writeFile(STATS_FILE, JSON.stringify(s, null, 2) + "\n", "utf-8", (err) => {
+    if (err) console.warn(`Warning: failed to save stats.json —`, err);
+  });
 }
 
 function todayStr(): string {
@@ -285,6 +327,7 @@ export class WebServer {
     const indexPath = join(import.meta.dir, "index.html");
 
     this.server = Bun.serve<WSData>({
+      hostname: "0.0.0.0",
       port: this.port,
       fetch: async (req, server) => {
         const url = new URL(req.url);
@@ -292,8 +335,13 @@ export class WebServer {
         // WebSocket upgrade
         if (url.pathname === "/ws") {
           const id = this.nextClientId++;
+          console.log(`WebSocket upgrade attempt from ${req.headers.get('user-agent') || 'unknown'} (id: ${id})`);
           const ok = server.upgrade(req, { data: { id } });
-          if (ok) return undefined as unknown as Response;
+          if (ok) {
+            console.log(`WebSocket upgrade successful (id: ${id})`);
+            return undefined as unknown as Response;
+          }
+          console.log(`WebSocket upgrade failed (id: ${id})`);
           return new Response("WebSocket upgrade failed", { status: 400 });
         }
 
@@ -395,6 +443,36 @@ export class WebServer {
         if (url.pathname === "/api/catalog") {
           return Response.json(catalogStore.getAll());
         }
+        if (url.pathname === "/data/catalog.json") {
+          const catalogPath = join(DATA_DIR, "catalog.json");
+          if (existsSync(catalogPath)) {
+            return new Response(readFileSync(catalogPath, "utf-8"), {
+              headers: { "Content-Type": "application/json" },
+            });
+          } else {
+            return Response.json({ error: "Catalog file not found" }, { status: 404 });
+          }
+        }
+        if (url.pathname === "/data/map.json") {
+          const mapPath = join(DATA_DIR, "map.json");
+          if (existsSync(mapPath)) {
+            return new Response(readFileSync(mapPath, "utf-8"), {
+              headers: { "Content-Type": "application/json" },
+            });
+          } else {
+            return Response.json({ error: "Map file not found" }, { status: 404 });
+          }
+        }
+        if (url.pathname === "/data/shipsForSale.json") {
+          const shipsForSalePath = join(DATA_DIR, "shipsForSale.json");
+          if (existsSync(shipsForSalePath)) {
+            return new Response(readFileSync(shipsForSalePath, "utf-8"), {
+              headers: { "Content-Type": "application/json" },
+            });
+          } else {
+            return Response.json({ error: "Ships for sale file not found" }, { status: 404 });
+          }
+        }
         if (url.pathname === "/api/logs/main") {
           // Return persisted main logs (activity, broadcast, system, faction)
           return Response.json({
@@ -403,6 +481,22 @@ export class WebServer {
             system: this.systemLog,
             faction: this.factionLog,
           });
+        }
+        if (url.pathname === "/api/faction-storage") {
+          // Return faction shared warehouse contents
+          const factionStoragePath = join(process.cwd(), "data", "factionStorage.json");
+          if (!existsSync(factionStoragePath)) {
+            return Response.json({ items: [] });
+          }
+          try {
+            const raw = readFileSync(factionStoragePath, "utf-8");
+            const data = JSON.parse(raw);
+            // Normalize: entries may be under "entries" or "items"
+            const items = data.entries || data.items || [];
+            return Response.json({ items });
+          } catch {
+            return Response.json({ items: [] });
+          }
         }
 
         // Shutdown endpoint
@@ -626,10 +720,24 @@ export class WebServer {
         // Crafting Loadouts endpoints
         const LOADOUTS_FILE = join(DATA_DIR, "craftingLoadouts.json");
 
+        interface CraftingLoadoutFile {
+          crafting?: Record<string, Record<string, number>>;
+          ship?: Record<string, ShipLoadout>;
+        }
+
+        interface ShipLoadout {
+          shipId: string;
+          shipName: string;
+          buildMaterials: Array<{ item_id: string; quantity: number }>;
+          defaultModules: string[];
+          savedAt: string;
+        }
+
         function loadCraftingLoadouts(): Record<string, Record<string, number>> {
           if (existsSync(LOADOUTS_FILE)) {
             try {
-              return JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              const data: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              return data.crafting || {};
             } catch (err) {
               console.warn(`Warning: corrupt craftingLoadouts.json, starting fresh —`, err);
             }
@@ -639,7 +747,69 @@ export class WebServer {
 
         function saveCraftingLoadouts(loadouts: Record<string, Record<string, number>>): void {
           if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-          writeFileSync(LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
+          let fileData: CraftingLoadoutFile = { crafting: loadouts, ship: {} };
+          if (existsSync(LOADOUTS_FILE)) {
+            try {
+              const existing: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              fileData.ship = existing.ship || {};
+            } catch (err) {
+              // ignore, use empty ship section
+            }
+          }
+          fileData.crafting = loadouts;
+          writeFileSync(LOADOUTS_FILE, JSON.stringify(fileData, null, 2) + "\n", "utf-8");
+        }
+
+        function loadShipLoadouts(): Record<string, ShipLoadout> {
+          if (existsSync(LOADOUTS_FILE)) {
+            try {
+              const data: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              return data.ship || {};
+            } catch (err) {
+              console.warn(`Warning: corrupt craftingLoadouts.json (ship section) —`, err);
+            }
+          }
+          return {};
+        }
+
+        function saveShipLoadouts(loadouts: Record<string, ShipLoadout>): void {
+          if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+          let fileData: CraftingLoadoutFile = { crafting: {}, ship: loadouts };
+          if (existsSync(LOADOUTS_FILE)) {
+            try {
+              const existing: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              fileData.crafting = existing.crafting || {};
+            } catch (err) {
+              // ignore, use empty crafting section
+            }
+          }
+          fileData.ship = loadouts;
+          writeFileSync(LOADOUTS_FILE, JSON.stringify(fileData, null, 2) + "\n", "utf-8");
+        }
+
+        // GET /api/facilities - Get cached facility types
+        if (url.pathname === "/api/facilities" && req.method === "GET") {
+          const facilities = loadFacilities();
+          return Response.json(facilities);
+        }
+
+        // POST /api/facilities - Save facility types
+        if (url.pathname === "/api/facilities" && req.method === "POST") {
+          const body = await req.json() as CachedFacilities;
+          if (!body?.version) {
+            return Response.json({ error: "Missing version" }, { status: 400 });
+          }
+          const existing = loadFacilities();
+          // Merge: keep existing details, add new ones
+          const merged: CachedFacilities = {
+            version: body.version,
+            lastUpdated: new Date().toISOString(),
+            personal: body.personal || existing.personal,
+            production: body.production || existing.production,
+            details: { ...existing.details, ...body.details },
+          };
+          saveFacilities(merged);
+          return Response.json({ ok: true });
         }
 
         // GET /api/crafting-loadouts - Load all loadouts
@@ -660,19 +830,55 @@ export class WebServer {
           return Response.json({ ok: true, name: body.name });
         }
 
-        // DELETE /api/crafting-loadouts/:name - Delete a loadout
-        if (url.pathname.startsWith("/api/crafting-loadouts/") && req.method === "DELETE") {
-          const name = decodeURIComponent(url.pathname.slice("/api/crafting-loadouts/".length));
-          const loadouts = loadCraftingLoadouts();
-          if (!(name in loadouts)) {
-            return Response.json({ error: "Loadout not found" }, { status: 404 });
-          }
-          delete loadouts[name];
-          saveCraftingLoadouts(loadouts);
-          return Response.json({ ok: true, name });
-        }
+         // DELETE /api/crafting-loadouts/:name - Delete a loadout
+         if (url.pathname.startsWith("/api/crafting-loadouts/") && req.method === "DELETE") {
+           const name = decodeURIComponent(url.pathname.slice("/api/crafting-loadouts/".length));
+           const loadouts = loadCraftingLoadouts();
+           if (!(name in loadouts)) {
+             return Response.json({ error: "Loadout not found" }, { status: 404 });
+           }
+           delete loadouts[name];
+           saveCraftingLoadouts(loadouts);
+           return Response.json({ ok: true, name });
+         }
 
-        // Serve index.css
+         // GET /api/ship-loadouts - Load all ship loadouts
+         if (url.pathname === "/api/ship-loadouts" && req.method === "GET") {
+           const loadouts = loadShipLoadouts();
+           return Response.json({ loadouts });
+         }
+
+         // POST /api/ship-loadouts - Save a ship loadout
+         if (url.pathname === "/api/ship-loadouts" && req.method === "POST") {
+           const body = await req.json() as { name: string; shipId: string; shipName: string; buildMaterials: Array<{item_id: string; quantity: number}>; defaultModules: string[] };
+           if (!body?.name || !body?.shipId || !body?.buildMaterials) {
+             return Response.json({ error: "Missing required fields" }, { status: 400 });
+           }
+           const loadouts = loadShipLoadouts();
+           loadouts[body.name] = {
+             shipId: body.shipId,
+             shipName: body.shipName,
+             buildMaterials: body.buildMaterials,
+             defaultModules: body.defaultModules || [],
+             savedAt: new Date().toISOString()
+           };
+           saveShipLoadouts(loadouts);
+           return Response.json({ ok: true, name: body.name });
+         }
+
+         // DELETE /api/ship-loadouts/:name - Delete a ship loadout
+         if (url.pathname.startsWith("/api/ship-loadouts/") && req.method === "DELETE") {
+           const name = decodeURIComponent(url.pathname.slice("/api/ship-loadouts/".length));
+           const loadouts = loadShipLoadouts();
+           if (!(name in loadouts)) {
+             return Response.json({ error: "Loadout not found" }, { status: 404 });
+           }
+           delete loadouts[name];
+           saveShipLoadouts(loadouts);
+           return Response.json({ ok: true, name });
+         }
+
+         // Serve index.css
         if (url.pathname === "/index.css") {
           const cssPath = join(import.meta.dir, "index.css");
           return new Response(readFileSync(cssPath, "utf-8"), {
@@ -694,6 +900,77 @@ export class WebServer {
           });
         }
 
+        // API endpoint for player data
+        if (url.pathname === "/api/players" && req.method === "GET") {
+          const playersPath = join(DATA_DIR, "fullPlayerInfo.json");
+          if (!existsSync(playersPath)) {
+            return Response.json({ players: {}, total: 0 });
+          }
+          try {
+            const raw = readFileSync(playersPath, "utf-8");
+            const data = JSON.parse(raw);
+            const playerCount = Object.keys(data.players || {}).length;
+            return Response.json({ ...data, total: playerCount });
+          } catch {
+            return Response.json({ players: {}, total: 0 });
+          }
+        }
+
+        // Serve settings.html for settings route
+        if (url.pathname === "/settings.html") {
+          const settingsPath = join(import.meta.dir, "settings.html");
+          return new Response(readFileSync(settingsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve players.html for players route
+        if (url.pathname === "/players.html") {
+          const playersPath = join(import.meta.dir, "players.html");
+          return new Response(readFileSync(playersPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve shipsforsale.html for ships for sale route
+        if (url.pathname === "/shipsforsale.html") {
+          const shipsforsalePath = join(import.meta.dir, "shipsforsale.html");
+          return new Response(readFileSync(shipsforsalePath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve shipSim.html for ship simulator route
+        if (url.pathname === "/shipSim.html") {
+          const shipSimPath = join(import.meta.dir, "shipSim.html");
+          return new Response(readFileSync(shipSimPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve engineeringCalc.html for engineering calculator route
+        if (url.pathname === "/engineeringCalc.html") {
+          const engineeringCalcPath = join(import.meta.dir, "engineeringCalc.html");
+          return new Response(readFileSync(engineeringCalcPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve index.html for all other routes (read fresh for dev, no cache)
         return new Response(readFileSync(indexPath, "utf-8"), {
           headers: {
@@ -705,38 +982,65 @@ export class WebServer {
 
       websocket: {
         open: (ws: ServerWebSocket<WSData>) => {
+          console.log(`WebSocket connection opened (id: ${ws.data.id})`);
           this.clients.add(ws);
 
-          // Build known systems list for settings dropdowns
-          const knownSystems = this.getKnownSystemsList();
-          const knownOres = mapStore.getAllKnownOres();
+          // Defer sending init to avoid blocking the event loop
+          setImmediate(() => {
+            try {
+              // Build known systems list for settings dropdowns
+              const knownSystems = this.getKnownSystemsList();
+              const knownOres = mapStore.getAllKnownOres();
 
-          // Send scrollback and current state
-          // Serialize per-bot logs as { username: lines[] }
-          const botLogsObj: Record<string, string[]> = {};
-          for (const [name, lines] of this.botLogs) {
-            botLogsObj[name] = lines;
-          }
+              // Serialize per-bot logs as { username: lines[] }
+              const botLogsObj: Record<string, string[]> = {};
+              for (const [name, lines] of this.botLogs) {
+                botLogsObj[name] = lines;
+              }
 
-          ws.send(JSON.stringify({
-            type: "init",
-            bots: this.latestStatuses,
-            routines: this.routines,
-            settings: this.settings,
-            knownSystems,
-            knownOres,
-            mobileCapitol: this.getMobileCapitolLocation(),
-            catalog: catalogStore.getAll(),
-            mapData: mapStore.getAllSystems(),
-            statsDaily: this.statsData.daily,
-            logs: {
-              activity: this.activityLog,
-              broadcast: this.broadcastLog,
-              system: this.systemLog,
-              faction: this.factionLog,
-            },
-            botLogs: botLogsObj,
-          }));
+              // Send basic init data first (small)
+              ws.send(JSON.stringify({
+                type: "init",
+                bots: this.latestStatuses,
+                routines: this.routines,
+                settings: this.settings,
+                knownSystems,
+                knownOres,
+                mobileCapitol: this.getMobileCapitolLocation(),
+                logs: {
+                  activity: this.activityLog,
+                  broadcast: this.broadcastLog,
+                  system: this.systemLog,
+                  faction: this.factionLog,
+                },
+                botLogs: botLogsObj,
+              }));
+
+              // Send large data separately to avoid blocking with JSON serialization
+              setImmediate(() => {
+                try {
+                  const mapData = mapStore.getAllSystems();
+                  const mapJson = JSON.stringify({ type: "mapData", data: mapData });
+                  console.log(`Sending mapData, size: ${mapJson.length} chars`);
+                  ws.send(mapJson);
+
+                  const catalogData = catalogStore.getAll();
+                  const catalogJson = JSON.stringify({ type: "catalog", data: catalogData });
+                  console.log(`Sending catalog, size: ${catalogJson.length} chars`);
+                  ws.send(catalogJson);
+
+                  const statsJson = JSON.stringify({ type: "statsDaily", data: this.statsData.daily });
+                  console.log(`Sending statsDaily, size: ${statsJson.length} chars`);
+                  ws.send(statsJson);
+                } catch (err) {
+                  console.warn('Failed to send large data:', err);
+                }
+              });
+            } catch (err) {
+              console.warn('Failed to send init message:', err);
+              this.clients.delete(ws);
+            }
+          });
         },
 
         message: async (ws: ServerWebSocket<WSData>, msg: string | Buffer) => {
@@ -747,6 +1051,9 @@ export class WebServer {
             seq = raw._seq;
             isExec = raw.type === "exec";
             const data = raw as WebAction;
+
+
+
             if (this.onAction) {
               const result = await this.onAction(data);
               const resType = isExec ? "execResult" : "actionResult";
@@ -773,7 +1080,9 @@ export class WebServer {
       this.reloadSettingsFromDisk();
     }, 10000); // Check every 10 seconds
 
+    const lanIp = getLocalIp() || "localhost";
     console.log(`Dashboard: http://localhost:${this.port}`);
+    console.log(`Dashboard (LAN): http://${lanIp}:${this.port}`);
   }
 
   stop(): void {

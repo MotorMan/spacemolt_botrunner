@@ -15,20 +15,60 @@ export interface RescueAnnouncement {
 
 const announcedRescues: RescueAnnouncement[] = [];
 
+// Track announcements we've already seen and logged (prevents repeated logging)
+// Key format: "${rescuerUsername}|${targetName}|${targetSystem}"
+const seenAnnouncements = new Set<string>();
+
 // Consider a rescue "active" for 10 minutes (600000 ms)
 // After that, assume it completed or failed
 const RESCUE_ACTIVE_MS = 600000;
+const ANNOUNCEMENT_SEEN_TTL_MS = 300000; // 5 minutes - announcements stay "seen" for 5 minutes
 
 /**
  * Record a rescue announcement from faction chat.
+ * Returns true if this is a new announcement we haven't seen before,
+ * false if we already processed/saw this announcement.
  */
-export function recordRescueAnnouncement(announcement: RescueAnnouncement): void {
+export function recordRescueAnnouncement(announcement: RescueAnnouncement): boolean {
+  // Check if we've already seen this announcement (prevent repeated logging)
+  const seenKey = `${announcement.rescuerUsername}|${announcement.targetName}|${announcement.targetSystem}`;
+  if (seenAnnouncements.has(seenKey)) {
+    return false; // Already seen this one
+  }
+  
+  // Mark as seen
+  seenAnnouncements.add(seenKey);
+  
+  // Now record it
   announcedRescues.push(announcement);
   
   // Clean up old entries (keep last 50)
   if (announcedRescues.length > 50) {
     announcedRescues.shift();
   }
+  
+  return true; // New announcement
+}
+
+/**
+ * Clear a seen announcement (when the rescue is completed or failed).
+ * This allows the same player/system to be announced again for a new rescue.
+ */
+export function clearSeenAnnouncement(targetName: string, targetSystem: string): void {
+  for (const rescuer of seenAnnouncements) {
+    const parts = rescuer.split('|');
+    if (parts.length >= 2 && parts[1] === targetName && parts[2] === targetSystem) {
+      seenAnnouncements.delete(rescuer);
+    }
+  }
+}
+
+/**
+ * Check if we've already seen this announcement (for conditional logging).
+ */
+export function haveSeenAnnouncement(rescuerUsername: string, targetName: string, targetSystem: string): boolean {
+  const seenKey = `${rescuerUsername}|${targetName}|${targetSystem}`;
+  return seenAnnouncements.has(seenKey);
 }
 
 /**
@@ -137,7 +177,7 @@ export function parseRescueAnnouncement(
   // Pattern 3: "for [name] at [system]" or "for [name] in [system]"
   // Example: "Launching rescue mission for Peon7 at Sol / Sol Station"
   if (!targetName) {
-    const forAtPattern = /for\s+([a-z0-9_\-\.]+)\s+(?:at|in)\s+([a-z0-9_\s\-]+)/i;
+    const forAtPattern = /for\s+([a-z0-9_\-\.]+)\s+(?:at|in)\s+([a-z0-9_\s\-/]+)/i;
     match = content.match(forAtPattern);
     if (match) {
       targetName = match[1];
@@ -178,6 +218,29 @@ export function cleanupExpiredAnnouncements(): void {
   if (valid.length < initialLength) {
     announcedRescues.length = 0;
     announcedRescues.push(...valid);
+  }
+  
+  // Also clean up expired "seen" announcements (older than ANNOUNCEMENT_SEEN_TTL_MS)
+  // These are tracked separately from the announcements array
+  // We iterate through and check timestamps in the announcements array
+  const expiredKeys: string[] = [];
+  for (const seenKey of seenAnnouncements) {
+    const parts = seenKey.split('|');
+    if (parts.length >= 3) {
+      const [, targetName, targetSystem] = parts;
+      // Find this announcement in the array
+      const announcement = announcedRescues.find(a => 
+        a.targetName === targetName && a.targetSystem === targetSystem
+      );
+      if (announcement && now - announcement.timestamp > ANNOUNCEMENT_SEEN_TTL_MS) {
+        expiredKeys.push(seenKey);
+      }
+    }
+  }
+  
+  // Remove expired keys
+  for (const key of expiredKeys) {
+    seenAnnouncements.delete(key);
   }
 }
 

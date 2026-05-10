@@ -1,5 +1,7 @@
 import type { Routine, RoutineContext } from "../bot.js";
+import type { BotChatMessage } from "../bot_chat_channel.js";
 import { mapStore } from "../mapstore.js";
+import { getBotChatChannel } from "../botmanager.js";
 import {
   isMinablePoi,
   isStationPoi,
@@ -23,7 +25,6 @@ import {
   fullSalvageWrecks,
   processTowedWrecks,
   getSystemInfo,
-  sleep,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
   getBattleStatus,
@@ -31,6 +32,49 @@ import {
   handleBattleNotifications,
   fleeFromBattle,
 } from "./common.js";
+import { getSystemBlacklist } from "../web/server.js";
+
+// ── Temporary pirate blacklist (in-memory) ────────────────────
+const temporaryPirateBlacklist = new Map<string, number>(); // systemId -> expiresAt timestamp
+
+/**
+ * Add a system to the temporary pirate blacklist.
+ * @param systemId System to blacklist
+ * @param durationMinutes How long to blacklist (default: 30 minutes)
+ */
+function addTemporaryPirateBlacklist(systemId: string, durationMinutes: number = 30): void {
+  const expiresAt = Date.now() + durationMinutes * 60 * 1000;
+  temporaryPirateBlacklist.set(systemId, expiresAt);
+  console.log(`[BLACKLIST] Added ${systemId} to temporary pirate blacklist for ${durationMinutes} minutes`);
+}
+
+/**
+ * Check if a system is temporarily blacklisted due to recent pirate activity.
+ */
+function isTemporarilyBlacklisted(systemId: string): boolean {
+  const expiresAt = temporaryPirateBlacklist.get(systemId);
+  if (!expiresAt) return false;
+
+  // Remove expired entries
+  if (Date.now() > expiresAt) {
+    temporaryPirateBlacklist.delete(systemId);
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Clean up expired temporary blacklists (call periodically).
+ */
+function cleanupTemporaryBlacklist(): void {
+  const now = Date.now();
+  for (const [systemId, expiresAt] of temporaryPirateBlacklist.entries()) {
+    if (now > expiresAt) {
+      temporaryPirateBlacklist.delete(systemId);
+    }
+  }
+}
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -53,6 +97,7 @@ function getSalvagerSettings(username?: string): {
   maxRoamJumps: number;
   roamBaseSystems: string[];
   depositAtSalvageYard: boolean;
+
 } {
   const all = readSettings();
   const m = all.salvager || {};
@@ -88,7 +133,39 @@ function getSalvagerSettings(username?: string): {
     maxRoamJumps: (m.maxRoamJumps as number) || 0, // 0 = no roaming beyond neighbors
     roamBaseSystems: parseStringArray(botOverrides.roamBaseSystems ?? m.roamBaseSystems),
     depositAtSalvageYard: (m.depositAtSalvageYard as boolean) ?? false,
+
   };
+}
+
+// ── Bot chat handler for escort queries ───────────────────────
+
+// ── Escort signaling ──────────────────────────────────────────
+
+async function signalEscort(
+  ctx: RoutineContext,
+  action: "jump" | "travel" | "dock" | "undock",
+  systemId?: string,
+  channel: "faction" | "local" | "file" | "chat" = "faction",
+): Promise<void> {
+  const { bot } = ctx;
+  const message = `[ESCORT] ${action}${systemId ? ` ${systemId}` : ""}`;
+
+  if (channel === "faction") {
+    await bot.exec("chat", { channel: "faction", content: message });
+  } else if (channel === "local") {
+    ctx.log("escort", `Signal: ${message}`);
+  } else if (channel === "chat") {
+    // Use non-API chat channel for instant coordination
+    ctx.sendBotChat?.(message, "escort");
+  } else {
+    // File-based signaling for cross-bot coordination on same machine
+    const { writeFileSync, existsSync, mkdirSync } = await import("fs");
+    const { join } = await import("path");
+    const escortDir = join(process.cwd(), "data", "escort_signals");
+    if (!existsSync(escortDir)) mkdirSync(escortDir, { recursive: true });
+    const signalFile = join(escortDir, `${bot.username}.signal`);
+    writeFileSync(signalFile, JSON.stringify({ action, systemId, timestamp: Date.now() }));
+  }
 }
 
 // ── BFS helpers for roaming ──────────────────────────────────
@@ -124,17 +201,23 @@ function findSystemsInRange(fromSystemId: string, maxHops: number): Array<{ syst
  * Build an ordered list of systems to roam through.
  * If roamBaseSystems are configured, use those as starting points (filtered by maxRoamJumps).
  * Otherwise, use the current system as the base.
+ * Systems on the blacklist or temporarily blacklisted are excluded.
  */
-function buildRoamList(currentSystem: string, maxRoamJumps: number, roamBaseSystems: string[]): string[] {
+function buildRoamList(currentSystem: string, maxRoamJumps: number, roamBaseSystems: string[], blacklist: string[]): string[] {
   const bases = roamBaseSystems.length > 0 ? roamBaseSystems : [currentSystem];
   const allSystems = new Set<string>();
+  const blacklistLower = blacklist.map(b => b.toLowerCase());
 
   for (const base of bases) {
-    // Always include the base
-    allSystems.add(base);
-    // Add systems within range
-    for (const sys of findSystemsInRange(base, maxRoamJumps)) {
-      allSystems.add(sys.systemId);
+    // Always include the base (unless blacklisted or temporarily blacklisted)
+    if (!blacklistLower.some(b => b === base.toLowerCase()) && !isTemporarilyBlacklisted(base)) {
+      allSystems.add(base);
+      // Add systems within range
+      for (const sys of findSystemsInRange(base, maxRoamJumps)) {
+        if (!blacklistLower.some(b => b === sys.systemId.toLowerCase()) && !isTemporarilyBlacklisted(sys.systemId)) {
+          allSystems.add(sys.systemId);
+        }
+      }
     }
   }
 
@@ -155,10 +238,31 @@ function buildRoamList(currentSystem: string, maxRoamJumps: number, roamBaseSyst
 export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
+  // Persistent battle state across cycles
+  const battleRef = { state: null as BattleState | null };
+  battleRef.state = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+    lastFleeTime: undefined,
+  };
+
   await bot.refreshStatus();
   const startSystem = bot.system;
   const settings0 = getSalvagerSettings(bot.username);
   const homeSystem0 = settings0.homeSystem || startSystem;
+
+  // Register chat handler for escort queries
+  const chatChannel = getBotChatChannel();
+  const chatHandler = (message: BotChatMessage) => {
+    if (message.channel === "escort" && message.recipients.includes(bot.username) && message.content === "QUERY_LOCATION") {
+      chatChannel.send({ sender: bot.username, recipients: [message.sender], channel: "escort", content: `LOCATION: ${bot.system}` });
+      ctx.log("escort", `Responded to location query: ${bot.system}`);
+    }
+  };
+  chatChannel.onMessage(bot.username, chatHandler);
 
   // ── Startup: return home and dump non-fuel cargo to storage ──
   await bot.refreshCargo();
@@ -195,13 +299,62 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   while (bot.state === "running") {
+    // Clean up expired temporary blacklists
+    cleanupTemporaryBlacklist();
+
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "salvager")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // Periodic battle status check (backup detection in case notifications fail)
+    // Check every cycle for fast detection
+    if (bot.isInBattle()) {
+      const now = Date.now();
+      if (!battleRef.state!.lastFleeTime || now - battleRef.state!.lastFleeTime > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", `PERIODIC CHECK: IN BATTLE! - initiating IMMEDIATE flee!`);
+        battleRef.state!.inBattle = true;
+        battleRef.state!.isFleeing = false;
+
+        // Add current system to temporary pirate blacklist to avoid returning soon
+        addTemporaryPirateBlacklist(bot.system);
+
+        await bot.exec("battle", { action: "stance", stance: "flee" });
+        battleRef.state!.lastFleeTime = now;
+        ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
+      }
+    }
+
+    // If we're in battle, re-issue flee command to ensure we stay in flee stance
+    if (battleRef.state!.inBattle) {
+      const now = Date.now();
+      if (!battleRef.state!.lastFleeTime || now - battleRef.state!.lastFleeTime > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", "Re-issuing flee stance (ensuring we stay in flee mode)...");
+        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (fleeResp.error) {
+          ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+        } else {
+          battleRef.state!.lastFleeTime = now;
+        }
+      }
+      // Check if we've successfully disengaged
+      const currentBattleStatus = await getBattleStatus(ctx);
+      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+        ctx.log("combat", "Battle cleared - no longer in combat!");
+        battleRef.state!.inBattle = false;
+        battleRef.state!.battleId = null;
+        battleRef.state!.isFleeing = false;
+        battleRef.state!.lastFleeTime = undefined;
+        await ctx.sleep(2000); // Brief pause before next check
+        continue;
+      }
+      // Still in battle - continue to next cycle
+      await ctx.sleep(2000); // Brief pause before next check
       continue;
     }
 
@@ -236,7 +389,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
     if (!fueled) {
       ctx.log("error", "Cannot refuel — waiting 30s...");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -253,10 +406,33 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Navigate to target system if configured ──
     const targetSystemId = settings.system || "";
     if (targetSystemId && targetSystemId !== bot.system) {
-      yield "navigate_to_target";
-      const arrived = await navigateToSystem(ctx, targetSystemId, safetyOpts);
-      if (!arrived) {
-        ctx.log("error", "Failed to reach target system — salvaging locally instead");
+      // Check if target system is blacklisted
+      const blacklist = getSystemBlacklist();
+      if (blacklist.some(b => b.toLowerCase() === targetSystemId.toLowerCase()) || isTemporarilyBlacklisted(targetSystemId)) {
+        ctx.log("error", `Target system ${targetSystemId} is blacklisted — salvaging locally instead`);
+      } else {
+        // Announce destination and signal escorts before traveling
+        const chatChannel = getBotChatChannel();
+        chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Going to ${targetSystemId}` });
+        ctx.log("escort", `Sent going to ${targetSystemId}`);
+
+        ctx.log("escort", `Signaling escorts to travel to ${targetSystemId}...`);
+        await signalEscort(ctx, "travel", targetSystemId, "chat");
+        await ctx.sleep(2000); // Brief pause to let escorts read the signal
+
+        yield "navigate_to_target";
+        const travelOpts = {
+          ...safetyOpts,
+          onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
+            const chatChannel = getBotChatChannel();
+            chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Jumping to ${nextSystem}` });
+          }
+        };
+
+        const arrived = await navigateToSystem(ctx, targetSystemId, travelOpts);
+        if (!arrived) {
+          ctx.log("error", "Failed to reach target system — salvaging locally instead");
+        }
       }
     }
 
@@ -284,7 +460,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (!skipScanning && visitPois.length === 0) {
       ctx.log("error", "No salvageable POIs in this system — waiting 60s");
-      await sleep(30000);
+      await ctx.sleep(30000);
       continue;
     }
 
@@ -325,7 +501,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
             battleState.isFleeing = false;
           } else {
             // Still in battle - wait briefly and continue to next cycle to re-flee
-            await sleep(2000);
+            await ctx.sleep(2000);
             continue;
           }
         }
@@ -405,7 +581,8 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Expand to roam systems if current system had no wrecks ──
     // Don't expand if already towing (need to deliver wreck first)
     if (!skipScanning && totalLooted === 0 && !cargoFull && !bot.towingWreck && bot.state === "running") {
-      const roamList = buildRoamList(bot.system, settings.maxRoamJumps, settings.roamBaseSystems);
+      const blacklist = getSystemBlacklist();
+      const roamList = buildRoamList(bot.system, settings.maxRoamJumps, settings.roamBaseSystems, blacklist);
 
       if (roamList.length > 0) {
         ctx.log("scavenge", `No wrecks locally — roaming across ${roamList.length} system(s): ${roamList.join(", ")}`);
@@ -433,10 +610,25 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
 
         yield "roam_system";
         ctx.log("travel", `Jumping to ${roamSystemId} to check for wrecks...`);
+
+        // Announce destination
+        const chatChannel = getBotChatChannel();
+        chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Going to ${roamSystemId}` });
+        ctx.log("escort", `Sent going to ${roamSystemId}`);
+        await signalEscort(ctx, "travel", roamSystemId, "chat");
+        await ctx.sleep(1000); // Brief pause
+
         await ensureUndocked(ctx);
         const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!fueled) break;
-        const arrived = await navigateToSystem(ctx, roamSystemId, safetyOpts);
+        const travelOpts = {
+          ...safetyOpts,
+          onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
+            const chatChannel = getBotChatChannel();
+            chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Jumping to ${nextSystem}` });
+          }
+        };
+        const arrived = await navigateToSystem(ctx, roamSystemId, travelOpts);
         if (!arrived) continue;
 
         // Scan roam system POIs (all non-station POIs — wrecks can spawn anywhere)
@@ -574,12 +766,24 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Navigate to salvage yard system if not already there
       if (targetSystem && bot.system !== targetSystem) {
+        // Announce destination
+        const chatChannel = getBotChatChannel();
+        chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Going to ${targetSystem}` });
+        await signalEscort(ctx, "travel", targetSystem, "chat");
+        await ctx.sleep(1000);
+
         yield "navigate_to_salvage_yard";
         ctx.log("travel", `Traveling to salvage yard system: ${targetSystem}...`);
-        const arrived = await navigateToSystem(ctx, targetSystem, {
+        const travelOpts = {
           ...safetyOpts,
           autoCloak: settings.autoCloak,
-        });
+          onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
+            const chatChannel = getBotChatChannel();
+            chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Jumping to ${nextSystem}` });
+            ctx.log("escort", `Sent jumping to ${nextSystem}`);
+          }
+        };
+        const arrived = await navigateToSystem(ctx, targetSystem, travelOpts);
         if (!arrived) {
           ctx.log("error", "Failed to reach salvage yard system — docking at nearest station");
         }
@@ -722,7 +926,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     const dockResp = await bot.exec("dock");
     if (dockResp.error && !dockResp.error.message.includes("already")) {
       ctx.log("error", `Dock failed: ${dockResp.error.message}`);
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
     bot.docked = true;
@@ -853,17 +1057,8 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     await bot.refreshStatus();
     const endFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Cycle done — ${bot.credits} credits, ${endFuel}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
-
-    // If we processed a towed wreck, restart the cycle immediately (don't continue scanning)
-    if (processedTow) {
-      ctx.log("scavenge", "Processed towed wreck — restarting cycle");
-      continue;
-    }
-
-    // If nothing was found, wait longer before next sweep
-    if (totalLooted === 0) {
-      ctx.log("scavenge", "No wrecks found — waiting 60s before next sweep");
-      await sleep(60000);
-    }
   }
+
+  // Unregister chat handler
+  chatChannel.offMessage(bot.username, chatHandler);
 };

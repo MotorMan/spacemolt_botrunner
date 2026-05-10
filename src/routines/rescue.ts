@@ -1,4 +1,7 @@
 import type { Routine, RoutineContext, BotStatus } from "../bot.js";
+import type { BotChatMessage } from "../bot_chat_channel.js";
+import * as fs from 'fs';
+import * as path from 'path';
 import {
   findStation,
   getSystemInfo,
@@ -11,12 +14,12 @@ import {
   scavengeWrecks,
   detectAndRecoverFromDeath,
   readSettings,
-  sleep,
   logStatus,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
   fleeFromBattle,
   type BattleState,
+  getBattleStatus,
   PIRATE_SYSTEMS,
   isPirateSystem,
   checkAndFleeFromPirates,
@@ -43,6 +46,7 @@ import {
   type RescueSession,
 } from "./rescueActivity.js";
 import { isKnownPlayer } from "../playernames.js";
+import { mapStore } from "../mapstore.js";
 import {
   shouldRescuePlayer,
   recordRescueRequest,
@@ -71,10 +75,13 @@ import {
   getCooperationSettings,
   isCooperationEnabled,
   sendRescueClaim,
-  processPrivateMessage,
+  processBotChatMessage,
   calculateJumpsToTarget,
   shouldProceedOrYield,
   isRescueClaimedByPartner,
+  registerCooperationHandler,
+  unregisterCooperationHandler,
+  recordRoundRobinComplete,
   type RescueClaim,
 } from "../cooperation/rescueCooperation.js";
 
@@ -82,6 +89,7 @@ import {
 
 function getRescueSettings(): {
   fuelThreshold: number;
+  ghostThreshold: number;
   rescueFuelCells: number;
   rescueCredits: number;
   scanIntervalSec: number;
@@ -92,57 +100,106 @@ function getRescueSettings(): {
   homeStation?: string;
   costPerJump: number;
   costPerFuel: number;
-  cooperationEnabled: boolean;
-  partnerBotName: string;
-  cooperationMaxDelaySeconds: number;
   creditTopOffAmount: number;
   creditTopOffMinThreshold: number;
   maydayPirateProximityThreshold: number;
   maydayPirateLockoutMinutes: number;
+  creditTopOffBot: string;
+  fleetRescueBot: string;
+  maydayRescueBot: string;
+  premiumFuelReserve: number;
 } {
   const all = readSettings();
   const r = all.rescue || {};
   const ft = all.fuel_transfer || {};
-  // Also check global settings for homeSystem
   const general = all.general || {};
   return {
-    /** Fuel % below which a bot is considered in need of rescue. */
     fuelThreshold: (r.fuelThreshold as number) || 10,
-    /** Number of fuel cells to deliver per rescue. */
     rescueFuelCells: (r.rescueFuelCells as number) || 10,
-    /** Credits to send per rescue (if docked at same station). */
     rescueCredits: (r.rescueCredits as number) || 500,
-    /** Seconds between fleet scans. */
     scanIntervalSec: (r.scanIntervalSec as number) || 30,
-    /** Keep own fuel above this %. */
     refuelThreshold: (r.refuelThreshold as number) || 60,
-    /** Maximum jumps away to respond to MAYDAYs (0 = unlimited). */
     maydayMaxJumps: (r.maydayMaxJumps as number) || 12,
-    /** Max fuel % for MAYDAY sender to be considered a valid rescue (avoids ambushes). */
     maydayFuelThreshold: (r.maydayFuelThreshold as number) || 15,
-    /** Home system from rescue settings, fuel_transfer settings, or global settings */
+    ghostThreshold: (r.ghostThreshold as number) || 3,
     homeSystem: (r.homeSystem as string) || (ft.homeSystem as string) || (general.homeSystem as string),
-    /** Home station ID (format: "systemId|stationId") */
     homeStation: (r.homeStation as string) || '',
-    /** Credits charged per jump for rescue billing */
     costPerJump: (r.costPerJump as number) || 50,
-    /** Credits charged per unit of fuel for rescue billing */
     costPerFuel: (r.costPerFuel as number) || 2,
-    /** Cooperation enabled for multi-bot coordination */
-    cooperationEnabled: (r.cooperationEnabled as boolean) || false,
-    /** Partner bot name for DM communication */
-    partnerBotName: (r.partnerBotName as string) || '',
-    /** Max acceptable delay for cooperation messages */
-    cooperationMaxDelaySeconds: (r.cooperationMaxDelaySeconds as number) || 30,
-    /** Credits threshold for topping off bots (0 = disabled) */
     creditTopOffAmount: (r.creditTopOffAmount as number) || 10000,
-    /** Minimum credits a bot must have before topping off (prevents constant top-offs) */
     creditTopOffMinThreshold: (r.creditTopOffMinThreshold as number) || 10000,
-    /** Maximum jumps from pirate base to decline MAYDAY (0 = disabled) */
     maydayPirateProximityThreshold: (r.maydayPirateProximityThreshold as number) || 5,
-    /** Minutes to lockout MAYDAYs from players near pirate bases */
     maydayPirateLockoutMinutes: (r.maydayPirateLockoutMinutes as number) || 30,
+    creditTopOffBot: (r.creditTopOffBot as string) || '',
+    fleetRescueBot: (r.fleetRescueBot as string) || '',
+    maydayRescueBot: (r.maydayRescueBot as string) || '',
+    premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
   };
+}
+
+/**
+ * Check if this bot is the primary assigned for credit top-off operations.
+ * Returns true if this bot is the primary credit top-off bot, or if no assignment exists (legacy behavior).
+ */
+function isPrimaryCreditTopOffBot(botUsername: string): boolean {
+  const settings = getRescueSettings();
+  if (!settings.creditTopOffBot) {
+    return true;
+  }
+  return botUsername === settings.creditTopOffBot;
+}
+
+/**
+ * Check if this bot is the primary assigned for fleet rescue operations.
+ * Returns true if this bot is the primary fleet rescue bot, or if no assignment exists (legacy behavior).
+ */
+function isPrimaryFleetRescueBot(botUsername: string): boolean {
+  const settings = getRescueSettings();
+  if (!settings.fleetRescueBot) {
+    return true;
+  }
+  return botUsername === settings.fleetRescueBot;
+}
+
+/**
+ * Check if this bot is the primary assigned for MAYDAY rescue operations.
+ * Returns true if this bot is the primary MAYDAY rescue bot, or if no assignment exists (legacy behavior).
+ */
+function isPrimaryMaydayRescueBot(botUsername: string): boolean {
+  const settings = getRescueSettings();
+  if (!settings.maydayRescueBot) {
+    return true;
+  }
+  return botUsername === settings.maydayRescueBot;
+}
+
+/**
+ * Get the backup bot username for a given rescue type.
+ * Returns the other rescue bot if there's one assigned, otherwise returns empty string.
+ */
+function getBackupBotForRescue(botUsername: string, rescueType: 'fleet' | 'mayday' | 'creditTopOff'): string {
+  const settings = getRescueSettings();
+  const fleet = (globalThis as any).getFleetStatus?.() || [];
+  
+  let primaryBot: string;
+  if (rescueType === 'fleet') {
+    primaryBot = settings.fleetRescueBot;
+  } else if (rescueType === 'mayday') {
+    primaryBot = settings.maydayRescueBot;
+  } else {
+    primaryBot = settings.creditTopOffBot;
+  }
+  
+  // If this bot is the primary, find the other bot
+  if (botUsername === primaryBot || !primaryBot) {
+    for (const b of fleet) {
+      if (b.username !== botUsername && b.state === 'running') {
+        return b.username;
+      }
+    }
+  }
+  
+  return '';
 }
 
 // ── Pirate Base Proximity & MAYDAY Lockout ──────────────────────────────────────────────────
@@ -245,7 +302,7 @@ async function checkForPirateTrap(
   targetUsername: string,
   targetSystem: string,
   isMaydayTarget: boolean,
-  settings: { partnerBotName: string; maydayMaxJumps: number }
+  settings: { maydayMaxJumps: number }
 ): Promise<{ isTrap: boolean; reason: string; details: Record<string, unknown> }> {
   const { bot } = ctx;
   const fleet = ctx.getFleetStatus?.() || [];
@@ -623,12 +680,12 @@ async function emergencyFleeFromPirates(
     // If battle was detected during polling, flee was already issued
     if (battleDetectedDuringJump) {
       ctx.log("combat", "Battle detected during rescue flee jump - waiting for flee to complete...");
-      await sleep(3000);
+      await ctx.sleep(3000);
       return;
     }
 
     // After fleeing, scan again to ensure we're safe
-    await sleep(2000);
+    await ctx.sleep(2000);
     const fled = await checkAndFleeFromPiratesRescue(ctx, "post-flee scan");
     if (fled) {
       ctx.log("combat", "⚠️ Pirates followed us! Continuing to flee...");
@@ -866,6 +923,159 @@ async function hasRefuelingPump(ctx: RoutineContext): Promise<boolean> {
 }
 
 /**
+ * Check if we have sufficient premium fuel cells in cargo for emergency reserves.
+ * Returns the quantity of premium fuel cells currently in cargo.
+ */
+async function getPremiumFuelCellsInCargo(ctx: RoutineContext): Promise<number> {
+  const { bot } = ctx;
+  await bot.refreshCargo();
+  const premiumCell = bot.inventory.find(i => i.itemId === "premium_fuel_cell");
+  return premiumCell?.quantity || 0;
+}
+
+/**
+ * Ensure we have the configured reserve of premium fuel cells in cargo.
+ * This is used to maintain emergency reserves for self-rescue scenarios.
+ * 
+ * @returns true if we have the required reserve (or acquired it), false if unable
+ */
+async function ensurePremiumFuelReserve(ctx: RoutineContext, reserveCount: number): Promise<boolean> {
+  const { bot } = ctx;
+  
+  if (reserveCount <= 0) {
+    return true; // No reserve needed
+  }
+  
+  const settings = getRescueSettings();
+  const currentPremium = await getPremiumFuelCellsInCargo(ctx);
+  
+  if (currentPremium >= reserveCount) {
+    ctx.log("rescue", `✓ Premium fuel reserve OK: ${currentPremium}/${reserveCount}`);
+    return true;
+  }
+  
+  ctx.log("rescue", `⚠️ Low premium fuel reserve: ${currentPremium}/${reserveCount} — acquiring more...`);
+  
+  // Must be docked to buy from market
+  if (!bot.docked) {
+    await ensureDocked(ctx);
+  }
+  
+  // First check faction storage
+  await bot.refreshFactionStorage();
+  const factionPremium = bot.factionStorage?.find(i => i.itemId === "premium_fuel_cell");
+  
+  if (factionPremium && factionPremium.quantity >= reserveCount) {
+    ctx.log("rescue", `Found ${factionPremium.quantity}x premium fuel cells in faction storage`);
+    const { collectFromStorage } = await import("./common.js");
+    await collectFromStorage(ctx);
+    await bot.refreshCargo();
+    const afterCollect = await getPremiumFuelCellsInCargo(ctx);
+    if (afterCollect >= reserveCount) {
+      ctx.log("rescue", `✓ Acquired premium fuel reserve from faction storage: ${afterCollect}/${reserveCount}`);
+      return true;
+    }
+  }
+  
+  // Try buying from market
+  const needed = reserveCount - currentPremium;
+  const marketResp = await bot.exec("view_market");
+  
+  if (!marketResp.error && marketResp.result) {
+    const mData = marketResp.result as Record<string, unknown>;
+    const items = (
+      Array.isArray(mData) ? mData :
+      Array.isArray(mData.items) ? mData.items :
+      Array.isArray(mData.market) ? mData.market :
+      []
+    ) as Array<Record<string, unknown>>;
+    
+    const premiumItem = items.find(i => 
+      ((i.item_id as string) || (i.id as string)) === "premium_fuel_cell"
+    );
+    
+    if (premiumItem) {
+      const itemId = (premiumItem.item_id as string) || (premiumItem.id as string) || "";
+      const price = (premiumItem.price as number) || (premiumItem.buy_price as number) || 0;
+      const available = (premiumItem.quantity as number) || (premiumItem.stock as number) || 0;
+      const qty = Math.min(needed, available);
+      
+      if (qty > 0 && (price * qty) <= bot.credits) {
+        ctx.log("rescue", `Buying ${qty}x premium fuel cells (${price}cr each)...`);
+        const buyResp = await bot.exec("buy", { item_id: itemId, quantity: qty });
+        if (!buyResp.error) {
+          await bot.refreshCargo();
+          const afterBuy = await getPremiumFuelCellsInCargo(ctx);
+          ctx.log("rescue", `✓ Acquired premium fuel reserve from market: ${afterBuy}/${reserveCount}`);
+          return afterBuy >= reserveCount;
+        } else {
+          ctx.log("rescue", `Buy failed: ${buyResp.error.message}`);
+        }
+      }
+    }
+  }
+  
+  // Try regular fuel cells if premium not available
+  ctx.log("rescue", `Premium fuel cells not available — trying regular fuel cells as fallback...`);
+  await bot.refreshCargo();
+  const regularFuel = bot.inventory.find(i => 
+    i.itemId.includes("fuel_cell") && i.itemId !== "premium_fuel_cell"
+  );
+  
+  if (regularFuel && regularFuel.quantity >= reserveCount) {
+    ctx.log("rescue", `✓ Using regular fuel cells as reserve: ${regularFuel.quantity}/${reserveCount}`);
+    return true;
+  }
+  
+  ctx.log("rescue", `⚠️ Could not maintain premium fuel reserve - continuing anyway`);
+  return false; // Not critical enough to fail the mission
+}
+
+/**
+ * Retrieve actual credits of a bot by parsing its debug log.
+ * Reads last 20 lines, finds most recent get_status response, extracts credits.
+ */
+async function getActualCreditsFromLog(botUsername: string, ctx: RoutineContext): Promise<number | null> {
+  const logDir = './data/logs';
+  const logFileName = `${botUsername}_debug.log`;
+  const logPath = path.resolve(logDir, logFileName);
+
+  try {
+    if (!fs.existsSync(logPath)) {
+      ctx.log("rescue", `💰 Log file not found for ${botUsername}: ${logPath}`);
+      return null;
+    }
+
+    const content = fs.readFileSync(logPath, 'utf-8');
+    const lines = content.split('\n').filter(l => l.trim());
+    const last20 = lines.slice(-20);
+
+    // Find most recent get_status response line
+    let statusLine: string | null = null;
+    for (let i = last20.length - 1; i >= 0; i--) {
+      if (last20[i].includes('get_status response') && last20[i].includes(botUsername)) {
+        statusLine = last20[i];
+        break;
+      }
+    }
+
+    if (!statusLine) {
+      ctx.log("rescue", `💰 No get_status response found in last 20 lines of ${botUsername}'s log`);
+      return null;
+    }
+
+    const jsonStart = statusLine.indexOf('{');
+    if (jsonStart === -1) return null;
+
+    const data = JSON.parse(statusLine.substring(jsonStart)) as { player?: { credits?: number } };
+    return data.player?.credits ?? null;
+  } catch (e) {
+    ctx.log("rescue", `💰 Error reading log for ${botUsername}: ${e}`);
+    return null;
+  }
+}
+
+/**
  * Credit top-off function — redistributes credits from faction treasury
  * to ONE bot that is running low, including self.
  * This is designed to be called repeatedly in a background loop,
@@ -894,46 +1104,132 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
   for (const member of fleet) {
     if (member.username === bot.username) continue;
     if (member.state !== "running" && member.state !== "idle") continue;
-    // Only top off if bot has less than minThreshold credits
-    if (member.credits >= minThreshold) continue;
-    if (member.credits >= targetAmount) continue;
 
-    const needed = targetAmount - member.credits;
-    ctx.log("rescue", `💰 ${member.username} has ${member.credits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+    const currentCredits = member.credits;
 
-    // Withdraw from faction treasury
-    ctx.log("rescue", `💰 Withdrawing ${needed}cr from faction treasury for ${member.username}...`);
+    // Track consecutive 0 credit readings
+    if (currentCredits === 0) {
+      const count = (consecutiveZeroCredits.get(member.username) || 0) + 1;
+      consecutiveZeroCredits.set(member.username, count);
+      ctx.log("rescue", `💰 ${member.username} has 0 credits (consecutive count: ${count})`);
+    } else {
+      if (consecutiveZeroCredits.has(member.username)) {
+        ctx.log("rescue", `💰 ${member.username} credits recovered to ${currentCredits}, reset consecutive 0 count`);
+        consecutiveZeroCredits.delete(member.username);
+      }
+      // Handle non-0 low credits as before
+      if (currentCredits >= minThreshold || currentCredits >= targetAmount) continue;
+      const needed = targetAmount - currentCredits;
+      ctx.log("rescue", `💰 ${member.username} has ${currentCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
+      //const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+      const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); //fixed by human!
+      if (withdrawResp.error) {
+        ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
+        return false;
+      }
+
+      ctx.log("rescue", `💰 Successfully withdrew ${needed}cr, sending to ${member.username}...`);
+      //const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
+      const giftResp = await bot.exec("storage", { action: 'deposit', target: member.username, item_id: 'credits', quantity: needed }); //fixed by human!
+      if (giftResp.error) {
+        ctx.log("rescue", `💰 Gift to ${member.username} failed: ${giftResp.error.message}`);
+        await bot.exec("faction_deposit_credits", { amount: needed });
+        return false;
+      } else {
+        ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
+        return true;
+      }
+    }
+
+    // Only proceed with 0-credit bots after 5 consecutive readings
+    const consecutiveCount = consecutiveZeroCredits.get(member.username) || 0;
+    if (consecutiveCount < 5) {
+      ctx.log("rescue", `💰 ${member.username} has 0 credits but only ${consecutiveCount} consecutive readings, need 5 to verify`);
+      continue;
+    }
+
+    // Verify actual credits via debug log
+    ctx.log("rescue", `💰 ${member.username} has 5 consecutive 0 credit readings, verifying via debug log...`);
+    const actualCredits = await getActualCreditsFromLog(member.username, ctx);
+    if (actualCredits === null) {
+      ctx.log("rescue", `💰 Failed to verify credits for ${member.username} from log, skipping`);
+      continue;
+    }
+
+    if (actualCredits >= minThreshold) {
+      ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr (>= ${minThreshold}), false 0 reading. Resetting count.`);
+      consecutiveZeroCredits.delete(member.username);
+      continue;
+    }
+
+    // Proceed with top-off using verified credits
+    const needed = targetAmount - actualCredits;
+    ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
     const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
     if (withdrawResp.error) {
       ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
-      return false; // treasury likely empty, stop trying
+      return false;
     }
 
     ctx.log("rescue", `💰 Successfully withdrew ${needed}cr, sending to ${member.username}...`);
-    // Send credits to the bot
     const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
     if (giftResp.error) {
       ctx.log("rescue", `💰 Gift to ${member.username} failed: ${giftResp.error.message}`);
-      // Re-deposit withdrawn credits back
       await bot.exec("faction_deposit_credits", { amount: needed });
       return false;
     } else {
       ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
-      return true; // Successfully topped off one bot
+      consecutiveZeroCredits.delete(member.username);
+      return true;
     }
   }
 
   // Top off self if needed
   ctx.log("rescue", `💰 No other bots need topping off, checking self...`);
   await bot.refreshStatus();
+
+  // Track consecutive 0 credits for self
+  if (bot.credits === 0) {
+    const count = (consecutiveZeroCredits.get(bot.username) || 0) + 1;
+    consecutiveZeroCredits.set(bot.username, count);
+    ctx.log("rescue", `💰 Self has 0 credits (consecutive count: ${count})`);
+  } else {
+    if (consecutiveZeroCredits.has(bot.username)) {
+      ctx.log("rescue", `💰 Self credits recovered to ${bot.credits}, reset consecutive 0 count`);
+      consecutiveZeroCredits.delete(bot.username);
+    }
+  }
+
   if (bot.credits < minThreshold) {
     if (bot.credits >= targetAmount) {
       ctx.log("rescue", `💰 Self credits OK (${bot.credits}cr >= ${targetAmount}cr), no action needed`);
       return false;
     }
-    
-    const needed = targetAmount - bot.credits;
-    ctx.log("rescue", `💰 Self has ${bot.credits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+
+    // Apply same 5-consecutive-0 check for self
+    const selfConsecutive = consecutiveZeroCredits.get(bot.username) || 0;
+    if (bot.credits === 0 && selfConsecutive < 5) {
+      ctx.log("rescue", `💰 Self has 0 credits but only ${selfConsecutive} consecutive readings, need 5 to verify`);
+      return false;
+    }
+
+    // Verify via log if credits are 0
+    let actualSelfCredits = bot.credits;
+    if (bot.credits === 0) {
+      ctx.log("rescue", `💰 Self has 0 credits, verifying via debug log...`);
+      const verified = await getActualCreditsFromLog(bot.username, ctx);
+      if (verified !== null) actualSelfCredits = verified;
+      if (actualSelfCredits >= minThreshold) {
+        ctx.log("rescue", `💰 Verified self has ${actualSelfCredits}cr, false 0 reading. Resetting count.`);
+        consecutiveZeroCredits.delete(bot.username);
+        return false;
+      }
+    }
+
+    const needed = targetAmount - actualSelfCredits;
+    ctx.log("rescue", `💰 Self has ${actualSelfCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
 
     const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
     if (withdrawResp.error) {
@@ -941,7 +1237,8 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       return false;
     }
 
-    ctx.log("rescue", `💰 Withdrew ${needed}cr from faction treasury for self (now at ${bot.credits + needed}cr)`);
+    ctx.log("rescue", `💰 Withdrew ${needed}cr from faction treasury for self (now at ${actualSelfCredits + needed}cr)`);
+    consecutiveZeroCredits.delete(bot.username);
     return true;
   }
 
@@ -951,6 +1248,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 
 // ── Background credit top-off state ──────────────────────────────────────────
 let creditTopOffIntervalId: NodeJS.Timeout | null = null;
+const consecutiveZeroCredits = new Map<string, number>(); // botUsername -> consecutive 0 credit count
 
 /**
  * Background credit top-off loop — runs independently every 60 seconds,
@@ -1095,16 +1393,36 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
   ctx.log("rescue", `✓ Marked ${ourBotNames.length} bots as our own (excluded from ghost tracking)`);
 
   // ── Start background credit top-off loop (non-blocking) ──
-  startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+  // Only the primary credit top-off bot should run this background loop
+  if (isPrimaryCreditTopOffBot(bot.username)) {
+    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+  } else {
+    ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
+  }
+
+  // ── Register Bot Chat handler for rescue cooperation ──
+  // This enables coordination with other rescue bots via Bot Chat Channel
+  const botChatHandler = (message: BotChatMessage) => {
+    if (message.sender === bot.username) return; // Ignore own messages
+    
+    const result = processBotChatMessage(message);
+    if (result.isClaim && result.claim) {
+      ctx.log("coop", `📥 Received rescue claim from ${result.claim.botName}: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps)`);
+    }
+  };
+
+  // Always register cooperation handler - Bot Chat Channel handles coordination automatically
+  registerCooperationHandler(bot.username, botChatHandler);
+  ctx.log("coop", `🤝 Registered Bot Chat handler for rescue cooperation`);
 
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "rescue")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -1257,7 +1575,7 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         ctx.log("rescue", `Session state '${recoveredSession.state}' - continuing return to home (${homeSystem})...`);
         bot.system = target.system;
         bot.poi = target.poi;
-        skipToReturnHome = true;
+skipToReturnHome = true;
       }
     }
 
@@ -1267,11 +1585,15 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       const fleet = ctx.getFleetStatus?.() || [];
       if (fleet.length === 0) {
         ctx.log("info", "No fleet data available — waiting...");
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
-      const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
+      // Check if we're the primary fleet rescue bot
+      const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+      ctx.log("rescue", `🔍 Fleet scan - primary fleet rescue: ${isFleetRescuePrimary ? 'YES (this bot)' : 'NO (waiting for ' + (settings.fleetRescueBot || 'other bot') + ')'} `);
+
+      const targets = isFleetRescuePrimary ? findStrandedBots(fleet, bot.username, settings.fuelThreshold) : [];
 
       // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
       for (const target of targets) {
@@ -1293,6 +1615,12 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
       cleanupStaleQueue();
 
       // ── Check for MAYDAY requests if no fleet targets ──
+      // Check if we're the primary MAYDAY rescue bot
+      const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
+      if (!isMaydayRescuePrimary) {
+        ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
+      }
+
       let maydayTarget: RescueTarget | null = null;
       if (targets.length === 0) {
         const mayday = getNextMayday();
@@ -1321,7 +1649,8 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
           ctx.log("mayday", `✓ Fuel check passed: ${mayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
-          const rescueDecision = shouldRescuePlayer(mayday.sender);
+          const ghostThresholdOverride = normalizeSystemName(mayday.system) === normalizeSystemName(bot.system) ? Infinity : settings.ghostThreshold;
+          const rescueDecision = shouldRescuePlayer(mayday.sender, ghostThresholdOverride);
           if (!rescueDecision.shouldRescue) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - ${rescueDecision.reason}`);
             markMaydayHandled(mayday);
@@ -1407,8 +1736,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           // ── RESCUE COOPERATION: Check with partner bot if enabled ──
           let partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
           
-          if (isCooperationEnabled() && settings.cooperationEnabled) {
-            ctx.log("coop", `🤝 Cooperation enabled (partner: ${settings.partnerBotName})`);
+          if (isCooperationEnabled()) {
+            ctx.log("coop", `🤝 Bot Chat Channel cooperation active`);
             ctx.log("coop", `🤝 MAYDAY: ${mayday.sender} at ${mayday.system}/${mayday.poi}`);
             
             if (partnerClaim) {
@@ -1525,7 +1854,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
           
           // ── RESCUE COOPERATION: Send claim to partner bot ──
-          if (isCooperationEnabled() && settings.cooperationEnabled) {
+          if (isCooperationEnabled()) {
             const myClaim: RescueClaim = {
               type: "RESCUE_CLAIM",
               player: mayday.sender,
@@ -1537,19 +1866,19 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             };
 
             // Send claim to partner bot and wait for it to complete
-            ctx.log("coop", `📧 Sending rescue claim to ${settings.partnerBotName}...`);
+            ctx.log("coop", `📧 Sending rescue claim to Bot Chat Channel...`);
             const sendResult = await sendRescueClaim(bot, myClaim);
             if (sendResult.ok) {
-              ctx.log("coop", `📧 Sent rescue claim to ${settings.partnerBotName}: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
+              ctx.log("coop", `📧 Sent rescue claim: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
             } else {
               ctx.log("coop", `⚠️ Failed to send rescue claim: ${sendResult.error}`);
             }
 
             // Wait briefly for partner's claim to arrive (accounts for chat delays)
-            // Use configured delay, default 3 seconds
-            const cooperationDelay = Math.min(settings.cooperationMaxDelaySeconds * 1000, 5000);
+            // Use default 3 second delay
+            const cooperationDelay = 3000;
             ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for partner claim...`);
-            await sleep(cooperationDelay);
+            await ctx.sleep(cooperationDelay);
 
             // Re-check for partner claims after delay
             partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
@@ -1615,7 +1944,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                       ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                       await fleeFromBattle(ctx);
-                      await sleep(5000);
+                      await ctx.sleep(5000);
                       continue;
                     }
                     ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -1680,7 +2009,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                   if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                     ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                     await fleeFromBattle(ctx);
-                    await sleep(5000);
+                    await ctx.sleep(5000);
                     continue;
                   }
                   ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -1717,7 +2046,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           idleStartTime = 0;
         }
 
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -1782,7 +2111,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     }
 
     if (!target) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -1790,7 +2119,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     if (!target.system || target.system.trim() === "") {
       ctx.log("rescue", `⚠️ Target ${target.username} has no valid system — refreshing status and skipping...`);
       ctx.log("rescue", `💡 This can happen with stale fleet data or hidden POIs`);
-      await sleep(settings.scanIntervalSec * 1000);
+      await ctx.sleep(settings.scanIntervalSec * 1000);
       continue;
     }
 
@@ -1893,7 +2222,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             const fueled = await ensureFueled(ctx, settings.refuelThreshold);
             if (!fueled) {
               ctx.log("error", "Cannot refuel self — waiting before retry...");
-              await sleep(settings.scanIntervalSec * 1000);
+              await ctx.sleep(settings.scanIntervalSec * 1000);
               continue;
             }
           } else {
@@ -1919,7 +2248,6 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
         // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names ──
         const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
-          partnerBotName: settings.partnerBotName,
           maydayMaxJumps: settings.maydayMaxJumps
         });
         if (trapCheck.isTrap) {
@@ -1938,7 +2266,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (mayday) markMaydayHandled(mayday);
           }
           
-          await sleep(settings.scanIntervalSec * 1000);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }
 
@@ -1963,43 +2291,132 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (mayday) markMaydayHandled(mayday);
           }
           
-          await sleep(settings.scanIntervalSec * 1000);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }
 
         // Also check if route to target passes through blacklisted systems
-        try {
-          const routeResp = await bot.exec("find_route", { target_system: target.system });
-          if (!routeResp.error && routeResp.result) {
-            const route = routeResp.result as Record<string, unknown>;
-            const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
-            
-            if (routeData) {
-              const blacklistedOnRoute = routeData.find(r =>
-                blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
-              );
-              
-              if (blacklistedOnRoute) {
-                ctx.log("rescue", `🚫 BLOCKED: Route to ${target.system} passes through blacklisted system "${blacklistedOnRoute.system_id}"`);
-                ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available`);
-                
-                const activeSession = getActiveRescueSession(bot.username);
-                if (activeSession) {
-                  await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
-                }
-                
-                if (isMaydayTarget) {
-                  const mayday = getNextMayday();
-                  if (mayday) markMaydayHandled(mayday);
-                }
-                
-                await sleep(settings.scanIntervalSec * 1000);
-                continue;
-              }
+        // Try multiple routes if the first one is blocked
+        let routeToTarget: Array<{ system_id: string; name: string }> | null = null;
+        let routeAttempts = 0;
+        const MAX_ROUTE_ATTEMPTS = 3;
+        
+        while (routeAttempts < MAX_ROUTE_ATTEMPTS && !routeToTarget) {
+          routeAttempts++;
+          
+          // First try the mapped route (uses blacklist internally)
+          if (routeAttempts === 1) {
+            const mappedRoute = mapStore.findRoute(bot.system, target.system, blacklist);
+            if (mappedRoute && mappedRoute.length > 1) {
+              // Convert array of system IDs to route format
+              routeToTarget = mappedRoute.map((sysId, idx) => ({
+                system_id: sysId,
+                name: sysId,
+              }));
+              ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found safe mapped route (${routeToTarget.length} systems)`);
+            } else {
+              ctx.log("rescue", `📍 Route attempt ${routeAttempts}: No mapped route found, trying server...`);
             }
           }
-        } catch (e) {
-          ctx.log("warn", `Could not validate route to ${target.system}: ${e}`);
+          
+          // Second attempt: Query server for route
+          if (!routeToTarget && routeAttempts === 2) {
+            try {
+              const routeResp = await bot.exec("find_route", { target_system: target.system });
+              if (!routeResp.error && routeResp.result) {
+                const route = routeResp.result as Record<string, unknown>;
+                const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+                
+                if (routeData && routeData.length > 0) {
+                  // Check if this route passes through blacklisted systems
+                  const blacklistedOnRoute = routeData.find(r =>
+                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                  );
+                  
+                  if (!blacklistedOnRoute) {
+                    routeToTarget = routeData;
+                    ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found safe server route (${routeToTarget.length} systems)`);
+                  } else {
+                    ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Server route blocked by "${blacklistedOnRoute.system_id}"`);
+                  }
+                }
+              }
+            } catch (e) {
+              ctx.log("warn", `Route attempt ${routeAttempts} failed: ${e}`);
+            }
+          }
+          
+          // Third attempt: Try server route and filter out blacklisted systems manually
+          if (!routeToTarget && routeAttempts === 3) {
+            try {
+              const routeResp = await bot.exec("find_route", { target_system: target.system });
+              if (!routeResp.error && routeResp.result) {
+                const route = routeResp.result as Record<string, unknown>;
+                const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+                
+                if (routeData && routeData.length > 1) {
+                  // Find the blacklisted system and try to find alternative path around it
+                  const blockedIdx = routeData.findIndex(r =>
+                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                  );
+                  
+                  if (blockedIdx > 0) {
+                    // Try to find a route from system before the blocked one to the system after
+                    const beforeBlocked = routeData[blockedIdx - 1]?.system_id;
+                    const afterBlocked = routeData[blockedIdx + 1]?.system_id;
+                    
+                    if (beforeBlocked && afterBlocked) {
+                      ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Trying to bypass blocked system "${routeData[blockedIdx].system_id}"`);
+                      
+                      // Try to find alternate route from beforeBlocked to afterBlocked
+                      const altRoute = mapStore.findRoute(beforeBlocked, afterBlocked, blacklist);
+                      if (altRoute && altRoute.length > 1) {
+                        // Combine: before blocked portion + alternate route + after blocked portion
+                        const beforePortion = routeData.slice(0, blockedIdx);
+                        const afterPortion = routeData.slice(blockedIdx + 1);
+                        
+                        // Insert alternate route (excluding endpoints since they're already in route)
+                        const altPortion = altRoute.slice(1, -1).map(sysId => ({
+                          system_id: sysId,
+                          name: sysId,
+                        }));
+                        
+                        routeToTarget = [...beforePortion, ...altPortion, ...afterPortion];
+                        ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found bypass route! Total ${routeToTarget.length} systems`);
+                      }
+                    }
+                  }
+                }
+              }
+            } catch (e) {
+              ctx.log("warn", `Route attempt ${routeAttempts} failed: ${e}`);
+            }
+          }
+          
+          // If we still don't have a route, wait a bit and retry
+          if (!routeToTarget && routeAttempts < MAX_ROUTE_ATTEMPTS) {
+            ctx.log("rescue", `📍 Route attempt ${routeAttempts} failed - retrying in 1s...`);
+            await ctx.sleep(1000);
+          }
+        }
+        
+        // If no safe route found after all attempts, abort
+        if (!routeToTarget) {
+          ctx.log("rescue", `🚫 BLOCKED: All routes to ${target.system} pass through blacklisted systems`);
+          ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available after ${MAX_ROUTE_ATTEMPTS} attempts`);
+          
+          const activeSession = getActiveRescueSession(bot.username);
+          if (activeSession) {
+            await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
+          }
+          
+          if (isMaydayTarget) {
+            const mayday = getNextMayday();
+            if (mayday) markMaydayHandled(mayday);
+          }
+          
+          await ctx.sleep(settings.scanIntervalSec * 1000);
+          continue;
         }
 
         ctx.log(logCategory, `Navigating to ${target.system}...`);
@@ -2066,7 +2483,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (failures >= 3) {
               ctx.log("error", `❌ ${failureReason} — ABORTING after ${failures} consecutive failures`);
               await failRescueSession(bot.username, `Aborted after ${failures} consecutive navigation failures`);
-              await sleep(settings.scanIntervalSec * 1000);
+              await ctx.sleep(settings.scanIntervalSec * 1000);
               continue;
             }
 
@@ -2077,7 +2494,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               await failRescueSession(bot.username, "Could not reach target system");
             }
           }
-          await sleep(settings.scanIntervalSec * 1000);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }
         // CRITICAL: Refresh status to update bot.system after navigation
@@ -2091,7 +2508,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (recoveredSession || getActiveRescueSession(bot.username)) {
             await failRescueSession(bot.username, "Pirates detected on arrival - fleeing");
           }
-          await sleep(5000);
+          await ctx.sleep(5000);
           continue;
         }
 
@@ -2103,70 +2520,125 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
       if (bot.state !== "running") break;
 
-      // ── Travel to stranded bot's POI ──
-      if (target.poi) {
-        yield "travel_to_target";
+       // ── Travel to stranded bot's POI ──
+       if (target.poi) {
+         yield "travel_to_target";
 
-        // CRITICAL: Refresh target's current position from fleet status after arriving at system
-        const fleet = ctx.getFleetStatus?.() || [];
-        const targetBot = fleet.find(b => b.username === target.username);
-        if (targetBot) {
-          const oldSystem = target.system;
-          const oldPoi = target.poi;
-          target.system = targetBot.system || target.system;
-          target.poi = targetBot.poi || target.poi;
-          target.docked = targetBot.docked;
-          if (oldSystem !== target.system || oldPoi !== target.poi) {
-            ctx.log("rescue", `📍 Target position updated after arrival: ${oldSystem}/${oldPoi} -> ${target.system}/${target.poi}`);
-          }
-        }
+         // CRITICAL: Refresh target's current position from fleet status after arriving at system
+         const fleet = ctx.getFleetStatus?.() || [];
+         const targetBot = fleet.find(b => b.username === target.username);
+         if (targetBot) {
+           const oldSystem = target.system;
+           const oldPoi = target.poi;
+           target.system = targetBot.system || target.system;
+           target.poi = targetBot.poi || target.poi;
+           target.docked = targetBot.docked;
+           if (oldSystem !== target.system || oldPoi !== target.poi) {
+             ctx.log("rescue", `📍 Target position updated after arrival: ${oldSystem}/${oldPoi} -> ${target.system}/${target.poi}`);
+           }
+         }
 
-        // Resolve POI name to POI ID by querying system info
-        let targetPoiId: string | null = null;
-        let targetPoiName: string = target.poi;
-        
-        try {
-          const { pois } = await getSystemInfo(ctx);
-          // Find POI by name (case-insensitive match)
-          const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
-          if (matchedPoi) {
-            targetPoiId = matchedPoi.id;
-            targetPoiName = matchedPoi.name;
-            ctx.log(logCategory, `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
-          } else {
-            // Try partial match as fallback
-            const partialMatch = pois.find(p => p.name.toLowerCase().includes(target.poi.toLowerCase()) || target.poi.toLowerCase().includes(p.name.toLowerCase()));
-            if (partialMatch) {
-              targetPoiId = partialMatch.id;
-              targetPoiName = partialMatch.name;
-              ctx.log(logCategory, `Partial POI match: "${target.poi}" -> ID: ${targetPoiId}`);
-            }
-          }
-        } catch (e) {
-          ctx.log("warn", `Could not query system POIs: ${e}`);
-        }
-        
-        // Use POI ID if resolved, otherwise fall back to name
-        const travelTarget = targetPoiId || target.poi;
-        
-        ctx.log(logCategory, `Traveling to ${target.username}'s location (${targetPoiName})...`);
-        const travelResp = await bot.exec("travel", { target_poi: travelTarget });
-        // Check for battle notifications after travel
-        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
-          ctx.log("combat", "Battle detected while traveling to POI - fleeing!");
-          continue;
-        }
-        if (travelResp.error && !travelResp.error.message.includes("already")) {
-          ctx.log("error", `Travel failed: ${travelResp.error.message}`);
-        } else {
-          // Success - update bot.poi with the resolved name
-          bot.poi = targetPoiName;
-        }
-        // Update session state after traveling to POI
-        if (recoveredSession || getActiveRescueSession(bot.username)) {
-          await updateRescueSession(bot.username, { state: "at_poi" });
-        }
-      }
+         // Resolve POI name to POI ID by querying system info
+         let targetPoiId: string | null = null;
+         let targetPoiName: string = target.poi;
+         
+         try {
+           const { pois } = await getSystemInfo(ctx);
+           // Find POI by name (case-insensitive match)
+           const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
+           if (matchedPoi) {
+             targetPoiId = matchedPoi.id;
+             targetPoiName = matchedPoi.name;
+             ctx.log(logCategory, `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
+           } else {
+             // Try partial match as fallback
+             const partialMatch = pois.find(p => p.name.toLowerCase().includes(target.poi.toLowerCase()) || target.poi.toLowerCase().includes(p.name.toLowerCase()));
+             if (partialMatch) {
+               targetPoiId = partialMatch.id;
+               targetPoiName = partialMatch.name;
+               ctx.log(logCategory, `Partial POI match: "${target.poi}" -> ID: ${targetPoiId}`);
+             }
+           }
+         } catch (e) {
+           ctx.log("warn", `Could not query system POIs: ${e}`);
+         }
+         
+         // Use POI ID if resolved, otherwise fall back to name
+         const travelTarget = targetPoiId || target.poi;
+         
+         ctx.log(logCategory, `Traveling to ${target.username}'s location (${targetPoiName})...`);
+         const travelResp = await bot.exec("travel", { target_poi: travelTarget });
+         
+         // Check for battle notifications after travel
+         if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+           ctx.log("combat", "Battle detected while traveling to POI - fleeing!");
+           continue;
+         }
+         
+         let travelSucceeded = !travelResp.error || travelResp.error.message.toLowerCase().includes("already");
+         
+         if (travelResp.error && !travelResp.error.message.toLowerCase().includes("already")) {
+           ctx.log("error", `Travel failed: ${travelResp.error.message}`);
+         }
+         
+         if (travelSucceeded) {
+           // Success - update bot.poi with the resolved name
+           bot.poi = targetPoiName;
+         } else {
+           // Travel failed - target may be at an unknown/hidden POI
+           ctx.log("rescue", `⚠️ Could not travel to ${targetPoiName} - POI may be hidden or unknown`);
+           ctx.log("rescue", `📡 Using get_nearby to scan for ${target.username} in the area...`);
+           
+           // Scan for nearby players to find the target
+           const nearbyResp = await bot.exec("get_nearby", { range: 50000 });
+           if (await checkBattleAfterCommand(ctx, nearbyResp.notifications, "get_nearby", battleState)) {
+             ctx.log("combat", "Battle detected during scan - fleeing!");
+             continue;
+           }
+           
+           if (!nearbyResp.error && nearbyResp.result) {
+             const data = nearbyResp.result as Record<string, unknown>;
+             const players = Array.isArray(data.players) ? data.players :
+                             Array.isArray(data.nearby) ? data.nearby :
+                             Array.isArray(data.ships) ? data.ships : [];
+             
+             let foundTarget = false;
+             for (const p of players as Array<Record<string, unknown>>) {
+               const username = (p.username as string) || (p.name as string);
+               if (username && username.toLowerCase() === target.username.toLowerCase()) {
+                 ctx.log("rescue", `✓ Found ${target.username} nearby via get_nearby scan`);
+                 foundTarget = true;
+                 // Update our position to be at the same POI as target
+                 bot.poi = (p.poi as string) || target.poi;
+                 break;
+               }
+             }
+             
+             if (!foundTarget) {
+               ctx.log("error", `${target.username} not found in nearby scan after failed POI travel`);
+               ctx.log("rescue", `Marking rescue as failed - target unreachable at this location`);
+               if (recoveredSession || getActiveRescueSession(bot.username)) {
+                 await failRescueSession(bot.username, `Target not found at ${target.system}/${target.poi} after POI travel failure`);
+                 const activeSession = getActiveRescueSession(bot.username);
+                 if (activeSession) {
+                   await completeRescueSession(bot.username);
+                 }
+               }
+               await ctx.sleep(settings.scanIntervalSec * 1000);
+               continue;
+             }
+           } else {
+             ctx.log("error", `get_nearby scan failed after POI travel failure: ${nearbyResp.error?.message || 'unknown error'}`);
+             await ctx.sleep(settings.scanIntervalSec * 1000);
+             continue;
+           }
+         }
+         
+         // Update session state after traveling to POI (or confirming presence via get_nearby)
+         if (recoveredSession || getActiveRescueSession(bot.username)) {
+           await updateRescueSession(bot.username, { state: "at_poi" });
+         }
+       }
 
       // ── Transfer fuel ──
       yield "transfer_fuel";
@@ -2183,7 +2655,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (recoveredSession || getActiveRescueSession(bot.username)) {
           await failRescueSession(bot.username, "Pirates detected before refuel - fleeing");
         }
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
 
@@ -2200,7 +2672,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             // Re-add to queue so another bot can try
             // (For now, just log - the MAYDAY is already marked as handled)
           }
-          await sleep(settings.scanIntervalSec * 1000);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }
 
@@ -2424,7 +2896,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -2486,7 +2958,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
               await fleeFromBattle(ctx);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
             ctx.log("error", `Travel to station failed: ${travelResp.error.message}`);
@@ -2645,6 +3117,10 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     if (recoveredSession || getActiveRescueSession(bot.username)) {
       await completeRescueSession(bot.username);
 
+      // Record round-robin completion for same-location coordination
+      recordRoundRobinComplete(target.system, bot.username);
+      ctx.log("coop", `📝 Recorded round-robin completion for ${target.system} by ${bot.username}`);
+
       // Also mark the queue entry as completed if this was our own bot
       if (isOwnBot(target.username)) {
         const queue = getRescueQueue();
@@ -2671,12 +3147,16 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     isReturningIdle = false;
 
     // Short cooldown before next scan
-    await sleep(10000);
+    await ctx.sleep(10000);
   }
 
   // Cleanup when routine exits
   stopCreditTopOffBackground();
-};
+  if (isCooperationEnabled()) {
+    unregisterCooperationHandler(bot.username, botChatHandler);
+    ctx.log("coop", `🤝 Unregistered Bot Chat handler for cooperation`);
+  }
+}
 
 // ── Manual Player Rescue routine ────────────────────────────
 
@@ -2708,7 +3188,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
   if (!rescueParams) {
     ctx.log("error", "No rescue parameters provided! Need targetSystem, targetPOI, and targetPlayer.");
-    await sleep(5000);
+    await ctx.sleep(5000);
     return;
   }
 
@@ -2720,25 +3200,71 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
   const settings = getRescueSettings();
 
+  // Persistent battle state across cycles
+  const battleState: BattleState = {
+    inBattle: false,
+    battleId: null,
+    battleStartTick: null,
+    lastHitTick: null,
+    isFleeing: false,
+    lastFleeTime: undefined,
+  };
+
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
-    if (await checkAndFleeFromBattle(ctx, "manual_rescue")) {
-      await sleep(5000);
+    if (await checkAndFleeFromBattle(ctx, "rescue")) {
+      await ctx.sleep(5000);
       continue;
     }
 
-    // ── Battle state tracking (per-cycle initialization) ──
-    const battleState: BattleState = {
-      inBattle: false,
-      battleId: null,
-      battleStartTick: null,
-      lastHitTick: null,
-      isFleeing: false,
-    };
+    // Periodic battle status check (backup detection in case notifications fail)
+    // Check every cycle for fast detection
+    if (bot.isInBattle()) {
+      const now = Date.now();
+      const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+      if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", `PERIODIC CHECK: IN BATTLE! - initiating IMMEDIATE flee!`);
+        battleState.inBattle = true;
+        battleState.isFleeing = false;
+
+        await bot.exec("battle", { action: "stance", stance: "flee" });
+        battleState.lastFleeTime = now;
+        ctx.log("combat", "Flee stance issued - will re-issue every cycle until disengaged!");
+      }
+    }
+
+    // If we're in battle, re-issue flee command to ensure we stay in flee stance
+    if (battleState.inBattle) {
+      const now = Date.now();
+      const timeSinceLastFlee = battleState.lastFleeTime ? now - battleState.lastFleeTime : Infinity;
+      if (timeSinceLastFlee > 10000) { // Only issue if more than 10 seconds since last flee
+        ctx.log("combat", "Re-issuing flee stance (ensuring we stay in flee mode)...");
+        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+        if (fleeResp.error) {
+          ctx.log("error", `Flee re-issue failed: ${fleeResp.error.message}`);
+        } else {
+          battleState.lastFleeTime = now;
+        }
+      }
+      // Check if we've successfully disengaged
+      const currentBattleStatus = await getBattleStatus(ctx);
+      if (!currentBattleStatus || !currentBattleStatus.is_participant) {
+        ctx.log("combat", "Battle cleared - no longer in combat!");
+        battleState.inBattle = false;
+        battleState.battleId = null;
+        battleState.isFleeing = false;
+        battleState.lastFleeTime = undefined;
+        await ctx.sleep(2000); // Brief pause before next check
+        continue;
+      }
+      // Still in battle - continue to next cycle
+      await ctx.sleep(2000); // Brief pause before next check
+      continue;
+    }
 
     // ── Check for Refueling Pump ──
     const hasPump = await hasRefuelingPump(ctx);
@@ -2759,7 +3285,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         const fueled = await ensureFueled(ctx, settings.refuelThreshold);
         if (!fueled) {
           ctx.log("error", "Cannot refuel self — aborting mission");
-          await sleep(5000);
+          await ctx.sleep(5000);
           return;
         }
       }
@@ -2775,7 +3301,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
       const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
       if (!arrived) {
         ctx.log("error", `Could not reach ${targetSystem} — aborting mission`);
-        await sleep(5000);
+        await ctx.sleep(5000);
         return;
       }
     }
@@ -2793,7 +3319,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
       const currentPoi = targetBotCheck.poi;
       if (currentSystem && currentSystem !== targetSystem) {
         ctx.log("rescue", `⚠️ Target moved from ${targetSystem} to ${currentSystem} - aborting manual rescue`);
-        await sleep(5000);
+        await ctx.sleep(5000);
         return;
       }
       if (currentPoi && currentPoi !== targetPOI) {
@@ -3000,7 +3526,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -3042,7 +3568,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
               await fleeFromBattle(ctx);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
           }
@@ -3119,7 +3645,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
   await bot.refreshStatus();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
-  
+
   if (settings.homeSystem) {
     ctx.log("system", `Home base configured: ${homeSystem}`);
   } else {
@@ -3140,11 +3666,11 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "mayday_rescue")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -3210,7 +3736,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         // No pending MAYDAYs - idle and wait
         ctx.log("mayday", "No pending MAYDAY requests - standing by...");
         yield "idle";
-        await sleep(10000); // Check every 10 seconds
+        await ctx.sleep(10000); // Check every 10 seconds
         continue;
       }
 
@@ -3238,14 +3764,21 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       }
       ctx.log("mayday", `✓ Fuel check passed: ${nextMayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
-      // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
-      const rescueDecision = shouldRescuePlayer(nextMayday.sender);
-      if (!rescueDecision.shouldRescue) {
-        ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - ${rescueDecision.reason}`);
-        markMaydayHandled(nextMayday);
-        continue;
-      }
-      ctx.log("mayday", `✓ BlackBook check passed: ${rescueDecision.reason}`);
+          // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
+          const ghostThresholdOverride = normalizeSystemName(nextMayday.system) === normalizeSystemName(bot.system) ? Infinity : settings.ghostThreshold;
+          const rescueDecision = shouldRescuePlayer(nextMayday.sender, ghostThresholdOverride);
+          if (!rescueDecision.shouldRescue) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - ${rescueDecision.reason}`);
+            // Check if decline is due to ghost threshold
+            const record = getPlayerRecord(nextMayday.sender);
+            if (record.ghostCount >= settings.ghostThreshold) {
+              ctx.log("mayday", `🚫 ${nextMayday.sender} is blacklisted due to ${record.ghostCount} ghost incidents (threshold: ${settings.ghostThreshold})`);
+              ctx.log("mayday", `📢 "if you wish to have your MAYDAY blacklist reviewed, please ask the BUSY represenative on the SpaceMolt Discord channel. Thank You."`);
+            }
+            markMaydayHandled(nextMayday);
+            continue;
+          }
+          ctx.log("mayday", `✓ BlackBook check passed: ${rescueDecision.reason}`);
 
       // Record rescue request for blackbook tracking
       recordRescueRequest(nextMayday.sender);
@@ -3255,7 +3788,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
     // mayday is guaranteed to be set at this point (either from recovery or fresh)
     if (!mayday) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -3279,7 +3812,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         const fueled = await ensureFueled(ctx, settings.refuelThreshold);
         if (!fueled) {
           ctx.log("error", "Cannot refuel self - cannot respond to MAYDAY");
-          await sleep(30000);
+          await ctx.sleep(30000);
           continue;
         }
       }
@@ -3309,7 +3842,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
     if (maxJumps > 0 && jumpsToTarget > maxJumps) {
       ctx.log("mayday", `⚠️ MAYDAY too far: ${jumpsToTarget} jumps (max: ${maxJumps}) - ignoring`);
       markMaydayHandled(mayday);
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
     
@@ -3376,7 +3909,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
           await failRescueSession(bot.username, "Could not reach target system");
         }
         markMaydayHandled(mayday);
-        await sleep(5000);
+        await ctx.sleep(5000);
         continue;
       }
       // Update session state after successful navigation
@@ -3582,7 +4115,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -3628,7 +4161,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
               await fleeFromBattle(ctx);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
           }
@@ -3690,12 +4223,14 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
     logStatus(ctx);
     ctx.log("mayday", "✓ Bot is docked and ready for next MAYDAY");
 
-    // Short cooldown before next scan
-    await sleep(5000);
-  }
+    // ── Ensure premium fuel reserve for emergency self-rescue ──
+    // This prevents the endless rescue loop by keeping fuel cells for when WE run out
+    yield "check_reserve";
+    await ensurePremiumFuelReserve(ctx, settings.premiumFuelReserve);
 
-  // Cleanup when routine exits
-  stopCreditTopOffBackground();
+    // Short cooldown before next scan
+    await ctx.sleep(10000);
+  }
 };
 
 /**
@@ -3816,7 +4351,12 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   }
 
   // ── Start background credit top-off loop (non-blocking) ──
-  startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+  // Only the primary credit top-off bot should run this background loop
+  if (isPrimaryCreditTopOffBot(bot.username)) {
+    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+  } else {
+    ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
+  }
 
   // Log category - determined when target is selected
   let logCategory: string = "rescue";
@@ -3824,11 +4364,11 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await sleep(30000); continue; }
+    if (!alive) { await ctx.sleep(30000); continue; }
 
     // ── Battle check ──
     if (await checkAndFleeFromBattle(ctx, "rescue")) {
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -3998,11 +4538,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       const fleet = ctx.getFleetStatus?.() || [];
       if (fleet.length === 0) {
         ctx.log("info", "No fleet data available — waiting...");
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
-      const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
+      // Check if we're the primary fleet rescue bot
+      const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+      ctx.log("rescue", `🔍 Fleet scan - primary fleet rescue: ${isFleetRescuePrimary ? 'YES (this bot)' : 'NO (waiting for ' + (settings.fleetRescueBot || 'other bot') + ')'} `);
+
+      const targets = isFleetRescuePrimary ? findStrandedBots(fleet, bot.username, settings.fuelThreshold) : [];
 
       // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
       for (const target of targets) {
@@ -4024,6 +4568,12 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       cleanupStaleQueue();
 
       // ── Check for MAYDAY requests if no fleet targets ──
+      // Check if we're the primary MAYDAY rescue bot
+      const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
+      if (!isMaydayRescuePrimary) {
+        ctx.log("mayday", `📡 Not primary MAYDAY rescue bot - waiting for ${settings.maydayRescueBot || 'primary bot'}`);
+      }
+
       let maydayTarget: RescueTarget | null = null;
       if (targets.length === 0) {
         const mayday = getNextMayday();
@@ -4052,7 +4602,8 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log("mayday", `✓ Fuel check passed: ${mayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
-          const rescueDecision = shouldRescuePlayer(mayday.sender);
+          const ghostThresholdOverride = normalizeSystemName(mayday.system) === normalizeSystemName(bot.system) ? Infinity : settings.ghostThreshold;
+          const rescueDecision = shouldRescuePlayer(mayday.sender, ghostThresholdOverride);
           if (!rescueDecision.shouldRescue) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - ${rescueDecision.reason}`);
             markMaydayHandled(mayday);
@@ -4138,8 +4689,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           // ── RESCUE COOPERATION: Check with partner bot if enabled ──
           let partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
           
-          if (isCooperationEnabled() && settings.cooperationEnabled) {
-            ctx.log("coop", `🤝 Cooperation enabled (partner: ${settings.partnerBotName})`);
+          if (isCooperationEnabled()) {
+            ctx.log("coop", `🤝 Bot Chat Channel cooperation active`);
             ctx.log("coop", `🤝 MAYDAY: ${mayday.sender} at ${mayday.system}/${mayday.poi}`);
             
             if (partnerClaim) {
@@ -4256,7 +4807,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
           
           // ── RESCUE COOPERATION: Send claim to partner bot ──
-          if (isCooperationEnabled() && settings.cooperationEnabled) {
+          if (isCooperationEnabled()) {
             const myClaim: RescueClaim = {
               type: "RESCUE_CLAIM",
               player: mayday.sender,
@@ -4268,19 +4819,19 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             };
 
             // Send claim to partner bot and wait for it to complete
-            ctx.log("coop", `📧 Sending rescue claim to ${settings.partnerBotName}...`);
+            ctx.log("coop", `📧 Sending rescue claim to Bot Chat Channel...`);
             const sendResult = await sendRescueClaim(bot, myClaim);
             if (sendResult.ok) {
-              ctx.log("coop", `📧 Sent rescue claim to ${settings.partnerBotName}: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
+              ctx.log("coop", `📧 Sent rescue claim: ${mayday.sender} at ${mayday.system} (${jumpsAway} jumps)`);
             } else {
               ctx.log("coop", `⚠️ Failed to send rescue claim: ${sendResult.error}`);
             }
 
             // Wait briefly for partner's claim to arrive (accounts for chat delays)
-            // Use configured delay, default 3 seconds
-            const cooperationDelay = Math.min(settings.cooperationMaxDelaySeconds * 1000, 5000);
+            // Use default 3 second delay
+            const cooperationDelay = 3000;
             ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for partner claim...`);
-            await sleep(cooperationDelay);
+            await ctx.sleep(cooperationDelay);
 
             // Re-check for partner claims after delay
             partnerClaim = isRescueClaimedByPartner(mayday.sender, mayday.system, mayday.poi, bot.username);
@@ -4344,7 +4895,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                       ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                       await fleeFromBattle(ctx);
-                      await sleep(5000);
+                      await ctx.sleep(5000);
                       continue;
                     }
                     ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -4409,7 +4960,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                   if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                     ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                     await fleeFromBattle(ctx);
-                    await sleep(5000);
+                    await ctx.sleep(5000);
                     continue;
                   }
                   ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -4490,7 +5041,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (!bot.docked) {
             await scavengeWrecks(ctx);
           }
-          await sleep(settings.scanIntervalSec * 1000);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }
       }
@@ -4503,7 +5054,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     if (!target) {
       // Should not happen, but safety check
-      await sleep(5000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -4511,7 +5062,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     if (!target.system || target.system.trim() === "") {
       ctx.log("rescue", `⚠️ Target ${target.username} has no valid system — refreshing status and skipping...`);
       ctx.log("rescue", `💡 This can happen with stale fleet data or hidden POIs`);
-      await sleep(settings.scanIntervalSec * 1000);
+      await ctx.sleep(settings.scanIntervalSec * 1000);
       continue;
     }
 
@@ -4615,7 +5166,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       const fueled = await ensureFueled(ctx, settings.refuelThreshold);
       if (!fueled) {
         ctx.log("error", "Cannot refuel self — waiting before retry...");
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
     } else {
@@ -4709,7 +5260,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (recoveredSession || getActiveRescueSession(bot.username)) {
           await failRescueSession(bot.username, "Could not acquire fuel cells or credits");
         }
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
     } else {
@@ -4725,7 +5276,6 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
       // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names ──
       const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
-        partnerBotName: settings.partnerBotName,
         maydayMaxJumps: settings.maydayMaxJumps
       });
       if (trapCheck.isTrap) {
@@ -4744,7 +5294,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (mayday) markMaydayHandled(mayday);
         }
         
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -4769,43 +5319,123 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (mayday) markMaydayHandled(mayday);
         }
         
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
       // Also check if route to target passes through blacklisted systems
-      try {
-        const routeResp = await bot.exec("find_route", { target_system: target.system });
-        if (!routeResp.error && routeResp.result) {
-          const route = routeResp.result as Record<string, unknown>;
-          const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
-          
-          if (routeData) {
-            const blacklistedOnRoute = routeData.find(r =>
-              blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
-            );
-            
-            if (blacklistedOnRoute) {
-              ctx.log("rescue", `🚫 BLOCKED: Route to ${target.system} passes through blacklisted system "${blacklistedOnRoute.system_id}"`);
-              ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available`);
-              
-              const activeSession = getActiveRescueSession(bot.username);
-              if (activeSession) {
-                await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
-              }
-              
-              if (isMaydayTarget) {
-                const mayday = getNextMayday();
-                if (mayday) markMaydayHandled(mayday);
-              }
-              
-              await sleep(settings.scanIntervalSec * 1000);
-              continue;
-            }
+      // Try multiple routes if the first one is blocked
+      let routeToTarget: Array<{ system_id: string; name: string }> | null = null;
+      let routeAttempts = 0;
+      const MAX_ROUTE_ATTEMPTS = 3;
+      
+      while (routeAttempts < MAX_ROUTE_ATTEMPTS && !routeToTarget) {
+        routeAttempts++;
+        
+        // First try the mapped route (uses blacklist internally)
+        if (routeAttempts === 1) {
+          const mappedRoute = mapStore.findRoute(bot.system, target.system, blacklist);
+          if (mappedRoute && mappedRoute.length > 1) {
+            routeToTarget = mappedRoute.map((sysId, idx) => ({
+              system_id: sysId,
+              name: sysId,
+            }));
+            ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found safe mapped route (${routeToTarget.length} systems)`);
+          } else {
+            ctx.log("rescue", `📍 Route attempt ${routeAttempts}: No mapped route found, trying server...`);
           }
         }
-      } catch (e) {
-        ctx.log("warn", `Could not validate route to ${target.system}: ${e}`);
+        
+        // Second attempt: Query server for route
+        if (!routeToTarget && routeAttempts === 2) {
+          try {
+            const routeResp = await bot.exec("find_route", { target_system: target.system });
+            if (!routeResp.error && routeResp.result) {
+              const route = routeResp.result as Record<string, unknown>;
+              const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+              
+              if (routeData && routeData.length > 0) {
+                const blacklistedOnRoute = routeData.find(r =>
+                  blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                );
+                
+                if (!blacklistedOnRoute) {
+                  routeToTarget = routeData;
+                  ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found safe server route (${routeToTarget.length} systems)`);
+                } else {
+                  ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Server route blocked by "${blacklistedOnRoute.system_id}"`);
+                }
+              }
+            }
+          } catch (e) {
+            ctx.log("warn", `Route attempt ${routeAttempts} failed: ${e}`);
+          }
+        }
+        
+        // Third attempt: Try server route and filter out blacklisted systems manually
+        if (!routeToTarget && routeAttempts === 3) {
+          try {
+            const routeResp = await bot.exec("find_route", { target_system: target.system });
+            if (!routeResp.error && routeResp.result) {
+              const route = routeResp.result as Record<string, unknown>;
+              const routeData = route.route as Array<{ system_id: string; name: string }> | undefined;
+              
+              if (routeData && routeData.length > 1) {
+                const blockedIdx = routeData.findIndex(r =>
+                  blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                );
+                
+                if (blockedIdx > 0) {
+                  const beforeBlocked = routeData[blockedIdx - 1]?.system_id;
+                  const afterBlocked = routeData[blockedIdx + 1]?.system_id;
+                  
+                  if (beforeBlocked && afterBlocked) {
+                    ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Trying to bypass blocked system "${routeData[blockedIdx].system_id}"`);
+                    
+                    const altRoute = mapStore.findRoute(beforeBlocked, afterBlocked, blacklist);
+                    if (altRoute && altRoute.length > 1) {
+                      const beforePortion = routeData.slice(0, blockedIdx);
+                      const afterPortion = routeData.slice(blockedIdx + 1);
+                      
+                      const altPortion = altRoute.slice(1, -1).map(sysId => ({
+                        system_id: sysId,
+                        name: sysId,
+                      }));
+                      
+                      routeToTarget = [...beforePortion, ...altPortion, ...afterPortion];
+                      ctx.log("rescue", `📍 Route attempt ${routeAttempts}: Found bypass route! Total ${routeToTarget.length} systems`);
+                    }
+                  }
+                }
+              }
+            }
+          } catch (e) {
+            ctx.log("warn", `Route attempt ${routeAttempts} failed: ${e}`);
+          }
+        }
+        
+        if (!routeToTarget && routeAttempts < MAX_ROUTE_ATTEMPTS) {
+          ctx.log("rescue", `📍 Route attempt ${routeAttempts} failed - retrying in 1s...`);
+          await ctx.sleep(1000);
+        }
+      }
+      
+      if (!routeToTarget) {
+        ctx.log("rescue", `🚫 BLOCKED: All routes to ${target.system} pass through blacklisted systems`);
+        ctx.log("rescue", `🚫 ABORTING RESCUE - no safe route available after ${MAX_ROUTE_ATTEMPTS} attempts`);
+        
+        const activeSession = getActiveRescueSession(bot.username);
+        if (activeSession) {
+          await failRescueSession(bot.username, "Aborted - route passes through blacklisted system");
+        }
+        
+        if (isMaydayTarget) {
+          const mayday = getNextMayday();
+          if (mayday) markMaydayHandled(mayday);
+        }
+        
+        await ctx.sleep(settings.scanIntervalSec * 1000);
+        continue;
       }
 
       ctx.log(logCategory, `Navigating to ${target.system}...`);
@@ -4872,7 +5502,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (failures >= 3) {
             ctx.log("error", `❌ ${failureReason} — ABORTING after ${failures} consecutive failures`);
             await failRescueSession(bot.username, `Aborted after ${failures} consecutive navigation failures`);
-            await sleep(settings.scanIntervalSec * 1000);
+            await ctx.sleep(settings.scanIntervalSec * 1000);
             continue;
           }
 
@@ -4883,7 +5513,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             await failRescueSession(bot.username, "Could not reach target system");
           }
         }
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -4987,7 +5617,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
             ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
             await fleeFromBattle(ctx);
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
         }
@@ -5019,7 +5649,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
                 if (!jumpResp.error || jumpResp.error.message.includes("already")) {
                   // Now jump back to the target POI
-                  await sleep(2000); // Brief pause for system to update
+                  await ctx.sleep(2000); // Brief pause for system to update
 
                   ctx.log("rescue", `🚀 Jumping back to ${targetPoiName} from ${jumpGate.name}...`);
                   const returnResp = await bot.exec("travel", { target_poi: travelTarget });
@@ -5055,7 +5685,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         // If we haven't succeeded and this is our bot, refresh position again
         if (!travelSuccess && isOurBot && travelAttempts < maxTravelAttempts) {
           ctx.log("rescue", `⏳ Waiting before next attempt for ${target.username}...`);
-          await sleep(3000);
+          await ctx.sleep(3000);
         }
       }
 
@@ -5092,7 +5722,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 const jumpResp = await bot.exec("travel", { target_poi: jumpGate.id });
                 
                 if (!jumpResp.error || jumpResp.error.message.includes("already")) {
-                  await sleep(2000);
+                  await ctx.sleep(2000);
                   ctx.log("rescue", `🚀 Jumping back to ${target.poi} from ${jumpGate.name}...`);
                   const returnResp = await bot.exec("travel", { target_poi: target.poi });
                   
@@ -5137,35 +5767,42 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             }
             
             // Don't fail the session permanently - just continue the loop
-            await sleep(10000);
+            await ctx.sleep(10000);
             continue;
-          }
-          
-          // For non-own bots, record ghost and fail normally
-          recordGhost(target.username);
-          const currentGhosts = getPlayerRecord(target.username).ghostCount;
-          ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
-          
-          // Send grumpy faction chat message about being ghosted
-          const aiChatService = (globalThis as any).aiChatService;
-          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-            try {
-              const result = await aiChatService.sendFactionMessage(bot, {
-                messageType: "rescue_no_show",
-                targetName: target.username,
-                isMayday: isMaydayTarget,
-                isBot: !isMaydayTarget,
-                currentSystem: bot.system,
-                targetSystem: target.system,
-                targetPoi: target.poi || undefined,
-              });
-              if (!result.ok) {
-                ctx.log("ai_chat_debug", `Faction announcement (no_show) skipped: ${result.error}`);
+           } else {
+            // For non-own bots, record ghost and fail normally
+            recordGhost(target.username);
+            const currentGhosts = getPlayerRecord(target.username).ghostCount;
+            if (currentGhosts < 0) {
+              ctx.log("rescue", `👻 Skipped ghost recording for ${target.username} (our own bot)`);
+            } else {
+              ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
+              if (currentGhosts >= 5) {
+                ctx.log("rescue", `⚠️ ${target.username} has ${currentGhosts} ghost incidents (>=5 threshold). Continued ghosting will result in permanent blacklist!`);
               }
-            } catch (e) {
-              ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
             }
-          }
+
+            // Send grumpy faction chat message about being ghosted
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+              try {
+                const result = await aiChatService.sendFactionMessage(bot, {
+                  messageType: "rescue_no_show",
+                  targetName: target.username,
+                  isMayday: isMaydayTarget,
+                  isBot: !isMaydayTarget,
+                  currentSystem: bot.system,
+                  targetSystem: target.system,
+                  targetPoi: target.poi || undefined,
+                });
+                if (!result.ok) {
+                  ctx.log("ai_chat_debug", `Faction announcement (no_show) skipped: ${result.error}`);
+                }
+              } catch (e) {
+                ctx.log("warn", `AI faction message (no_show) failed: ${e}`);
+              }
+            }
+           }
           
           if (recoveredSession || getActiveRescueSession(bot.username)) {
             await failRescueSession(bot.username, "Could not reach target - all attempts failed");
@@ -5229,7 +5866,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                   ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                   await fleeFromBattle(ctx);
-                  await sleep(5000);
+                  await ctx.sleep(5000);
                   continue;
                 }
               }
@@ -5290,7 +5927,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             }
             
             // Retry by continuing the loop without failing the session
-            await sleep(5000);
+            await ctx.sleep(5000);
             continue;
           }
 
@@ -5300,8 +5937,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (currentGhosts < 0) {
             ctx.log("rescue", `👻 Skipped ghost recording for ${target.username} (our own bot)`);
           } else {
-            ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
-          }
+             ctx.log("rescue", `👻 Recorded ghost incident for ${target.username} (total ghosts: ${currentGhosts})`);
+             if (currentGhosts >= 5) {
+               ctx.log("rescue", `⚠️ ${target.username} has ${currentGhosts} ghost incidents (>=5 threshold). Continued ghosting will result in permanent blacklist!`);
+             }
+           }
 
           // Send grumpy faction chat message about being ghosted
           const aiChatService = (globalThis as any).aiChatService;
@@ -5351,7 +5991,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                       ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                       await fleeFromBattle(ctx);
-                      await sleep(5000);
+                      await ctx.sleep(5000);
                       continue;
                     }
                   }
@@ -5387,7 +6027,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
       if (!targetPlayerId) {
         ctx.log("error", `Could not find player ID for ${target.username} — aborting transfer`);
-        await sleep(settings.scanIntervalSec * 1000);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
 
@@ -5496,7 +6136,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
               await fleeFromBattle(ctx);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
           }
@@ -5643,7 +6283,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
                 ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
                 await fleeFromBattle(ctx);
-                await sleep(5000);
+                await ctx.sleep(5000);
                 continue;
               }
               ctx.log("error", `❌ Failed to travel to home station: ${travelResp.error.message}`);
@@ -5689,7 +6329,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (travelResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
               ctx.log("combat", `Travel interrupted by battle! ${travelResp.error.message} - fleeing!`);
               await fleeFromBattle(ctx);
-              await sleep(5000);
+              await ctx.sleep(5000);
               continue;
             }
           }
@@ -5726,6 +6366,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     await bot.refreshStatus();
     logStatus(ctx);
 
+    // ── Ensure premium fuel reserve for emergency self-rescue ──
+    // This prevents the endless rescue loop by keeping fuel cells for when WE run out
+    yield "check_reserve";
+    await ensurePremiumFuelReserve(ctx, settings.premiumFuelReserve);
+
     // ── Complete the rescue session ──
     if (recoveredSession || getActiveRescueSession(bot.username)) {
       await completeRescueSession(bot.username);
@@ -5752,7 +6397,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     isReturningIdle = false;
 
     // Short cooldown before next scan
-    await sleep(10000);
+    await ctx.sleep(10000);
   }
 
   // Cleanup when routine exits

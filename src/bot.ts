@@ -1,3 +1,5 @@
+import { appendFileSync, existsSync, mkdirSync } from "fs";
+import { join } from "path";
 import { SpaceMoltAPI, type ApiResponse } from "./api.js";
 import { SessionManager, type Credentials } from "./session.js";
 import { log, logError, logNotifications } from "./ui.js";
@@ -6,7 +8,8 @@ import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
-import { processPrivateMessage as processCooperationPrivateMessage } from "./cooperation/rescueCooperation.js";
+import { getFactionStorageCache, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
+import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -39,8 +42,9 @@ export interface BotStatus {
   docked: boolean;
   lastAction: string;
   error: string | null;
-  shipName: string;
-  hull: number;
+   shipName: string;
+   shipClass: string;
+   hull: number;
   maxHull: number;
   shield: number;
   maxShield: number;
@@ -54,6 +58,8 @@ export interface RoutineContext {
   api: SpaceMoltAPI;
   bot: Bot;
   log: (category: string, message: string) => void;
+  /** Interruptible sleep - checks for stop signal periodically. */
+  sleep: (ms: number) => Promise<void>;
   /** Optional: get status of all bots in the fleet (used by rescue routine). */
   getFleetStatus?: () => BotStatus[];
   /** Optional: send a chat message to other bots. */
@@ -88,12 +94,16 @@ export class Bot {
   readonly username: string;
   readonly api: SpaceMoltAPI;
   readonly session: SessionManager;
+  private baseDir: string;
   private color: string;
   private _state: BotState = "idle";
   private _routine: string | null = null;
   private _lastAction = "";
   private _error: string | null = null;
   private _abortController: AbortController | null = null;
+  private pendingCommands = new Map<string, AbortController>();
+  private lastSystem = "unknown";
+  private lastPoi = "";
 
   // Cached game state from last get_status
   credits = 0;
@@ -105,8 +115,9 @@ export class Bot {
   system = "unknown";
   poi = "";
   docked = false;
-  shipName = "";
-  hull = 0;
+   shipName = "";
+   shipClass = "";
+   hull = 0;
   maxHull = 0;
   shield = 0;
   maxShield = 0;
@@ -133,11 +144,17 @@ export class Bot {
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
+  /** Cached ship speed from last get_status (1-6, where 1 is slowest, 6 is fastest). */
+  shipSpeed = 1;
+
   /** Cached installed mod IDs from last refreshShipMods(). */
   installedMods: string[] = [];
 
   /** Accumulated stats for this bot. */
   stats: BotStats = { totalMined: 0, totalCrafted: 0, totalTrades: 0, totalProfit: 0, totalSystems: 0 };
+
+  /** Bot-specific settings loaded from disk. */
+  settings?: Record<string, unknown>;
 
   // Action log (last N entries)
   readonly actionLog: string[] = [];
@@ -177,10 +194,18 @@ export class Bot {
   /** Optional callback for faction activity log entries. */
   onFactionLog?: (username: string, line: string) => void;
 
-  /** Cached skill levels for detecting level-ups. */
-  private skillLevels: Map<string, number> = new Map();
+   /** Cached skill levels for detecting level-ups. */
+   private skillLevels: Map<string, number> = new Map();
+   /** Cached skill XP for tracking gains. */
+   private skillXP: Map<string, number> = new Map();
+   /** Cached total cumulative XP (if available from API). */
+   private skillTotalXP: Map<string, number> = new Map();
+   /** Cached XP-to-next for accurate gain calculation across level-ups. */
+   private skillXpToNext: Map<string, number> = new Map();
+   /** Snapshot of skills (level, XP, totalXP, xpToNext) taken before a command to measure gains. */
+   private skillSnapshot: Map<string, { level: number; xp: number; totalXP?: number; xpToNext?: number }> = new Map();
 
-  /** Timestamp of the last faction combat alert (ms). Rate-limits chat spam. */
+   /** Timestamp of the last faction combat alert (ms). Rate-limits chat spam. */
   private lastCombatAlertMs = 0;
   private static readonly COMBAT_ALERT_COOLDOWN_MS = 30_000;
 
@@ -188,11 +213,16 @@ export class Bot {
   private lastWarningAlertMs = 0;
   private static readonly WARNING_ALERT_COOLDOWN_MS = 60_000;
 
+  /** Timestamp of the last battle response to AI chat service (ms). Prevents spam. */
+  private lastBattleResponseMs = 0;
+  private static readonly BATTLE_RESPONSE_COOLDOWN_MS = 15000;
+
   /** Track ongoing login to prevent duplicate concurrent logins */
   private _loginPromise: Promise<boolean> | null = null;
 
   constructor(username: string, baseDir: string) {
     this.username = username;
+    this.baseDir = baseDir;
     this.api = new SpaceMoltAPI();
     this.api.setBotName(username);
     this.session = new SessionManager(username, baseDir);
@@ -200,9 +230,24 @@ export class Bot {
     this.api.setSessionManager(this.session);
     this.color = BOT_COLORS[colorIndex % BOT_COLORS.length];
     colorIndex++;
-    
+
     // Initialize player name tracking
     playerNameStore.setBotName(username);
+  }
+
+  private logPosition(): void {
+    const dataDir = join(this.baseDir, "data");
+    if (!existsSync(dataDir)) {
+      mkdirSync(dataDir, { recursive: true });
+    }
+    const logFile = join(dataDir, "bot_positions.csv");
+    const header = "bot_name,time,system_id,poi_id\n";
+    if (!existsSync(logFile)) {
+      appendFileSync(logFile, header);
+    }
+    const time = new Date().toISOString();
+    const line = `${this.username},${time},${this.system},${this.poi}\n`;
+    appendFileSync(logFile, line);
   }
 
   get state(): BotState {
@@ -228,17 +273,21 @@ export class Bot {
     payload: Record<string, unknown> | undefined,
     timeoutMs: number,
     targetId: string,
+    abortSignal?: AbortSignal,
   ): Promise<ApiResponse> {
-    // Race the API call against a timeout
-    const apiPromise = this.api.execute(command, payload);
+    // Race the API call against a timeout and abort
+    const apiPromise = this.api.execute(command, payload, abortSignal);
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(() => reject(new Error(`TIMEOUT`)), timeoutMs);
     });
+    const abortPromise = abortSignal ? new Promise<never>((_, reject) => {
+      abortSignal.addEventListener('abort', () => reject(new Error('ABORTED')));
+    }) : new Promise(() => {}); // Never resolves if no signal
 
     try {
-      return await Promise.race([apiPromise, timeoutPromise]);
+      return await Promise.race([apiPromise, timeoutPromise, abortPromise]) as ApiResponse;
     } catch (err) {
-      if (err instanceof Error && err.message === "TIMEOUT") {
+      if (err instanceof Error && (err.message === "TIMEOUT" || err.message === "ABORTED")) {
         this.log("warn", `${command} timed out after ${timeoutMs / 1000}s — checking position...`);
         // Refresh status to see where we actually are
         await this.refreshStatus();
@@ -283,6 +332,16 @@ export class Bot {
           }
         }
 
+        // For mine/jettison: check if interrupted by battle (timeout or abort)
+        if ((command === "mine" || command === "jettison") && this.currentBattle.inBattle) {
+          this.log("combat", `${command} interrupted by battle! Battle ID: ${this.currentBattle.battleId}`);
+          return {
+            error: { code: "battle_interrupt", message: `${command} interrupted by battle ${this.currentBattle.battleId}` },
+            result: undefined,
+            notifications: [],
+          };
+        }
+
         // Not at target — return timeout error so caller can retry
         this.log("error", `${command} timed out — not at target ${targetId} (currently at ${this.system}/${this.poi})`);
         return {
@@ -294,6 +353,75 @@ export class Bot {
       // Re-throw other errors
       throw err;
     }
+  }
+
+  /**
+   * Calculate the appropriate timeout for a jump command based on ship speed.
+   * Uses configurable jump times from settings (with defaults if not set).
+   * If towing a wreck, speed is reduced by 50% (timeout increased accordingly).
+   * Adds configurable buffer (default 10s = 1 game tick) to the base jump time.
+   */
+  private calculateJumpTimeout(): number {
+    // Get jump times from settings or use defaults
+    const settings = (this as any).settings || {};
+    const generalSettings = settings.general || {};
+
+    const jumpTimes: Record<number, number> = {
+      1: generalSettings.jumpSpeed1 || 80,
+      2: generalSettings.jumpSpeed2 || 70,
+      3: generalSettings.jumpSpeed3 || 60,
+      4: generalSettings.jumpSpeed4 || 50,
+      5: generalSettings.jumpSpeed5 || 40,
+      6: generalSettings.jumpSpeed6 || 30,
+    };
+
+    const buffer = generalSettings.jumpBuffer || 10;
+    let baseTime = jumpTimes[this.shipSpeed] || 80;
+
+    // Apply 50% speed penalty if towing a wreck
+    if (this.towingWreck) {
+      baseTime = Math.round(baseTime * 1.5);
+    }
+
+    // Add buffer (1 game tick = 10s by default)
+    const timeoutWithBuffer = baseTime + buffer;
+
+    return timeoutWithBuffer * 1000; // Convert to milliseconds
+  }
+
+  /**
+   * Calculate the appropriate timeout for a travel command based on ship speed.
+   * Travel within a system is generally faster than jumps between systems.
+   * Uses configurable travel times from settings (with defaults if not set).
+   * If towing a wreck, speed is reduced by 50% (timeout increased accordingly).
+   * Adds configurable buffer (default 5s) to the base travel time.
+   */
+  private calculateTravelTimeout(): number {
+    // Get travel times from settings or use defaults (shorter than jump times)
+    const settings = (this as any).settings || {};
+    const generalSettings = settings.general || {};
+
+    const travelTimes: Record<number, number> = {
+      1: generalSettings.travelSpeed1 || 20,
+      2: generalSettings.travelSpeed2 || 18,
+      3: generalSettings.travelSpeed3 || 15,
+      4: generalSettings.travelSpeed4 || 12,
+      5: generalSettings.travelSpeed5 || 10,
+      6: generalSettings.travelSpeed6 || 8,
+    };
+
+    const buffer = generalSettings.travelBuffer || 5;
+    let baseTime = travelTimes[this.shipSpeed] || 20;
+
+    // Apply 50% speed penalty if towing a wreck
+    if (this.towingWreck) {
+      baseTime = Math.round(baseTime * 1.5);
+    }
+
+    // Add buffer
+    const timeoutWithBuffer = baseTime + buffer;
+
+    return timeoutWithBuffer * 1000; // Convert to milliseconds
   }
 
   log(category: string, message: string): void {
@@ -355,150 +483,204 @@ export class Bot {
       this.log("customs", `✅ Customs clearance received (outcome: ${outcome}), resuming ${command}`);
     }
 
-    this._lastAction = command;
-    debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
+     this._lastAction = command;
+     debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
 
-    // Apply 120s timeout to jump/travel commands to detect hangs
-    // Max normal jump time is 110s (without towing), so 120s is safe threshold
-    let resp: ApiResponse;
-    if (command === "jump" || command === "travel") {
-      const targetSystem = (payload?.target_system as string) || (payload?.target_poi as string) || "";
-      resp = await this.execWithTimeout(command, payload, 120_000, targetSystem);
-    } else {
-      resp = await this.api.execute(command, payload);
-    }
+     // Capture skill snapshot before command to measure gains later
+     this.captureSkillSnapshot();
 
-    // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
-    // This prevents 502 errors from breaking routines mid-operation
-    if (resp.error && resp.error.message && resp.error.message.includes("502")) {
-      const MAX_502_RETRIES = 3;
-      for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
-        // CRITICAL: Check if we're in battle - if so, stop retrying immediately
-        if (this.currentBattle.inBattle) {
-          this.log("combat", `HTTP 502 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
-          break;
+       // Create AbortController for this command
+       const controller = new AbortController();
+       const key = command + (payload ? JSON.stringify(payload) : "");
+       this.pendingCommands.set(key, controller);
+
+        let resp: ApiResponse;
+        try {
+          // Use timeout for all commands to prevent indefinite hangs
+          let timeoutMs = 60000; // default 60s
+          let targetId = "";
+          if (command === "jump") {
+            timeoutMs = this.calculateJumpTimeout();
+            targetId = (payload as Record<string, unknown>)?.target_system as string || "";
+            this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+          } else if (command === "mine" || command === "jettison") {
+            timeoutMs = 15000; // 15s for mining/jettison
+          } else if (command === "travel") {
+            timeoutMs = this.calculateTravelTimeout();
+            targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
+            this.log("travel", `Travel timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+          }
+          resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
+
+        // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
+        // This prevents 502 errors from breaking routines mid-operation
+        if (resp.error && resp.error.message && resp.error.message.includes("502")) {
+          const MAX_502_RETRIES = 3;
+          for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
+            // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+            if (this.currentBattle.inBattle) {
+              this.log("combat", `HTTP 502 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              break;
+            }
+
+            const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
+            this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1}/${MAX_502_RETRIES} after ${waitTime/1000}s...`);
+            await sleep(waitTime);
+            resp = await this.api.execute(command, payload);
+            if (!resp.error || !resp.error.message?.includes("502")) break;
+          }
+          if (resp.error && resp.error.message?.includes("502")) {
+            this.log("error", `HTTP 502: Bad Gateway (after ${MAX_502_RETRIES} retries)`);
+          }
         }
-        
-        const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
-        this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1}/${MAX_502_RETRIES} after ${waitTime/1000}s...`);
-        await sleep(waitTime);
-        resp = await this.api.execute(command, payload);
-        if (!resp.error || !resp.error.message?.includes("502")) break;
-      }
-      if (resp.error && resp.error.message?.includes("502")) {
-        this.log("error", `HTTP 502: Bad Gateway (after ${MAX_502_RETRIES} retries)`);
-      }
-    }
 
-    // Handle HTTP 524 Timeout — server took too long to respond (common during battles)
-    // Retry with backoff since battle notifications may still be flowing via WebSocket
-    if (resp.error && resp.error.message && resp.error.message.includes("524")) {
-      const MAX_524_RETRIES = 3;
-      for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
-        // CRITICAL: Check if we're in battle - if so, stop retrying immediately
-        if (this.currentBattle.inBattle) {
-          this.log("combat", `HTTP 524 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
-          break;
+        // Handle HTTP 524 Timeout — server took too long to respond (common during battles)
+        // Retry with backoff since battle notifications may still be flowing via WebSocket
+        if (resp.error && resp.error.message && resp.error.message.includes("524")) {
+          const MAX_524_RETRIES = 3;
+          for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
+            // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+            if (this.currentBattle.inBattle) {
+              this.log("combat", `HTTP 524 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              break;
+            }
+
+            const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
+            this.log("warn", `HTTP 524 Timeout — retry ${retry + 1}/${MAX_524_RETRIES} after ${waitTime/1000}s...`);
+            await sleep(waitTime);
+            resp = await this.api.execute(command, payload);
+            if (!resp.error || !resp.error.message?.includes("524")) break;
+          }
+          if (resp.error && resp.error.message?.includes("524")) {
+            this.log("error", `HTTP 524: Timeout (after ${MAX_524_RETRIES} retries)`);
+          }
         }
-        
-        const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
-        this.log("warn", `HTTP 524 Timeout — retry ${retry + 1}/${MAX_524_RETRIES} after ${waitTime/1000}s...`);
-        await sleep(waitTime);
-        resp = await this.api.execute(command, payload);
-        if (!resp.error || !resp.error.message?.includes("524")) break;
-      }
-      if (resp.error && resp.error.message?.includes("524")) {
-        this.log("error", `HTTP 524: Timeout (after ${MAX_524_RETRIES} retries)`);
-      }
-    }
 
-    // Handle full login required (after too many session recovery failures)
-    if (resp.error && resp.error.code === "full_login_required") {
-      this.log("system", "Full login required due to session recovery failures, performing login...");
-      const loggedIn = await this.login();
-      if (loggedIn) {
-        this.log("system", "Full login successful, retrying command...");
-        resp = await this.api.execute(command, payload);
-      } else {
-        this.log("error", "Full login failed");
-      }
-    }
+        // Handle full login required (after too many session recovery failures)
+        if (resp.error && resp.error.code === "full_login_required") {
+          this.log("system", "Full login required due to session recovery failures, performing login...");
+          const loggedIn = await this.login();
+          if (loggedIn) {
+            this.log("system", "Full login successful, retrying command...");
+            resp = await this.api.execute(command, payload);
+          } else {
+            this.log("error", "Full login failed");
+          }
+        }
 
-    // After jump/travel commands in empire space, wait for customs messages
-    // This is the PROACTIVE check - wait 2 seconds minimum for customs to respond
-    // Only applies to customs empires (Voidborn, Nebula, Crimson, Solarian) in non-lawless systems
-    if (!resp.error && (command === "jump" || command === "travel")) {
-      await this.refreshStatus();
-      // Check if we're in an empire system with customs (not Frontier, not Outer Rim, not pirate, not lawless)
-      const sysData = mapStore.getSystem(this.system);
-      if (isEmpireSystem(this.system, this.getEmpire(), sysData?.security_level)) {
-        this.log("customs", `⏱️ Post-jump customs wait @ ${this.system} - 2 second delay...`);
-        await sleep(2000);
-      }
-    }
-
-    // Action pending — a previous game action is still resolving (10s tick).
-    // Wait for the tick to complete then retry once.
-    if (resp.error) {
-      const msg = resp.error.message || "";
-      if (resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress")) {
-        debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
-        this.log("system", "Action pending — waiting for server to process...");
-        await sleep(10_000);
-        // Refresh status before retry to ensure we're in a valid state
-        await this.refreshStatus();
-        resp = await this.api.execute(command, payload);
-        
-        // If still pending, wait a bit longer and try one more time
-        if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
-          this.log("system", "Action still pending — waiting additional 5s...");
-          await sleep(5_000);
+        // After jump/travel commands in empire space, wait for customs messages
+        // This is the PROACTIVE check - wait 2 seconds minimum for customs to respond
+        // Only applies to customs empires (Voidborn, Nebula, Crimson, Solarian) in non-lawless systems
+        if (!resp.error && (command === "jump" || command === "travel")) {
           await this.refreshStatus();
-          resp = await this.api.execute(command, payload);
+          // Check if we're in an empire system with customs (not Frontier, not Outer Rim, not pirate, not lawless)
+          const sysData = mapStore.getSystem(this.system);
+          if (isEmpireSystem(this.system, this.getEmpire(), sysData?.security_level)) {
+            this.log("customs", `⏱️ Post-jump customs wait @ ${this.system} - 2 second delay...`);
+            await sleep(250); //human says it does not need to be much because the cusoms know you are coming the instant you issue the jump command.
+          }
         }
-      }
-    }
 
-    if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
-      logNotifications(resp.notifications);
-      await this.handleNotifications(resp.notifications);
-    }
+        // Action pending — a previous game action is still resolving (10s tick).
+        // Wait for the tick to complete then retry once.
+        if (resp.error) {
+          const msg = resp.error.message || "";
+          if (resp.error.code === "action_pending" || msg.includes("action is already pending") || msg.includes("Another action is already in progress")) {
+            debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
+            this.log("system", "Action pending — waiting for server to process...");
+            await sleep(10_000);
+            // Refresh status before retry to ensure we're in a valid state
+            await this.refreshStatus();
+            resp = await this.api.execute(command, payload);
 
-    if (resp.error) {
-      // Suppress noisy expected errors — callers handle these gracefully
-      const code = resp.error.code || "";
-      const quiet =
-        code === "mission_incomplete" ||
-        code === "not_in_battle" ||
-        (command === "view_faction_storage" && code !== "session_invalid") ||
-        (command === "get_missions" && code !== "session_invalid") ||
-        (command === "complete_mission" && code === "mission_incomplete") ||
-        (command === "get_insurance_quote" && code !== "session_invalid") ||
-        (command === "survey_system" && code === "no_scanner") ||
-        (command === "faction_deposit_items" && code === "no_faction_storage") ||
-        (command === "faction_deposit_credits" && code === "no_faction_storage") ||
-        (command === "withdraw_items" && code === "cargo_full") ||
-        (command === "faction_withdraw_items" && code === "cargo_full");
-      if (!quiet) {
-        this.log("error", `${command}: ${resp.error.message}`);
-      }
-    }
-
-    // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
-    // This helps collect player names faster as we move through the galaxy
-    if (!resp.error) {
-      const navigationCommands = ["travel", "jump", "dock", "undock"];
-      if (navigationCommands.includes(command)) {
-        // Small delay to let the navigation complete
-        await sleep(500);
-        const nearbyResp = await this.api.execute("get_nearby");
-        if (!nearbyResp.error && nearbyResp.result) {
-          this.trackNearbyPlayers(nearbyResp.result);
+            // If still pending, wait a bit longer and try one more time
+            if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
+              this.log("system", "Action still pending — waiting additional 5s...");
+              await sleep(5_000);
+              await this.refreshStatus();
+              resp = await this.api.execute(command, payload);
+            }
+          }
         }
-      }
-    }
 
-    return resp;
+        if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
+          logNotifications(resp.notifications);
+          await this.handleNotifications(resp.notifications);
+        }
+
+        // Update faction storage cache whenever view_storage is called for faction
+        if (command === "view_storage" && payload?.target === "faction" && !resp.error && this.faction) {
+          const entries = this.parseItemList(resp.result);
+          updateFactionStorageCache(this.faction, entries);
+        }
+
+        if (resp.error) {
+          // Suppress noisy expected errors — callers handle these gracefully
+          const code = resp.error.code || "";
+          const quiet =
+            code === "mission_incomplete" ||
+            code === "not_in_battle" ||
+            (command === "view_storage" && code !== "session_invalid") ||
+            (command === "get_missions" && code !== "session_invalid") ||
+            (command === "complete_mission" && code === "mission_incomplete") ||
+            (command === "get_insurance_quote" && code !== "session_invalid") ||
+            (command === "survey_system" && code === "no_scanner") ||
+            ((command === "deposit_items" || command === "view_storage") && code === "no_faction_storage") ||
+            (command === "withdraw_items" && code === "cargo_full");
+          if (!quiet) {
+            this.log("error", `${command}: ${resp.error.message}`);
+          }
+        }
+
+          // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
+          // This helps collect player names faster as we move through the galaxy
+          if (!resp.error) {
+            const navigationCommands = ["travel", "jump", "dock", "undock"];
+            if (navigationCommands.includes(command)) {
+              // Small delay to let the navigation complete
+              await sleep(500);
+              const nearbyResp = await this.api.execute("get_nearby");
+              if (!nearbyResp.error && nearbyResp.result) {
+                this.trackNearbyPlayers(nearbyResp.result);
+              }
+              // For jump commands, also scan the entire system for players
+              if (command === "jump") {
+                const systemResp = await this.api.execute("get_system_agents");
+                if (!systemResp.error && systemResp.result) {
+                  this.trackSystemAgents(systemResp.result);
+                }
+              }
+            }
+          }
+
+          // Track piloting XP after ship-based actions that grant exp
+          const PILOTING_EXP_COMMANDS = new Set([
+            'jump', 'travel', 'mine', 'attack', 'salvage_wreck', 'loot_wreck',
+            'refuel', 'repair', 'dock', 'undock', 'survey_system'
+          ]);
+          if (!resp.error && PILOTING_EXP_COMMANDS.has(command)) {
+             try {
+                await this.logSkillGains(command);
+             } catch (e) {
+                // ignore tracking errors
+             }
+          }
+
+          return resp;
+      } catch (err) {
+        // Handle abort
+        if (err instanceof Error && err.name === "AbortError" && this.currentBattle.inBattle) {
+          this.log("combat", `${command} aborted due to battle detection`);
+          return {
+            error: { code: "battle_interrupt", message: `${command} aborted due to battle ${this.currentBattle.battleId}` },
+            result: undefined,
+            notifications: [],
+          };
+        }
+        throw err;
+      } finally {
+        this.pendingCommands.delete(key);
+      }
   }
 
   /** Login using stored credentials. Returns true on success. Prevents duplicate concurrent logins. */
@@ -539,10 +721,16 @@ export class Bot {
       return false;
     }
 
-    this.log("system", "Login successful");
-    this.api.resetFullLoginFlag();
-    await this.refreshStatus();
-    return true;
+     this.log("system", "Login successful");
+     this.api.resetFullLoginFlag();
+     await this.refreshStatus();
+     // Populate initial skill snapshot
+     try {
+       await this.checkSkills();
+     } catch {
+       // ignore skill fetch errors
+     }
+     return true;
   }
 
   /** Resume session from disk without full login. Returns true if session was restored and is valid. */
@@ -561,9 +749,14 @@ export class Bot {
       return false;
     }
 
-    this.log("system", "Session resumed successfully");
-    await this.refreshStatus();
-    return true;
+     this.log("system", "Session resumed successfully");
+     await this.refreshStatus();
+     try {
+       await this.checkSkills();
+     } catch {
+       // ignore
+     }
+     return true;
   }
 
   /** Fetch current game state and cache it. */
@@ -574,32 +767,44 @@ export class Bot {
       const r = resp.result as Record<string, unknown>;
       debugLogForBot(this.username, "bot:refreshStatus", `${this.username} top-level keys`, Object.keys(r));
 
-      // Player data may be nested under r.player or flat at top level
+      // Location is now nested under `location` object in v2
+      const location = r.location as Record<string, unknown> | undefined;
       const player = r.player as Record<string, unknown> | undefined;
-      const p = player || r;
+      // Use location data first, then player, then root level
+      const p = location || player || r;
 
-      this.credits = (p.credits as number) ?? this.credits;
-      debugLogForBot(this.username, "bot:credits", `${this.username} credits=${this.credits} raw=${p.credits}`);
-      this.system = (p.current_system as string) ?? this.system;
-      this.poi = (p.current_poi as string) ?? (p.poi_id as string) ?? this.poi;
-      this.docked = p.docked_at_base != null
-        ? !!(p.docked_at_base)
-        : (p.docked as boolean) ?? (p.status === "docked");
+      this.credits = (player?.credits as number) ?? (p.credits as number) ?? this.credits;
+      debugLogForBot(this.username, "bot:credits", `${this.username} credits=${this.credits} raw=${player?.credits ?? p.credits}`);
+
+      // System and POI are now inside `location` object in v2
+      // location.system_id, location.system_name, location.poi_id, location.poi_name
+      this.system = (location?.system_id as string) || (location?.system_name as string) || (p.current_system as string) || this.system;
+      this.poi = (location?.poi_id as string) || (location?.poi_name as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+      this.docked = location?.docked_at != null
+        ? !!(location.docked_at)
+        : (p.docked_at_base != null
+          ? !!(p.docked_at_base)
+          : (p.docked as boolean) ?? (p.status === "docked"));
       this.location =
+        (location?.system_name as string) ||
+        (location?.system_id as string) ||
         (p.current_system as string) ||
         (p.location as string) ||
         this.location;
 
       // Faction membership
-      this.faction = (p.faction_id as string) ?? (p.faction as string) ?? null;
+      if (!this.faction) {
+        this.faction = (p.faction_id as string) ?? (p.faction as string) ?? null;
+      }
 
-      // Ship fields
+       // Ship fields
       const ship = r.ship as Record<string, unknown> | undefined;
       debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
       if (ship) {
         const rawName = (ship.name as string) || "";
         const shipType = (ship.ship_type as string) || (ship.type as string) || "";
         this.shipName = (rawName && rawName.toLowerCase() !== "unnamed" ? rawName : shipType) || this.shipName;
+        this.shipClass = shipType;
         this.fuel = (ship.fuel as number) ?? this.fuel;
         this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
         this.cargo = (ship.cargo_used as number) ?? this.cargo;
@@ -608,6 +813,8 @@ export class Bot {
         this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
         this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
         this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
+        // Cache ship speed (1-6, where 1=slowest at 120s/jump, 6=fastest at 30s/jump)
+        this.shipSpeed = (ship.speed as number) || 1;
         
         // Ammo is stored per-weapon-module, not at ship level.
         // get_status may return modules as full objects or just IDs.
@@ -647,7 +854,10 @@ export class Bot {
           this.towingWreck = shipTowing;
         }
       }
-      
+
+      // Add this bot to the player tracking so it appears in the web UI players tab
+      playerNameStore.add(this.username, this.faction || "", this.shipClass, this.system, this.poi);
+
       // Debug: log tow-related fields from status
       if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
           (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
@@ -665,6 +875,14 @@ export class Bot {
       if (typeof r.fuel === "number") this.fuel = r.fuel;
     }
 
+    // Log position change if system or poi updated
+    if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
+      this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
+      this.logPosition();
+      this.lastSystem = this.system;
+      this.lastPoi = this.poi;
+    }
+
     // Also refresh cargo inventory (and storage only if docked)
     await this.refreshCargo();
     if (this.docked) {
@@ -678,21 +896,43 @@ export class Bot {
   private parseItemList(result: unknown): CargoItem[] {
     if (!result || typeof result !== "object") return [];
 
-    const r = result as Record<string, unknown>;
+    let r = result as Record<string, unknown>;
+
+    // If response has a data wrapper, use that
+    if (r.data && typeof r.data === "object") {
+      r = r.data as Record<string, unknown>;
+    }
+
+    // Check structuredContent first (V2 API format)
+    if (r.structuredContent && typeof r.structuredContent === "object") {
+      const sc = r.structuredContent as Record<string, unknown>;
+      if (Array.isArray(sc.items)) {
+        r = sc;
+      }
+    }
+
     const items = (
       Array.isArray(r) ? r :
       Array.isArray(r.items) ? r.items :
       Array.isArray(r.cargo) ? r.cargo :
       Array.isArray(r.storage) ? r.storage :
+      Array.isArray(r.stored_items) ? r.stored_items :
+      Array.isArray(r.faction_items) ? r.faction_items :
+      Array.isArray(r.faction_storage) ? r.faction_storage :
+      Array.isArray(r.data) ? r.data :
       []
     ) as Array<Record<string, unknown>>;
 
     return items
-      .map((item) => ({
-        itemId: (item.item_id as string) || (item.resource_id as string) || (item.id as string) || "",
-        name: (item.name as string) || (item.item_name as string) || (item.resource_name as string) || (item.item_id as string) || "",
-        quantity: (item.quantity as number) || (item.count as number) || 0,
-      }))
+      .map((item) => {
+        const parsedItem = {
+          itemId: ((item.item_id as string) || (item.resource_id as string) || (item.id as string) || "").replace(/ /g, '_').toLowerCase(),
+          name: (item.name as string) || (item.item_name as string) || (item.resource_name as string) || (item.item_id as string) || "",
+          quantity: (item.quantity as number) || (item.count as number) || (item.amount as number) || 0,
+        };
+
+        return parsedItem;
+      })
       .filter((i) => i.itemId && i.quantity > 0);
   }
 
@@ -730,12 +970,41 @@ export class Bot {
 
   /** Fetch faction storage contents and cache them. Silently returns empty on error. */
   async refreshFactionStorage(): Promise<void> {
-    const resp = await this.exec("view_faction_storage");
-    if (resp.error) {
+    let factionName = this.faction;
+    if (!factionName) {
+      // Try to load from cache to get faction name and storage
+      try {
+        const { existsSync, readFileSync } = await import("fs");
+        const { join } = await import("path");
+        const cacheFile = join(process.cwd(), "data", "factionStorage.json");
+        if (existsSync(cacheFile)) {
+          const content = readFileSync(cacheFile, "utf-8");
+          const cached = JSON.parse(content) as { factionName: string; entries: any[] };
+          this.faction = cached.factionName;
+          this.factionStorage = cached.entries;
+          this.log("info", `Loaded faction storage from cache: ${cached.factionName} (${cached.entries.length} items)`);
+          return;
+        }
+      } catch (e) {
+        this.log("warn", "Failed to load faction storage from cache");
+      }
+      this.log("warn", "No faction name set and no cache, skipping faction storage refresh");
       this.factionStorage = [];
       return;
     }
-    this.factionStorage = this.parseItemList(resp.result);
+
+    const resp = await this.exec("view_storage", { target: "faction" });
+    if (resp.error) {
+      this.log("error", `Error refreshing faction storage: ${resp.error.message}`);
+      // Don't reset factionStorage to empty on error - keep cached data
+      return;
+    }
+    const entries = this.parseItemList(resp.result);
+    if (entries.length === 0) {
+      this.log("warn", "Faction storage refresh returned 0 items");
+    }
+    this.factionStorage = entries;
+    updateFactionStorageCache(factionName, entries);
   }
 
   /** Start running a routine. */
@@ -796,6 +1065,24 @@ export class Bot {
       api: this.api,
       bot: this,
       log: (cat, msg) => this.log(cat, msg),
+      // Interruptible sleep that checks for stop signal every 100ms
+      sleep: (ms: number) => {
+        return new Promise<void>((resolve) => {
+          const start = Date.now();
+          const self = this; // Capture this for use in setInterval callback
+          const timer = setInterval(() => {
+            if (self._state === "stopping") {
+              clearInterval(timer);
+              resolve();
+              return;
+            }
+            if (Date.now() - start >= ms) {
+              clearInterval(timer);
+              resolve();
+            }
+          }, 100);
+        });
+      },
       getFleetStatus: opts?.getFleetStatus,
       sendBotChat: opts?.sendBotChat,
       getAllBotNames: opts?.getAllBotNames,
@@ -807,8 +1094,8 @@ export class Bot {
           this.log("system", `Stopped during state: ${stateName}`);
           break;
         }
-        // Small gap between actions
-        await sleep(2000);
+        // Small gap between actions - use interruptible sleep
+        await ctx.sleep(2000);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -851,59 +1138,171 @@ export class Bot {
     return this.skillLevels.get(skillId) ?? 0;
   }
 
-  /** Fetch skills and log any level-ups since the last check. */
-  async checkSkills(): Promise<void> {
-    const resp = await this.exec("get_skills");
-    if (!resp.result || typeof resp.result !== "object") return;
-
-    const r = resp.result as Record<string, unknown>;
-
-    // Resolve the skills container — handles all known API shapes:
-    //   Array at top level:          [{ skill_id, name, level }, ...]
-    //   Array nested under .skills:  { skills: [{ skill_id, ... }] }
-    //   Dict nested under .skills:   { skills: { crafting_basic: { level, xp, ... } } }
-    //   Dict at top level:           { crafting_basic: { level, xp, ... } }
-    //   Dict with numeric values:    { crafting_basic: 7, ... }
-    let skillsContainer: unknown = r;
-    if (!Array.isArray(r) && r.skills !== undefined) {
-      skillsContainer = r.skills;
+   /** Fetch skills and log any level-ups since the last check. */
+    async checkSkills(): Promise<void> {
+      const fresh = await this.fetchAllSkills();
+      for (const [id, data] of fresh.entries()) {
+        const prev = this.skillLevels.get(id);
+        if (prev !== undefined && data.level > prev) {
+          this.log("skill", `LEVEL UP! ${id}: ${prev} -> ${data.level}`);
+        }
+        this.skillLevels.set(id, data.level);
+        this.skillXP.set(id, data.xp);
+        this.skillTotalXP.set(id, data.totalXP ?? 0);
+        this.skillXpToNext.set(id, data.xpToNext ?? 0);
+      }
     }
 
-    const entries: Array<{ id: string; name: string; level: number }> = [];
-
-    if (Array.isArray(skillsContainer)) {
-      for (const skill of skillsContainer as Array<Record<string, unknown>>) {
-        const id = (skill.skill_id as string) || (skill.id as string) || (skill.name as string) || "";
-        const name = (skill.name as string) || id;
-        const level = (skill.level as number) ?? 0;
-        if (id) entries.push({ id, name, level });
-      }
-    } else if (skillsContainer && typeof skillsContainer === "object") {
-      for (const [key, val] of Object.entries(skillsContainer as Record<string, unknown>)) {
-        if (typeof val === "number") {
-          entries.push({ id: key, name: key, level: val });
-        } else if (val && typeof val === "object") {
-          const s = val as Record<string, unknown>;
-          const level = (s.level as number) ?? (s.current_level as number) ?? 0;
-          const name = (s.name as string) || key;
-          entries.push({ id: key, name, level });
+     /** Fetch all skills as a Map<skillId, {level, xp, xpToNext, totalXP?}>. */
+     private async fetchAllSkills(): Promise<Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>> {
+     const resp = await this.api.execute('get_skills');
+     if (resp.error || !resp.result) return new Map();
+     const r = resp.result as Record<string, unknown>;
+     let skillsContainer: unknown = r;
+     if (!Array.isArray(r) && r.skills !== undefined) {
+       skillsContainer = r.skills;
+     }
+      const map = new Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>();
+      if (Array.isArray(skillsContainer)) {
+        for (const skill of skillsContainer as Array<Record<string, unknown>>) {
+          const id = (skill.skill_id as string) || (skill.id as string) || (skill.name as string) || "";
+          const level = (skill.level as number) ?? 0;
+          const rawXP = (skill.xp as number) ?? (skill.experience as number) ?? (skill.current_xp as string) ?? 0;
+          const xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
+          const xpToNext = (skill.xp_to_next_level as number) ??
+                           (skill.xp_to_next as number) ??
+                           (skill.xp_needed as number) ??
+                           (skill.xp_remaining as number) ??
+                           (skill.next_level_xp as number);
+          const totalXP = (skill.total_xp as number) ??
+                          (skill.total_experience as number) ??
+                          (skill.cumulative_xp as number);
+          const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = { level, xp, xpToNext: xpToNext ?? undefined };
+          if (totalXP !== undefined) entry.totalXP = totalXP;
+          if (id) map.set(id, entry);
+        }
+      } else if (skillsContainer && typeof skillsContainer === 'object') {
+        for (const [key, val] of Object.entries(skillsContainer as Record<string, unknown>)) {
+          let level = 0;
+          let xp = 0;
+          let xpToNext: number | undefined;
+          let totalXP: number | undefined;
+          if (typeof val === 'number') {
+            level = val;
+          } else if (val && typeof val === 'object') {
+            const s = val as Record<string, unknown>;
+            level = (s.level as number) ?? (s.current_level as number) ?? 0;
+            const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as string) ?? 0;
+            xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
+            xpToNext = (s.xp_to_next_level as number) ??
+                       (s.xp_to_next as number) ??
+                       (s.xp_needed as number) ??
+                       (s.xp_remaining as number) ??
+                       (s.next_level_xp as number);
+            totalXP = (s.total_xp as number) ??
+                      (s.total_experience as number) ??
+                      (s.cumulative_xp as number);
+          }
+          const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = { level, xp, xpToNext: xpToNext ?? undefined };
+          if (totalXP !== undefined) entry.totalXP = totalXP;
+          map.set(key, entry);
         }
       }
+      return map;
     }
 
-    for (const { id, name, level } of entries) {
-      const prev = this.skillLevels.get(id);
-      if (prev !== undefined && level > prev) {
-        this.log("skill", `LEVEL UP! ${name}: ${prev} -> ${level}`);
+    /** Capture current skill levels & XP for before/after comparison. */
+    captureSkillSnapshot(): void {
+      this.skillSnapshot = new Map(
+        Array.from(this.skillLevels.entries()).map(([id, level]) => [
+          id,
+          {
+            level,
+            xp: this.skillXP.get(id) ?? 0,
+            totalXP: this.skillTotalXP.get(id) ?? undefined,
+            xpToNext: this.skillXpToNext.get(id) ?? undefined
+          }
+        ])
+      );
+    }
+
+    /** Compare skills after a command and log any gains. */
+     private async logSkillGains(command: string): Promise<void> {
+       const fresh = await this.fetchAllSkills();
+       if (fresh.size === 0) return; // failed to fetch, keep old snapshot
+       const gains: Array<{
+         id: string;
+         name: string;
+         levelBefore: number;
+         levelAfter: number;
+         xpBefore: number;
+         xpAfter: number;
+         xpGained: number;
+         xpToNext?: number;
+         totalXPBefore?: number;
+         totalXPAfter?: number;
+       }> = [];
+       for (const [id, data] of fresh.entries()) {
+         const old = this.skillSnapshot.get(id);
+         if (!old) continue;
+         let xpGained: number;
+         // Prefer using total cumulative XP if available for exact gain
+         if (old.totalXP !== undefined && data.totalXP !== undefined) {
+           xpGained = data.totalXP - old.totalXP;
+         } else if (data.level > old.level) {
+           // Level-up: remaining XP to finish old level + XP in new level
+           const oldRemaining = (old.xpToNext !== undefined) ? (old.xpToNext - old.xp) : 0;
+           xpGained = oldRemaining + data.xp;
+         } else {
+           xpGained = data.xp - old.xp;
+         }
+         const levelDelta = data.level - old.level;
+         if (xpGained > 0 || levelDelta > 0) {
+           gains.push({
+             id,
+             name: id,
+             levelBefore: old.level,
+             levelAfter: data.level,
+             xpBefore: old.xp,
+             xpAfter: data.xp,
+             xpGained,
+             xpToNext: data.xpToNext,
+             totalXPBefore: old.totalXP,
+             totalXPAfter: data.totalXP,
+           });
+         }
+       }
+      if (gains.length > 0) {
+        const parts = gains.map(g => {
+          if (g.levelAfter > g.levelBefore && g.xpGained > 0) return `+${g.xpGained} ${g.id} (lvl ${g.levelAfter - g.levelBefore})`;
+          if (g.xpGained > 0) return `+${g.xpGained} ${g.id}`;
+          return `+${g.levelAfter - g.levelBefore} ${g.id}`;
+        }).join(", ");
+        this.log("skills", `Skill gains: ${parts}`);
+        recordSkillGains(this, command, this.shipName, gains);
+        // Also update piloting-specific aggregated stats if piloting was among gains
+        const pilotGain = gains.find(g => g.id.toLowerCase().includes('pilot'));
+        if (pilotGain) {
+          recordPilotingActivity(this, command, pilotGain.xpGained, pilotGain.levelAfter, pilotGain.xpAfter, this.shipName);
+        }
       }
-      this.skillLevels.set(id, level);
+      // Update in-memory skill maps to the fresh snapshot for next command
+      this.skillLevels.clear();
+      this.skillXP.clear();
+      this.skillTotalXP.clear();
+      this.skillXpToNext.clear();
+      for (const [id, data] of fresh.entries()) {
+        this.skillLevels.set(id, data.level);
+        this.skillXP.set(id, data.xp);
+        this.skillTotalXP.set(id, data.totalXP ?? 0);
+        this.skillXpToNext.set(id, data.xpToNext ?? 0);
+      }
     }
-  }
 
-  /**
-   * Start a customs hold - blocks travel/jump actions until cleared.
-   */
-  startCustomsHold(): void {
+    /**
+     * Start a customs hold - blocks travel/jump actions until cleared.
+     */
+   startCustomsHold(): void {
     // Don't restart if already active - prevents timer reset and AI response spam
     if (this.customsHold.active) {
       this.log("customs", "📋 Customs hold already active - ignoring duplicate stop request");
@@ -1060,7 +1459,7 @@ export class Bot {
               senderLower.includes("rim ranger");
             
             if (!contentLower.includes("mayday") && !isEmpireNpc) {
-              playerNameStore.add(sender);
+              playerNameStore.add(sender, "", "", this.system, this.poi);
             } else if (isEmpireNpc) {
               debugLogForBot(this.username, "playernames:skip", `${this.username}`, `Ignored empire NPC sender: "${sender}"`);
             } else {
@@ -1208,21 +1607,8 @@ export class Bot {
             this.log("debug", `AI Chat service not available (service=${!!aiChatService}, addChatMessage=${typeof aiChatService?.addChatMessage === "function"})`);
           }
           
-          // ── RESCUE COOPERATION: Process private messages for cooperation claims ──
-          if (channel === "private") {
-            const senderId = data.sender_id as string | undefined;
-            const result = processCooperationPrivateMessage(sender, content, senderId);
-            
-            if (result.isClaim && result.claim) {
-              this.log("coop", `📧 Processed claim from ${sender}: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps by ${result.claim.botName})`);
-            } else if (result.skipReason) {
-              this.log("coop_debug", `Skipped private message from ${sender}: ${result.skipReason}`);
-            }
-            
-            if (senderId && result.isClaim) {
-              this.log("coop_debug", `Cached player ID for ${sender}: ${senderId}`);
-            }
-          }
+          // Note: Rescue cooperation is now handled via Bot Chat Channel (in rescue.ts)
+          // Private message processing for cooperation claims has been replaced
         } else {
           this.log("debug", `Chat message received but data is not object: ${typeof data}`);
         }
@@ -1250,24 +1636,58 @@ export class Bot {
 
           debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
         }
-      } else if (msgType === "battle_damage" && data && typeof data === "object") {
-        // Battle damage also indicates we're in battle
-        const attackerName = (data.attacker_name as string) || "";
-        const targetName = (data.target_name as string) || "";
-        const totalDamage = (data.total_damage as number) || 0;
+       } else if (msgType === "battle_damage" && data && typeof data === "object") {
+         // Battle damage also indicates we're in battle
+         const attackerName = (data.attacker_name as string) || "";
+         const targetName = (data.target_name as string) || "";
+         const totalDamage = (data.total_damage as number) || 0;
 
-        // CRITICAL: Set battle state on damage too (battle_update might not arrive first)
-        const battleId = (data.battle_id as string) || this.currentBattle.battleId || "";
-        if (battleId || attackerName) {
-          this.currentBattle.inBattle = true;
-          if (battleId) {
-            this.currentBattle.battleId = battleId;
-          }
-          this.currentBattle.lastUpdate = Date.now();
-        }
+         // CRITICAL: Set battle state on damage too (battle_update might not arrive first)
+         const battleId = (data.battle_id as string) || this.currentBattle.battleId || "";
+         if (battleId || attackerName) {
+           this.currentBattle.inBattle = true;
+           if (battleId) {
+             this.currentBattle.battleId = battleId;
+           }
+           this.currentBattle.lastUpdate = Date.now();
+         }
 
-        debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
-      } else if (type === "system" && data && typeof data === "object") {
+         debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
+
+         // Check if we should send a battle response to AI chat
+         const now = Date.now();
+         if (now - this.lastBattleResponseMs > Bot.BATTLE_RESPONSE_COOLDOWN_MS) {
+           // Only respond if we're taking damage or just entered battle
+           if (totalDamage > 0 || !this.currentBattle.inBattle) {
+             this.lastBattleResponseMs = now;
+             await this.sendBattleResponseToAI(attackerName, totalDamage);
+           }
+         }
+       } else if (msgType === "battle_update" && data && typeof data === "object") {
+         const battleId = (data.battle_id as string) || "";
+         const tick = (data.tick as number) || 0;
+         const participants = Array.isArray(data.participants) ? data.participants : [];
+         
+         if (battleId) {
+           // We're in battle - update global state
+           this.currentBattle.inBattle = true;
+           this.currentBattle.battleId = battleId;
+           this.currentBattle.lastUpdate = Date.now();
+           this.currentBattle.participants = participants as Array<Record<string, unknown>>;
+ 
+           debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
+         }
+         
+         // Check if we should send a battle response to AI chat (when we just entered battle)
+         const now = Date.now();
+         if (now - this.lastBattleResponseMs > Bot.BATTLE_RESPONSE_COOLDOWN_MS) {
+           // Only respond when we just entered battle (not already in battle)
+           if (!this.currentBattle.inBattle) {
+             this.lastBattleResponseMs = now;
+             await this.sendBattleResponseToAI("", 0);
+           }
+         }
+       } else if (type === "system" && data && typeof data === "object") {
         const message = (data.message as string) || "";
         const msgLower = message.toLowerCase();
 
@@ -1290,6 +1710,12 @@ export class Bot {
             this.currentBattle.battleId = battleIdMatch[1];
           }
           debugLogForBot(this.username, "bot:battle", `${this.username} battle detected via system message: ${message}`);
+
+          // Abort any pending mutation commands since we're now in battle
+          for (const controller of this.pendingCommands.values()) {
+            controller.abort();
+          }
+          this.pendingCommands.clear();
         }
       }
 
@@ -1316,7 +1742,7 @@ export class Bot {
 
           // Track pirate name
           if (pirateName && pirateName !== "Unknown") {
-            playerNameStore.add(pirateName);
+            playerNameStore.add(pirateName, pirateT, "", this.system, this.poi);
           }
 
           // Combat chat alerts disabled — was spamming faction chat
@@ -1419,22 +1845,243 @@ export class Bot {
     }
   }
 
-  /** Post a faction chat warning about an imminent attack or pirate detection. */
-  private async sendWarningFactionAlert(message: string): Promise<void> {
-    try {
-      const content = `[COMBAT WARNING] ${this.username} — ${message} | ${this.system}/${this.poi}`;
-      await this.api.execute("chat", { channel: "faction", content });
-      this.log("combat", `Faction warning sent`);
-    } catch (err) {
-      this.log("error", `Warning alert failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
-  }
+   /** Post a faction chat warning about an imminent attack or pirate detection. */
+   private async sendWarningFactionAlert(message: string): Promise<void> {
+     try {
+       const content = `[COMBAT WARNING] ${this.username} — ${message} | ${this.system}/${this.poi}`;
+       await this.api.execute("chat", { channel: "faction", content });
+       this.log("combat", `Faction warning sent`);
+     } catch (err) {
+       this.log("error", `Warning alert failed: ${err instanceof Error ? err.message : String(err)}`);
+     }
+   }
 
-  /**
-   * Extract and track player names, pirates, and empire NPCs from a get_nearby response.
-   * Players, pirates, and empire NPCs are tracked in separate categories.
-   * Empire NPCs are excluded from player tracking even if they appear in player arrays.
-   */
+   /** Fetch piloting skill info (level and XP) via get_skills. */
+   async getPilotingSkill(): Promise<{ level: number; xp: number } | null> {
+     const resp = await this.api.execute('get_skills');
+     if (resp.error || !resp.result) return null;
+     const r = resp.result as Record<string, unknown>;
+     let skillsContainer: unknown = r;
+     if (!Array.isArray(r) && r.skills !== undefined) {
+       skillsContainer = r.skills;
+     }
+     let result: { level: number; xp: number } | null = null;
+     const process = (id: string, name: string, level: number, xp: number) => {
+       if (!result && (id.toLowerCase().includes('pilot') || name.toLowerCase().includes('pilot'))) {
+         result = { level, xp };
+       }
+     };
+     if (Array.isArray(skillsContainer)) {
+       for (const skill of skillsContainer as Array<Record<string, unknown>>) {
+         const id = (skill.skill_id as string) || (skill.id as string) || (skill.name as string) || "";
+         const name = (skill.name as string) || id;
+         const level = (skill.level as number) ?? 0;
+         const rawXP = (skill.xp as number) ?? (skill.experience as number) ?? (skill.current_xp as string) ?? 0;
+         const xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
+         if (id) process(id, name, level, xp);
+       }
+     } else if (skillsContainer && typeof skillsContainer === 'object') {
+       for (const [key, val] of Object.entries(skillsContainer as Record<string, unknown>)) {
+         let level = 0;
+         let xp = 0;
+         if (typeof val === 'number') {
+           level = val;
+         } else if (val && typeof val === 'object') {
+           const s = val as Record<string, unknown>;
+           level = (s.level as number) ?? (s.current_level as number) ?? 0;
+           const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as string) ?? 0;
+           xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
+         }
+         process(key, key, level, xp);
+       }
+     }
+     return result;
+   }
+
+   /**
+    * Send a witty battle response to the AI chat service when attacked.
+    * This gets the attacker info and sends a personality-appropriate response.
+    */
+   private async sendBattleResponseToAI(attackerName: string, damageTaken: number): Promise<void> {
+     try {
+       // Get AI Chat service from global scope
+       const aiChatService = (globalThis as any).aiChatService;
+       if (!aiChatService || typeof aiChatService.addChatMessage !== "function") {
+         this.log("ai_chat_debug", "AI Chat service not available for battle response");
+         return;
+       }
+
+       // Get nearby entities to provide context
+       const nearbyResp = await this.api.execute("get_nearby");
+       let nearbyInfo = "";
+       if (nearbyResp.result && typeof nearbyResp.result === "object") {
+         const nearby = nearbyResp.result as Record<string, unknown>;
+         const players = Array.isArray(nearby.players) ? nearby.players : [];
+         const npcs = Array.isArray(nearby.npcs) ? nearby.npcs : [];
+         const stations = Array.isArray(nearby.stations) ? nearby.stations : [];
+         
+         if (players.length > 0) {
+           nearbyInfo += ` | Players nearby: ${players.map(p => (p as any).name || (p as any).username || "Unknown").join(", ")}`;
+         }
+         if (npcs.length > 0) {
+           nearbyInfo += ` | NPCs nearby: ${npcs.map(n => (n as any).name || "Unknown").join(", ")}`;
+         }
+         if (stations.length > 0) {
+           nearbyInfo += ` | Stations nearby: ${stations.map(s => (s as any).name || "Unknown").join(", ")}`;
+         }
+       }
+
+        // Get battle status for more details
+        const battleStatusResp = await this.api.execute("get_battle_status");
+        let battleInfo = "";
+        let isAttackerFriendly = false;
+        let ourSideId: number | undefined;
+        if (battleStatusResp.result && typeof battleStatusResp.result === "object") {
+          const battle = battleStatusResp.result as Record<string, unknown>;
+          const participants = Array.isArray(battle.participants) ? battle.participants : [];
+          
+          // Find our side and enemy side
+          // Explicitly check and cast your_side_id to number
+          const yourSideIdRaw = battle.your_side_id;
+          if (typeof yourSideIdRaw === "number") {
+            ourSideId = yourSideIdRaw;
+            const ourZone = battle.your_zone;
+            const ourStance = battle.your_stance;
+            
+            // Find our participant data
+            const ourParticipant = participants.find((p: any) => p.side_id === ourSideId);
+            
+            // Get ship info for context
+            const shipResp = await this.api.execute("get_ship");
+            let shipInfo = "";
+            if (shipResp.result && typeof shipResp.result === "object") {
+              const ship = shipResp.result as Record<string, unknown>;
+              const shipName = (ship as any).name || "Unknown Ship";
+              const shipClass = (ship as any).class || "Unknown Class";
+              shipInfo = `I'm flying a ${shipClass} named ${shipName}`;
+            }
+            
+            // Determine if we're winning or losing based on hull/shield from our participant data
+            const ourHullPct = ourParticipant?.hull_pct || ourParticipant?.hull_percent || 100;
+            const ourShieldPct = ourParticipant?.shield_pct || ourParticipant?.shield_percent || 100;
+            
+            let statusComment = "";
+            if (ourHullPct <= 30) {
+              statusComment = "I'm taking heavy damage!";
+            } else if (ourHullPct <= 60) {
+              statusComment = "I've got some hull damage but I'm still fighting!";
+            } else if (ourShieldPct <= 30) {
+              statusComment = "My shields are down but hull is holding!";
+            } else {
+              statusComment = "I'm holding my own in this fight!";
+            }
+            
+            // Get enemy zone info if available
+            const enemyZone = battle.enemy_zone || 'unknown';
+            
+            battleInfo = ` | Battle status: ${shipInfo}. ${statusComment} Enemy zone: ${enemyZone}, Our zone: ${ourZone || 'unknown'}`;
+          }
+          // If we don't have a valid side ID, we skip battle details (can't determine friend/foe)
+        }
+
+        // Create a message that mentions the attacker (if we have their name)
+        let messageContent = "";
+        if (attackerName && attackerName !== "Unknown" && attackerName !== "") {
+          // Check if attacker is actually on our side (to avoid friendly fire mentions)
+          let isAttackerFriendly = false;
+          if (this.currentBattle.participants && this.currentBattle.participants.length > 0 && ourSideId !== undefined) {
+            isAttackerFriendly = this.currentBattle.participants.some(
+              p => (p as any).username === attackerName && (p as any).side_id === ourSideId
+            );
+          }
+          
+          if (!isAttackerFriendly) {
+            messageContent = `${attackerName} just hit me for ${damageTaken} damage! `;
+          } else {
+            messageContent = "Whoa! Friendly fire! ";
+          }
+        } else {
+          messageContent = "I'm under attack! ";
+        }
+
+       // Add personality-appropriate witty response based on damage and situation
+       const wittyResponses = [
+         "That tickles! Is that the best you've got?",
+         "Ow! My mom could hit harder than that!",
+         "Is your weapon broken or are you just bad at this?",
+         "You fight like a drunk federation cadet!",
+         "My shields absorbed that like a sponge!",
+         "Did you forget to load your weapons?",
+         "Is that a peace offering or an attack?",
+         "You shoot like my grandma playing laser tag!",
+         "I've seen stronger hits from a peashooter!",
+         "Is that all? I barely felt that!",
+         "My grandfather's toupee has more firepower!",
+         "You couldn't hit the broadside of a barn!",
+         "Is that supposed to hurt? Adorable.",
+         "My pet rock could do better than that!",
+         "Are you trying to scratch my paint?",
+         "That barely registered on my damage sensors!",
+         "Is that a nerf gun or a real weapon?",
+         "You fight like you're afraid of winning!",
+         "Is that your attack or did you sneeze on my shields?"
+       ];
+       
+       // Select a random witty response
+       const randomIndex = Math.floor(Math.random() * wittyResponses.length);
+       const wittyResponse = wittyResponses[randomIndex];
+       
+       // If we took significant damage, use a different tone
+       if (damageTaken >= 50) {
+         const seriousResponses = [
+           "Okay, that actually hurt. Who are you working for?",
+           "Not bad! You've got my attention now.",
+           "Alright, you wanna dance? Let's go!",
+           "That sting means you're worth fighting!",
+           "Okay, okay... you've made this interesting.",
+           "Now we're talking! Let's see what you've really got!",
+           "You've got guts, I'll give you that.",
+           "That's more like it! Now we're getting somewhere.",
+           "Alright, you've earned my respect. Let's finish this.",
+           "Okay, you're not completely useless after all."
+         ];
+         const seriousIndex = Math.floor(Math.random() * seriousResponses.length);
+         messageContent += seriousResponses[seriousIndex];
+       } else {
+         messageContent += wittyResponse;
+       }
+       
+       // Add battle context if available
+       if (battleInfo) {
+         messageContent += battleInfo;
+       }
+       
+       // Add nearby info if available
+       if (nearbyInfo) {
+         messageContent += nearbyInfo;
+       }
+       
+       // Send the message to AI chat service as a local chat message
+       // This will allow any bot to respond based on their personality
+       aiChatService.addChatMessage({
+         sender: "System", // Mark as system message so bots know it's a battle alert
+         channel: "local",
+         content: messageContent,
+         timestamp: Date.now(),
+         botUsername: this.username,
+         botSystem: this.system,
+         botPoi: this.poi
+       });
+       
+       this.log("ai_chat", `Sent battle response to AI chat: ${messageContent.substring(0, 100)}...`);
+     } catch (err) {
+       this.log("error", `Failed to send battle response to AI chat: ${err instanceof Error ? err.message : String(err)}`);
+     }
+   }
+
+   /**
+    * Extract and track player names, pirates, and empire NPCs from a get_nearby response.
+    */
   trackNearbyPlayers(nearbyResult: unknown): void {
     if (!nearbyResult || typeof nearbyResult !== "object") {
       this.log("debug", "trackNearbyPlayers: no result or not object");
@@ -1482,7 +2129,32 @@ export class Bot {
           if (empireNpcNames.has(trimmedName)) {
             continue;
           }
-          if (playerNameStore.add(trimmedName)) {
+          // Extract faction info - try faction_tag first (from nearby array), then faction/faction_id
+          let faction = "";
+          if (typeof entity.faction_tag === "string" && entity.faction_tag) {
+            faction = entity.faction_tag;
+          } else if (typeof entity.faction === "string" && entity.faction) {
+            faction = entity.faction;
+          } else if (typeof entity.faction_id === "string" && entity.faction_id) {
+            faction = entity.faction_id;
+          }
+          // Extract ship info - try ship_class (from nearby array), then ship/ship_type/ship_name
+          let ship = "";
+          if (typeof entity.ship_class === "string" && entity.ship_class) {
+            ship = entity.ship_class;
+          } else if (typeof entity.ship === "string" && entity.ship) {
+            ship = entity.ship;
+          } else if (typeof entity.ship_type === "string" && entity.ship_type) {
+            ship = entity.ship_type;
+          } else if (typeof entity.ship_name === "string" && entity.ship_name) {
+            ship = entity.ship_name;
+          }
+          // Log status message if available
+          if (typeof entity.status_message === "string" && entity.status_message) {
+            debugLogForBot(this.username, "playernames:status", `${this.username}`, 
+              `Player ${trimmedName}: ${entity.status_message}`);
+          }
+          if (playerNameStore.add(trimmedName, faction, ship, this.system, this.poi)) {
             playerCount++;
           }
         }
@@ -1495,7 +2167,9 @@ export class Bot {
     for (const pirate of piratesArray as Array<Record<string, unknown>>) {
       const name = pirate.name as string;
       if (name && name.trim()) {
-        if (playerNameStore.addPirate(name)) {
+        const faction = (pirate.faction as string) || "";
+        const ship = (pirate.ship_type as string) || (pirate.ship as string) || "";
+        if (playerNameStore.addPirate(name, faction, ship, this.system, this.poi)) {
           pirateCount++;
         }
       }
@@ -1506,7 +2180,9 @@ export class Bot {
     for (const npc of empireNpcsArray as Array<Record<string, unknown>>) {
       const name = npc.name as string;
       if (name && name.trim()) {
-        if (playerNameStore.addEmpireNpc(name)) {
+        const faction = (npc.faction as string) || "";
+        const ship = (npc.ship_type as string) || (npc.ship as string) || "";
+        if (playerNameStore.addEmpireNpc(name, faction, ship, this.system, this.poi)) {
           empireNpcCount++;
         }
       }
@@ -1517,6 +2193,44 @@ export class Bot {
 
     if (playerCount > 0 || pirateCount > 0 || empireNpcCount > 0) {
       this.log("playernames", `Discovered ${playerCount} new player(s), ${pirateCount} new pirate(s), ${empireNpcCount} new empire NPC(s) from nearby scan`);
+    }
+  }
+
+  /**
+   * Extract and track player names from a get_system_agents response.
+   */
+  trackSystemAgents(systemAgentsResult: unknown): void {
+    if (!systemAgentsResult || typeof systemAgentsResult !== "object") {
+      this.log("debug", "trackSystemAgents: no result or not object");
+      return;
+    }
+
+    const data = systemAgentsResult as Record<string, unknown>;
+
+    // Debug: log what keys we have
+    debugLogForBot(this.username, "playernames:track_system", `${this.username}`, `get_system_agents result keys: ${Object.keys(data).join(", ")}`);
+
+    const agentsArray = Array.isArray(data.agents) ? data.agents : [];
+    let agentCount = 0;
+
+    for (const agent of agentsArray as Array<Record<string, unknown>>) {
+      const name = agent.username as string;
+      if (name && name.trim()) {
+        const trimmedName = name.trim();
+        // Extract faction info - prefer faction_tag over faction_id
+        let faction = "";
+        if (typeof agent.faction_tag === "string" && agent.faction_tag) {
+          faction = agent.faction_tag;
+        } else if (typeof agent.faction_id === "string" && agent.faction_id) {
+          faction = agent.faction_id;
+        }
+        // Ship class is directly available
+        const ship = (agent.ship_class as string) || "";
+        // System-wide, no specific POI
+        if (playerNameStore.add(trimmedName, faction, ship, this.system, "")) {
+          agentCount++;
+        }
+      }
     }
   }
 
@@ -1536,7 +2250,7 @@ export class Bot {
     for (const member of members as Array<Record<string, unknown>>) {
       const name = (member.username as string) || (member.player_name as string) || (member.name as string);
       if (name && name.trim()) {
-        if (playerNameStore.add(name)) {
+        if (playerNameStore.add(name, '', '', this.system, this.poi)) {
           count++;
         }
       }
@@ -1582,7 +2296,7 @@ export class Bot {
             nameLower.startsWith("[customs]") ||
             nameLower.startsWith("[police]");
           
-          if (!isEmpireNpc && playerNameStore.add(trimmedName)) {
+          if (!isEmpireNpc && playerNameStore.add(trimmedName, '', '', this.system, this.poi)) {
             count++;
           }
         }
@@ -1594,12 +2308,17 @@ export class Bot {
     }
   }
 
-  /** Signal the bot to stop after the current action. */
+  /** Signal the bot to stop immediately, canceling all pending operations. */
   stop(): void {
     if (this._state !== "running") return;
     this._state = "stopping";
     this._abortController?.abort();
-    this.log("system", "Stop requested — will halt after current action");
+    // Abort all pending API commands immediately
+    for (const controller of this.pendingCommands.values()) {
+      controller.abort();
+    }
+    this.pendingCommands.clear();
+    this.log("system", "Stop requested — canceling all pending operations immediately");
   }
 
   /** Get a summary of the bot's current state. */
@@ -1619,8 +2338,9 @@ export class Bot {
       docked: this.docked,
       lastAction: this._lastAction,
       error: this._error,
-      shipName: this.shipName,
-      hull: this.hull,
+       shipName: this.shipName,
+       shipClass: this.shipClass,
+       hull: this.hull,
       maxHull: this.maxHull,
       shield: this.shield,
       maxShield: this.maxShield,

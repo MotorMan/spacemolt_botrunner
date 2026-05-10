@@ -365,7 +365,7 @@ export class Bot {
     // Get jump times from settings or use defaults
     const settings = (this as any).settings || {};
     const generalSettings = settings.general || {};
-    
+
     const jumpTimes: Record<number, number> = {
       1: generalSettings.jumpSpeed1 || 80,
       2: generalSettings.jumpSpeed2 || 70,
@@ -374,7 +374,7 @@ export class Bot {
       5: generalSettings.jumpSpeed5 || 40,
       6: generalSettings.jumpSpeed6 || 30,
     };
-    
+
     const buffer = generalSettings.jumpBuffer || 10;
     let baseTime = jumpTimes[this.shipSpeed] || 80;
 
@@ -384,6 +384,41 @@ export class Bot {
     }
 
     // Add buffer (1 game tick = 10s by default)
+    const timeoutWithBuffer = baseTime + buffer;
+
+    return timeoutWithBuffer * 1000; // Convert to milliseconds
+  }
+
+  /**
+   * Calculate the appropriate timeout for a travel command based on ship speed.
+   * Travel within a system is generally faster than jumps between systems.
+   * Uses configurable travel times from settings (with defaults if not set).
+   * If towing a wreck, speed is reduced by 50% (timeout increased accordingly).
+   * Adds configurable buffer (default 5s) to the base travel time.
+   */
+  private calculateTravelTimeout(): number {
+    // Get travel times from settings or use defaults (shorter than jump times)
+    const settings = (this as any).settings || {};
+    const generalSettings = settings.general || {};
+
+    const travelTimes: Record<number, number> = {
+      1: generalSettings.travelSpeed1 || 20,
+      2: generalSettings.travelSpeed2 || 18,
+      3: generalSettings.travelSpeed3 || 15,
+      4: generalSettings.travelSpeed4 || 12,
+      5: generalSettings.travelSpeed5 || 10,
+      6: generalSettings.travelSpeed6 || 8,
+    };
+
+    const buffer = generalSettings.travelBuffer || 5;
+    let baseTime = travelTimes[this.shipSpeed] || 20;
+
+    // Apply 50% speed penalty if towing a wreck
+    if (this.towingWreck) {
+      baseTime = Math.round(baseTime * 1.5);
+    }
+
+    // Add buffer
     const timeoutWithBuffer = baseTime + buffer;
 
     return timeoutWithBuffer * 1000; // Convert to milliseconds
@@ -471,7 +506,9 @@ export class Bot {
           } else if (command === "mine" || command === "jettison") {
             timeoutMs = 15000; // 15s for mining/jettison
           } else if (command === "travel") {
+            timeoutMs = this.calculateTravelTimeout();
             targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
+            this.log("travel", `Travel timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
           }
           resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
 

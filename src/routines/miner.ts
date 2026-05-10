@@ -1,4 +1,5 @@
 import type { Routine, RoutineContext } from "../bot.js";
+import type { BotChatMessage } from "../bot_chat_channel.js";
 import { mapStore, isDepletionExpired } from "../mapstore.js";
 import { getBotChatChannel } from "../botmanager.js";
 import { getSystemBlacklist } from "../web/server.js";
@@ -319,8 +320,7 @@ function getMinerSettings(username?: string): {
   ignoreDepletion: boolean;
   stayOutUntilFull: boolean;
   maxJumps: number;
-  escortName: string;
-   escortSignalChannel: "faction" | "local" | "file" | "chat";
+
   // Flock mining settings
   flockEnabled: boolean;
   flockName: string;
@@ -404,10 +404,7 @@ function getMinerSettings(username?: string): {
     ignoreDepletion: (m.ignoreDepletion as boolean) ?? false,
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
     maxJumps: (m.maxJumps as number) ?? 10,
-    escortName: (botOverrides.escortName as string) || (m.escortName as string) || "",
-    escortSignalChannel:
-      parseSignalChannel(botOverrides.escortSignalChannel) ??
-      parseSignalChannel(m.escortSignalChannel) ?? "chat",
+
     // Flock mining settings
     flockEnabled: (botOverrides.flockEnabled as boolean) ?? (m.flockEnabled as boolean) ?? false,
     flockName: (botOverrides.flockName as string) || (m.flockName as string) || "",
@@ -417,6 +414,8 @@ function getMinerSettings(username?: string): {
     flockGroups,
   };
 }
+
+// ── Bot chat handler for escort queries ───────────────────────
 
 /** Detect mining type from ship modules. Uses cached modules if provided for resilience. */
 async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]): Promise<"ore" | "gas" | "ice" | "radioactive" | null> {
@@ -1566,6 +1565,16 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   const homeSystem = settings0.homeSystem || bot.system;
   const cargoThresholdRatio = settings0.cargoThreshold / 100;
 
+  // Register chat handler for escort queries
+  const chatChannel = getBotChatChannel();
+  const chatHandler = (message: BotChatMessage) => {
+    if (message.channel === "escort" && message.recipients.includes(bot.username) && message.content === "QUERY_LOCATION") {
+      chatChannel.send({ sender: bot.username, recipients: [message.sender], channel: "escort", content: `LOCATION: ${bot.system}` });
+      ctx.log("escort", `Responded to location query: ${bot.system}`);
+    }
+  };
+  chatChannel.onMessage(bot.username, chatHandler);
+
   // ── CRITICAL FIX: Check cargo after client restart/timeout before anything else ──
   // If cargo is full at routine start, log a warning - the session recovery will handle it
   const startCargoFill = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
@@ -2307,10 +2316,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // Signal escorts that we're undocking (they should prepare to follow)
-    if (settings.escortName) {
-      ctx.log("escort", "Signaling escorts: miner undocking...");
-      await signalEscort(ctx, "undock", undefined, settings.escortSignalChannel);
-    }
+    ctx.log("escort", "Signaling escorts: miner undocking...");
+      await signalEscort(ctx, "undock", undefined, "chat");
 
     await ensureUndocked(ctx);
 
@@ -2724,23 +2731,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Announce destination and signal escorts before jumping
       const minerSettings = getMinerSettings(bot.username);
-      if (minerSettings.escortName) {
-        // Send chat message to escort channel
-        const chatChannel = getBotChatChannel();
-        chatChannel.send(`Going to ${targetSystemId}`, "escort");
+      // Send chat message to escort channel
+      const chatChannel = getBotChatChannel();
+      chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Going to ${targetSystemId}` });
+      ctx.log("escort", `Sent going to ${targetSystemId}`);
 
-        ctx.log("escort", `Signaling escorts to jump to ${targetSystemId}...`);
-        await signalEscort(ctx, "jump", targetSystemId, minerSettings.escortSignalChannel);
-        await ctx.sleep(2000); // Brief pause to let escorts read the signal
-      }
+      ctx.log("escort", `Signaling escorts to jump to ${targetSystemId}...`);
+      await signalEscort(ctx, "jump", targetSystemId, "chat"); // Default to faction for signals
+      await ctx.sleep(2000); // Brief pause to let escorts read the signal
 
-      const travelOpts = minerSettings.escortName ? {
+      const travelOpts = {
         ...safetyOpts,
         onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
           const chatChannel = getBotChatChannel();
-          chatChannel.send(`Jumping to ${nextSystem}`, "escort");
+          chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Jumping to ${nextSystem}` });
+          ctx.log("escort", `Sent jumping to ${nextSystem}`);
         }
-      } : safetyOpts;
+      };
 
       const arrived = await navigateToSystem(ctx, targetSystemId, travelOpts);
       if (!arrived) {
@@ -5225,10 +5232,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
 
     // Signal escorts that we're docking (they should stay on patrol)
     const minerDockSettings = getMinerSettings(bot.username);
-    if (minerDockSettings.escortName) {
-      ctx.log("escort", "Signaling escorts: miner docking...");
-      await signalEscort(ctx, "dock", undefined, minerDockSettings.escortSignalChannel);
-    }
+    await signalEscort(ctx, "dock", undefined, "chat");
 
     // Signal flock that we're docking
     if (settings.flockEnabled && settings.flockName) {
@@ -5357,4 +5361,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     const endFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Cycle done — ${bot.credits} credits, ${endFuel}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
   }
+
+  // Unregister chat handler
+  chatChannel.offMessage(bot.username, chatHandler);
 };

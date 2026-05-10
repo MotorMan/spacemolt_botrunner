@@ -14165,26 +14165,6 @@ function renderMinerSettings(panel) {
         <input type="number" id="set-miner-maxJumps" min="1" max="50" value="${settings.miner?.maxJumps ?? 10}" style="width:80px" />
       </div>
 
-      <div class="setting-row">
-        <div>
-          <div class="setting-label">Escort Bot Name</div>
-          <div class="setting-hint">Username of an escort bot that should follow this miner. Leave empty if no escort. The miner will broadcast [ESCORT] signals for coordination.</div>
-        </div>
-        <input type="text" id="set-miner-escortName" value="${esc(settings.miner?.escortName || '')}" placeholder="escort_bot_username" />
-      </div>
-
-      <div class="setting-row">
-        <div>
-          <div class="setting-label">Escort Signal Channel</div>
-          <div class="setting-hint">How the miner sends signals to escorts. Faction chat works across systems. File-based is most reliable for bots on the same machine.</div>
-        </div>
-        <select id="set-miner-escortSignalChannel">
-          <option value="faction"${(!settings.miner?.escortSignalChannel || settings.miner?.escortSignalChannel === 'faction') ? ' selected' : ''}>Faction Chat (cross-system)</option>
-          <option value="file"${settings.miner?.escortSignalChannel === 'file' ? ' selected' : ''}>File-Based (same machine)</option>
-          <option value="local"${settings.miner?.escortSignalChannel === 'local' ? ' selected' : ''}>Local Log Only (debug)</option>
-        </select>
-      </div>
-
     <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
       <div class="setting-label" style="margin-bottom:8px">🐦 Flock Mining</div>
       <div class="setting-hint" style="margin-bottom:12px">Coordinate multiple miners to mine together at the same location. First, create flock groups below, then assign this miner to a group.</div>
@@ -14545,8 +14525,7 @@ function saveMinerSettings() {
     ignoreDepletion: document.getElementById('set-miner-ignoreDepletion').checked,
     stayOutUntilFull: document.getElementById('set-miner-stayOutUntilFull').checked,
     maxJumps: parseInt(document.getElementById('set-miner-maxJumps').value) || 10,
-    escortName: document.getElementById('set-miner-escortName').value,
-    escortSignalChannel: document.getElementById('set-miner-escortSignalChannel').value,
+
     // Note: oreQuotas, gasQuotas, iceQuotas, deepCoreQuotas, radioactiveQuotas are managed in Miner Quotas settings page
     // They are preserved from existing settings when saving from this page
     jettisonOres: collectJettisonOres(),
@@ -15165,7 +15144,7 @@ function renderEscortSettings(panel) {
   const globalMaxAttackTier = e.maxAttackTier || 'large';
   const globalFleeFromTier = e.fleeFromTier || 'boss';
   const globalMinPiratesToFlee = e.minPiratesToFlee ?? 3;
-  const globalSignalChannel = e.signalChannel || 'faction';
+
 
   const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
   const tierOpts = tierOptions.map(t => `<option value="${t}"${t === globalMaxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
@@ -15247,13 +15226,11 @@ function renderEscortSettings(panel) {
       <div class="setting-row">
         <div>
           <div class="setting-label">Signal Channel</div>
-          <div class="setting-hint">Method used to receive location signals from the miner bot. <strong>File</strong> is most reliable for bots on the same machine. <strong>Faction Chat</strong> works across different machines.</div>
+          <div class="setting-hint">Escorts use <strong>Bot Chat</strong> to receive location signals from miners/salvagers. This is an instant, private channel between bots.</div>
         </div>
-        <select id="set-escort-signalChannel">
-          <option value="faction"${globalSignalChannel === 'faction' ? ' selected' : ''}>Faction Chat (cross-system)</option>
-          <option value="file"${globalSignalChannel === 'file' ? ' selected' : ''}>File-based (same machine)</option>
-          <option value="local"${globalSignalChannel === 'local' ? ' selected' : ''}>Local Log Only</option>
-        </select>
+        <div class="setting-value">
+          <span style="color: var(--text-secondary); font-style: italic;">Bot Chat (automatic)</span>
+        </div>
       </div>
     </div>
 
@@ -15336,7 +15313,6 @@ function saveEscortSettings() {
     maxAttackTier: document.getElementById('set-escort-maxAttackTier').value,
     fleeFromTier: document.getElementById('set-escort-fleeFromTier').value,
     minPiratesToFlee: parseInt(document.getElementById('set-escort-minPiratesToFlee').value) || 3,
-    signalChannel: document.getElementById('set-escort-signalChannel').value,
   };
   send({ type: 'saveSettings', routine: 'escort', settings: s });
   settings.escort = s;

@@ -452,6 +452,10 @@ export function setExplorerReturnToHomeOnFuelCellDepletion(username: string, ret
 export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
+  // DEBUG: Log system blacklist at startup
+  const systemBlacklist = getSystemBlacklist();
+  ctx.log("info", `Explorer starting - System blacklist contains ${systemBlacklist.length} systems: ${systemBlacklist.length > 0 ? systemBlacklist.join(', ') : 'none'}`);
+
   // Check per-bot mode
   const initialSettings = getExplorerSettings(bot.username);
   if (initialSettings.mode === "trade_update") {
@@ -1119,7 +1123,15 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     const validConns = connections.filter(c => c.id);
-    const nextSystem = pickNextSystem(validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems);
+
+    // DEBUG: Check for any blacklisted systems in connections
+    const blacklist = getSystemBlacklist();
+    const blacklistedInConnections = validConns.filter(c => blacklist.some(b => b.toLowerCase() === c.id.toLowerCase()));
+    if (blacklistedInConnections.length > 0) {
+      ctx.log("warning", `Found ${blacklistedInConnections.length} blacklisted systems in current connections: ${blacklistedInConnections.map(c => c.id).join(', ')}`);
+    }
+
+    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems);
     if (!nextSystem) {
       ctx.log("info", "All connected systems explored! Picking a random connection...");
       if (validConns.length > 0) {
@@ -1132,6 +1144,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
         // Smart selection: avoid dead-ends and pirate systems
         const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems);
+        if (!random) {
+          ctx.log("error", "No valid non-blacklisted connections available! Explorer is trapped. Waiting before retry...");
+          await ctx.sleep(60000); // Wait 1 minute before retry
+          continue;
+        }
         await ensureUndocked(ctx);
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
         const jumpResp = await bot.exec("jump", { target_system: random.id });
@@ -3196,17 +3213,36 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  * 3. Among unvisited, prefer systems with fewer POIs (less explored)
  * Always avoids pirate systems, blacklisted systems, and systems we've fled from.
  */
-function pickNextSystem(connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>): Connection | null {
+function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
 
+  // DEBUG: Log blacklist contents and filtering
+  if (blacklist.length > 0) {
+    ctx.log("debug", `System blacklist contains ${blacklist.length} systems: ${blacklist.join(', ')}`);
+  } else {
+    ctx.log("debug", "System blacklist is empty");
+  }
+
   // Filter out blacklisted systems, systems we've fled from, and temporarily blacklisted systems
-  const nonBlacklistedConns = connections.filter(c =>
-    !blacklist.some(b => b.toLowerCase() === c.id.toLowerCase()) &&
-    !fledFromSystems.has(c.id) &&
-    !isTemporarilyBlacklisted(c.id)
-  );
+  const nonBlacklistedConns = connections.filter(c => {
+    const isBlacklisted = blacklist.some(b => b.toLowerCase() === c.id.toLowerCase());
+    const hasFledFrom = fledFromSystems.has(c.id);
+    const isTempBlacklisted = isTemporarilyBlacklisted(c.id);
+
+    if (isBlacklisted) {
+      ctx.log("debug", `Filtering out blacklisted system: ${c.id}`);
+    }
+    if (hasFledFrom) {
+      ctx.log("debug", `Filtering out fled-from system: ${c.id}`);
+    }
+    if (isTempBlacklisted) {
+      ctx.log("debug", `Filtering out temporarily blacklisted system: ${c.id}`);
+    }
+
+    return !isBlacklisted && !hasFledFrom && !isTempBlacklisted;
+  });
   
   // Separate connections into pirate and non-pirate
   const nonPirateConns = nonBlacklistedConns.filter(c => !isPirateSystem(c.id));
@@ -3267,23 +3303,48 @@ function pickNextSystem(connections: Connection[], visited: Set<string>, visited
  * 5. Systems with more connections (not a dead-end)
  * 6. Unexplored systems (not in map.json) over explored ones
  */
-function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>): Connection {
+function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
-  
+
+  // DEBUG: Log blacklist contents and filtering
+  if (blacklist.length > 0) {
+    ctx.log("debug", `Smart connection picker - System blacklist contains ${blacklist.length} systems: ${blacklist.join(', ')}`);
+  } else {
+    ctx.log("debug", "Smart connection picker - System blacklist is empty");
+  }
+
   // First, filter out the system we came from (if possible)
   let candidates = lastSystem ? connections.filter(c => c.id !== lastSystem) : connections;
   if (candidates.length === 0) candidates = connections;
 
   // Filter out blacklisted systems, systems we've fled from, and temporarily blacklisted systems
-  const nonBlacklisted = candidates.filter(c =>
-    !blacklist.some(b => b.toLowerCase() === c.id.toLowerCase()) &&
-    !fledFromSystems.has(c.id) &&
-    !isTemporarilyBlacklisted(c.id)
-  );
-  // If all are blacklisted, use original candidates (trapped situation)
-  candidates = nonBlacklisted.length > 0 ? nonBlacklisted : candidates;
+  const nonBlacklisted = candidates.filter(c => {
+    const isBlacklisted = blacklist.some(b => b.toLowerCase() === c.id.toLowerCase());
+    const hasFledFrom = fledFromSystems.has(c.id);
+    const isTempBlacklisted = isTemporarilyBlacklisted(c.id);
+
+    if (isBlacklisted) {
+      ctx.log("debug", `Smart connection picker - Filtering out blacklisted system: ${c.id}`);
+    }
+    if (hasFledFrom) {
+      ctx.log("debug", `Smart connection picker - Filtering out fled-from system: ${c.id}`);
+    }
+    if (isTempBlacklisted) {
+      ctx.log("debug", `Smart connection picker - Filtering out temporarily blacklisted system: ${c.id}`);
+    }
+
+    return !isBlacklisted && !hasFledFrom && !isTempBlacklisted;
+  });
+
+  // CRITICAL: Never use blacklisted systems, even in trapped situations
+  if (nonBlacklisted.length === 0) {
+    ctx.log("error", `Smart connection picker - ALL connected systems are blacklisted/fled-from/temp-blacklisted! Cannot proceed with exploration.`);
+    return null; // Return null to indicate no valid connections
+  }
+
+  candidates = nonBlacklisted;
 
   // Separate into pirate and non-pirate
   const nonPirate = candidates.filter(c => !isPirateSystem(c.id));

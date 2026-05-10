@@ -70,6 +70,11 @@ import {
   getQueueStats,
   cleanupStaleQueue,
   getRescueQueue,
+  claimRescue,
+  releaseRescueClaim,
+  isRescueClaimed,
+  cleanupStaleClaims,
+  getUnclaimedRescuesInSystem,
 } from "../rescueQueue.js";
 import {
   getCooperationSettings,
@@ -1032,6 +1037,107 @@ async function ensurePremiumFuelReserve(ctx: RoutineContext, reserveCount: numbe
 }
 
 /**
+ * Fill cargo with as many premium fuel cells as possible (they take 2x space).
+ * This ensures rescue ships carry maximum emergency fuel reserves.
+ *
+ * @returns true if successfully filled cargo, false if unable
+ */
+async function fillCargoWithPremiumFuel(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+
+  // Must be docked to access storage/market
+  if (!bot.docked) {
+    await ensureDocked(ctx);
+  }
+
+  await bot.refreshCargo();
+  const currentPremium = await getPremiumFuelCellsInCargo(ctx);
+  const cargoSpace = bot.cargoMax - bot.cargo;
+  const maxPremiumInCargo = Math.floor(cargoSpace / 2); // Premium fuel cells take 2 slots each
+
+  ctx.log("rescue", `Cargo status: ${bot.cargo}/${bot.cargoMax} used, ${cargoSpace} free. Can hold ${maxPremiumInCargo} premium fuel cells`);
+
+  if (currentPremium >= maxPremiumInCargo) {
+    ctx.log("rescue", `✓ Cargo already full of premium fuel: ${currentPremium}/${maxPremiumInCargo}`);
+    return true;
+  }
+
+  const needed = maxPremiumInCargo - currentPremium;
+  ctx.log("rescue", `⚠️ Need ${needed} more premium fuel cells to fill cargo`);
+
+  // First check faction storage for premium fuel cells
+  await bot.refreshFactionStorage();
+  const factionPremium = bot.factionStorage?.find(i => i.itemId === "premium_fuel_cell");
+
+  if (factionPremium && factionPremium.quantity > 0) {
+    const canTake = Math.min(needed, factionPremium.quantity);
+    ctx.log("rescue", `Found ${factionPremium.quantity}x premium fuel cells in faction storage, taking ${canTake}`);
+
+    const { collectFromStorage } = await import("./common.js");
+    await collectFromStorage(ctx);
+
+    await bot.refreshCargo();
+    const afterCollect = await getPremiumFuelCellsInCargo(ctx);
+    ctx.log("rescue", `✓ After faction storage: ${afterCollect}/${maxPremiumInCargo} premium fuel cells`);
+
+    if (afterCollect >= maxPremiumInCargo) {
+      return true;
+    }
+  }
+
+  // Try buying from market to fill remaining space
+  const stillNeeded = maxPremiumInCargo - await getPremiumFuelCellsInCargo(ctx);
+  if (stillNeeded > 0) {
+    const marketResp = await bot.exec("view_market");
+
+    if (!marketResp.error && marketResp.result) {
+      const mData = marketResp.result as Record<string, unknown>;
+      const items = (
+        Array.isArray(mData) ? mData :
+        Array.isArray(mData.items) ? mData.items :
+        Array.isArray(mData.market) ? mData.market :
+        []
+      ) as Array<Record<string, unknown>>;
+
+      const premiumItem = items.find(i =>
+        ((i.item_id as string) || (i.id as string)) === "premium_fuel_cell"
+      );
+
+      if (premiumItem) {
+        const itemId = (premiumItem.item_id as string) || (premiumItem.id as string) || "";
+        const price = (premiumItem.price as number) || (premiumItem.buy_price as number) || 0;
+        const available = (premiumItem.quantity as number) || (premiumItem.stock as number) || 0;
+        const canAfford = Math.floor(bot.credits / price);
+        const qty = Math.min(stillNeeded, available, canAfford);
+
+        if (qty > 0) {
+          ctx.log("rescue", `Buying ${qty}x premium fuel cells (${price}cr each, total ${price * qty}cr)...`);
+          const buyResp = await bot.exec("buy", { item_id: itemId, quantity: qty });
+          if (!buyResp.error) {
+            await bot.refreshCargo();
+            const afterBuy = await getPremiumFuelCellsInCargo(ctx);
+            ctx.log("rescue", `✓ After market purchase: ${afterBuy}/${maxPremiumInCargo} premium fuel cells`);
+            return afterBuy >= maxPremiumInCargo;
+          } else {
+            ctx.log("rescue", `Buy failed: ${buyResp.error.message}`);
+          }
+        }
+      }
+    }
+  }
+
+  // If we can't get premium fuel cells, fall back to regular fuel cells as emergency reserve
+  const finalPremium = await getPremiumFuelCellsInCargo(ctx);
+  if (finalPremium > 0) {
+    ctx.log("rescue", `⚠️ Could not fill cargo completely - ${finalPremium}/${maxPremiumInCargo} premium fuel cells. Continuing with what we have.`);
+    return true; // We have some premium fuel, better than nothing
+  }
+
+  ctx.log("rescue", `⚠️ No premium fuel cells available - cargo remains empty`);
+  return false; // No premium fuel at all
+}
+
+/**
  * Retrieve actual credits of a bot by parsing its debug log.
  * Reads last 20 lines, finds most recent get_status response, extracts credits.
  */
@@ -1571,29 +1677,26 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
         ctx.log("rescue", `Session state '${recoveredSession.state}' - at POI, proceeding to fuel delivery...`);
         bot.system = target.system;
         bot.poi = target.poi;
-      } else if (recoveredSession.state === "returning_home") {
-        ctx.log("rescue", `Session state '${recoveredSession.state}' - continuing return to home (${homeSystem})...`);
-        bot.system = target.system;
-        bot.poi = target.poi;
+       } else if (recoveredSession.state === "returning_home") {
+         ctx.log("rescue", `Session state '${recoveredSession.state}' - continuing return to home (${homeSystem})...`);
+         bot.system = target.system;
+         bot.poi = target.poi;
 skipToReturnHome = true;
-      }
-    }
+       }
+     }
 
-    // ── Check fleet status (only if not resuming and no manual rescue) ──
-    if (!recoveredSession && !manualRescueTarget) {
-      yield "scan_fleet";
-      const fleet = ctx.getFleetStatus?.() || [];
-      if (fleet.length === 0) {
-        ctx.log("info", "No fleet data available — waiting...");
-        await ctx.sleep(settings.scanIntervalSec * 1000);
-        continue;
-      }
+     // ── Check fleet status (only if not resuming and no manual rescue) ──
+     if (!recoveredSession && !manualRescueTarget) {
+       yield "scan_fleet";
+       const fleet = ctx.getFleetStatus?.() || [];
+       if (fleet.length === 0) {
+         ctx.log("info", "No fleet data available — waiting...");
+         await ctx.sleep(settings.scanIntervalSec * 1000);
+         continue;
+       }
 
-      // Check if we're the primary fleet rescue bot
-      const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
-      ctx.log("rescue", `🔍 Fleet scan - primary fleet rescue: ${isFleetRescuePrimary ? 'YES (this bot)' : 'NO (waiting for ' + (settings.fleetRescueBot || 'other bot') + ')'} `);
-
-      const targets = isFleetRescuePrimary ? findStrandedBots(fleet, bot.username, settings.fuelThreshold) : [];
+       // Any rescue bot can rescue our own fleet bots
+       const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
 
       // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
       for (const target of targets) {
@@ -2068,24 +2171,29 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
           // Get the first system in the optimized route
           const firstSystem = optimizedRoute[0];
-          const rescuesInSystem = getRescuesInSystem(firstSystem);
+          const rescuesInSystem = getUnclaimedRescuesInSystem(firstSystem);
 
           if (rescuesInSystem.length > 0) {
             // Pick the most critical (lowest fuel) rescue in the closest system
             rescuesInSystem.sort((a, b) => a.fuelPct - b.fuelPct);
             const queuedRescue = rescuesInSystem[0];
 
-            ctx.log("rescue", `🎯 Selecting queued rescue: ${queuedRescue.targetUsername} at ${queuedRescue.system}/${queuedRescue.poi} (${queuedRescue.fuelPct}%)`);
+            // Try to claim this rescue
+            if (claimRescue(queuedRescue.id, bot.username)) {
+              ctx.log("rescue", `🎯 Claimed and selecting queued rescue: ${queuedRescue.targetUsername} at ${queuedRescue.system}/${queuedRescue.poi} (${queuedRescue.fuelPct}%)`);
 
-            selectedTarget = {
-              username: queuedRescue.targetUsername,
-              system: queuedRescue.system,
-              poi: queuedRescue.poi,
-              fuelPct: queuedRescue.fuelPct,
-              docked: queuedRescue.docked,
-            };
-            selectedFromQueue = true;
-            incrementRescueAttempt(queuedRescue.id);
+              selectedTarget = {
+                username: queuedRescue.targetUsername,
+                system: queuedRescue.system,
+                poi: queuedRescue.poi,
+                fuelPct: queuedRescue.fuelPct,
+                docked: queuedRescue.docked,
+              };
+              selectedFromQueue = true;
+              incrementRescueAttempt(queuedRescue.id);
+            } else {
+              ctx.log("rescue", `⚠️ Could not claim queued rescue ${queuedRescue.targetUsername} - already claimed by another bot`);
+            }
           }
         }
       }
@@ -2912,15 +3020,19 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 ctx.log("error", `❌ Failed to dock at home station: ${dockResp.error.message}`);
               } else {
                 ctx.log(logCategory, `✓ Docked at home station`);
-                // Refuel after docking
-                ctx.log(logCategory, `⛽ Refueling at home station...`);
-                const refuelResp = await bot.exec("refuel");
-                if (refuelResp.error) {
-                  ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
-                } else {
-                  await bot.refreshStatus();
-                  ctx.log(logCategory, `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
-                }
+                      // Refuel after docking
+                      ctx.log("rescue", `⛽ Refueling at home station...`);
+                      const refuelResp = await bot.exec("refuel");
+                      if (refuelResp.error) {
+                        ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
+                      } else {
+                        await bot.refreshStatus();
+                        ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
+                      }
+
+                      // Fill cargo with premium fuel cells (take 2x space, max capacity)
+                      ctx.log("rescue", `⛽ Filling cargo with premium fuel cells...`);
+                      await fillCargoWithPremiumFuel(ctx);
               }
             }
           } else {
@@ -4197,6 +4309,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
         const queuedRescue = queue.pending.find(r => r.targetUsername === mayday.sender);
         if (queuedRescue) {
           markRescueCompleted(queuedRescue.id);
+          releaseRescueClaim(queuedRescue.id, bot.username); // Release claim when completed
           ctx.log("rescue", `📋 Marked ${mayday.sender} as completed in rescue queue`);
         }
       }
@@ -4542,11 +4655,8 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
-      // Check if we're the primary fleet rescue bot
-      const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
-      ctx.log("rescue", `🔍 Fleet scan - primary fleet rescue: ${isFleetRescuePrimary ? 'YES (this bot)' : 'NO (waiting for ' + (settings.fleetRescueBot || 'other bot') + ')'} `);
-
-      const targets = isFleetRescuePrimary ? findStrandedBots(fleet, bot.username, settings.fuelThreshold) : [];
+      // Any rescue bot can rescue our own fleet bots
+      const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
 
       // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
       for (const target of targets) {
@@ -5010,27 +5120,28 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             
             // Get the first system in the route
             const firstSystem = optimizedRoute[0];
-            const rescuesInSystem = getRescuesInSystem(firstSystem);
-            
+            const rescuesInSystem = getUnclaimedRescuesInSystem(firstSystem);
+
             if (rescuesInSystem.length > 0) {
               // Pick the most critical rescue in the first system
               rescuesInSystem.sort((a, b) => a.fuelPct - b.fuelPct);
               const queuedRescue = rescuesInSystem[0];
-              
-              ctx.log("rescue", `🎯 Selecting queued rescue: ${queuedRescue.targetUsername} at ${queuedRescue.system}/${queuedRescue.poi} (${queuedRescue.fuelPct}%)`);
-              
-              target = {
-                username: queuedRescue.targetUsername,
-                system: queuedRescue.system,
-                poi: queuedRescue.poi,
-                fuelPct: queuedRescue.fuelPct,
-                docked: queuedRescue.docked,
-              };
-              isMaydayTarget = false;
-              logCategory = "rescue";
-              
-              // Skip the idle/scavenge and go directly to rescue
-              incrementRescueAttempt(queuedRescue.id);
+
+              // Try to claim this rescue
+              if (claimRescue(queuedRescue.id, bot.username)) {
+                ctx.log("rescue", `🎯 Claimed and selecting queued rescue: ${queuedRescue.targetUsername} at ${queuedRescue.system}/${queuedRescue.poi} (${queuedRescue.fuelPct}%)`);
+
+                target = {
+                  username: queuedRescue.targetUsername,
+                  system: queuedRescue.system,
+                  poi: queuedRescue.poi,
+                  fuelPct: queuedRescue.fuelPct,
+                  docked: queuedRescue.docked,
+                };
+                incrementRescueAttempt(queuedRescue.id);
+              } else {
+                ctx.log("rescue", `⚠️ Could not claim queued rescue ${queuedRescue.targetUsername} - already claimed by another bot`);
+              }
             }
           }
         }
@@ -6381,6 +6492,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         const queuedRescue = queue.pending.find(r => r.targetUsername === target.username);
         if (queuedRescue) {
           markRescueCompleted(queuedRescue.id);
+          releaseRescueClaim(queuedRescue.id, bot.username); // Release claim when completed
           ctx.log("rescue", `📋 Marked ${target.username} as completed in rescue queue`);
         }
       }

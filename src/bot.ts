@@ -400,21 +400,21 @@ export class Bot {
    * Adds configurable buffer (default 5s) to the base travel time.
    */
   private calculateTravelTimeout(): number {
-    // Get travel times from settings or use defaults (shorter than jump times)
+    // Use same timeout as jumps to prevent station travel timeouts
     const settings = (this as any).settings || {};
     const generalSettings = settings.general || {};
 
-    const travelTimes: Record<number, number> = {
-      1: generalSettings.travelSpeed1 || 20,
-      2: generalSettings.travelSpeed2 || 18,
-      3: generalSettings.travelSpeed3 || 15,
-      4: generalSettings.travelSpeed4 || 12,
-      5: generalSettings.travelSpeed5 || 10,
-      6: generalSettings.travelSpeed6 || 8,
+    const jumpTimes: Record<number, number> = {
+      1: generalSettings.jumpSpeed1 || 80,
+      2: generalSettings.jumpSpeed2 || 70,
+      3: generalSettings.jumpSpeed3 || 60,
+      4: generalSettings.jumpSpeed4 || 50,
+      5: generalSettings.jumpSpeed5 || 40,
+      6: generalSettings.jumpSpeed6 || 30,
     };
 
-    const buffer = generalSettings.travelBuffer || 5;
-    let baseTime = travelTimes[this.shipSpeed] || 20;
+    const buffer = generalSettings.jumpBuffer || 10;
+    let baseTime = jumpTimes[this.shipSpeed] || 80;
 
     // Apply 50% speed penalty if towing a wreck
     if (this.towingWreck) {

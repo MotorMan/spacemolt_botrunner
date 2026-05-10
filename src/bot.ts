@@ -386,7 +386,10 @@ export class Bot {
     // Add buffer (1 game tick = 10s by default)
     const timeoutWithBuffer = baseTime + buffer;
 
-    return timeoutWithBuffer * 1000; // Convert to milliseconds
+    // Round up to next 10-second tick (game ticks every 10 seconds)
+    const roundedTimeout = Math.ceil(timeoutWithBuffer / 10) * 10;
+
+    return roundedTimeout * 1000; // Convert to milliseconds
   }
 
   /**
@@ -421,7 +424,10 @@ export class Bot {
     // Add buffer
     const timeoutWithBuffer = baseTime + buffer;
 
-    return timeoutWithBuffer * 1000; // Convert to milliseconds
+    // Round up to next 10-second tick (game ticks every 10 seconds)
+    const roundedTimeout = Math.ceil(timeoutWithBuffer / 10) * 10;
+
+    return roundedTimeout * 1000; // Convert to milliseconds
   }
 
   log(category: string, message: string): void {

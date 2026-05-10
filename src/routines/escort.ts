@@ -92,6 +92,29 @@ function isTierTooHigh(pirateTier: PirateTier | undefined, maxTier: PirateTier):
   return getTierLevel(pirateTier) > getTierLevel(maxTier);
 }
 
+// ── Route helpers ─────────────────────────────────────────────
+
+function getJumpsToSystem(fromSystemId: string, toSystemId: string): number {
+  if (fromSystemId === toSystemId) return 0;
+
+  const visited = new Set<string>();
+  const queue: [string, number][] = [[fromSystemId, 0]];
+
+  while (queue.length > 0) {
+    const [current, jumps] = queue.shift()!;
+    if (current === toSystemId) return jumps;
+
+    for (const conn of mapStore.getConnections(current)) {
+      if (!visited.has(conn.system_id)) {
+        visited.add(conn.system_id);
+        queue.push([conn.system_id, jumps + 1]);
+      }
+    }
+  }
+
+  return -1; // not reachable
+}
+
 // ── Settings ─────────────────────────────────────────────────
 
 function getEscortSettings(username?: string): {
@@ -462,7 +485,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
   let totalKills = 0;
   let lastMinerSystemCheck = 0;
-  const MINER_CHECK_INTERVAL_MS = 10_000;
+  const MINER_CHECK_INTERVAL_MS = 2_000;
   let minerSystem: string | null = null;
   let consecutiveFailedChecks = 0;
   const MAX_FAILED_CHECKS = 5;
@@ -519,7 +542,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       } else if (escortSignal.systemId && (escortSignal.action === "jump" || escortSignal.action === "travel")) {
         minerSystem = escortSignal.systemId;
         setMinerLocation(minerName, escortSignal.systemId);
-        ctx.log("escort", `Miner signaled travel to ${escortSignal.systemId} — will follow after checks`);
+        ctx.log("escort", `Miner signaled travel to ${escortSignal.systemId} (target system) — will follow immediately`);
       }
     } else {
       ctx.log("escort", `⚠ No signals received from ${minerName}`);
@@ -771,6 +794,15 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       if (minerSystem && minerSystem !== bot.system) {
+        // Check if too far behind
+        const jumpsAway = getJumpsToSystem(bot.system, minerSystem);
+        if (jumpsAway > 3) {
+          ctx.log("escort", `Miner is ${jumpsAway} jumps away — waiting to catch up rather than following immediately`);
+          minerSystem = null; // clear to avoid repeated attempts
+          await ctx.sleep(30000);
+          continue;
+        }
+
         // Pre-navigation verification: check if miner is actually where we think
         let currentMinerLocation = minerSystem;
         if (ctx.getFleetStatus) {
@@ -1095,6 +1127,15 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log("escort", `⚠ Miner ${minerName} has moved to ${minerBot.system} — following...`);
           minerSystem = minerBot.system;
           setMinerLocation(minerName, minerBot.system);
+
+          // Check if too far behind
+          const jumpsAway = getJumpsToSystem(bot.system, minerSystem);
+          if (jumpsAway > 3) {
+            ctx.log("escort", `Miner is ${jumpsAway} jumps away — waiting to catch up rather than following immediately`);
+            minerSystem = null; // clear to avoid repeated attempts
+            await ctx.sleep(30000);
+            continue;
+          }
         } else {
           ctx.log("escort", `✓ Miner ${minerName} still in ${bot.system}`);
         }
@@ -1112,9 +1153,19 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
 
         if (normalizeSystemName(minerBot.system) !== normalizeSystemName(bot.system)) {
-          ctx.log("escort", `⚠ Miner ${minerName} has moved to ${minerBot.system} — following...`);
           minerSystem = minerBot.system;
           setMinerLocation(minerName, minerBot.system);
+
+          // Check if too far behind
+          const jumpsAway = getJumpsToSystem(bot.system, minerSystem);
+          if (jumpsAway > 3) {
+            ctx.log("escort", `Miner is ${jumpsAway} jumps away — waiting to catch up rather than following immediately`);
+            minerSystem = null; // clear to avoid repeated attempts
+            await ctx.sleep(30000);
+            continue;
+          }
+
+          ctx.log("escort", `⚠ Miner ${minerName} has moved to ${minerBot.system} — following...`);
 
           const arrived = await navigateToSystem(ctx, minerSystem, safetyOpts);
           if (arrived) {

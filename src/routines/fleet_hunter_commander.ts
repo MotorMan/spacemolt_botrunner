@@ -344,7 +344,7 @@ interface FleetHunterSettings {
   manualMode: boolean;
 }
 
-function getFleetHunterSettings(): FleetHunterSettings {
+export function getFleetHunterSettings(): FleetHunterSettings {
   const all = readSettings();
   const h = all.fleet_hunter || {};
 
@@ -1741,13 +1741,13 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
           }
         }
 
-        if (!currentSettings.huntingEnabled) {
+        if (!currentSettings.huntingEnabled && currentSettings.mode !== 'stationary') {
           ctx.log("fleet", "Hunting is disabled — waiting for commands...");
           await ctx.sleep(5000);
           continue;
         }
 
-        if (currentSettings.manualMode) {
+        if (currentSettings.manualMode && currentSettings.mode !== 'stationary') {
           ctx.log("fleet", "Manual mode active — awaiting commands");
           await ctx.sleep(2000);
           continue;

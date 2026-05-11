@@ -372,6 +372,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('fuel_cell_seller')">Fuel Cell Sell</div>
         <div class="sidebar-item" onclick="switchSettingsTab('miner')">Miner</div>
         <div class="sidebar-item" onclick="switchSettingsTab('miner_quotas')">Miner Quotas</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('flock_grouping')">Flock Grouping</div>
         <div class="sidebar-item" onclick="switchSettingsTab('salvager')">Salvager</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cleanup')">Cleanup</div>
         <div class="sidebar-item" onclick="switchSettingsTab('return_home')">Return Home</div>
@@ -2044,7 +2045,7 @@ function renderProfileTopbar() {
         <span class="profile-ore-label" style="margin-left:8px">Focus:</span>
         <select id="profile-focusAreaSystem" onchange="saveProfileFocusAreaSystem()">${sysOpts.join('')}</select>
         <span class="profile-ore-label" style="margin-left:8px">Max Jumps:</span>
-        <input type="number" id="profile-maxJumps" value="${maxJumps}" min="1" max="50" style="width:60px" onchange="saveProfileMaxJumps()">`;
+        <input type="number" id="profile-maxJumps" value="${maxJumps}" min="1" max="100" style="width:60px" onchange="saveProfileMaxJumps()">`;
     }
   }
 
@@ -2185,6 +2186,24 @@ function renderProfileTopbar() {
       <span class="profile-ore-label" style="margin-left:8px">Follow:</span>
       <select id="profile-minerName" onclick="event.stopPropagation()" onchange="saveProfileEscortMiner()">${minerOpts.join('')}</select>`;
   }
+
+  // Add flock controls
+  const flockAssignments = settings.flockAssignments || {};
+  const botFlock = flockAssignments[bot.username];
+  const flockGroups = settings.miner?.flockGroups || [];
+  const flockOpts = [`<option value=""${!botFlock?.flockName ? ' selected' : ''}>None</option>`];
+  for (const group of flockGroups) {
+    const sel = group.name === botFlock?.flockName ? ' selected' : '';
+    flockOpts.push(`<option value="${esc(group.name)}"${sel}>${esc(group.name)}</option>`);
+  }
+
+  actions += `
+    <span class="profile-ore-label" style="margin-left:8px">Flock:</span>
+    <select id="profile-flockName" onclick="event.stopPropagation()" onchange="saveProfileFlock()">${flockOpts.join('')}</select>
+    <label style="margin-left:4px;font-size:11px">
+      <input type="checkbox" id="profile-flockLeader" onclick="event.stopPropagation()" onchange="saveProfileFlock()"${botFlock?.flockRole === 'leader' ? ' checked' : ''}>
+      Leader
+    </label>`;
 
   document.getElementById('profileActions').innerHTML = actions;
 }
@@ -2327,6 +2346,31 @@ function saveProfileEscortMiner() {
   const updated = Object.assign({}, existing, { minerName });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
+}
+
+function saveProfileFlock() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const flockSel = document.getElementById('profile-flockName');
+  const leaderChk = document.getElementById('profile-flockLeader');
+  if (!flockSel || !leaderChk) return;
+
+  const flockName = flockSel.value;
+  const isLeader = leaderChk.checked;
+
+  if (!settings.flockAssignments) settings.flockAssignments = {};
+
+  if (flockName) {
+    settings.flockAssignments[bot.username] = {
+      flockEnabled: true,
+      flockName: flockName,
+      flockRole: isLeader ? 'leader' : 'follower'
+    };
+  } else {
+    delete settings.flockAssignments[bot.username];
+  }
+
+  send({ type: 'saveSettings', routine: 'flock', settings: { assignments: settings.flockAssignments } });
 }
 
 function saveProfileFocusStation() {
@@ -6843,6 +6887,8 @@ function renderSettingsPanel() {
     renderMinerSettings(panel);
   } else if (activeSettingsTab === 'miner_quotas') {
     renderMinerQuotasSettings(panel);
+  } else if (activeSettingsTab === 'flock_grouping') {
+    renderFlockGroupingSettings(panel);
   } else if (activeSettingsTab === 'crafter') {
     renderCrafterSettings(panel);
   } else if (activeSettingsTab === 'rescue') {
@@ -13459,7 +13505,7 @@ function renderExplorerSettings(panel) {
       perBotHtml += `<tr>
         <td style="padding:6px;border-bottom:1px solid rgba(255,255,255,0.03)">${esc(bot.username)}</td>
         <td style="padding:6px;border-bottom:1px solid rgba(255,255,255,0.03)"><select data-bot="${esc(bot.username)}" class="focus-system-select" style="width:100%;padding:4px">${sysOpts}</select></td>
-        <td style="padding:6px;border-bottom:1px solid rgba(255,255,255,0.03)"><input type="number" data-bot="${esc(bot.username)}" class="focus-maxjumps-input" value="${botMaxJumps}" min="1" max="50" style="width:60px;padding:4px"></td>
+        <td style="padding:6px;border-bottom:1px solid rgba(255,255,255,0.03)"><input type="number" data-bot="${esc(bot.username)}" class="focus-maxjumps-input" value="${botMaxJumps}" min="1" max="100" style="width:60px;padding:4px"></td>
         <td style="padding:6px;border-bottom:1px solid rgba(255,255,255,0.03)"><button class="sm primary" onclick="saveExplorerBotFocus('${esc(bot.username)}')">Save</button></td>
       </tr>`;
     }
@@ -13635,13 +13681,14 @@ function buildFlockGroupRows() {
   for (const group of groups) {
     rows += `<tr data-flock-group="${esc(group.name)}">
       <td style="padding:4px 8px">${esc(group.name)}</td>
-      <td style="padding:4px 8px">${esc(group.targetOre || '-')}</td>
-      <td style="padding:4px 8px">${esc(group.targetGas || '-')}</td>
-      <td style="padding:4px 8px">${esc(group.targetIce || '-')}</td>
+      <td style="padding:4px 8px">${esc(group.targetOre || 'Auto (from quotas)')}</td>
+      <td style="padding:4px 8px">${esc(group.targetGas || 'Auto (from quotas)')}</td>
+      <td style="padding:4px 8px">${esc(group.targetIce || 'Auto (from quotas)')}</td>
       <td style="padding:4px 8px">${esc(group.miningType || 'auto')}</td>
-      <td style="padding:4px 8px">${esc(group.systemOre || '-')}</td>
-      <td style="padding:4px 8px">${esc(group.systemGas || '-')}</td>
-      <td style="padding:4px 8px">${esc(group.systemIce || '-')}</td>
+      <td style="padding:4px 8px">${esc(group.systemOre || 'Auto')}</td>
+      <td style="padding:4px 8px">${esc(group.systemGas || 'Auto')}</td>
+      <td style="padding:4px 8px">${esc(group.systemIce || 'Auto')}</td>
+      <td style="padding:4px 8px">${esc(group.systemSalvage || 'Auto')}</td>
       <td style="padding:4px 8px">${esc(group.rallySystem || '-')}</td>
       <td style="padding:4px 8px">${esc(group.maxMembers || '-')}</td>
       <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
@@ -13660,6 +13707,37 @@ function buildFlockGroupOptions(selectedName) {
   return opts;
 }
 
+function buildFlockAssignmentsRows() {
+  let rows = '';
+  const flockAssignments = settings.flockAssignments || {};
+  for (const bot of bots) {
+    const botSettings = flockAssignments[bot.username];
+    if (botSettings && botSettings.flockEnabled && botSettings.flockName) {
+      rows += `<tr data-bot="${esc(bot.username)}">
+        <td style="padding:4px 8px">${esc(bot.username)}</td>
+        <td style="padding:4px 8px">${esc(botSettings.flockName)}</td>
+        <td style="padding:4px 8px">${esc(botSettings.flockRole || 'follower')}</td>
+        <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="removeBotFromFlock('${esc(bot.username)}')" title="Remove from flock">❌</button></td>
+      </tr>`;
+    }
+  }
+  if (!rows) {
+    rows = '<tr><td colspan="4" style="padding:8px;text-align:center;color:var(--text-dim)">No bots assigned to flocks</td></tr>';
+  }
+  return rows;
+}
+
+function removeBotFromFlock(botUsername) {
+  if (!settings.flockAssignments) settings.flockAssignments = {};
+  delete settings.flockAssignments[botUsername];
+
+  // Send to server
+  send({ type: 'saveSettings', routine: 'flock', settings: { assignments: settings.flockAssignments } });
+
+  // Refresh the assignments table
+  document.getElementById('flock-assignments-tbody').innerHTML = buildFlockAssignmentsRows();
+}
+
 function addFlockGroupRow() {
   const name = document.getElementById('flock-group-name').value.trim();
   const targetOre = document.getElementById('flock-group-targetOre').value;
@@ -13669,6 +13747,7 @@ function addFlockGroupRow() {
   const systemOre = document.getElementById('flock-group-systemOre').value.trim();
   const systemGas = document.getElementById('flock-group-systemGas').value.trim();
   const systemIce = document.getElementById('flock-group-systemIce').value.trim();
+  const systemSalvage = document.getElementById('flock-group-systemSalvage').value.trim();
   const rallySystem = document.getElementById('flock-group-rallySystem').value.trim();
   const maxMembers = document.getElementById('flock-group-maxMembers').value;
 
@@ -13689,13 +13768,14 @@ function addFlockGroupRow() {
   tr.dataset.flockGroup = name;
   tr.innerHTML = `
     <td style="padding:4px 8px">${esc(name)}</td>
-    <td style="padding:4px 8px">${esc(targetOre || '-')}</td>
-    <td style="padding:4px 8px">${esc(targetGas || '-')}</td>
-    <td style="padding:4px 8px">${esc(targetIce || '-')}</td>
+    <td style="padding:4px 8px">${esc(targetOre || 'Auto (from quotas)')}</td>
+    <td style="padding:4px 8px">${esc(targetGas || 'Auto (from quotas)')}</td>
+    <td style="padding:4px 8px">${esc(targetIce || 'Auto (from quotas)')}</td>
     <td style="padding:4px 8px">${esc(miningType)}</td>
-    <td style="padding:4px 8px">${esc(systemOre || '-')}</td>
-    <td style="padding:4px 8px">${esc(systemGas || '-')}</td>
-    <td style="padding:4px 8px">${esc(systemIce || '-')}</td>
+    <td style="padding:4px 8px">${esc(systemOre || 'Auto')}</td>
+    <td style="padding:4px 8px">${esc(systemGas || 'Auto')}</td>
+    <td style="padding:4px 8px">${esc(systemIce || 'Auto')}</td>
+    <td style="padding:4px 8px">${esc(systemSalvage || 'Auto')}</td>
     <td style="padding:4px 8px">${esc(rallySystem || '-')}</td>
     <td style="padding:4px 8px">${esc(maxMembers || '-')}</td>
     <td style="padding:4px 8px;text-align:center"><button class="btn-icon" onclick="this.closest('tr').remove()" title="Remove">&#x2715;</button></td>
@@ -13704,6 +13784,14 @@ function addFlockGroupRow() {
 
   // Clear inputs
   document.getElementById('flock-group-name').value = '';
+  document.getElementById('flock-group-targetOre').value = '';
+  document.getElementById('flock-group-targetGas').value = '';
+  document.getElementById('flock-group-targetIce').value = '';
+  document.getElementById('flock-group-miningType').value = 'auto';
+  document.getElementById('flock-group-systemOre').value = '';
+  document.getElementById('flock-group-systemGas').value = '';
+  document.getElementById('flock-group-systemIce').value = '';
+  document.getElementById('flock-group-systemSalvage').value = '';
   document.getElementById('flock-group-rallySystem').value = '';
   document.getElementById('flock-group-maxMembers').value = '5';
 }
@@ -14162,94 +14250,10 @@ function renderMinerSettings(panel) {
           <div class="setting-label">Max Jump Distance</div>
           <div class="setting-hint">Maximum number of jumps the miner will travel to reach a mining location. Prevents miners from traveling across the galaxy. Default is 10 jumps.</div>
         </div>
-        <input type="number" id="set-miner-maxJumps" min="1" max="50" value="${settings.miner?.maxJumps ?? 10}" style="width:80px" />
+        <input type="number" id="set-miner-maxJumps" min="1" max="100" value="${settings.miner?.maxJumps ?? 10}" style="width:80px" />
       </div>
 
-    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
-      <div class="setting-label" style="margin-bottom:8px">🐦 Flock Mining</div>
-      <div class="setting-hint" style="margin-bottom:12px">Coordinate multiple miners to mine together at the same location. First, create flock groups below, then assign this miner to a group.</div>
 
-      <div class="setting-row">
-        <div>
-          <div class="setting-label">Enable Flock Mining</div>
-          <div class="setting-hint">When enabled, this miner will coordinate with other flock members.</div>
-        </div>
-        <label style="display:flex;align-items:center;gap:8px">
-          <input type="checkbox" id="set-miner-flockEnabled"${settings.miner?.flockEnabled ? ' checked' : ''} />
-          <span>Enable flock mining</span>
-        </label>
-      </div>
-
-      <div class="setting-row">
-        <div>
-          <div class="setting-label">Assign to Flock Group</div>
-          <div class="setting-hint">Select which flock group this miner belongs to. The group defines target resources and systems.</div>
-        </div>
-        <select id="set-miner-flockGroup" onchange="onFlockGroupChange()">
-          <option value="">-- Select flock group --</option>
-          ${buildFlockGroupOptions(settings.miner?.flockName || '')}
-        </select>
-      </div>
-
-      <div class="setting-row">
-        <div>
-          <div class="setting-label">Flock Role</div>
-          <div class="setting-hint">Leader decides where to mine. Followers automatically go to the leader's location.</div>
-        </div>
-        <select id="set-miner-flockRole">
-          <option value="leader"${settings.miner?.flockRole === 'leader' ? ' selected' : ''}>Leader (decides target)</option>
-          <option value="follower"${settings.miner?.flockRole === 'follower' ? ' selected' : ''}>Follower (follows leader)</option>
-        </select>
-      </div>
-
-      <div id="flockMembersDisplay" style="display:none;margin-top:12px;padding:12px;background:var(--bg-secondary);border:1px solid var(--border);border-radius:6px">
-        <div class="setting-label" style="margin-bottom:8px">📋 Current Flock Members</div>
-        <div id="flockMembersList" style="font-size:12px;color:var(--text-dim)">Loading...</div>
-      </div>
-    </div>
-
-    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
-      <div class="setting-label" style="margin-bottom:8px">📦 Flock Groups Configuration</div>
-      <div class="setting-hint" style="margin-bottom:12px">Define flock groups here. Each group can target different resources and systems. Then assign miners to groups using the dropdown above.</div>
-      
-      <table id="flock-groups-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
-        <thead><tr style="border-bottom:1px solid var(--border)">
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Flock Name</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Ore</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Gas</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Ice</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Mining Type</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">System Ore</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">System Gas</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">System Ice</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Rally System</th>
-          <th style="padding:4px 8px;text-align:left;font-size:12px">Max Members</th>
-          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
-        </tr></thead>
-        <tbody id="flock-groups-tbody">
-          ${buildFlockGroupRows()}
-        </tbody>
-      </table>
-      
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <input type="text" id="flock-group-name" style="width:120px" placeholder="Flock name" />
-        <select id="flock-group-targetOre" style="flex:1;min-width:120px">${oreOpts.join('')}</select>
-        <select id="flock-group-targetGas" style="flex:1;min-width:120px">${gasOpts.join('')}</select>
-        <select id="flock-group-targetIce" style="flex:1;min-width:120px">${iceOpts.join('')}</select>
-        <select id="flock-group-miningType" style="width:140px">
-          <option value="auto">Auto</option>
-          <option value="ore">Ore</option>
-          <option value="gas">Gas</option>
-          <option value="ice">Ice</option>
-        </select>
-        <select id="flock-group-systemOre" style="flex:1;min-width:120px">${systemOreOpts.join('')}</select>
-        <select id="flock-group-systemGas" style="flex:1;min-width:120px">${systemGasOpts.join('')}</select>
-        <select id="flock-group-systemIce" style="flex:1;min-width:120px">${systemIceOpts.join('')}</select>
-        <input type="text" id="flock-group-rallySystem" style="width:140px" placeholder="Rally system (opt)" />
-        <input type="number" id="flock-group-maxMembers" min="1" max="20" value="5" style="width:80px" placeholder="Max" />
-        <button class="secondary" onclick="addFlockGroupRow()">Add Group</button>
-      </div>
-    </div>
 
       <div class="setting-row">
         <div>
@@ -14482,25 +14486,6 @@ function saveMinerSettings() {
     return ores;
   };
 
-  const collectFlockGroups = () => {
-    const groups = [];
-    for (const row of document.querySelectorAll('#flock-groups-tbody tr')) {
-      groups.push({
-        name: row.dataset.flockGroup,
-        targetOre: row.cells[1].textContent === '-' ? '' : row.cells[1].textContent,
-        targetGas: row.cells[2].textContent === '-' ? '' : row.cells[2].textContent,
-        targetIce: row.cells[3].textContent === '-' ? '' : row.cells[3].textContent,
-        miningType: row.cells[4].textContent,
-        systemOre: row.cells[5].textContent === '-' ? '' : row.cells[5].textContent,
-        systemGas: row.cells[6].textContent === '-' ? '' : row.cells[6].textContent,
-        systemIce: row.cells[7].textContent === '-' ? '' : row.cells[7].textContent,
-        rallySystem: row.cells[8].textContent === '-' ? '' : row.cells[8].textContent,
-        maxMembers: row.cells[9].textContent === '-' ? undefined : parseInt(row.cells[9].textContent),
-      });
-    }
-    return groups;
-  };
-
   const s = {
     miningType: document.getElementById('set-miner-miningType').value,
     targetOre: document.getElementById('set-miner-targetOre').value,
@@ -14531,11 +14516,6 @@ function saveMinerSettings() {
     jettisonOres: collectJettisonOres(),
     deepCoreJettisonOres: collectDeepCoreJettisonOres(),
     radioactiveJettisonOres: collectRadioactiveJettisonOres(),
-    // Flock mining settings
-    flockEnabled: document.getElementById('set-miner-flockEnabled').checked,
-    flockName: document.getElementById('set-miner-flockGroup').value,
-    flockRole: document.getElementById('set-miner-flockRole').value,
-    flockGroups: collectFlockGroups(),
   };
 
   // Preserve existing quotas when saving from main miner settings
@@ -15322,6 +15302,7 @@ function saveEscortSettings() {
 function renderFleetHunterSettings(panel) {
   const fh = settings.fleet_hunter || {};
   const fleetId = fh.fleetId || 'default';
+  const mode = fh.mode || 'roam_systems';
   const patrolSystem = fh.patrolSystem || '';
   const refuelThreshold = fh.refuelThreshold ?? 40;
   const repairThreshold = fh.repairThreshold ?? 30;
@@ -15362,6 +15343,18 @@ function renderFleetHunterSettings(panel) {
         <div class="setting-hint">Unique identifier for this fleet. All bots in the same fleet must use the same ID.</div>
       </div>
       <input type="text" id="set-fleet-hunter-fleetId" value="${esc(fleetId)}" placeholder="default">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Patrol Mode</div>
+        <div class="setting-hint">roam_systems: patrol multiple systems. roam_system: patrol one system. stationary: stay in one POI with auto battle.</div>
+      </div>
+      <select id="set-fleet-hunter-mode">
+        <option value="roam_systems"${mode === 'roam_systems' ? ' selected' : ''}>Roam Systems</option>
+        <option value="roam_system"${mode === 'roam_system' ? ' selected' : ''}>Roam System</option>
+        <option value="stationary"${mode === 'stationary' ? ' selected' : ''}>Stationary (Auto Battle)</option>
+      </select>
     </div>
 
     <div class="setting-row">
@@ -15508,6 +15501,7 @@ function renderFleetHunterSettings(panel) {
 function saveFleetHunterSettings() {
   const s = {
     fleetId: document.getElementById('set-fleet-hunter-fleetId').value.trim() || 'default',
+    mode: document.getElementById('set-fleet-hunter-mode').value,
     patrolSystem: document.getElementById('set-fleet-hunter-patrolSystem').value,
     refuelThreshold: parseInt(document.getElementById('set-fleet-hunter-refuelThreshold').value) || 40,
     repairThreshold: parseInt(document.getElementById('set-fleet-hunter-repairThreshold').value) || 30,
@@ -15527,6 +15521,205 @@ function saveFleetHunterSettings() {
   send({ type: 'saveSettings', routine: 'fleet_hunter', settings: s });
   settings.fleet_hunter = s;
   logToSystem('Fleet Hunter settings saved');
+}
+
+// ── Flock Grouping settings ─────────────────────────────────────
+
+function renderFlockGroupingSettings(panel) {
+  const m = settings.miner || {};
+
+  const oreOpts = knownOres.filter(o => !o.radioactive).map(o => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
+  const gasOpts = knownOres.filter(o => {
+    const n = o.name.toLowerCase();
+    return n.includes('gas') || n.includes('nebula') || n.includes('plasma') || n.includes('hydrogen') || n.includes('helium');
+  }).map(o => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
+  const iceOpts = knownOres.filter(o => {
+    const n = o.name.toLowerCase();
+    return n.includes('ice') || n.includes('frost') || n.includes('cryo') || n.includes('water');
+  }).map(o => `<option value="${esc(o.id)}">${esc(o.name)}</option>`).join('');
+  const systemOreOpts = knownSystems.map(s => `<option value="${esc(s.id)}">${esc(s.name)}</option>`).join('');
+  const systemGasOpts = systemOreOpts;
+  const systemIceOpts = systemOreOpts;
+
+  const botOpts = bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join('');
+
+  panel.innerHTML = `
+    <div class="setting-label" style="margin-bottom:8px">🐦 Flock Grouping</div>
+    <div class="setting-hint" style="margin-bottom:12px">Manage flock groups and assign bots to coordinate mining operations.</div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">📋 Flock Groups Configuration</div>
+      <div class="setting-hint" style="margin-bottom:12px">Define flock groups here. Each group can target different resources and systems.</div>
+      
+      <table id="flock-groups-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Flock Name</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Ore</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Gas</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Target Ice</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Mining Type</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">System Ore</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">System Gas</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">System Ice</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">System Salvage</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Rally System</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Max Members</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody id="flock-groups-tbody">
+          ${buildFlockGroupRows()}
+        </tbody>
+      </table>
+      
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <input type="text" id="flock-group-name" style="width:120px" placeholder="Flock name" />
+        <select id="flock-group-targetOre" style="flex:1;min-width:120px">
+          <option value="">Auto (from quotas)</option>
+          ${oreOpts}
+        </select>
+        <select id="flock-group-targetGas" style="flex:1;min-width:120px">
+          <option value="">Auto (from quotas)</option>
+          ${gasOpts}
+        </select>
+        <select id="flock-group-targetIce" style="flex:1;min-width:120px">
+          <option value="">Auto (from quotas)</option>
+          ${iceOpts}
+        </select>
+        <select id="flock-group-miningType" style="width:140px">
+          <option value="auto">Auto</option>
+          <option value="ore">Ore</option>
+          <option value="gas">Gas</option>
+          <option value="ice">Ice</option>
+          <option value="salvage">Salvage</option>
+        </select>
+        <select id="flock-group-systemOre" style="flex:1;min-width:120px">
+          <option value="">Auto</option>
+          ${systemOreOpts}
+        </select>
+        <select id="flock-group-systemGas" style="flex:1;min-width:120px">
+          <option value="">Auto</option>
+          ${systemGasOpts}
+        </select>
+        <select id="flock-group-systemIce" style="flex:1;min-width:120px">
+          <option value="">Auto</option>
+          ${systemIceOpts}
+        </select>
+        <select id="flock-group-systemSalvage" style="flex:1;min-width:120px">
+          <option value="">Auto</option>
+          ${systemOreOpts}
+        </select>
+        <input type="text" id="flock-group-rallySystem" style="width:140px" placeholder="Rally system (opt)" />
+        <input type="number" id="flock-group-maxMembers" min="1" max="20" value="5" style="width:80px" placeholder="Max" />
+        <button class="secondary" onclick="addFlockGroupRow()">Add Group</button>
+      </div>
+    </div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">🤖 Assign Bots to Flocks</div>
+      <div class="setting-hint" style="margin-bottom:12px">Select a bot from your fleet and assign it to a flock group with a role.</div>
+
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="flock-assign-bot" style="width:150px">
+          <option value="">-- Select Bot --</option>
+          ${botOpts}
+        </select>
+        <select id="flock-assign-group" style="width:150px">
+          <option value="">-- Select Flock Group --</option>
+          ${buildFlockGroupOptions('')}
+        </select>
+        <select id="flock-assign-role" style="width:120px">
+          <option value="follower">Follower</option>
+          <option value="leader">Leader</option>
+        </select>
+        <button class="primary" onclick="assignBotToFlock()">Assign Bot</button>
+      </div>
+    </div>
+
+    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">📋 Current Flock Assignments</div>
+      <div class="setting-hint" style="margin-bottom:12px">Shows which bots are currently assigned to flock groups.</div>
+
+      <table id="flock-assignments-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
+        <thead><tr style="border-bottom:1px solid var(--border)">
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Bot Name</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Flock Group</th>
+          <th style="padding:4px 8px;text-align:left;font-size:12px">Role</th>
+          <th style="padding:4px 8px;text-align:center;font-size:12px;width:40px"></th>
+        </tr></thead>
+        <tbody id="flock-assignments-tbody">
+          ${buildFlockAssignmentsRows()}
+        </tbody>
+      </table>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveFlockGroupingSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function assignBotToFlock() {
+  const botUsername = document.getElementById('flock-assign-bot').value;
+  const flockName = document.getElementById('flock-assign-group').value;
+  const flockRole = document.getElementById('flock-assign-role').value;
+
+  if (!botUsername || !flockName) {
+    alert('Please select a bot and flock group');
+    return;
+  }
+
+  // Initialize flock assignments if not exists
+  if (!settings.flockAssignments) settings.flockAssignments = {};
+
+  // Save assignment
+  settings.flockAssignments[botUsername] = {
+    flockEnabled: true,
+    flockName: flockName,
+    flockRole: flockRole
+  };
+
+  // Send to server
+  send({ type: 'saveSettings', routine: 'flock', settings: { assignments: settings.flockAssignments } });
+
+  // Refresh the assignments table
+  document.getElementById('flock-assignments-tbody').innerHTML = buildFlockAssignmentsRows();
+
+  // Clear the form
+  document.getElementById('flock-assign-bot').value = '';
+  document.getElementById('flock-assign-group').value = '';
+  document.getElementById('flock-assign-role').value = 'follower';
+
+  alert(`Assigned ${botUsername} to ${flockName} as ${flockRole}`);
+}
+
+function saveFlockGroupingSettings() {
+  const collectFlockGroups = () => {
+    const groups = [];
+    for (const row of document.querySelectorAll('#flock-groups-tbody tr')) {
+      groups.push({
+        name: row.dataset.flockGroup,
+        targetOre: row.cells[1].textContent === 'Auto (from quotas)' ? '' : row.cells[1].textContent,
+        targetGas: row.cells[2].textContent === 'Auto (from quotas)' ? '' : row.cells[2].textContent,
+        targetIce: row.cells[3].textContent === 'Auto (from quotas)' ? '' : row.cells[3].textContent,
+        miningType: row.cells[4].textContent,
+        systemOre: row.cells[5].textContent === 'Auto' ? '' : row.cells[5].textContent,
+        systemGas: row.cells[6].textContent === 'Auto' ? '' : row.cells[6].textContent,
+        systemIce: row.cells[7].textContent === 'Auto' ? '' : row.cells[7].textContent,
+        systemSalvage: row.cells[8].textContent === 'Auto' ? '' : row.cells[8].textContent,
+        rallySystem: row.cells[9].textContent === '-' ? '' : row.cells[9].textContent,
+        maxMembers: row.cells[10].textContent === '-' ? undefined : parseInt(row.cells[10].textContent),
+      });
+    }
+    return groups;
+  };
+
+  const s = {
+    flockGroups: collectFlockGroups(),
+  };
+
+  send({ type: 'saveSettings', routine: 'miner', settings: s });
+  if (!settings.miner) settings.miner = {};
+  settings.miner.flockGroups = s.flockGroups;
 }
 
 // ── Cargo Mover settings ────────────────────────────────────────
@@ -15556,10 +15749,10 @@ function renderCargoMoverSettings(panel) {
       const val = sysId + '|' + poi.id;
       const label = poi.base_name || poi.name || poi.id;
 
-      const srcSel = poi.id === sourceStation ? ' selected' : '';
+      const srcSel = val === sourceStation ? ' selected' : '';
       sourceStationOpts += `<option value="${val}"${srcSel}>${label} (${sysName})</option>`;
 
-      const dstSel = poi.id === destinationStation ? ' selected' : '';
+      const dstSel = val === destinationStation ? ' selected' : '';
       destStationOpts += `<option value="${val}"${dstSel}>${label} (${sysName})</option>`;
     }
   }
@@ -15633,18 +15826,22 @@ function renderCargoMoverSettings(panel) {
       }).join('')
     : (cmPersonalItems.length > 0 ? '<div style="color:var(--dim);padding:8px">No personal items configured. Add one below.</div>' : '<div style="color:var(--yellow);padding:8px">Select a bot and click "Load Personal Storage" to see available items</div>');
 
-  // Build faction storage item options
+  // Build faction storage item options (sorted alphabetically)
   const factionUsedIds = new Set(factionItems.map(i => i.itemId));
   const factionAvailable = cmFactionItems.filter(i => !factionUsedIds.has(i.itemId));
   const factionItemOpts = factionAvailable.length > 0
-    ? factionAvailable.map(i => `<option value="${esc(i.itemId)}">${esc(i.name)} (${i.quantity} available)</option>`).join('')
+    ? factionAvailable
+        .sort((a, b) => (a.name || a.itemId || '').localeCompare(b.name || b.itemId || ''))
+        .map(i => `<option value="${esc(i.itemId)}">${esc(i.name)} (${i.quantity} available)</option>`).join('')
     : '<option value="">No items available</option>';
 
-  // Build personal storage item options
+  // Build personal storage item options (sorted alphabetically)
   const personalUsedIds = new Set(personalItems.map(i => i.itemId));
   const personalAvailable = cmPersonalItems.filter(i => !personalUsedIds.has(i.itemId));
   const personalItemOpts = personalAvailable.length > 0
-    ? personalAvailable.map(i => `<option value="${esc(i.itemId)}">${esc(i.name)} (${i.quantity} available)</option>`).join('')
+    ? personalAvailable
+        .sort((a, b) => (a.name || a.itemId || '').localeCompare(b.name || b.itemId || ''))
+        .map(i => `<option value="${esc(i.itemId)}">${esc(i.name)} (${i.quantity} available)</option>`).join('')
     : '<option value="">No items available</option>';
 
   const showBotName = destinationStorageType === 'send_gift';
@@ -15658,7 +15855,7 @@ function renderCargoMoverSettings(panel) {
         <div class="setting-label">Source Station</div>
         <div class="setting-hint">Station where items will be picked up</div>
       </div>
-      <select id="set-cm-sourceStation">
+      <select id="set-cm-sourceStation" onchange="saveCargoMoverSettings()">
         ${sourceStationOpts}
       </select>
     </div>
@@ -15668,7 +15865,7 @@ function renderCargoMoverSettings(panel) {
         <div class="setting-label">Destination Station</div>
         <div class="setting-hint">Station where items will be delivered</div>
       </div>
-      <select id="set-cm-destinationStation">
+      <select id="set-cm-destinationStation" onchange="saveCargoMoverSettings()">
         ${destStationOpts}
       </select>
     </div>
@@ -15678,7 +15875,7 @@ function renderCargoMoverSettings(panel) {
         <div class="setting-label">Destination Storage</div>
         <div class="setting-hint">Where to put items at destination</div>
       </div>
-      <select id="set-cm-destinationStorageType" onchange="toggleCargoMoverGiftField()">
+      <select id="set-cm-destinationStorageType" onchange="toggleCargoMoverGiftField(); saveCargoMoverSettings()">
         <option value="faction" ${destinationStorageType === 'faction' ? 'selected' : ''}>Faction Storage</option>
         <option value="personal" ${destinationStorageType === 'personal' ? 'selected' : ''}>Personal Storage</option>
         <option value="send_gift" ${destinationStorageType === 'send_gift' ? 'selected' : ''}>Send Gift to Bot</option>
@@ -15690,7 +15887,7 @@ function renderCargoMoverSettings(panel) {
         <div class="setting-label">Gift Recipient Bot</div>
         <div class="setting-hint">Bot username to receive gifts</div>
       </div>
-      <select id="set-cm-destinationBotName">${giftBotOpts}</select>
+      <select id="set-cm-destinationBotName" onchange="saveCargoMoverSettings()">${giftBotOpts}</select>
     </div>
 
     <!-- Faction Storage Items Section -->
@@ -15729,12 +15926,34 @@ function renderCargoMoverSettings(panel) {
       </div>
     </div>
 
+    <!-- Ship Loadout Loader Section -->
+    <div style="margin-top:20px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🚢 Ship Loadout Loader</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
+        Load materials for building ships into the cargo mover items list. Select a ship loadout and multiplier.
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <select id="cm-ship-loadout-select" style="flex:1;min-width:150px;max-width:250px">
+          <option value="">-- Select Ship Loadout --</option>
+        </select>
+        <button class="sm primary" onclick="loadShipLoadoutToCargoMover()" id="cm-ship-load-load-btn" disabled>Load to Cargo Mover</button>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center">
+        <label style="font-size:12px;color:var(--text)">Ships to Build:</label>
+        <input type="number" id="cm-ship-loadout-multiplier" min="1" max="99" value="1" style="width:70px;padding:4px 8px;font-size:12px">
+        <span style="font-size:11px;color:var(--dim)">x multiplier</span>
+      </div>
+      <div style="font-size:11px;color:var(--dim);margin-top:6px" id="cm-ship-loadout-count">
+        No ship loadouts available. Create ship loadouts in Crafter settings first.
+      </div>
+    </div>
+
     <div class="setting-row" style="margin-top:16px">
       <div>
         <div class="setting-label">Refuel Threshold</div>
         <div class="setting-hint">Refuel when fuel drops below this %</div>
       </div>
-      <input type="number" id="set-cm-refuelThreshold" min="20" max="80" value="${refuelThreshold}">
+      <input type="number" id="set-cm-refuelThreshold" min="20" max="80" value="${refuelThreshold}" onchange="saveCargoMoverSettings()">
     </div>
 
     <div class="setting-row">
@@ -15742,7 +15961,7 @@ function renderCargoMoverSettings(panel) {
         <div class="setting-label">Repair Threshold</div>
         <div class="setting-hint">Repair hull when HP drops below this %</div>
       </div>
-      <input type="number" id="set-cm-repairThreshold" min="20" max="80" value="${repairThreshold}">
+      <input type="number" id="set-cm-repairThreshold" min="20" max="80" value="${repairThreshold}" onchange="saveCargoMoverSettings()">
     </div>
 
     <div class="settings-save-bar">
@@ -15751,7 +15970,18 @@ function renderCargoMoverSettings(panel) {
     </div>
   `;
 
-  // Restore bot selector values after render
+  // Populate ship loadout dropdown
+  populateCargoMoverShipLoadouts();
+
+  // Restore selector values after render
+  if (sourceStation) {
+    const srcSel = document.getElementById('set-cm-sourceStation');
+    if (srcSel) srcSel.value = sourceStation;
+  }
+  if (destinationStation) {
+    const dstSel = document.getElementById('set-cm-destinationStation');
+    if (dstSel) dstSel.value = destinationStation;
+  }
   if (factionStorageBot) {
     const botSel = document.getElementById('cm-faction-bot-select');
     if (botSel) botSel.value = factionStorageBot;
@@ -15940,34 +16170,138 @@ function setCargoMoverDeliveryTarget(idx) {
 }
 
 function saveCargoMoverSettings() {
-  const sourceStationVal = document.getElementById('set-cm-sourceStation').value;
-  const [, sourceStation] = sourceStationVal ? sourceStationVal.split('|') : ['', ''];
-
-  const destStationVal = document.getElementById('set-cm-destinationStation').value;
-  const [, destinationStation] = destStationVal ? destStationVal.split('|') : ['', ''];
-
-  const personalStorageBot = document.getElementById('cm-personal-bot-select')?.value || '';
-  const factionStorageBot = document.getElementById('cm-faction-bot-select')?.value || '';
-  
-  let destinationBotName = '';
-  if (document.getElementById('set-cm-destinationBotName')) {
-    destinationBotName = document.getElementById('set-cm-destinationBotName').value;
-  }
-
   const s = {
-    sourceStation,
-    destinationStation,
-    destinationStorageType: document.getElementById('set-cm-destinationStorageType').value,
-    destinationBotName,
+    sourceStation: document.getElementById('set-cm-sourceStation')?.value || '',
+    destinationStation: document.getElementById('set-cm-destinationStation')?.value || '',
+    destinationStorageType: document.getElementById('set-cm-destinationStorageType')?.value || 'faction',
+    destinationBotName: document.getElementById('set-cm-destinationBotName')?.value || '',
     items: settings.cargo_mover?.items || [],
-    personalStorageBot,
-    factionStorageBot,
-    refuelThreshold: parseInt(document.getElementById('set-cm-refuelThreshold').value) || 50,
-    repairThreshold: parseInt(document.getElementById('set-cm-repairThreshold').value) || 40,
+    personalStorageBot: document.getElementById('cm-personal-bot-select')?.value || '',
+    factionStorageBot: document.getElementById('cm-faction-bot-select')?.value || '',
+    refuelThreshold: parseInt(document.getElementById('set-cm-refuelThreshold')?.value) || 50,
+    repairThreshold: parseInt(document.getElementById('set-cm-repairThreshold')?.value) || 40,
   };
+
   send({ type: 'saveSettings', routine: 'cargo_mover', settings: s });
   settings.cargo_mover = s;
-  alert('Cargo Mover settings saved!');
+}
+
+// Populate ship loadout dropdown in cargo mover settings
+async function populateCargoMoverShipLoadouts() {
+  const select = document.getElementById('cm-ship-loadout-select');
+  const countEl = document.getElementById('cm-ship-loadout-count');
+  const loadBtn = document.getElementById('cm-ship-load-load-btn');
+
+  if (!select || !countEl || !loadBtn) return;
+
+  try {
+    const loadouts = await getShipLoadouts();
+    const loadoutNames = Object.keys(loadouts).sort();
+
+    select.innerHTML = '<option value="">-- Select Ship Loadout --</option>';
+    for (const name of loadoutNames) {
+      const option = document.createElement('option');
+      option.value = name;
+      option.textContent = name;
+      select.appendChild(option);
+    }
+
+    loadBtn.disabled = loadoutNames.length === 0;
+
+    countEl.textContent = loadoutNames.length > 0
+      ? `${loadoutNames.length} ship loadout(s) available (created in Crafter settings)`
+      : 'No ship loadouts available. Create ship loadouts in Crafter settings first.';
+  } catch (e) {
+    console.warn('Failed to load ship loadouts for cargo mover:', e);
+    select.innerHTML = '<option value="">-- Failed to load --</option>';
+    loadBtn.disabled = true;
+    countEl.textContent = 'Failed to load ship loadouts.';
+  }
+}
+
+// Load ship loadout materials into cargo mover items list
+async function loadShipLoadoutToCargoMover() {
+  const select = document.getElementById('cm-ship-loadout-select');
+  const multiplierEl = document.getElementById('cm-ship-loadout-multiplier');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a ship loadout to load.');
+    return;
+  }
+
+  const multiplier = parseInt(multiplierEl?.value) || 1;
+  const clampedMultiplier = Math.max(1, Math.min(99, multiplier));
+
+  const loadouts = await getShipLoadouts();
+  const loadout = loadouts[name];
+  if (!loadout) {
+    alert(`Ship loadout "${name}" not found!`);
+    return;
+  }
+
+  // Initialize cargo mover settings if needed
+  if (!settings.cargo_mover) settings.cargo_mover = {};
+  if (!settings.cargo_mover.items) settings.cargo_mover.items = [];
+
+  // Add build materials to cargo mover items (multiplied, from faction storage)
+  let addedCount = 0;
+  for (const mat of loadout.buildMaterials) {
+    const itemId = mat.item_id;
+    const quantity = mat.quantity * clampedMultiplier;
+    if (itemId && quantity > 0) {
+      // Check if this item is already in the list
+      const existing = settings.cargo_mover.items.find(i => i.itemId === itemId && i.storageType === 'faction');
+      if (existing) {
+        // Add to existing quantity
+        existing.quantity = (existing.quantity || 0) + quantity;
+      } else {
+        // Add new item
+        settings.cargo_mover.items.push({
+          itemId,
+          itemName: mat.name || itemId,
+          quantity,
+          storageType: 'faction',
+          category: 'Ship Building'
+        });
+      }
+      addedCount++;
+    }
+  }
+
+  // Add default modules to cargo mover items (counted and multiplied)
+  const loadoutModuleCounts = new Map();
+  for (const mod of loadout.defaultModules) {
+    const count = (loadoutModuleCounts.get(mod) || 0) + 1;
+    loadoutModuleCounts.set(mod, count);
+  }
+  for (const [mod, count] of loadoutModuleCounts) {
+    const item = catalog.items?.[mod];
+    if (item) {
+      const quantity = count * clampedMultiplier;
+      const existing = settings.cargo_mover.items.find(i => i.itemId === mod && i.storageType === 'faction');
+      if (existing) {
+        existing.quantity = (existing.quantity || 0) + quantity;
+      } else {
+        settings.cargo_mover.items.push({
+          itemId: mod,
+          itemName: item.name || mod,
+          quantity,
+          storageType: 'faction',
+          category: 'Ship Modules'
+        });
+      }
+      addedCount++;
+    }
+  }
+
+  // Re-render the cargo mover settings to show the new items
+  renderCargoMoverSettings(document.getElementById('settingsContent'));
+
+  if (addedCount > 0) {
+    alert(`Loaded "${name}" x${clampedMultiplier}: Added ${addedCount} items to cargo mover list (${loadout.buildMaterials.length} materials, ${loadout.defaultModules.length} modules). Click "Save Settings" to persist.`);
+  } else {
+    alert(`Loaded "${name}" but no items were added.`);
+  }
 }
 
 // ── Shipyard ────────────────────────────────────────────────
@@ -18147,6 +18481,7 @@ function caLog(html) {
 // ── Fleet Combat Controls ───────────────────────────────────
 
 let fleetCombatFleetId = 'default';
+let fleetCombatMode = 'roam_systems';
 let fleetCombatFireMode = 'spread';
 let fleetCombatHuntingEnabled = true;
 let fleetCombatManualMode = false;
@@ -18170,6 +18505,7 @@ function renderFleetCombatControls(force = false) {
   }
   
   fleetCombatFleetId = fleetHunterSettings.fleetId || 'default';
+  fleetCombatMode = fleetHunterSettings.mode || 'roam_systems';
   fleetCombatFireMode = fleetHunterSettings.fireMode || 'spread';
   fleetCombatHuntingEnabled = fleetHunterSettings.huntingEnabled ?? true;
   fleetCombatManualMode = fleetHunterSettings.manualMode ?? false;
@@ -18351,6 +18687,16 @@ function renderFleetCombatControls(force = false) {
     </div>
 
     <div class="cmd-group">
+      <label>Patrol Mode</label>
+      <select id="fc-mode">
+        <option value="roam_systems"${fleetCombatMode === 'roam_systems' ? ' selected' : ''}>Roam Systems (multi-system patrol)</option>
+        <option value="roam_system"${fleetCombatMode === 'roam_system' ? ' selected' : ''}>Roam System (single system patrol)</option>
+        <option value="stationary"${fleetCombatMode === 'stationary' ? ' selected' : ''}>Stationary (auto battle at POI)</option>
+      </select>
+      <button class="sm" onclick="fcSetMode()">Set</button>
+    </div>
+
+    <div class="cmd-group">
       <label>Fire Mode</label>
       <select id="fc-fire-mode">
         <option value="spread"${fleetCombatFireMode === 'spread' ? ' selected' : ''}>Spread (bots pick different targets)</option>
@@ -18505,6 +18851,33 @@ function fcSetFleetId() {
   })
   .then(() => {
     logFleetCombat('Fleet ID saved to settings');
+    // Refresh settings from server
+    return fetch('/api/settings');
+  })
+  .then(r => r.json())
+  .then(settingsData => {
+    window.currentSettings = settingsData;
+    settings = settingsData;
+  })
+  .catch(err => {
+    logFleetCombat(`Error saving: ${err.message}`, 'error');
+  });
+}
+
+function fcSetMode() {
+  const mode = document.getElementById('fc-mode').value;
+  fleetCombatMode = mode;
+  logFleetCombat(`Patrol mode set to: ${mode}`);
+
+  fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      fleet_hunter: { mode },
+    }),
+  })
+  .then(() => {
+    logFleetCombat('Patrol mode saved to settings');
     // Refresh settings from server
     return fetch('/api/settings');
   })

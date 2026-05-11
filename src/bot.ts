@@ -185,6 +185,12 @@ export class Bot {
   private lastCustomsMessage: string = "";
   private lastCustomsMessageTime: number = 0;
 
+  /** Track last chat message content to prevent duplicate processing. */
+  private lastChatMessage: string = "";
+  private lastChatMessageTime: number = 0;
+  private lastChatSender: string = "";
+  private lastChatChannel: string = "";
+
   /** Cooldown after customs clears before new hold can start (prevents rapid re-triggering). */
   private static readonly CUSTOMS_COOLDOWN_MS = 30000; // 30 seconds
 
@@ -1436,12 +1442,23 @@ export class Bot {
           const sender = (data.sender as string) || "Unknown";
           const content = (data.content as string) || "";
 
-          // Skip messages from self (prevent processing our own AI responses)
-          if (sender === this.username) {
-            continue;
-          }
+           // Skip messages from self (prevent processing our own AI responses)
+           if (sender === this.username) {
+             continue;
+           }
 
-          this.log("chat", `Received [${channel}] ${sender}: ${content}`);
+           // Deduplicate chat messages: ignore if same sender, channel, content within 10 seconds
+           const now = Date.now();
+           if (sender === this.lastChatSender && channel === this.lastChatChannel && content === this.lastChatMessage && now - this.lastChatMessageTime < 10000) {
+             this.log("chat_debug", "Skipping duplicate chat message");
+             continue;
+           }
+           this.lastChatSender = sender;
+           this.lastChatChannel = channel;
+           this.lastChatMessage = content;
+           this.lastChatMessageTime = now;
+
+           this.log("chat", `Received [${channel}] ${sender}: ${content}`);
 
           // Track player name from chat (but NOT from MAYDAY messages - those can be fake/pirate names)
           // Also skip empire NPCs like customs agents and police
@@ -1596,8 +1613,8 @@ export class Bot {
             // End of isFromCustoms block - non-customs messages fall through
           }
 
-          // Route NON-customs messages to AI chat handler
-          if (aiChatService && typeof aiChatService.addChatMessage === "function") {
+           // Route NON-customs messages to AI chat handler
+           if (aiChatService && typeof aiChatService.addChatMessage === "function") {
             aiChatService.addChatMessage({
               sender,
               channel: channel as "local" | "faction" | "system" | "private",

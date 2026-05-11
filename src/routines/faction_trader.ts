@@ -1386,7 +1386,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           } else {
             ctx.log("trade", `No viable buy orders for ${route!.itemName} — skipping`);
           }
-          continue;
+          break;
         }
 
         ctx.log("trade", `Processing ${initialMarketCheck.buyOrders.length} buy orders for ${route!.itemName} (min price: ${itemMinSellPrice}cr)`);

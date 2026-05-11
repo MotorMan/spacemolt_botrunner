@@ -1834,7 +1834,7 @@ interface Wreck {
 }
 
 /** Parse wreck list from get_wrecks response. */
-function parseWrecks(result: unknown): Wreck[] {
+export function parseWrecks(result: unknown): Wreck[] {
   if (!result || typeof result !== "object") return [];
   const r = result as Record<string, unknown>;
   const rawList = (
@@ -3894,8 +3894,8 @@ export async function checkCustomsInspection(
   ctx.log("customs", "⏱️ Mandatory customs wait - 2 second delay...");
   await sleep(2000);
 
-  // Wait for customs inspection (up to 5 seconds total)
-  const result = await waitForCustomsInspection(bot, (cat, msg) => bot.log(cat, msg), systemToCheck, 5000);
+  // Wait for customs inspection (up to 90 seconds total)
+  const result = await waitForCustomsInspection(bot, (cat, msg) => bot.log(cat, msg), systemToCheck, 90000);
 
   // If customs ship is expected but not yet visible, poll for it
   if (result.wasStopped && result.outcome === "timeout") {

@@ -54,6 +54,7 @@ const CUSTOMS_CLEAR_KEYWORDS = [
   "cargo is crimson-compliant",
   "cargo is voidborn-compliant",
   "cargo is nebula-compliant",
+  "cargo is collective-compliant",
   "cleared to proceed",
   "you may proceed",
   "safe travels",
@@ -240,7 +241,7 @@ export async function waitForCustomsInspection(
   bot: Bot,
   log: (category: string, message: string) => void,
   targetSystem: string,
-  maxWaitMs: number = 5000
+  maxWaitMs: number = 90000
 ): Promise<{
   wasStopped: boolean;
   outcome: "cleared" | "contraband" | "evasion" | "timeout" | "none";
@@ -361,7 +362,7 @@ export async function waitForCustomsInspection(
     // Log the stop
     if (wasStopped) {
       const logOutcome: "cleared" | "contraband" | "evasion" | "pending" =
-        outcome === "timeout" || outcome === "none" ? "cleared" : outcome;
+        outcome === "timeout" ? "pending" : outcome === "none" ? "pending" : outcome;
       logCustomsStop(bot.username, targetSystem, logOutcome);
     }
   } else {
@@ -485,7 +486,7 @@ export async function sendCustomsChatResponse(
  * - Outer Rim does NOT have customs (lawless territory)
  * - Frontier does NOT have customs (per developer confirmation)
  */
-const CUSTOMS_EMPIRES = ["voidborn", "nebula", "crimson", "solarian"];
+const CUSTOMS_EMPIRES = ["voidborn", "nebula", "crimson", "solarian", "collective"];
 
 /** Pirate systems — hostile territory with no customs inspections. */
 const PIRATE_SYSTEMS = [

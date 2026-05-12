@@ -77,7 +77,7 @@ export function loadRescueActivity(): RescueActivityData {
     }
   }
   
-  console.warn("No valid rescue activity file found. Starting with empty data.");
+  //console.warn("No valid rescue activity file found. Starting with empty data.");
   return {};
 }
 

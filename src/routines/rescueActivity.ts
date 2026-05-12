@@ -69,8 +69,8 @@ export function loadRescueActivity(): RescueActivityData {
           console.warn(`Invalid rescue activity data structure from ${file}`);
           continue;
         }
-        console.log(`Loaded rescue activity from ${file}`);
-        return parsed;
+        //console.log(`Loaded rescue activity from ${file}`);
+        //return parsed;
       }
     } catch (err) {
       console.warn(`Could not load ${file}:`, err);

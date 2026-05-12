@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, writeF
 import { join } from "path";
 import os from "os";
 import type { BotStatus } from "../bot.js";
-import { getBot } from "../botmanager.js";
+import { getBot, getTotalBandwidth } from "../botmanager.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
@@ -354,6 +354,10 @@ export class WebServer {
           const { getDiscoveredBots } = await import("../botmanager.js");
           const discovered = getDiscoveredBots();
           return Response.json({ usernames: discovered });
+        }
+        if (url.pathname === "/api/bandwidth") {
+          const bandwidth = getTotalBandwidth();
+          return Response.json(bandwidth);
         }
         if (url.pathname === "/api/map") {
           return Response.json({ systems: mapStore.getAllSystems() });

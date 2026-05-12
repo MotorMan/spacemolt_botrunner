@@ -123,8 +123,8 @@ function getSalvagerSettings(username?: string): {
   let botOverrides = username ? (all[username] || {}) : {};
 
   // Include flock assignments
-  if (username && all.flockAssignments && all.flockAssignments[username]) {
-    botOverrides = { ...botOverrides, ...all.flockAssignments[username] };
+  if (username && all.flock?.flockAssignments && typeof all.flock.flockAssignments === 'object' && (all.flock.flockAssignments as any)[username]) {
+    botOverrides = { ...botOverrides, ...(all.flock.flockAssignments as any)[username] };
   }
 
   function parseDepositMode(val: unknown): DepositMode | null {
@@ -159,8 +159,8 @@ function getSalvagerSettings(username?: string): {
     depositAtSalvageYard: (m.depositAtSalvageYard as boolean) ?? false,
 
     // Flock salvaging settings
-    flockEnabled: (botOverrides.flockEnabled as boolean) ?? (m.flockEnabled as boolean) ?? false,
-    flockName: (botOverrides.flockName as string) || (m.flockName as string) || "",
+    flockEnabled: (botOverrides.flockEnabled as boolean) ?? false,
+    flockName: (botOverrides.flockName as string) || "",
     flockRole: ((botOverrides.flockRole as string) === "leader" ? "leader" : "follower") as "leader" | "follower",
     allowIndependentTowing: (m.allowIndependentTowing as boolean) ?? false,
   };
@@ -578,7 +578,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Note: For now, we'll assume flock groups are defined in miner settings
       // TODO: Add salvager-specific flock groups
       const allSettings = readSettings();
-      const minerGroups = (allSettings.miner?.flockGroups as FlockGroupConfig[]) || [];
+      const minerGroups = (allSettings.flock?.flockGroups as FlockGroupConfig[]) || [];
       flockGroup = minerGroups.find(g => g.name === settings.flockName);
 
       if (settings.flockRole === "leader") {

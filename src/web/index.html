@@ -80,10 +80,11 @@
         <button class="sm" onclick="toggleRoutineGroupsLayout()" title="Switch back to Table view">📊 Groups View</button>
       </div>
     </div>
-    <div class="bot-table-wrap" id="originalTableWrap">
-      <div class="bot-table-header">
-        <span>Bots</span>
-        <div style="display:flex;gap:8px;align-items:center;">
+     <div class="bot-table-wrap" id="originalTableWrap">
+       <div class="bot-table-header">
+         <span>Bots</span>
+         <span id="bandwidthDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">BW: 0.0 KB/s ↓ | 0.0 b/s ↑</span>
+         <div style="display:flex;gap:8px;align-items:center;">
           <button class="sm" id="aiChatToggleBtn" onclick="toggleAiChat()" title="Enable/Disable AI Chat">
             <span id="aiChatToggleIcon">🔌</span> <span id="aiChatToggleText">AI Chat: Off</span>
           </button>
@@ -2064,6 +2065,26 @@ function renderProfileTopbar() {
       </select>`;
   }
 
+  // Per-bot crafter profile selector (visible when crafter is selected or running)
+  const isCrafter = (bot.state === 'running' && bot.routine === 'crafter')
+    || (bot.state !== 'running' && bot.state !== 'stopping' && getProfileSelectedRoutine() === 'crafter');
+  if (isCrafter) {
+    const crafterSettings = settings.crafter || {};
+    const crafters = crafterSettings.crafters || [];
+    const botCrafterAssignments = crafterSettings.botCrafterAssignments || {};
+    const currentAssignment = botCrafterAssignments[bot.username] || "Default Crafter";
+
+    // Build crafter profile options
+    const crafterProfileOpts = crafters.map(c => `<option value="${esc(c.name)}"${c.name === currentAssignment ? ' selected' : ''}>${esc(c.name)}</option>`).join('');
+    if (crafters.length === 0) {
+      crafterProfileOpts = '<option value="Default Crafter" selected>Default Crafter</option>';
+    }
+
+    actions += `
+      <span class="profile-ore-label" style="margin-left:8px">Profile:</span>
+      <select id="profile-crafterProfile" onchange="saveProfileCrafterProfile()">${crafterProfileOpts}</select>`;
+  }
+
   // Per-bot missions toggle (visible for miner and explorer)
   const isMinerOrExplorer = isMiner || isExplorer;
   if (isMinerOrExplorer) {
@@ -2188,9 +2209,9 @@ function renderProfileTopbar() {
   }
 
   // Add flock controls
-  const flockAssignments = settings.flockAssignments || {};
+  const flockAssignments = settings.flock?.assignments || {};
   const botFlock = flockAssignments[bot.username];
-  const flockGroups = settings.miner?.flockGroups || [];
+  const flockGroups = settings.flock?.flockGroups || [];
   const flockOpts = [`<option value=""${!botFlock?.flockName ? ' selected' : ''}>None</option>`];
   for (const group of flockGroups) {
     const sel = group.name === botFlock?.flockName ? ' selected' : '';
@@ -2358,19 +2379,23 @@ function saveProfileFlock() {
   const flockName = flockSel.value;
   const isLeader = leaderChk.checked;
 
-  if (!settings.flockAssignments) settings.flockAssignments = {};
+  if (!settings.flock) settings.flock = {};
+  if (!settings.flock.assignments) settings.flock.assignments = {};
 
   if (flockName) {
-    settings.flockAssignments[bot.username] = {
+    settings.flock.assignments[bot.username] = {
       flockEnabled: true,
       flockName: flockName,
       flockRole: isLeader ? 'leader' : 'follower'
     };
   } else {
-    delete settings.flockAssignments[bot.username];
+    delete settings.flock.assignments[bot.username];
   }
 
-  send({ type: 'saveSettings', routine: 'flock', settings: { assignments: settings.flockAssignments } });
+  send({ type: 'saveSettings', routine: 'flock', settings: {
+    flockGroups: settings.flock.flockGroups || [],
+    assignments: settings.flock.assignments
+  } });
 }
 
 function saveProfileFocusStation() {
@@ -2383,6 +2408,22 @@ function saveProfileFocusStation() {
   const updated = Object.assign({}, existing, { focusStationId });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
+}
+
+function saveProfileCrafterProfile() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const sel = document.getElementById('profile-crafterProfile');
+  if (!sel) return;
+  const crafterProfileName = sel.value;
+
+  // Save to crafter settings
+  if (!settings.crafter) settings.crafter = {};
+  if (!settings.crafter.botCrafterAssignments) settings.crafter.botCrafterAssignments = {};
+  settings.crafter.botCrafterAssignments[bot.username] = crafterProfileName;
+
+  // Send updated crafter settings
+  send({ type: 'saveSettings', routine: 'crafter', settings: settings.crafter });
 }
 
 function renderPerBotSettings(bot) {
@@ -7480,7 +7521,33 @@ function fetchSettingsRecipesPage(username, page, panel) {
 
 async function renderCrafterSettings(panel) {
   const crafter = settings.crafter || {};
-  const craftLimits = crafter.craftLimits || {};
+  const crafters = crafter.crafters || [];
+  const botCrafterAssignments = crafter.botCrafterAssignments || {};
+
+  // For backward compatibility, if no crafters array, create one from old format
+  let effectiveCrafters = crafters;
+  if (effectiveCrafters.length === 0 && crafter.craftLimits) {
+    effectiveCrafters = [{
+      name: "Default Crafter",
+      craftLimits: crafter.craftLimits
+    }];
+    // Migrate to new format
+    settings.crafter.crafters = effectiveCrafters;
+    delete settings.crafter.craftLimits; // Remove old format
+  }
+  if (effectiveCrafters.length === 0) {
+    effectiveCrafters = [{ name: "Default Crafter", craftLimits: {} }];
+    settings.crafter.crafters = effectiveCrafters;
+  }
+
+  // Get current selected crafter profile (from a global state or first one)
+  const currentCrafterName = window._currentCrafterProfile || effectiveCrafters[0].name;
+  const currentCrafter = effectiveCrafters.find(c => c.name === currentCrafterName) || effectiveCrafters[0];
+
+  // Ensure the global state is set
+  window._currentCrafterProfile = currentCrafterName;
+
+  const craftLimits = currentCrafter.craftLimits || {};
   const enabledCategories = crafter.enabledCategories || ["Refining", "Components", "Consumables"];
   const refuelThreshold = crafter.refuelThreshold ?? 50;
   const repairThreshold = crafter.repairThreshold ?? 40;
@@ -7549,13 +7616,30 @@ async function renderCrafterSettings(panel) {
   ).join('');
   const hasLoadouts = Object.keys(loadouts).length > 0;
 
+  // Build crafter profile options
+  const crafterProfileOptions = effectiveCrafters.map(c => `<option value="${esc(c.name)}"${c.name === currentCrafterName ? ' selected' : ''}>${esc(c.name)}</option>`).join('');
+
   panel.innerHTML = `
     <h3>Crafter Settings</h3>
-    <div class="settings-desc">Add recipes and set stock limits. The crafter bot will craft each item up to its limit, then stop.</div>
+    <div class="settings-desc">Manage multiple crafter profiles. Each profile can have different recipes and limits. Assign profiles to individual bots.</div>
+
+    <!-- Crafter Profile Management Section -->
+    <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">👥 Crafter Profiles</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="crafter-profile-select" onchange="switchCrafterProfile()">${crafterProfileOptions}</select>
+        <button class="sm primary" onclick="addCrafterProfile()">+ New Profile</button>
+        <button class="sm" onclick="renameCrafterProfile()" ${effectiveCrafters.length <= 1 ? 'disabled' : ''}>✏️ Rename</button>
+        <button class="sm danger" onclick="deleteCrafterProfile()" ${effectiveCrafters.length <= 1 ? 'disabled' : ''}>🗑 Delete</button>
+      </div>
+      <div style="font-size:11px;color:var(--text-dim);margin-top:6px">
+        Select a profile to edit its recipes and settings. Profiles can be assigned to individual bots.
+      </div>
+    </div>
 
     <!-- Loadout Management Section -->
     <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
-      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🎯 Crafting Loadouts</div>
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🎯 Crafting Loadouts for "${esc(currentCrafterName)}"</div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <select id="loadout-select" style="flex:1;min-width:150px;max-width:250px">
           <option value="">-- Select Loadout --</option>
@@ -7746,8 +7830,12 @@ function updateCraftItemSelect() {
   const cat = catSel.value;
   const searchText = (searchEl?.value || '').trim().toLowerCase();
   const recipes = cachedSettingsRecipes || [];
-  const crafter = settings.crafter || {};
-  const craftLimits = crafter.craftLimits || {};
+
+  // Get current crafter profile
+  const currentCrafterName = window._currentCrafterProfile;
+  const crafters = settings.crafter?.crafters || [];
+  const currentProfile = crafters.find(c => c.name === currentCrafterName) || crafters[0];
+  const craftLimits = currentProfile?.craftLimits || {};
   const usedIds = new Set(Object.keys(craftLimits).filter(id => craftLimits[id] > 0));
 
   const filtered = recipes.filter(r => {
@@ -7805,9 +7893,19 @@ function addCraftItem() {
   const qty = parseInt(qtyEl?.value) || 10;
   if (!id) return;
 
+  // Get current crafter profile
+  const currentCrafterName = window._currentCrafterProfile;
   if (!settings.crafter) settings.crafter = {};
-  if (!settings.crafter.craftLimits) settings.crafter.craftLimits = {};
-  settings.crafter.craftLimits[id] = qty;
+  if (!settings.crafter.crafters) settings.crafter.crafters = [];
+  let crafters = settings.crafter.crafters;
+  if (crafters.length === 0) {
+    crafters = [{ name: "Default Crafter", craftLimits: {} }];
+    settings.crafter.crafters = crafters;
+  }
+
+  const currentProfile = crafters.find(c => c.name === currentCrafterName) || crafters[0];
+  if (!currentProfile.craftLimits) currentProfile.craftLimits = {};
+  currentProfile.craftLimits[id] = qty;
   renderCrafterSettings(document.getElementById('settingsContent'));
 }
 
@@ -7818,8 +7916,18 @@ function addCraftCategory() {
   const qty = parseInt(qtyEl?.value) || 10;
   if (!category) return;
 
+  // Get current crafter profile
+  const currentCrafterName = window._currentCrafterProfile;
   if (!settings.crafter) settings.crafter = {};
-  if (!settings.crafter.craftLimits) settings.crafter.craftLimits = {};
+  if (!settings.crafter.crafters) settings.crafter.crafters = [];
+  let crafters = settings.crafter.crafters;
+  if (crafters.length === 0) {
+    crafters = [{ name: "Default Crafter", craftLimits: {} }];
+    settings.crafter.crafters = crafters;
+  }
+
+  const currentProfile = crafters.find(c => c.name === currentCrafterName) || crafters[0];
+  if (!currentProfile.craftLimits) currentProfile.craftLimits = {};
 
   const recipes = cachedSettingsRecipes || [];
   let addedCount = 0;
@@ -7828,7 +7936,7 @@ function addCraftCategory() {
     if (category === '__all__' || cat === category) {
       const id = r.recipe_id || r.id || r.name;
       if (id) {
-        settings.crafter.craftLimits[id] = qty;
+        currentProfile.craftLimits[id] = qty;
         addedCount++;
       }
     }
@@ -7842,8 +7950,14 @@ function addCraftCategory() {
 }
 
 function removeCraftItem(id) {
-  if (!settings.crafter?.craftLimits) return;
-  delete settings.crafter.craftLimits[id];
+  // Get current crafter profile
+  const currentCrafterName = window._currentCrafterProfile;
+  if (!settings.crafter?.crafters) return;
+
+  const currentProfile = settings.crafter.crafters.find(c => c.name === currentCrafterName);
+  if (!currentProfile?.craftLimits) return;
+
+  delete currentProfile.craftLimits[id];
   renderCrafterSettings(document.getElementById('settingsContent'));
 }
 
@@ -7853,6 +7967,18 @@ function toggleAllCategories(checkbox) {
 }
 
 function saveCrafterSettings() {
+  // Get current crafter profile
+  const currentCrafterName = window._currentCrafterProfile;
+  if (!settings.crafter) settings.crafter = {};
+  if (!settings.crafter.crafters) settings.crafter.crafters = [];
+  let crafters = settings.crafter.crafters;
+  if (crafters.length === 0) {
+    crafters = [{ name: "Default Crafter", craftLimits: {} }];
+    settings.crafter.crafters = crafters;
+  }
+
+  const currentProfile = crafters.find(c => c.name === currentCrafterName) || crafters[0];
+
   // Collect from rendered inputs (in case user edited qty inline)
   const craftLimits = {};
   document.querySelectorAll('.craft-limit-val').forEach(el => {
@@ -7861,12 +7987,8 @@ function saveCrafterSettings() {
     if (id && val > 0) craftLimits[id] = val;
   });
 
-  // Also merge any items from settings that aren't rendered (shouldn't happen, but safe)
-  if (settings.crafter?.craftLimits) {
-    for (const [id, val] of Object.entries(settings.crafter.craftLimits)) {
-      if (val > 0 && !(id in craftLimits)) craftLimits[id] = val;
-    }
-  }
+  // Update current profile's craftLimits
+  currentProfile.craftLimits = craftLimits;
 
   // Collect enabled categories
   const enabledCategories = [];
@@ -7901,7 +8023,8 @@ function saveCrafterSettings() {
   });
 
   const s = {
-    craftLimits,
+    crafters: settings.crafter.crafters || [{ name: currentCrafterName, craftLimits }],
+    botCrafterAssignments: settings.crafter.botCrafterAssignments || {},
     enabledCategories,
     refuelThreshold: parseInt(document.getElementById('set-crafter-refuelThreshold').value) || 50,
     repairThreshold: parseInt(document.getElementById('set-crafter-repairThreshold').value) || 40,
@@ -7955,10 +8078,14 @@ async function saveLoadout(name) {
     if (id && val > 0) craftLimits[id] = val;
   });
 
-  // Also merge from settings object
-  if (settings.crafter?.craftLimits) {
-    for (const [id, val] of Object.entries(settings.crafter.craftLimits)) {
-      if (val > 0 && !(id in craftLimits)) craftLimits[id] = val;
+  // Also merge from current crafter profile
+  const currentCrafterName = window._currentCrafterProfile;
+  if (settings.crafter?.crafters) {
+    const currentProfile = settings.crafter.crafters.find(c => c.name === currentCrafterName);
+    if (currentProfile?.craftLimits) {
+      for (const [id, val] of Object.entries(currentProfile.craftLimits)) {
+        if (val > 0 && !(id in craftLimits)) craftLimits[id] = val;
+      }
     }
   }
 
@@ -8002,8 +8129,19 @@ function loadLoadout() {
     return;
   }
 
+  // Load into current crafter profile
+  const currentCrafterName = window._currentCrafterProfile;
   if (!settings.crafter) settings.crafter = {};
-  settings.crafter.craftLimits = JSON.parse(JSON.stringify(loadout));
+  if (!settings.crafter.crafters) settings.crafter.crafters = [];
+  let crafters = settings.crafter.crafters;
+  if (crafters.length === 0) {
+    crafters = [{ name: "Default Crafter", craftLimits: {} }];
+    settings.crafter.crafters = crafters;
+  }
+
+  const currentProfile = crafters.find(c => c.name === currentCrafterName) || crafters[0];
+  currentProfile.craftLimits = JSON.parse(JSON.stringify(loadout));
+
   renderCrafterSettings(document.getElementById('settingsContent'));
 }
 
@@ -8033,6 +8171,112 @@ async function deleteLoadout() {
   } catch (e) {
     alert(`Failed to delete loadout: ${e.message}`);
   }
+}
+
+// ── Crafter Profile Management ─────────────────────────────
+
+function switchCrafterProfile() {
+  const select = document.getElementById('crafter-profile-select');
+  if (!select) return;
+
+  // Save current settings before switching
+  saveCrafterSettings();
+
+  window._currentCrafterProfile = select.value;
+  renderCrafterSettings(document.getElementById('settingsContent'));
+}
+
+function addCrafterProfile() {
+  const name = prompt('Enter a name for the new crafter profile:');
+  if (!name || !name.trim()) return;
+  const trimmedName = name.trim();
+
+  if (!settings.crafter) settings.crafter = {};
+  if (!settings.crafter.crafters) settings.crafter.crafters = [];
+
+  // Check if profile name already exists
+  if (settings.crafter.crafters.some(c => c.name === trimmedName)) {
+    alert(`A profile named "${trimmedName}" already exists.`);
+    return;
+  }
+
+  settings.crafter.crafters.push({
+    name: trimmedName,
+    craftLimits: {}
+  });
+
+  window._currentCrafterProfile = trimmedName;
+  saveCrafterSettings();
+}
+
+function renameCrafterProfile() {
+  const currentName = window._currentCrafterProfile;
+  if (!currentName) return;
+
+  const newName = prompt('Enter a new name for this crafter profile:', currentName);
+  if (!newName || !newName.trim() || newName.trim() === currentName) return;
+  const trimmedNewName = newName.trim();
+
+  if (!settings.crafter?.crafters) return;
+
+  // Check if new name already exists
+  if (settings.crafter.crafters.some(c => c.name === trimmedNewName)) {
+    alert(`A profile named "${trimmedNewName}" already exists.`);
+    return;
+  }
+
+  // Update the profile name
+  const profile = settings.crafter.crafters.find(c => c.name === currentName);
+  if (profile) {
+    profile.name = trimmedNewName;
+
+    // Update any bot assignments that reference the old name
+    if (settings.crafter.botCrafterAssignments) {
+      for (const [botName, profileName] of Object.entries(settings.crafter.botCrafterAssignments)) {
+        if (profileName === currentName) {
+          settings.crafter.botCrafterAssignments[botName] = trimmedNewName;
+        }
+      }
+    }
+
+    window._currentCrafterProfile = trimmedNewName;
+    saveCrafterSettings();
+  }
+}
+
+function deleteCrafterProfile() {
+  const currentName = window._currentCrafterProfile;
+  if (!currentName || currentName === 'Default Crafter') {
+    alert('Cannot delete the default crafter profile.');
+    return;
+  }
+
+  if (!confirm(`Are you sure you want to delete the crafter profile "${currentName}"? This will also unassign it from any bots.`)) return;
+
+  if (!settings.crafter?.crafters) return;
+
+  // Remove the profile
+  settings.crafter.crafters = settings.crafter.crafters.filter(c => c.name !== currentName);
+
+  // Update any bot assignments that referenced this profile
+  if (settings.crafter.botCrafterAssignments) {
+    for (const [botName, profileName] of Object.entries(settings.crafter.botCrafterAssignments)) {
+      if (profileName === currentName) {
+        delete settings.crafter.botCrafterAssignments[botName];
+      }
+    }
+  }
+
+  // Switch to first available profile
+  if (settings.crafter.crafters.length > 0) {
+    window._currentCrafterProfile = settings.crafter.crafters[0].name;
+  } else {
+    // Recreate default if somehow empty
+    settings.crafter.crafters = [{ name: "Default Crafter", craftLimits: {} }];
+    window._currentCrafterProfile = "Default Crafter";
+  }
+
+  saveCrafterSettings();
 }
 
 // ── Ship Loadouts ───────────────────────────────────────
@@ -8360,9 +8604,18 @@ function addShipToCraftingList() {
   const multiplier = parseInt(document.getElementById('set-crafter-shipCommissionMultiplier')?.value) || 1;
   const clampedMultiplier = Math.max(1, Math.min(99, multiplier));
 
-  // Initialize crafter settings if needed
+  // Get current crafter profile
+  const currentCrafterName = window._currentCrafterProfile;
   if (!settings.crafter) settings.crafter = {};
-  if (!settings.crafter.craftLimits) settings.crafter.craftLimits = {};
+  if (!settings.crafter.crafters) settings.crafter.crafters = [];
+  let crafters = settings.crafter.crafters;
+  if (crafters.length === 0) {
+    crafters = [{ name: "Default Crafter", craftLimits: {} }];
+    settings.crafter.crafters = crafters;
+  }
+
+  const currentProfile = crafters.find(c => c.name === currentCrafterName) || crafters[0];
+  if (!currentProfile.craftLimits) currentProfile.craftLimits = {};
 
   // Add build materials to craftLimits (multiplied)
   let addedCount = 0;
@@ -8370,7 +8623,7 @@ function addShipToCraftingList() {
     const itemId = mat.item_id;
     const quantity = mat.quantity * clampedMultiplier;
     if (itemId && quantity > 0) {
-      settings.crafter.craftLimits[itemId] = quantity;
+      currentProfile.craftLimits[itemId] = quantity;
       addedCount++;
     }
   }
@@ -8387,7 +8640,7 @@ function addShipToCraftingList() {
   for (const [mod, count] of moduleCounts) {
     const item = catalog.items?.[mod];
     if (item) {
-      settings.crafter.craftLimits[mod] = count * clampedMultiplier;
+      currentProfile.craftLimits[mod] = count * clampedMultiplier;
       addedCount++;
     }
   }
@@ -8422,9 +8675,18 @@ async function loadShipLoadout() {
   const multiplier = parseInt(document.getElementById('set-crafter-shipCommissionMultiplier')?.value) || 1;
   const clampedMultiplier = Math.max(1, Math.min(99, multiplier));
 
-  // Initialize crafter settings if needed
+  // Get current crafter profile
+  const currentCrafterName = window._currentCrafterProfile;
   if (!settings.crafter) settings.crafter = {};
-  if (!settings.crafter.craftLimits) settings.crafter.craftLimits = {};
+  if (!settings.crafter.crafters) settings.crafter.crafters = [];
+  let crafters = settings.crafter.crafters;
+  if (crafters.length === 0) {
+    crafters = [{ name: "Default Crafter", craftLimits: {} }];
+    settings.crafter.crafters = crafters;
+  }
+
+  const currentProfile = crafters.find(c => c.name === currentCrafterName) || crafters[0];
+  if (!currentProfile.craftLimits) currentProfile.craftLimits = {};
 
   // Add build materials to craftLimits (multiplied)
   let addedCount = 0;
@@ -8432,7 +8694,7 @@ async function loadShipLoadout() {
     const itemId = mat.item_id;
     const quantity = mat.quantity * clampedMultiplier;
     if (itemId && quantity > 0) {
-      settings.crafter.craftLimits[itemId] = quantity;
+      currentProfile.craftLimits[itemId] = quantity;
       addedCount++;
     }
   }
@@ -8449,7 +8711,7 @@ async function loadShipLoadout() {
   for (const [mod, count] of loadoutModuleCounts) {
     const item = catalog.items?.[mod];
     if (item) {
-      settings.crafter.craftLimits[mod] = count * clampedMultiplier;
+      currentProfile.craftLimits[mod] = count * clampedMultiplier;
       addedCount++;
     }
   }
@@ -8493,10 +8755,16 @@ async function deleteShipLoadout() {
 }
 
 function clearAllRecipes() {
-  if (!confirm('Clear all configured recipes? This will remove all recipes from the current list.')) return;
+  if (!confirm('Clear all configured recipes? This will remove all recipes from the current profile.')) return;
 
-  if (!settings.crafter) settings.crafter = {};
-  settings.crafter.craftLimits = {};
+  // Get current crafter profile
+  const currentCrafterName = window._currentCrafterProfile;
+  if (!settings.crafter?.crafters) return;
+
+  const currentProfile = settings.crafter.crafters.find(c => c.name === currentCrafterName);
+  if (!currentProfile) return;
+
+  currentProfile.craftLimits = {};
   renderCrafterSettings(document.getElementById('settingsContent'));
 }
 
@@ -13676,7 +13944,7 @@ function saveExplorerBotFocus(botName) {
 // ── Flock Mining Helpers ──────────────────────────────────────────
 
 function buildFlockGroupRows() {
-  const groups = settings.miner?.flockGroups || [];
+  const groups = settings.flock?.flockGroups || [];
   let rows = '';
   for (const group of groups) {
     rows += `<tr data-flock-group="${esc(group.name)}">
@@ -13698,7 +13966,7 @@ function buildFlockGroupRows() {
 }
 
 function buildFlockGroupOptions(selectedName) {
-  const groups = settings.miner?.flockGroups || [];
+  const groups = settings.flock?.flockGroups || [];
   let opts = '';
   for (const group of groups) {
     const selected = group.name === selectedName ? ' selected' : '';
@@ -13709,7 +13977,7 @@ function buildFlockGroupOptions(selectedName) {
 
 function buildFlockAssignmentsRows() {
   let rows = '';
-  const flockAssignments = settings.flockAssignments || {};
+  const flockAssignments = settings.flock?.assignments || {};
   for (const bot of bots) {
     const botSettings = flockAssignments[bot.username];
     if (botSettings && botSettings.flockEnabled && botSettings.flockName) {
@@ -13728,11 +13996,15 @@ function buildFlockAssignmentsRows() {
 }
 
 function removeBotFromFlock(botUsername) {
-  if (!settings.flockAssignments) settings.flockAssignments = {};
-  delete settings.flockAssignments[botUsername];
+  if (!settings.flock) settings.flock = {};
+  if (!settings.flock.assignments) settings.flock.assignments = {};
+  delete settings.flock.assignments[botUsername];
 
   // Send to server
-  send({ type: 'saveSettings', routine: 'flock', settings: { assignments: settings.flockAssignments } });
+  send({ type: 'saveSettings', routine: 'flock', settings: {
+    flockGroups: settings.flock.flockGroups || [],
+    assignments: settings.flock.assignments
+  } });
 
   // Refresh the assignments table
   document.getElementById('flock-assignments-tbody').innerHTML = buildFlockAssignmentsRows();
@@ -13816,7 +14088,7 @@ async function loadFlockMembers(flockName) {
       if (state && state.members && state.members.length > 0) {
         const leader = state.leader || 'unknown';
         // Get maxMembers from the flock group config in settings
-        const flockGroup = (settings.miner?.flockGroups || []).find(g => g.name === flockName);
+        const flockGroup = (settings.flock?.flockGroups || []).find(g => g.name === flockName);
         const maxMembers = flockGroup?.maxMembers;
         const membersList = state.members.map(m => {
           const isLeader = m === leader;
@@ -15669,17 +15941,21 @@ function assignBotToFlock() {
   }
 
   // Initialize flock assignments if not exists
-  if (!settings.flockAssignments) settings.flockAssignments = {};
+  if (!settings.flock) settings.flock = {};
+  if (!settings.flock.assignments) settings.flock.assignments = {};
 
   // Save assignment
-  settings.flockAssignments[botUsername] = {
+  settings.flock.assignments[botUsername] = {
     flockEnabled: true,
     flockName: flockName,
     flockRole: flockRole
   };
 
   // Send to server
-  send({ type: 'saveSettings', routine: 'flock', settings: { assignments: settings.flockAssignments } });
+  send({ type: 'saveSettings', routine: 'flock', settings: {
+    flockGroups: settings.flock.flockGroups || [],
+    assignments: settings.flock.assignments
+  } });
 
   // Refresh the assignments table
   document.getElementById('flock-assignments-tbody').innerHTML = buildFlockAssignmentsRows();
@@ -15713,13 +15989,14 @@ function saveFlockGroupingSettings() {
     return groups;
   };
 
-  const s = {
-    flockGroups: collectFlockGroups(),
-  };
+  const flockGroups = collectFlockGroups();
 
-  send({ type: 'saveSettings', routine: 'miner', settings: s });
-  if (!settings.miner) settings.miner = {};
-  settings.miner.flockGroups = s.flockGroups;
+  send({ type: 'saveSettings', routine: 'flock', settings: {
+    flockGroups: flockGroups,
+    assignments: settings.flock?.assignments || {}
+  } });
+  if (!settings.flock) settings.flock = {};
+  settings.flock.flockGroups = flockGroups;
 }
 
 // ── Cargo Mover settings ────────────────────────────────────────
@@ -20252,11 +20529,29 @@ async function loadGlobalFactionStorage() {
   }
 }
 
+async function updateBandwidthDisplay() {
+  try {
+    const res = await fetch('/api/bandwidth');
+    const data = await res.json();
+    const inKBps = data.inKBps || 0;
+    const outKBps = data.outKBps || 0;
+    // Display received (in) as KB/s, sent (out) as b/s since it's low
+    const inDisplay = inKBps.toFixed(1);
+    const outDisplay = (outKBps * 1024).toFixed(0); // Convert KB/s to b/s
+    document.getElementById('bandwidthDisplay').textContent = `BW: ${inDisplay} KB/s ↓ | ${outDisplay} b/s ↑`;
+  } catch (e) {
+    console.warn('Failed to update bandwidth:', e);
+  }
+}
+
 connect();
 loadGlobalFactionStorage(); // Load immediately on page load
 setInterval(refreshFactionFunds, 60000);
 // Poll battle status every 2 seconds when in battle
 setInterval(pollBattleStatus, 2000);
+// Update bandwidth display every 5 seconds
+setInterval(updateBandwidthDisplay, 5000);
+updateBandwidthDisplay(); // Initial update
 </script>
 </body>
 </html>

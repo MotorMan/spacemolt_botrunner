@@ -1070,7 +1070,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         for (const item of itemsToDeposit) {
           if (item.quantity <= 0) continue;
           const lower = item.itemId.toLowerCase();
-          if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+          if (lower === "fuel_cell" || lower === "premium_fuel_cell" || lower.includes("energy_cell")) continue;
 
           const depositResult = await depositToDestination(
             ctx,
@@ -1615,8 +1615,78 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           continue;
         }
         if (!errMsg.includes("already")) {
-          // Check if it's a mobile station that moved
-          if (settings.destinationStation === "mobile_capital" && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
+          // Check if mobile capital moved and we got location info
+          if (settings.destinationStation === "mobile_capital" && errMsg.includes("jump to") && errMsg.includes("to find it")) {
+            // Parse the error message like "Jump to First Step to find it."
+            const match = tResp.error.message.match(/jump to (.+?) to find it/i);
+            if (match) {
+              const newSystemName = match[1];
+              ctx.log("cargo", `Mobile capital relocated to system: ${newSystemName}`);
+
+              // Update map store with new location
+              // We need to get the system ID from the name, or use the name directly
+              // For now, we'll query the current location and update the map
+              const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
+              if (currentSystem) {
+                // Update the map store
+                mapStore.updateMobileCapitolLocation(currentSystem, newSystemName, "mobile_capital");
+                ctx.log("cargo", `Updated map store: mobile capital now in ${newSystemName} (${currentSystem})`);
+
+                // Navigate to the new system
+                if (bot.system !== currentSystem) {
+                  ctx.log("travel", `Mobile capital moved - navigating to ${newSystemName} (${currentSystem})...`);
+                  const arrived = await navigateToSystem(ctx, currentSystem, safetyOpts);
+                  if (!arrived || bot.state !== "running") {
+                    if (bot.state !== "running") {
+                      ctx.log("system", "⛔ Stopping — emergency detected");
+                      return;
+                    }
+                    ctx.log("error", `Failed to reach mobile capital's new system ${currentSystem}`);
+                    logCargoActivity(bot.username, "error", `Failed to navigate to mobile capital's new system ${currentSystem}`, {
+                      location: `${bot.system}/${bot.poi}`,
+                    });
+                    allJobsCompleted = false;
+                    break;
+                  }
+                  ctx.log("cargo", `✅ Arrived at mobile capital's new system ${currentSystem}`);
+                }
+
+                // Retry travel to the mobile capital
+                const retryResp = await bot.exec("travel", { target_poi: extractStationId(settings.destinationStation) });
+                if (retryResp.error) {
+                  const retryErrMsg = retryResp.error.message.toLowerCase();
+                  if (!retryErrMsg.includes("already")) {
+                    ctx.log("error", `Still failed to travel to relocated mobile capital: ${retryResp.error.message}`);
+                    logCargoActivity(bot.username, "error", `Travel to relocated mobile capital failed: ${retryResp.error.message}`, {
+                      location: `${bot.system}/${bot.poi}`,
+                    });
+                    allJobsCompleted = false;
+                    break;
+                  }
+                } else {
+                  bot.poi = extractStationId(settings.destinationStation);
+                }
+              } else {
+                ctx.log("error", "Could not determine mobile capital's new location from error message");
+                logCargoActivity(bot.username, "error", "Could not parse mobile capital relocation from error message", {
+                  location: `${bot.system}/${bot.poi}`,
+                  error: tResp.error.message,
+                });
+                allJobsCompleted = false;
+                break;
+              }
+            } else {
+              ctx.log("error", "Could not parse new system name from mobile capital relocation error");
+              logCargoActivity(bot.username, "error", "Could not parse system name from mobile capital relocation error", {
+                location: `${bot.system}/${bot.poi}`,
+                error: tResp.error.message,
+              });
+              allJobsCompleted = false;
+              break;
+            }
+          }
+          // Check if it's a mobile station that moved (fallback for other cases)
+          else if (settings.destinationStation === "mobile_capital" && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
             ctx.log("cargo", "Mobile capital not found at expected location, querying current system...");
             const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
             if (currentSystem) {
@@ -1691,18 +1761,35 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     });
 
     yield "deposit_items";
+
+    // Check destination storage BEFORE depositing to establish baseline
+    let destStorageBefore: Array<{ itemId: string; name: string; quantity: number }> = [];
+    let canVerifyDelivery = true;
+
+    if (settings.destinationStorageType === "faction") {
+      await bot.refreshFactionStorage();
+      destStorageBefore = [...bot.factionStorage];
+    } else if (settings.destinationStorageType === "personal") {
+      await bot.refreshStorage();
+      destStorageBefore = [...bot.storage];
+    } else if (settings.destinationStorageType === "send_gift") {
+      // Cannot verify gift deliveries - fall back to deposit function reporting
+      canVerifyDelivery = false;
+      ctx.log("cargo", `📦 Gift delivery selected - cannot verify actual delivery to recipient storage`);
+    }
+
     await bot.refreshCargo();
     // Deposit ALL items in cargo to the destination
     const itemsToDeposit = [...bot.inventory];
-    const deliveredItems: { itemId: string; quantity: number }[] = [];
 
     if (itemsToDeposit.length > 0) {
       ctx.log("cargo", `📦 Depositing ${itemsToDeposit.length} item type(s) to destination...`);
+      let depositErrors = 0;
       for (const item of itemsToDeposit) {
         if (item.quantity <= 0) continue;
-        // Skip fuel/energy cells
+        // Skip specific fuel cells used for operations
         const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+        if (lower === "fuel_cell" || lower === "premium_fuel_cell" || lower.includes("energy_cell")) continue;
 
         const depositResult = await depositToDestination(
           ctx,
@@ -1711,18 +1798,71 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           settings.destinationStorageType,
           settings.destinationBotName,
         );
-        if (depositResult.success) {
-          ctx.log("cargo", `✅ Delivered ${depositResult.depositedQty}x ${item.name}`);
-          deliveredItems.push({ itemId: item.itemId, quantity: depositResult.depositedQty });
-        } else {
+        if (!depositResult.success) {
           ctx.log("error", `❌ Failed to deliver ${item.quantity}x ${item.name}`);
-          allJobsCompleted = false;
+          depositErrors++;
         }
       }
+
+      let deliveredItems: { itemId: string; quantity: number }[] = [];
+
+      if (canVerifyDelivery) {
+        // Check destination storage AFTER depositing to count what actually arrived
+        let destStorageAfter: Array<{ itemId: string; name: string; quantity: number }> = [];
+        if (settings.destinationStorageType === "faction") {
+          await bot.refreshFactionStorage();
+          destStorageAfter = [...bot.factionStorage];
+        } else if (settings.destinationStorageType === "personal") {
+          await bot.refreshStorage();
+          destStorageAfter = [...bot.storage];
+        }
+
+        // Calculate what actually arrived by comparing before/after
+        const beforeMap = new Map(destStorageBefore.map(item => [item.itemId, item.quantity]));
+
+        for (const afterItem of destStorageAfter) {
+          const beforeQty = beforeMap.get(afterItem.itemId) || 0;
+          const arrivedQty = Math.max(0, afterItem.quantity - beforeQty);
+
+          if (arrivedQty > 0) {
+            deliveredItems.push({ itemId: afterItem.itemId, quantity: arrivedQty });
+            ctx.log("cargo", `✅ Verified delivery: ${arrivedQty}x ${afterItem.name} arrived at destination`);
+          }
+        }
+
+        if (deliveredItems.length > 0) {
+          ctx.log("cargo", `📊 Verified total delivery: ${deliveredItems.reduce((sum, d) => sum + d.quantity, 0)} items across ${deliveredItems.length} types`);
+        }
+
+        if (depositErrors > 0) {
+          ctx.log("warn", `⚠️ ${depositErrors} deposit operations reported errors, but verified ${deliveredItems.length} successful deliveries`);
+        }
+      } else {
+        // For gift deliveries, fall back to deposit function reporting
+        ctx.log("cargo", `📦 Using reported delivery quantities for gift delivery (cannot verify)`);
+        for (const item of itemsToDeposit) {
+          if (item.quantity <= 0) continue;
+          const lower = item.itemId.toLowerCase();
+          if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+
+          const depositResult = await depositToDestination(
+            ctx,
+            item.itemId,
+            item.quantity,
+            settings.destinationStorageType,
+            settings.destinationBotName,
+          );
+          if (depositResult.success) {
+            ctx.log("cargo", `✅ Reported delivery: ${depositResult.depositedQty}x ${item.name} to ${settings.destinationBotName}`);
+            deliveredItems.push({ itemId: item.itemId, quantity: depositResult.depositedQty });
+          }
+        }
+      }
+
       totalTrips++;
       currentTrip = totalTrips;
 
-      // Update delivery tracking after successful delivery
+      // Update delivery tracking with VERIFIED quantities
       if (deliveredItems.length > 0) {
         const itemIds = deliveredItems.map((d) => d.itemId);
         const quantities = deliveredItems.map((d) => d.quantity);
@@ -1730,7 +1870,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
         // Remove delivered items from in-transit tracking
         removeInTransitItems(bot.username, settings.destinationStation, deliveredItems);
-        ctx.log("cargo", `📦 Removed ${deliveredItems.length} item types from in-transit tracking (${deliveredItems.reduce((sum, d) => sum + d.quantity, 0)} total items delivered)`);
+        ctx.log("cargo", `📦 Removed ${deliveredItems.length} item types from in-transit tracking (${deliveredItems.reduce((sum, d) => sum + d.quantity, 0)} verified deliveries)`);
 
         // Update trip completion tracking
         for (const itemId of itemIds) {
@@ -1744,6 +1884,9 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         quantity: deliveredItems.reduce((sum, d) => sum + d.quantity, 0),
       });
     }
+
+    // Refuel at destination to prevent getting stuck on return journey
+    await tryRefuel(ctx);
 
     await bot.refreshCargo();
 

@@ -212,10 +212,11 @@ export class PlayerNameStore {
   /**
    * Update an entity's ship, tracking history without duplicates.
    * Only adds to history if the ship actually changed and isn't already logged.
+   * Returns true if the ship was changed.
    */
-  private updateShipWithHistory(entity: EntityDetail, newShip: string, timestamp: string): void {
+  private updateShipWithHistory(entity: EntityDetail, newShip: string, timestamp: string): boolean {
     if (!newShip || newShip === entity.ship) {
-      return; // No change or empty ship
+      return false; // No change or empty ship
     }
 
     // If entity has an existing ship, add it to history
@@ -233,6 +234,7 @@ export class PlayerNameStore {
 
     // Update to new ship
     entity.ship = newShip;
+    return true;
   }
 
   /**
@@ -253,11 +255,12 @@ export class PlayerNameStore {
 
     const isNew = !this.normalizedMap.has(normalized);
     const now = new Date().toISOString();
+    let shipChanged = false;
 
     if (!isNew && this.fullPlayerInfo.players[normalized]) {
       // Update existing player - track ship history
       const entity = this.fullPlayerInfo.players[normalized];
-      this.updateShipWithHistory(entity, ship, entity.lastSeen);
+      shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
       entity.faction = faction || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
@@ -278,17 +281,20 @@ export class PlayerNameStore {
 
     // Check if we already have this name (case-insensitive, normalized)
     if (!isNew) {
-      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Updated: "${name}" (faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
+      // debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Updated: "${name}" (faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     } else {
       // Add to both sets
       this.names.add(name);
       this.normalizedMap.set(normalized, name);
-      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added: "${name}" (total: ${this.names.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
+      // debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added: "${name}" (total: ${this.names.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     }
 
-    this.fullPlayerInfo.counts.players = Object.keys(this.fullPlayerInfo.players).length;
-    this.saveFullPlayerInfo();
-    this.save();
+    // Only save if new or ship changed
+    if (isNew || shipChanged) {
+      this.fullPlayerInfo.counts.players = Object.keys(this.fullPlayerInfo.players).length;
+      this.saveFullPlayerInfo();
+      this.save();
+    }
     return isNew;
   }
 
@@ -310,11 +316,12 @@ export class PlayerNameStore {
 
     const isNew = !this.pirateNormalizedMap.has(normalized);
     const now = new Date().toISOString();
+    let shipChanged = false;
 
     if (!isNew && this.fullPlayerInfo.pirates[normalized]) {
       // Update existing pirate - track ship history
       const entity = this.fullPlayerInfo.pirates[normalized];
-      this.updateShipWithHistory(entity, ship, entity.lastSeen);
+      shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
       entity.faction = faction || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
@@ -335,17 +342,20 @@ export class PlayerNameStore {
 
     // Check if we already have this name (case-insensitive, normalized)
     if (!isNew) {
-      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Pirate updated: "${name}" (faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
+      // debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Pirate updated: "${name}" (faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     } else {
       // Add to both sets
       this.pirates.add(name);
       this.pirateNormalizedMap.set(normalized, name);
-      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added pirate: "${name}" (total: ${this.pirates.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
+      // debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added pirate: "${name}" (total: ${this.pirates.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     }
 
-    this.fullPlayerInfo.counts.pirates = Object.keys(this.fullPlayerInfo.pirates).length;
-    this.saveFullPlayerInfo();
-    this.save();
+    // Only save if new or ship changed
+    if (isNew || shipChanged) {
+      this.fullPlayerInfo.counts.pirates = Object.keys(this.fullPlayerInfo.pirates).length;
+      this.saveFullPlayerInfo();
+      this.save();
+    }
     return isNew;
   }
 
@@ -367,11 +377,12 @@ export class PlayerNameStore {
 
     const isNew = !this.empireNpcNormalizedMap.has(normalized);
     const now = new Date().toISOString();
+    let shipChanged = false;
 
     if (!isNew && this.fullPlayerInfo.empire_npcs[normalized]) {
       // Update existing empire NPC - track ship history
       const entity = this.fullPlayerInfo.empire_npcs[normalized];
-      this.updateShipWithHistory(entity, ship, entity.lastSeen);
+      shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
       entity.faction = faction || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
@@ -392,17 +403,20 @@ export class PlayerNameStore {
 
     // Check if we already have this name (case-insensitive, normalized)
     if (!isNew) {
-      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Empire NPC updated: "${name}" (faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
+      // debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Empire NPC updated: "${name}" (faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     } else {
       // Add to both sets
       this.empireNpcs.add(name);
       this.empireNpcNormalizedMap.set(normalized, name);
-      debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added empire NPC: "${name}" (total: ${this.empireNpcs.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
+      // debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added empire NPC: "${name}" (total: ${this.empireNpcs.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     }
 
-    this.fullPlayerInfo.counts.empire_npcs = Object.keys(this.fullPlayerInfo.empire_npcs).length;
-    this.saveFullPlayerInfo();
-    this.save();
+    // Only save if new or ship changed
+    if (isNew || shipChanged) {
+      this.fullPlayerInfo.counts.empire_npcs = Object.keys(this.fullPlayerInfo.empire_npcs).length;
+      this.saveFullPlayerInfo();
+      this.save();
+    }
     return isNew;
   }
 
@@ -623,7 +637,7 @@ export class PlayerNameStore {
         empire_npc_count: this.empireNpcs.size,
       };
       writeFileSync(PLAYER_NAMES_FILE, JSON.stringify(data, null, 2), "utf-8");
-      debugLogForBot(this._botName || "unknown", "playernames:save", `${this._botName || "unknown"}`, `Saved ${this.names.size} players, ${this.pirates.size} pirates, ${this.empireNpcs.size} empire NPCs`);
+      // debugLogForBot(this._botName || "unknown", "playernames:save", `${this._botName || "unknown"}`, `Saved ${this.names.size} players, ${this.pirates.size} pirates, ${this.empireNpcs.size} empire NPCs`);
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       console.error(`[PlayerNameStore] Save failed: ${msg}`);

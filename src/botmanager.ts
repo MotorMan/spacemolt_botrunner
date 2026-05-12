@@ -64,6 +64,18 @@ export function getBotChatChannel() {
   return botChatChannel;
 }
 
+/** Get total bandwidth usage across all bots in KB/s */
+export function getTotalBandwidth(): { inKBps: number; outKBps: number } {
+  let totalIn = 0;
+  let totalOut = 0;
+  for (const bot of bots.values()) {
+    const usage = bot.api.getBandwidthUsage();
+    totalIn += usage.inKBps;
+    totalOut += usage.outKBps;
+  }
+  return { inKBps: totalIn, outKBps: totalOut };
+}
+
 /** Send a chat message from a bot to other bots. */
 export function sendBotChatMessage(
   sender: string,
@@ -724,7 +736,6 @@ async function main(): Promise<void> {
             bot.login().then(async (loginOk) => {
               // Clear failure counter on successful login
               sessionRestoreFailures.delete(name);
-              server.logSystem(`DEBUG: ${name} forced login completed, ok=${loginOk}`);
               refreshStatusTable();
               if (!loginOk) {
                 server.logSystem(`${name} forced login failed`);
@@ -740,7 +751,6 @@ async function main(): Promise<void> {
                   }
                 }
               const routineKey = assignments[name];
-              server.logSystem(`DEBUG: ${name} routine assignment: ${routineKey || 'none'}`);
               if (!routineKey || !ROUTINES[routineKey]) {
                 server.logSystem(`${name} logged in but no routine assigned`);
                 return;
@@ -755,13 +765,10 @@ async function main(): Promise<void> {
             // Normal case: schedule full login with rate-limited delay
             const loginDelay = loginIndex * FULL_LOGIN_DELAY_MS;
             server.logSystem(`${name} session expired (${recentFailures.length}/3 failures in past minute), scheduling full login in ${loginDelay / 1000}s...`);
-            server.logSystem(`DEBUG: ${name} login scheduled with delay ${loginDelay}ms (index=${loginIndex})`);
             setTimeout(() => {
-              server.logSystem(`DEBUG: ${name} login timeout fired, calling bot.login()`);
               bot.login().then(async (loginOk) => {
                 // Clear failure counter on successful login
                 sessionRestoreFailures.delete(name);
-                server.logSystem(`DEBUG: ${name} login completed, ok=${loginOk}`);
                 refreshStatusTable();
                 if (!loginOk) {
                   server.logSystem(`${name} login failed`);
@@ -777,7 +784,6 @@ async function main(): Promise<void> {
                 }
               }
                 const routineKey = assignments[name];
-                server.logSystem(`DEBUG: ${name} routine assignment: ${routineKey || 'none'}`);
                 if (!routineKey || !ROUTINES[routineKey]) {
                   server.logSystem(`${name} logged in but no routine assigned`);
                   return;

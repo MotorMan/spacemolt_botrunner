@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { RoutineContext } from "../../bot.js";
-import { isDeepCoreOre, hasDeepCoreSurveyScanner, hasDeepCoreExtractor, getDeepCoreCapability } from "../miner.js";
+import { isDeepCoreOre, hasDeepCoreSurveyScanner, hasDeepCoreExtractor, getDeepCoreCapability, findFirstAvailableQuotaTarget, pickTargetFromQuotas, hasEquipmentForMiningType, ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS } from "../miner.js";
 
 // Mock the bot and context
 const mockBot = {
@@ -177,6 +177,112 @@ describe("Miner Deep Core Functions", () => {
       });
     });
   });
+
+  describe("hasEquipmentForMiningType", () => {
+    it("should return true for ore mining with mining laser", async () => {
+      mockBot.exec.mockResolvedValue({
+        result: {
+          modules: [
+            { id: "mining_laser", name: "Mining Laser" }
+          ]
+        }
+      });
+
+      const result = await hasEquipmentForMiningType(mockCtx, "ore");
+      expect(result).toBe(true);
+    });
+
+    it("should return true for ore mining with strip miner", async () => {
+      mockBot.exec.mockResolvedValue({
+        result: {
+          modules: [
+            { id: "strip_miner", name: "Strip Miner" }
+          ]
+        }
+      });
+
+      const result = await hasEquipmentForMiningType(mockCtx, "ore");
+      expect(result).toBe(true);
+    });
+
+    it("should return true for ore mining with deep core survey scanner", async () => {
+      mockBot.exec.mockResolvedValue({
+        result: {
+          modules: [
+            { id: "deep_core_survey_scanner", name: "Deep Core Survey Scanner" }
+          ]
+        }
+      });
+
+      const result = await hasEquipmentForMiningType(mockCtx, "ore");
+      expect(result).toBe(true);
+    });
+
+    it("should return true for ore mining with deep core extractor", async () => {
+      mockBot.exec.mockResolvedValue({
+        result: {
+          modules: [
+            { id: "deep_core_extractor_ii", name: "Deep Core Extractor II", special: "rare_ore_access,exotic_ore_chance_10" }
+          ]
+        }
+      });
+
+      const result = await hasEquipmentForMiningType(mockCtx, "ore");
+      expect(result).toBe(true);
+    });
+
+    it("should return true for ore mining with deep core extractor (different naming)", async () => {
+      mockBot.exec.mockResolvedValue({
+        result: {
+          modules: [
+            { id: "deep_core_extractor_mkii", name: "Deep Core Extractor MKII" }
+          ]
+        }
+      });
+
+      const result = await hasEquipmentForMiningType(mockCtx, "ore");
+      expect(result).toBe(true);
+    });
+
+    it("should return false for ore mining with no equipment", async () => {
+      mockBot.exec.mockResolvedValue({
+        result: {
+          modules: [
+            { id: "cargo_expander", name: "Cargo Expander" }
+          ]
+        }
+      });
+
+      const result = await hasEquipmentForMiningType(mockCtx, "ore");
+      expect(result).toBe(false);
+    });
+
+    it("should return true for gas mining with gas harvester", async () => {
+      mockBot.exec.mockResolvedValue({
+        result: {
+          modules: [
+            { id: "gas_harvester", name: "Gas Harvester" }
+          ]
+        }
+      });
+
+      const result = await hasEquipmentForMiningType(mockCtx, "gas");
+      expect(result).toBe(true);
+    });
+
+    it("should return true for ice mining with ice harvester", async () => {
+      mockBot.exec.mockResolvedValue({
+        result: {
+          modules: [
+            { id: "ice_harvester", name: "Ice Harvester" }
+          ]
+        }
+      });
+
+      const result = await hasEquipmentForMiningType(mockCtx, "ice");
+      expect(result).toBe(true);
+    });
+  });
 });
 
 // Integration test for mining logic (simplified)
@@ -293,5 +399,139 @@ describe("Miner Integration Tests", () => {
     const cap = await getDeepCoreCapability(testCtx);
     expect(cap.canMineHidden).toBe(false);
     expect(cap.canMineVisibleDeepCore).toBe(false);
+  });
+
+  it("should allow partial deep core miners to access adamantite_core exception", () => {
+    // Test the ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS constant
+    expect(ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has("adamantite_core")).toBe(true);
+    expect(ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has("some_other_poi")).toBe(false);
+  });
+});
+
+describe("Quota Target Selection", () => {
+  const mockMapStore = {
+    findOreLocations: vi.fn(),
+    findBestMiningLocation: vi.fn(),
+    getSystem: vi.fn(),
+  };
+
+  const mockSettings = {
+    ignoreDepletion: false,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  describe("findFirstAvailableQuotaTarget", () => {
+    it("should return the resource with biggest deficit that has available locations", () => {
+      const quotas = {
+        adamantite_ore: 500000,
+        exotic_matter: 500000,
+      };
+      const factionStorage = [
+        { itemId: "adamantite_ore", quantity: 400000 }, // 100000 deficit
+        { itemId: "exotic_matter", quantity: 200000 }, // 300000 deficit
+      ];
+
+      // Mock locations: adamantite has locations, exotic has locations
+      mockMapStore.findOreLocations.mockImplementation((oreId: string) => {
+        if (oreId === "adamantite_ore") return [{ systemId: "system1", poiId: "poi1" }];
+        if (oreId === "exotic_matter") return [{ systemId: "system2", poiId: "poi2" }];
+        return [];
+      });
+
+      mockMapStore.getSystem.mockReturnValue({
+        pois: [{ id: "poi1", type: "ore_belt", ores_found: [] }]
+      });
+
+      const result = findFirstAvailableQuotaTarget(
+        quotas,
+        factionStorage,
+        "ore",
+        mockSettings,
+        mockMapStore,
+        3 * 60 * 60 * 1000, // 3 hours
+        false, // canMineHiddenRadioactive
+        false  // canMineHiddenIce
+      );
+
+      expect(result).toBe("exotic_matter"); // Bigger deficit
+    });
+
+    it("should skip resources with no available locations", () => {
+      const quotas = {
+        adamantite_ore: 500000,
+        exotic_matter: 500000,
+      };
+      const factionStorage = [
+        { itemId: "adamantite_ore", quantity: 400000 }, // 100000 deficit
+        { itemId: "exotic_matter", quantity: 200000 }, // 300000 deficit
+      ];
+
+      // Mock: adamantite has no locations, exotic has locations
+      mockMapStore.findOreLocations.mockImplementation((oreId: string) => {
+        if (oreId === "exotic_matter") return [{ systemId: "system2", poiId: "poi2" }];
+        return [];
+      });
+
+      const result = findFirstAvailableQuotaTarget(
+        quotas,
+        factionStorage,
+        "ore",
+        mockSettings,
+        mockMapStore,
+        3 * 60 * 60 * 1000,
+        false,
+        false
+      );
+
+      expect(result).toBe("exotic_matter");
+    });
+
+    it("should return empty string when no quotas have deficits or locations", () => {
+      const quotas = {
+        adamantite_ore: 500000,
+      };
+      const factionStorage = [
+        { itemId: "adamantite_ore", quantity: 600000 }, // No deficit
+      ];
+
+      mockMapStore.findOreLocations.mockReturnValue([]);
+
+      const result = findFirstAvailableQuotaTarget(
+        quotas,
+        factionStorage,
+        "ore",
+        mockSettings,
+        mockMapStore,
+        3 * 60 * 60 * 1000,
+        false,
+        false
+      );
+
+      expect(result).toBe("");
+    });
+  });
+
+  describe("pickTargetFromQuotas", () => {
+    it("should return the resource with biggest deficit", () => {
+      const quotas = {
+        adamantite_ore: 500000,
+        exotic_matter: 500000,
+      };
+      const factionStorage = [
+        { itemId: "adamantite_ore", quantity: 400000 }, // 100000 deficit
+        { itemId: "exotic_matter", quantity: 200000 }, // 300000 deficit
+      ];
+
+      const result = pickTargetFromQuotas(quotas, factionStorage, "ore");
+      expect(result).toBe("exotic_matter");
+    });
+
+    it("should return empty string when no quotas", () => {
+      const result = pickTargetFromQuotas({}, [], "ore");
+      expect(result).toBe("");
+    });
   });
 });

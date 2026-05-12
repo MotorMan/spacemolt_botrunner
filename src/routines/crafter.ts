@@ -108,6 +108,11 @@ interface CraftLimit {
   limit: number;
 }
 
+interface CrafterProfile {
+  name: string;
+  craftLimits: CraftLimit[];
+}
+
 interface AutoBuySettings {
   enabled: boolean;
   maxPricePercentOverBase: number;  // e.g., 150 = 150% of base price (50% markup)
@@ -134,8 +139,9 @@ const PENALTY_RECIPES: Record<string, number> = {
 /** Processing mode for goal-based crafting */
 type GoalProcessingMode = "batch" | "round-robin";
 
-function getCrafterSettings(): {
-  craftLimits: CraftLimit[];
+export function getCrafterSettings(): {
+  crafters: CrafterProfile[];
+  botCrafterAssignments: Record<string, string>; // botName -> crafterName
   enabledCategories: string[];
   refuelThreshold: number;
   repairThreshold: number;
@@ -146,17 +152,84 @@ function getCrafterSettings(): {
 } {
   const all = readSettings();
   const c = all.crafter || {};
-  const rawLimits = (c.craftLimits as Record<string, number>) || {};
-  const craftLimits: CraftLimit[] = [];
-  for (const [recipeId, limit] of Object.entries(rawLimits)) {
-    if (limit > 0) {
-      // Filter out Ship Passive recipes - they can't be crafted manually
-      if (SHIP_PASSIVE_RECIPE_IDS.has(recipeId)) {
-        continue; // Skip silently
+
+
+
+  // Handle migration from old single crafter format
+  let crafters: CrafterProfile[] = [];
+  if (Array.isArray(c.crafters)) {
+    // New format with multiple crafters
+    crafters = (c.crafters as Array<{name: string, craftLimits: any}>).map((profile, index) => {
+      const rawLimits = profile.craftLimits || [];
+      const craftLimits: CraftLimit[] = [];
+
+      if (Array.isArray(rawLimits)) {
+        // New array format: [{ recipeId: string, limit: number }, ...]
+        for (const item of rawLimits) {
+          if (item && typeof item === 'object' && item.recipeId && typeof item.limit === 'number' && item.limit > 0) {
+            // Filter out Ship Passive recipes - they can't be crafted manually
+            if (SHIP_PASSIVE_RECIPE_IDS.has(item.recipeId)) {
+              continue; // Skip silently
+            }
+            craftLimits.push({ recipeId: item.recipeId, limit: item.limit });
+          } else {
+            // Invalid item
+          }
+        }
+      } else if (typeof rawLimits === 'object') {
+        // Old object format: { recipeId: limit, ... }
+        for (const [recipeId, limit] of Object.entries(rawLimits)) {
+          if (typeof limit === 'number' && limit > 0) {
+            // Filter out Ship Passive recipes - they can't be crafted manually
+            if (SHIP_PASSIVE_RECIPE_IDS.has(recipeId)) {
+              continue; // Skip silently
+            }
+            craftLimits.push({ recipeId, limit });
+          }
+        }
       }
-      craftLimits.push({ recipeId, limit });
+      return { name: profile.name || 'Unnamed Crafter', craftLimits };
+    });
+  } else if (c.craftLimits) {
+    // Migrate old single crafter format
+    const rawLimits = c.craftLimits;
+    const craftLimits: CraftLimit[] = [];
+
+    if (Array.isArray(rawLimits)) {
+      // Array format
+      for (const item of rawLimits) {
+        if (item && typeof item === 'object' && item.recipeId && typeof item.limit === 'number' && item.limit > 0) {
+          if (SHIP_PASSIVE_RECIPE_IDS.has(item.recipeId)) {
+            continue;
+          }
+          craftLimits.push({ recipeId: item.recipeId, limit: item.limit });
+        }
+      }
+    } else if (typeof rawLimits === 'object') {
+      // Object format
+      for (const [recipeId, limit] of Object.entries(rawLimits)) {
+        if (typeof limit === 'number' && limit > 0) {
+          if (SHIP_PASSIVE_RECIPE_IDS.has(recipeId)) {
+            continue;
+          }
+          craftLimits.push({ recipeId, limit });
+        }
+      }
+    }
+
+    if (craftLimits.length > 0) {
+      crafters.push({ name: "Default Crafter", craftLimits });
     }
   }
+
+  // If no crafters exist, create a default one
+  if (crafters.length === 0) {
+    crafters.push({ name: "Default Crafter", craftLimits: [] });
+  }
+
+  // Per-bot crafter assignments
+  const botCrafterAssignments = (c.botCrafterAssignments as Record<string, string>) || {};
+
   // Default enabled categories for when no specific recipes are configured
   const defaultCategories = ["Refining", "Components", "Consumables"];
   const enabledCategories = (c.enabledCategories as string[]) || defaultCategories;
@@ -175,7 +248,8 @@ function getCrafterSettings(): {
     excludeCategories: autoBuyConfig.excludeCategories ?? ["ammo"],
   };
   return {
-    craftLimits,
+    crafters,
+    botCrafterAssignments,
     enabledCategories,
     refuelThreshold: (c.refuelThreshold as number) || 50,
     repairThreshold: (c.repairThreshold as number) || 40,
@@ -1450,7 +1524,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await ctx.sleep(30000); continue; }
 
-    const settings = getCrafterSettings();
+    let settings = getCrafterSettings();
 
     // ── Scavenge wrecks before docking ──
     yield "scavenge";
@@ -1537,11 +1611,23 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("craft", `Bot is assigned to categories: ${assignedCategories.join(", ")}`);
     }
 
-    // ── Determine effective quotas for this bot (global + bot-specific overrides) ──
+    // ── Re-read settings to pick up any changes made during the cycle ──
+    settings = getCrafterSettings();
+
+    // ── Determine which crafter profile this bot should use ──
+    const assignedCrafterName = settings.botCrafterAssignments[botName] || "Default Crafter";
+    const assignedCrafter = settings.crafters.find(c => c.name === assignedCrafterName) || settings.crafters[0];
+    ctx.log("craft", `Bot assigned to crafter profile: ${assignedCrafter.name}`);
+
+    // ── Determine effective quotas for this bot (crafter profile + bot-specific overrides) ──
     const effectiveQuotas = new Map<string, number>();
-    // First, add global quotas
-    for (const { recipeId, limit } of settings.craftLimits) {
-      effectiveQuotas.set(recipeId, limit);
+    // First, add crafter profile quotas
+    if (assignedCrafter && Array.isArray(assignedCrafter.craftLimits)) {
+      for (const { recipeId, limit } of assignedCrafter.craftLimits) {
+        if (recipeId && typeof limit === 'number' && limit > 0) {
+          effectiveQuotas.set(recipeId, limit);
+        }
+      }
     }
     // Then apply bot-specific overrides
     const botOverrides = settings.botQuotaOverrides[botName] || {};

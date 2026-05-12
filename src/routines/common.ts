@@ -2640,9 +2640,13 @@ export function readSettings(): Record<string, Record<string, unknown>> {
     const { join } = require("path");
     const file = join(process.cwd(), "data", "settings.json");
     if (existsSync(file)) {
-      return JSON.parse(readFileSync(file, "utf-8"));
+      const content = readFileSync(file, "utf-8");
+      const parsed = JSON.parse(content);
+      return parsed;
+    } else {
     }
-  } catch { /* use defaults */ }
+  } catch (error) {
+  }
   return {};
 }
 
@@ -3641,7 +3645,7 @@ export async function emergencyFleeFromPirates(
         jumpCompleted = true;
         // Issue flee IMMEDIATELY - don't wait for jump promise to resolve
         // The jump command can't be cancelled, but we need to start fleeing NOW
-        fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${err.message}`));
+        fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${(err as Error).message}`));
         fleeIssued = true;
         return;
       }
@@ -3653,7 +3657,7 @@ export async function emergencyFleeFromPirates(
         battleDetectedDuringJump = true;
         jumpCompleted = true;
         // Issue flee IMMEDIATELY
-        fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${err.message}`));
+        fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${(err as Error).message}`));
         fleeIssued = true;
         return;
       }

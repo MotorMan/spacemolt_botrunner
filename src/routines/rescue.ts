@@ -2784,8 +2784,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           continue;
         }
 
+        // Calculate maximum fuel to deliver (1/3 of current fuel)
+        const maxDeliverable = Math.floor(bot.fuel / 3);
+        ctx.log(logCategory, `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel})`);
+
         // Issue the refuel command
-        const refuelResp = await bot.exec("refuel", { target: targetPlayerId });
+        const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
         // Check for battle notifications after refuel
         if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
           ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
@@ -3553,7 +3557,11 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         // Direct refuel using refuel command
         ctx.log("rescue", `Refueling ${player.username}${player.shipType ? ` (${player.shipType})` : ''}...`);
 
-        const refuelResp = await bot.exec("refuel", { target: player.playerId });
+        // Calculate maximum fuel to deliver (1/3 of current fuel)
+        const maxDeliverable = Math.floor(bot.fuel / 3);
+        ctx.log("rescue", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel})`);
+
+        const refuelResp = await bot.exec("refuel", { target: player.playerId, quantity: maxDeliverable });
         // Check for battle notifications after refuel
         if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
           ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
@@ -4119,7 +4127,12 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
       if (hasPump) {
         // Direct refuel using refuel command
         ctx.log("mayday", `Refueling ${mayday.sender}...`);
-        const refuelResp = await bot.exec("refuel", { target: targetPlayerId });
+
+        // Calculate maximum fuel to deliver (1/3 of current fuel)
+        const maxDeliverable = Math.floor(bot.fuel / 3);
+        ctx.log("mayday", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel})`);
+
+        const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
         // Check for battle notifications after refuel
         if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
           ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
@@ -6142,8 +6155,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         continue;
       }
 
+      // Calculate maximum fuel to deliver (1/3 of current fuel)
+      const maxDeliverable = Math.floor(bot.fuel / 3);
+      ctx.log("rescue", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel})`);
+
       // Issue the refuel command
-      const refuelResp = await bot.exec("refuel", { target: targetPlayerId });
+      const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
 
       if (refuelResp.error) {
         ctx.log("error", `Refuel command failed: ${refuelResp.error.message}`);

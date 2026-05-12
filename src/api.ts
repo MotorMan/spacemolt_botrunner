@@ -19,7 +19,7 @@ export interface ApiResponse {
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
-const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-4-28-26";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-5-11-26-BW-Monitor-Ver";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;
@@ -352,7 +352,7 @@ const COMMAND_TTL: Record<string, number> = {
   view_orders: 30_000,
   estimate_purchase: 30_000,
   get_wrecks: 10_000, //doesn't need to be 15.
-  catalog: 3600_000,
+  catalog: 3600000_000, //only really needs to be once per client restart, it NEVER changes while running.
 };
 
 const INV_STATUS   = ["get_status", "get_player", "get_queue", "get_skills"];
@@ -411,6 +411,9 @@ export class SpaceMoltAPI {
   private _recoveryCount = 0;
   private _recoveryInProgress = false;
   private _forceFullLogin = false;
+  private _totalBytesIn = 0;
+  private _totalBytesOut = 0;
+  private _bandwidthStartTime = Date.now();
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
@@ -463,6 +466,15 @@ export class SpaceMoltAPI {
   resetFullLoginFlag(): void {
     this._forceFullLogin = false;
     this._recoveryCount = 0;
+  }
+
+  /** Get current bandwidth usage in KB/s (kilobytes per second) */
+  getBandwidthUsage(): { inKBps: number; outKBps: number } {
+    const elapsed = (Date.now() - this._bandwidthStartTime) / 1000;
+    if (elapsed <= 0) return { inKBps: 0, outKBps: 0 };
+    const inKBps = this._totalBytesIn / 1024 / elapsed;
+    const outKBps = this._totalBytesOut / 1024 / elapsed;
+    return { inKBps, outKBps };
   }
 
   async execute(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
@@ -655,7 +667,9 @@ export class SpaceMoltAPI {
           throw new Error(`Failed to create session: ${resp.status} ${resp.statusText}`);
         }
 
-        const data = (await resp.json()) as ApiResponse;
+        const text = await resp.text();
+        this._totalBytesIn += Buffer.byteLength(text, 'utf8');
+        const data = JSON.parse(text) as ApiResponse;
         if (data.session) {
           this.session = data.session;
           lastSessionCreateTime = Date.now();
@@ -775,10 +789,16 @@ export class SpaceMoltAPI {
       headers["X-Session-Id"] = this.session.id;
     }
 
+    let requestBody: string | undefined;
+    if (body) {
+      requestBody = JSON.stringify(body);
+      this._totalBytesOut += Buffer.byteLength(requestBody, 'utf8');
+    }
+
     const resp = await fetch(url, {
       method: "POST",
       headers,
-      body: body ? JSON.stringify(body) : undefined,
+      body: requestBody,
       signal: abortSignal,
     });
 
@@ -789,7 +809,9 @@ export class SpaceMoltAPI {
     }
 
     try {
-      const data = (await resp.json()) as ApiResponse & { structuredContent?: unknown };
+      const text = await resp.text();
+      this._totalBytesIn += Buffer.byteLength(text, 'utf8');
+      const data = JSON.parse(text) as ApiResponse & { structuredContent?: unknown };
       if (data.structuredContent !== undefined) {
         data.result = data.structuredContent;
       }

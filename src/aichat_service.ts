@@ -54,6 +54,17 @@ interface BotLockInfo {
 
 const PERSONALITIES_DIR = join(process.cwd(), "data", "personalities");
 const MAP_FILE = join(process.cwd(), "data", "map.json");
+const IMPORTANT_MESSAGES_FILE = join(process.cwd(), "data", "IMPORTANTMESSAGES.json");
+
+const BLOCKED_EMPIRE_NPCS = [
+  "Chancellor Yusuf Delacroix",
+  "The Pathfinder, Siv Larkin",
+  "High Warlord Petra Kast", //needs verification
+  "Director-General Darya Lim", //needs verification
+  "The Convergence", //needs verification
+];
+
+const EMPIRE_OFFICIAL_TAG = "[empire_official]";
 
 /**
  * Load and summarize map data for LLM context.
@@ -332,6 +343,49 @@ function messageMentionsBot(message: string, botName: string): boolean {
 
 function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+interface ImportantMessage {
+  timestamp: string;
+  sender: string;
+  channel: string;
+  content: string;
+  botReceived: string;
+}
+
+function logImportantMessage(msg: ChatMessage): void {
+  try {
+    const dir = join(process.cwd(), "data");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+    let messages: ImportantMessage[] = [];
+    if (existsSync(IMPORTANT_MESSAGES_FILE)) {
+      const content = readFileSync(IMPORTANT_MESSAGES_FILE, "utf-8");
+      messages = JSON.parse(content);
+    }
+
+    messages.push({
+      timestamp: new Date().toISOString(),
+      sender: msg.sender,
+      channel: msg.channel,
+      content: msg.content,
+      botReceived: msg.botUsername || "unknown",
+    });
+
+    writeFileSync(IMPORTANT_MESSAGES_FILE, JSON.stringify(messages, null, 2) + "\n", "utf-8");
+  } catch (err) {
+    console.error("Error logging important message:", err);
+  }
+}
+
+function isEmpireOfficialMessage(msg: ChatMessage): boolean {
+  if (msg.content.includes(EMPIRE_OFFICIAL_TAG)) {
+    return true;
+  }
+  if (BLOCKED_EMPIRE_NPCS.includes(msg.sender)) {
+    return true;
+  }
+  return false;
 }
 
 /**
@@ -629,6 +683,13 @@ export class AiChatService {
     // but we double-check here to prevent self-talk loops
     if (msg.sender === msg.botUsername) {
       this.logFn("ai_chat", `🚫 SELF-MESSAGE BLOCKED: ${msg.sender} === ${msg.botUsername} [${msg.channel}] "${msg.content.slice(0, 50)}"`);
+      return;
+    }
+
+    // CRITICAL: Block messages from Empire officials - these need human review
+    if (isEmpireOfficialMessage(msg)) {
+      this.logFn("ai_chat", `🚫 EMPIRE OFFICIAL BLOCKED: ${msg.sender} [${msg.channel}] "${msg.content.slice(0, 50)}"`);
+      logImportantMessage(msg);
       return;
     }
 

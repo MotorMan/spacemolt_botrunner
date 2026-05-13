@@ -57,7 +57,7 @@ const PENALTY_RECIPES: Record<string, number> = {
  * Returns a score from 0-100 where higher means more materials are available.
  * Blacklisted recipes return -Infinity. Penalized recipes get a massive score reduction.
  */
-function scoreRecipeAvailability(
+export function scoreRecipeAvailability(
   recipe: Recipe,
   countItemFn: (itemId: string) => number,
 ): number {
@@ -110,13 +110,13 @@ function hasRecipeMaterials(
  * Find the best recipe that produces a given item.
  * Prefers recipes with materials already available in storage.
  */
-function findRecipeForItem(
+export function findRecipeForItem(
   itemId: string,
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
 ): Recipe | null {
-  // Find all recipes that produce this item
-  const candidates = recipes.filter(r => r.output_item_id === itemId);
+  // Find all recipes that produce this item and are craftable manually
+  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok);
 
   if (candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
@@ -304,7 +304,7 @@ export function findAllRecipesForItem(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
 ): Recipe[] {
-  const candidates = recipes.filter(r => r.output_item_id === itemId);
+  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok);
   if (candidates.length === 0) return [];
 
   const scored = candidates.map(recipe => ({

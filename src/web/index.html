@@ -664,6 +664,7 @@ let battleState = {};
 let catalog = { items: {}, ships: {}, skills: {}, recipes: {}, lastFetched: null };
 let globalFactionStorage = [];
 let statsDaily = {};
+let profileReturnHomeIgnoreBlacklist = false;
 
 // ── Resolve a system ID + optional POI ID to display names using mapData. ──
 
@@ -1870,6 +1871,7 @@ function refreshFactionFunds() {
 // ── Bot Profile ────────────────────────────────────────────
 function openProfile(username) {
   profileBot = username;
+  profileReturnHomeIgnoreBlacklist = false;
   profileSystemData = null;
   profileRecipes = null;
   profileMarket = null;
@@ -2176,7 +2178,7 @@ function renderProfileTopbar() {
   if (currentRoutine === 'return_home') {
     actions += `
       <label class="profile-ore-label" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:8px">
-        <input type="checkbox" id="profile-returnhome-ignore-blacklist">
+        <input type="checkbox" id="profile-returnhome-ignore-blacklist" onchange="profileReturnHomeIgnoreBlacklist = this.checked"${profileReturnHomeIgnoreBlacklist ? ' checked' : ''}>
         Ignore blacklist
       </label>`;
   }
@@ -6036,8 +6038,7 @@ function startBotFromProfile() {
   const routine = sel ? sel.value : 'miner';
   const params = {};
   if (routine === 'return_home') {
-    const cb = document.getElementById('profile-returnhome-ignore-blacklist');
-    if (cb && cb.checked) params.ignoreBlacklist = true;
+    if (profileReturnHomeIgnoreBlacklist) params.ignoreBlacklist = true;
   }
   send({ type: 'start', bot: profileBot, routine, params: Object.keys(params).length ? params : undefined });
 }
@@ -15271,6 +15272,7 @@ function renderHunterSettings(panel) {
   const maxAttackTier = h.maxAttackTier || 'large';
   const fleeFromTier = h.fleeFromTier || 'boss';
   const minPiratesToFlee = h.minPiratesToFlee ?? 3;
+  const disableScanCommandForPirates = h.disableScanCommandForPirates ?? false;
 
   const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
   const tierOpts = tierOptions.map(t => `<option value="${t}"${t === maxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
@@ -15365,6 +15367,28 @@ function renderHunterSettings(panel) {
       <input type="number" id="set-hunter-responseRange" min="0" max="20" value="${responseRange}">
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Disable Scan Command for Pirates</div>
+        <div class="setting-hint">Skip the scan command when engaging pirates to avoid delays if scanning fails. Bot will still detect and engage pirates normally.</div>
+      </div>
+      <select id="set-hunter-disableScanCommandForPirates">
+        <option value="false"${!disableScanCommandForPirates ? ' selected' : ''}>Enabled</option>
+        <option value="true"${disableScanCommandForPirates ? ' selected' : ''}>Disabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Disable Wreck Salvaging</div>
+        <div class="setting-hint">Disable looting wrecks after kills to prevent blocking pirate hunting in areas with many wrecks.</div>
+      </div>
+      <select id="set-hunter-disableWreckSalvaging">
+        <option value="false"${!(h.disableWreckSalvaging ?? false) ? ' selected' : ''}>Enabled</option>
+        <option value="true"${h.disableWreckSalvaging ?? false ? ' selected' : ''}>Disabled</option>
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
     </div>
@@ -15382,6 +15406,8 @@ function saveHunterSettings() {
     fleeFromTier: document.getElementById('set-hunter-fleeFromTier').value,
     minPiratesToFlee: parseInt(document.getElementById('set-hunter-minPiratesToFlee').value) || 3,
     responseRange: parseInt(document.getElementById('set-hunter-responseRange').value) ?? 3,
+    disableScanCommandForPirates: document.getElementById('set-hunter-disableScanCommandForPirates').value === 'true',
+    disableWreckSalvaging: document.getElementById('set-hunter-disableWreckSalvaging').value === 'true',
   };
   send({ type: 'saveSettings', routine: 'hunter', settings: s });
   settings.hunter = s;

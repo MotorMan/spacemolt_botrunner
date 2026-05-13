@@ -75,6 +75,7 @@ const CUSTOMS_EVASION_KEYWORDS = [
   "declined to remain",
   "Noted and logged",
   "evasion",
+  "left before the",
 ];
 
 // Contraband detection requires specific phrases indicating contraband was FOUND
@@ -241,7 +242,7 @@ export async function waitForCustomsInspection(
   bot: Bot,
   log: (category: string, message: string) => void,
   targetSystem: string,
-  maxWaitMs: number = 90000
+  maxWaitMs: number = 120000
 ): Promise<{
   wasStopped: boolean;
   outcome: "cleared" | "contraband" | "evasion" | "timeout" | "none";

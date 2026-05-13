@@ -68,6 +68,28 @@ import {
   getWeaponModules,
 } from "./battle.js";
 
+async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier): Promise<void> {
+  const battleStatus = await getBattleStatus(ctx);
+  if (!battleStatus) return;
+
+  ctx.log("combat", `⚠️ Unexpectedly in battle (ID: ${battleStatus.battle_id}) during scanning`);
+
+  const analysis = await analyzeExistingBattle(ctx, maxAttackTier, minPiratesToFlee);
+  if (!analysis.shouldJoin) {
+    ctx.log("combat", `⏭️ Skipping unexpected battle: ${analysis.reason}`);
+    return;
+  }
+
+  ctx.log("combat", `✅ Joining unexpected battle on side ${analysis.sideId}: ${analysis.reason}`);
+  const engageResp = await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId!.toString() });
+  if (engageResp.error) {
+    ctx.log("error", `Failed to join unexpected battle: ${engageResp.error.message}`);
+    return;
+  }
+
+  await fightJoinedBattle(ctx, null, fleeThreshold, fleeFromTier, maxAttackTier);
+}
+
 // ── Settings ─────────────────────────────────────────────────
 
 export type HunterMode = "roam_systems" | "roam_system" | "stationary";
@@ -86,6 +108,8 @@ function getHunterSettings(username?: string): {
   maxAttackTier: PirateTier;
   fleeFromTier: PirateTier;
   minPiratesToFlee: number;
+  disableScanCommandForPirates: boolean;
+  disableWreckSalvaging: boolean;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -105,6 +129,8 @@ function getHunterSettings(username?: string): {
     maxAttackTier: ((h.maxAttackTier as PirateTier) || "large") as PirateTier,
     fleeFromTier: ((h.fleeFromTier as PirateTier) || "boss") as PirateTier,
     minPiratesToFlee: (h.minPiratesToFlee as number) || 3,
+    disableScanCommandForPirates: (h.disableScanCommandForPirates as boolean) ?? false,
+    disableWreckSalvaging: (h.disableWreckSalvaging as boolean) ?? false,
   };
 }
 
@@ -487,6 +513,12 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     await bot.refreshStatus();
     logStatus(ctx);
 
+    // ── Position update for visual display ──
+    yield "get_system";
+    await bot.exec("get_system");
+    yield "get_poi";
+    if (bot.poi) await bot.exec("get_poi", { poi_id: bot.poi });
+
     // ── Fuel check ──
     yield "fuel_check";
     const fueled = await ensureFueled(ctx, settings.refuelThreshold);
@@ -654,7 +686,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               ctx.log("combat", `🚨 Threat(s) detected: ${threats.map(t => t.name).join(", ")}`);
               // Engage the threats
               for (const threat of threats) {
-                const won = await engageTarget(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier);
+                const won = await engageTarget(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
                 if (!won) {
                   ctx.log("combat", "Retreated from threat — aborting patrol");
                   abortPatrol = true;
@@ -675,7 +707,6 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       // Scan for targets
       yield "scan_for_targets";
       const nearbyResp = await bot.exec("get_nearby");
-      //ctx.log("info", `get_nearby: ${nearbyResp}.`);
       if (nearbyResp.error) {
         ctx.log("error", `get_nearby at ${poi.name}: ${nearbyResp.error.message}`);
         continue;
@@ -684,13 +715,16 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       // Track player names from nearby scan
       bot.trackNearbyPlayers(nearbyResp.result);
 
+      // Check if we got pulled into battle during scanning
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier);
+
       const entities = parseNearby(nearbyResp.result);
       ctx.log("info", `entities: ${entities}`);
       const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
 
       if (targets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
-        await scavengeWrecks(ctx);
+        if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
         continue;
       }
 
@@ -763,7 +797,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               for (const newThreat of newThreats) {
                 if (bot.state !== "running") break;
                 
-                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier);
+                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
                 if (newWon) {
                   totalKills++;
                   patrolKills++;
@@ -910,6 +944,12 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     await bot.refreshStatus();
     logStatus(ctx);
 
+    // ── Position update for visual display ──
+    yield "get_system";
+    await bot.exec("get_system");
+    yield "get_poi";
+    if (bot.poi) await bot.exec("get_poi", { poi_id: bot.poi });
+
     // ── Fuel check ──
     yield "fuel_check";
     const fueled = await ensureFueled(ctx, settings.refuelThreshold);
@@ -1024,13 +1064,16 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       // Track player names from nearby scan
       bot.trackNearbyPlayers(nearbyResp.result);
 
+      // Check if we got pulled into battle during scanning
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier);
+
       const entities = parseNearby(nearbyResp.result);
       ctx.log("info", `entities: ${entities}`);
       const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
 
       if (targets.length === 0) {
         ctx.log("combat", `No targets at ${poi.name}`);
-        await scavengeWrecks(ctx);
+        if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
         continue;
       }
 
@@ -1081,7 +1124,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               for (const newThreat of newThreats) {
                 if (bot.state !== "running") break;
 
-                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier);
+                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
                 if (newWon) {
                   totalKills++;
                   patrolKills++;
@@ -1100,8 +1143,10 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             }
           }
 
-          yield "loot";
-          await scavengeWrecks(ctx);
+          if (!settings.disableWreckSalvaging) {
+            yield "loot";
+            await scavengeWrecks(ctx);
+          }
 
           // Post-kill reload
           const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
@@ -1198,27 +1243,16 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
   await bot.refreshStatus();
   let totalKills = 0;
 
-  // Choose a POI to stay in - prefer non-station POIs
-  const { pois } = await getSystemInfo(ctx);
-  const nonStationPois = pois.filter(p => !isStationPoi(p));
-  const targetPoi = nonStationPois.length > 0 ? nonStationPois[0] : pois[0];
+  // Store the original position to stay in
+  const originalSystem = bot.system;
+  const originalPoi = bot.poi;
 
-  if (!targetPoi) {
-    ctx.log("error", "No POIs found in system — cannot operate in stationary mode");
+  if (!originalPoi) {
+    ctx.log("error", "No current POI set — cannot operate in stationary mode");
     return;
   }
 
-  ctx.log("info", `Stationary mode: staying in ${targetPoi.name} (${bot.system})`);
-
-  // Travel to the chosen POI
-  if (bot.poi !== targetPoi.id) {
-    const travelResp = await bot.exec("travel", { target_poi: targetPoi.id });
-    if (travelResp.error && !travelResp.error.message.includes("already")) {
-      ctx.log("error", `Failed to travel to ${targetPoi.name}: ${travelResp.error.message}`);
-      return;
-    }
-    bot.poi = targetPoi.id;
-  }
+  ctx.log("info", `Stationary mode: staying in ${originalPoi} (${originalSystem})`);
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -1236,6 +1270,12 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     yield "get_status";
     await bot.refreshStatus();
     logStatus(ctx);
+
+    // ── Position update for visual display ──
+    yield "get_system";
+    await bot.exec("get_system");
+    yield "get_poi";
+    if (bot.poi) await bot.exec("get_poi", { poi_id: bot.poi });
 
     // ── Fuel check ──
     yield "fuel_check";
@@ -1261,6 +1301,23 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         await ensureInsured(ctx);
         await bot.checkSkills();
         await ensureUndocked(ctx);
+        // Return to stationary position
+        if (bot.system !== originalSystem) {
+          ctx.log("travel", `Returning to stationary system ${originalSystem}...`);
+          const arrived = await navigateToSystem(ctx, originalSystem, safetyOpts);
+          if (!arrived) {
+            ctx.log("error", `Could not return to ${originalSystem} — staying in ${bot.system}`);
+          }
+        }
+        if (bot.poi !== originalPoi) {
+          ctx.log("travel", `Returning to stationary POI ${originalPoi}...`);
+          const travelResp = await bot.exec("travel", { target_poi: originalPoi });
+          if (travelResp.error && !travelResp.error.message.includes("already")) {
+            ctx.log("error", `Failed to return to POI ${originalPoi}: ${travelResp.error.message}`);
+          } else {
+            bot.poi = originalPoi;
+          }
+        }
       }
       continue;
     }
@@ -1273,7 +1330,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     }
 
     // ── Wait and scan for targets ──
-    ctx.log("info", `Waiting for targets at ${targetPoi.name}...`);
+    ctx.log("info", `Waiting for targets at ${originalPoi}...`);
     yield "scan_for_targets";
     const nearbyResp = await bot.exec("get_nearby");
     if (nearbyResp.error) {
@@ -1282,20 +1339,23 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       continue;
     }
 
-    // Track player names from nearby scan
-    bot.trackNearbyPlayers(nearbyResp.result);
+      // Track player names from nearby scan
+      bot.trackNearbyPlayers(nearbyResp.result);
 
-    const entities = parseNearby(nearbyResp.result);
+      // Check if we got pulled into battle during scanning
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier);
+
+      const entities = parseNearby(nearbyResp.result);
     const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
 
     if (targets.length === 0) {
-      ctx.log("combat", `No targets detected at ${targetPoi.name}`);
-      await scavengeWrecks(ctx);
+      ctx.log("combat", `No targets detected at ${originalPoi}`);
+      if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
       await ctx.sleep(30000); // Wait 30 seconds before next scan
       continue;
     }
 
-    ctx.log("combat", `Found ${targets.length} target(s) at ${targetPoi.name}: ${targets.map(t => t.name).join(", ")}`);
+    ctx.log("combat", `Found ${targets.length} target(s) at ${originalPoi}: ${targets.map(t => t.name).join(", ")}`);
 
     // Engage each target
     for (const target of targets) {
@@ -1313,13 +1373,13 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       if (!hasAmmo) {
         ctx.log("combat", "Out of ammo — aborting to resupply");
         break;
-      }
+        }
 
-      yield "engage";
-      const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier);
+        yield "engage";
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
 
-      if (won) {
-        totalKills++;
+        if (won) {
+          totalKills++;
         ctx.log("combat", `Kill #${totalKills} — checking for new threats...`);
 
         // Safety check for new threats
@@ -1327,6 +1387,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         const safetyCheckResp = await bot.exec("get_nearby");
         if (!safetyCheckResp.error) {
           bot.trackNearbyPlayers(safetyCheckResp.result);
+          await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier);
           const nearbyEntities = parseNearby(safetyCheckResp.result);
           const newThreats = nearbyEntities.filter(e =>
             isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
@@ -1339,8 +1400,8 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             for (const newThreat of newThreats) {
               if (bot.state !== "running") break;
 
-              const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier);
-              if (newWon) {
+                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+                if (newWon) {
                 totalKills++;
                 ctx.log("combat", `Kill #${totalKills} (additional threat)`);
               } else {
@@ -1348,13 +1409,15 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
                 break;
               }
             }
+            }
           }
-        }
 
-        yield "loot";
-        await scavengeWrecks(ctx);
+          if (!settings.disableWreckSalvaging) {
+            yield "loot";
+            await scavengeWrecks(ctx);
+          }
 
-        // Post-kill reload
+          // Post-kill reload
         const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
         if (!hasAmmo) {
           ctx.log("combat", "No ammo after kill — aborting to resupply");

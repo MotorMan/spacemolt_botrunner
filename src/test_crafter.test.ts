@@ -7,6 +7,14 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { getCrafterSettings } from "./routines/crafter.js";
 import { readSettings } from "./routines/common.js";
+import {
+  calculateCraftingPlan,
+  calculateMultiGoalPlan,
+  findRecipeForItem,
+  findAllRecipesForItem,
+  isRecipeCraftable,
+  scoreRecipeAvailability,
+} from "./routines/craft-goals.js";
 
 // Mock dependencies
 vi.mock("./routines/common.js", () => ({
@@ -43,10 +51,10 @@ describe("Crafter Settings and Profiles", () => {
 
       expect(result.crafters).toHaveLength(1);
       expect(result.crafters[0].name).toBe("Default Crafter");
-      expect(result.crafters[0].craftLimits).toEqual({
-        "basic_alloy": 100,
-        "advanced_composite": 50,
-      });
+      expect(result.crafters[0].craftLimits).toEqual([
+        { recipeId: "basic_alloy", limit: 100 },
+        { recipeId: "advanced_composite", limit: 50 },
+      ]);
       expect(result.enabledCategories).toEqual(["Refining", "Components"]);
       expect(result.refuelThreshold).toBe(60);
     });
@@ -102,7 +110,7 @@ describe("Crafter Settings and Profiles", () => {
 
       expect(result.crafters).toHaveLength(1);
       expect(result.crafters[0].name).toBe("Default Crafter");
-      expect(result.crafters[0].craftLimits).toEqual({});
+      expect(result.crafters[0].craftLimits).toEqual([]);
     });
 
     it("should filter out ship passive recipes", () => {
@@ -119,8 +127,8 @@ describe("Crafter Settings and Profiles", () => {
 
       const result = getCrafterSettings();
 
-      expect(result.crafters[0].craftLimits).not.toHaveProperty("onboard_alloy_synthesis");
-      expect(result.crafters[0].craftLimits).toHaveProperty("basic_alloy");
+      expect(result.crafters[0].craftLimits.some(l => l.recipeId === "onboard_alloy_synthesis")).toBe(false);
+      expect(result.crafters[0].craftLimits.some(l => l.recipeId === "basic_alloy")).toBe(true);
     });
   });
 
@@ -228,7 +236,7 @@ describe("Crafting Logic Integration", () => {
 
     const settings = getCrafterSettings();
     expect(settings.botCrafterAssignments["testBot"]).toBe("Test Profile");
-    expect(settings.crafters.find(c => c.name === "Test Profile")?.craftLimits).toEqual({ "test_recipe": 10 });
+    expect(settings.crafters.find(c => c.name === "Test Profile")?.craftLimits).toEqual([{ recipeId: "test_recipe", limit: 10 }]);
   });
 
   it("should handle profile switching without data loss", () => {
@@ -246,8 +254,8 @@ describe("Crafting Logic Integration", () => {
 
     const settings = getCrafterSettings();
     expect(settings.crafters).toHaveLength(2);
-    expect(settings.crafters[0].craftLimits["recipe_a"]).toBe(100);
-    expect(settings.crafters[1].craftLimits["recipe_b"]).toBe(200);
+    expect(settings.crafters[0].craftLimits.find(l => l.recipeId === "recipe_a")?.limit).toBe(100);
+    expect(settings.crafters[1].craftLimits.find(l => l.recipeId === "recipe_b")?.limit).toBe(200);
   });
 });
 
@@ -325,6 +333,198 @@ describe("Crafter Profile Workflow", () => {
     mockSettings.crafter.crafters[1].craftLimits = loadout;
     vi.mocked(readSettings).mockReturnValue(mockSettings);
     settings = getCrafterSettings();
-    expect(settings.crafters[1].craftLimits).toEqual(loadout);
+    expect(settings.crafters[1].craftLimits).toEqual([{ recipeId: "loaded_recipe", limit: 75 }]);
+  });
+});
+
+describe("Craft Goals Recipe Selection", () => {
+  const mockRecipes = [
+    {
+      recipe_id: "forge_hull_plating",
+      name: "Forge Hull Plating",
+      components: [
+        { item_id: "iron_ore", name: "Iron Ore", quantity: 10 },
+        { item_id: "titanium_ore", name: "Titanium Ore", quantity: 5 },
+      ],
+      output_item_id: "hull_plating",
+      output_name: "Hull Plating",
+      output_quantity: 1,
+      category: "Components",
+    },
+    {
+      recipe_id: "reforge_hull_plating",
+      name: "Reforge Hull Plating",
+      components: [
+        { item_id: "hull_plating", name: "Hull Plating", quantity: 1 },
+        { item_id: "advanced_alloy", name: "Advanced Alloy", quantity: 2 },
+      ],
+      output_item_id: "hull_plating",
+      output_name: "Hull Plating",
+      output_quantity: 1,
+      category: "Components",
+    },
+    {
+      recipe_id: "onboard_alloy_synthesis",
+      name: "Onboard Alloy Synthesis",
+      components: [
+        { item_id: "iron_ore", name: "Iron Ore", quantity: 20 },
+      ],
+      output_item_id: "alloy",
+      output_name: "Alloy",
+      output_quantity: 10,
+      category: "Ship Passive",
+    },
+    {
+      recipe_id: "facility_alloy",
+      name: "Facility Alloy",
+      components: [
+        { item_id: "iron_ore", name: "Iron Ore", quantity: 15 },
+      ],
+      output_item_id: "alloy",
+      output_name: "Alloy",
+      output_quantity: 5,
+      category: "Facility Only",
+    },
+    {
+      recipe_id: "basic_alloy",
+      name: "Basic Alloy",
+      components: [
+        { item_id: "iron_ore", name: "Iron Ore", quantity: 10 },
+      ],
+      output_item_id: "alloy",
+      output_name: "Alloy",
+      output_quantity: 5,
+      category: "Refining",
+    },
+  ];
+
+  describe("isRecipeCraftable", () => {
+    it("should allow normal recipes", () => {
+      const recipe = mockRecipes[0]; // forge_hull_plating
+      const result = isRecipeCraftable(recipe);
+      expect(result.ok).toBe(true);
+      expect(result.reason).toBe("");
+    });
+
+    it("should reject ship passive recipes", () => {
+      const recipe = mockRecipes[2]; // onboard_alloy_synthesis
+      const result = isRecipeCraftable(recipe);
+      expect(result.ok).toBe(false);
+      expect(result.reason).toContain("automatically on ships");
+    });
+
+    it("should reject facility only recipes", () => {
+      const recipe = mockRecipes[3]; // facility_alloy
+      const result = isRecipeCraftable(recipe);
+      expect(result.ok).toBe(false);
+      expect(result.reason).toContain("facilities");
+    });
+  });
+
+  describe("scoreRecipeAvailability", () => {
+    it("should score 100 when all materials are available", () => {
+      const recipe = mockRecipes[0]; // forge_hull_plating
+      const countFn = (id: string) => id === "iron_ore" ? 20 : id === "titanium_ore" ? 10 : 0;
+      const score = scoreRecipeAvailability(recipe, countFn);
+      expect(score).toBe(100);
+    });
+
+    it("should score 50 when half materials are available", () => {
+      const recipe = mockRecipes[0];
+      const countFn = (id: string) => id === "iron_ore" ? 5 : id === "titanium_ore" ? 10 : 0;
+      const score = scoreRecipeAvailability(recipe, countFn);
+      expect(score).toBe(67); // (5+5)/(10+5) * 100 ≈ 67
+    });
+
+    it("should score 0 when no materials are available", () => {
+      const recipe = mockRecipes[0];
+      const countFn = () => 0;
+      const score = scoreRecipeAvailability(recipe, countFn);
+      expect(score).toBe(0);
+    });
+
+    it("should return -Infinity for blacklisted recipes", () => {
+      const blacklistedRecipe = { ...mockRecipes[0], recipe_id: "basic_silicon_refinement" };
+      const countFn = () => 100;
+      const score = scoreRecipeAvailability(blacklistedRecipe, countFn);
+      expect(score).toBe(-Infinity);
+    });
+
+    it("should apply penalty recipes", () => {
+      const penaltyRecipe = { ...mockRecipes[0], recipe_id: "synthesize_bio_polymer" };
+      const countFn = () => 100;
+      const score = scoreRecipeAvailability(penaltyRecipe, countFn);
+      expect(score).toBe(100 - 1000);
+    });
+  });
+
+  describe("findRecipeForItem", () => {
+    it("should return null when no recipes exist", () => {
+      const result = findRecipeForItem("nonexistent", [], () => 0);
+      expect(result).toBeNull();
+    });
+
+    it("should return the only recipe when one exists", () => {
+      const result = findRecipeForItem("alloy", [mockRecipes[4]], () => 100);
+      expect(result?.recipe_id).toBe("basic_alloy");
+    });
+
+    it("should filter out uncraftable recipes", () => {
+      const recipes = [mockRecipes[2], mockRecipes[3], mockRecipes[4]]; // ship passive, facility only, basic
+      const result = findRecipeForItem("alloy", recipes, () => 100);
+      expect(result?.recipe_id).toBe("basic_alloy");
+    });
+
+    it("should prefer recipe with higher material availability", () => {
+      const recipes = [mockRecipes[0], mockRecipes[1]]; // forge and reforge hull_plating
+      const countFn = (id: string) => {
+        if (id === "iron_ore") return 10;
+        if (id === "titanium_ore") return 5;
+        if (id === "hull_plating") return 0; // reforge needs hull_plating, not available
+        return 0;
+      };
+      const result = findRecipeForItem("hull_plating", recipes, countFn);
+      expect(result?.recipe_id).toBe("forge_hull_plating"); // should pick forge since materials available
+    });
+  });
+
+  describe("findAllRecipesForItem", () => {
+    it("should return all craftable recipes sorted by score", () => {
+      const recipes = [mockRecipes[2], mockRecipes[3], mockRecipes[4]]; // ship passive, facility, basic
+      const result = findAllRecipesForItem("alloy", recipes, () => 100);
+      expect(result).toHaveLength(1);
+      expect(result[0].recipe_id).toBe("basic_alloy");
+    });
+  });
+
+  describe("calculateCraftingPlan", () => {
+    it("should return null when no recipe exists", () => {
+      const plan = calculateCraftingPlan("nonexistent", 10, [], () => 0);
+      expect(plan).toBeNull();
+    });
+
+    it("should create a plan for a simple recipe", () => {
+      const plan = calculateCraftingPlan("alloy", 5, [mockRecipes[4]], (id) => id === "iron_ore" ? 50 : 0);
+      expect(plan).not.toBeNull();
+      expect(plan?.goalItem).toBe("Alloy");
+      expect(plan?.goalQuantity).toBe(5);
+      expect(plan?.flatOrder).toHaveLength(1);
+      expect(plan?.flatOrder[0].recipe.recipe_id).toBe("basic_alloy");
+    });
+
+    it("should build dependency tree for complex recipes", () => {
+      // Test with reforge requiring hull_plating, which requires forge
+      const recipes = [mockRecipes[0], mockRecipes[1]]; // forge and reforge
+      const countFn = (id: string) => {
+        if (id === "iron_ore") return 100;
+        if (id === "titanium_ore") return 50;
+        if (id === "hull_plating") return 0;
+        return 0;
+      };
+      const plan = calculateCraftingPlan("hull_plating", 1, recipes, countFn);
+      expect(plan).not.toBeNull();
+      expect(plan?.flatOrder).toHaveLength(1); // Just the forge, since reforge not better
+      expect(plan?.flatOrder[0].recipe.recipe_id).toBe("forge_hull_plating");
+    });
   });
 });

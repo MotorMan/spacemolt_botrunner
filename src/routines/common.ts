@@ -1007,6 +1007,11 @@ export async function safetyCheck(
 
   const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (fuelPct < opts.fuelThresholdPct) {
+    if (bot.isCustomsHold()) {
+      ctx.log("customs", "Fuel low but customs hold active - waiting for clearance before refueling");
+      const outcome = await bot.waitForCustomsClear();
+      ctx.log("customs", `Customs cleared (outcome: ${outcome}) - proceeding with refueling`);
+    }
     const ok = await ensureFueled(ctx, opts.fuelThresholdPct);
     if (!ok) return false;
   }

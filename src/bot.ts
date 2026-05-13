@@ -192,7 +192,7 @@ export class Bot {
   private lastChatChannel: string = "";
 
   /** Cooldown after customs clears before new hold can start (prevents rapid re-triggering). */
-  private static readonly CUSTOMS_COOLDOWN_MS = 30000; // 30 seconds
+  private static readonly CUSTOMS_COOLDOWN_MS = 120000; // 2 minutes
 
   /** Optional callback for routing log output (e.g. to TUI). */
   onLog?: (username: string, category: string, message: string) => void;
@@ -1345,7 +1345,7 @@ export class Bot {
     this.customsHold.active = false;
     this.customsHold.aiResponseSent = false; // Reset for next customs stop
     this.customsClearedAt = Date.now(); // Set cooldown timestamp
-    this.log("customs", `✅ CUSTOMS CLEARED: ${outcome} (30s cooldown)`);
+    this.log("customs", `✅ CUSTOMS CLEARED: ${outcome} (2m cooldown)`);
   }
 
   /**
@@ -1354,10 +1354,10 @@ export class Bot {
   isCustomsHold(): boolean {
     if (!this.customsHold.active) return false;
 
-    // Auto-timeout after 30 seconds (customs ship should have arrived by then)
+    // Auto-timeout after 2 minutes (customs ship should have arrived by then)
     const elapsed = Date.now() - this.customsHold.since;
-    if (elapsed > 30000) {
-      this.log("customs", "⏰ CUSTOMS TIMEOUT: Proceeding after 30s wait");
+    if (elapsed > 120000) {
+      this.log("customs", "⏰ CUSTOMS TIMEOUT: Proceeding after 2m wait");
       this.customsHold.active = false;
       this.customsHold.outcome = "cleared";
       return false;
@@ -1390,7 +1390,7 @@ export class Bot {
   /**
    * Wait for customs hold to clear (blocks until cleared or timeout).
    */
-  async waitForCustomsClear(maxWaitMs: number = 30000): Promise<"cleared" | "contraband" | "evasion" | "timeout"> {
+  async waitForCustomsClear(maxWaitMs: number = 120000): Promise<"cleared" | "contraband" | "evasion" | "timeout"> {
     const startTime = Date.now();
     
     while (this.customsHold.active && Date.now() - startTime < maxWaitMs) {
@@ -1407,7 +1407,7 @@ export class Bot {
     if (this.customsHold.active) {
       this.customsHold.active = false;
       this.customsHold.outcome = "cleared";
-      this.log("customs", "⏰ Customs scan timeout - proceeding");
+      this.log("customs", "⏰ Customs scan timeout - proceeding after 2m");
       return "timeout";
     }
 
@@ -1677,15 +1677,15 @@ export class Bot {
 
          debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
 
-         // Check if we should send a battle response to AI chat
-         const now = Date.now();
-         if (now - this.lastBattleResponseMs > Bot.BATTLE_RESPONSE_COOLDOWN_MS) {
-           // Only respond if we're taking damage or just entered battle
-           if (totalDamage > 0 || !this.currentBattle.inBattle) {
-             this.lastBattleResponseMs = now;
-             await this.sendBattleResponseToAI(attackerName, totalDamage);
-           }
-         }
+          // Check if we should send a battle response to AI chat
+          const now = Date.now();
+          if (now - this.lastBattleResponseMs > Bot.BATTLE_RESPONSE_COOLDOWN_MS) {
+            // Only respond if we're taking damage (target is us) or just entered battle
+            if ((totalDamage > 0 && targetName === this.username) || !this.currentBattle.inBattle) {
+              this.lastBattleResponseMs = now;
+              await this.sendBattleResponseToAI(attackerName, totalDamage);
+            }
+          }
        } else if (msgType === "battle_update" && data && typeof data === "object") {
          const battleId = (data.battle_id as string) || "";
          const tick = (data.tick as number) || 0;

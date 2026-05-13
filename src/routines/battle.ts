@@ -537,6 +537,7 @@ export async function engageTarget(
   minPiratesToFlee: number,
   maxAttackTier: PirateTier,
   sideId?: number, // Optional: if provided, skip analysis and directly join this side
+  skipScan: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   if (!target.id) return false;
@@ -571,17 +572,19 @@ export async function engageTarget(
   }
 
   ctx.log("combat", `🎯 Engaging ${target.name}...`);
-  let scanResp = await bot.exec("scan", { target_id: target.id });
-  if (scanResp.error && scanResp.error.message.toLowerCase().includes("invalid_target")) {
-    ctx.log("combat", `Scan with pirate_id failed - trying name instead...`);
-    scanResp = await bot.exec("scan", { target_id: target.name });
-  }
+  if (!skipScan) {
+    let scanResp = await bot.exec("scan", { target_id: target.id });
+    if (scanResp.error && scanResp.error.message.toLowerCase().includes("invalid_target")) {
+      ctx.log("combat", `Scan with pirate_id failed - trying name instead...`);
+      scanResp = await bot.exec("scan", { target_id: target.name });
+    }
 
-  if (!scanResp.error && scanResp.result) {
-    const s = scanResp.result as Record<string, unknown>;
-    const shipType = (s.ship_type as string) || (s.ship as string) || "unknown";
-    const faction = (s.faction as string) || target.faction || "unknown";
-    ctx.log("combat", `   Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
+    if (!scanResp.error && scanResp.result) {
+      const s = scanResp.result as Record<string, unknown>;
+      const shipType = (s.ship_type as string) || (s.ship as string) || "unknown";
+      const faction = (s.faction as string) || target.faction || "unknown";
+      ctx.log("combat", `   Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
+    }
   }
 
   let attackResp = await bot.exec("attack", { target_id: target.id });
@@ -755,18 +758,20 @@ export async function fightFreshBattle(
 
 export async function fightJoinedBattle(
   ctx: RoutineContext,
-  target: NearbyEntity,
+  target: NearbyEntity | null,
   fleeThreshold: number,
   fleeFromTier: PirateTier,
   maxAttackTier: PirateTier,
 ): Promise<boolean> {
   const { bot } = ctx;
 
-  ctx.log("combat", `🎯 Fighting in joined battle — targeting ${target.name}`);
+  ctx.log("combat", `🎯 Fighting in joined battle${target ? ` — targeting ${target.name}` : ''}`);
 
   // Set target and fire stance - wait for tick completion
   ctx.log("combat", `Setting target and stance...`);
-  await bot.exec("battle", { action: "target", target_id: target.id });
+  if (target) {
+    await bot.exec("battle", { action: "target", target_id: target.id });
+  }
   await ctx.sleep(10000);
   await bot.exec("battle", { action: "stance", stance: "fire" });
   await ctx.sleep(10000);
@@ -788,10 +793,10 @@ export async function fightJoinedBattle(
     }
 
     const targetParticipant = status.participants.find(
-      p => p.player_id === target.id || p.username === target.name
+      p => target && (p.player_id === target.id || p.username === target.name)
     );
 
-    if (targetParticipant && targetParticipant.is_destroyed) {
+    if (targetParticipant && targetParticipant.is_destroyed && target) {
       ctx.log("combat", `⚠️ ${target.name} marked destroyed but battle still active — waiting...`);
       // Brief pause before re-check (non-locking getBattleStatus will show battle ended)
       await ctx.sleep(2000);
@@ -809,9 +814,9 @@ export async function fightJoinedBattle(
         const prevDir = zoneDir[lastKnownEnemyZone as keyof typeof zoneDir] ?? 0;
         const newDir = zoneDir[targetParticipant.zone as keyof typeof zoneDir] ?? 0;
         if (newDir > prevDir) {
-          ctx.log("combat", `⚠️ ${target.name} advancing: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+          if (target) ctx.log("combat", `⚠️ ${target.name} advancing: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
         } else if (newDir < prevDir) {
-          ctx.log("combat", `${target.name} retreating: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+          if (target) ctx.log("combat", `${target.name} retreating: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
         }
         lastKnownEnemyZone = targetParticipant.zone;
       }
@@ -834,7 +839,7 @@ export async function fightJoinedBattle(
     const enemyZoneNum = zoneDirMap[enemyZone as keyof typeof zoneDirMap] ?? 0;
     const ourZone = status.your_zone || "outer";
     const ourZoneNum = zoneDirMap[ourZone as keyof typeof zoneDirMap] ?? 0;
-    const isHighDamageEnemy = target.tier && ["boss", "capitol", "large"].includes(target.tier);
+    const isHighDamageEnemy = target && target.tier && ["boss", "capitol", "large"].includes(target.tier);
     const shieldsCritical = isHighDamageEnemy
       ? (shieldPct < 40 || hullPct < 50)
       : (shieldPct < 15 && hullPct < 70);

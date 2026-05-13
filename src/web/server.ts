@@ -231,6 +231,9 @@ export class WebServer {
   // Shutdown callback — set by botmanager
   onShutdown: (() => Promise<void>) | null = null;
 
+  // Empire official alert callback — set by botmanager
+  onEmpireAlert: ((sender: string, content: string) => void) | null = null;
+
   // Available routines — set by botmanager
   routines: string[] = [];
 
@@ -1237,5 +1240,9 @@ export class WebServer {
         this.clients.delete(ws);
       }
     }
+  }
+
+  sendEmpireAlert(sender: string, content: string): void {
+    this.broadcast({ type: "empireAlert", sender, content });
   }
 }

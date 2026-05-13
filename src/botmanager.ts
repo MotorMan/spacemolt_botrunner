@@ -637,6 +637,10 @@ async function main(): Promise<void> {
     server.logSystem(line);
   });
   AiChatService.setGetBotsFn(() => [...bots.values()]);
+  // Set up empire alert callback
+  aiChatService.setEmpireAlertCallback((sender, content) => {
+    server.sendEmpireAlert(sender, content);
+  });
   aiChatService.start();
   // Expose on globalThis for bot.ts to access
   (globalThis as any).aiChatService = aiChatService;

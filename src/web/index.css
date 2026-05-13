@@ -45,6 +45,15 @@ header h1 {
   letter-spacing: 0.5px;
   padding: 12px 0;
 }
+header h1.empire-alert-flash {
+  animation: empire-alert-pulse 1.5s ease-in-out infinite alternate;
+}
+
+@keyframes empire-alert-pulse {
+  0% { color: var(--text-bright); text-shadow: 0 0 5px var(--yellow); }
+  50% { color: var(--yellow); text-shadow: 0 0 20px var(--yellow), 0 0 30px var(--red); }
+  100% { color: var(--red); text-shadow: 0 0 10px var(--red), 0 0 20px var(--red), 0 0 30px var(--yellow); }
+}
 .header-right {
   display: flex;
   align-items: center;

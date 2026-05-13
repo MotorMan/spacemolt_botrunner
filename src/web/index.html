@@ -700,6 +700,66 @@ for (const [key, el] of [['activity', activityEl], ['broadcast', broadcastEl], [
   });
 }
 
+// ── Empire Alert Flashing ──────────────────────────────────────
+let empireAlertActive = false;
+let empireAlertTimeout = null;
+
+function triggerEmpireAlert(sender, content) {
+  const header = document.querySelector('header h1');
+  if (!header) return;
+  
+  empireAlertActive = true;
+  header.classList.add('empire-alert-flash');
+  
+  // Clear any existing timeout
+  if (empireAlertTimeout) {
+    clearTimeout(empireAlertTimeout);
+  }
+  
+  // Auto-disable after 10 seconds
+  empireAlertTimeout = setTimeout(() => {
+    disableEmpireAlert();
+  }, 10000);
+  
+  // Log to system panel
+  const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
+  const line = `${timestamp} [SYSTEM] ⚠️ Empire official message from ${sender} was blocked (awaiting human review)`;
+  appendLine('system', line);
+}
+
+function disableEmpireAlert() {
+  const header = document.querySelector('header h1');
+  if (header) {
+    header.classList.remove('empire-alert-flash');
+  }
+  empireAlertActive = false;
+  if (empireAlertTimeout) {
+    clearTimeout(empireAlertTimeout);
+    empireAlertTimeout = null;
+  }
+}
+
+// Double-click to disable flashing (single click is ignored to avoid accidental dismissal)
+document.addEventListener('DOMContentLoaded', () => {
+  let clickTimer = null;
+  const header = document.querySelector('header h1');
+  if (header) {
+    header.style.cursor = 'pointer';
+    header.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (clickTimer) {
+        clearTimeout(clickTimer);
+        clickTimer = null;
+        disableEmpireAlert();
+      } else {
+        clickTimer = setTimeout(() => {
+          clickTimer = null;
+        }, 300);
+      }
+    });
+  }
+});
+
 // ── Top-level tabs ─────────────────────────────────────────
 function switchTab(name) {
   // Hide profile if switching to a normal tab
@@ -1051,6 +1111,12 @@ async function fetchInitialData() {
         // Handle combat log entries
         if (msg.event) {
           addCombatLogEntry(msg.event);
+        }
+        break;
+      case 'empireAlert':
+        // Handle empire official message blocked - trigger flashing alert
+        if (msg.sender && msg.content) {
+          triggerEmpireAlert(msg.sender, msg.content);
         }
         break;
     }

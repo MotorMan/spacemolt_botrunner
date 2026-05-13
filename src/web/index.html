@@ -704,24 +704,22 @@ for (const [key, el] of [['activity', activityEl], ['broadcast', broadcastEl], [
 let empireAlertActive = false;
 let empireAlertTimeout = null;
 
-function triggerEmpireAlert(sender, content) {
+function triggerEmpireAlert(sender, content, botUsername) {
   const header = document.querySelector('header h1');
   if (!header) return;
   
   empireAlertActive = true;
   header.classList.add('empire-alert-flash');
+  header.title = `Bot: ${botUsername} | Empire NPC: ${sender}`;
   
-  // Clear any existing timeout
   if (empireAlertTimeout) {
     clearTimeout(empireAlertTimeout);
   }
   
-  // Auto-disable after 10 seconds
   empireAlertTimeout = setTimeout(() => {
     disableEmpireAlert();
   }, 10000);
   
-  // Log to system panel
   const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
   const line = `${timestamp} [SYSTEM] ⚠️ Empire official message from ${sender} was blocked (awaiting human review)`;
   appendLine('system', line);
@@ -731,6 +729,7 @@ function disableEmpireAlert() {
   const header = document.querySelector('header h1');
   if (header) {
     header.classList.remove('empire-alert-flash');
+    header.title = '';
   }
   empireAlertActive = false;
   if (empireAlertTimeout) {
@@ -1114,9 +1113,8 @@ async function fetchInitialData() {
         }
         break;
       case 'empireAlert':
-        // Handle empire official message blocked - trigger flashing alert
         if (msg.sender && msg.content) {
-          triggerEmpireAlert(msg.sender, msg.content);
+          triggerEmpireAlert(msg.sender, msg.content, msg.botUsername);
         }
         break;
     }

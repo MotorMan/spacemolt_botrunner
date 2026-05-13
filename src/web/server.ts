@@ -1242,7 +1242,7 @@ export class WebServer {
     }
   }
 
-  sendEmpireAlert(sender: string, content: string): void {
-    this.broadcast({ type: "empireAlert", sender, content });
+  sendEmpireAlert(sender: string, content: string, botUsername: string): void {
+    this.broadcast({ type: "empireAlert", sender, content, botUsername });
   }
 }

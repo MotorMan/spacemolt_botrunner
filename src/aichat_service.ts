@@ -465,7 +465,7 @@ export class AiChatService {
   private globalChatLock: BotLockInfo | null = null;
   private running = false;
   private logFn: (category: string, message: string) => void;
-  private empireAlertFn: ((sender: string, content: string) => void) | null = null;
+  private empireAlertFn: ((sender: string, content: string, botUsername: string) => void) | null = null;
   
   // Duplicate detection: track message hashes seen in last 10 minutes
   private seenMessages = new Map<string, number>();
@@ -505,7 +505,7 @@ export class AiChatService {
     }
   }
 
-  setEmpireAlertCallback(fn: (sender: string, content: string) => void): void {
+  setEmpireAlertCallback(fn: (sender: string, content: string, botUsername: string) => void): void {
     this.empireAlertFn = fn;
   }
 
@@ -697,7 +697,7 @@ export class AiChatService {
       logImportantMessage(msg);
       // Trigger empire alert callback for web UI
       if (this.empireAlertFn) {
-        this.empireAlertFn(msg.sender, msg.content);
+        this.empireAlertFn(msg.sender, msg.content, msg.botUsername || "unknown");
       }
       return;
     }

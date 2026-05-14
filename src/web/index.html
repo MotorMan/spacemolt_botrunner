@@ -11057,7 +11057,7 @@ function fetchFactionInfo(username) {
     }
     factionData = result.data;
     // faction_info doesn't include treasury — fetch it separately
-    sendExec(username, 'view_storage', { source: 'faction', station_id: 'any' }, (storageResult) => {
+    sendExec(username, 'view_storage', { source: 'faction' }, (storageResult) => { //removed any because that is WRONG.
       if (storageResult.ok && storageResult.data && storageResult.data.credits != null) {
         factionData.treasury = storageResult.data.credits;
       }
@@ -12275,7 +12275,7 @@ function factionUpgradeFacility(username, facilityId, facilityType) {
     
     if (cost > 0) {
       await new Promise(resolve => {
-        sendExec(username, 'storage', { action: 'withdraw', item_id: 'credits', quantity: cost, target: 'faction' }, resolve);
+        sendExec(username, 'storage', { action: 'deposit', target: 'self', source: 'faction', item_id: 'credits', quantity: cost }, resolve);
       });
     }
     
@@ -12284,7 +12284,7 @@ function factionUpgradeFacility(username, facilityId, facilityType) {
         const mId = m.item_id || m.name || '?';
         const mQty = m.quantity || m.count || 1;
         await new Promise(resolve => {
-          sendExec(username, 'storage', { action: 'deposit', target: 'self', item_id: mId, quantity: mQty, source: 'faction' }, resolve);
+          sendExec(username, 'storage', { action: 'deposit', target: 'self', source: 'faction', item_id: mId, quantity: mQty }, resolve);
         });
       }
     }
@@ -12667,12 +12667,11 @@ function upgradePersonalFacility(username, facilityId) {
   const uName = up.name || upgradeType || 'Unknown';
   
   const mats = up.materials || up.requirements || up.build_materials || [];
-  const cost = up.cost ?? up.credits ?? up.price ?? up.credit_cost ?? 0;
   
   let progressHtml = `
     <div class="faction-card" style="padding:12px">
       <div style="font-size:14px;font-weight:700;color:var(--text-bright);margin-bottom:12px">Upgrading: ${esc(uName)}</div>
-      <div id="up-step-1">Getting upgrade details...</div>
+      <div id="up-step-1">Getting facility details...</div>
       <div id="up-step-2" style="color:var(--text-dim)">Checking faction storage...</div>
       <div id="up-step-3" style="color:var(--text-dim)">Withdrawing materials...</div>
       <div id="up-step-4" style="color:var(--text-dim)">Upgrading facility...</div>
@@ -12700,18 +12699,22 @@ function upgradePersonalFacility(username, facilityId) {
   };
   
   (async () => {
-    updateStep(1, 'Getting upgrade details...', 'var(--text)');
+    updateStep(1, 'Getting facility details...', 'var(--text)');
     
-    const detailsResult = await new Promise(resolve => {
-      sendExec(username, 'facility', { action: 'upgrades' }, resolve);
+    const typeResult = await new Promise(resolve => {
+      sendExec(username, 'facility', { action: 'types', facility_type: upgradeType }, resolve);
     });
     
-    if (!detailsResult.ok || !detailsResult.data) {
-      showError(detailsResult.error || 'Failed to get upgrade details');
+    if (!typeResult.ok || !typeResult.data) {
+      showError(typeResult.error || 'Failed to get facility type details');
       return;
     }
     
-    updateStep(1, 'Got upgrade details', 'var(--green)');
+    const d = typeResult.data;
+    const detail = Array.isArray(d) ? d[0] : (d.type || d.facility || d);
+    const cost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? detail.credit_cost ?? 0;
+    
+    updateStep(1, 'Got facility details', 'var(--green)');
     updateStep(2, 'Checking faction storage...', 'var(--text)');
     
     const storageResult = await new Promise(resolve => {
@@ -12756,7 +12759,7 @@ function upgradePersonalFacility(username, facilityId) {
     if (cost > 0) {
       setStatus(`Withdrawing ${cost.toLocaleString()} credits...`);
       const creditResult = await new Promise(resolve => {
-        sendExec(username, 'storage', { action: 'withdraw', item_id: 'credits', quantity: cost, target: 'faction' }, resolve);
+        sendExec(username, 'storage', { action: 'deposit', target: 'self', source: 'faction', item_id: 'credits', quantity: cost }, resolve);
       });
       if (!creditResult.ok) {
         showError('Failed to withdraw credits: ' + (creditResult.error || 'unknown'));
@@ -12771,7 +12774,7 @@ function upgradePersonalFacility(username, facilityId) {
         const mQty = m.quantity || m.count || m.amount || 1;
         setStatus(`Withdrawing ${mQty}x ${mName}...`);
         const matResult = await new Promise(resolve => {
-          sendExec(username, 'storage', { action: 'deposit', target: 'self', item_id: mId, quantity: mQty, source: 'faction' }, resolve);
+          sendExec(username, 'storage', { action: 'deposit', target: 'self', source: 'faction', item_id: mId, quantity: mQty }, resolve);
         });
         if (!matResult.ok) {
           showError(`Failed to withdraw ${mName}: ${matResult.error || 'unknown'}`);
@@ -13019,7 +13022,7 @@ function upgradeFactionFacility(username, facilityId, upgradeType) {
       if (cost > 0) {
         setStatus(`Withdrawing ${cost.toLocaleString()} credits...`);
         const creditResult = await new Promise(resolve => {
-          sendExec(username, 'storage', { action: 'withdraw', item_id: 'credits', quantity: cost, target: 'faction' }, resolve);
+          sendExec(username, 'storage', { action: 'deposit', target: 'self', source: 'faction', item_id: 'credits', quantity: cost }, resolve);
         });
         if (!creditResult.ok) {
           showError('Failed to withdraw credits: ' + (creditResult.error || 'unknown'));
@@ -13034,7 +13037,7 @@ function upgradeFactionFacility(username, facilityId, upgradeType) {
           const mQty = m.quantity || m.count || m.amount || 1;
           setStatus(`Withdrawing ${mQty}x ${mName}...`);
           const matResult = await new Promise(resolve => {
-            sendExec(username, 'storage', { action: 'deposit', target: 'self', item_id: mId, quantity: mQty, source: 'faction' }, resolve);
+            sendExec(username, 'storage', { action: 'deposit', target: 'self', source: 'faction', item_id: mId, quantity: mQty }, resolve);
           });
           if (!matResult.ok) {
             showError(`Failed to withdraw ${mName}: ${matResult.error || 'unknown'}`);
@@ -13529,7 +13532,7 @@ async function buildPersonalFacility(username, facilityType) {
     return;
   }
   
-  updateStep(2, `Faction storage OK (${factionCredits.toLocaleString()} credits)`, 'var(--green)');
+updateStep(2, `Faction storage OK (${factionCredits.toLocaleString()} credits)`, 'var(--green)');
   updateStep(3, 'Withdrawing materials...', 'var(--text)');
   
   // Step 3: Withdraw materials from faction storage
@@ -13538,7 +13541,7 @@ async function buildPersonalFacility(username, facilityType) {
   if (cost > 0) {
     setStatus(`Withdrawing ${cost.toLocaleString()} credits...`);
     const creditResult = await new Promise(resolve => {
-      sendExec(username, 'storage', { action: 'withdraw', item_id: 'credits', quantity: cost, target: 'faction' }, resolve);
+      sendExec(username, 'storage', { action: 'deposit', target: 'self', source: 'faction', item_id: 'credits', quantity: cost }, resolve);
     });
     if (creditResult.ok) {
       withdrawnCredits = cost;
@@ -13559,9 +13562,9 @@ async function buildPersonalFacility(username, facilityType) {
       const mQty = m.quantity || m.count || m.amount || 1;
       setStatus(`Withdrawing ${mQty}x ${mName} (${matIndex}/${mats.length})...`);
       
-      // Use withdraw_items to get from faction storage to cargo
+      // Use deposit from faction storage to station storage
       const withdrawResult = await new Promise(resolve => {
-        sendExec(username, 'withdraw_items', { item_id: mId, quantity: mQty, source: 'self', target: 'faction' }, resolve); //fixed by human!
+        sendExec(username, 'storage', { action: 'deposit', target: 'self', source: 'faction', item_id: mId, quantity: mQty }, resolve);
       });
       
       if (!withdrawResult.ok) {
@@ -13600,7 +13603,7 @@ async function buildPersonalFacilityConfirm(username, facilityType, matsJson, co
   
   if (cost > 0) {
     await new Promise(resolve => {
-      sendExec(username, 'storage', { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: cost }, () => resolve(true));
+      sendExec(username, 'storage', { action: 'deposit', target: 'self', source: 'faction', item_id: 'credits', quantity: cost }, () => resolve(true));
     });
   }
   
@@ -13608,9 +13611,9 @@ async function buildPersonalFacilityConfirm(username, facilityType, matsJson, co
     for (const m of mats) {
       const mId = m.item_id || m.name || m.resource || '?';
       const mQty = m.quantity || m.count || m.amount || 1;
-        await new Promise(resolve => {
-          sendExec(username, 'withdraw_items', { item_id: mId, quantity: mQty, source: 'self', target: 'faction' }, () => resolve(true)); //fixed by human!
-        });
+      await new Promise(resolve => {
+        sendExec(username, 'storage', { action: 'deposit', target: 'self', source: 'faction', item_id: mId, quantity: mQty }, () => resolve(true));
+      });
     }
   }
   

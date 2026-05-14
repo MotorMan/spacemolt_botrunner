@@ -13579,7 +13579,7 @@ async function buildPersonalFacility(username, facilityType) {
   
   // Step 4: Build the facility
   const buildResult = await new Promise(resolve => {
-    sendExec(username, 'facility', { action: 'build', facility_type: facilityType }, resolve);
+    sendExec(username, 'facility', { action: 'personal_build', facility_type: facilityType }, resolve);
   });
   
   if (buildResult.ok) {

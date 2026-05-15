@@ -56,12 +56,13 @@ const PERSONALITIES_DIR = join(process.cwd(), "data", "personalities");
 const MAP_FILE = join(process.cwd(), "data", "map.json");
 const IMPORTANT_MESSAGES_FILE = join(process.cwd(), "data", "IMPORTANTMESSAGES.json");
 
-const BLOCKED_EMPIRE_NPCS = [
+const BLOCKED_EMPIRE_NPCS = [ //that is blocked from replying too, even though they don't have actual private message return functionality
   "Chancellor Yusuf Delacroix",
   "The Pathfinder, Siv Larkin",
   "High Warlord Petra Kast", //needs verification
   "Director-General Darya Lim", //needs verification
   "The Convergence", //needs verification
+  "Solarian Confederacy", //gives message about rep increase. bot responded to it under "solarian"
 ];
 
 const EMPIRE_OFFICIAL_TAG = "[empire_official]";

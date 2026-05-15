@@ -2799,18 +2799,22 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (refuelResp.error) {
           ctx.log("error", `Refuel command failed: ${refuelResp.error.message}`);
         } else {
-          // Parse and log the result
+          let fuelDelivered = 0;
           const result = refuelResp.result as Record<string, unknown> | undefined;
           if (result) {
             const fuelDelta = result.fuel as number || 0;
             const fuelNow = result.fuel_now as number || bot.fuel;
             const targetFuelNow = result.target_fuel_now as number || 0;
             const targetName = result.target_player_name as string || target.username;
+            fuelDelivered = Math.abs(fuelDelta);
 
-            ctx.log(logCategory, `✓ Transferred ${Math.abs(fuelDelta)} fuel to ${targetName}`);
+            ctx.log(logCategory, `✓ Transferred ${fuelDelivered} fuel to ${targetName}`);
             ctx.log(logCategory, `  Our fuel: ${fuelNow}, Their fuel: ${targetFuelNow}`);
           } else {
             ctx.log(logCategory, `✓ Fuel transfer complete for ${target.username}`);
+          }
+          if (recoveredSession || getActiveRescueSession(bot.username)) {
+            await updateRescueSession(bot.username, { fuelDelivered });
           }
         }
       } else {
@@ -2845,7 +2849,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (jetResp.error) {
             ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
           } else {
-            ctx.log(logCategory, `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them`);
+            const jettisonedFuel = fuelItem.quantity * 10;
+            ctx.log(logCategory, `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them (${jettisonedFuel} fuel units)`);
+            if (recoveredSession || getActiveRescueSession(bot.username)) {
+              await updateRescueSession(bot.username, { fuelDelivered: jettisonedFuel });
+            }
           }
         } else {
           // No fuel cells in cargo — try to buy them
@@ -2952,7 +2960,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 if (jetResp.error) {
                   ctx.log("error", `Jettison failed: ${jetResp.error.message}`);
                 } else {
-                  ctx.log(logCategory, `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them`);
+                  const jettisonedFuel = purchasedItem.quantity * 10;
+                  ctx.log(logCategory, `✓ Fuel cells jettisoned at ${bot.poi} — ${target.username} should scavenge them (${jettisonedFuel} fuel units)`);
+                  if (recoveredSession || getActiveRescueSession(bot.username)) {
+                    await updateRescueSession(bot.username, { fuelDelivered: jettisonedFuel });
+                  }
                 }
               }
             } else {
@@ -3171,52 +3183,51 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         // Record successful rescue in BlackBook
         recordSuccessfulRescue(activeSessionForBill.targetUsername, bill.total);
 
-        // ── Send faction announcement in background (non-blocking) ──
-        // This allows immediate return home instead of waiting for cooldown
+        // ── Send faction announcement (send immediately, not in setTimeout) ──
         const aiChatService = (globalThis as any).aiChatService;
-        const aiChatSettings = aiChatService?.getSettings?.();
-        const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
-        ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
-        
-        // Schedule faction announcement to run after cooldown, but don't block
-        setTimeout(async () => {
-          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
-            try {
-              const result = await aiChatService.sendFactionMessage(bot, {
-                messageType: "rescue_complete",
-                targetName: activeSessionForBill.targetUsername,
-                isMayday: activeSessionForBill.isMayday,
-                isBot: !activeSessionForBill.isMayday,
-                currentSystem: bot.system,
-                targetSystem: activeSessionForBill.targetSystem,
-                targetPoi: activeSessionForBill.targetPoi || undefined,
-              });
-              if (!result.ok) {
-                ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
-              }
-            } catch (e) {
-              ctx.log("warn", `AI faction message (complete) failed: ${e}`);
+        if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+          try {
+            const result = await aiChatService.sendFactionMessage(bot, {
+              messageType: "rescue_complete",
+              targetName: activeSessionForBill.targetUsername,
+              isMayday: activeSessionForBill.isMayday,
+              isBot: !activeSessionForBill.isMayday,
+              currentSystem: bot.system,
+              targetSystem: activeSessionForBill.targetSystem,
+              targetPoi: activeSessionForBill.targetPoi || undefined,
+            });
+            if (!result.ok) {
+              ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
+            } else {
+              ctx.log("rescue", `📢 Faction announcement sent: ${result.message}`);
             }
+          } catch (e) {
+            ctx.log("warn", `AI faction message (complete) failed: ${e}`);
           }
-        }, cooldownSec * 1000);
+        }
       } else {
-        // No bill to send, but still send faction announcement in background
-        const aiChatService = (globalThis as any).aiChatService;
-        const aiChatSettings = aiChatService?.getSettings?.();
+        const aiChatSettings = ((globalThis as any).aiChatService)?.getSettings?.();
         const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
         ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
         
+        const botSystemAtRescue = bot.system;
+        const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
+        const isMaydayForAnnounce = activeSessionForBill.isMayday;
+        const targetSystemForAnnounce = activeSessionForBill.targetSystem;
+        const targetPoiForAnnounce = activeSessionForBill.targetPoi;
+        
         setTimeout(async () => {
-          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+          const freshAiChatService = (globalThis as any).aiChatService;
+          if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
             try {
-              const result = await aiChatService.sendFactionMessage(bot, {
+              const result = await freshAiChatService.sendFactionMessage(bot, {
                 messageType: "rescue_complete",
-                targetName: activeSessionForBill.targetUsername,
-                isMayday: activeSessionForBill.isMayday,
-                isBot: !activeSessionForBill.isMayday,
-                currentSystem: bot.system,
-                targetSystem: activeSessionForBill.targetSystem,
-                targetPoi: activeSessionForBill.targetPoi || undefined,
+                targetName: targetUsernameForAnnounce,
+                isMayday: isMaydayForAnnounce,
+                isBot: !isMaydayForAnnounce,
+                currentSystem: botSystemAtRescue,
+                targetSystem: targetSystemForAnnounce,
+                targetPoi: targetPoiForAnnounce || undefined,
               });
               if (!result.ok) {
                 ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
@@ -6336,17 +6347,24 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
         ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
         
+        const botSystemAtRescue = bot.system;
+        const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
+        const isMaydayForAnnounce = activeSessionForBill.isMayday;
+        const targetSystemForAnnounce = activeSessionForBill.targetSystem;
+        const targetPoiForAnnounce = activeSessionForBill.targetPoi;
+        
         setTimeout(async () => {
-          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+          const freshAiChatService = (globalThis as any).aiChatService;
+          if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
             try {
-              const result = await aiChatService.sendFactionMessage(bot, {
+              const result = await freshAiChatService.sendFactionMessage(bot, {
                 messageType: "rescue_complete",
-                targetName: activeSessionForBill.targetUsername,
-                isMayday: activeSessionForBill.isMayday,
-                isBot: !activeSessionForBill.isMayday,
-                currentSystem: bot.system,
-                targetSystem: activeSessionForBill.targetSystem,
-                targetPoi: activeSessionForBill.targetPoi || undefined,
+                targetName: targetUsernameForAnnounce,
+                isMayday: isMaydayForAnnounce,
+                isBot: !isMaydayForAnnounce,
+                currentSystem: botSystemAtRescue,
+                targetSystem: targetSystemForAnnounce,
+                targetPoi: targetPoiForAnnounce || undefined,
               });
               if (!result.ok) {
                 ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);
@@ -6362,17 +6380,24 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         const cooldownSec = aiChatSettings?.conversationCooldownSec || 10;
         ctx.log("rescue", `📢 Faction announcement scheduled for ${cooldownSec}s from now (non-blocking)...`);
         
+        const botSystemAtRescue = bot.system;
+        const targetUsernameForAnnounce = activeSessionForBill.targetUsername;
+        const isMaydayForAnnounce = activeSessionForBill.isMayday;
+        const targetSystemForAnnounce = activeSessionForBill.targetSystem;
+        const targetPoiForAnnounce = activeSessionForBill.targetPoi;
+        
         setTimeout(async () => {
-          if (aiChatService && typeof aiChatService.sendFactionMessage === "function") {
+          const freshAiChatService = (globalThis as any).aiChatService;
+          if (freshAiChatService && typeof freshAiChatService.sendFactionMessage === "function") {
             try {
-              const result = await aiChatService.sendFactionMessage(bot, {
+              const result = await freshAiChatService.sendFactionMessage(bot, {
                 messageType: "rescue_complete",
-                targetName: activeSessionForBill.targetUsername,
-                isMayday: activeSessionForBill.isMayday,
-                isBot: !activeSessionForBill.isMayday,
-                currentSystem: bot.system,
-                targetSystem: activeSessionForBill.targetSystem,
-                targetPoi: activeSessionForBill.targetPoi || undefined,
+                targetName: targetUsernameForAnnounce,
+                isMayday: isMaydayForAnnounce,
+                isBot: !isMaydayForAnnounce,
+                currentSystem: botSystemAtRescue,
+                targetSystem: targetSystemForAnnounce,
+                targetPoi: targetPoiForAnnounce || undefined,
               });
               if (!result.ok) {
                 ctx.log("ai_chat_debug", `Faction announcement (complete) skipped: ${result.error}`);

@@ -122,7 +122,14 @@ main {
 #page-players.active {
   display: flex;
 }
-#playersFrame, #shipsforsaleFrame {
+#page-commandall {
+  padding: 0;
+  gap: 0;
+}
+#page-commandall.active {
+  display: flex;
+}
+#playersFrame, #shipsforsaleFrame, #commandallFrame {
   flex: 1;
   width: 100%;
   border: none;

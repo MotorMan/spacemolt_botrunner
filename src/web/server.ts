@@ -978,6 +978,17 @@ export class WebServer {
           });
         }
 
+        // Serve commandall.html for command all route
+        if (url.pathname === "/commandall.html") {
+          const commandallPath = join(import.meta.dir, "commandall.html");
+          return new Response(readFileSync(commandallPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve index.html for all other routes (read fresh for dev, no cache)
         return new Response(readFileSync(indexPath, "utf-8"), {
           headers: {

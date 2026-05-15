@@ -6296,8 +6296,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     // ── Send rescue bill IMMEDIATELY after fuel delivery ──
     // Get the active session for billing
-    const activeSessionForBill = getActiveRescueSession(bot.username);
-    if (activeSessionForBill) {
+    const activeSessionForBill = getActiveRescueSession(bot.username) || (recoveredSession as any);
+    if (activeSessionForBill || recoveredSession) {
       const jumpsToTarget = activeSessionForBill.jumpsCompleted || 0;
       const fuelDeliveredBill = activeSessionForBill.fuelDelivered || 0;
 

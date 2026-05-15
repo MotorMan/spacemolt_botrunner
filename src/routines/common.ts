@@ -1407,8 +1407,13 @@ export async function navigateToSystem(
         const blacklistedOnRoute = serverRouteSystemIds.find(
           sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
         );
+        // Also validate that the route actually starts from our current system
+        const routeStartsHere = serverRouteSystemIds[0] && 
+          normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
         if (blacklistedOnRoute) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route`);
+        } else if (!routeStartsHere) {
+          ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route`);
         } else {
           nextSystem = routeData.route[1].system_id;
           ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
@@ -1499,8 +1504,13 @@ export async function navigateToSystem(
         const blacklistedOnRoute = serverRouteSystemIds.find(
           sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
         );
+        // Also validate that the route actually starts from our current system
+        const routeStartsHere = serverRouteSystemIds[0] && 
+          normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
         if (blacklistedOnRoute) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route (post-fuel)`);
+        } else if (!routeStartsHere) {
+          ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route (post-fuel)`);
         } else {
           nextSystem = routeData.route[1].system_id;
           ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
@@ -1645,7 +1655,20 @@ export async function navigateToSystem(
         if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
 
         // Recalculate route from CURRENT position (may have changed during wait, use blacklist)
-        const retryRoute = mapStore.findRoute(bot.system, targetSystemId, blacklist);
+        // For "systems not connected" errors, always do a full server re-query to avoid stale bad hops
+        let retryRoute = mapStore.findRoute(bot.system, targetSystemId, blacklist);
+        if (!retryRoute || retryRoute.length <= 1) {
+          ctx.log("travel", `No mapped route after wait — querying server for fresh route to ${targetSystemId}`);
+          const retryResp = await bot.exec("find_route", { target_system: targetSystemId });
+          const retryData = retryResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number } | null;
+          if (!retryResp.error && retryData?.found && retryData.route && retryData.route.length > 1) {
+            const ids = retryData.route.map(r => r.system_id);
+            const startsHere = ids[0] && normalizeSystemName(ids[0]) === normalizeSystemName(bot.system);
+            if (startsHere) {
+              retryRoute = ids;
+            }
+          }
+        }
         if (retryRoute && retryRoute.length > 1) {
           nextSystem = retryRoute[1];
           ctx.log("travel", `Route recalculated after wait: ${retryRoute.length - 1} jump${retryRoute.length - 1 !== 1 ? "s" : ""} remaining`);

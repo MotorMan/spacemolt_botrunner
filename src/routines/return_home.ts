@@ -24,6 +24,7 @@ import {
 function getReturnHomeSettings(username?: string): {
   homeSystem: string;
   homeStation: string;
+  refuelThreshold: number;
 } {
   const all = readSettings();
   const globalDefaults = all.return_home || {};
@@ -32,6 +33,7 @@ function getReturnHomeSettings(username?: string): {
   return {
     homeSystem: (botOverrides.homeSystem as string) || (globalDefaults.homeSystem as string) || "sol",
     homeStation: (botOverrides.homeStation as string) || (globalDefaults.homeStation as string) || "",
+    refuelThreshold: (botOverrides.refuelThreshold as number) ?? (globalDefaults.refuelThreshold as number) ?? 50,
   };
 }
 
@@ -80,6 +82,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   const settings = getReturnHomeSettings(bot.username);
   const homeSystem = settings.homeSystem;
   const homeStation = settings.homeStation;
+  const refuelThreshold = settings.refuelThreshold;
 
   if (!homeSystem) {
     ctx.log("error", "No home system configured — cannot return home");
@@ -107,12 +110,12 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       }
       // Refuel if needed before journey
       const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      if (fuelPct < 50) {
+      if (fuelPct < refuelThreshold) {
         ctx.log("system", `Fuel at ${fuelPct}% — refueling before departure...`);
         const { pois } = await getSystemInfo(ctx);
         const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
         if (currentStation) {
-          await refuelAtStation(ctx, currentStation, 50);
+          await refuelAtStation(ctx, currentStation, refuelThreshold);
           await ensureDocked(ctx, true);
         }
       }
@@ -129,12 +132,12 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       }
       // Refuel if needed before journey
       const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      if (fuelPct < 50) {
+      if (fuelPct < refuelThreshold) {
         ctx.log("system", `Fuel at ${fuelPct}% — refueling before departure...`);
         const { pois } = await getSystemInfo(ctx);
         const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
         if (currentStation) {
-          await refuelAtStation(ctx, currentStation, 50);
+          await refuelAtStation(ctx, currentStation, refuelThreshold);
           await ensureDocked(ctx, true);
         }
       }
@@ -151,21 +154,36 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       await repairShip(ctx);
     }
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-    if (fuelPct < 50) {
+    if (fuelPct < refuelThreshold) {
       ctx.log("system", `Fuel at ${fuelPct}% — refueling before return journey...`);
       const { pois } = await getSystemInfo(ctx);
       const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
       if (currentStation) {
-        await refuelAtStation(ctx, currentStation, 50);
+        await refuelAtStation(ctx, currentStation, refuelThreshold);
         await ensureDocked(ctx, true);
       }
     }
   }
 
-  // Ensure fueled before journey
+  // Ensure fueled before journey — use exact route fuel estimate
   yield "fuel_check";
   const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  if (fuelPct < 50) {
+  let needsRefuel = fuelPct < refuelThreshold;
+  try {
+    const routeResp = await bot.exec("find_route", { target_system: homeSystem, target_poi: homeStation || undefined });
+    if (!routeResp.error && routeResp.result && typeof routeResp.result === "object") {
+      const r = routeResp.result as any;
+      const est = r.estimated_fuel ?? 0;
+      const avail = r.fuel_available ?? bot.fuel;
+      if (avail >= est) {
+        needsRefuel = false;
+        ctx.log("system", `Route fuel check: ${avail} available >= ${est} needed — no refuel required`);
+      } else {
+        ctx.log("system", `Route needs ${est - avail} more fuel — will refuel`);
+      }
+    }
+  } catch {}
+  if (needsRefuel) {
     ctx.log("system", `Fuel low (${fuelPct}%) — refueling before journey...`);
     
     // Try to refuel at current location if docked
@@ -173,12 +191,12 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       const { pois } = await getSystemInfo(ctx);
       const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
       if (currentStation) {
-        const ok = await refuelAtStation(ctx, currentStation, 50);
+        const ok = await refuelAtStation(ctx, currentStation, refuelThreshold);
         if (!ok) {
-          ctx.log("error", "Failed to refuel at current station — cannot continue");
-          return; // Cancel routine
+          ctx.log("warn", "Refuel failed (station empty?) — proceeding with current fuel for return trip");
+        } else {
+          await ensureDocked(ctx, true);
         }
-        await ensureDocked(ctx, true);
       }
     } else {
       // Need to dock first to refuel (skip storage collection - just need fuel)
@@ -191,8 +209,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       const refuelResp = await bot.exec("refuel");
       if (refuelResp.error) {
         ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
-        // Try to continue anyway if we have some fuel
-        const stillLow = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 < 20 : true;
+        const stillLow = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 < 10 : true;
         if (stillLow) {
           ctx.log("error", "Fuel too low to continue — aborting");
           return; // Cancel routine
@@ -227,7 +244,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       navAttempts++;
       try {
         arrived = await navigateToSystem(ctx, homeSystem, {
-          fuelThresholdPct: 30,
+          fuelThresholdPct: refuelThreshold,
           hullThresholdPct: 40,
           skipBlacklist: ignoreBlacklist,
         });
@@ -326,12 +343,12 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     await repairShip(ctx);
   }
   const dockedFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  if (dockedFuelPct < 50) {
+  if (dockedFuelPct < refuelThreshold) {
     ctx.log("system", `Fuel at ${dockedFuelPct}% — refueling at home station...`);
     const { pois } = await getSystemInfo(ctx);
     const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
     if (currentStation) {
-      await refuelAtStation(ctx, currentStation, 50);
+      await refuelAtStation(ctx, currentStation, refuelThreshold);
       await ensureDocked(ctx, true);
     }
   }

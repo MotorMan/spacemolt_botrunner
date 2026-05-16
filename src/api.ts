@@ -352,7 +352,7 @@ const COMMAND_TTL: Record<string, number> = {
   view_orders: 30_000,
   estimate_purchase: 30_000,
   get_wrecks: 10_000, //doesn't need to be 15.
-  catalog: 3600000_000, //only really needs to be once per client restart, it NEVER changes while running.
+  catalog: 3600_000, //only really needs to be once per client restart, it NEVER changes while running.
 };
 
 const INV_STATUS   = ["get_status", "get_player", "get_queue", "get_skills"];

@@ -1187,6 +1187,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     const settings = getTraderSettings(bot.username);
+    const homeSystem = settings.homeSystem || startSystem;
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
@@ -2008,7 +2009,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("trade", `Cleared cargo: ${depositSummary.join(", ")}`);
       }
 
-      // Ensure we have enough fuel cells for the route
+      // Ensure we have enough fuel cells for the route + return home (exact calc)
       await bot.refreshCargo();
       await bot.refreshStatus();
       let fuelInCargo = 0;
@@ -2016,12 +2017,34 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const lower = item.itemId.toLowerCase();
         if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
       }
-      if (fuelInCargo < RESERVE_FUEL_CELLS) { //why are we not checking if we are at home base first???
-        const freeSpace = getFreeSpace(bot);
-        const needed = Math.min(RESERVE_FUEL_CELLS - fuelInCargo, maxItemsForCargo(freeSpace, "fuel_cell"));
-        if (needed > 0) {
-          ctx.log("trade", `Buying ${needed} fuel cells for ${candidate.jumps}-jump route...`);
-          await bot.exec("buy", { item_id: "fuel_cell", quantity: needed }); //this needs to be changed to check if it's at home base, and if so, withdraw the premium_fuel_cell's!
+      let needed = RESERVE_FUEL_CELLS;
+      try {
+        const r = (await bot.exec("find_route", { target_system: homeSystem })).result as any;
+        if (r?.estimated_fuel && r?.fuel_available) {
+          const deficit = Math.max(0, r.estimated_fuel - r.fuel_available);
+          needed = Math.ceil(deficit / 20); // regular fuel_cell = 20 fuel
+          ctx.log("trade", `Exact return fuel: need ${needed} cells (${deficit} fuel deficit)`);
+        }
+      } catch {}
+      if (fuelInCargo < needed) {
+        const isAtHome = homeSystem && bot.system === homeSystem;
+        let stillNeeded = needed - fuelInCargo;
+        if (isAtHome) {
+          const prem = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
+          if (!prem.error) stillNeeded = Math.max(0, stillNeeded - 50);
+          if (stillNeeded > 0) {
+            const reg = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
+            if (!reg.error) stillNeeded = 0;
+          }
+          if (stillNeeded <= 0) ctx.log("trade", `Withdrew fuel cells from faction storage`);
+        }
+        if (stillNeeded > 0) {
+          const freeSpace = getFreeSpace(bot);
+          const buyQty = Math.min(Math.ceil(stillNeeded / 20), maxItemsForCargo(freeSpace, "fuel_cell"));
+          if (buyQty > 0) {
+            ctx.log("trade", `Buying ${buyQty} fuel cells for return trip (last resort)`);
+            await bot.exec("buy", { item_id: "fuel_cell", quantity: buyQty });
+          }
         }
       }
 
@@ -2808,8 +2831,6 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check if we've recovered our investment
       const totalRevenue = sellRevenue + extraRevenue;
       const isProfitable = totalRevenue >= investedCredits;
-      const homeSystem = settings.homeSystem || startSystem;
-      
       if (!isProfitable && investedCredits > 0 && homeSystem) {
         // Unprofitable trade — return home and deposit to faction storage
         ctx.log("trade", `${remaining}x ${route.itemName} still unsold — trade unprofitable (spent ${investedCredits}cr, earned ${totalRevenue}cr) — returning to home system ${homeSystem} to deposit`);
@@ -2937,7 +2958,6 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     await factionDonateProfit(ctx, actualProfit);
 
     // ── Check for next trade before considering excess credit deposit ──
-    const homeSystem = settings.homeSystem || startSystem;
     yield "seek_next_trade";
     await bot.refreshStatus();
     await bot.refreshCargo();

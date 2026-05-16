@@ -778,7 +778,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           const wormholeDestinationId = surveyResult.wormhole_destination_id as string | undefined;
           const wormholeExpiresIn = surveyResult.wormhole_expires_in as string | undefined;
 
-          if (wormholeExit && wormholeExit.type === "wormhole_exit" && wormholeDestinationId) {
+          if (wormholeExit && (wormholeExit.type === "wormhole_exit" || wormholeExit.type === "wormhole_entrance") && wormholeDestinationId) {
             ctx.log("info", `🌌 Wormhole detected: ${wormholeExit.name} -> ${wormholeDestination}`);
             
             // Register wormhole in mapStore
@@ -935,6 +935,40 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       bot.poi = poi.id;
 
+      // ── Wormhole test: travel to wh POI then jump with same POI id ──
+      const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
+      if (isWormholePoi) {
+        ctx.log("info", `🌌 Testing wormhole ${poi.id}...`);
+        yield `test_wormhole_${poi.id}`;
+        const jumpResp = await bot.exec("jump", { target_poi: poi.id });
+        if (!jumpResp.error) {
+          const r = jumpResp.result as Record<string, unknown> | undefined;
+          if (r && r.action === "jumped") {
+            const fromSystem = (r.from_system as string) || systemId;
+            const exitPoi = (r.poi as string) || "";
+            const destSystem = (r.system as string) || "";
+            const destSystemId = (r.system_id as string) || "";
+            ctx.log("info", `🌌 Wormhole jumped: ${fromSystem} -> ${destSystem} (${exitPoi})`);
+            mapStore.registerWormhole(destSystemId || fromSystem, {
+              id: exitPoi || poi.id,
+              name: exitPoi || poi.name,
+              exit_system_id: destSystemId || fromSystem,
+              exit_system_name: destSystem || destSystemId,
+              exit_poi_id: exitPoi || poi.id,
+              exit_poi_name: exitPoi || poi.name,
+              destination_system_id: fromSystem,
+              destination_system_name: bot.system || fromSystem,
+            });
+            // Mark both entrance and exit POIs explored
+            mapStore.markExplored(systemId, poi.id);
+            if (destSystemId) mapStore.markExplored(destSystemId, exitPoi);
+          }
+        }
+        // Refresh status after wormhole jump
+        await bot.refreshStatus();
+        continue; // Skip normal POI visit, restart loop in new system
+      }
+
       // Scavenge wrecks/containers at each POI (only if enabled — unsafe near pirates)
       if (explorerSettings.scavengeEnabled) {
         yield "scavenge";
@@ -1010,12 +1044,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       const fuelCellCheck = await checkFuelCellInventory(ctx);
       // Only return if we previously had fuel cells (cargo was full with them) but now they're gone
       // This prevents unnecessary trips when we never loaded fuel cells in the first place
-      if (fuelCellCheck.totalFuelCells === 0) {
-        ctx.log("system", `Fuel cells depleted (0 remaining) — returning to home base to reload`);
+      if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock premium fuel cells`);
         yield "return_to_home_fuel_cells";
         const returned = await returnToHomeBaseForFuelCells(ctx);
         if (returned) {
-          // After returning, restart the loop to continue exploration
           await bot.refreshStatus();
           ctx.log("info", `Returned to home base — continuing exploration`);
           continue;
@@ -2536,16 +2569,17 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const tradeFuelSettings = getExplorerSettings(bot.username);
       if (tradeFuelSettings.returnToHomeOnFuelCellDepletion) {
         const fuelCellCheck = await checkFuelCellInventory(ctx);
-        if (fuelCellCheck.totalFuelCells === 0) {
-          ctx.log("system", `Fuel cells depleted (0 remaining) — returning to home base to reload`);
+        if (fuelCellCheck.totalFuelCells < 3) {
+          ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock premium fuel cells`);
           yield "return_to_home_fuel_cells";
           const returned = await returnToHomeBaseForFuelCells(ctx);
           if (returned) {
             await bot.refreshStatus();
-            ctx.log("info", `Returned to home base — continuing trade update`);
-            break; // Break to restart the while loop
+            ctx.log("info", `Returned to home base — continuing exploration`);
+            continue;
           }
         }
+        
       }
 
       // ── Check skills ──

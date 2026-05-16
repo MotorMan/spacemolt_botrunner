@@ -1416,7 +1416,9 @@ export async function navigateToSystem(
           ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route`);
         } else {
           nextSystem = routeData.route[1].system_id;
+          const fullRoute = routeData.route.map(r => r.system_id).join(" → ");
           ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
+          ctx.log("debug", `Server returned full route for ${targetSystemId}: ${fullRoute}`);
         }
       }
 
@@ -1465,7 +1467,7 @@ export async function navigateToSystem(
     }
 
     // Fuel check — MUST have adequate fuel before jumping
-    const fueled = await ensureFueled(ctx, Math.max(opts.fuelThresholdPct, 25), { noJettison: opts.noJettison });
+    const fueled = await ensureFueled(ctx, Math.max(opts.fuelThresholdPct, 1), { noJettison: opts.noJettison }); //changed to 1.
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;
@@ -1513,7 +1515,9 @@ export async function navigateToSystem(
           ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route (post-fuel)`);
         } else {
           nextSystem = routeData.route[1].system_id;
+          const fullRoute = routeData.route.map(r => r.system_id).join(" → ");
           ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
+          ctx.log("debug", `Server returned full route for ${targetSystemId}: ${fullRoute}`);
         }
       }
 
@@ -1666,6 +1670,10 @@ export async function navigateToSystem(
             const startsHere = ids[0] && normalizeSystemName(ids[0]) === normalizeSystemName(bot.system);
             if (startsHere) {
               retryRoute = ids;
+              const full = ids.join(" → ");
+              ctx.log("debug", `Fresh server route after wait for ${targetSystemId}: ${full}`);
+            } else {
+              ctx.log("warn", `Fresh server route after wait rejected — does not start at ${bot.system}`);
             }
           }
         }

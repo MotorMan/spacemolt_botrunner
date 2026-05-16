@@ -113,6 +113,7 @@ function getRescueSettings(): {
   fleetRescueBot: string;
   maydayRescueBot: string;
   premiumFuelReserve: number;
+  maxFuelDelivery: number;
 } {
   const all = readSettings();
   const r = all.rescue || {};
@@ -139,6 +140,7 @@ function getRescueSettings(): {
     fleetRescueBot: (r.fleetRescueBot as string) || '',
     maydayRescueBot: (r.maydayRescueBot as string) || '',
     premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
+    maxFuelDelivery: (r.maxFuelDelivery as number) || 1000,
   };
 }
 
@@ -740,6 +742,7 @@ async function sendRescueBill(
   isMayday: boolean
 ): Promise<void> {
   const aiChatService = (globalThis as any).aiChatService;
+  ctx.log("rescue", `📧 DEBUG sendRescueBill: target=${targetUsername}, jumps=${jumpsToTarget}+${jumpsToHome}, fuel=${fuelDelivered}, total=${bill.total}, isMayday=${isMayday}`);
   if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
     try {
       const result = await aiChatService.sendPrivateMessage(ctx.bot, targetUsername, {
@@ -2784,12 +2787,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           continue;
         }
 
-        // Calculate maximum fuel to deliver (1/3 of current fuel)
-        const maxDeliverable = Math.floor(bot.fuel / 3);
-        ctx.log(logCategory, `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel})`);
+          // Calculate maximum fuel to deliver (capped by setting)
+          const rescueSettings = getRescueSettings();
+          const maxDeliverable = Math.min(Math.floor(bot.fuel / 3), rescueSettings.maxFuelDelivery);
+          ctx.log(logCategory, `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel}, capped at ${rescueSettings.maxFuelDelivery})`);
 
-        // Issue the refuel command
-        const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
+         const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
         // Check for battle notifications after refuel
         if (await checkBattleAfterCommand(ctx, refuelResp.notifications, "refuel", battleState)) {
           ctx.log("combat", "Battle detected during fuel transfer - fleeing!");
@@ -3160,6 +3163,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       ctx.log("rescue", `   • TOTAL: ${bill.total} credits`);
       
       if (bill.total > 0) {
+        ctx.log("rescue", `📋 Billing debug: jumps=${jumpsToTarget}, fuel=${fuelDelivered}, total=${bill.total}`);
         // Send bill via private message FIRST
         await sendRescueBill(
           ctx,
@@ -3568,9 +3572,10 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         // Direct refuel using refuel command
         ctx.log("rescue", `Refueling ${player.username}${player.shipType ? ` (${player.shipType})` : ''}...`);
 
-        // Calculate maximum fuel to deliver (1/3 of current fuel)
-        const maxDeliverable = Math.floor(bot.fuel / 3);
-        ctx.log("rescue", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel})`);
+        // Calculate maximum fuel to deliver (capped by setting)
+        const rescueSettings = getRescueSettings();
+        const maxDeliverable = Math.min(Math.floor(bot.fuel / 3), rescueSettings.maxFuelDelivery);
+        ctx.log("rescue", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel}, capped at ${rescueSettings.maxFuelDelivery})`);
 
         const refuelResp = await bot.exec("refuel", { target: player.playerId, quantity: maxDeliverable });
         // Check for battle notifications after refuel
@@ -4139,9 +4144,10 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
         // Direct refuel using refuel command
         ctx.log("mayday", `Refueling ${mayday.sender}...`);
 
-        // Calculate maximum fuel to deliver (1/3 of current fuel)
-        const maxDeliverable = Math.floor(bot.fuel / 3);
-        ctx.log("mayday", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel})`);
+        // Calculate maximum fuel to deliver (capped by setting)
+        const rescueSettings = getRescueSettings();
+        const maxDeliverable = Math.min(Math.floor(bot.fuel / 3), rescueSettings.maxFuelDelivery);
+        ctx.log("mayday", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel}, capped at ${rescueSettings.maxFuelDelivery})`);
 
         const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
         // Check for battle notifications after refuel
@@ -6166,11 +6172,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         continue;
       }
 
-      // Calculate maximum fuel to deliver (1/3 of current fuel)
-      const maxDeliverable = Math.floor(bot.fuel / 3);
-      ctx.log("rescue", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel})`);
+      // Calculate maximum fuel to deliver (capped by setting)
+      const rescueSettings = getRescueSettings();
+      const maxDeliverable = Math.min(Math.floor(bot.fuel / 3), rescueSettings.maxFuelDelivery);
+      ctx.log("rescue", `Calculated max fuel to deliver: ${maxDeliverable} (1/3 of ${bot.fuel}, capped at ${rescueSettings.maxFuelDelivery})`);
 
-      // Issue the refuel command
       const refuelResp = await bot.exec("refuel", { target: targetPlayerId, quantity: maxDeliverable });
 
       if (refuelResp.error) {
@@ -6322,6 +6328,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       // Note: The bill message includes rescue completion info, so no separate message is needed
       const aiChatService = (globalThis as any).aiChatService;
       if (bill.total > 0) {
+        ctx.log("rescue", `📋 Billing debug: jumps=${jumpsToTarget}, fuel=${fuelDeliveredBill}, total=${bill.total}`);
         await sendRescueBill(
           ctx,
           activeSessionForBill.targetUsername,

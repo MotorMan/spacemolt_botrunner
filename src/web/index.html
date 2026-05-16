@@ -5603,7 +5603,7 @@ function mcSurveySystem() {
       const wormholeDestinationId = surveyData.wormhole_destination_id;
       const wormholeExpiresIn = surveyData.wormhole_expires_in;
 
-      if (wormholePoi && wormholePoi.type === 'wormhole_exit' && wormholeDestinationId) {
+      if (wormholePoi && (wormholePoi.type === 'wormhole_exit' || wormholePoi.type === 'wormhole_entrance') && wormholeDestinationId) {
         logResponse(`<span class="resp-info">🌌 Wormhole detected: ${esc(wormholePoi.name)} -> ${esc(wormholeDestination)}</span>`);
         
         // Register wormhole via API
@@ -7435,6 +7435,7 @@ function renderReturnHomeSettings(panel) {
   const returnHome = settings.return_home || {};
   const homeSystem = returnHome.homeSystem || '';
   const homeStation = returnHome.homeStation || '';
+  const refuelThreshold = returnHome.refuelThreshold ?? 50;
 
   // Build station options from mapData
   let stationOpts = '<option value="">(not set)</option>';
@@ -7491,6 +7492,14 @@ function renderReturnHomeSettings(panel) {
       <select id="set-returnhome-station">${stationOpts}</select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Refuel if fuel below this % before/after journeys. 0-99 (no upper limit enforced).</div>
+      </div>
+      <input type="number" id="set-returnhome-refuelThreshold" min="0" value="${refuelThreshold}" style="width:80px" />
+    </div>
+
     ${perBotHtml}
 
     <div class="setting-section">
@@ -7517,7 +7526,8 @@ function renderReturnHomeSettings(panel) {
 function saveReturnHomeSettings() {
   const stationVal = document.getElementById('set-returnhome-station').value;
   const [homeSystem, homeStation] = stationVal ? stationVal.split('|') : ['', ''];
-  const s = { homeSystem, homeStation };
+  const refuelThreshold = parseInt(document.getElementById('set-returnhome-refuelThreshold').value) || 50;
+  const s = { homeSystem, homeStation, refuelThreshold };
   send({ type: 'saveSettings', routine: 'return_home', settings: s });
   settings.return_home = Object.assign(settings.return_home || {}, s);
 }
@@ -8955,6 +8965,7 @@ function renderRescueSettings(panel) {
   const r = settings.rescue || {};
   const fuelThreshold = r.fuelThreshold ?? 10;
   const rescueFuelCells = r.rescueFuelCells ?? 10;
+  const maxFuelDelivery = r.maxFuelDelivery ?? 1000;
   const rescueCredits = r.rescueCredits ?? 500;
   const scanIntervalSec = r.scanIntervalSec ?? 30;
   const refuelThreshold = r.refuelThreshold ?? 60;
@@ -9064,6 +9075,12 @@ function renderRescueSettings(panel) {
     </div>
 
     <div class="settings-group">
+      <label>Max fuel delivery (units)</label>
+      <input type="number" id="set-rescue-maxFuelDelivery" value="${maxFuelDelivery}" min="100" max="5000" style="width:80px">
+      <small style="color:var(--dim)">Hard cap on fuel units transferred per rescue (prevents costly accidents)</small>
+    </div>
+
+    <div class="settings-group">
       <label>Credits to send</label>
       <input type="number" id="set-rescue-credits" value="${rescueCredits}" min="0" max="10000" style="width:80px">
       <small style="color:var(--dim)">Credits to gift when fuel cells unavailable (0 = disabled)</small>
@@ -9142,6 +9159,7 @@ function saveRescueSettings() {
     homeStation: document.getElementById('set-rescue-homeStation').value || '',
     fuelThreshold: parseInt(document.getElementById('set-rescue-fuelThreshold').value) || 10,
     rescueFuelCells: parseInt(document.getElementById('set-rescue-fuelCells').value) || 10,
+    maxFuelDelivery: parseInt(document.getElementById('set-rescue-maxFuelDelivery').value) || 1000,
     rescueCredits: parseInt(document.getElementById('set-rescue-credits').value) || 500,
     scanIntervalSec: parseInt(document.getElementById('set-rescue-scanInterval').value) || 30,
     refuelThreshold: parseInt(document.getElementById('set-rescue-refuelThreshold').value) || 60,

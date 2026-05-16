@@ -1338,6 +1338,42 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("trade", `Unloaded ${unloadedItems.join(", ")} → ${label}`);
     }
 
+    // Exact fuel cells for return home (route estimated_fuel)
+    await bot.refreshCargo();
+    let fuelInCargo = 0;
+    for (const item of bot.inventory) {
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
+    }
+    try {
+      const r = (await bot.exec("find_route", { target_system: homeSystem })).result as any;
+      if (r?.estimated_fuel && r?.fuel_available != null) {
+        const deficit = Math.max(0, r.estimated_fuel - r.fuel_available);
+        const needed = Math.ceil(deficit / 20);
+        if (fuelInCargo < needed) {
+          const isAtHome = homeSystem && bot.system === homeSystem;
+          let stillNeeded = needed - fuelInCargo;
+          if (isAtHome) {
+            const premResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
+            if (!premResp.error) stillNeeded = Math.max(0, stillNeeded - 50);
+            if (stillNeeded > 0) {
+              const regResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
+              if (!regResp.error) stillNeeded = 0;
+            }
+            if (stillNeeded <= 0) ctx.log("salvage", `Withdrew fuel cells from faction storage`);
+          }
+          if (stillNeeded > 0) {
+            const free = Math.max(0, (bot.cargoMax || 50) - bot.cargo);
+            const buyQty = Math.min(Math.ceil(stillNeeded / 20), Math.floor(free));
+            if (buyQty > 0) {
+              ctx.log("salvage", `Buying ${buyQty} fuel cells for return (last resort)`);
+              await bot.exec("buy", { item_id: "fuel_cell", quantity: buyQty });
+            }
+          }
+        }
+      }
+    } catch {}
+
     await bot.refreshStatus();
 
     const earnings = bot.credits - creditsBefore;

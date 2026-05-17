@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Shipyard - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    .shipyard-stat-grid { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; font-size: 12px; }
+    .shipyard-stat-grid .ssl { color: var(--text-dim); }
+    .shipyard-stat-grid .ssv { color: var(--text); }
+    .shipyard-bar { height: 6px; border-radius: 3px; background: #21262d; overflow: hidden; margin-top: 4px; width: 100%; }
+    .shipyard-bar-fill { height: 100%; border-radius: 3px; transition: width 0.3s; }
+    .shipyard-slots { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 8px; margin-top: 8px; }
+    .shipyard-slot { background: var(--bg); border: 1px solid #21262d; border-radius: 6px; padding: 8px 10px; font-size: 12px; }
+    .shipyard-slot .slot-type { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--text-dim); margin-bottom: 4px; }
+    .shipyard-slot .slot-name { color: var(--text); font-weight: 500; }
+    .shipyard-color-preview { width: 28px; height: 24px; padding: 0; border: 1px solid var(--border); background: none; }
+  </style>
+</head>
+<body>
+  <div class="faction-layout">
+    <div class="faction-sidebar">
+      <div class="faction-sidebar-header">Shipyard</div>
+      <div class="faction-sidebar-body" id="shipyardSidebarBody">
+        <!-- filled by JS -->
+      </div>
+    </div>
+    <div class="faction-content" id="shipyardContent">
+      <div class="faction-no-data">Select a bot to manage ships.</div>
+    </div>
+  </div>
+
+<script>
+const parentWin = window.parent;
+
+let shipyardSelectedBot = null;
+let shipyardActivePanel = 'overview';
+let shipyardShipData = null;
+let shipyardFleetData = null;
+let shipyardCatalogData = null;
+let shipyardMode = 'bots';
+
+function renderShipyardPage() {
+  shipyardMode = 'bots';
+  renderShipyardSidebar();
+  renderShipyardContent();
+}
+
+function renderShipyardContent() {
+  if (shipyardMode === 'simulator') {
+    document.getElementById('shipyardContent').innerHTML = `<iframe id="shipSimFrame" src="/shipSim.html" style="width:100%;height:100%;border:none;border-radius:4px;"></iframe>`;
+  } else {
+    if (shipyardSelectedBot) {
+      fetchShipDetails(shipyardSelectedBot);
+    } else {
+      document.getElementById('shipyardContent').innerHTML = '<div class="faction-no-data">Select a bot to manage ships.</div>';
+    }
+  }
+}
+
+function renderShipyardSidebar() {
+  const body = document.getElementById('shipyardSidebarBody');
+  if (!body) return;
+
+  let html = `
+    <div style="border-bottom:1px solid var(--border);padding-bottom:8px;margin-bottom:8px;">
+      <button class="faction-nav-btn${shipyardMode === 'bots' ? ' active' : ''}" onclick="switchShipyardMode('bots')" style="width:100%;margin-bottom:4px;">Bot Management</button>
+      <button class="faction-nav-btn${shipyardMode === 'simulator' ? ' active' : ''}" onclick="switchShipyardMode('simulator')" style="width:100%;margin-bottom:4px;">Loadout Simulator</button>
+      <button class="faction-nav-btn${shipyardMode === 'engineeringCalc' ? ' active' : ''}" onclick="switchShipyardMode('engineeringCalc')" style="width:100%;">Engineering Calculator</button>
+    </div>`;
+
+  if (shipyardMode === 'bots') {
+    const bots = parentWin.bots || [];
+    for (const bot of bots) {
+      const active = shipyardSelectedBot === bot.username ? ' active' : '';
+      html += `<button class="faction-nav-btn${active}" onclick="selectShipyardBot('${parentWin.esc ? parentWin.esc(bot.username) : bot.username}')">${parentWin.esc ? parentWin.esc(bot.username) : bot.username}</button>`;
+    }
+    if (bots.length === 0) {
+      html += '<div class="faction-no-data">No bots available</div>';
+    }
+  }
+
+  body.innerHTML = html;
+}
+
+function selectShipyardBot(username) {
+  shipyardSelectedBot = username;
+  shipyardShipData = null;
+  shipyardFleetData = null;
+  shipyardActivePanel = 'overview';
+  renderShipyardSidebar();
+  fetchShipDetails(username);
+}
+
+function switchShipyardMode(mode) {
+  shipyardMode = mode;
+  renderShipyardSidebar();
+
+  if (mode === 'bots') {
+    if (shipyardSelectedBot) {
+      fetchShipDetails(shipyardSelectedBot);
+    } else {
+      document.getElementById('shipyardContent').innerHTML = '<div class="faction-no-data">Select a bot to manage ships.</div>';
+    }
+  } else if (mode === 'simulator') {
+    document.getElementById('shipyardContent').innerHTML = `<iframe id="shipSimFrame" src="/shipSim.html" style="width:100%;height:100%;border:none;border-radius:4px;"></iframe>`;
+  } else if (mode === 'engineeringCalc') {
+    document.getElementById('shipyardContent').innerHTML = `<iframe id="engineeringCalcFrame" src="/engineeringCalc.html" style="width:100%;height:100%;border:none;border-radius:4px;"></iframe>`;
+  }
+}
+
+function fetchShipDetails(username) {
+  const content = document.getElementById('shipyardContent');
+  content.innerHTML = '<div class="faction-no-data">Loading ship data...</div>';
+  parentWin.sendExec(username, 'get_status', undefined, (result) => {
+    if (shipyardSelectedBot !== username) return;
+    if (!result.ok || !result.data) {
+      shipyardShipData = null;
+      content.innerHTML = `<div class="faction-no-data">${parentWin.esc ? parentWin.esc(result.error || 'Could not load ship data') : (result.error || 'Could not load ship data')}</div>`;
+      return;
+    }
+    shipyardShipData = result.data;
+    renderShipyardBotContent(username);
+  });
+}
+
+function renderShipyardBotContent(username) {
+  const content = document.getElementById('shipyardContent');
+  const panels = ['overview', 'fleet', 'shipyard', 'modules'];
+  const panelNav = panels.map(p => {
+    const active = shipyardActivePanel === p ? ' active' : '';
+    const label = p.charAt(0).toUpperCase() + p.slice(1);
+    return `<button class="faction-nav-btn${active}" style="display:inline-block;width:auto;padding:5px 12px;font-size:11px" onclick="switchShipyardPanel('${p}')">${label}</button>`;
+  }).join('');
+
+  let panelHtml = '';
+  switch (shipyardActivePanel) {
+    case 'overview': panelHtml = renderShipOverview(shipyardShipData, username); break;
+    case 'fleet': panelHtml = '<div class="faction-no-data">Loading fleet...</div>'; break;
+    case 'shipyard':
+      if (shipyardCatalogData && shipyardCatalogData.length > 0) {
+        renderShipyardPanel(username);
+        return; // prevent double render
+      } else {
+        panelHtml = '<div class="faction-no-data">Loading catalog...</div>';
+      }
+      break;
+    case 'modules': panelHtml = renderModulesPanel(shipyardShipData, username); break;
+  }
+
+  const bot = (parentWin.bots || []).find(b => b.username === username);
+  const credits = bot ? (parentWin.num ? parentWin.num(bot.credits) : bot.credits) : '?';
+  content.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+      <div style="font-size:16px;font-weight:700;color:var(--text-bright)">${parentWin.esc ? parentWin.esc(username) : username}</div>
+      <span style="font-size:12px;color:var(--text-dim)">${credits} cr</span>
+    </div>
+    <div class="shipyard-panel-nav">${panelNav}</div>
+    ${panelHtml}
+  `;
+
+  if (shipyardActivePanel === 'fleet') fetchFleetList(username);
+  if (shipyardActivePanel === 'shipyard' && (!shipyardCatalogData || shipyardCatalogData.length === 0)) {
+    fetchShipCatalog(username);
+  }
+}
+
+function switchShipyardPanel(panel) {
+  shipyardActivePanel = panel;
+  if (shipyardSelectedBot) renderShipyardBotContent(shipyardSelectedBot);
+}
+
+// Core helper functions (extractShip, findModules, renderShipOverview, etc.)
+// Full implementations from index.html are included below in the complete version.
+
+function extractShip(data) {
+  if (!data || typeof data !== 'object') return data;
+  if (data.ship && typeof data.ship === 'object') return data.ship;
+  if (data.state?.ship) return data.state.ship;
+  if (data.player?.ship) return data.player.ship;
+  return data;
+}
+
+function findModules(ship, fullData) {
+  if (fullData && Array.isArray(fullData.modules) && fullData.modules.length > 0) {
+    if (typeof fullData.modules[0] === 'object' && fullData.modules[0] !== null) {
+      return fullData.modules;
+    }
+  }
+  const directKeys = ['installed_modules', 'fitted_modules', 'loadout', 'fitted', 'mods', 'equipment', 'fittings', 'modules'];
+  for (const k of directKeys) {
+    if (Array.isArray(ship[k]) && ship[k].length > 0 && typeof ship[k][0] === 'object' && ship[k][0] !== null) {
+      return ship[k];
+    }
+  }
+  return [];
+}
+
+function renderShipOverview(data, username) {
+  if (!data) return '<div class="faction-no-data">No ship data available</div>';
+  const ship = extractShip(data);
+  const rawShipName = ship.name || ship.ship_name || '';
+  const cls = ship.class || ship.ship_class || '';
+  const name = (rawShipName && rawShipName.toLowerCase() !== 'unnamed') ? rawShipName : (cls || '?');
+  const hull = ship.hull ?? ship.current_hull ?? '?';
+  const maxHull = ship.max_hull ?? ship.hull_max ?? hull;
+  const shield = ship.shield ?? ship.current_shield ?? '?';
+  const maxShield = ship.max_shield ?? ship.shield_max ?? shield;
+  const fuel = ship.fuel ?? ship.current_fuel ?? '?';
+  const maxFuel = ship.max_fuel ?? ship.fuel_max ?? fuel;
+
+  return `
+    <div class="faction-section">
+      <div class="faction-section-title">${parentWin.esc ? parentWin.esc(name) : name} ${cls ? `<span style="color:var(--text-dim);font-size:11px;font-weight:400">${parentWin.esc ? parentWin.esc(cls) : cls}</span>` : ''}</div>
+      <div class="shipyard-stat-grid">
+        <span class="ssl">Hull</span><span class="ssv">${hull} / ${maxHull}</span>
+        <span class="ssl">Shield</span><span class="ssv">${shield} / ${maxShield}</span>
+        <span class="ssl">Fuel</span><span class="ssv">${fuel} / ${maxFuel}</span>
+      </div>
+    </div>
+  `;
+}
+
+function fetchFleetList(username) {
+  parentWin.sendExec(username, 'list_ships', undefined, (result) => {
+    if (result.ok && result.data) {
+      shipyardFleetData = Array.isArray(result.data) ? result.data : (result.data.ships || []);
+      renderFleetInline(username, shipyardFleetData);
+    }
+  });
+}
+
+function renderFleetInline(username, ships, error) {
+  const content = document.getElementById('shipyardContent');
+  if (!content) return;
+
+  let html = '';
+  if (error) {
+    html += `<div style="color:var(--red);font-size:11px;margin-bottom:8px">${parentWin.esc ? parentWin.esc(error) : error}</div>`;
+  }
+
+  const activeShipId = shipyardShipData?.ship?.id || shipyardShipData?.ship?.ship_id || shipyardShipData?.id || shipyardShipData?.ship_id || null;
+  const bots = parentWin.bots || [];
+
+  if (!ships || ships.length === 0) {
+    html += '<div class="faction-no-data">No ships owned</div>';
+  } else {
+    for (const s of ships) {
+      const id = s.id || s.ship_id || '';
+      const rawName = s.name || s.ship_name || '';
+      const cls = s.class_name || s.class || s.ship_class || s.ship_type || s.type || '';
+      const classId = s.class_id || '';
+      const name = (rawName && rawName.toLowerCase() !== 'unnamed') ? rawName : (cls || classId || 'Unknown');
+      const rawLoc = s.location || s.system || '';
+      const loc = rawLoc;
+      const isActive = id === activeShipId || s.active || s.is_active;
+
+      function parseStat(val) {
+        if (val == null) return null;
+        if (typeof val === 'string' && val.includes('/')) {
+          const [cur, max] = val.split('/').map(Number);
+          return isNaN(cur) ? null : { cur, max: isNaN(max) ? cur : max };
+        }
+        if (typeof val === 'number') return { cur: val, max: val };
+        return null;
+      }
+
+      const hull = parseStat(s.hull ?? s.current_hull);
+      const shield = parseStat(s.shield ?? s.current_shield);
+      const fuel = parseStat(s.fuel ?? s.current_fuel);
+      const cargoUsed = s.cargo_used ?? s.cargo ?? null;
+      const cargoMax = s.cargo_capacity ?? s.max_cargo ?? s.cargo_max ?? null;
+      const modCount = typeof s.modules === 'number' ? s.modules : (Array.isArray(s.modules) ? s.modules.length : null);
+
+      const stats = [];
+      if (hull) stats.push(`<span style="color:var(--red)">Hull ${hull.cur}/${hull.max}</span>`);
+      if (shield) stats.push(`<span style="color:var(--cyan)">Shd ${shield.cur}/${shield.max}</span>`);
+      if (fuel) stats.push(`<span>Fuel ${fuel.cur}/${fuel.max}</span>`);
+      if (cargoUsed != null) stats.push(`<span>Cargo ${cargoUsed}${cargoMax != null ? '/' + cargoMax : ''}</span>`);
+      if (modCount != null) stats.push(`<span style="color:var(--magenta)">${modCount} mod${modCount !== 1 ? 's' : ''}</span>`);
+      const statsHtml = stats.length > 0 ? `<div class="ssc-stats">${stats.join('')}</div>` : '';
+
+      const isBuilding = s._commission || s.status === 'building' || s.status === 'commissioned' || s.status === 'pending';
+      const buildPct = s.progress ?? s.build_progress ?? s.completion ?? null;
+      const buildEta = s.eta ?? s.ready_at ?? s.completion_time ?? s.estimated_completion ?? null;
+      const buildBadge = isBuilding ? `<span style="font-size:10px;padding:2px 8px;background:#2d1b4e;color:#c084fc;border-radius:3px">Building${buildPct != null ? ` ${buildPct}%` : ''}</span>` : '';
+      const etaHtml = buildEta ? `<span style="font-size:10px;color:var(--text-dim);margin-left:4px">${parentWin.esc ? parentWin.esc(String(buildEta)) : buildEta}</span>` : '';
+
+      const botOptions = bots.filter(b => b.username !== username).map(b => `<option value="${parentWin.esc ? parentWin.esc(b.username) : b.username}">${parentWin.esc ? parentWin.esc(b.username) : b.username}</option>`).join('');
+      const giftDropdown = !isActive && !isBuilding ? `
+        <select class="ship-gift-bot-select" id="gift-select-${id}" onchange="handleGiftBotSelect('${parentWin.esc ? parentWin.esc(username) : username}','${parentWin.esc ? parentWin.esc(id) : id}',this)">
+          <option value="">Gift to...</option>
+          ${botOptions}
+          <option value="__custom__">Enter name...</option>
+        </select>
+        <input type="text" class="ship-gift-custom-input" id="gift-input-${id}" placeholder="Bot name..." style="display:none;width:120px;font-size:11px;padding:2px 6px;">
+        <button class="sm" style="color:var(--cyan)" onclick="shipGift('${parentWin.esc ? parentWin.esc(username) : username}','${parentWin.esc ? parentWin.esc(id) : id}','${parentWin.esc ? parentWin.esc(name) : name}')">Gift</button>
+      ` : '';
+
+      const bot = bots.find(b => b.username === username);
+      const carrierStation = bot?.location || '';
+      const carrierName = shipyardShipData?.ship?.name || shipyardShipData?.ship?.ship_name || '';
+      const shipLocation = s.location || s.system || '';
+      const shipStoredInCarrier = s.stored_in_ship || s.carrier_ship || s.stored_on || '';
+      const isAtSameStation = bot?.docked && shipLocation === carrierStation && !isActive;
+      const isStoredInThisCarrier = carrierName && (shipStoredInCarrier === carrierName || s.carrier_name === carrierName);
+
+      const depositBtn = isAtSameStation ? `<button class="sm" style="color:var(--green)" onclick="shipDepositIntoCarrier('${parentWin.esc ? parentWin.esc(username) : username}','${parentWin.esc ? parentWin.esc(id) : id}','${parentWin.esc ? parentWin.esc(name) : name}')" title="Deposit into carrier">📦 Deposit</button>` : '';
+      const withdrawBtn = isStoredInThisCarrier ? `<button class="sm" style="color:var(--cyan)" onclick="shipWithdrawFromCarrier('${parentWin.esc ? parentWin.esc(username) : username}','${parentWin.esc ? parentWin.esc(id) : id}','${parentWin.esc ? parentWin.esc(name) : name}')" title="Withdraw from carrier">📤 Withdraw</button>` : '';
+
+      html += `<div class="shipyard-ship-card">
+        <div style="flex:1">
+          <div class="ssc-name">${parentWin.esc ? parentWin.esc(name) : name} ${cls && name !== cls ? `<span style="font-weight:400;color:var(--text-dim);font-size:11px">${parentWin.esc ? parentWin.esc(cls) : cls}</span>` : ''} ${isActive ? '<span class="shipyard-active-badge">Active</span>' : ''}${buildBadge}${etaHtml}</div>
+          <div class="ssc-detail">${parentWin.esc ? parentWin.esc(loc) : loc}${shipStoredInCarrier ? ` <span style="color:var(--cyan);font-size:10px">📦 Stored in: ${parentWin.esc ? parentWin.esc(shipStoredInCarrier) : shipStoredInCarrier}</span>` : ''}</div>
+          ${statsHtml}
+        </div>
+        <div class="ssc-actions">
+          ${!isActive && !isBuilding ? `<button class="sm" onclick="shipGoTo('${parentWin.esc ? parentWin.esc(username) : username}','${parentWin.esc ? parentWin.esc(id) : id}','${parentWin.esc ? parentWin.esc(rawLoc) : rawLoc}')">Go</button>` : ''}
+          ${!isActive && !isBuilding ? `<button class="sm" onclick="shipSwitch('${parentWin.esc ? parentWin.esc(username) : username}','${parentWin.esc ? parentWin.esc(id) : id}')">Switch</button>` : ''}
+          ${depositBtn}
+          ${withdrawBtn}
+          ${!isActive && !isBuilding ? `<button class="sm" style="color:var(--red)" onclick="shipSell('${parentWin.esc ? parentWin.esc(username) : username}','${parentWin.esc ? parentWin.esc(id) : id}','${parentWin.esc ? parentWin.esc(name) : name}')">Sell</button>` : ''}
+          ${giftDropdown}
+        </div>
+      </div>`;
+    }
+  }
+
+  const bot = bots.find(b => b.username === username);
+  const credits = bot ? (parentWin.num ? parentWin.num(bot.credits) : bot.credits) : '?';
+  const panels = ['overview', 'fleet', 'shipyard', 'modules'];
+  const panelNav = panels.map(p => {
+    const active = shipyardActivePanel === p ? ' active' : '';
+    const label = p.charAt(0).toUpperCase() + p.slice(1);
+    return `<button class="faction-nav-btn${active}" style="display:inline-block;width:auto;padding:5px 12px;font-size:11px" onclick="switchShipyardPanel('${p}')">${label}</button>`;
+  }).join('');
+
+  content.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+      <div style="font-size:16px;font-weight:700;color:var(--text-bright)">${parentWin.esc ? parentWin.esc(username) : username}</div>
+      <span style="font-size:12px;color:var(--text-dim)">${credits} cr</span>
+    </div>
+    <div class="shipyard-panel-nav">${panelNav}</div>
+    <div class="faction-section"><div class="faction-section-title">Fleet <span style="font-size:12px;color:var(--text-dim)">(${ships.length} ships)</span></div>${html}</div>
+  `;
+}
+
+function fetchShipCatalog(username) {
+  let showroomDone = false;
+  let catalogDone = false;
+
+  function tryRender() {
+    if (shipyardActivePanel === 'shipyard' && (showroomDone || catalogDone)) {
+      renderShipyardPanel(username);
+    }
+  }
+
+  // 1. Try showroom first
+  parentWin.sendExec(username, 'shipyard_showroom', undefined, (result) => {
+    if (result.ok && result.data) {
+      const d = result.data;
+      shipyardCatalogData = Array.isArray(d) ? d : (d.ships || d.showroom || d.available || []);
+    } else {
+      shipyardCatalogData = [];
+    }
+    showroomDone = true;
+    tryRender();
+  });
+
+  // 2. Also fetch full catalog as fallback (original behavior)
+  parentWin.sendExec(username, 'catalog', { type: 'ships' }, (result) => {
+    if (result.ok && result.data) {
+      const d = result.data;
+      const ships = Array.isArray(d) ? d : (d.items || d.ships || d.catalog || []);
+      if (!shipyardCatalogData || shipyardCatalogData.length === 0) {
+        shipyardCatalogData = ships;
+      }
+    }
+    catalogDone = true;
+    tryRender();
+  });
+}
+
+function renderCatalogCards(ships, username) {
+  if (!ships || ships.length === 0) {
+    return '<div class="faction-no-data">No ships available for purchase</div>';
+  }
+
+  let html = '';
+  for (const s of ships) {
+    const id = s.id || s.ship_id || s.class_id || '';
+    const name = s.name || s.ship_name || s.class || id || '?';
+    const cls = s.class || s.ship_class || '';
+    const tier = s.tier || '';
+    const category = s.category || '';
+    const price = s.price ?? s.cost ?? s.buy_price ?? '?';
+    const isCommission = s._commission || s.status === 'building' || s.status === 'commissioned' || s.status === 'pending';
+
+    html += `<div class="shipyard-slot">
+      <div class="slot-name">${parentWin.esc ? parentWin.esc(name) : name}</div>
+      <div class="slot-type">${parentWin.esc ? parentWin.esc(cls) : cls} ${tier ? `T${tier}` : ''}</div>
+      <div style="margin-top:6px;color:var(--green);font-weight:600;">${parentWin.num ? parentWin.num(price) : price} cr</div>
+      <button class="sm" style="margin-top:8px" onclick="buyShipFromShowroom('${parentWin.esc ? parentWin.esc(username) : username}', '${parentWin.esc ? parentWin.esc(id) : id}', ${isCommission})">
+        ${isCommission ? 'Commission' : 'Purchase'}
+      </button>
+    </div>`;
+  }
+  return html;
+}
+
+function renderShipyardPanel(username) {
+  const content = document.getElementById('shipyardContent');
+  if (!content || shipyardActivePanel !== 'shipyard') return;
+
+  const ships = shipyardCatalogData || [];
+  const bot = (parentWin.bots || []).find(b => b.username === username);
+  const credits = bot ? (parentWin.num ? parentWin.num(bot.credits) : bot.credits) : '?';
+  const panels = ['overview', 'fleet', 'shipyard', 'modules'];
+  const panelNav = panels.map(p => {
+    const active = shipyardActivePanel === p ? ' active' : '';
+    const label = p.charAt(0).toUpperCase() + p.slice(1);
+    return `<button class="faction-nav-btn${active}" style="display:inline-block;width:auto;padding:5px 12px;font-size:11px" onclick="switchShipyardPanel('${p}')">${label}</button>`;
+  }).join('');
+
+  const cardsHtml = renderCatalogCards(ships, username);
+
+  content.innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+      <div style="font-size:16px;font-weight:700;color:var(--text-bright)">${parentWin.esc ? parentWin.esc(username) : username}</div>
+      <span style="font-size:12px;color:var(--text-dim)">${credits} cr</span>
+    </div>
+    <div class="shipyard-panel-nav">${panelNav}</div>
+    <div class="faction-section"><div class="faction-section-title">Shipyard Showroom</div>${cardsHtml}</div>
+  `;
+}
+
+function extractShip(data) {
+  if (!data || typeof data !== 'object') return data;
+  if (data.ship && typeof data.ship === 'object') return data.ship;
+  if (data.state?.ship) return data.state.ship;
+  if (data.player?.ship) return data.player.ship;
+  return data;
+}
+
+function findModules(ship, fullData) {
+  if (fullData && Array.isArray(fullData.modules) && fullData.modules.length > 0) {
+    if (typeof fullData.modules[0] === 'object' && fullData.modules[0] !== null) return fullData.modules;
+  }
+  if (fullData?.state && Array.isArray(fullData.state.modules) && fullData.state.modules.length > 0) {
+    if (typeof fullData.state.modules[0] === 'object' && fullData.state.modules[0] !== null) return fullData.state.modules;
+  }
+  const directKeys = ['installed_modules', 'fitted_modules', 'loadout', 'fitted', 'mods', 'equipment', 'fittings', 'modules'];
+  let stringFallback = null;
+  for (const k of directKeys) {
+    if (!Array.isArray(ship[k]) || ship[k].length === 0) continue;
+    if (typeof ship[k][0] === 'object' && ship[k][0] !== null) return ship[k];
+    if (typeof ship[k][0] === 'string' && !stringFallback) stringFallback = ship[k];
+  }
+  for (const [key, val] of Object.entries(ship)) {
+    if (directKeys.includes(key)) continue;
+    if (Array.isArray(val) && val.length > 0 && typeof val[0] === 'object' && val[0] !== null) {
+      const first = val[0];
+      if (first.module_id || first.module_name || first.slot_type || first.slot || first.instance_id || first.module_instance_id || (first.name && (first.cpu !== undefined || first.power !== undefined))) {
+        return val;
+      }
+    }
+  }
+  if (stringFallback) {
+    return stringFallback.map(id => ({ _stringId: true, module_id: id, id: id, name: id }));
+  }
+  return [];
+}
+
+function renderShipOverview(data, username) {
+  if (!data) return '<div class="faction-no-data">No ship data available</div>';
+
+  const ship = extractShip(data);
+  const rawShipName = ship.name || ship.ship_name || '';
+  const cls = ship.class || ship.ship_class || '';
+  const name = (rawShipName && rawShipName.toLowerCase() !== 'unnamed') ? rawShipName : (cls || '?');
+  const tier = ship.tier || '';
+  const hull = ship.hull ?? ship.current_hull ?? '?';
+  const maxHull = ship.max_hull ?? ship.hull_max ?? hull;
+  const shield = ship.shield ?? ship.current_shield ?? '?';
+  const maxShield = ship.max_shield ?? ship.shield_max ?? shield;
+  const fuel = ship.fuel ?? ship.current_fuel ?? '?';
+  const maxFuel = ship.max_fuel ?? ship.fuel_max ?? fuel;
+  const cargo = ship.cargo_used ?? ship.cargo ?? 0;
+  const maxCargo = ship.cargo_capacity ?? ship.max_cargo ?? ship.cargo_max ?? cargo;
+  const speed = ship.speed ?? '?';
+  const armor = ship.armor ?? '?';
+  const cpu = ship.cpu_used ?? 0;
+  const maxCpu = ship.cpu_capacity ?? ship.max_cpu ?? 0;
+  const power = ship.power_used ?? 0;
+  const maxPower = ship.power_capacity ?? ship.max_power ?? 0;
+  const primary = ship.primary_color || ship.colors?.primary || '#58a6ff';
+  const secondary = ship.secondary_color || ship.colors?.secondary || '#8b949e';
+
+  const hullPct = maxHull > 0 ? Math.round((hull / maxHull) * 100) : 0;
+  const shieldPct = maxShield > 0 ? Math.round((shield / maxShield) * 100) : 0;
+  const fuelPct = maxFuel > 0 ? Math.round((fuel / maxFuel) * 100) : 0;
+  const cargoPct = maxCargo > 0 ? Math.round((cargo / maxCargo) * 100) : 0;
+  const cpuPct = maxCpu > 0 ? Math.round((cpu / maxCpu) * 100) : 0;
+  const powerPct = maxPower > 0 ? Math.round((power / maxPower) * 100) : 0;
+
+  function bar(pct, color) {
+    return `<div class="shipyard-bar"><div class="shipyard-bar-fill" style="width:${pct}%;background:${color}"></div></div>`;
+  }
+
+  const modules = findModules(ship, data);
+  const slots = ship.slots || ship.module_slots || {};
+  let slotsHtml = '';
+  if (modules.length > 0) {
+    slotsHtml = '<div class="shipyard-slots">';
+    for (const m of modules) {
+      const mName = m.name || m.module_name || m.type_id || m.module_id || m.id || '?';
+      const mType = m.type || m.slot_type || m.category || m.slot || '';
+      const mWear = m.wear ?? m.wear_status ?? '';
+      const wearStr = mWear !== '' ? `<div style="font-size:10px;color:var(--text-dim);margin-top:2px">Wear: ${mWear}${typeof mWear === 'number' ? '%' : ''}</div>` : '';
+      slotsHtml += `<div class="shipyard-slot"><div class="slot-type">${parentWin.esc ? parentWin.esc(mType) : mType}</div><div class="slot-name">${parentWin.esc ? parentWin.esc(mName) : mName}</div>${wearStr}</div>`;
+    }
+    slotsHtml += '</div>';
+  } else {
+    const slotTypes = Object.entries(slots);
+    if (slotTypes.length > 0) {
+      slotsHtml = '<div class="shipyard-slots">';
+      for (const [type, count] of slotTypes) {
+        for (let i = 0; i < Number(count); i++) {
+          slotsHtml += `<div class="shipyard-slot"><div class="slot-type">${parentWin.esc ? parentWin.esc(type) : type}</div><div class="slot-empty">Empty</div></div>`;
+        }
+      }
+      slotsHtml += '</div>';
+    } else {
+      slotsHtml = '<div class="faction-no-data">No modules or slots found</div>';
+    }
+  }
+
+  const rawJson = JSON.stringify(data, null, 2);
+
+  return `
+    <div class="faction-section">
+      <div class="faction-section-title">${parentWin.esc ? parentWin.esc(name) : name} ${tier ? `<span class="count-badge">T${parentWin.esc ? parentWin.esc(String(tier)) : tier}</span>` : ''} ${cls ? `<span style="color:var(--text-dim);font-size:11px;font-weight:400">${parentWin.esc ? parentWin.esc(cls) : cls}</span>` : ''}</div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+        <span style="font-size:11px;color:var(--text-dim)">Colors:</span>
+        <input type="color" class="shipyard-color-preview" id="sy-color-primary" value="${parentWin.esc ? parentWin.esc(primary) : primary}" title="Primary">
+        <input type="color" class="shipyard-color-preview" id="sy-color-secondary" value="${parentWin.esc ? parentWin.esc(secondary) : secondary}" title="Secondary">
+        <button class="sm" onclick="shipSetColors('${parentWin.esc ? parentWin.esc(username) : username}')">Apply</button>
+      </div>
+      <div class="shipyard-stat-grid">
+        <span class="ssl">Hull</span><span class="ssv">${hull} / ${maxHull}<br>${bar(hullPct, 'var(--green)')}</span>
+        <span class="ssl">Shield</span><span class="ssv">${shield} / ${maxShield}<br>${bar(shieldPct, 'var(--cyan)')}</span>
+        <span class="ssl">Fuel</span><span class="ssv">${fuel} / ${maxFuel}<br>${bar(fuelPct, 'var(--yellow)')}</span>
+        <span class="ssl">Cargo</span><span class="ssv">${cargo} / ${maxCargo}<br>${bar(cargoPct, 'var(--orange)')}</span>
+        <span class="ssl">Speed</span><span class="ssv">${speed}</span>
+        <span class="ssl">Armor</span><span class="ssv">${armor}</span>
+        <span class="ssl">CPU</span><span class="ssv">${cpu} / ${maxCpu}<br>${bar(cpuPct, 'var(--magenta)')}</span>
+        <span class="ssl">Power</span><span class="ssv">${power} / ${maxPower}<br>${bar(powerPct, 'var(--accent)')}</span>
+      </div>
+    </div>
+    <div class="faction-section" style="display:flex;gap:6px;flex-wrap:wrap">
+      <button class="sm" onclick="shipRepair('${parentWin.esc ? parentWin.esc(username) : username}')">Repair</button>
+      <button class="sm" onclick="shipRefuel('${parentWin.esc ? parentWin.esc(username) : username}')">Refuel</button>
+    </div>
+    <div class="faction-section"><div class="faction-section-title">Modules</div>${slotsHtml}</div>
+    <details style="margin-top:12px">
+      <summary style="cursor:pointer;font-size:11px;color:var(--text-dim)">Raw Ship Data</summary>
+      <pre style="font-size:10px;color:var(--text-dim);white-space:pre-wrap;margin-top:6px;max-height:300px;overflow-y:auto;background:var(--bg);border:1px solid #21262d;border-radius:4px;padding:8px">${parentWin.esc ? parentWin.esc(rawJson) : rawJson}</pre>
+    </details>
+  `;
+}
+
+function renderModulesPanel(data, username) {
+  const ship = extractShip(data);
+  const modules = findModules(ship, data);
+  if (!modules.length) return '<div class="faction-no-data">No modules found for this ship.</div>';
+  let html = '<div class="shipyard-slots">';
+  for (const m of modules) {
+    const mName = m.name || m.module_name || m.type_id || m.id || '?';
+    const mType = m.type || m.slot_type || m.category || '';
+    const wear = m.wear ?? m.wear_status ?? '';
+    const wearStr = wear !== '' ? `<div style="font-size:10px;color:var(--text-dim)">Wear: ${wear}${typeof wear === 'number' ? '%' : ''}</div>` : '';
+    html += `<div class="shipyard-slot"><div class="slot-type">${parentWin.esc ? parentWin.esc(mType) : mType}</div><div class="slot-name">${parentWin.esc ? parentWin.esc(mName) : mName}</div>${wearStr}</div>`;
+  }
+  html += '</div>';
+  return html;
+}
+
+function handleGiftBotSelect(username, shipId, selectEl) {
+  const input = document.getElementById(`gift-input-${shipId}`);
+  if (!input) return;
+  if (selectEl.value === '__custom__') {
+    input.style.display = 'inline-block';
+    input.focus();
+  } else {
+    input.style.display = 'none';
+    input.value = '';
+  }
+}
+
+// Ship action helpers
+function shipSwitch(username, shipId) {
+  parentWin.sendExec(username, 'switch_ship', { ship_id: shipId }, () => {
+    fetchShipDetails(username);
+  });
+}
+
+function shipGoTo(username, shipId, systemId) {
+  parentWin.sendExec(username, 'go_to_system', { system_id: systemId }, () => {
+    fetchFleetList(username);
+  });
+}
+
+function shipSell(username, shipId, shipName) {
+  if (!confirm(`Sell ${shipName}?`)) return;
+  parentWin.sendExec(username, 'sell_ship', { ship_id: shipId }, () => {
+    fetchFleetList(username);
+  });
+}
+
+function shipGift(username, shipId, shipName) {
+  const selectEl = document.getElementById(`gift-select-${shipId}`);
+  const inputEl = document.getElementById(`gift-input-${shipId}`);
+
+  let recipient = selectEl ? selectEl.value : '';
+
+  if (inputEl && inputEl.style.display !== 'none') {
+    recipient = inputEl.value.trim();
+  }
+
+  if (!recipient) {
+    alert('Please select or enter a recipient');
+    return;
+  }
+
+  if (recipient === '__custom__' && inputEl) {
+    recipient = inputEl.value.trim();
+    if (!recipient) {
+      alert('Please enter a recipient name');
+      return;
+    }
+  }
+
+  if (!confirm(`Gift ${shipName || 'this ship'} to ${recipient}? This cannot be undone.`)) return;
+
+  parentWin.sendExec(username, 'storage', {
+    action: 'deposit',
+    target: recipient,
+    quantity: 1,
+    item_id: shipId
+  }, (result) => {
+    if (result.ok) {
+      if (shipyardActivePanel === 'fleet') fetchFleetList(username);
+    }
+  });
+}
+
+function shipDepositIntoCarrier(username, shipId, shipName) {
+  parentWin.sendExec(username, 'deposit_ship_into_carrier', { ship_id: shipId }, () => {
+    fetchFleetList(username);
+  });
+}
+
+function shipWithdrawFromCarrier(username, shipId, shipName) {
+  parentWin.sendExec(username, 'withdraw_ship_from_carrier', { ship_id: shipId }, () => {
+    fetchFleetList(username);
+  });
+}
+
+function buyShipFromShowroom(username, classId, isCommission = false) {
+  if (!classId) return;
+  const command = isCommission ? 'commission_ship' : 'buy_ship';
+  parentWin.sendExec(username, command, { class_id: classId }, () => {
+    fetchShipCatalog(username);
+    fetchFleetList(username);
+  });
+}
+
+function initShipyard() {
+  if (parentWin.bots && parentWin.bots.length > 0) {
+    renderShipyardPage();
+    return;
+  }
+  let attempts = 0;
+  const timer = setInterval(() => {
+    attempts++;
+    if (parentWin.bots && parentWin.bots.length > 0) {
+      clearInterval(timer);
+      renderShipyardPage();
+    } else if (attempts > 20) {
+      clearInterval(timer);
+      renderShipyardPage(); // render anyway so user sees "No bots available"
+    }
+  }, 600);
+}
+
+window.onload = initShipyard;
+</script>
+</body>
+</html>

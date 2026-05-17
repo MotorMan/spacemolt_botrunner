@@ -498,6 +498,14 @@ export async function analyzeExistingBattle(
 
   const playerVsPirateSides = sideAnalysis.filter(s => s.playerCount > 0 && s.pirateCount > 0);
   if (playerVsPirateSides.length === 0) {
+    // If our bot (or our drones/faction) is in the battle, we are already fighting — do NOT re-engage
+    const ourName = bot.username;
+    const weAreInBattle = participants.some(p => p.username === ourName || (ourName && p.username?.includes(ourName.split(" ")[0])));
+    if (weAreInBattle || battleStatus.is_participant) {
+      const ourSide = battleStatus.your_side_id ?? sides.find(s => participants.some(p => p.side_id === s.side_id && (p.username === ourName || p.username?.includes(ourName?.split(" ")[0] || ""))))?.side_id ?? sides[0]?.side_id ?? 1;
+      return { shouldJoin: true, sideId: ourSide, reason: "Already in battle with our bot/drones — fighting" };
+    }
+
     const allPlayers = participants.filter(p => {
       const username = p.username || "";
       return !username.startsWith("[POLICE]") &&
@@ -562,12 +570,17 @@ export async function engageTarget(
       return false;
     }
 
-    ctx.log("combat", `✅ Joining battle on side ${analysis.sideId}: ${analysis.reason}`);
-    const engageResp = await bot.exec("battle", { action: "engage", side_id: analysis.sideId!.toString() });
-    if (engageResp.error) {
-      ctx.log("error", `Failed to join battle: ${engageResp.error.message}`);
-      return false;
+    if (analysis.reason.includes("Already in battle")) {
+      ctx.log("combat", `Already participating on side ${analysis.sideId} — continuing fight`);
+    } else {
+      ctx.log("combat", `✅ Joining battle on side ${analysis.sideId}: ${analysis.reason}`);
+      const engageResp = await bot.exec("battle", { action: "engage", side_id: analysis.sideId!.toString() });
+      if (engageResp.error) {
+        ctx.log("error", `Failed to join battle: ${engageResp.error.message}`);
+        return false;
+      }
     }
+
     return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier);
   }
 
@@ -604,6 +617,16 @@ export async function engageTarget(
       return false;
     }
     ctx.log("error", `Attack failed on ${target.name}: ${attackResp.error.message}`);
+
+    // If the attack was interrupted by combat (or we are now in a battle), jump straight into battle handling
+    const battleStatus = await getBattleStatus(ctx);
+    if (battleStatus) {
+      ctx.log("combat", `⚔️ Attack interrupted by combat — entering battle immediately`);
+      const analysis = await analyzeExistingBattle(ctx, maxAttackTier, 3);
+      if (analysis.shouldJoin) {
+        return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier);
+      }
+    }
     return false;
   }
 
@@ -767,14 +790,13 @@ export async function fightJoinedBattle(
 
   ctx.log("combat", `🎯 Fighting in joined battle${target ? ` — targeting ${target.name}` : ''}`);
 
-  // Set target and fire stance - wait for tick completion
+  // Set target and fire stance - start acting immediately
   ctx.log("combat", `Setting target and stance...`);
   if (target) {
     await bot.exec("battle", { action: "target", target_id: target.id });
   }
-  await ctx.sleep(10000);
   await bot.exec("battle", { action: "stance", stance: "fire" });
-  await ctx.sleep(10000);
+  // No artificial delay — battle is already running, act on next tick
 
   // Tactical combat loop
   let consecutiveBraceTicks = 0;

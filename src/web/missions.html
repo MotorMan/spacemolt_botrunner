@@ -1,0 +1,535 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Missions - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+</head>
+<body>
+  <div class="missions-layout">
+    <div class="missions-sidebar">
+      <div class="missions-sidebar-header">
+        Missions
+        <button class="sm" id="consolidatedViewBtn" onclick="toggleConsolidatedMissionsView()" title="Show consolidated view" style="margin-left:8px;font-size:11px;padding:2px 6px;">📋 Consolidated</button>
+      </div>
+      <div class="missions-sidebar-body" id="missionsSidebarBody">
+        <!-- filled by JS -->
+      </div>
+    </div>
+    <div class="missions-content" id="missionsContent">
+      <div class="map-empty">Select a bot to view active missions, or browse all available missions.</div>
+    </div>
+  </div>
+
+<script>
+// Missions tab JS - extracted from index.html
+// All parent globals are accessed via window.parent
+
+let missionsSelectedBot = null;
+let activeMissionsCache = {};
+let showConsolidatedMissions = false;
+
+function renderMissionsPage() {
+  renderMissionsSidebar();
+  if (showConsolidatedMissions) {
+    fetchAllActiveMissions();
+  } else if (missionsSelectedBot) {
+    fetchActiveMissions(missionsSelectedBot);
+  } else {
+    renderMissionsFromMap();
+  }
+}
+
+function fetchAllActiveMissions() {
+  const parentWin = window.parent;
+  const bots = parentWin.bots || [];
+  let fetched = 0;
+  const total = bots.length;
+  
+  if (total === 0) {
+    renderConsolidatedMissions();
+    return;
+  }
+  
+  for (const bot of bots) {
+    parentWin.sendExec(bot.username, 'get_active_missions', undefined, (result) => {
+      let activeMissions = [];
+      if (result.ok && result.data) {
+        const d = result.data;
+        activeMissions = Array.isArray(d) ? d : (d.missions || d.active_missions || d.active || []);
+      }
+      activeMissionsCache[bot.username] = activeMissions;
+      fetched++;
+      if (fetched >= total) {
+        renderConsolidatedMissions();
+      }
+    });
+  }
+}
+
+function toggleConsolidatedMissionsView() {
+  showConsolidatedMissions = !showConsolidatedMissions;
+  const btn = document.getElementById('consolidatedViewBtn');
+  if (btn) {
+    btn.classList.toggle('active', showConsolidatedMissions);
+  }
+  renderMissionsSidebar();
+  renderMissionsPage();
+}
+
+function renderMissionsSidebar() {
+  const body = document.getElementById('missionsSidebarBody');
+  if (!body) return;
+  const parentWin = window.parent;
+  const bots = parentWin.bots || [];
+  
+  if (showConsolidatedMissions) {
+    body.innerHTML = '<div style="padding:10px;font-size:11px;color:var(--text-dim);text-align:center">Consolidated View Active<br>Grouping missions by template across all bots</div>';
+    return;
+  }
+  
+  let html = `<button class="mission-bot-btn${!missionsSelectedBot ? ' active' : ''}" onclick="selectMissionView(null)">All Available</button>`;
+  for (const bot of bots) {
+    const active = missionsSelectedBot === bot.username ? ' active' : '';
+    html += `<button class="mission-bot-btn${active}" onclick="selectMissionView('${parentWin.esc ? parentWin.esc(bot.username) : bot.username}')">${parentWin.esc ? parentWin.esc(bot.username) : bot.username}</button>`;
+  }
+  body.innerHTML = html;
+}
+
+function selectMissionView(botName) {
+  missionsSelectedBot = botName;
+  renderMissionsSidebar();
+  if (botName) {
+    fetchActiveMissions(botName);
+  } else {
+    renderMissionsFromMap();
+  }
+}
+
+function fetchActiveMissions(username) {
+  const content = document.getElementById('missionsContent');
+  if (!content) return;
+  content.innerHTML = '<div class="map-empty">Loading missions...</div>';
+
+  const parentWin = window.parent;
+  parentWin.sendExec(username, 'get_active_missions', undefined, (result) => {
+    if (missionsSelectedBot !== username) return;
+    let activeMissions = [];
+    if (result.ok && result.data) {
+      const d = result.data;
+      activeMissions = Array.isArray(d) ? d : (d.missions || d.active_missions || d.active || []);
+    }
+    activeMissionsCache[username] = activeMissions;
+    renderBotMissions(username, activeMissions);
+  });
+}
+
+function renderBotMissions(username, activeMissions) {
+  const content = document.getElementById('missionsContent');
+  if (!content) return;
+  const parentWin = window.parent;
+
+  let html = '';
+  html += `<div class="missions-section">`;
+  html += `<div class="missions-section-title">Active Missions <span class="count-badge">${activeMissions.length}</span></div>`;
+  if (activeMissions.length === 0) {
+    html += `<div style="color:var(--text-dim);font-size:12px;font-style:italic">No active missions for ${parentWin.esc ? parentWin.esc(username) : username}</div>`;
+  } else {
+    for (const m of activeMissions) {
+      const title = m.title || m.name || m.mission_id || 'Unknown';
+      const type = m.type || m.mission_type || '';
+      const desc = m.description || '';
+      const reward = m.reward_credits ? `${Number(m.reward_credits).toLocaleString()} cr` : (m.reward || '-');
+      const status = m.status || 'active';
+      const mId = m.mission_id || m.id || '';
+
+      html += `<div class="mission-card">`;
+      html += `<div class="mission-card-head">`;
+      html += `<span class="mission-title">${parentWin.esc ? parentWin.esc(title) : title}</span>`;
+      if (type) html += `<span class="mission-type-badge">${parentWin.esc ? parentWin.esc(type) : type}</span>`;
+      html += `<span class="active-mission-status ams-${status === 'active' ? 'active' : 'complete'}">${parentWin.esc ? parentWin.esc(status) : status}</span>`;
+      html += `</div>`;
+      if (desc) html += `<div class="mission-desc">${parentWin.esc ? parentWin.esc(desc) : desc}</div>`;
+      html += `<div class="mission-meta">`;
+      html += `<span class="mission-reward">${reward}</span>`;
+      html += `<button class="mission-action-btn complete-btn" onclick="missionAction('${parentWin.esc ? parentWin.esc(username) : username}','complete_mission','${parentWin.esc ? parentWin.esc(mId) : mId}')">Complete</button>`;
+      html += `<button class="mission-action-btn abandon-btn" onclick="missionAction('${parentWin.esc ? parentWin.esc(username) : username}','abandon_mission','${parentWin.esc ? parentWin.esc(mId) : mId}')">Abandon</button>`;
+      html += `</div>`;
+      html += `</div>`;
+    }
+  }
+  html += `</div>`;
+
+  html += `<div class="missions-section">`;
+  html += `<div class="missions-section-title">Available to Claim</div>`;
+  html += renderAvailableMissions(username);
+  html += `</div>`;
+
+  content.innerHTML = html;
+}
+
+function renderAvailableMissions(claimBot) {
+  const parentWin = window.parent;
+  const mapData = parentWin.mapData || {};
+  let html = '';
+  let count = 0;
+
+  for (const [sysId, sys] of Object.entries(mapData)) {
+    const sysName = sys.name || sysId;
+    for (const poi of (sys.pois || [])) {
+      if (!poi.missions || poi.missions.length === 0) continue;
+      for (const m of poi.missions) {
+        count++;
+        const title = m.title || m.mission_id || 'Unknown';
+        const type = m.type || '';
+        const reward = m.reward_credits ? `${Number(m.reward_credits).toLocaleString()} cr` : '-';
+        const mId = m.mission_id || m.id || '';
+
+        html += `<div class="mission-card">`;
+        html += `<div class="mission-card-head">`;
+        html += `<span class="mission-title">${parentWin.esc ? parentWin.esc(title) : title}</span>`;
+        if (type) html += `<span class="mission-type-badge">${parentWin.esc ? parentWin.esc(type) : type}</span>`;
+        html += `</div>`;
+        if (m.description) html += `<div class="mission-desc">${parentWin.esc ? parentWin.esc(m.description) : m.description}</div>`;
+        html += `<div class="mission-meta">`;
+        html += `<span class="mission-reward">${reward}</span>`;
+        html += `<span class="mission-location">${parentWin.esc ? parentWin.esc(sysName) : sysName} - ${parentWin.esc ? parentWin.esc(poi.name || poi.id) : (poi.name || poi.id)}</span>`;
+        html += `<span class="mission-age">${parentWin.timeAgo ? parentWin.timeAgo(m.last_seen) : ''}</span>`;
+        if (claimBot) {
+          html += `<button class="mission-claim-btn" onclick="claimMission('${parentWin.esc ? parentWin.esc(claimBot) : claimBot}','${parentWin.esc ? parentWin.esc(mId) : mId}')">Claim</button>`;
+        }
+        html += `</div>`;
+        html += `</div>`;
+      }
+    }
+  }
+
+  if (count === 0) {
+    html = '<div style="color:var(--text-dim);font-size:12px;font-style:italic">No missions discovered yet. Run Explorer to find missions at stations.</div>';
+  }
+  return html;
+}
+
+function renderMissionsFromMap() {
+  const content = document.getElementById('missionsContent');
+  if (!content) return;
+
+  let html = '<div class="missions-section">';
+  html += '<div class="missions-section-title">All Discovered Missions</div>';
+  html += renderAvailableMissions(null);
+  html += '</div>';
+  content.innerHTML = html;
+}
+
+function claimMission(botName, missionId) {
+  if (!botName || !missionId) return;
+  const parentWin = window.parent;
+  parentWin.sendExec(botName, 'accept_mission', { mission_id: missionId }, (result) => {
+    if (result.ok) {
+      if (parentWin.appendLine) parentWin.appendLine('system', `${botName} claimed mission: ${missionId}`);
+      if (missionsSelectedBot === botName) fetchActiveMissions(botName);
+    } else {
+      if (parentWin.appendLine) parentWin.appendLine('system', `Failed to claim mission: ${result.error || 'unknown error'}`);
+    }
+  });
+}
+
+function missionAction(botName, action, missionId) {
+  if (!botName || !missionId) return;
+  const parentWin = window.parent;
+  parentWin.sendExec(botName, action, { mission_id: missionId }, (result) => {
+    if (result.ok) {
+      if (parentWin.appendLine) parentWin.appendLine('system', `${botName}: ${action.replace('_', ' ')} successful`);
+      if (missionsSelectedBot === botName) fetchActiveMissions(botName);
+    } else {
+      if (parentWin.appendLine) parentWin.appendLine('system', `${action.replace('_', ' ')} failed: ${result.error || 'unknown'}`);
+    }
+  });
+}
+
+const CONSOLIDATED_MISSIONS_DELAY_MS = 1000;
+
+function renderConsolidatedMissions() {
+  const content = document.getElementById('missionsContent');
+  if (!content) return;
+  const parentWin = window.parent;
+  const bots = parentWin.bots || [];
+
+  const missionGroups = new Map();
+
+  for (const bot of bots) {
+    const botMissions = activeMissionsCache[bot.username] || [];
+    for (const m of botMissions) {
+      const templateId = m.mission_id || m.id || '';
+      const title = m.title || m.name || m.mission_template_id || templateId;
+      const type = m.type || m.mission_type || '';
+      const reward = m.reward_credits ? `${Number(m.reward_credits).toLocaleString()} cr` : (m.reward || '-');
+      const status = m.status || 'active';
+
+      if (!missionGroups.has(templateId)) {
+        missionGroups.set(templateId, {
+          templateId,
+          title,
+          type,
+          reward,
+          description: m.description || '',
+          bots: []
+        });
+      }
+      missionGroups.get(templateId).bots.push({
+        username: bot.username,
+        missionId: templateId,
+        status
+      });
+    }
+  }
+
+  let html = '';
+
+  if (missionGroups.size === 0) {
+    html = '<div class="map-empty">No active missions across all bots. Claim missions first to see them here.</div>';
+  } else {
+    html = '<div class="missions-section">';
+    html += '<div class="missions-section-title">Consolidated Missions</div>';
+    html += '<div style="color:var(--text-dim);font-size:12px;margin-bottom:12px">Grouped by mission template. Complete all instances of a mission with one click.</div>';
+
+    for (const [templateId, group] of missionGroups) {
+      const botCount = group.bots.length;
+      const activeCount = group.bots.filter(b => b.status === 'active').length;
+
+      html += `<div class="mission-card consolidated-mission-card">`;
+      html += `<div class="mission-card-head">`;
+      html += `<span class="mission-title">${parentWin.esc ? parentWin.esc(group.title) : group.title}</span>`;
+      if (group.type) html += `<span class="mission-type-badge">${parentWin.esc ? parentWin.esc(group.type) : group.type}</span>`;
+      html += `<span class="mission-count-badge">${botCount} bot${botCount > 1 ? 's' : ''} (${activeCount} active)</span>`;
+      html += `</div>`;
+
+      if (group.description) {
+        html += `<div class="mission-desc">${parentWin.esc ? parentWin.esc(group.description) : group.description}</div>`;
+      }
+
+      html += `<div class="consolidated-bots-list">`;
+      for (const botInfo of group.bots) {
+        const statusClass = botInfo.status === 'active' ? 'active' : 'complete';
+        html += `<div class="consolidated-bot-item">`;
+        html += `<span class="bot-name">${parentWin.esc ? parentWin.esc(botInfo.username) : botInfo.username}</span>`;
+        html += `<span class="mission-status-badge ms-${statusClass}">${botInfo.status}</span>`;
+        html += `</div>`;
+      }
+      html += `</div>`;
+
+      html += `<div class="mission-meta">`;
+      html += `<span class="mission-reward">${group.reward} each</span>`;
+
+      const activeBots = group.bots.filter(b => b.status === 'active');
+      if (activeBots.length > 0) {
+        html += `<button class="mission-action-btn complete-btn" onclick="completeConsolidatedMission('${parentWin.esc ? parentWin.esc(templateId) : templateId}')">Complete All (${activeBots.length})</button>`;
+      }
+
+      html += `</div>`;
+      html += `</div>`;
+    }
+
+    html += '</div>';
+  }
+
+  content.innerHTML = html;
+}
+
+function completeConsolidatedMission(templateId) {
+  const parentWin = window.parent;
+  const bots = parentWin.bots || [];
+  const groupBots = [];
+  for (const bot of bots) {
+    const botMissions = activeMissionsCache[bot.username] || [];
+    for (const m of botMissions) {
+      if ((m.mission_id || m.id) === templateId && (m.status || 'active') === 'active') {
+        groupBots.push({ username: bot.username, missionId: templateId });
+        break;
+      }
+    }
+  }
+
+  if (groupBots.length === 0) {
+    if (parentWin.appendLine) parentWin.appendLine('system', 'No active missions to complete');
+    return;
+  }
+
+  if (parentWin.appendLine) parentWin.appendLine('system', `Completing mission "${templateId}" for ${groupBots.length} bot(s)...`);
+
+  let index = 0;
+  function completeNext() {
+    if (index >= groupBots.length) {
+      if (parentWin.appendLine) parentWin.appendLine('system', 'All completion commands sent!');
+      setTimeout(() => {
+        if (showConsolidatedMissions) {
+          renderConsolidatedMissions();
+        }
+      }, 1000);
+      return;
+    }
+
+    const botInfo = groupBots[index];
+    parentWin.sendExec(botInfo.username, 'complete_mission', { mission_id: botInfo.missionId }, (result) => {
+      if (result.ok) {
+        if (parentWin.appendLine) parentWin.appendLine('system', `✓ ${botInfo.username}: mission completed`);
+      } else {
+        if (parentWin.appendLine) parentWin.appendLine('system', `✗ ${botInfo.username}: ${result.error || 'failed'}`);
+      }
+    });
+
+    index++;
+    if (index < groupBots.length) {
+      setTimeout(completeNext, CONSOLIDATED_MISSIONS_DELAY_MS);
+    } else {
+      completeNext();
+    }
+  }
+
+  completeNext();
+}
+
+function fetchActiveMissions(username) {
+  const content = document.getElementById('missionsContent');
+  if (!content) return;
+  content.innerHTML = '<div class="map-empty">Loading missions...</div>';
+
+  const parentWin = window.parent;
+  parentWin.sendExec(username, 'get_active_missions', undefined, (result) => {
+    if (missionsSelectedBot !== username) return;
+    let activeMissions = [];
+    if (result.ok && result.data) {
+      const d = result.data;
+      activeMissions = Array.isArray(d) ? d : (d.missions || d.active_missions || d.active || []);
+    }
+    activeMissionsCache[username] = activeMissions;
+    renderBotMissions(username, activeMissions);
+  });
+}
+
+function renderBotMissions(username, activeMissions) {
+  const content = document.getElementById('missionsContent');
+  if (!content) return;
+  const parentWin = window.parent;
+
+  let html = '';
+  html += `<div class="missions-section">`;
+  html += `<div class="missions-section-title">Active Missions <span class="count-badge">${activeMissions.length}</span></div>`;
+  if (activeMissions.length === 0) {
+    html += `<div style="color:var(--text-dim);font-size:12px;font-style:italic">No active missions for ${parentWin.esc ? parentWin.esc(username) : username}</div>`;
+  } else {
+    for (const m of activeMissions) {
+      const title = m.title || m.name || m.mission_id || 'Unknown';
+      const type = m.type || m.mission_type || '';
+      const desc = m.description || '';
+      const reward = m.reward_credits ? `${Number(m.reward_credits).toLocaleString()} cr` : (m.reward || '-');
+      const status = m.status || 'active';
+      const mId = m.mission_id || m.id || '';
+
+      html += `<div class="mission-card">`;
+      html += `<div class="mission-card-head">`;
+      html += `<span class="mission-title">${parentWin.esc ? parentWin.esc(title) : title}</span>`;
+      if (type) html += `<span class="mission-type-badge">${parentWin.esc ? parentWin.esc(type) : type}</span>`;
+      html += `<span class="active-mission-status ams-${status === 'active' ? 'active' : 'complete'}">${parentWin.esc ? parentWin.esc(status) : status}</span>`;
+      html += `</div>`;
+      if (desc) html += `<div class="mission-desc">${parentWin.esc ? parentWin.esc(desc) : desc}</div>`;
+      html += `<div class="mission-meta">`;
+      html += `<span class="mission-reward">${reward}</span>`;
+      html += `<button class="mission-action-btn complete-btn" onclick="missionAction('${parentWin.esc ? parentWin.esc(username) : username}','complete_mission','${parentWin.esc ? parentWin.esc(mId) : mId}')">Complete</button>`;
+      html += `<button class="mission-action-btn abandon-btn" onclick="missionAction('${parentWin.esc ? parentWin.esc(username) : username}','abandon_mission','${parentWin.esc ? parentWin.esc(mId) : mId}')">Abandon</button>`;
+      html += `</div>`;
+      html += `</div>`;
+    }
+  }
+  html += `</div>`;
+
+  html += `<div class="missions-section">`;
+  html += `<div class="missions-section-title">Available to Claim</div>`;
+  html += renderAvailableMissions(username);
+  html += `</div>`;
+
+  content.innerHTML = html;
+}
+
+function renderAvailableMissions(claimBot) {
+  const parentWin = window.parent;
+  const mapData = parentWin.mapData || {};
+  let html = '';
+  let count = 0;
+
+  for (const [sysId, sys] of Object.entries(mapData)) {
+    const sysName = sys.name || sysId;
+    for (const poi of (sys.pois || [])) {
+      if (!poi.missions || poi.missions.length === 0) continue;
+      for (const m of poi.missions) {
+        count++;
+        const title = m.title || m.mission_id || 'Unknown';
+        const type = m.type || '';
+        const reward = m.reward_credits ? `${Number(m.reward_credits).toLocaleString()} cr` : '-';
+        const mId = m.mission_id || m.id || '';
+
+        html += `<div class="mission-card">`;
+        html += `<div class="mission-card-head">`;
+        html += `<span class="mission-title">${parentWin.esc ? parentWin.esc(title) : title}</span>`;
+        if (type) html += `<span class="mission-type-badge">${parentWin.esc ? parentWin.esc(type) : type}</span>`;
+        html += `</div>`;
+        if (m.description) html += `<div class="mission-desc">${parentWin.esc ? parentWin.esc(m.description) : m.description}</div>`;
+        html += `<div class="mission-meta">`;
+        html += `<span class="mission-reward">${reward}</span>`;
+        html += `<span class="mission-location">${parentWin.esc ? parentWin.esc(sysName) : sysName} - ${parentWin.esc ? parentWin.esc(poi.name || poi.id) : (poi.name || poi.id)}</span>`;
+        html += `<span class="mission-age">${parentWin.timeAgo ? parentWin.timeAgo(m.last_seen) : ''}</span>`;
+        if (claimBot) {
+          html += `<button class="mission-claim-btn" onclick="claimMission('${parentWin.esc ? parentWin.esc(claimBot) : claimBot}','${parentWin.esc ? parentWin.esc(mId) : mId}')">Claim</button>`;
+        }
+        html += `</div>`;
+        html += `</div>`;
+      }
+    }
+  }
+
+  if (count === 0) {
+    html = '<div style="color:var(--text-dim);font-size:12px;font-style:italic">No missions discovered yet. Run Explorer to find missions at stations.</div>';
+  }
+  return html;
+}
+
+function renderMissionsFromMap() {
+  const content = document.getElementById('missionsContent');
+  if (!content) return;
+
+  let html = '<div class="missions-section">';
+  html += '<div class="missions-section-title">All Discovered Missions</div>';
+  html += renderAvailableMissions(null);
+  html += '</div>';
+  content.innerHTML = html;
+}
+
+function claimMission(botName, missionId) {
+  if (!botName || !missionId) return;
+  const parentWin = window.parent;
+  parentWin.sendExec(botName, 'accept_mission', { mission_id: missionId }, (result) => {
+    if (result.ok) {
+      if (parentWin.appendLine) parentWin.appendLine('system', `${botName} claimed mission: ${missionId}`);
+      if (missionsSelectedBot === botName) fetchActiveMissions(botName);
+    } else {
+      if (parentWin.appendLine) parentWin.appendLine('system', `Failed to claim mission: ${result.error || 'unknown error'}`);
+    }
+  });
+}
+
+function missionAction(botName, action, missionId) {
+  if (!botName || !missionId) return;
+  const parentWin = window.parent;
+  parentWin.sendExec(botName, action, { mission_id: missionId }, (result) => {
+    if (result.ok) {
+      if (parentWin.appendLine) parentWin.appendLine('system', `${botName}: ${action.replace('_', ' ')} successful`);
+      if (missionsSelectedBot === botName) fetchActiveMissions(botName);
+    } else {
+      if (parentWin.appendLine) parentWin.appendLine('system', `${action.replace('_', ' ')} failed: ${result.error || 'unknown'}`);
+    }
+  });
+}
+</script>
+</body>
+</html>

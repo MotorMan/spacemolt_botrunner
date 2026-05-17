@@ -104,6 +104,8 @@ export class Bot {
   private pendingCommands = new Map<string, AbortController>();
   private lastSystem = "unknown";
   private lastPoi = "";
+  private _lastTimeoutLog = 0;
+  private _lastTimeoutCommand = "";
 
   // Cached game state from last get_status
   credits = 0;
@@ -294,6 +296,16 @@ export class Bot {
       return await Promise.race([apiPromise, timeoutPromise, abortPromise]) as ApiResponse;
     } catch (err) {
       if (err instanceof Error && (err.message === "TIMEOUT" || err.message === "ABORTED")) {
+        // Skip expensive position check on non-movement commands (get_cargo, get_status, etc.)
+        // to prevent timeout cascades during heavy combat
+        if (command !== "travel" && command !== "jump" && command !== "mine" && command !== "jettison") {
+          return {
+            error: { code: "timeout", message: `${command} timed out after ${timeoutMs / 1000}s` },
+            result: undefined,
+            notifications: [],
+          };
+        }
+
         this.log("warn", `${command} timed out after ${timeoutMs / 1000}s — checking position...`);
         // Refresh status to see where we actually are
         await this.refreshStatus();
@@ -349,7 +361,13 @@ export class Bot {
         }
 
         // Not at target — return timeout error so caller can retry
-        this.log("error", `${command} timed out — not at target ${targetId} (currently at ${this.system}/${this.poi})`);
+        // Debounce repeated identical timeout errors (common after battles)
+        const now = Date.now();
+        if (!this._lastTimeoutLog || now - this._lastTimeoutLog > 2000 || this._lastTimeoutCommand !== command) {
+          this.log("error", `${command} timed out — not at target ${targetId} (currently at ${this.system}/${this.poi})`);
+          this._lastTimeoutLog = now;
+          this._lastTimeoutCommand = command;
+        }
         return {
           error: { code: "timeout", message: `${command} timed out after ${timeoutMs / 1000}s` },
           result: undefined,
@@ -2177,7 +2195,8 @@ export class Bot {
             debugLogForBot(this.username, "playernames:status", `${this.username}`, 
               `Player ${trimmedName}: ${entity.status_message}`);
           }
-          if (playerNameStore.add(trimmedName, faction, ship, this.system, this.poi)) {
+          const playerId = (entity.player_id as string) || "";
+          if (playerNameStore.add(trimmedName, faction, ship, this.system, this.poi, playerId)) {
             playerCount++;
           }
         }
@@ -2191,8 +2210,9 @@ export class Bot {
       const name = pirate.name as string;
       if (name && name.trim()) {
         const faction = (pirate.faction as string) || "";
-        const ship = (pirate.ship_type as string) || (pirate.ship as string) || "";
-        if (playerNameStore.addPirate(name, faction, ship, this.system, this.poi)) {
+        const ship = (pirate.ship_class as string) || (pirate.ship_name as string) || (pirate.ship_type as string) || (pirate.ship as string) || "";
+        const pirateId = (pirate.pirate_id as string) || (pirate.id as string) || "";
+        if (playerNameStore.addPirate(name, faction, ship, this.system, this.poi, pirateId)) {
           pirateCount++;
         }
       }
@@ -2204,8 +2224,9 @@ export class Bot {
       const name = npc.name as string;
       if (name && name.trim()) {
         const faction = (npc.faction as string) || "";
-        const ship = (npc.ship_type as string) || (npc.ship as string) || "";
-        if (playerNameStore.addEmpireNpc(name, faction, ship, this.system, this.poi)) {
+        const ship = (npc.ship_class as string) || (npc.ship_name as string) || (npc.ship_type as string) || (npc.ship as string) || "";
+        const npcId = (npc.npc_id as string) || "";
+        if (playerNameStore.addEmpireNpc(name, faction, ship, this.system, this.poi, npcId)) {
           empireNpcCount++;
         }
       }

@@ -989,6 +989,72 @@ export class WebServer {
           });
         }
 
+        // Serve map.html for map route
+        if (url.pathname === "/map.html") {
+          const mapPath = join(import.meta.dir, "map.html");
+          return new Response(readFileSync(mapPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve market.html for market route
+        if (url.pathname === "/market.html") {
+          const marketPath = join(import.meta.dir, "market.html");
+          return new Response(readFileSync(marketPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve missions.html for missions route
+        if (url.pathname === "/missions.html") {
+          const missionsPath = join(import.meta.dir, "missions.html");
+          return new Response(readFileSync(missionsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve shipyard.html for shipyard route
+        if (url.pathname === "/shipyard.html") {
+          const shipyardPath = join(import.meta.dir, "shipyard.html");
+          return new Response(readFileSync(shipyardPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve stats.html for stats route
+        if (url.pathname === "/stats.html") {
+          const statsPath = join(import.meta.dir, "stats.html");
+          return new Response(readFileSync(statsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve settings.html for settings route
+        if (url.pathname === "/settings.html") {
+          const settingsPath = join(import.meta.dir, "settings.html");
+          return new Response(readFileSync(settingsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve index.html for all other routes (read fresh for dev, no cache)
         return new Response(readFileSync(indexPath, "utf-8"), {
           headers: {

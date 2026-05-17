@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stats - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+</head>
+<body>
+  <div class="stats-page-header">
+    <h3>Fleet Statistics</h3>
+    <div class="stats-toggle" id="statsToggle">
+      <button class="active" onclick="setStatsPeriod('today')">Today</button>
+      <button onclick="setStatsPeriod('week')">Week</button>
+      <button onclick="setStatsPeriod('all')">All Time</button>
+    </div>
+  </div>
+  <div class="stats-bar" id="statsBarPersist">
+    <span class="stats-title">Totals</span>
+    <div class="stat-item"><span class="stat-value" id="pStatMined">0</span><span class="stat-label">Ores Mined</span></div>
+    <div class="stat-item"><span class="stat-value" id="pStatCrafted">0</span><span class="stat-label">Items Crafted</span></div>
+    <div class="stat-item"><span class="stat-value" id="pStatTrades">0</span><span class="stat-label">Trades</span></div>
+    <div class="stat-item"><span class="stat-value" id="pStatProfit">0</span><span class="stat-label">Trade Profit</span></div>
+    <div class="stat-item"><span class="stat-value" id="pStatSystems">0</span><span class="stat-label">Explored</span></div>
+    <div class="stat-item"><span class="stat-value" id="pStatFaction">-</span><span class="stat-label">Faction Funds</span></div>
+  </div>
+  <div style="display:flex;gap:16px;flex:1;min-height:0;overflow:hidden">
+    <div class="bot-table-wrap" style="flex:1;overflow:auto">
+      <div class="bot-table-header"><span>Per-Bot Breakdown</span></div>
+      <div class="bot-table-scroll">
+        <table class="bot-table" id="statsTable">
+          <thead><tr>
+            <th style="text-align:left;padding:6px 12px">Bot</th>
+            <th style="text-align:right;padding:6px 12px">Mined</th>
+            <th style="text-align:right;padding:6px 12px">Crafted</th>
+            <th style="text-align:right;padding:6px 12px">Trades</th>
+            <th style="text-align:right;padding:6px 12px">Profit</th>
+            <th style="text-align:right;padding:6px 12px">Systems</th>
+          </tr></thead>
+          <tbody id="statsTableBody"></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="bot-table-wrap" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
+      <div class="bot-table-header">
+        <span>Faction Activity</span>
+        <div class="faction-log-filters" id="statsLogFilters">
+          <button class="faction-log-filter-btn active" onclick="setStatsLogFilter('all')">All</button>
+          <button class="faction-log-filter-btn" onclick="setStatsLogFilter('deposit')">Deposit</button>
+          <button class="faction-log-filter-btn" onclick="setStatsLogFilter('withdraw')">Withdraw</button>
+          <button class="faction-log-filter-btn" onclick="setStatsLogFilter('donation')">Donation</button>
+          <button class="faction-log-filter-btn" onclick="setStatsLogFilter('gift')">Gift</button>
+        </div>
+      </div>
+      <div id="statsActivityLog" class="faction-log-content" style="flex:1;min-height:0"></div>
+    </div>
+  </div>
+
+<script>
+const parentWin = window.parent;
+
+let statsPeriod = 'today';
+let statsLogFilter = 'all';
+
+function setStatsPeriod(period) {
+  statsPeriod = period;
+  document.querySelectorAll('#statsToggle button').forEach(b => b.classList.remove('active'));
+  const labels = { today: 'Today', week: 'Week', all: 'All Time' };
+  document.querySelectorAll('#statsToggle button').forEach(b => {
+    if (b.textContent === labels[period]) b.classList.add('active');
+  });
+  renderStatsTab();
+}
+
+function aggregateStats(botDaily, days) {
+  const totals = { mined: 0, crafted: 0, trades: 0, profit: 0, systems: 0 };
+  if (!botDaily) return totals;
+  let cutoff = null;
+  if (days > 0) {
+    const d = new Date();
+    d.setDate(d.getDate() - (days - 1));
+    cutoff = d.toISOString().slice(0, 10);
+  }
+  for (const [date, s] of Object.entries(botDaily)) {
+    if (cutoff && date < cutoff) continue;
+    totals.mined += s.mined || 0;
+    totals.crafted += s.crafted || 0;
+    totals.trades += s.trades || 0;
+    totals.profit += s.profit || 0;
+    totals.systems += s.systems || 0;
+  }
+  return totals;
+}
+
+function renderStatsTab() {
+  const days = statsPeriod === 'today' ? 1 : statsPeriod === 'week' ? 7 : 0;
+
+  const nameSet = new Set(Object.keys(parentWin.statsDaily || {}));
+  for (const b of (parentWin.bots || [])) nameSet.add(b.username);
+  const botNames = [...nameSet].sort();
+
+  let tMined = 0, tCrafted = 0, tTrades = 0, tProfit = 0, tSystems = 0;
+  const rows = [];
+  for (const name of botNames) {
+    const agg = aggregateStats((parentWin.statsDaily || {})[name], days);
+    tMined += agg.mined;
+    tCrafted += agg.crafted;
+    tTrades += agg.trades;
+    tProfit += agg.profit;
+    tSystems += agg.systems;
+    rows.push({ name, ...agg });
+  }
+
+  const pMined = document.getElementById('pStatMined');
+  const pCrafted = document.getElementById('pStatCrafted');
+  const pTrades = document.getElementById('pStatTrades');
+  const pProfit = document.getElementById('pStatProfit');
+  const pSystems = document.getElementById('pStatSystems');
+  const pFaction = document.getElementById('pStatFaction');
+
+  if (pMined) pMined.textContent = parentWin.num ? parentWin.num(tMined) : tMined;
+  if (pCrafted) pCrafted.textContent = parentWin.num ? parentWin.num(tCrafted) : tCrafted;
+  if (pTrades) pTrades.textContent = parentWin.num ? parentWin.num(tTrades) : tTrades;
+  if (pProfit) pProfit.textContent = (parentWin.num ? parentWin.num(tProfit) : tProfit) + 'cr';
+  if (pSystems) pSystems.textContent = parentWin.num ? parentWin.num(tSystems) : tSystems;
+
+  const treasury = parentWin.factionTreasury ?? (parentWin.factionData ? (parentWin.factionData.treasury ?? parentWin.factionData.credits ?? null) : null);
+  if (pFaction) pFaction.textContent = treasury != null ? (parentWin.num ? parentWin.num(treasury) : treasury) + 'cr' : '-';
+
+  const tbody = document.getElementById('statsTableBody');
+  if (tbody) {
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="padding:24px;text-align:center;color:var(--text-dim)">No stats recorded yet.</td></tr>';
+    } else {
+      tbody.innerHTML = rows.map(r => `<tr>
+        <td style="padding:6px 12px;font-weight:500;color:var(--text-bright)">${parentWin.esc ? parentWin.esc(r.name) : r.name}</td>
+        <td style="padding:6px 12px;text-align:right">${parentWin.num ? parentWin.num(r.mined) : r.mined}</td>
+        <td style="padding:6px 12px;text-align:right">${parentWin.num ? parentWin.num(r.crafted) : r.crafted}</td>
+        <td style="padding:6px 12px;text-align:right">${parentWin.num ? parentWin.num(r.trades) : r.trades}</td>
+        <td style="padding:6px 12px;text-align:right">${parentWin.num ? parentWin.num(r.profit) : r.profit}cr</td>
+        <td style="padding:6px 12px;text-align:right">${parentWin.num ? parentWin.num(r.systems) : r.systems}</td>
+      </tr>`).join('');
+    }
+  }
+
+  renderStatsActivityLog();
+}
+
+function setStatsLogFilter(filter) {
+  statsLogFilter = filter;
+  document.querySelectorAll('#statsLogFilters .faction-log-filter-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('#statsLogFilters .faction-log-filter-btn').forEach(b => {
+    if (b.textContent.toLowerCase() === filter) b.classList.add('active');
+  });
+  renderStatsActivityLog();
+}
+
+function renderStatsActivityLog() {
+  const log = document.getElementById('statsActivityLog');
+  if (!log) return;
+  const filtered = statsLogFilter === 'all'
+    ? (parentWin.factionLogLines || [])
+    : (parentWin.factionLogLines || []).filter(l => l.includes(`[${statsLogFilter}]`));
+  if (filtered.length === 0) {
+    log.innerHTML = '<span style="color:var(--text-dim);padding:12px;display:block">No faction activity logged yet.</span>';
+    return;
+  }
+  log.innerHTML = filtered.map(l => `<div class="log-entry">${parentWin.formatFactionLogLine ? parentWin.formatFactionLogLine(l) : l}</div>`).join('');
+  log.scrollTop = 0;
+}
+</script>
+</body>
+</html>

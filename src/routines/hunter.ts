@@ -80,14 +80,21 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
     return;
   }
 
-  ctx.log("combat", `✅ Joining unexpected battle on side ${analysis.sideId}: ${analysis.reason}`);
-  const engageResp = await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId!.toString() });
-  if (engageResp.error) {
-    ctx.log("error", `Failed to join unexpected battle: ${engageResp.error.message}`);
-    return;
+  if (analysis.reason.includes("Already in battle")) {
+    ctx.log("combat", `Already participating on side ${analysis.sideId} — continuing fight`);
+  } else {
+    ctx.log("combat", `✅ Joining unexpected battle on side ${analysis.sideId}: ${analysis.reason}`);
+    const engageResp = await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId!.toString() });
+    if (engageResp.error) {
+      ctx.log("error", `Failed to join unexpected battle: ${engageResp.error.message}`);
+      return;
+    }
   }
 
-  await fightJoinedBattle(ctx, null, fleeThreshold, fleeFromTier, maxAttackTier);
+  // Pick a real target from battle participants so we get the full combat loop
+  const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
+  const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
+  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier);
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -718,6 +725,27 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       // Check if we got pulled into battle during scanning
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier);
 
+      // Immediate reaction to pirate scan notification (NPC only, not player scans)
+      if (nearbyResp.notifications) {
+        const notifs = Array.isArray(nearbyResp.notifications) ? nearbyResp.notifications : [];
+        for (const n of notifs) {
+          const msg = (n as any)?.data?.message || (n as any)?.message || "";
+          if (msg.includes("You were scanned by") && msg.includes("[COMBAT]")) {
+            ctx.log("combat", "Pirate scan detected - immediate get_nearby + engage");
+            const scanNearby = await bot.exec("get_nearby");
+            if (!scanNearby.error) {
+              bot.trackNearbyPlayers(scanNearby.result);
+              const scanEntities = parseNearby(scanNearby.result);
+              const scanTargets = scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+              for (const t of scanTargets) {
+                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+              }
+            }
+            break;
+          }
+        }
+      }
+
       const entities = parseNearby(nearbyResp.result);
       ctx.log("info", `entities: ${entities}`);
       const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
@@ -994,7 +1022,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     const confirmedSec = mapStore.getSystem(bot.system)?.security_level;
     if (!isHuntableSystem(confirmedSec)) {
       ctx.log("info", `${bot.system} is ${confirmedSec || "unknown"} security — no pirates here. Waiting for pirates to appear...`);
-      await ctx.sleep(30000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -1066,6 +1094,27 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
       // Check if we got pulled into battle during scanning
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier);
+
+      // Immediate reaction to pirate scan notification (NPC only, not player scans)
+      if (nearbyResp.notifications) {
+        const notifs = Array.isArray(nearbyResp.notifications) ? nearbyResp.notifications : [];
+        for (const n of notifs) {
+          const msg = (n as any)?.data?.message || (n as any)?.message || "";
+          if (msg.includes("You were scanned by") && msg.includes("[COMBAT]")) {
+            ctx.log("combat", "Pirate scan detected - immediate get_nearby + engage");
+            const scanNearby = await bot.exec("get_nearby");
+            if (!scanNearby.error) {
+              bot.trackNearbyPlayers(scanNearby.result);
+              const scanEntities = parseNearby(scanNearby.result);
+              const scanTargets = scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+              for (const t of scanTargets) {
+                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+              }
+            }
+            break;
+          }
+        }
+      }
 
       const entities = parseNearby(nearbyResp.result);
       ctx.log("info", `entities: ${entities}`);
@@ -1335,7 +1384,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     const nearbyResp = await bot.exec("get_nearby");
     if (nearbyResp.error) {
       ctx.log("error", `get_nearby failed: ${nearbyResp.error.message}`);
-      await ctx.sleep(10000);
+      await ctx.sleep(5000);
       continue;
     }
 
@@ -1345,13 +1394,34 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       // Check if we got pulled into battle during scanning
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier);
 
+      // Immediate reaction to pirate scan notification (NPC only, not player scans)
+      if (nearbyResp.notifications) {
+        const notifs = Array.isArray(nearbyResp.notifications) ? nearbyResp.notifications : [];
+        for (const n of notifs) {
+          const msg = (n as any)?.data?.message || (n as any)?.message || "";
+          if (msg.includes("You were scanned by") && msg.includes("[COMBAT]")) {
+            ctx.log("combat", "Pirate scan detected - immediate get_nearby + engage");
+            const scanNearby = await bot.exec("get_nearby");
+            if (!scanNearby.error) {
+              bot.trackNearbyPlayers(scanNearby.result);
+              const scanEntities = parseNearby(scanNearby.result);
+              const scanTargets = scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+              for (const t of scanTargets) {
+                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+              }
+            }
+            break;
+          }
+        }
+      }
+
       const entities = parseNearby(nearbyResp.result);
     const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
 
     if (targets.length === 0) {
       ctx.log("combat", `No targets detected at ${originalPoi}`);
       if (!settings.disableWreckSalvaging) await scavengeWrecks(ctx);
-      await ctx.sleep(30000); // Wait 30 seconds before next scan
+      await ctx.sleep(5000); // Wait 30 seconds before next scan
       continue;
     }
 
@@ -1428,13 +1498,13 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
       } else {
         ctx.log("combat", "Retreated — waiting before next scan");
-        await ctx.sleep(30000);
+        await ctx.sleep(5000);
         break;
       }
     }
 
     // After fighting, wait a bit before next scan
-    await ctx.sleep(10000);
+    await ctx.sleep(5000);
   }
 }
 

@@ -19,13 +19,14 @@ export interface ShipHistoryEntry {
 export interface EntityDetail {
   name: string;
   type: "player" | "pirate" | "empire_npc";
-  faction: string; // 4-letter faction code (e.g., "SOLR", "CRMS", "NEBU", "VOID")
-  ship: string; // Last seen ship name/type
-  lastSeen: string; // ISO timestamp of last sighting
-  system: string; // Last known system
-  poi: string; // Last known POI/location
-  normalized: string; // Normalized name for lookup
-  shipHistory?: ShipHistoryEntry[]; // Previously seen ships (no duplicates)
+  id?: string; // player_id / pirate_id / npc_id
+  faction: string;
+  ship: string;
+  lastSeen: string;
+  system: string;
+  poi: string;
+  normalized: string;
+  shipHistory?: ShipHistoryEntry[];
 }
 
 /**
@@ -241,7 +242,7 @@ export class PlayerNameStore {
    * Add/update a player with full details.
    * Returns true if this is a new player (not previously seen).
    */
-  add(name: string, faction = "", ship = "", system = "", poi = ""): boolean {
+  add(name: string, faction = "", ship = "", system = "", poi = "", id = ""): boolean {
     this.ensureLoaded();
 
     if (!name || typeof name !== "string") {
@@ -258,18 +259,18 @@ export class PlayerNameStore {
     let shipChanged = false;
 
     if (!isNew && this.fullPlayerInfo.players[normalized]) {
-      // Update existing player - track ship history
       const entity = this.fullPlayerInfo.players[normalized];
       shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
       entity.faction = faction || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
+      if (id) entity.id = id;
       entity.lastSeen = now;
     } else {
-      // New player
       this.fullPlayerInfo.players[normalized] = {
         name: name,
         type: "player",
+        id: id || undefined,
         faction: faction,
         ship: ship,
         lastSeen: now,
@@ -302,7 +303,7 @@ export class PlayerNameStore {
    * Add/update a pirate with full details.
    * Returns true if this is a new pirate (not previously seen).
    */
-  addPirate(name: string, faction = "", ship = "", system = "", poi = ""): boolean {
+  addPirate(name: string, faction = "", ship = "", system = "", poi = "", id = ""): boolean {
     this.ensureLoaded();
 
     if (!name || typeof name !== "string") {
@@ -319,18 +320,18 @@ export class PlayerNameStore {
     let shipChanged = false;
 
     if (!isNew && this.fullPlayerInfo.pirates[normalized]) {
-      // Update existing pirate - track ship history
       const entity = this.fullPlayerInfo.pirates[normalized];
       shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
       entity.faction = faction || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
+      if (id) entity.id = id;
       entity.lastSeen = now;
     } else {
-      // New pirate
       this.fullPlayerInfo.pirates[normalized] = {
         name: name,
         type: "pirate",
+        id: id || undefined,
         faction: faction,
         ship: ship,
         lastSeen: now,
@@ -363,7 +364,7 @@ export class PlayerNameStore {
    * Add/update an empire NPC with full details.
    * Returns true if this is a new empire NPC (not previously seen).
    */
-  addEmpireNpc(name: string, faction = "", ship = "", system = "", poi = ""): boolean {
+  addEmpireNpc(name: string, faction = "", ship = "", system = "", poi = "", id = ""): boolean {
     this.ensureLoaded();
 
     if (!name || typeof name !== "string") {
@@ -380,18 +381,18 @@ export class PlayerNameStore {
     let shipChanged = false;
 
     if (!isNew && this.fullPlayerInfo.empire_npcs[normalized]) {
-      // Update existing empire NPC - track ship history
       const entity = this.fullPlayerInfo.empire_npcs[normalized];
       shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
       entity.faction = faction || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
+      if (id) entity.id = id;
       entity.lastSeen = now;
     } else {
-      // New empire NPC
       this.fullPlayerInfo.empire_npcs[normalized] = {
         name: name,
         type: "empire_npc",
+        id: id || undefined,
         faction: faction,
         ship: ship,
         lastSeen: now,
@@ -579,7 +580,7 @@ export class PlayerNameStore {
       const entity = this.fullPlayerInfo[category][normalized];
       if (entity) {
         entity.faction = updates.faction || entity.faction;
-        // Handle ship update with history tracking
+        if (updates.id) entity.id = updates.id;
         if (updates.ship !== undefined && updates.ship !== entity.ship) {
           this.updateShipWithHistory(entity, updates.ship, entity.lastSeen);
         }

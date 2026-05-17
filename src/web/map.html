@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Map - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { height: 100vh; margin: 0; padding: 0; overflow: hidden; }
+    .map-layout { height: 100%; display: flex; min-height: 0; }
+    .map-filters { width: 240px; flex-shrink: 0; overflow-y: auto; border-right: 1px solid var(--border); background: var(--bg); padding: 8px; }
+    .map-content { flex: 1; overflow-y: auto; padding: 12px; min-height: 0; }
+    .map-filters-header { font-weight: 700; font-size: 15px; margin-bottom: 8px; color: var(--text-bright); }
+    .map-stats-bar { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 12px; color: var(--text-dim); margin-bottom: 12px; }
+    .stat-val { color: var(--text-bright); font-weight: 600; }
+    .map-filter-body label { display: block; font-size: 11px; margin: 8px 0 4px; color: var(--text-dim); }
+    .map-filter-body input, .map-filter-body select { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 6px 8px; font-size: 12px; }
+    .ore-chip { display: inline-block; background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; padding: 2px 10px; margin: 2px; font-size: 11px; cursor: pointer; }
+    .ore-chip.active { background: var(--accent); color: #000; border-color: var(--accent); }
+    .sys-card { background: var(--card-bg); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 10px; overflow: hidden; }
+    .sys-header { padding: 10px 14px; display: flex; align-items: center; gap: 8px; cursor: pointer; }
+    .sys-chevron { font-size: 10px; transition: transform .2s; }
+    .sys-name { font-weight: 700; flex: 1; }
+    .sys-badges { display: flex; gap: 4px; }
+    .badge { font-size: 10px; padding: 1px 6px; border-radius: 3px; }
+    .badge-high { background: #1a3a2a; color: #4ade80; }
+    .badge-medium { background: #3a2f1a; color: #fbbf24; }
+    .badge-low { background: #3a1f1f; color: #f87171; }
+    .badge-null { background: #2a2a2a; color: #9ca3af; }
+    .sys-summary { display: flex; gap: 12px; font-size: 11px; color: var(--text-dim); }
+    .sys-body { display: none; padding: 0 14px 14px; border-top: 1px solid var(--border); }
+    .sys-card.expanded .sys-body { display: block; }
+    .sys-card.expanded .sys-chevron { transform: rotate(90deg); }
+    .sys-connections { margin-bottom: 8px; }
+    .conn-label { font-size: 11px; color: var(--text-dim); margin-right: 6px; }
+    .conn-chip { background: var(--bg); padding: 1px 6px; border-radius: 3px; font-size: 11px; margin-right: 4px; }
+    .poi-card { background: var(--bg); border-radius: 6px; padding: 8px; margin-bottom: 6px; }
+    .poi-head { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+    .poi-icon { font-size: 14px; }
+    .poi-name { font-weight: 600; flex: 1; }
+    .poi-type-badge { font-size: 10px; padding: 0 6px; border-radius: 3px; background: var(--card-bg); color: var(--text-dim); }
+    .poi-hidden-badge { font-size: 9px; padding: 1px 5px; border-radius: 3px; background: #3a1f1f; color: #f87171; margin-left: 4px; }
+    .poi-resource-grid { display: flex; flex-wrap: wrap; gap: 4px; }
+    .resource-mini { background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; min-width: 110px; font-size: 10px; }
+    .resource-mini .resource-name { font-weight: 600; margin-bottom: 2px; }
+    .resource-mini .resource-stats { display: flex; justify-content: space-between; font-size: 9px; color: var(--text-dim); }
+    .depletion-bar { height: 3px; background: #333; border-radius: 2px; margin-top: 3px; overflow: hidden; }
+    .depletion-fill { height: 100%; transition: width 0.2s; }
+    .system-map-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.85); display: none; align-items: center; justify-content: center; z-index: 9999; }
+    .system-map-panel { width: 92%; max-width: 980px; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+    .system-map-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .system-map-svg-wrap { background: #0a0f1a; border-radius: 6px; overflow: hidden; }
+    .system-map-legend { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; font-size: 12px; }
+    .sml-item { display: flex; align-items: center; gap: 6px; }
+    .sml-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+    .map-empty { color: var(--text-dim); padding: 40px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div class="map-layout">
+    <div class="map-filters">
+      <div class="map-filters-header">Galaxy Map</div>
+      <div class="map-stats-bar" id="mapStatsBar"></div>
+      <div class="map-filter-body">
+        <label>Search System</label>
+        <input type="text" id="mapSearch" placeholder="System name..." oninput="renderMap()">
+        <label>Security Level</label>
+        <select id="mapSecFilter" onchange="renderMap()">
+          <option value="">All</option>
+          <option value="high">High Security</option>
+          <option value="low">Low Security</option>
+          <option value="medium">Medium Security</option>
+          <option value="unknown">Unknown</option>
+        </select>
+        <label>Resources</label>
+        <div class="ore-filter-list" id="oreFilterList"></div>
+        <label>Sort By</label>
+        <select id="mapSortBy" onchange="renderMap()">
+          <option value="name">Name</option>
+          <option value="updated">Last Updated</option>
+          <option value="pois">Most POIs</option>
+          <option value="security">Security Level</option>
+        </select>
+        <div style="margin-top:12px;border-top:1px solid #21262d;padding-top:10px">
+          <button class="sm" style="width:100%" onclick="parent.switchTab && parent.switchTab('market')">Market Overview</button>
+        </div>
+      </div>
+    </div>
+    <div class="map-content" id="mapContent">
+      <div class="map-empty">No map data yet. Start a bot to begin exploring!</div>
+    </div>
+  </div>
+
+  <div id="systemMapOverlay" class="system-map-overlay" style="display:none">
+    <div class="system-map-panel">
+      <div class="system-map-header">
+        <span id="systemMapTitle" style="font-weight:700;color:var(--text-bright)"></span>
+        <button class="sm" onclick="closeSystemMap()">Close</button>
+      </div>
+      <div class="system-map-svg-wrap" id="systemMapSvgWrap"></div>
+      <div class="system-map-legend" id="systemMapLegend"></div>
+    </div>
+  </div>
+
+<script>
+const parentWin = window.parent;
+let activeOreFilters = new Set();
+let expandedSystems = new Set();
+
+function renderMapPage() {
+  buildOreFilters();
+  renderMapStats();
+  renderMap();
+}
+
+function renderMapStats() {
+  const bar = document.getElementById('mapStatsBar');
+  if (!bar) return;
+  const mapData = parentWin.mapData || {};
+  const systems = Object.values(mapData);
+  const totalPois = systems.reduce((s, sys) => s + (sys.pois || []).length, 0);
+  const totalBelts = systems.reduce((s, sys) => s + (sys.pois || []).filter(p => (p.type || '').toLowerCase().includes('asteroid')).length, 0);
+  const totalStations = systems.reduce((s, sys) => s + (sys.pois || []).filter(p => p.has_base).length, 0);
+  const totalOres = new Set();
+  systems.forEach(sys => (sys.pois || []).forEach(p => (p.ores_found || []).forEach(o => totalOres.add(o.item_id))));
+  const mcDisplay = parentWin.mobileCapitol 
+    ? `<span style="margin-left:auto;color:#4fc3f7">Mobile Capitol: <span class="stat-val">${parentWin.esc ? parentWin.esc(parentWin.mobileCapitol.systemName || parentWin.mobileCapitol.systemId) : ''}</span></span>`
+    : `<span style="margin-left:auto;color:#666">Mobile Capitol: <span class="stat-val">not discovered</span></span>`;
+  bar.innerHTML = `
+    <span>Systems: <span class="stat-val">${systems.length}</span></span>
+    <span>POIs: <span class="stat-val">${totalPois}</span></span>
+    <span>Belts: <span class="stat-val">${totalBelts}</span></span>
+    <span>Stations: <span class="stat-val">${totalStations}</span></span>
+    <span>Ores: <span class="stat-val">${totalOres.size}</span></span>
+    ${mcDisplay}
+  `;
+}
+
+const POI_COLORS = {
+  sun: '#ffd740', station: '#4fc3f7', asteroid_belt: '#ff9800', asteroid: '#ff9800',
+  nebula: '#ce93d8', gas_cloud: '#80cbc4', ice_field: '#b3e5fc', gate: '#69f0ae',
+  planet: '#66bb6a', wreck: '#78909c', anomaly: '#ff5252'
+};
+
+function openSystemMap(sysId) {
+  const mapData = parentWin.mapData || {};
+  const bots = parentWin.bots || [];
+  const sys = mapData[sysId];
+  if (!sys) return;
+
+  const overlay = document.getElementById('systemMapOverlay');
+  const title = document.getElementById('systemMapTitle');
+  const wrap = document.getElementById('systemMapSvgWrap');
+  const legend = document.getElementById('systemMapLegend');
+  if (!overlay || !wrap) return;
+
+  title.textContent = `${sys.name || sysId} System Map`;
+  overlay.style.display = 'flex';
+
+  const pois = (sys.pois || []);
+  const botsHere = bots.filter(b => b.system === sysId);
+  const botPois = new Set(botsHere.map(b => b.poi));
+  const withPos = pois.filter(p => p.position && (p.position.x !== undefined));
+
+  if (withPos.length === 0) {
+    const count = pois.length;
+    const radius = 4;
+    for (let i = 0; i < count; i++) {
+      const angle = (i / count) * Math.PI * 2 - Math.PI / 2;
+      const t = (pois[i].type || '').toLowerCase();
+      if (t === 'sun' || t === 'star') {
+        pois[i]._x = 0; pois[i]._y = 0;
+      } else {
+        pois[i]._x = radius * Math.cos(angle);
+        pois[i]._y = radius * Math.sin(angle);
+      }
+    }
+  } else {
+    for (const p of pois) {
+      if (p.position) { p._x = p.position.x; p._y = p.position.y; }
+      else { p._x = 0; p._y = 0; }
+    }
+  }
+
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const p of pois) {
+    if (p._x < minX) minX = p._x;
+    if (p._x > maxX) maxX = p._x;
+    if (p._y < minY) minY = p._y;
+    if (p._y > maxY) maxY = p._y;
+  }
+  if (pois.length <= 1) { minX = -5; maxX = 5; minY = -5; maxY = 5; }
+
+  const cx = (minX + maxX) / 2;
+  const cy = (minY + maxY) / 2;
+  for (const p of pois) { p._x -= cx; p._y -= cy; }
+  minX -= cx; maxX -= cx; minY -= cy; maxY -= cy;
+
+  const s = Math.max(Math.abs(minX), Math.abs(maxX), Math.abs(minY), Math.abs(maxY), 1) * 1.2;
+  const sw = s * 0.008;
+  const vx = -s, vy = -s, vw = s * 2, vh = s * 2;
+
+  function hash(a, b) {
+    const h = Math.sin(a * 127.1 + b * 311.7) * 43758.5453;
+    return h - Math.floor(h);
+  }
+
+  function dotR(type) {
+    switch (type) {
+      case 'sun': case 'star': return s * 0.07;
+      case 'planet': return s * 0.045;
+      case 'station': return s * 0.036;
+      case 'nebula': return s * 0.055;
+      case 'gas_cloud': return s * 0.05;
+      case 'ice_field': return s * 0.045;
+      default: return s * 0.036;
+    }
+  }
+
+  let svg = `<svg viewBox="${vx} ${vy} ${vw} ${vh}" xmlns="http://www.w3.org/2000/svg">`;
+  svg += `<defs>
+    <filter id="sm-glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="${s * 0.015}" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <filter id="sm-sun-glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="${s * 0.02}" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+    <linearGradient id="sm-planet-grad" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#4caf50"/><stop offset="100%" stop-color="#66bb6a"/></linearGradient>
+    <linearGradient id="sm-ice-grad" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#00bcd4"/><stop offset="100%" stop-color="#26c6da"/></linearGradient>
+  </defs>`;
+
+  const orbits = new Set();
+  for (const p of pois) {
+    const r = Math.sqrt(p._x * p._x + p._y * p._y);
+    if (r > 0.01) orbits.add(r.toFixed(3));
+  }
+  for (const rStr of orbits) {
+    const r = parseFloat(rStr);
+    svg += `<circle cx="0" cy="0" r="${r}" fill="none" stroke="rgba(79,195,247,0.12)" stroke-width="${sw * 0.5}" stroke-dasharray="${s * 0.02} ${s * 0.015}"/>`;
+  }
+
+  svg += `<line x1="${-s*0.02}" y1="0" x2="${s*0.02}" y2="0" stroke="rgba(79,195,247,0.2)" stroke-width="${sw*0.3}"/>`;
+  svg += `<line x1="0" y1="${-s*0.02}" x2="0" y2="${s*0.02}" stroke="rgba(79,195,247,0.2)" stroke-width="${sw*0.3}"/>`;
+
+  const usedTypes = new Set();
+  for (const p of pois) {
+    const x = p._x, y = p._y;
+    const t = (p.type || '').toLowerCase();
+    const color = POI_COLORS[t] || '#b0bec5';
+    const r = dotR(t);
+    const isHere = botPois.has(p.id);
+    usedTypes.add(t);
+
+    if (isHere) {
+      svg += `<circle cx="${x}" cy="${y}" r="${r + s * 0.012}" fill="none" stroke="#4caf50" stroke-width="${sw * 0.96}" filter="url(#sm-glow)"><animate attributeName="stroke-opacity" values="1;0.4;1" dur="2s" repeatCount="indefinite"/></circle>`;
+    }
+
+    if (t === 'sun' || t === 'star') {
+      svg += `<circle cx="${x}" cy="${y}" r="${r * 1.4}" fill="#ffd740" opacity="0.15" filter="url(#sm-sun-glow)"/>`;
+      svg += `<circle cx="${x}" cy="${y}" r="${r}" fill="#ffd740" opacity="0.9" filter="url(#sm-sun-glow)"><animate attributeName="opacity" values="0.9;0.7;0.9" dur="4s" repeatCount="indefinite"/></circle>`;
+      svg += `<circle cx="${x}" cy="${y}" r="${r * 0.55}" fill="#fff8e1" opacity="0.7"/>`;
+    } else if (t === 'station' || p.has_base) {
+      const fc = isHere ? '#4caf50' : '#4fc3f7';
+      const sc = isHere ? '#81c784' : '#b3e5fc';
+      svg += `<polygon points="${x},${y-r} ${x+r},${y} ${x},${y+r} ${x-r},${y}" fill="${fc}" opacity="0.9" stroke="${sc}" stroke-width="${sw*0.4}"/>`;
+      const ir = r * 0.4;
+      svg += `<polygon points="${x},${y-ir} ${x+ir},${y} ${x},${y+ir} ${x-ir},${y}" fill="none" stroke="${isHere?'#c8e6c9':'#e1f5fe'}" stroke-width="${sw*0.25}" opacity="0.6"/>`;
+    } else if (t === 'planet') {
+      svg += `<circle cx="${x}" cy="${y}" r="${r*1.12}" fill="none" stroke="rgba(102,187,106,0.2)" stroke-width="${sw*0.6}"/>`;
+      svg += `<circle cx="${x}" cy="${y}" r="${r}" fill="${isHere?'#4caf50':'url(#sm-planet-grad)'}" opacity="0.9" stroke="${isHere?'#81c784':'rgba(255,255,255,0.15)'}" stroke-width="${sw*0.3}"/>`;
+    } else if (t === 'nebula') {
+      svg += `<circle cx="${x+r*0.2}" cy="${y-r*0.15}" r="${r*0.8}" fill="#ce93d8" opacity="0.15"/>`;
+      svg += `<circle cx="${x}" cy="${y}" r="${r*0.6}" fill="${isHere?'#4caf50':'#ce93d8'}" opacity="0.7"/>`;
+    } else if (t === 'gas_cloud') {
+      svg += `<ellipse cx="${x}" cy="${y}" rx="${r*0.8}" ry="${r*0.55}" fill="#4db6ac" opacity="0.2"/>`;
+      svg += `<ellipse cx="${x}" cy="${y}" rx="${r*0.5}" ry="${r*0.35}" fill="${isHere?'#4caf50':'#b2dfdb'}" opacity="0.6"/>`;
+    } else if (t === 'ice_field') {
+      svg += `<circle cx="${x}" cy="${y}" r="${r*0.9}" fill="${isHere?'#4caf50':'url(#sm-ice-grad)'}" opacity="0.8" stroke="#b3e5fc" stroke-width="${sw*0.3}"/>`;
+    } else if (t.includes('asteroid') || t.includes('belt')) {
+      const orbitR = Math.sqrt(x*x + y*y);
+      if (orbitR > 0.01) {
+        const rockCount = 40;
+        const baseR = s * 0.007;
+        for (let i = 0; i < rockCount; i++) {
+          const angle = (i / rockCount) * Math.PI * 2;
+          const radVar = hash(i, orbitR) * 0.06 - 0.03;
+          const rr = orbitR * (1 + radVar);
+          const aJit = (hash(i * 3.1, orbitR * 7.3) - 0.5) * (Math.PI * 2 / rockCount) * 0.6;
+          const rx = rr * Math.cos(angle + aJit);
+          const ry = rr * Math.sin(angle + aJit);
+          const sizeFactor = 0.4 + hash(i * 43.3, orbitR * 17.1) * 0.6;
+          const opacity = 0.4 + hash(i * 73.7, orbitR * 53.3) * 0.5;
+          svg += `<circle cx="${rx}" cy="${ry}" r="${baseR * sizeFactor}" fill="${isHere?'#4caf50':'#ff9800'}" opacity="${opacity}"/>`;
+        }
+      } else {
+        svg += `<circle cx="${x}" cy="${y}" r="${r}" fill="${isHere?'#4caf50':color}" opacity="0.85"/>`;
+      }
+    } else if (t.includes('gate') || t.includes('jump')) {
+      svg += `<circle cx="${x}" cy="${y}" r="${r}" fill="none" stroke="${isHere?'#4caf50':'#69f0ae'}" stroke-width="${sw*0.6}" opacity="0.8"/>`;
+      svg += `<circle cx="${x}" cy="${y}" r="${r*0.5}" fill="${isHere?'#4caf50':'#69f0ae'}" opacity="0.6"/>`;
+    } else {
+      svg += `<circle cx="${x}" cy="${y}" r="${r}" fill="${isHere?'#4caf50':color}" opacity="0.85" stroke="${isHere?'#81c784':'rgba(255,255,255,0.15)'}" stroke-width="${sw*0.4}"/>`;
+    }
+
+    const labelColor = isHere ? '#81c784' : '#78909c';
+    const labelY = y + r + s * 0.03;
+    svg += `<text x="${x}" y="${labelY}" text-anchor="middle" dominant-baseline="hanging" fill="${labelColor}" font-size="${s * 0.035}" font-family="sans-serif" style="pointer-events:none">${parentWin.esc ? parentWin.esc(p.name || p.id) : (p.name || p.id)}</text>`;
+    if (p.hidden) {
+      svg += `<text x="${x}" y="${labelY + s * 0.04}" text-anchor="middle" dominant-baseline="hanging" fill="#9e9e9e" font-size="${s * 0.025}" font-family="sans-serif" opacity="0.7" style="pointer-events:none">🔒</text>`;
+    }
+  }
+  svg += `</svg>`;
+  wrap.innerHTML = svg;
+
+  const legendTypes = { sun: 'Sun', station: 'Station', planet: 'Planet', asteroid_belt: 'Asteroid Belt', nebula: 'Nebula', gas_cloud: 'Gas Cloud', ice_field: 'Ice Field', gate: 'Jump Gate' };
+  let legHtml = '';
+  for (const [type, label] of Object.entries(legendTypes)) {
+    if (usedTypes.has(type) || (type === 'asteroid_belt' && usedTypes.has('asteroid'))) {
+      legHtml += `<span class="sml-item"><span class="sml-dot" style="background:${POI_COLORS[type] || '#b0bec5'}"></span>${label}</span>`;
+    }
+  }
+  if (botsHere.length > 0) {
+    legHtml += `<span class="sml-item"><span class="sml-dot" style="background:#4caf50;box-shadow:0 0 4px #4caf50"></span>Bot here (${botsHere.map(b => b.username).join(', ')})</span>`;
+  }
+  legend.innerHTML = legHtml;
+}
+
+function closeSystemMap() {
+  const overlay = document.getElementById('systemMapOverlay');
+  if (overlay) overlay.style.display = 'none';
+}
+
+function buildOreFilters() {
+  const mapData = parentWin.mapData || {};
+  const ores = new Map();
+  for (const sys of Object.values(mapData)) {
+    for (const poi of (sys.pois || [])) {
+      for (const ore of (poi.ores_found || [])) {
+        if (ore.item_id && !ores.has(ore.item_id)) ores.set(ore.item_id, ore.name || ore.item_id);
+      }
+      for (const res of (poi.resources || [])) {
+        if (res.resource_id && !ores.has(res.resource_id)) ores.set(res.resource_id, res.name || res.resource_id);
+      }
+    }
+  }
+  const container = document.getElementById('oreFilterList');
+  if (!container) return;
+  if (ores.size === 0) {
+    container.innerHTML = '<span style="font-size:11px;color:var(--text-dim)">No resource data yet</span>';
+    return;
+  }
+  const sorted = [...ores.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+  container.innerHTML = sorted.map(([id, name]) => {
+    const active = activeOreFilters.has(id) ? ' active' : '';
+    return `<div class="ore-chip${active}" onclick="toggleOreFilter('${parentWin.esc ? parentWin.esc(id) : id}')">${parentWin.esc ? parentWin.esc(name) : name}</div>`;
+  }).join('') + `<div class="ore-chip${activeOreFilters.size === 0 ? ' active' : ''}" onclick="clearOreFilters()">All</div>`;
+}
+
+function toggleOreFilter(oreId) {
+  if (activeOreFilters.has(oreId)) activeOreFilters.delete(oreId);
+  else activeOreFilters.add(oreId);
+  buildOreFilters();
+  renderMap();
+}
+
+function clearOreFilters() {
+  activeOreFilters.clear();
+  buildOreFilters();
+  renderMap();
+}
+
+function toggleSystemCard(sysId) {
+  if (expandedSystems.has(sysId)) expandedSystems.delete(sysId);
+  else expandedSystems.add(sysId);
+  renderMap();
+}
+
+function timeAgo(isoStr) {
+  if (!isoStr) return '';
+  const diff = Date.now() - new Date(isoStr).getTime();
+  if (diff < 0) return 'just now';
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 30) return `${days}d ago`;
+  return `${Math.floor(days / 30)}mo ago`;
+}
+
+function securityBadge(level) {
+  if (!level) return '<span class="badge badge-null">Unknown</span>';
+  const lc = level.toLowerCase();
+  if (lc.includes('high') || lc.includes('safe') || lc.includes('secure')) return `<span class="badge badge-high">${parentWin.esc ? parentWin.esc(level) : level}</span>`;
+  if (lc.includes('low') || lc.includes('danger') || lc.includes('lawless') || lc.includes('null')) return `<span class="badge badge-low">${parentWin.esc ? parentWin.esc(level) : level}</span>`;
+  return `<span class="badge badge-medium">${parentWin.esc ? parentWin.esc(level) : level}</span>`;
+}
+
+function securityOrder(level) {
+  if (!level) return 3;
+  const lc = level.toLowerCase();
+  if (lc.includes('high') || lc.includes('safe')) return 0;
+  if (lc.includes('low') || lc.includes('danger') || lc.includes('lawless')) return 2;
+  return 1;
+}
+
+function poiIcon(type) {
+  const t = (type || '').toLowerCase();
+  if (t.includes('asteroid')) return '◆';
+  if (t.includes('station') || t.includes('base')) return '■';
+  if (t.includes('planet')) return '●';
+  if (t.includes('gate') || t.includes('jump')) return '→';
+  if (t.includes('anomaly')) return '✦';
+  return '•';
+}
+
+function renderMap() {
+  const container = document.getElementById('mapContent');
+  if (!container) return;
+  const mapData = parentWin.mapData || {};
+  const systems = Object.values(mapData);
+
+  if (systems.length === 0) {
+    container.innerHTML = '<div class="map-empty">No map data yet. Start a bot to begin exploring!</div>';
+    return;
+  }
+
+  const searchTerm = (document.getElementById('mapSearch')?.value || '').toLowerCase();
+  const secFilter = document.getElementById('mapSecFilter')?.value || '';
+  const sortBy = document.getElementById('mapSortBy')?.value || 'name';
+
+  let filtered = systems.filter(sys => {
+    // Skip blank/orphaned system entries that have no real id or name
+    if (!sys.id && !sys.name) return false;
+    const sysName = (sys.name || sys.id || '').toLowerCase();
+    if (searchTerm && !sysName.includes(searchTerm) && !(sys.id || '').toLowerCase().includes(searchTerm)) return false;
+    if (activeOreFilters.size > 0) {
+      const hasOre = (sys.pois || []).some(poi =>
+        (poi.ores_found || []).some(o => activeOreFilters.has(o.item_id)) ||
+        (poi.resources || []).some(r => activeOreFilters.has(r.resource_id))
+      );
+      if (!hasOre) return false;
+    }
+    if (secFilter) {
+      const sl = (sys.security_level || '').toLowerCase();
+      if (secFilter === 'unknown' && sl) return false;
+      if (secFilter === 'high' && !sl.includes('high') && !sl.includes('safe') && !sl.includes('secure')) return false;
+      if (secFilter === 'medium' && (sl.includes('high') || sl.includes('safe') || sl.includes('low') || sl.includes('danger') || sl.includes('lawless') || !sl)) return false;
+      if (secFilter === 'low' && !sl.includes('low') && !sl.includes('danger') && !sl.includes('lawless') && !sl.includes('null')) return false;
+    }
+    return true;
+  });
+
+  filtered.sort((a, b) => {
+    if (sortBy === 'name') return (a.name || a.id || '').localeCompare(b.name || b.id || '');
+    if (sortBy === 'updated') return (b.last_updated || '').localeCompare(a.last_updated || '');
+    if (sortBy === 'pois') return (b.pois || []).length - (a.pois || []).length;
+    if (sortBy === 'security') return securityOrder(a.security_level) - securityOrder(b.security_level);
+    return 0;
+  });
+
+  if (filtered.length === 0) {
+    container.innerHTML = '<div class="map-empty">No systems match your filters.</div>';
+    return;
+  }
+
+  let html = '';
+  for (const sys of filtered) {
+    const sec = (sys.security_level || '').toLowerCase();
+    let badgeClass = 'badge-null';
+    let badgeText = 'Unknown';
+    if (sec.includes('high') || sec.includes('safe') || sec.includes('secure')) { badgeClass = 'badge-high'; badgeText = 'High Sec'; }
+    else if (sec.includes('medium')) { badgeClass = 'badge-medium'; badgeText = 'Medium Sec'; }
+    else if (sec.includes('low') || sec.includes('danger') || sec.includes('lawless') || sec.includes('null')) { badgeClass = 'badge-low'; badgeText = 'Low Sec'; }
+
+    const pois = (sys.pois || []);
+    const poiCount = pois.length;
+    const connections = sys.connections || [];
+    const updated = sys.last_updated ? new Date(sys.last_updated).toLocaleDateString() : 'Never';
+    const isExpanded = expandedSystems.has(sys.id);
+
+    html += `
+      <div class="sys-card${isExpanded ? ' expanded' : ''}" data-sys="${parentWin.esc ? parentWin.esc(sys.id) : sys.id}">
+        <div class="sys-header" onclick="toggleSystemCard('${parentWin.esc ? parentWin.esc(sys.id) : sys.id}')">
+          <span class="sys-chevron">▶</span>
+          <span class="sys-name">${parentWin.esc ? parentWin.esc(sys.name || sys.id) : (sys.name || sys.id)}</span>
+          <div class="sys-badges"><span class="badge ${badgeClass}">${badgeText}</span></div>
+          <div class="sys-summary">
+            <span>${poiCount} POI${poiCount !== 1 ? 's' : ''}</span>
+            <span>${connections.length} connection${connections.length !== 1 ? 's' : ''}</span>
+            <span class="sys-updated">${updated}</span>
+          </div>
+        </div>
+        <div class="sys-body">
+          <div class="sys-connections">
+            <span class="conn-label">Connections:</span>
+            ${connections.length > 0 ? connections.map(c => {
+              const cSys = mapData[c.system_id];
+              const cName = cSys?.name || c.system_id;
+              return `<span class="conn-chip">${parentWin.esc ? parentWin.esc(cName) : cName}</span>`;
+            }).join('') : '<span style="color:var(--text-dim)">None</span>'}
+          </div>
+          ${pois.length > 0 ? `
+            <div class="sys-pois">
+              ${pois.map(poi => {
+                const resources = (poi.resources || []).slice(0, 6);
+                return `
+                  <div class="poi-card">
+                     <div class="poi-head">
+                       <span class="poi-icon">${poiIcon(poi.type)}</span>
+                       <span class="poi-name">${parentWin.esc ? parentWin.esc(poi.name || poi.id) : (poi.name || poi.id)}</span>
+                       <span class="poi-type-badge">${parentWin.esc ? parentWin.esc(poi.type || 'unknown') : (poi.type || 'unknown')}</span>
+                       ${poi.hidden ? '<span class="poi-hidden-badge">🔒 hidden</span>' : ''}
+                     </div>
+                     ${resources.length > 0 ? `
+                       <div class="poi-section">
+                         <div style="font-size:10px;color:var(--text-dim);margin-bottom:2px">Resources</div>
+                         <div class="poi-resource-grid">
+                           ${resources.map(r => {
+                             const name = parentWin.esc ? parentWin.esc(r.name || r.resource_id) : (r.name || r.resource_id);
+                             const remaining = r.remaining || 0;
+                             const max = r.max_remaining || 1;
+                             // Availability % (100% = full/untouched, 0% = fully depleted)
+                             const availability = (max > 0) ? Math.round((remaining / max) * 100) : 0;
+                             const availColor = availability > 50 ? '#4caf50' : availability > 20 ? '#ff9800' : '#f44336';
+                             return `
+                               <div class="resource-mini">
+                                 <div class="resource-name">${name}</div>
+                                 <div class="resource-stats">
+                                   <span>${remaining.toLocaleString()} / ${max.toLocaleString()}</span>
+                                   <span style="color:${availColor}">${availability}%</span>
+                                 </div>
+                                 <div class="depletion-bar"><div class="depletion-fill" style="width:${availability}%;background:${availColor}"></div></div>
+                               </div>`;
+                           }).join('')}
+                         </div>
+                       </div>` : ''}
+                    <button class="sm" style="margin-top:6px" onclick="event.stopImmediatePropagation(); openSystemMap('${parentWin.esc ? parentWin.esc(sys.id) : sys.id}')">View System Map</button>
+                  </div>`;
+              }).join('')}
+            </div>` : ''}
+        </div>
+      </div>`;
+  }
+  container.innerHTML = html;
+}
+
+function initMap() {
+  if (parentWin.mapData && Object.keys(parentWin.mapData).length > 0) {
+    renderMapPage();
+    return;
+  }
+  let attempts = 0;
+  const timer = setInterval(() => {
+    attempts++;
+    if (parentWin.mapData && Object.keys(parentWin.mapData).length > 0) {
+      clearInterval(timer);
+      renderMapPage();
+    } else if (attempts > 15) {
+      clearInterval(timer);
+    }
+  }, 800);
+}
+
+window.onload = initMap;
+</script>
+</body>
+</html>

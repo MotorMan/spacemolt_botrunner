@@ -1,0 +1,245 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Market - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    .mkt-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    .mkt-table th { text-align: left; padding: 8px 10px; background: var(--card-bg); border-bottom: 1px solid var(--border); color: var(--text-dim); font-weight: 600; white-space: nowrap; cursor: pointer; }
+    .mkt-table td { padding: 6px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    .mkt-table tr:hover { background: var(--hover); }
+    .mkt-sell { color: var(--green); font-weight: 600; }
+    .market-empty { color: var(--text-dim); padding: 40px; text-align: center; }
+  </style>
+</head>
+<body>
+  <div style="padding:16px;overflow-y:auto;height:100%">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px;flex-wrap:wrap">
+      <h3 style="margin:0;color:var(--text-bright)">Market Overview</h3>
+      <span id="marketStats" style="color:var(--text-dim);font-size:12px"></span>
+      <input type="text" id="marketSearch" placeholder="Search items..." oninput="renderMarketTable()" style="margin-left:auto;width:200px;font-size:12px;padding:4px 8px">
+    </div>
+    <div id="marketTableWrap"></div>
+  </div>
+
+<script>
+const parentWin = window.parent;
+let marketSortKey = 'profit';
+let marketSortAsc = false;
+
+function renderMarketPage() {
+  renderMarketTable();
+}
+
+function sortMarketBy(key) {
+  if (marketSortKey === key) {
+    marketSortAsc = !marketSortAsc;
+  } else {
+    marketSortKey = key;
+    if (key === 'name' || key === 'station' || key === 'age') marketSortAsc = true;
+    else marketSortAsc = false;
+  }
+  renderMarketTable();
+}
+
+function renderMarketTable() {
+  try {
+    const container = document.getElementById('marketTableWrap');
+    const statsEl = document.getElementById('marketStats');
+    if (!container) {
+      console.error('marketTableWrap container NOT FOUND');
+      return;
+    }
+    container.innerHTML = '<div style="padding:16px;color:var(--text-dim)">Loading market data...</div>';
+
+    const mapData = parentWin.mapData || {};
+    const bots = parentWin.bots || [];
+    const globalFactionStorage = parentWin.globalFactionStorage || [];
+
+    // Aggregate inventory across all bots AND faction storage
+    const inventoryMap = new Map();
+    for (const bot of bots) {
+      if (bot.inventory && Array.isArray(bot.inventory)) {
+        for (const item of bot.inventory) {
+          const itemId = item.itemId || item.id;
+          if (itemId) inventoryMap.set(itemId, (inventoryMap.get(itemId) || 0) + (item.quantity || 0));
+        }
+      }
+      if (bot.storage && Array.isArray(bot.storage)) {
+        for (const item of bot.storage) {
+          const itemId = item.itemId || item.id;
+          if (itemId) inventoryMap.set(itemId, (inventoryMap.get(itemId) || 0) + (item.quantity || 0));
+        }
+      }
+    }
+    if (globalFactionStorage && Array.isArray(globalFactionStorage)) {
+      for (const item of globalFactionStorage) {
+        const itemId = item.item_id || item.itemId;
+        if (itemId) inventoryMap.set(itemId, (inventoryMap.get(itemId) || 0) + (item.quantity || 0));
+      }
+    }
+
+    // Build itemMap from mapData
+    const itemMap = new Map();
+    for (const [sysId, sys] of Object.entries(mapData)) {
+      const sysName = sys.name || sysId;
+      for (const poi of (sys.pois || [])) {
+        const stationName = poi.name || poi.id;
+        if (poi.market && Array.isArray(poi.market)) {
+          for (const m of poi.market) {
+            const itemId = m.item_id;
+            if (!itemId) continue;
+            if (!itemMap.has(itemId)) {
+              itemMap.set(itemId, { name: m.item_name || itemId, stations: [] });
+            }
+            const entry = itemMap.get(itemId);
+            entry.stations.push({
+              sysName,
+              stationName,
+              sellPrice: m.best_buy != null ? m.best_buy : null,
+              buyPrice: m.best_sell != null ? m.best_sell : null,
+              demand: m.buy_quantity || 0,
+              supply: m.sell_quantity || 0,
+              updated: m.last_updated || null,
+            });
+          }
+        }
+      }
+    }
+
+    const searchTerm = (document.getElementById('marketSearch')?.value || '').toLowerCase();
+    const rows = [];
+
+    for (const [itemId, data] of itemMap) {
+      let bestSell = null, bestSellStation = '', totalDemand = 0, bestSellUpdated = null;
+
+      for (const s of data.stations) {
+        if (s.sellPrice != null && (bestSell === null || s.sellPrice > bestSell)) {
+          bestSell = s.sellPrice;
+          bestSellStation = `${s.stationName} (${s.sysName})`;
+          totalDemand = s.demand;
+          bestSellUpdated = s.updated;
+        }
+      }
+
+      if (bestSell === null || totalDemand <= 0) continue;
+
+      if (searchTerm && !itemId.toLowerCase().includes(searchTerm) && !data.name.toLowerCase().includes(searchTerm)) continue;
+
+      const inventoryQty = inventoryMap.get(itemId) || 0;
+
+      let ageStr = '-';
+      let skipStale = false;
+      if (bestSellUpdated) {
+        const updatedMs = Date.parse(bestSellUpdated);
+        if (!isNaN(updatedMs)) {
+          const ageMs = Date.now() - updatedMs;
+          const ageMins = Math.floor(ageMs / 60000);
+          let ageHours = 0;
+          if (ageMins < 60) ageStr = `${ageMins}m`;
+          else { ageHours = Math.floor(ageMins / 60); ageStr = ageHours < 24 ? `${ageHours}h` : `${Math.floor(ageHours / 24)}d`; }
+          if (ageHours >= 24) skipStale = true;
+        }
+      }
+      if (skipStale) continue;
+
+      const sellableQty = Math.min(totalDemand, inventoryQty);
+      const revenue = bestSell * sellableQty;
+
+      rows.push({
+        itemId,
+        name: data.name,
+        bestSell,
+        bestSellStation,
+        demand: totalDemand,
+        inventoryQty,
+        profit: revenue,
+        ageStr,
+        ageMs: bestSellUpdated ? Date.parse(bestSellUpdated) : Infinity,
+      });
+    }
+
+    if (statsEl) {
+      const stationSet = new Set();
+      for (const [sysId, sys] of Object.entries(mapData)) {
+        for (const poi of (sys.pois || [])) {
+          if (poi.market && poi.market.length > 0) stationSet.add(`${sysId}:${poi.id}`);
+        }
+      }
+      statsEl.textContent = `${rows.length} items across ${stationSet.size} stations in ${Object.keys(mapData).length} systems`;
+    }
+
+    if (rows.length === 0) {
+      container.innerHTML = '<div class="market-empty">No sell listings found. Explore stations to gather market data.</div>';
+      return;
+    }
+
+    rows.sort((a, b) => {
+      let av, bv;
+      switch (marketSortKey) {
+        case 'name': av = a.itemId.toLowerCase(); bv = b.itemId.toLowerCase(); break;
+        case 'bestSell': av = a.bestSell ?? -1; bv = b.bestSell ?? -1; break;
+        case 'station': av = a.bestSellStation.toLowerCase(); bv = b.bestSellStation.toLowerCase(); break;
+        case 'sellQty': av = a.demand; bv = b.demand; break;
+        case 'inventory': av = a.inventoryQty; bv = b.inventoryQty; break;
+        case 'profit': av = a.profit ?? -Infinity; bv = b.profit ?? -Infinity; break;
+        case 'age': av = a.ageMs; bv = b.ageMs; break;
+        default: av = a.itemId.toLowerCase(); bv = b.itemId.toLowerCase();
+      }
+      if (av < bv) return marketSortAsc ? -1 : 1;
+      if (av > bv) return marketSortAsc ? 1 : -1;
+      return 0;
+    });
+
+    const arrow = (key) => marketSortKey === key ? (marketSortAsc ? ' ▲' : ' ▼') : '';
+
+    let html = `<table class="mkt-table" style="width:100%">`;
+    html += `<thead><tr>`;
+    html += `<th onclick="sortMarketBy('name')">Item ID${arrow('name')}</th>`;
+    html += `<th onclick="sortMarketBy('bestSell')">Best Buy${arrow('bestSell')}</th>`;
+    html += `<th onclick="sortMarketBy('station')">At Station${arrow('station')}</th>`;
+    html += `<th onclick="sortMarketBy('sellQty')">Demand${arrow('sellQty')}</th>`;
+    html += `<th onclick="sortMarketBy('inventory')">In Stock${arrow('inventory')}</th>`;
+    html += `<th onclick="sortMarketBy('profit')">Profit${arrow('profit')}</th>`;
+    html += `<th onclick="sortMarketBy('age')">Age${arrow('age')}</th>`;
+    html += `</tr></thead><tbody>`;
+
+    const esc = parentWin.esc || (s => s);
+
+    for (const r of rows) {
+      const profitColor = r.profit != null ? (r.profit > 0 ? 'var(--green)' : (r.profit < 0 ? 'var(--red)' : 'var(--text-dim)')) : 'var(--text-dim)';
+      html += `<tr>`;
+      html += `<td style="font-weight:500">${esc(r.itemId)}</td>`;
+      html += `<td class="mkt-sell">${r.bestSell != null ? r.bestSell.toLocaleString() + ' cr' : '-'}</td>`;
+      html += `<td style="font-size:11px;color:var(--text-dim)">${esc(r.bestSellStation)}</td>`;
+      html += `<td style="text-align:center">${r.demand != null ? r.demand.toLocaleString() : '-'}</td>`;
+      html += `<td style="text-align:center">${r.inventoryQty != null ? r.inventoryQty.toLocaleString() : '0'}</td>`;
+      html += `<td style="color:${profitColor};font-weight:500">${r.profit != null ? r.profit.toLocaleString() + ' cr' : '-'}</td>`;
+      html += `<td style="text-align:center;color:var(--text-dim);font-size:11px">${r.ageStr}</td>`;
+      html += `</tr>`;
+    }
+
+    html += `</tbody></table>`;
+    container.innerHTML = html;
+
+  } catch (e) {
+    console.error('renderMarketTable error:', e);
+    const c = document.getElementById('marketTableWrap');
+    if (c) c.innerHTML = '<div style="color:var(--red);padding:16px">Error loading market data: ' + e.message + '</div>';
+  }
+}
+
+window.onload = () => {
+  if (parentWin.mapData && Object.keys(parentWin.mapData).length > 0) {
+    renderMarketPage();
+  } else {
+    setTimeout(() => {
+      if (parentWin.mapData) renderMarketPage();
+    }, 800);
+  }
+};
+</script>
+</body>
+</html>

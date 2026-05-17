@@ -1541,6 +1541,24 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Works from anywhere (doesn't require being docked)
     await bot.refreshFactionStorage();
 
+    // Top up fuel cells from faction storage when at home (runs every cycle)
+    if (homeSystem && bot.system === homeSystem) {
+      await bot.refreshCargo();
+      let fuelInCargo = 0;
+      for (const item of bot.inventory) {
+        const lower = item.itemId.toLowerCase();
+        if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
+      }
+      if (fuelInCargo < 10) {
+        const prem = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: 20 });
+        if (!prem.error) ctx.log("mining", `Withdrew premium fuel cells from storage`);
+        else {
+          const reg = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: 30 });
+          if (!reg.error) ctx.log("mining", `Withdrew fuel cells from storage`);
+        }
+      }
+    }
+
     // ── Check for field_test mission (early game mining mission) ──
     const fieldTestActive = await hasFieldTestMission(ctx);
     if (fieldTestActive) {

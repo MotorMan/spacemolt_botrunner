@@ -11008,7 +11008,27 @@ function renderFactionPage() {
   renderFactionSidebar();
   // Try to load facilities cache when faction tab is opened (non-blocking)
   if (!personalFacilityLoadComplete) {
-    loadFacilitiesCache();
+    loadFacilitiesCache().then(loaded => {
+      if (!loaded && bots.length > 0) {
+        // Cache was outdated or empty, fetch fresh data
+        const availableBot = bots.find(b => b.username);
+        if (availableBot) {
+          fetchPersonalFacilityTypes(availableBot.username);
+        }
+      } else if (loaded && bots.length > 0) {
+        // Cache was loaded successfully, render the UI with cached types
+        const availableBot = bots.find(b => b.username);
+        if (availableBot) {
+          renderPersonalFacilitiesWithCache(availableBot.username);
+        }
+      }
+    });
+  } else if (bots.length > 0 && !document.querySelector('#personalFacilityTypes')) {
+    // Cache is already loaded but UI not rendered, render it
+    const availableBot = bots.find(b => b.username);
+    if (availableBot) {
+      renderPersonalFacilitiesWithCache(availableBot.username);
+    }
   }
   if (factionSelectedBot) {
     fetchFactionInfo(factionSelectedBot);
@@ -12123,8 +12143,8 @@ function fetchFactionFacilities(username) {
         const name = fac.name || fac.facility_type || fac.type || '?';
         const facId = fac.facility_id || fac.id || '';
         const level = fac.level ?? fac.tier ?? '';
-        const enabled = fac.enabled !== false;
-        const status = enabled ? '<span style="color:var(--green)">Active</span>' : '<span style="color:var(--red)">Disabled</span>';
+        const enabled = fac.status === 'active';
+        const status = enabled ? '<span style="color:var(--green)">Active</span>' : '<span style="color:var(--red)">Inactive</span>';
         const levelStr = level ? ` (Level ${level})` : '';
         const factionService = fac.faction_service || '';
         const canTransfer = !factionService;
@@ -12443,7 +12463,21 @@ async function loadFacilitiesCache() {
     const res = await fetch('/api/facilities');
     const data = await res.json();
     console.log('Cache API response:', data);
-    if (data.version && data.version === '0.269.15') {
+    if (data.version) {
+      const hasData = (data.personal?.length > 0 || data.production?.length > 0);
+      const currentVersion = await fetchGameVersion();
+      if (!hasData) {
+        console.log('Cache is empty, fetching fresh data.');
+        personalFacilityVersion = currentVersion || data.version;
+        personalFacilityLoadComplete = false;
+        return false;
+      }
+      if (currentVersion && currentVersion !== data.version) {
+        console.log(`Cache version ${data.version} outdated, current is ${currentVersion}. Fetching fresh data.`);
+        personalFacilityVersion = currentVersion;
+        personalFacilityLoadComplete = false;
+        return false;
+      }
       personalFacilityVersion = data.version;
       console.log('Loading', data.personal?.length, 'personal and', data.production?.length, 'production types from cache');
       // Load cached types (already deduplicated from server)
@@ -12465,13 +12499,34 @@ async function loadFacilitiesCache() {
       console.log('Loaded facilities from cache:', personalFacilityTypes.length, 'types total');
       return true;
     } else {
-      console.log('Cache version mismatch or empty:', data.version);
+      console.log('Cache empty or no version:', data.version);
       return false;
     }
   } catch (err) {
     console.warn('Failed to load facilities cache:', err);
     return false;
   }
+}
+
+// Get current game version from server
+async function fetchGameVersion() {
+  try {
+    // Find an available bot to make the get_version call
+    const availableBot = bots.find(b => b.username);
+    if (!availableBot) {
+      console.warn('No available bot to fetch game version');
+      return null;
+    }
+    const result = await new Promise(resolve => {
+      sendExec(availableBot.username, 'get_version', {}, resolve);
+    });
+    if (result.ok && result.data && result.data.version) {
+      return result.data.version;
+    }
+  } catch (err) {
+    console.warn('Failed to fetch game version:', err);
+  }
+  return null;
 }
 
 // Save facilities to server cache
@@ -12538,6 +12593,66 @@ function renderPersonalFacilities(f, username) {
   `;
 }
 
+function renderPersonalFacilitiesWithCache(username) {
+  const bot = bots.find(b => b.username === username);
+  const docked = bot ? bot.docked : false;
+  const dockWarning = !docked
+    ? '<div style="color:var(--yellow);font-size:11px;margin-bottom:12px">Bot must be docked at a station to manage personal facilities.</div>'
+    : '';
+
+  personalFacilityCategory = 'personal';
+  personalFacilityPage = 0;
+
+  const container = document.createElement('div');
+  container.style.cssText = 'display:flex;flex-direction:column;flex:1;min-height:0;gap:16px';
+  container.innerHTML = `
+    ${dockWarning}
+    <div class="faction-section">
+      <div class="faction-section-title">My Personal Facilities</div>
+      <div id="personalFacilitiesList">
+        <button class="sm" onclick="fetchPersonalFacilities('${esc(username)}')" ${!docked ? 'disabled' : ''}>Load My Facilities</button>
+      </div>
+    </div>
+    <div class="faction-section" style="flex:1;display:flex;flex-direction:column;min-height:0">
+      <div class="faction-section-title">Available Personal Facilities</div>
+      <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
+        <button class="sm" id="pf-cat-personal" style="background:var(--accent);color:#fff">Personal</button>
+        <button class="sm" id="pf-cat-production" onclick="switchPersonalFacilityCategory('production','${esc(username)}')">Production</button>
+        <span id="pf-category-info" style="font-size:11px;color:var(--text-dim);margin-left:auto">${personalFacilityTypes.filter(t => t._category === 'personal').length} personal types</span>
+      </div>
+      <div id="personalFacilityTypes" style="flex:1;min-height:0;overflow-y:auto"></div>
+    </div>
+  `;
+
+  document.getElementById('factionContent').innerHTML = `
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+      <div style="font-size:16px;font-weight:700;color:var(--text-bright)">${esc(bot?.faction?.name || 'Faction')}</div>
+      <span style="font-size:11px;padding:2px 8px;background:#1a3a2a;color:#4ade80;border-radius:4px">[${esc(bot?.faction?.tag || 'FACTION')}]</span>
+      <button class="sm" style="margin-left:auto;background:var(--red);border:none;color:#fff;font-size:11px" onclick="factionLeave('${esc(username)}')">Leave Faction</button>
+    </div>
+    <div style="display:flex;gap:6px;margin-bottom:16px;flex-wrap:wrap">${renderFactionPanelNav('personal')}</div>
+    ${container.innerHTML}
+  `;
+
+  const typesContainer = document.getElementById('personalFacilityTypes');
+  renderPersonalFacilityList(typesContainer, username);
+}
+
+function renderFactionPanelNav(activePanel) {
+  return `
+    <button class="faction-nav-btn ${activePanel === 'overview' ? 'active' : ''}" onclick="switchFactionPanel('overview')">Overview</button>
+    <button class="faction-nav-btn ${activePanel === 'members' ? 'active' : ''}" onclick="switchFactionPanel('members')">Members</button>
+    <button class="faction-nav-btn ${activePanel === 'storage' ? 'active' : ''}" onclick="switchFactionPanel('storage')">Storage</button>
+    <button class="faction-nav-btn ${activePanel === 'facilities' ? 'active' : ''}" onclick="switchFactionPanel('facilities')">Facilities</button>
+    <button class="faction-nav-btn ${activePanel === 'personal' ? 'active' : ''}" onclick="switchFactionPanel('personal')">Personal Facilities</button>
+    <button class="faction-nav-btn ${activePanel === 'rooms' ? 'active' : ''}" onclick="switchFactionPanel('rooms')">Rooms</button>
+    <button class="faction-nav-btn ${activePanel === 'missions' ? 'active' : ''}" onclick="switchFactionPanel('missions')">Missions</button>
+    <button class="faction-nav-btn ${activePanel === 'diplomacy' ? 'active' : ''}" onclick="switchFactionPanel('diplomacy')">Diplomacy</button>
+    <button class="faction-nav-btn ${activePanel === 'intel' ? 'active' : ''}" onclick="switchFactionPanel('intel')">Intel</button>
+    <button class="faction-nav-btn ${activePanel === 'activity' ? 'active' : ''}" onclick="switchFactionPanel('activity')">Activity</button>
+  `;
+}
+
 function switchPersonalFacilityCategory(category, username) {
   personalFacilityCategory = category;
   personalFacilityPage = 0; // Reset to first page when switching
@@ -12562,8 +12677,9 @@ function switchPersonalFacilityCategory(category, username) {
       productionBtn.style.color = '';
     }
   }
-  // If we have cached data for this category, render it
-  if (personalFacilityTypes.length > 0 && personalFacilityVersion === '0.269.15') {
+  // Check if we have cached data for the current category
+  const hasCategoryData = personalFacilityTypes.some(t => t._category === category);
+  if (hasCategoryData && personalFacilityLoadComplete) {
     renderPersonalFacilityList(document.getElementById('personalFacilityTypes'), username);
   } else {
     fetchPersonalFacilityTypes(username);
@@ -13087,34 +13203,21 @@ async function fetchPersonalFacilityTypes(username) {
   if (!container) return;
   container.innerHTML = '<div class="faction-no-data">Loading available types...</div>';
   
-  // First, try to load from cache if not already done
-  if (!personalFacilityLoadComplete) {
-    const loaded = await loadFacilitiesCache();
-    if (loaded && personalFacilityLoadComplete) {
-      console.log('Using cached data after loadFacilitiesCache:', personalFacilityTypes.length, 'types');
-      renderPersonalFacilityList(container, username);
-      return;
-    }
-  }
-  
-  // Use cached data if fully loaded from cache
-  if (personalFacilityTypes.length > 0 && personalFacilityLoadComplete && personalFacilityVersion) {
-    console.log('Using cached data,', personalFacilityTypes.length, 'types, version:', personalFacilityVersion);
-    renderPersonalFacilityList(container, username);
-    return;
-  }
-  
-  console.log('Cache not ready, fetching from API. Has types:', personalFacilityTypes.length, 'Complete:', personalFacilityLoadComplete, 'Version:', personalFacilityVersion);
+  // Always fetch fresh data from the game API
   personalFacilityLoading = true;
   personalFacilityPage = 0;
-  // Don't clear types if we already have some from cache - reuse them
-  if (personalFacilityTypes.length === 0) {
-    personalFacilityTypes = [];
-  }
+  personalFacilityTypes = [];
   personalFacilityLoadComplete = false;
   
-  // Fetch both personal and production categories
-  fetchPersonalFacilityPage(username, container, 0, 'personal');
+  // Fetch game version first
+  fetchGameVersion().then(version => {
+    if (version) {
+      personalFacilityVersion = version;
+      console.log('Game version:', personalFacilityVersion);
+    }
+    // Fetch both personal and production categories
+    fetchPersonalFacilityPage(username, container, 0, 'personal');
+  });
 }
 
 async function fetchPersonalFacilityPage(username, container, page, category) {
@@ -13167,7 +13270,6 @@ async function fetchPersonalFacilityPage(username, container, page, category) {
         }, 2000);
       } else {
         // All done
-        personalFacilityVersion = '0.269.15';
         personalFacilityPage = 0;
         personalFacilityLoadComplete = true;
         
@@ -13387,7 +13489,7 @@ function renderPersonalFacilityDetailCard(container, username, typeId, detail) {
           <div style="font-size:14px;font-weight:700;color:var(--text-bright)">${esc(name)}${esc(levelStr)}</div>
           <div style="font-size:11px;color:var(--text-dim)">${esc(category)}</div>
         </div>
-        <button class="sm" onclick="fetchPersonalFacilityTypes('${esc(username)}')">Back to List</button>
+        <button class="sm" onclick="renderPersonalFacilityList(document.getElementById('personalFacilityTypes'), '${esc(username)}')">Back to List</button>
       </div>
       <div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>
       ${buildCostStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Build Cost: ${esc(buildCostStr)}</div>` : ''}
@@ -13450,7 +13552,7 @@ async function buildPersonalFacility(username, facilityType) {
   
   const showError = (msg) => {
     setStatus('ERROR: ' + msg, 'var(--red)');
-    document.getElementById('bp-actions').innerHTML = '<button class="sm" onclick="fetchPersonalFacilityTypes(\'' + esc(username) + '\')">Back to List</button>';
+    document.getElementById('bp-actions').innerHTML = '<button class="sm" onclick="renderPersonalFacilityList(document.getElementById(\'personalFacilityTypes\'), \'' + esc(username) + '\')">Back to List</button>';
   };
   
   const showSuccess = () => {
@@ -13525,7 +13627,7 @@ async function buildPersonalFacility(username, facilityType) {
     setStatus('Missing materials: ' + missing.join(', '), 'var(--orange)');
     document.getElementById('bp-actions').innerHTML = `
       <button class="sm" onclick="buildPersonalFacilityConfirm('${esc(username)}','${esc(facilityType)}','${esc(JSON.stringify(mats))}',${cost})">Try Anyway</button>
-      <button class="sm" onclick="fetchPersonalFacilityTypes('${esc(username)}')">Cancel</button>
+      <button class="sm" onclick="renderPersonalFacilityList(document.getElementById('personalFacilityTypes'), '${esc(username)}')">Cancel</button>
     `;
     return;
   }
@@ -13626,7 +13728,7 @@ async function buildPersonalFacilityConfirm(username, facilityType, matsJson, co
     document.getElementById('bp-actions').innerHTML = '<button class="primary sm" onclick="fetchPersonalFacilities(\'' + esc(username) + '\')">View My Facilities</button>';
   } else {
     setStatus('Build failed: ' + (buildResult.error || 'unknown'), 'var(--red)');
-    document.getElementById('bp-actions').innerHTML = '<button class="sm" onclick="fetchPersonalFacilityTypes(\'' + esc(username) + '\')">Back to List</button>';
+    document.getElementById('bp-actions').innerHTML = '<button class="sm" onclick="renderPersonalFacilityList(document.getElementById(\'personalFacilityTypes\'), \'' + esc(username) + '\')">Back to List</button>';
   }
 }
 

@@ -9,8 +9,9 @@ const FULL_PLAYER_INFO_FILE = join(process.cwd(), "data", "fullPlayerInfo.json")
  * Ship history entry for tracking previously seen ships.
  */
 export interface ShipHistoryEntry {
-  ship: string; // Ship name/type
-  lastSeen: string; // ISO timestamp when this ship was last seen
+  ship: string;
+  shipName?: string;
+  lastSeen: string;
 }
 
 /**
@@ -19,9 +20,10 @@ export interface ShipHistoryEntry {
 export interface EntityDetail {
   name: string;
   type: "player" | "pirate" | "empire_npc";
-  id?: string; // player_id / pirate_id / npc_id
+  id?: string;
   faction: string;
   ship: string;
+  shipName?: string;
   lastSeen: string;
   system: string;
   poi: string;
@@ -217,24 +219,41 @@ export class PlayerNameStore {
    */
   private updateShipWithHistory(entity: EntityDetail, newShip: string, timestamp: string): boolean {
     if (!newShip || newShip === entity.ship) {
-      return false; // No change or empty ship
+      return false;
     }
 
-    // If entity has an existing ship, add it to history
     if (entity.ship && entity.ship !== newShip) {
       if (!entity.shipHistory) {
         entity.shipHistory = [];
       }
 
-      // Check if this ship is already in history
       const alreadyLogged = entity.shipHistory.some(entry => entry.ship === entity.ship);
       if (!alreadyLogged) {
         entity.shipHistory.push({ ship: entity.ship, lastSeen: entity.lastSeen });
       }
     }
 
-    // Update to new ship
     entity.ship = newShip;
+    return true;
+  }
+
+  private updateShipNameWithHistory(entity: EntityDetail, newShipName: string, timestamp: string): boolean {
+    if (!newShipName || newShipName === entity.shipName) {
+      return false;
+    }
+
+    if (entity.shipName && entity.shipName !== newShipName) {
+      if (!entity.shipHistory) {
+        entity.shipHistory = [];
+      }
+
+      const alreadyLogged = entity.shipHistory.some(entry => entry.shipName === entity.shipName);
+      if (!alreadyLogged) {
+        entity.shipHistory.push({ ship: "", shipName: entity.shipName, lastSeen: entity.lastSeen });
+      }
+    }
+
+    entity.shipName = newShipName;
     return true;
   }
 
@@ -242,7 +261,7 @@ export class PlayerNameStore {
    * Add/update a player with full details.
    * Returns true if this is a new player (not previously seen).
    */
-  add(name: string, faction = "", ship = "", system = "", poi = "", id = ""): boolean {
+  add(name: string, faction = "", ship = "", shipName = "", system = "", poi = "", id = ""): boolean {
     this.ensureLoaded();
 
     if (!name || typeof name !== "string") {
@@ -257,14 +276,17 @@ export class PlayerNameStore {
     const isNew = !this.normalizedMap.has(normalized);
     const now = new Date().toISOString();
     let shipChanged = false;
+    let shipNameChanged = false;
 
     if (!isNew && this.fullPlayerInfo.players[normalized]) {
       const entity = this.fullPlayerInfo.players[normalized];
       shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
+      shipNameChanged = this.updateShipNameWithHistory(entity, shipName, entity.lastSeen);
       entity.faction = faction || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
       if (id) entity.id = id;
+      entity.shipName = shipName || entity.shipName;
       entity.lastSeen = now;
     } else {
       this.fullPlayerInfo.players[normalized] = {
@@ -273,6 +295,7 @@ export class PlayerNameStore {
         id: id || undefined,
         faction: faction,
         ship: ship,
+        shipName: shipName || undefined,
         lastSeen: now,
         system: system,
         poi: poi,
@@ -290,8 +313,8 @@ export class PlayerNameStore {
       // debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added: "${name}" (total: ${this.names.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     }
 
-    // Only save if new or ship changed
-    if (isNew || shipChanged) {
+    // Only save if new or ship/shipName changed
+    if (isNew || shipChanged || shipNameChanged) {
       this.fullPlayerInfo.counts.players = Object.keys(this.fullPlayerInfo.players).length;
       this.saveFullPlayerInfo();
       this.save();
@@ -303,7 +326,7 @@ export class PlayerNameStore {
    * Add/update a pirate with full details.
    * Returns true if this is a new pirate (not previously seen).
    */
-  addPirate(name: string, faction = "", ship = "", system = "", poi = "", id = ""): boolean {
+  addPirate(name: string, faction = "", ship = "", shipName = "", system = "", poi = "", id = ""): boolean {
     this.ensureLoaded();
 
     if (!name || typeof name !== "string") {
@@ -318,14 +341,17 @@ export class PlayerNameStore {
     const isNew = !this.pirateNormalizedMap.has(normalized);
     const now = new Date().toISOString();
     let shipChanged = false;
+    let shipNameChanged = false;
 
     if (!isNew && this.fullPlayerInfo.pirates[normalized]) {
       const entity = this.fullPlayerInfo.pirates[normalized];
       shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
+      shipNameChanged = this.updateShipNameWithHistory(entity, shipName, entity.lastSeen);
       entity.faction = faction || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
       if (id) entity.id = id;
+      entity.shipName = shipName || entity.shipName;
       entity.lastSeen = now;
     } else {
       this.fullPlayerInfo.pirates[normalized] = {
@@ -334,6 +360,7 @@ export class PlayerNameStore {
         id: id || undefined,
         faction: faction,
         ship: ship,
+        shipName: shipName || undefined,
         lastSeen: now,
         system: system,
         poi: poi,
@@ -351,8 +378,8 @@ export class PlayerNameStore {
       // debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added pirate: "${name}" (total: ${this.pirates.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     }
 
-    // Only save if new or ship changed
-    if (isNew || shipChanged) {
+    // Only save if new or ship/shipName changed
+    if (isNew || shipChanged || shipNameChanged) {
       this.fullPlayerInfo.counts.pirates = Object.keys(this.fullPlayerInfo.pirates).length;
       this.saveFullPlayerInfo();
       this.save();
@@ -364,7 +391,7 @@ export class PlayerNameStore {
    * Add/update an empire NPC with full details.
    * Returns true if this is a new empire NPC (not previously seen).
    */
-  addEmpireNpc(name: string, faction = "", ship = "", system = "", poi = "", id = ""): boolean {
+  addEmpireNpc(name: string, faction = "", ship = "", shipName = "", system = "", poi = "", id = ""): boolean {
     this.ensureLoaded();
 
     if (!name || typeof name !== "string") {
@@ -379,14 +406,17 @@ export class PlayerNameStore {
     const isNew = !this.empireNpcNormalizedMap.has(normalized);
     const now = new Date().toISOString();
     let shipChanged = false;
+    let shipNameChanged = false;
 
     if (!isNew && this.fullPlayerInfo.empire_npcs[normalized]) {
       const entity = this.fullPlayerInfo.empire_npcs[normalized];
       shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
+      shipNameChanged = this.updateShipNameWithHistory(entity, shipName, entity.lastSeen);
       entity.faction = faction || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
       if (id) entity.id = id;
+      entity.shipName = shipName || entity.shipName;
       entity.lastSeen = now;
     } else {
       this.fullPlayerInfo.empire_npcs[normalized] = {
@@ -395,6 +425,7 @@ export class PlayerNameStore {
         id: id || undefined,
         faction: faction,
         ship: ship,
+        shipName: shipName || undefined,
         lastSeen: now,
         system: system,
         poi: poi,
@@ -412,8 +443,8 @@ export class PlayerNameStore {
       // debugLogForBot(this._botName || "unknown", "playernames:add", `${this._botName || "unknown"}`, `Added empire NPC: "${name}" (total: ${this.empireNpcs.size}, faction: ${faction || "unknown"}, ship: ${ship || "unknown"})`);
     }
 
-    // Only save if new or ship changed
-    if (isNew || shipChanged) {
+    // Only save if new or ship/shipName changed
+    if (isNew || shipChanged || shipNameChanged) {
       this.fullPlayerInfo.counts.empire_npcs = Object.keys(this.fullPlayerInfo.empire_npcs).length;
       this.saveFullPlayerInfo();
       this.save();
@@ -583,6 +614,9 @@ export class PlayerNameStore {
         if (updates.id) entity.id = updates.id;
         if (updates.ship !== undefined && updates.ship !== entity.ship) {
           this.updateShipWithHistory(entity, updates.ship, entity.lastSeen);
+        }
+        if (updates.shipName !== undefined && updates.shipName !== entity.shipName) {
+          this.updateShipNameWithHistory(entity, updates.shipName, entity.lastSeen);
         }
         entity.system = updates.system || entity.system;
         entity.poi = updates.poi || entity.poi;

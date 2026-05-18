@@ -886,7 +886,7 @@ export class Bot {
       }
 
       // Add this bot to the player tracking so it appears in the web UI players tab
-      playerNameStore.add(this.username, this.faction || "", this.shipClass, this.system, this.poi);
+      playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
 
       // Debug: log tow-related fields from status
       if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
@@ -1500,7 +1500,7 @@ export class Bot {
               senderLower.includes("rim ranger");
             
             if (!contentLower.includes("mayday") && !isEmpireNpc) {
-              playerNameStore.add(sender, "", "", this.system, this.poi);
+              playerNameStore.add(sender, "", "", "", this.system, this.poi);
             } else if (isEmpireNpc) {
               debugLogForBot(this.username, "playernames:skip", `${this.username}`, `Ignored empire NPC sender: "${sender}"`);
             } else {
@@ -1783,7 +1783,7 @@ export class Bot {
 
           // Track pirate name
           if (pirateName && pirateName !== "Unknown") {
-            playerNameStore.add(pirateName, pirateT, "", this.system, this.poi);
+            playerNameStore.add(pirateName, pirateT, "", "", this.system, this.poi);
           }
 
           // Combat chat alerts disabled — was spamming faction chat
@@ -2161,8 +2161,7 @@ export class Bot {
         // Try various field names for player/ship names
         const name = (entity.username as string) ||
                      (entity.name as string) ||
-                     (entity.player_name as string) ||
-                     (entity.ship_name as string);
+                     (entity.player_name as string);
 
         if (name && name.trim()) {
           const trimmedName = name.trim();
@@ -2179,7 +2178,7 @@ export class Bot {
           } else if (typeof entity.faction_id === "string" && entity.faction_id) {
             faction = entity.faction_id;
           }
-          // Extract ship info - try ship_class (from nearby array), then ship/ship_type/ship_name
+          // Extract ship info - try ship_class first (ship type), then ship/ship_type/ship_name
           let ship = "";
           if (typeof entity.ship_class === "string" && entity.ship_class) {
             ship = entity.ship_class;
@@ -2187,16 +2186,16 @@ export class Bot {
             ship = entity.ship;
           } else if (typeof entity.ship_type === "string" && entity.ship_type) {
             ship = entity.ship_type;
-          } else if (typeof entity.ship_name === "string" && entity.ship_name) {
-            ship = entity.ship_name;
           }
+          // Extract ship_name separately (personalized ship name)
+          const shipName = (entity.ship_name as string) || "";
           // Log status message if available
           if (typeof entity.status_message === "string" && entity.status_message) {
             debugLogForBot(this.username, "playernames:status", `${this.username}`, 
               `Player ${trimmedName}: ${entity.status_message}`);
           }
           const playerId = (entity.player_id as string) || "";
-          if (playerNameStore.add(trimmedName, faction, ship, this.system, this.poi, playerId)) {
+          if (playerNameStore.add(trimmedName, faction, ship, shipName, this.system, this.poi, playerId)) {
             playerCount++;
           }
         }
@@ -2210,9 +2209,10 @@ export class Bot {
       const name = pirate.name as string;
       if (name && name.trim()) {
         const faction = (pirate.faction as string) || "";
-        const ship = (pirate.ship_class as string) || (pirate.ship_name as string) || (pirate.ship_type as string) || (pirate.ship as string) || "";
+        const ship = (pirate.ship_class as string) || (pirate.ship_type as string) || (pirate.ship as string) || "";
+        const shipName = (pirate.ship_name as string) || "";
         const pirateId = (pirate.pirate_id as string) || (pirate.id as string) || "";
-        if (playerNameStore.addPirate(name, faction, ship, this.system, this.poi, pirateId)) {
+        if (playerNameStore.addPirate(name, faction, ship, shipName, this.system, this.poi, pirateId)) {
           pirateCount++;
         }
       }
@@ -2224,9 +2224,10 @@ export class Bot {
       const name = npc.name as string;
       if (name && name.trim()) {
         const faction = (npc.faction as string) || "";
-        const ship = (npc.ship_class as string) || (npc.ship_name as string) || (npc.ship_type as string) || (npc.ship as string) || "";
+        const ship = (npc.ship_class as string) || (npc.ship_type as string) || (npc.ship as string) || "";
+        const shipName = (npc.ship_name as string) || "";
         const npcId = (npc.npc_id as string) || "";
-        if (playerNameStore.addEmpireNpc(name, faction, ship, this.system, this.poi, npcId)) {
+        if (playerNameStore.addEmpireNpc(name, faction, ship, shipName, this.system, this.poi, npcId)) {
           empireNpcCount++;
         }
       }
@@ -2271,7 +2272,7 @@ export class Bot {
         // Ship class is directly available
         const ship = (agent.ship_class as string) || "";
         // System-wide, no specific POI
-        if (playerNameStore.add(trimmedName, faction, ship, this.system, "")) {
+        if (playerNameStore.add(trimmedName, faction, ship, "", this.system, "")) {
           agentCount++;
         }
       }
@@ -2294,7 +2295,7 @@ export class Bot {
     for (const member of members as Array<Record<string, unknown>>) {
       const name = (member.username as string) || (member.player_name as string) || (member.name as string);
       if (name && name.trim()) {
-        if (playerNameStore.add(name, '', '', this.system, this.poi)) {
+        if (playerNameStore.add(name, '', '', '', this.system, this.poi)) {
           count++;
         }
       }
@@ -2340,7 +2341,7 @@ export class Bot {
             nameLower.startsWith("[customs]") ||
             nameLower.startsWith("[police]");
           
-          if (!isEmpireNpc && playerNameStore.add(trimmedName, '', '', this.system, this.poi)) {
+          if (!isEmpireNpc && playerNameStore.add(trimmedName, '', '', '', this.system, this.poi)) {
             count++;
           }
         }

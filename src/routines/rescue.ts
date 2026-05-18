@@ -3142,7 +3142,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     logStatus(ctx);
 
     // ── Calculate and send rescue bill (after refuel, before returning home) ──
-    const activeSessionForBill = getActiveRescueSession(bot.username);
+    let activeSessionForBill = getActiveRescueSession(bot.username);
+    if (!activeSessionForBill && target) {
+      ctx.log("rescue", `⚠️ No active session found - creating fallback for billing`);
+      activeSessionForBill = { targetUsername: target.username, targetSystem: target.system, targetPoi: target.poi, isMayday: isMaydayTarget, jumpsCompleted: 0, fuelDelivered: 0 } as any;
+    }
     if (activeSessionForBill) {
       const jumpsToTarget = activeSessionForBill.jumpsCompleted || 0;
       const fuelDelivered = activeSessionForBill.fuelDelivered || 0;

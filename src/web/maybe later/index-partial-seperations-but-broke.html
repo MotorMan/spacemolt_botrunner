@@ -10881,7 +10881,15 @@ function renderFactionPage() {
   renderFactionSidebar();
   // Try to load facilities cache when faction tab is opened (non-blocking)
   if (!personalFacilityLoadComplete) {
-    loadFacilitiesCache();
+    loadFacilitiesCache().then(loaded => {
+      if (!loaded && bots.length > 0) {
+        // Cache was outdated or empty, fetch fresh data
+        const availableBot = bots.find(b => b.username);
+        if (availableBot) {
+          fetchPersonalFacilityTypes(availableBot.username);
+        }
+      }
+    });
   }
   if (factionSelectedBot) {
     fetchFactionInfo(factionSelectedBot);
@@ -12316,7 +12324,15 @@ async function loadFacilitiesCache() {
     const res = await fetch('/api/facilities');
     const data = await res.json();
     console.log('Cache API response:', data);
-    if (data.version && data.version === '0.269.15') {
+    if (data.version) {
+      // Check if cache version matches current game version
+      const currentVersion = await fetchGameVersion();
+      if (currentVersion && currentVersion !== data.version) {
+        console.log(`Cache version ${data.version} outdated, current is ${currentVersion}. Fetching fresh data.`);
+        personalFacilityVersion = currentVersion;
+        personalFacilityLoadComplete = false;
+        return false;
+      }
       personalFacilityVersion = data.version;
       console.log('Loading', data.personal?.length, 'personal and', data.production?.length, 'production types from cache');
       // Load cached types (already deduplicated from server)
@@ -12338,13 +12354,34 @@ async function loadFacilitiesCache() {
       console.log('Loaded facilities from cache:', personalFacilityTypes.length, 'types total');
       return true;
     } else {
-      console.log('Cache version mismatch or empty:', data.version);
+      console.log('Cache empty or no version:', data.version);
       return false;
     }
   } catch (err) {
     console.warn('Failed to load facilities cache:', err);
     return false;
   }
+}
+
+// Get current game version from server
+async function fetchGameVersion() {
+  try {
+    // Find an available bot to make the get_version call
+    const availableBot = bots.find(b => b.username);
+    if (!availableBot) {
+      console.warn('No available bot to fetch game version');
+      return null;
+    }
+    const result = await new Promise(resolve => {
+      sendExec(availableBot.username, 'get_version', {}, resolve);
+    });
+    if (result.ok && result.data && result.data.version) {
+      return result.data.version;
+    }
+  } catch (err) {
+    console.warn('Failed to fetch game version:', err);
+  }
+  return null;
 }
 
 // Save facilities to server cache
@@ -12435,8 +12472,8 @@ function switchPersonalFacilityCategory(category, username) {
       productionBtn.style.color = '';
     }
   }
-  // If we have cached data for this category, render it
-  if (personalFacilityTypes.length > 0 && personalFacilityVersion === '0.269.15') {
+  // If we have cached data for this category, render it; otherwise fetch fresh
+  if (personalFacilityTypes.length > 0 && personalFacilityLoadComplete) {
     renderPersonalFacilityList(document.getElementById('personalFacilityTypes'), username);
   } else {
     fetchPersonalFacilityTypes(username);
@@ -12960,34 +12997,21 @@ async function fetchPersonalFacilityTypes(username) {
   if (!container) return;
   container.innerHTML = '<div class="faction-no-data">Loading available types...</div>';
   
-  // First, try to load from cache if not already done
-  if (!personalFacilityLoadComplete) {
-    const loaded = await loadFacilitiesCache();
-    if (loaded && personalFacilityLoadComplete) {
-      console.log('Using cached data after loadFacilitiesCache:', personalFacilityTypes.length, 'types');
-      renderPersonalFacilityList(container, username);
-      return;
-    }
-  }
-  
-  // Use cached data if fully loaded from cache
-  if (personalFacilityTypes.length > 0 && personalFacilityLoadComplete && personalFacilityVersion) {
-    console.log('Using cached data,', personalFacilityTypes.length, 'types, version:', personalFacilityVersion);
-    renderPersonalFacilityList(container, username);
-    return;
-  }
-  
-  console.log('Cache not ready, fetching from API. Has types:', personalFacilityTypes.length, 'Complete:', personalFacilityLoadComplete, 'Version:', personalFacilityVersion);
+  // Always fetch fresh data from the game API
   personalFacilityLoading = true;
   personalFacilityPage = 0;
-  // Don't clear types if we already have some from cache - reuse them
-  if (personalFacilityTypes.length === 0) {
-    personalFacilityTypes = [];
-  }
+  personalFacilityTypes = [];
   personalFacilityLoadComplete = false;
   
-  // Fetch both personal and production categories
-  fetchPersonalFacilityPage(username, container, 0, 'personal');
+  // Fetch game version first
+  fetchGameVersion().then(version => {
+    if (version) {
+      personalFacilityVersion = version;
+      console.log('Game version:', personalFacilityVersion);
+    }
+    // Fetch both personal and production categories
+    fetchPersonalFacilityPage(username, container, 0, 'personal');
+  });
 }
 
 async function fetchPersonalFacilityPage(username, container, page, category) {
@@ -13040,7 +13064,6 @@ async function fetchPersonalFacilityPage(username, container, page, category) {
         }, 2000);
       } else {
         // All done
-        personalFacilityVersion = '0.269.15';
         personalFacilityPage = 0;
         personalFacilityLoadComplete = true;
         

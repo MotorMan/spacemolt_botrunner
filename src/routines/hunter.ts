@@ -123,6 +123,7 @@ function getHunterSettings(username?: string): {
   disableScanCommandForPirates: boolean;
   disableWreckSalvaging: boolean;
   patrolSystems: string[];
+  singleLoop: boolean;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -160,6 +161,7 @@ function getHunterSettings(username?: string): {
     disableScanCommandForPirates: (h.disableScanCommandForPirates as boolean) ?? false,
     disableWreckSalvaging: (h.disableWreckSalvaging as boolean) ?? false,
     patrolSystems: resolvedPatrolSystems,
+    singleLoop: (h.singleLoop as boolean) ?? false,
   };
 }
 
@@ -980,6 +982,11 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       await bot.checkSkills();
 
       ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
+
+      if (settings.singleLoop) {
+        ctx.log("system", "Single loop mode enabled — patrol complete, returning to base and stopping.");
+        return;
+      }
 
     } else {
       ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Hull: ${postHull}% | Fuel: ${postFuel}% — continuing hunt...`);

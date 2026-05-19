@@ -2129,6 +2129,13 @@ function renderProfileTopbar() {
     actions += `
       <span class="profile-ore-label" style="margin-left:8px">Patrol Profile:</span>
       <select id="profile-hunterPatrol" onchange="saveProfileHunterPatrolProfile()">${hunterPatrolOpts}</select>`;
+
+    const singleLoop = botSettings.singleLoop ?? false;
+    actions += `
+      <label class="profile-ore-label" style="margin-left:8px;cursor:pointer;display:inline-flex;align-items:center;gap:4px">
+        <input type="checkbox" id="profile-hunter-singleLoop" onchange="saveProfileHunterSingleLoop()"${singleLoop ? ' checked' : ''}>
+        Single Loop
+      </label>`;
   }
 
   // Per-bot crafter profile selector (visible when crafter is selected or running)
@@ -2354,6 +2361,19 @@ function saveProfileHunterPatrolProfile() {
   settings.hunter.botHunterPatrolAssignments[bot.username] = patrolProfileName;
 
   send({ type: 'saveSettings', routine: 'hunter', settings: settings.hunter });
+}
+
+function saveProfileHunterSingleLoop() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const checkbox = document.getElementById('profile-hunter-singleLoop');
+  if (!checkbox) return;
+  const singleLoop = checkbox.checked;
+
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { singleLoop });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
 }
 
 function saveProfileFocusAreaSystem() {
@@ -15664,6 +15684,17 @@ function renderHunterSettings(panel) {
       </select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Single Loop Mode</div>
+        <div class="setting-hint">Do one full patrol then return to home station to restock. Disable to loop forever until out of supplies.</div>
+      </div>
+      <select id="set-hunter-singleLoop">
+        <option value="false"${!h.singleLoop ? ' selected' : ''}>Loop forever</option>
+        <option value="true"${h.singleLoop ? ' selected' : ''}>Single loop then restock</option>
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
     </div>
@@ -15683,6 +15714,7 @@ function saveHunterSettings() {
     responseRange: parseInt(document.getElementById('set-hunter-responseRange').value) ?? 3,
     disableScanCommandForPirates: document.getElementById('set-hunter-disableScanCommandForPirates').value === 'true',
     disableWreckSalvaging: document.getElementById('set-hunter-disableWreckSalvaging').value === 'true',
+    singleLoop: document.getElementById('set-hunter-singleLoop').value === 'true',
     hunterPatrols: Array.isArray(settings.hunter?.hunterPatrols) ? settings.hunter.hunterPatrols : [],
     botHunterPatrolAssignments: settings.hunter?.botHunterPatrolAssignments || {},
   };

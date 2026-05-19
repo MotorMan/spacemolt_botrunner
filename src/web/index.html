@@ -2109,7 +2109,26 @@ function renderProfileTopbar() {
         <option value="roam_systems"${hunterMode === 'roam_systems' ? ' selected' : ''}>Roam systems</option>
         <option value="roam_system"${hunterMode === 'roam_system' ? ' selected' : ''}>Roam current system</option>
         <option value="stationary"${hunterMode === 'stationary' ? ' selected' : ''}>Stationary</option>
+        <option value="patrol_systems"${hunterMode === 'patrol_systems' ? ' selected' : ''}>Patrol specific systems</option>
       </select>`;
+
+    // Per-bot hunter patrol profile selector (only meaningful when mode = patrol_systems)
+    const hunterSettings = settings.hunter || {};
+    const hunterPatrols = Array.isArray(hunterSettings.hunterPatrols) ? hunterSettings.hunterPatrols : [];
+    const botHunterAssignments = hunterSettings.botHunterPatrolAssignments || {};
+    const currentHunterPatrol = botHunterAssignments[bot.username] || (hunterPatrols[0]?.name || "Default Patrol");
+
+    let hunterPatrolOpts = hunterPatrols.map(p => 
+      `<option value="${esc(p.name)}"${p.name === currentHunterPatrol ? ' selected' : ''}>${esc(p.name)}</option>`
+    ).join('');
+
+    if (hunterPatrols.length === 0) {
+      hunterPatrolOpts = '<option value="Default Patrol" selected>Default Patrol</option>';
+    }
+
+    actions += `
+      <span class="profile-ore-label" style="margin-left:8px">Patrol Profile:</span>
+      <select id="profile-hunterPatrol" onchange="saveProfileHunterPatrolProfile()">${hunterPatrolOpts}</select>`;
   }
 
   // Per-bot crafter profile selector (visible when crafter is selected or running)
@@ -2320,6 +2339,21 @@ function saveProfileHunterMode() {
   const updated = Object.assign({}, existing, { hunterMode });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
+}
+
+function saveProfileHunterPatrolProfile() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const sel = document.getElementById('profile-hunterPatrol');
+  if (!sel) return;
+  const patrolProfileName = sel.value;
+
+  // Save assignment into the global hunter settings (like crafter does)
+  if (!settings.hunter) settings.hunter = {};
+  if (!settings.hunter.botHunterPatrolAssignments) settings.hunter.botHunterPatrolAssignments = {};
+  settings.hunter.botHunterPatrolAssignments[bot.username] = patrolProfileName;
+
+  send({ type: 'saveSettings', routine: 'hunter', settings: settings.hunter });
 }
 
 function saveProfileFocusAreaSystem() {
@@ -15440,6 +15474,7 @@ function renderHunterSettings(panel) {
   const fleeFromTier = h.fleeFromTier || 'boss';
   const minPiratesToFlee = h.minPiratesToFlee ?? 3;
   const disableScanCommandForPirates = h.disableScanCommandForPirates ?? false;
+  const hunterPatrols = Array.isArray(h.hunterPatrols) ? h.hunterPatrols : [];
 
   const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
   const tierOpts = tierOptions.map(t => `<option value="${t}"${t === maxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
@@ -15465,6 +15500,78 @@ function renderHunterSettings(panel) {
         <div class="setting-hint">Fixed system to patrol. Leave empty to auto-find the nearest huntable (low/null-sec) system.</div>
       </div>
       <select id="set-hunter-system">${systemOpts.join('')}</select>
+    </div>
+
+    <!-- Hunter Patrol Profiles (multi-bot system, same as crafter) -->
+    <div class="setting-row" style="flex-direction:column;align-items:stretch;margin-top:16px">
+      <div style="margin-bottom:8px">
+        <div class="setting-label">Hunter Patrol Profiles</div>
+        <div class="setting-hint">Create named patrol profiles. Each profile has its own list of systems. Assign bots to profiles in their manual control panel.</div>
+      </div>
+
+      <div class="blacklist-section">
+        <div class="blacklist-header">
+          <span>Patrol Profiles (${hunterPatrols.length})</span>
+          <button class="sm primary" onclick="addHunterPatrolProfile()">+ New Profile</button>
+        </div>
+        <div class="blacklist-list" style="max-height:200px">
+          ${hunterPatrols.length > 0 
+            ? hunterPatrols.map((profile, idx) => `
+                <div class="blacklist-item" style="flex-direction:column;align-items:stretch;gap:6px">
+                  <div style="display:flex;justify-content:space-between;align-items:center">
+                    <span class="blacklist-name">${esc(profile.name)}</span>
+                    <div>
+                      <button class="small" onclick="selectHunterPatrolProfile(${idx})">Edit Systems</button>
+                      <button class="small danger" onclick="deleteHunterPatrolProfile(${idx})">Delete</button>
+                    </div>
+                  </div>
+                  <div style="font-size:12px;color:var(--dim)">${(profile.patrolSystems || []).length} systems</div>
+                </div>
+              `).join('')
+            : '<div class="blacklist-empty">No patrol profiles yet. Create one above.</div>'}
+        </div>
+
+        ${window._currentHunterPatrolIndex !== undefined && hunterPatrols[window._currentHunterPatrolIndex] ? (() => {
+            const p = hunterPatrols[window._currentHunterPatrolIndex];
+            const systems = p.patrolSystems || [];
+            return `
+              <div style="margin-top:12px;border-top:1px solid var(--border);padding-top:12px">
+                <div class="blacklist-header">
+                  <span>Systems in "${esc(p.name)}" (${systems.length})</span>
+                </div>
+                <div class="blacklist-list" style="max-height:160px">
+                  ${systems.length > 0 
+                    ? systems.map(sysId => {
+                        const sys = knownSystems.find(s => s.id === sysId);
+                        const label = sys ? (sys.name ? `${sys.name} (${sys.id})` : sys.id) : sysId;
+                        return `
+                          <div class="blacklist-item">
+                            <span class="blacklist-name">${esc(label)}</span>
+                            <button class="small danger" onclick="removeSystemFromCurrentHunterProfile('${esc(sysId)}')">Remove</button>
+                          </div>`;
+                      }).join('')
+                    : '<div class="blacklist-empty">No systems in this profile yet.</div>'}
+                </div>
+                <div class="blacklist-add">
+                  <div class="blacklist-add-row">
+                    <select id="hunter-patrol-system-select" style="flex:1;min-width:200px">
+                      <option value="">Select system...</option>
+                      ${[...knownSystems].sort((a,b)=>(a.name||a.id||'').localeCompare(b.name||b.id||'')).map(s => {
+                        const label = s.name ? `${s.name} (${s.id})` : s.id;
+                        return `<option value="${esc(s.id)}">${esc(label)}</option>`;
+                      }).join('')}
+                    </select>
+                    <button onclick="addSystemToCurrentHunterProfileFromSelect()">Add</button>
+                  </div>
+                  <div class="blacklist-divider">or</div>
+                  <div class="blacklist-add-row">
+                    <input type="text" id="hunter-patrol-manual-entry" placeholder="sys_xxx, Another System, ..." style="flex:1">
+                    <button onclick="addSystemToCurrentHunterProfileFromText()">Add</button>
+                  </div>
+                </div>
+              </div>`;
+          })() : ''}
+      </div>
     </div>
 
     <div class="setting-row">
@@ -15575,9 +15682,167 @@ function saveHunterSettings() {
     responseRange: parseInt(document.getElementById('set-hunter-responseRange').value) ?? 3,
     disableScanCommandForPirates: document.getElementById('set-hunter-disableScanCommandForPirates').value === 'true',
     disableWreckSalvaging: document.getElementById('set-hunter-disableWreckSalvaging').value === 'true',
+    hunterPatrols: Array.isArray(settings.hunter?.hunterPatrols) ? settings.hunter.hunterPatrols : [],
+    botHunterPatrolAssignments: settings.hunter?.botHunterPatrolAssignments || {},
   };
   send({ type: 'saveSettings', routine: 'hunter', settings: s });
   settings.hunter = s;
+}
+
+// ── Hunter Patrol Systems (blacklist-style UI) ───────────────
+function addToHunterPatrolFromSelect() {
+  const select = document.getElementById('hunter-patrol-select');
+  const systemId = select.value;
+  if (!systemId) return;
+
+  if (!settings.hunter) settings.hunter = {};
+  if (!Array.isArray(settings.hunter.patrolSystems)) {
+    settings.hunter.patrolSystems = [];
+  }
+  if (!settings.hunter.patrolSystems.includes(systemId)) {
+    settings.hunter.patrolSystems.push(systemId);
+  }
+  renderHunterSettings(document.getElementById('settingsContent'));
+}
+
+function addToHunterPatrolFromText() {
+  const input = document.getElementById('hunter-patrol-manual');
+  const text = input.value.trim();
+  if (!text) return;
+
+  if (!settings.hunter) settings.hunter = {};
+  if (!Array.isArray(settings.hunter.patrolSystems)) {
+    settings.hunter.patrolSystems = [];
+  }
+
+  const systems = text.split(',').map(s => s.trim()).filter(s => s.length > 0);
+  for (const system of systems) {
+    const match = Object.entries(mapData).find(
+      ([id, data]) => id.toLowerCase() === system.toLowerCase() ||
+                      (data.name || '').toLowerCase() === system.toLowerCase()
+    );
+    const systemId = match ? match[0] : system;
+
+    if (!settings.hunter.patrolSystems.includes(systemId)) {
+      settings.hunter.patrolSystems.push(systemId);
+    }
+  }
+
+  input.value = '';
+  renderHunterSettings(document.getElementById('settingsContent'));
+}
+
+function removeFromHunterPatrol(systemId) {
+  if (!settings.hunter || !Array.isArray(settings.hunter.patrolSystems)) return;
+  settings.hunter.patrolSystems = settings.hunter.patrolSystems.filter(s => s.toLowerCase() !== systemId.toLowerCase());
+  renderHunterSettings(document.getElementById('settingsContent'));
+}
+
+// ── Hunter Patrol Profile Management (crafter-style) ───────────
+function addHunterPatrolProfile() {
+  const name = prompt('Enter a name for the new hunter patrol profile:');
+  if (!name || !name.trim()) return;
+
+  if (!settings.hunter) settings.hunter = {};
+  if (!Array.isArray(settings.hunter.hunterPatrols)) {
+    settings.hunter.hunterPatrols = [];
+  }
+
+  // Avoid duplicate names
+  if (settings.hunter.hunterPatrols.some(p => p.name.toLowerCase() === name.trim().toLowerCase())) {
+    alert('A profile with that name already exists.');
+    return;
+  }
+
+  settings.hunter.hunterPatrols.push({ name: name.trim(), patrolSystems: [] });
+  renderHunterSettings(document.getElementById('settingsContent'));
+}
+
+function editHunterPatrolProfile(index) {
+  const profile = settings.hunter?.hunterPatrols?.[index];
+  if (!profile) return;
+
+  // For now, just let the user edit the name. Full system list editing can be added later.
+  const newName = prompt('Rename patrol profile:', profile.name);
+  if (!newName || !newName.trim()) return;
+
+  profile.name = newName.trim();
+  renderHunterSettings(document.getElementById('settingsContent'));
+  send({ type: 'saveSettings', routine: 'hunter', settings: settings.hunter });
+}
+
+function deleteHunterPatrolProfile(index) {
+  const profile = settings.hunter?.hunterPatrols?.[index];
+  if (!profile) return;
+
+  if (!confirm(`Delete patrol profile "${profile.name}"?`)) return;
+
+  settings.hunter.hunterPatrols.splice(index, 1);
+  window._currentHunterPatrolIndex = undefined;
+  renderHunterSettings(document.getElementById('settingsContent'));
+  send({ type: 'saveSettings', routine: 'hunter', settings: settings.hunter });
+}
+
+function selectHunterPatrolProfile(index) {
+  window._currentHunterPatrolIndex = index;
+  renderHunterSettings(document.getElementById('settingsContent'));
+}
+
+function addSystemToCurrentHunterProfileFromSelect() {
+  const idx = window._currentHunterPatrolIndex;
+  if (idx === undefined) return;
+
+  const select = document.getElementById('hunter-patrol-system-select');
+  const systemId = select.value;
+  if (!systemId) return;
+
+  const profile = settings.hunter.hunterPatrols[idx];
+  if (!profile.patrolSystems) profile.patrolSystems = [];
+  if (!profile.patrolSystems.includes(systemId)) {
+    profile.patrolSystems.push(systemId);
+  }
+  renderHunterSettings(document.getElementById('settingsContent'));
+  send({ type: 'saveSettings', routine: 'hunter', settings: settings.hunter });
+}
+
+function addSystemToCurrentHunterProfileFromText() {
+  const idx = window._currentHunterPatrolIndex;
+  if (idx === undefined) return;
+
+  const input = document.getElementById('hunter-patrol-manual-entry');
+  const text = input.value.trim();
+  if (!text) return;
+
+  const profile = settings.hunter.hunterPatrols[idx];
+  if (!profile.patrolSystems) profile.patrolSystems = [];
+
+  const systems = text.split(',').map(s => s.trim()).filter(s => s.length > 0);
+  for (const system of systems) {
+    const match = Object.entries(mapData).find(
+      ([id, data]) => id.toLowerCase() === system.toLowerCase() ||
+                      (data.name || '').toLowerCase() === system.toLowerCase()
+    );
+    const systemId = match ? match[0] : system;
+    if (!profile.patrolSystems.includes(systemId)) {
+      profile.patrolSystems.push(systemId);
+    }
+  }
+
+  input.value = '';
+  renderHunterSettings(document.getElementById('settingsContent'));
+  send({ type: 'saveSettings', routine: 'hunter', settings: settings.hunter });
+}
+
+function removeSystemFromCurrentHunterProfile(systemId) {
+  const idx = window._currentHunterPatrolIndex;
+  if (idx === undefined) return;
+
+  const profile = settings.hunter.hunterPatrols[idx];
+  if (!profile.patrolSystems) return;
+
+  profile.patrolSystems = profile.patrolSystems.filter(s => s.toLowerCase() !== systemId.toLowerCase());
+  renderHunterSettings(document.getElementById('settingsContent'));
+  send({ type: 'saveSettings', routine: 'hunter', settings: settings.hunter });
 }
 
 // ── Escort settings ─────────────────────────────────────────

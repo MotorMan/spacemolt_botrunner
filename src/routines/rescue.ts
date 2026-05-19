@@ -4471,6 +4471,19 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
+
+  // ── Register cooperation handler for Bot Chat Channel coordination ──
+  if (isCooperationEnabled()) {
+    const cooperationHandler = (message: BotChatMessage) => {
+      const result = processBotChatMessage(message);
+      if (result.isClaim && result.claim) {
+        // The claim is already recorded by processBotChatMessage via recordRescueClaim
+        ctx.log("coop", `📥 Processed incoming rescue claim: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps) by ${result.claim.botName}`);
+      }
+    };
+    registerCooperationHandler(bot.username, cooperationHandler);
+    ctx.log("coop", `📡 Registered cooperation handler for Bot Chat Channel coordination`);
+  }
   
   if (settings.homeSystem) {
     ctx.log("system", `Home base configured: ${homeSystem}`);
@@ -5141,44 +5154,151 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           idleStartTime = 0;
         }
 
-        // ── RESCUE QUEUE: Check if we have queued rescues before idling ──
-        const queueStats = getQueueStats();
-        if (queueStats.pending > 0) {
-          ctx.log("rescue", `📋 Rescue queue has ${queueStats.pending} pending rescues — checking for optimized route...`);
-          
-          // Optimize route based on current location
-          const optimizedRoute = optimizeRescueRoute(bot.system);
-          if (optimizedRoute.length > 0) {
-            setCurrentRoute(optimizedRoute);
-            ctx.log("rescue", `🗺️ Optimized route set: ${optimizedRoute.join(" → ")}`);
-            
-            // Get the first system in the route
-            const firstSystem = optimizedRoute[0];
-            const rescuesInSystem = getUnclaimedRescuesInSystem(firstSystem);
+             // ── RESCUE QUEUE: Check if we have queued rescues before idling ──
+             const queueStats = getQueueStats();
+             if (queueStats.pending > 0) {
+               ctx.log("rescue", `📋 Rescue queue has ${queueStats.pending} pending rescues — checking for optimized route...`);
+               
+               // Optimize route based on current location
+               const optimizedRoute = optimizeRescueRoute(bot.system);
+               if (optimizedRoute.length > 0) {
+                 setCurrentRoute(optimizedRoute);
+                 ctx.log("rescue", `🗺️ Optimized route set: ${optimizedRoute.join(" → ")}`);
+                 
+                 // Get the first system in the route
+                 const firstSystem = optimizedRoute[0];
+                 const rescuesInSystem = getUnclaimedRescuesInSystem(firstSystem);
 
-            if (rescuesInSystem.length > 0) {
-              // Pick the most critical rescue in the first system
-              rescuesInSystem.sort((a, b) => a.fuelPct - b.fuelPct);
-              const queuedRescue = rescuesInSystem[0];
+                 if (rescuesInSystem.length > 0) {
+                   // Pick the most critical rescue in the first system
+                   rescuesInSystem.sort((a, b) => a.fuelPct - b.fuelPct);
+                   const queuedRescue = rescuesInSystem[0];
 
-              // Try to claim this rescue
-              if (claimRescue(queuedRescue.id, bot.username)) {
-                ctx.log("rescue", `🎯 Claimed and selecting queued rescue: ${queuedRescue.targetUsername} at ${queuedRescue.system}/${queuedRescue.poi} (${queuedRescue.fuelPct}%)`);
+                   // ── RESCUE COOPERATION: Check with partner bot if enabled for fleet rescues ──
+                   let partnerClaim = null;
+                   let cooperationDecision = "proceed"; // Default to proceed if no cooperation
+                   
+                   if (isCooperationEnabled()) {
+                     // Check if partner has already claimed this rescue via Bot Chat Channel
+                     partnerClaim = isRescueClaimedByPartner(
+                       queuedRescue.targetUsername, 
+                       queuedRescue.system, 
+                       queuedRescue.poi, 
+                       bot.username
+                     );
+                     
+                     if (partnerClaim) {
+                       ctx.log("coop", `🤝 Partner claim found for queued rescue: ${partnerClaim.player} at ${partnerClaim.system}/${partnerClaim.poi || 'any'} (${partnerClaim.jumps} jumps)`);
+                       
+                       // Calculate jumps for our claim
+                       const { calculateJumpsToTarget } = await import("../cooperation/rescueCooperation.js");
+                       const myJumps = await calculateJumpsToTarget(bot, queuedRescue.system);
+                       
+                       // Create our claim for comparison
+                       const myClaim: RescueClaim = {
+                         type: "RESCUE_CLAIM",
+                         player: queuedRescue.targetUsername,
+                         system: queuedRescue.system,
+                         poi: queuedRescue.poi,
+                         timestamp: new Date().toISOString(),
+                         jumps: myJumps,
+                         botName: bot.username
+                       };
+                       
+                       // Determine if we should proceed or yield
+                       cooperationDecision = shouldProceedOrYield(myClaim, partnerClaim);
+                       ctx.log("coop", `🤝 Cooperation decision: ${cooperationDecision} (our jumps: ${myClaim.jumps}, partner jumps: ${partnerClaim.jumps})`);
+                     } else {
+                       ctx.log("coop", `🤝 No partner claim found for queued rescue ${queuedRescue.targetUsername} - will proceed to claim and send our claim`);
+                     }
+                   }
+                   
+                   // Only proceed with claiming if cooperation says we should
+                   if (cooperationDecision === "proceed") {
+                     // Try to claim this rescue
+                     if (claimRescue(queuedRescue.id, bot.username)) {
+                       ctx.log("rescue", `🎯 Claimed and selecting queued rescue: ${queuedRescue.targetUsername} at ${queuedRescue.system}/${queuedRescue.poi} (${queuedRescue.fuelPct}%)`);
 
-                target = {
-                  username: queuedRescue.targetUsername,
-                  system: queuedRescue.system,
-                  poi: queuedRescue.poi,
-                  fuelPct: queuedRescue.fuelPct,
-                  docked: queuedRescue.docked,
-                };
-                incrementRescueAttempt(queuedRescue.id);
-              } else {
-                ctx.log("rescue", `⚠️ Could not claim queued rescue ${queuedRescue.targetUsername} - already claimed by another bot`);
-              }
-            }
-          }
-        }
+                       target = {
+                         username: queuedRescue.targetUsername,
+                         system: queuedRescue.system,
+                         poi: queuedRescue.poi,
+                         fuelPct: queuedRescue.fuelPct,
+                         docked: queuedRescue.docked,
+                       };
+                       incrementRescueAttempt(queuedRescue.id);
+                       
+                       // ── RESCUE COOPERATION: Send claim to partner bot ──
+                       if (isCooperationEnabled()) {
+                         // Calculate jumps for our claim
+                         const { calculateJumpsToTarget } = await import("../cooperation/rescueCooperation.js");
+                         const myJumps = await calculateJumpsToTarget(bot, queuedRescue.system);
+                         
+                         const myClaim: RescueClaim = {
+                           type: "RESCUE_CLAIM",
+                           player: queuedRescue.targetUsername,
+                           system: queuedRescue.system,
+                           poi: queuedRescue.poi,
+                           timestamp: new Date().toISOString(),
+                           jumps: myJumps,
+                           botName: bot.username
+                         };
+                         
+                         // Send claim to partner bot and wait for it to complete
+                         ctx.log("coop", `📧 Sending rescue claim to Bot Chat Channel...`);
+                         const sendResult = await sendRescueClaim(bot, myClaim);
+                         if (sendResult.ok) {
+                           ctx.log("coop", `📧 Sent rescue claim: ${queuedRescue.targetUsername} at ${queuedRescue.system} (${myClaim.jumps} jumps)`);
+                         } else {
+                           ctx.log("coop", `⚠️ Failed to send rescue claim: ${sendResult.error}`);
+                         }
+                         
+                         // Wait briefly for partner's claim to arrive (accounts for chat delays)
+                         const cooperationDelay = 3000;
+                         ctx.log("coop", `⏱ Waiting ${cooperationDelay / 1000}s for partner claim...`);
+                         await ctx.sleep(cooperationDelay);
+                         
+                         // Re-check for partner claims after delay
+                         partnerClaim = isRescueClaimedByPartner(queuedRescue.targetUsername, queuedRescue.system, queuedRescue.poi, bot.username);
+                         
+                         // Check if we should yield to partner after sending our claim
+                         if (partnerClaim) {
+                           // Calculate jumps for our claim (again, to be safe)
+                           const { calculateJumpsToTarget } = await import("../cooperation/rescueCooperation.js");
+                           const myJumps = await calculateJumpsToTarget(bot, queuedRescue.system);
+                           
+                           const myClaim: RescueClaim = {
+                             type: "RESCUE_CLAIM",
+                             player: queuedRescue.targetUsername,
+                             system: queuedRescue.system,
+                             poi: queuedRescue.poi,
+                             timestamp: new Date().toISOString(),
+                             jumps: myJumps,
+                             botName: bot.username
+                           };
+                           
+                           const decision = shouldProceedOrYield(myClaim, partnerClaim);
+                           if (decision === "yield") {
+                             ctx.log("coop", `🤝 Yielding rescue to ${partnerClaim.botName} after sending claim (they are closer: ${partnerClaim.jumps} vs ${myClaim.jumps} jumps)`);
+                             // Release our claim since we're yielding
+                             releaseRescueClaim(queuedRescue.id, bot.username);
+                             target = null; // Cancel this rescue
+                             continue; // Skip to next iteration to avoid rescuing
+                           } else if (decision === "proceed") {
+                             ctx.log("coop", `🤝 Proceeding with rescue after sending claim (closer than partner: ${myClaim.jumps} vs ${partnerClaim.jumps} jumps)`);
+                           }
+                         }
+                       }
+                     } else {
+                       ctx.log("rescue", `⚠️ Could not claim queued rescue ${queuedRescue.targetUsername} - already claimed by another bot`);
+                     }
+                   } else if (cooperationDecision === "yield") {
+                     ctx.log("coop", `🤝 Yielding queued rescue ${queuedRescue.targetUsername} to partner bot (they are closer or have priority)`);
+                     // Don't set target, continue to next iteration
+                   }
+                 }
+               }
+             }
         
         if (!target) {
           // No queued rescues or queue is empty — scavenge and idle
@@ -6570,4 +6690,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
   // Cleanup when routine exits
   stopCreditTopOffBackground();
+
+  // Unregister cooperation handler if it was registered
+  if (isCooperationEnabled()) {
+    const cooperationHandler = (message: BotChatMessage) => {
+      const result = processBotChatMessage(message);
+      if (result.isClaim && result.claim) {
+        // The claim is already recorded by processBotChatMessage via recordRescueClaim
+        ctx.log("coop", `📥 Processed incoming rescue claim: ${result.claim.player} at ${result.claim.system} (${result.claim.jumps} jumps) by ${result.claim.botName}`);
+      }
+    };
+    unregisterCooperationHandler(bot.username, cooperationHandler);
+    ctx.log("coop", `📡 Unregistered cooperation handler for Bot Chat Channel coordination`);
+  }
 };

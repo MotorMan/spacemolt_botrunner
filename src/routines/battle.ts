@@ -156,7 +156,8 @@ export function parseNearby(result: unknown): NearbyEntity[] {
 
 export function isPirateTarget(entity: NearbyEntity, onlyNPCs: boolean, maxAttackTier: PirateTier = "large"): boolean {
   if (entity.isPirate) {
-    if (isTierTooHigh(entity.tier, maxAttackTier)) return false;
+    // Server already filtered this into the pirates list — attack it
+    // (tier system is still incomplete, so we ignore tier gating for now)
     return true;
   }
   if (onlyNPCs && !entity.isNPC) return false;

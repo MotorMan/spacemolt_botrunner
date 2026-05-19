@@ -99,7 +99,12 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
 
 // ── Settings ─────────────────────────────────────────────────
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems";
+
+export interface HunterPatrolProfile {
+  name: string;
+  patrolSystems: string[];
+}
 
 function getHunterSettings(username?: string): {
   mode: HunterMode;
@@ -117,10 +122,26 @@ function getHunterSettings(username?: string): {
   minPiratesToFlee: number;
   disableScanCommandForPirates: boolean;
   disableWreckSalvaging: boolean;
+  patrolSystems: string[];
 } {
   const all = readSettings();
   const h = all.hunter || {};
   const botOverrides = username ? (all[username] || {}) : {};
+
+  // New multi-profile support (like crafter)
+  const hunterPatrols: HunterPatrolProfile[] = Array.isArray(h.hunterPatrols) ? h.hunterPatrols : [];
+  const botHunterPatrolAssignments: Record<string, string> = (h.botHunterPatrolAssignments as Record<string, string>) || {};
+
+  let resolvedPatrolSystems: string[] = [];
+
+  if (hunterPatrols.length > 0 && username) {
+    const assignedProfileName = botHunterPatrolAssignments[username] || hunterPatrols[0]?.name || "Default Patrol";
+    const assignedProfile = hunterPatrols.find(p => p.name === assignedProfileName) || hunterPatrols[0];
+    resolvedPatrolSystems = assignedProfile?.patrolSystems || [];
+  } else if (Array.isArray(h.patrolSystems)) {
+    // Legacy single list
+    resolvedPatrolSystems = h.patrolSystems;
+  }
 
   return {
     mode: ((botOverrides.hunterMode as HunterMode) || (h.mode as HunterMode) || "roam_systems") as HunterMode,
@@ -138,6 +159,7 @@ function getHunterSettings(username?: string): {
     minPiratesToFlee: (h.minPiratesToFlee as number) || 3,
     disableScanCommandForPirates: (h.disableScanCommandForPirates as boolean) ?? false,
     disableWreckSalvaging: (h.disableWreckSalvaging as boolean) ?? false,
+    patrolSystems: resolvedPatrolSystems,
   };
 }
 
@@ -146,6 +168,22 @@ export function setHunterMode(username: string, mode: HunterMode): void {
   writeSettings({
     [username]: { hunterMode: mode },
   });
+}
+
+/** Persist patrol systems list for a specific bot. */
+export function setPatrolSystems(username: string, systems: string[]): void {
+  writeSettings({
+    [username]: { patrolSystems: systems },
+  });
+}
+
+/** Assign a bot to a named hunter patrol profile (new multi-bot system) */
+export function assignBotToHunterPatrol(username: string, patrolProfileName: string): void {
+  const all = readSettings();
+  const h = (all.hunter || {}) as any;
+  if (!h.botHunterPatrolAssignments) h.botHunterPatrolAssignments = {};
+  h.botHunterPatrolAssignments[username] = patrolProfileName;
+  writeSettings({ hunter: h });
 }
 
 // ── Security level helpers ────────────────────────────────────
@@ -489,6 +527,10 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
     yield* stationaryRoutine(ctx);
     return;
   }
+  if (initialSettings.mode === "patrol_systems") {
+    yield* patrolSystemsRoutine(ctx);
+    return;
+  }
 
   // Default to roam_systems
   yield* roamSystemsRoutine(ctx);
@@ -512,6 +554,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
+      skipBlacklist: true,
     };
     const patrolSystem = settings.system || "";
 
@@ -867,12 +910,21 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // ── Post-patrol decision ──
     yield "post_patrol";
+    await bot.refreshCargo();
     await bot.refreshStatus();
     const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
 
-    const needsRepair = abortPatrol || postHull <= settings.repairThreshold;
-    const needsFuel = postFuel < settings.refuelThreshold;
+    // Only return home for repairs when hull is actually low
+    const needsRepair = postHull <= settings.repairThreshold;
+
+    // Only return home for fuel when we have ZERO fuel cells of any type in cargo
+    const hasFuelCells = bot.inventory?.some(i =>
+      i.itemId === 'fuel_cell' ||
+      i.itemId === 'premium_fuel_cell' ||
+      i.itemId === 'military_fuel_cell'
+    );
+    const needsFuel = !hasFuelCells;
 
     if (needsRepair || needsFuel) {
       const reason = needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`;
@@ -965,6 +1017,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
+      skipBlacklist: true,
     };
 
     // ── Status ──
@@ -1216,12 +1269,21 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // ── Post-patrol decision ──
     yield "post_patrol";
+    await bot.refreshCargo();
     await bot.refreshStatus();
     const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
 
-    const needsRepair = abortPatrol || postHull <= settings.repairThreshold;
-    const needsFuel = postFuel < settings.refuelThreshold;
+    // Only return home for repairs when hull is actually low
+    const needsRepair = postHull <= settings.repairThreshold;
+
+    // Only return home for fuel when we have ZERO fuel cells of any type in cargo
+    const hasFuelCells = bot.inventory?.some(i =>
+      i.itemId === 'fuel_cell' ||
+      i.itemId === 'premium_fuel_cell' ||
+      i.itemId === 'military_fuel_cell'
+    );
+    const needsFuel = !hasFuelCells;
 
     if (needsRepair || needsFuel) {
       const reason = needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`;
@@ -1313,6 +1375,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
+      skipBlacklist: true,
     };
 
     // ── Status ──
@@ -1505,6 +1568,84 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // After fighting, wait a bit before next scan
     await ctx.sleep(5000);
+  }
+}
+
+// ── Patrol Systems Routine (cycle through configured list) ────────
+
+async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshStatus();
+  let totalKills = 0;
+  let systemIndex = 0;
+
+  while (bot.state === "running") {
+    const settings = getHunterSettings(bot.username);
+    const patrolList = settings.patrolSystems || [];
+    if (patrolList.length === 0) {
+      ctx.log("error", "patrol_systems mode but no patrolSystems configured — falling back to roam_systems");
+      yield* roamSystemsRoutine(ctx);
+      return;
+    }
+
+    const targetSystem = patrolList[systemIndex % patrolList.length];
+    systemIndex++;
+
+    const safetyOpts = {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
+      skipBlacklist: true,
+    };
+
+    // Navigate to the target system in the list
+    if (bot.system !== targetSystem) {
+      ctx.log("travel", `Patrol systems: heading to ${targetSystem}...`);
+      const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
+      if (!arrived) {
+        ctx.log("error", `Could not reach ${targetSystem} — skipping`);
+        await ctx.sleep(5000);
+        continue;
+      }
+    }
+
+    // Reuse the core patrol logic from roamSystem by calling a single-system patrol pass
+    // For simplicity, we run one full roamSystem-like sweep but targeted
+    ctx.log("info", `Starting patrol sweep in ${targetSystem}`);
+    // Delegate to a single pass of the roam logic but force the system
+    // (reuse existing code path by temporarily overriding via settings isn't clean,
+    // so we just call the navigation + let the main loop handle; instead do direct patrol here)
+    // Simpler: run the stationary-style patrol in this system
+    yield* (async function* singleSystemPatrol() {
+      // inline minimal patrol of current system (copy of key parts)
+      await fetchSecurityLevel(ctx, bot.system);
+      const { pois } = await getSystemInfo(ctx);
+      const patrolPois = pois.filter(p => !isStationPoi(p));
+      if (patrolPois.length === 0) {
+        ctx.log("info", "No POIs — moving to next system");
+        return;
+      }
+      for (const poi of patrolPois) {
+        if (bot.state !== "running") break;
+        await bot.exec("travel", { target_poi: poi.id });
+        bot.poi = poi.id;
+        await ctx.sleep(500);
+        const nearbyResp = await bot.exec("get_nearby");
+        if (nearbyResp.error) continue;
+        bot.trackNearbyPlayers(nearbyResp.result);
+        const entities = parseNearby(nearbyResp.result);
+        const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+        for (const target of targets) {
+          await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+          if (won) {
+            totalKills++;
+            await scavengeWrecks(ctx);
+          }
+        }
+      }
+    })();
   }
 }
 

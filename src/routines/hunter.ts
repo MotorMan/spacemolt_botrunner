@@ -993,8 +993,16 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
 
       if (settings.singleLoop) {
-        ctx.log("system", "Single loop mode enabled — patrol complete, returning to base and stopping.");
-        return;
+        ctx.log("system", "Single loop mode — returning to base for resupply...");
+        const safetyOpts = {
+          fuelThresholdPct: settings.refuelThreshold,
+          hullThresholdPct: settings.repairThreshold,
+          autoCloak: settings.autoCloak,
+          skipBlacklist: true,
+        };
+        await navigateToSafeStation(ctx, safetyOpts);
+        await ensureHunterResupply(ctx);
+        // loop will naturally continue after resupply
       }
 
     } else {
@@ -1663,6 +1671,21 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         }
       }
     })();
+
+    // Single loop support for patrol_systems mode
+    // After completing one full cycle, return to base for resupply, then repeat
+    if (settings.singleLoop && systemIndex >= (settings.patrolSystems?.length || 1)) {
+      ctx.log("system", "Single loop mode — returning to base for resupply...");
+      const safetyOpts = {
+        fuelThresholdPct: settings.refuelThreshold,
+        hullThresholdPct: settings.repairThreshold,
+        autoCloak: settings.autoCloak,
+        skipBlacklist: true,
+      };
+      await navigateToSafeStation(ctx, safetyOpts);
+      await ensureHunterResupply(ctx);
+      systemIndex = 0; // restart the patrol list
+    }
   }
 }
 

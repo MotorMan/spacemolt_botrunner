@@ -476,8 +476,9 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
     const atHomeStation = bot.system === settings.homeSystem && bot.poi === settings.homeStation;
 
+    // Restart recovery: empty cargo not at home → return home; full cargo → proceed to station
     if (!atHomeStation && cargoQty <= 0) {
-      ctx.log("fc", `No cargo and not at home (${bot.system}/${bot.poi}) — returning home to restock`);
+      ctx.log("fc", `Restart recovery: empty cargo not at home (${bot.system}/${bot.poi}) — returning home`);
       yield "return_home";
       if (bot.system !== settings.homeSystem) {
         await ensureUndocked(ctx);
@@ -502,7 +503,8 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       await bot.refreshCargo();
       const postReturnCargo = bot.inventory.find(i => i.itemId === FUEL_CELL_ITEM_ID);
       cargoQty = postReturnCargo?.quantity ?? 0;
-      ctx.log("fc", "Returned home with cargo");
+    } else if (!atHomeStation && cargoQty > 0) {
+      ctx.log("fc", `Restart recovery: cargo present — heading to selected station`);
     }
 
     await ensureDocked(ctx);

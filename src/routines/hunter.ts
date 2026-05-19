@@ -53,6 +53,7 @@ import {
   fleeFromBattle,
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
+  getItemSize,
 } from "./common.js";
 
 import type { PirateTier, NearbyEntity } from "./battle.js";
@@ -522,6 +523,14 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
 
   // Check per-bot mode
   const initialSettings = getHunterSettings(bot.username);
+
+  // If we started the routine while docked at home base, refuel, repair, then restock
+  if (bot.docked) {
+    await repairShip(ctx);
+    await tryRefuel(ctx);
+    await ensureHunterResupply(ctx);
+  }
+
   if (initialSettings.mode === "roam_system") {
     yield* roamSystemRoutine(ctx);
     return;
@@ -1663,6 +1672,12 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
   if (!bot.docked) return;
 
+  // Buying is currently disabled — we only withdraw from faction storage
+  const allowBuying = false;
+
+  // Always try to refuel when docked at home base (free fuel)
+  await tryRefuel(ctx);
+
   await bot.refreshStatus();
   await bot.refreshCargo();
 
@@ -1684,9 +1699,7 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     }
   }
 
-  await bot.refreshCargo();
-
-  const freeSpace = bot.cargoMax - bot.cargo;
+  let freeSpace = bot.cargoMax;
   if (freeSpace < 5) {
     ctx.log("trade", "Cargo almost full — skipping resupply");
     return;
@@ -1699,6 +1712,12 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
   // 1. Ammo resupply
   const weapons = await getWeaponModules(ctx);
+  ctx.log("debug", `Hunter resupply: detected ${weapons.length} weapons`);
+
+  for (const w of weapons) {
+    ctx.log("debug", `  Weapon: ${w.name} | ammoType: ${w.ammoType || 'none'} | maxAmmo: ${w.maxAmmo}`);
+  }
+
   let ammoToGet = 30;
 
   if (weapons.length > 0) {
@@ -1710,43 +1729,127 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     }
   }
 
-  let chosenAmmoId = "standard_ammo";
+  let chosenAmmoId: string | null = null;
 
   if (existingAmmo) {
-    // Respect existing ammo type the user has in cargo
     chosenAmmoId = existingAmmo.itemId;
     ctx.log("trade", `Using existing ammo type from cargo: ${chosenAmmoId}`);
   } else if (weapons.length > 0) {
-    // Try to pick smarter ammo using catalog
-    const firstWeapon = weapons[0];
-    const ammoIndex = catalogStore.getAmmoTypeIndex();
-    const possibleAmmo = ammoIndex[firstWeapon.ammoType || ""] || [];
+    // Find the first weapon that actually uses ammo
+    const ammoWeapon = weapons.find(w => w.ammoType && w.ammoType !== "none");
+    
+    if (ammoWeapon) {
+      const ammoIndex = catalogStore.getAmmoTypeIndex();
+      const ammoType = ammoWeapon.ammoType!;
 
-    if (possibleAmmo.length > 0) {
-      // Pick the first good one (could improve with damage/AoE lookup later)
-      chosenAmmoId = possibleAmmo[0];
+      // Prefer the ammo that is currently loaded in the weapon, if available
+      let possibleAmmo = ammoIndex[ammoType] || [];
+
+      if (ammoWeapon.loadedAmmoId && possibleAmmo.includes(ammoWeapon.loadedAmmoId)) {
+        // Move the currently loaded ammo to the front so we prefer it
+        possibleAmmo = [
+          ammoWeapon.loadedAmmoId,
+          ...possibleAmmo.filter(id => id !== ammoWeapon.loadedAmmoId)
+        ];
+        ctx.log("debug", `Preferring currently loaded ammo: ${ammoWeapon.loadedAmmoId}`);
+      }
+
+      ctx.log("debug", `Catalog ammo options for ${ammoType}: ${possibleAmmo.join(", ") || "none"}`);
+
+      if (possibleAmmo.length > 0) {
+        chosenAmmoId = possibleAmmo[0];
+      }
+    } else {
+      ctx.log("debug", "No weapons with ammoType found");
     }
   }
 
-  const ammoResp = await bot.exec("buy", { item_id: chosenAmmoId, quantity: ammoToGet });
-  if (!ammoResp.error) {
-    ctx.log("trade", `Resupplied ${ammoToGet} ${chosenAmmoId}`);
+  if (chosenAmmoId) {
+    // Try the selected ammo, then fall back through other catalog options if it fails
+    const ammoOptions = [chosenAmmoId];
+    const ammoIndex = catalogStore.getAmmoTypeIndex();
+    const ammoWeapon = weapons.find(w => w.ammoType && w.ammoType !== "none");
+    if (ammoWeapon) {
+      const ammoType = ammoWeapon.ammoType!;
+      const extra = ammoIndex[ammoType] || [];
+      for (const opt of extra) {
+        if (!ammoOptions.includes(opt)) ammoOptions.push(opt);
+      }
+    }
+
+    let gotAmmo = false;
+    for (const ammoId of ammoOptions) {
+      const ammoSize = getItemSize(ammoId);
+      const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
+      if (actualQty <= 0) continue;
+
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: ammoId,
+        quantity: actualQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
+        freeSpace -= actualQty * ammoSize;
+        gotAmmo = true;
+        break;
+      }
+    }
+
+    if (!gotAmmo) {
+      ctx.log("trade", `Ammo resupply: relying on faction storage (tried ${ammoOptions.length} options)`);
+    }
+  } else {
+    ctx.log("trade", "No suitable ammo found for equipped weapons — skipping ammo resupply");
   }
 
-  // 2. Advanced repair kits (~10)
-  const repairResp = await bot.exec("buy", { item_id: "advanced_repair_kit", quantity: 10 });
-  if (!repairResp.error) {
-    ctx.log("trade", "Resupplied 10 advanced repair kits");
+  // 2. Repair kits (~10) - try advanced first, then fallback to regular
+  const repairKits = ["advanced_repair_kit", "repair_kit"];
+  let gotRepairKits = false;
+  for (const kitId of repairKits) {
+    const kitSize = getItemSize(kitId);
+    const kitQty = Math.min(10, Math.floor(freeSpace / kitSize));
+    if (kitQty <= 0) continue;
+
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: kitId,
+      quantity: kitQty
+    });
+    if (!wResp.error) {
+      ctx.log("trade", `Withdrew ${kitQty} ${kitId} from faction storage`);
+      freeSpace -= kitQty * kitSize;
+      gotRepairKits = true;
+      break;
+    }
+  }
+  if (!gotRepairKits) {
+    ctx.log("trade", "Repair kits: relying on faction storage");
   }
 
-  // 3. Military fuel cells — fill the rest
-  await bot.refreshCargo();
-  const remainingSpace = bot.cargoMax - bot.cargo;
-  if (remainingSpace >= 3) {
-    const fuelQty = Math.floor(remainingSpace / 3);
-    const fuelResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: fuelQty });
-    if (!fuelResp.error) {
-      ctx.log("trade", `Resupplied ${fuelQty} military fuel cells`);
+  // 3. Military fuel cells — fill the rest (prefer faction storage)
+  const fuelCellSize = getItemSize("military_fuel_cell");
+  if (freeSpace >= fuelCellSize) {
+    const fuelQty = Math.floor(freeSpace / fuelCellSize);
+    if (allowBuying) {
+      const fuelResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: fuelQty });
+      if (!fuelResp.error) {
+        ctx.log("trade", `Resupplied ${fuelQty} military fuel cells`);
+      }
+    } else {
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: "military_fuel_cell",
+        quantity: fuelQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${fuelQty} military fuel cells from faction storage`);
+      } else {
+        ctx.log("trade", `Military fuel cells: relying on faction storage (${fuelQty} needed)`);
+      }
     }
   }
 }

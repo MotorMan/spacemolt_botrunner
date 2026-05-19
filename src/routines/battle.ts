@@ -69,6 +69,7 @@ export interface WeaponModule {
   currentAmmo: number;
   maxAmmo: number;
   ammoType?: string;
+  loadedAmmoId?: string;   // specific ammo item currently loaded (e.g. "corrosive_plasma_cell_pack")
 }
 
 // ── Constants ──────────────────────────────────────────────
@@ -219,6 +220,7 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
         currentAmmo,
         maxAmmo,
         ammoType,
+        loadedAmmoId: (mod.loaded_ammo_id as string) || (mod.current_ammo_item as string) || undefined,
       });
     }
   }

@@ -951,6 +951,32 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       // Show helpful message if faction storage is empty at this station
       if (factionError && (factionError.includes("no_faction_storage") || factionError.includes("no storage"))) {
         ctx.log("trade", `FACTION MODE: Bot is in a faction, but no faction storage at this station — travel to home station`);
+        // On restart at remote location: immediately head home instead of stopping
+        const homeSystem = settings.homeSystem || startSystem;
+        const homeStationPoi = settings.homeStation || null;
+        if (homeSystem && (bot.system !== homeSystem || (homeStationPoi && bot.poi !== homeStationPoi))) {
+          ctx.log("trade", `Returning to home to access faction storage...`);
+          yield "return_home";
+          if (bot.system !== homeSystem) {
+            await ensureUndocked(ctx);
+            const homeFueled = await ensureFueled(ctx, settings.refuelThreshold);
+            if (homeFueled) {
+              await navigateToSystem(ctx, homeSystem, {
+                fuelThresholdPct: settings.refuelThreshold,
+                hullThresholdPct: settings.repairThreshold,
+              });
+            }
+          }
+          if (homeStationPoi && bot.poi !== homeStationPoi) {
+            await ensureUndocked(ctx);
+            const tResp = await bot.exec("travel", { target_poi: homeStationPoi });
+            if (!tResp.error || tResp.error.message.includes("already")) {
+              bot.poi = homeStationPoi;
+            }
+          }
+          await ctx.sleep(5000);
+          continue;
+        }
       } else {
         ctx.log("trade", `FACTION MODE: Bot is in a faction, using faction storage`);
       }
@@ -1344,22 +1370,20 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: route!.itemId, quantity: wQty }); //fixed by human! withdraw from faction to cargo.
           }
           // Handle no_faction_storage error — return home and retry
-          if (wResp.error && wResp.error.message.includes("no_faction_storage")) {
-            ctx.log("error", `No faction storage at current station — returning to home station`);
-            // Clear faction storage cache to prevent stale data
-            clearFactionStorageCache();
-            bot.factionStorage = [];
-            // Skip to return home
-            await ctx.sleep(30000);
-            break;
-          }
-        }
-
-        if (wResp.error) {
-          if (totalSold > 0) break;
-          ctx.log("error", `Withdraw failed: ${wResp.error.message}`);
-          break;
-        }
+           if (wResp.error && wResp.error.message.includes("no_faction_storage")) {
+             ctx.log("error", `No faction storage at current station — returning to home station`);
+             clearFactionStorageCache();
+             bot.factionStorage = [];
+             await ctx.sleep(30000);
+             // fall through to return-home logic at end of cycle
+           }
+         }
+ 
+         if (wResp.error) {
+           if (totalSold > 0) break;
+           ctx.log("error", `Withdraw failed: ${wResp.error.message}`);
+           break;
+         }
 
         // Verify item was actually withdrawn to cargo
         await bot.refreshCargo();
@@ -1689,22 +1713,21 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: route!.itemId, quantity: qty }); //fixed by human! should withdraw from faction to storage.
           }
           // Handle no_faction_storage error — return home and retry
-          if (wResp.error && wResp.error.message.includes("no_faction_storage")) {
-            ctx.log("error", `No faction storage at current station — returning to home station`);
-            // Clear faction storage cache to prevent stale data
-            clearFactionStorageCache();
-            bot.factionStorage = [];
-            // Skip to return home
-            await ctx.sleep(30000);
-            break;
-          }
-        }
-
-        if (wResp.error) {
-          ctx.log("error", `Withdraw failed: ${wResp.error.message}`);
-          await ctx.sleep(30000);
-          continue;
-        }
+           if (wResp.error && wResp.error.message.includes("no_faction_storage")) {
+             ctx.log("error", `No faction storage at current station — returning to home station`);
+             clearFactionStorageCache();
+             bot.factionStorage = [];
+             await ctx.sleep(30000);
+             // fall through to return-home logic at end of cycle
+             continue;
+           }
+         }
+ 
+         if (wResp.error) {
+           ctx.log("error", `Withdraw failed: ${wResp.error.message}`);
+           await ctx.sleep(30000);
+           continue;
+         }
 
         const storageType = personalMode ? "personal storage" : "faction storage";
         ctx.log("trade", `Withdrew ${qty}x ${route!.itemName} from ${storageType}`);

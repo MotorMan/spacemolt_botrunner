@@ -15475,6 +15475,7 @@ function renderHunterSettings(panel) {
   const minPiratesToFlee = h.minPiratesToFlee ?? 3;
   const disableScanCommandForPirates = h.disableScanCommandForPirates ?? false;
   const hunterPatrols = Array.isArray(h.hunterPatrols) ? h.hunterPatrols : [];
+  const singleLoop = h.singleLoop ?? false;
 
   const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
   const tierOpts = tierOptions.map(t => `<option value="${t}"${t === maxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
@@ -15798,9 +15799,7 @@ function addSystemToCurrentHunterProfileFromSelect() {
 
   const profile = settings.hunter.hunterPatrols[idx];
   if (!profile.patrolSystems) profile.patrolSystems = [];
-  if (!profile.patrolSystems.includes(systemId)) {
-    profile.patrolSystems.push(systemId);
-  }
+  profile.patrolSystems.push(systemId);
   renderHunterSettings(document.getElementById('settingsContent'));
   send({ type: 'saveSettings', routine: 'hunter', settings: settings.hunter });
 }
@@ -15823,9 +15822,7 @@ function addSystemToCurrentHunterProfileFromText() {
                       (data.name || '').toLowerCase() === system.toLowerCase()
     );
     const systemId = match ? match[0] : system;
-    if (!profile.patrolSystems.includes(systemId)) {
-      profile.patrolSystems.push(systemId);
-    }
+    profile.patrolSystems.push(systemId);
   }
 
   input.value = '';
@@ -15840,7 +15837,13 @@ function removeSystemFromCurrentHunterProfile(systemId) {
   const profile = settings.hunter.hunterPatrols[idx];
   if (!profile.patrolSystems) return;
 
-  profile.patrolSystems = profile.patrolSystems.filter(s => s.toLowerCase() !== systemId.toLowerCase());
+  // Remove only the first matching instance (so duplicates can be removed one at a time)
+  const lowerId = systemId.toLowerCase();
+  const removeIndex = profile.patrolSystems.findIndex(s => s.toLowerCase() === lowerId);
+  if (removeIndex !== -1) {
+    profile.patrolSystems.splice(removeIndex, 1);
+  }
+
   renderHunterSettings(document.getElementById('settingsContent'));
   send({ type: 'saveSettings', routine: 'hunter', settings: settings.hunter });
 }

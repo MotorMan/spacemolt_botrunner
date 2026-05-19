@@ -387,6 +387,7 @@ async function navigateToSafeStation(ctx: RoutineContext, safetyOpts: { fuelThre
   }
   bot.docked = true;
   await collectFromStorage(ctx);
+  await ensureHunterResupply(ctx);
   return true;
 }
 
@@ -1649,7 +1650,99 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
   }
 }
 
+/** Hunter resupply: ammo, advanced repair kits, and military fuel cells from faction storage or station. */
+async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
 
+  if (!bot.docked) return;
+
+  await bot.refreshStatus();
+  await bot.refreshCargo();
+
+  // Empty cargo of loot while protecting ammo, fuel cells, and repair kits
+  for (const item of [...bot.inventory]) {
+    const id = item.itemId.toLowerCase();
+    const isProtected =
+      id.includes("ammo") ||
+      id.includes("fuel_cell") ||
+      id.includes("repair_kit");
+
+    if (isProtected) continue;
+
+    if (item.quantity > 0) {
+      const sellResp = await bot.exec("sell", { item_id: item.itemId, quantity: item.quantity });
+      if (!sellResp.error) {
+        ctx.log("trade", `Sold ${item.quantity}x ${item.name} (cleared cargo)`);
+      }
+    }
+  }
+
+  await bot.refreshCargo();
+
+  const freeSpace = bot.cargoMax - bot.cargo;
+  if (freeSpace < 5) {
+    ctx.log("trade", "Cargo almost full — skipping resupply");
+    return;
+  }
+
+  // Check if we already have ammo in cargo (user may have placed it manually)
+  const existingAmmo = bot.inventory.find(i =>
+    i.itemId.includes("ammo") || i.itemId.includes("_ammo")
+  );
+
+  // 1. Ammo resupply
+  const weapons = await getWeaponModules(ctx);
+  let ammoToGet = 30;
+
+  if (weapons.length > 0) {
+    const maxAmmo = Math.max(...weapons.map(w => w.maxAmmo || 0));
+    if (maxAmmo > 50) {
+      ammoToGet = 20;
+    } else if (maxAmmo > 0) {
+      ammoToGet = 40;
+    }
+  }
+
+  let chosenAmmoId = "standard_ammo";
+
+  if (existingAmmo) {
+    // Respect existing ammo type the user has in cargo
+    chosenAmmoId = existingAmmo.itemId;
+    ctx.log("trade", `Using existing ammo type from cargo: ${chosenAmmoId}`);
+  } else if (weapons.length > 0) {
+    // Try to pick smarter ammo using catalog
+    const firstWeapon = weapons[0];
+    const ammoIndex = catalogStore.getAmmoTypeIndex();
+    const possibleAmmo = ammoIndex[firstWeapon.ammoType || ""] || [];
+
+    if (possibleAmmo.length > 0) {
+      // Pick the first good one (could improve with damage/AoE lookup later)
+      chosenAmmoId = possibleAmmo[0];
+    }
+  }
+
+  const ammoResp = await bot.exec("buy", { item_id: chosenAmmoId, quantity: ammoToGet });
+  if (!ammoResp.error) {
+    ctx.log("trade", `Resupplied ${ammoToGet} ${chosenAmmoId}`);
+  }
+
+  // 2. Advanced repair kits (~10)
+  const repairResp = await bot.exec("buy", { item_id: "advanced_repair_kit", quantity: 10 });
+  if (!repairResp.error) {
+    ctx.log("trade", "Resupplied 10 advanced repair kits");
+  }
+
+  // 3. Military fuel cells — fill the rest
+  await bot.refreshCargo();
+  const remainingSpace = bot.cargoMax - bot.cargo;
+  if (remainingSpace >= 3) {
+    const fuelQty = Math.floor(remainingSpace / 3);
+    const fuelResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: fuelQty });
+    if (!fuelResp.error) {
+      ctx.log("trade", `Resupplied ${fuelQty} military fuel cells`);
+    }
+  }
+}
 
 
 

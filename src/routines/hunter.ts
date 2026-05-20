@@ -125,6 +125,8 @@ function getHunterSettings(username?: string): {
   disableWreckSalvaging: boolean;
   patrolSystems: string[];
   singleLoop: boolean;
+  homeSystem: string;
+  homeStation: string;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -163,6 +165,8 @@ function getHunterSettings(username?: string): {
     disableWreckSalvaging: (h.disableWreckSalvaging as boolean) ?? false,
     patrolSystems: resolvedPatrolSystems,
     singleLoop: (h.singleLoop as boolean) ?? false,
+    homeSystem: (botOverrides.homeSystem as string) || (all.return_home?.homeSystem as string) || (all.general?.homeSystem as string) || "",
+    homeStation: (botOverrides.homeStation as string) || (all.return_home?.homeStation as string) || (all.general?.homeStation as string) || "",
   };
 }
 
@@ -981,16 +985,16 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
 
       if (settings.singleLoop) {
-        ctx.log("system", "Single loop mode — returning to base for resupply...");
-        const safetyOpts = {
-          fuelThresholdPct: settings.refuelThreshold,
-          hullThresholdPct: settings.repairThreshold,
-          autoCloak: settings.autoCloak,
-          skipBlacklist: true,
-        };
-        await navigateToSafeStation(ctx, safetyOpts);
+        ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+        if (settings.homeStation) {
+          const [hsys, hpoi] = settings.homeStation.split("|");
+          if (hsys && hpoi) await navigateToSystem(ctx, hsys, safetyOpts);
+          const t = await bot.exec("travel", { target_poi: hpoi });
+          if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+        } else {
+          await navigateToSafeStation(ctx, safetyOpts);
+        }
         await ensureHunterResupply(ctx);
-        // loop will naturally continue after resupply
       }
 
     } else {
@@ -1651,14 +1655,15 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
     // Single loop support for patrol_systems mode
     // After completing one full cycle, return to base for resupply, then repeat
     if (settings.singleLoop && systemIndex >= (settings.patrolSystems?.length || 1)) {
-      ctx.log("system", "Single loop mode — returning to base for resupply...");
-      const safetyOpts = {
-        fuelThresholdPct: settings.refuelThreshold,
-        hullThresholdPct: settings.repairThreshold,
-        autoCloak: settings.autoCloak,
-        skipBlacklist: true,
-      };
-      await navigateToSafeStation(ctx, safetyOpts);
+      ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+      if (settings.homeStation) {
+        const [hsys, hpoi] = settings.homeStation.split("|");
+        if (hsys && hpoi) await navigateToSystem(ctx, hsys, safetyOpts);
+        const t = await bot.exec("travel", { target_poi: hpoi });
+        if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+      } else {
+        await navigateToSafeStation(ctx, safetyOpts);
+      }
       await ensureHunterResupply(ctx);
       systemIndex = 0; // restart the patrol list
     }
@@ -1685,6 +1690,8 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     const id = item.itemId.toLowerCase();
     const isProtected =
       id.includes("ammo") ||
+      id.includes("cell_pack") ||
+      id.includes("plasma") ||
       id.includes("fuel_cell") ||
       id.includes("repair_kit");
 

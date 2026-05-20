@@ -172,6 +172,15 @@ export function isPirateSystem(systemId: string): boolean {
   return PIRATE_SYSTEMS.some(ps => lower === ps || lower.includes(ps));
 }
 
+/** Returns true if stationId is on the approved fuel list (or list is empty/unset = allow all).
+ *  Reads from bot.settings.general.approvedFuelStations (string[] of station ids). */
+export function isApprovedFuelStation(stationId: string, settings: any): boolean {
+  const general = settings?.general || {};
+  const approved: string[] | undefined = general.approvedFuelStations;
+  if (!approved || approved.length === 0) return true;
+  return approved.includes(stationId);
+}
+
 /** Find a station with a salvage yard service. Returns null if none found. */
 export function findSalvageYardStation(pois: SystemPOI[]): SystemPOI | null {
   // First try: match known salvage yard station IDs (explicit list)
@@ -1135,14 +1144,30 @@ export async function ensureFueled(
     }
   }
 
-  // ── STEP 5: Find nearest known station with fuel ────────────────────────
+  // ── STEP 5: Find nearest known station with fuel (respect approved + actual fuel level) ────────────────────────
   ctx.log("system", "No station in current system — searching known map for nearest station...");
   const blacklist = getSystemBlacklist();
-  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
+  let nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
+  // Enforce approvedFuelStations if configured
+  const settings = (ctx as any).bot?.settings || {};
+  if (nearest && !isApprovedFuelStation(nearest.poiId, settings)) {
+    // try next one by re-querying without the bad one (simple: fall back to any other)
+    nearest = null; // will hit emergency or continue search below
+  }
   if (!nearest) {
     ctx.log("error", "No known station in mapped systems — emergency recovery...");
     return await emergencyFuelRecovery(ctx);
   }
+
+  // Check live fuel level via get_poi (base.fuel) or dock fuel_warning before committing
+  try {
+    const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
+    const baseFuel = (poiResp as any)?.base?.fuel ?? 0;
+    if (baseFuel <= 0) {
+      ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
+      return await emergencyFuelRecovery(ctx); // avoid the loop
+    }
+  } catch {}
 
   ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)`);
 
@@ -1223,7 +1248,7 @@ export async function ensureFueled(
         const msg = refuelResp.error.message.toLowerCase();
         if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty")) {
           ctx.log("error", `Cannot refuel: no fuel cells available at station — will not retry infinitely`);
-          break;
+          return false; // bail immediately, don't loop back
         }
       }
       await bot.refreshStatus();
@@ -1780,6 +1805,12 @@ export async function refuelAtStation(
       return await emergencyFuelRecovery(ctx);
     }
     bot.docked = true;
+    // Parse fuel_warning from dock response (e.g. "Fuel reserves critically low (0%)")
+    const warning = (dockResp as any)?.fuel_warning || "";
+    if (warning.toLowerCase().includes("0%") || warning.toLowerCase().includes("critically low")) {
+      ctx.log("error", `Station reports 0 fuel on dock — aborting refuel here`);
+      return false;
+    }
   }
 
   // Collect any gifted credits/items (may help pay for fuel)

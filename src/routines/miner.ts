@@ -337,7 +337,8 @@ function getMinerSettings(username?: string): {
   depletionTimeoutHours: number;
   ignoreDepletion: boolean;
   stayOutUntilFull: boolean;
-  maxJumps: number;
+    maxJumps: number;
+    minimumFuelCells: number;
 
   // Flock mining settings
   flockEnabled: boolean;
@@ -427,6 +428,7 @@ function getMinerSettings(username?: string): {
     ignoreDepletion: (m.ignoreDepletion as boolean) ?? false,
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
     maxJumps: (m.maxJumps as number) ?? 10,
+    minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
 
     // Flock mining settings
     flockEnabled: (botOverrides.flockEnabled as boolean) ?? false,
@@ -1549,12 +1551,17 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const lower = item.itemId.toLowerCase();
         if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
       }
-      if (fuelInCargo < 10) {
-        const prem = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: 20 });
-        if (!prem.error) ctx.log("mining", `Withdrew premium fuel cells from storage`);
+      const minFuel = settings.minimumFuelCells;
+      if (fuelInCargo < minFuel) {
+        const mil = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: minFuel });
+        if (!mil.error) ctx.log("mining", `Withdrew ${minFuel} military fuel cells from storage`);
         else {
-          const reg = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: 30 });
-          if (!reg.error) ctx.log("mining", `Withdrew fuel cells from storage`);
+          const prem = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: minFuel });
+          if (!prem.error) ctx.log("mining", `Withdrew ${minFuel} premium fuel cells from storage`);
+          else {
+            const reg = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: minFuel * 2 });
+            if (!reg.error) ctx.log("mining", `Withdrew fuel cells from storage`);
+          }
         }
       }
     }
@@ -5381,13 +5388,18 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
       if (r?.estimated_fuel && r?.fuel_available != null) {
         const deficit = Math.max(0, r.estimated_fuel - r.fuel_available);
         const needed = Math.ceil(deficit / 20);
-        if (fuelInCargo < needed) {
+        const minFuel = settings.minimumFuelCells;
+        if (fuelInCargo < Math.max(needed, minFuel)) {
           const isAtHome = homeSystem && bot.system === homeSystem;
-          let stillNeeded = needed - fuelInCargo;
+          let stillNeeded = Math.max(needed, minFuel) - fuelInCargo;
           if (isAtHome) {
-            // Withdraw premium first (50 fuel, 2 space), then regular
-            const premResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
-            if (!premResp.error) stillNeeded = Math.max(0, stillNeeded - 50);
+            // Prefer military_fuel_cell (100 fuel, 3 space)
+            const milResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: Math.ceil(stillNeeded / 3) });
+            if (!milResp.error) stillNeeded = Math.max(0, stillNeeded - 100);
+            if (stillNeeded > 0) {
+              const premResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
+              if (!premResp.error) stillNeeded = Math.max(0, stillNeeded - 50);
+            }
             if (stillNeeded > 0) {
               const regResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
               if (!regResp.error) stillNeeded = 0;
@@ -5396,10 +5408,10 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
           }
           if (stillNeeded > 0) {
             const free = Math.max(0, (bot.cargoMax || 50) - bot.cargo);
-            const buyQty = Math.min(Math.ceil(stillNeeded / 20), Math.floor(free));
+            const buyQty = Math.min(Math.ceil(stillNeeded / 3), Math.floor(free / 3));
             if (buyQty > 0) {
-              ctx.log("mining", `Buying ${buyQty} fuel cells for return (last resort)`);
-              await bot.exec("buy", { item_id: "fuel_cell", quantity: buyQty });
+              ctx.log("mining", `Buying ${buyQty} military fuel cells for return (last resort)`);
+              await bot.exec("buy", { item_id: "military_fuel_cell", quantity: buyQty });
             }
           }
         }

@@ -129,6 +129,7 @@ const SHIP_PASSIVE_RECIPE_IDS = new Set([
 /** Recipes that should NEVER be used - they are inefficient/wasteful */
 const BLACKLISTED_RECIPES = new Set([
   "basic_silicon_refinement", // Noob trap - severe waste of basic materials
+  "Fabricate Circuit Boards", // Force base materials only - never use expensive alternate paths
 ]);
 
 /** Recipes that should be heavily penalized - only use as absolute last resort */

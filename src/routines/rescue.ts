@@ -1698,24 +1698,15 @@ skipToReturnHome = true;
          continue;
        }
 
-       // Any rescue bot can rescue our own fleet bots
-       const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
-
-      // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
-      for (const target of targets) {
-        if (isOwnBot(target.username)) {
-          const result = addToRescueQueue(
-            target.username,
-            target.system,
-            target.poi,
-            target.fuelPct,
-            target.docked
-          );
-          if (result.added) {
-            ctx.log("rescue", `📋 Added ${target.username} to rescue queue at ${target.system}/${target.poi} (${target.fuelPct}% fuel)`);
-          }
+        // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
+        const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+        if (!isFleetRescuePrimary) {
+          ctx.log("rescue", `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
         }
-      }
+
+        const targets = isFleetRescuePrimary
+          ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
+          : [];
 
       // Clean up stale queue entries
       cleanupStaleQueue();
@@ -2356,8 +2347,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       yield "navigate_to_target";
       await ensureUndocked(ctx);
 
-      if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
-        // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names ──
+      if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system) && isMaydayTarget) {
+        // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names (MAYDAY only) ──
         const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
           maydayMaxJumps: settings.maydayMaxJumps
         });
@@ -4702,24 +4693,15 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
-      // Any rescue bot can rescue our own fleet bots
-      const targets = findStrandedBots(fleet, bot.username, settings.fuelThreshold);
-
-      // ── RESCUE QUEUE: Add our own bots to the queue for batch processing ──
-      for (const target of targets) {
-        if (isOwnBot(target.username)) {
-          const result = addToRescueQueue(
-            target.username,
-            target.system,
-            target.poi,
-            target.fuelPct,
-            target.docked
-          );
-          if (result.added) {
-            ctx.log("rescue", `📋 Added ${target.username} to rescue queue at ${target.system}/${target.poi} (${target.fuelPct}% fuel)`);
-          }
-        }
+      // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
+      const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
+      if (!isFleetRescuePrimary) {
+        ctx.log("rescue", `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
       }
+
+      const targets = isFleetRescuePrimary
+        ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
+        : [];
 
       // Clean up stale queue entries
       cleanupStaleQueue();
@@ -5538,8 +5520,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     yield "navigate_to_target";
     await ensureUndocked(ctx);
 
-    if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
-      // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names ──
+    if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system) && isMaydayTarget) {
+      // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names (MAYDAY only) ──
       const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
         maydayMaxJumps: settings.maydayMaxJumps
       });

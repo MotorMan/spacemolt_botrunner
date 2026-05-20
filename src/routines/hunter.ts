@@ -6,7 +6,7 @@
  *   2. Visit each non-station POI looking for pirate targets
  *   3. Scan -> engage -> loot each target
  *   4. Flee and dock if hull drops below flee threshold
- *   5. Post-patrol: complete missions, sell loot, accept new missions,
+ *   5. Post-patrol: complete missions, accept new missions,
  *      insure ship, refuel, repair
  *
  * Combat stances:
@@ -954,18 +954,6 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       yield "complete_missions";
       await completeActiveMissions(ctx);
 
-      // Sell loot (everything except fuel cells)
-      yield "sell_loot";
-      await bot.refreshCargo();
-      let unsold = false;
-      for (const item of bot.inventory) {
-        if (item.itemId.toLowerCase().includes("fuel") || item.itemId.toLowerCase().includes("energy_cell") || item.itemId.toLowerCase().includes("repair")) continue;
-        ctx.log("trade", `Selling ${item.quantity}x ${item.name}...`);
-        const sellResp = await bot.exec("sell", { item_id: item.itemId, quantity: item.quantity });
-        if (sellResp.error) unsold = true;
-        yield "selling";
-      }
-      if (unsold) await depositNonFuelCargo(ctx);
       await bot.refreshStatus();
 
       yield "check_missions";
@@ -1326,18 +1314,6 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       yield "complete_missions";
       await completeActiveMissions(ctx);
 
-      // Sell loot
-      yield "sell_loot";
-      await bot.refreshCargo();
-      let unsold = false;
-      for (const item of bot.inventory) {
-        if (item.itemId.toLowerCase().includes("fuel") || item.itemId.toLowerCase().includes("energy_cell") || item.itemId.toLowerCase().includes("repair")) continue;
-        ctx.log("trade", `Selling ${item.quantity}x ${item.name}...`);
-        const sellResp = await bot.exec("sell", { item_id: item.itemId, quantity: item.quantity });
-        if (sellResp.error) unsold = true;
-        yield "selling";
-      }
-      if (unsold) await depositNonFuelCargo(ctx);
       await bot.refreshStatus();
 
       yield "check_missions";
@@ -1704,7 +1680,7 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   await bot.refreshStatus();
   await bot.refreshCargo();
 
-  // Empty cargo of loot while protecting ammo, fuel cells, and repair kits
+  // Deposit any extra loot (everything except ammo, fuel cells, repair kits) so user can see what was brought home
   for (const item of [...bot.inventory]) {
     const id = item.itemId.toLowerCase();
     const isProtected =
@@ -1712,15 +1688,15 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       id.includes("fuel_cell") ||
       id.includes("repair_kit");
 
-    if (isProtected) continue;
+    if (isProtected || item.quantity <= 0) continue;
 
-    if (item.quantity > 0) {
-      const sellResp = await bot.exec("sell", { item_id: item.itemId, quantity: item.quantity });
-      if (!sellResp.error) {
-        ctx.log("trade", `Sold ${item.quantity}x ${item.name} (cleared cargo)`);
-      }
+    const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+    if (dResp.error) {
+      await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
     }
+    ctx.log("trade", `Deposited ${item.quantity}x ${item.name} to storage`);
   }
+  await bot.refreshCargo();
 
   let freeSpace = bot.cargoMax;
   if (freeSpace < 5) {

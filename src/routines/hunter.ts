@@ -165,8 +165,8 @@ function getHunterSettings(username?: string): {
     disableWreckSalvaging: (h.disableWreckSalvaging as boolean) ?? false,
     patrolSystems: resolvedPatrolSystems,
     singleLoop: (h.singleLoop as boolean) ?? false,
-    homeSystem: (botOverrides.homeSystem as string) || (all.return_home?.homeSystem as string) || (all.general?.homeSystem as string) || "",
-    homeStation: (botOverrides.homeStation as string) || (all.return_home?.homeStation as string) || (all.general?.homeStation as string) || "",
+    homeSystem: (botOverrides.homeSystem as string) || (botOverrides.hunterHomeSystem as string) || (h.homeSystem as string) || (all.return_home?.homeSystem as string) || "",
+    homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || "",
   };
 }
 
@@ -986,9 +986,10 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
       if (settings.singleLoop) {
         ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
-        if (settings.homeStation) {
-          const [hsys, hpoi] = settings.homeStation.split("|");
-          if (hsys && hpoi) await navigateToSystem(ctx, hsys, safetyOpts);
+        const hs = settings.homeStation || "";
+        const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+        if (hsys && hpoi) {
+          await navigateToSystem(ctx, hsys, safetyOpts);
           const t = await bot.exec("travel", { target_poi: hpoi });
           if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
         } else {
@@ -1656,9 +1657,10 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
     // After completing one full cycle, return to base for resupply, then repeat
     if (settings.singleLoop && systemIndex >= (settings.patrolSystems?.length || 1)) {
       ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
-      if (settings.homeStation) {
-        const [hsys, hpoi] = settings.homeStation.split("|");
-        if (hsys && hpoi) await navigateToSystem(ctx, hsys, safetyOpts);
+      const hs = settings.homeStation || "";
+      const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+      if (hsys && hpoi) {
+        await navigateToSystem(ctx, hsys, safetyOpts);
         const t = await bot.exec("travel", { target_poi: hpoi });
         if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
       } else {
@@ -1705,11 +1707,24 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   }
   await bot.refreshCargo();
 
-  let freeSpace = bot.cargoMax;
+  let freeSpace = Math.max(0, bot.cargoMax - (bot.cargo || 0));
   if (freeSpace < 5) {
     ctx.log("trade", "Cargo almost full — skipping resupply");
     return;
   }
+
+  // Count what we already have in cargo for protected resupply items (so we only top off)
+  const currentAmmo = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("ammo") || i.itemId.toLowerCase().includes("cell_pack") || i.itemId.toLowerCase().includes("plasma"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+  const currentRepair = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("repair_kit"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+  const currentFuel = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("fuel_cell"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
 
   // Check if we already have ammo in cargo (user may have placed it manually)
   const existingAmmo = bot.inventory.find(i =>
@@ -1724,14 +1739,14 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     ctx.log("debug", `  Weapon: ${w.name} | ammoType: ${w.ammoType || 'none'} | maxAmmo: ${w.maxAmmo}`);
   }
 
-  let ammoToGet = 30;
+  let ammoToGet = Math.max(0, 30 - currentAmmo);
 
   if (weapons.length > 0) {
     const maxAmmo = Math.max(...weapons.map(w => w.maxAmmo || 0));
     if (maxAmmo > 50) {
-      ammoToGet = 20;
+      ammoToGet = Math.max(0, 20 - currentAmmo);
     } else if (maxAmmo > 0) {
-      ammoToGet = 40;
+      ammoToGet = Math.max(0, 40 - currentAmmo);
     }
   }
 
@@ -1810,12 +1825,14 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     ctx.log("trade", "No suitable ammo found for equipped weapons — skipping ammo resupply");
   }
 
-  // 2. Repair kits (~10) - try advanced first, then fallback to regular
+  // 2. Repair kits (~10) - try advanced first, then fallback to regular (top off only)
   const repairKits = ["advanced_repair_kit", "repair_kit"];
   let gotRepairKits = false;
+  const desiredRepair = 12;
+  const repairToGet = Math.max(0, desiredRepair - currentRepair);
   for (const kitId of repairKits) {
     const kitSize = getItemSize(kitId);
-    const kitQty = Math.min(10, Math.floor(freeSpace / kitSize));
+    const kitQty = Math.min(repairToGet, Math.floor(freeSpace / kitSize));
     if (kitQty <= 0) continue;
 
     const wResp = await bot.exec("storage", {

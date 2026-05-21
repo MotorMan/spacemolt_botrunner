@@ -1358,6 +1358,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 // ── Background credit top-off state ──────────────────────────────────────────
 let creditTopOffIntervalId: NodeJS.Timeout | null = null;
 const consecutiveZeroCredits = new Map<string, number>(); // botUsername -> consecutive 0 credit count
+const ownBotRescueCooldown = new Map<string, number>(); // botUsername -> cooldown expiry timestamp (ms) for unreachable own fleet bots
 
 /**
  * Background credit top-off loop — runs independently every 60 seconds,
@@ -2347,7 +2348,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       yield "navigate_to_target";
       await ensureUndocked(ctx);
 
-      if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system) && isMaydayTarget) {
+    if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
         // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names (MAYDAY only) ──
         const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
           maydayMaxJumps: settings.maydayMaxJumps
@@ -4693,15 +4694,33 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         continue;
       }
 
+      // Mark all fleet bots as "own" so we never ghost them or blacklist them, even across restarts
+      for (const member of fleet) {
+        if (member.username !== bot.username && !isOwnBot(member.username)) {
+          markAsOwnBot(member.username);
+          ctx.log("rescue", `🤝 Marked ${member.username} as our bot (will not blacklist or ghost)`);
+        }
+      }
+
       // Check if we're the primary FLEET rescue bot (secondary only helps via cooperation when primary busy)
       const isFleetRescuePrimary = isPrimaryFleetRescueBot(bot.username);
       if (!isFleetRescuePrimary) {
         ctx.log("rescue", `📡 Not primary fleet rescue bot - waiting for ${settings.fleetRescueBot || 'primary bot'}`);
       }
 
-      const targets = isFleetRescuePrimary
+      let targets = isFleetRescuePrimary
         ? findStrandedBots(fleet, bot.username, settings.fuelThreshold)
         : [];
+
+      // Filter out own bots that are in temporary cooldown (e.g. hidden POI, unreachable)
+      const now = Date.now();
+      targets = targets.filter(t => {
+        const expiry = ownBotRescueCooldown.get(t.username);
+        if (expiry && expiry > now) {
+          return false;
+        }
+        return true;
+      });
 
       // Clean up stale queue entries
       cleanupStaleQueue();
@@ -5520,6 +5539,66 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     yield "navigate_to_target";
     await ensureUndocked(ctx);
 
+    // ── Explicit system navigation for fleet rescues (our own bots) ──
+    // This guarantees we jump to the target system BEFORE any POI travel attempt.
+    if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system) && !isMaydayTarget) {
+      ctx.log("rescue", `🚀 Fleet rescue: navigating to target system ${target.system} (from ${bot.system}) before attempting POI ${target.poi}...`);
+
+      // Capture jump count for billing (same as mayday path)
+      let jumpsToTarget = 0;
+      try {
+        const routeResp = await bot.exec("find_route", { target_system: target.system });
+        if (!routeResp.error && routeResp.result) {
+          const route = routeResp.result as Record<string, unknown>;
+          jumpsToTarget = (route.total_jumps as number) || 0;
+          ctx.log("rescue", `📍 Route to target: ${jumpsToTarget} jump${jumpsToTarget !== 1 ? 's' : ''}`);
+        }
+      } catch (e) {
+        ctx.log("warn", `Could not calculate route to ${target.system} for billing: ${e}`);
+      }
+
+      // Snapshot original target info for movement checks during navigation (fleet bots can still jump)
+      const originalTargetSystem = target.system;
+      const originalTargetPoi = target.poi;
+      const originalTargetFuel = target.fuelPct;
+      const originalTargetDocked = target.docked;
+
+      const arrived = await navigateToSystem(ctx, target.system, {
+        fuelThresholdPct: settings.refuelThreshold,
+        hullThresholdPct: 30,
+        onJump: async (jumpNumber: number) => {
+          // Periodically re-check where our fleet bot actually is (they can still move)
+          const statusCheck = await checkTargetStillNeedsRescue(
+            ctx,
+            target.username,
+            originalTargetFuel,
+            originalTargetSystem,
+            originalTargetDocked,
+          );
+          if (!statusCheck.needsRescue) {
+            ctx.log("rescue", `🛑 ABORTING fleet navigation - ${statusCheck.reason || "target moved or refueled"}`);
+            return false; // stop navigateToSystem
+          }
+          if (jumpNumber % 3 === 0 && statusCheck.currentSystem) {
+            ctx.log("rescue", `📍 Jump ${jumpNumber}: fleet target now at ${statusCheck.currentSystem}/${statusCheck.currentSystem ? target.poi : ""}`);
+          }
+          return true;
+        },
+      });
+      if (!arrived) {
+        ctx.log("error", `Could not reach fleet target system ${target.system} for ${target.username} (or target moved during travel)`);
+        await ctx.sleep(settings.scanIntervalSec * 1000);
+        continue;
+      }
+
+      // Record the jumps in the session so billing at the end gets a real number
+      if (recoveredSession || getActiveRescueSession(bot.username)) {
+        await updateRescueSession(bot.username, { state: "at_system", jumpsCompleted: jumpsToTarget });
+      }
+
+      ctx.log("rescue", `✓ Arrived in ${target.system} — now proceeding to POI travel for ${target.username}`);
+    }
+
     if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system) && isMaydayTarget) {
       // ── PIRATE TRAP DETECTION: Check if this is a false flag using our bot names (MAYDAY only) ──
       const trapCheck = await checkForPirateTrap(ctx, target.username, target.system, isMaydayTarget, {
@@ -5806,9 +5885,25 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         }
       }
 
+      // If the target moved to a different system while we were traveling (fleet bots can still jump),
+      // chase them to the new system before trying the (now-stale) POI.
+      if (target.system && normalizeSystemName(target.system) !== normalizeSystemName(bot.system)) {
+        ctx.log("rescue", `🔄 Fleet target moved to ${target.system} while we were en-route — navigating there now...`);
+        const arrived2 = await navigateToSystem(ctx, target.system, {
+          fuelThresholdPct: settings.refuelThreshold,
+          hullThresholdPct: 30,
+        });
+        if (!arrived2) {
+          ctx.log("error", `Could not follow target to new system ${target.system}`);
+          await ctx.sleep(settings.scanIntervalSec * 1000);
+          continue;
+        }
+        ctx.log("rescue", `✓ Now in ${target.system} with the target`);
+      }
+
       // Track attempts for hidden POI detection
       let travelAttempts = 0;
-      const maxTravelAttempts = isOurBot ? 5 : 3; // Retry more for our own bots, but always try search for others
+      let maxTravelAttempts = isOurBot ? 5 : 3; // Retry more for our own bots, but always try search for others
       let travelSuccess = false;
       let searchAttempted = false; // Track if we've tried the hidden POI search
 
@@ -5834,21 +5929,44 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
         try {
           const { pois } = await getSystemInfo(ctx);
-          // Find POI by name (case-insensitive match)
-          const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
+          const targetPoiLower = target.poi.toLowerCase();
+
+          // Find POI by matching against both name and id (fleet status often reports the id,
+          // while get_system may return a display name or vice-versa). This was causing
+          // real POIs like "errai_belt" to be falsely declared unresolvable.
+          const matchedPoi = pois.find(p => {
+            const pName = (p.name || "").toLowerCase();
+            const pId = (p.id || "").toLowerCase();
+            return pName === targetPoiLower || pId === targetPoiLower;
+          });
           if (matchedPoi) {
             targetPoiId = matchedPoi.id;
-            targetPoiName = matchedPoi.name;
+            targetPoiName = matchedPoi.name || matchedPoi.id;
             ctx.log(logCategory, `Resolved POI "${target.poi}" -> ID: ${targetPoiId}`);
           } else {
-            // Try partial match as fallback
-            const partialMatch = pois.find(p => p.name.toLowerCase().includes(target.poi.toLowerCase()) || target.poi.toLowerCase().includes(p.name.toLowerCase()));
+            // Try partial match as fallback (again on both fields)
+            const partialMatch = pois.find(p => {
+              const pName = (p.name || "").toLowerCase();
+              const pId = (p.id || "").toLowerCase();
+              return pName.includes(targetPoiLower) || targetPoiLower.includes(pName) ||
+                     pId.includes(targetPoiLower) || targetPoiLower.includes(pId);
+            });
             if (partialMatch) {
               targetPoiId = partialMatch.id;
-              targetPoiName = partialMatch.name;
+              targetPoiName = partialMatch.name || partialMatch.id;
               ctx.log(logCategory, `Partial POI match: "${target.poi}" -> ID: ${targetPoiId}`);
             }
           }
+
+          // Debug aid: if still no match, dump a few POI names/ids so we can see what the system actually returned
+          if (!targetPoiId) {
+            const sample = pois.slice(0, 8).map(p => `${p.id || p.name}`).join(', ');
+            ctx.log("rescue", `POI resolution failed for "${target.poi}" — system returned ${pois.length} POIs. Sample: ${sample}`);
+          }
+          // Note: even if the current get_system list doesn't contain the exact name/id the fleet bot is reporting,
+          // we still let the raw travelTarget (the value the bot itself reported) be attempted.
+          // Many "belt", "star", hidden, or dynamic POIs only become travelable via the raw value or the
+          // jump-out-and-back discovery. We only apply long cooldown after actual repeated travel failures.
         } catch (e) {
           ctx.log("warn", `Could not query system POIs: ${e}`);
         }
@@ -6001,6 +6119,9 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (isOurBot) {
             ctx.log("rescue", `👻 Our bot ${target.username} not reachable - likely in hidden POI`);
             ctx.log("rescue", `💡 Will retry rescue when bot is in a visible location`);
+
+            // Cooldown to avoid fast-loop spam on persistent hidden POIs
+            ownBotRescueCooldown.set(target.username, Date.now() + 5 * 60 * 1000);
             
             // Return home and retry later
             if (homeSystem && normalizeSystemName(bot.system) !== normalizeSystemName(homeSystem)) {
@@ -6104,7 +6225,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             // Try traveling to the new POI immediately
             ctx.log("rescue", `🚀 Traveling to updated position...`);
             const { pois } = await getSystemInfo(ctx);
-            const matchedPoi = pois.find(p => p.name.toLowerCase() === target.poi.toLowerCase());
+            const targetPoiLower = target.poi.toLowerCase();
+            const matchedPoi = pois.find(p => {
+              const pName = (p.name || "").toLowerCase();
+              const pId = (p.id || "").toLowerCase();
+              return pName === targetPoiLower || pId === targetPoiLower;
+            });
             if (matchedPoi) {
               const travelResp = await bot.exec("travel", { target_poi: matchedPoi.id });
               // CRITICAL: Check for battle interrupt error

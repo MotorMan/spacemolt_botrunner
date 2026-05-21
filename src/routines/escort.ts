@@ -66,8 +66,6 @@ import {
   parseNearby,
   isPirateTarget,
   ensureAmmoLoaded,
-  emergencyFleeSpam,
-  analyzeExistingBattle,
   engageTarget as battleEngageTarget,
   fightJoinedBattle,
 } from "./battle.js";
@@ -330,6 +328,55 @@ async function analyzeEscortBattle(
     reason: `Escort joining side ${sideToJoin.sideId} (${sideToJoin.playerCount} player(s)) vs ${opposingPirateCount} pirate(s)`,
     pirateCount: opposingPirateCount,
   };
+}
+
+/** Handle being unexpectedly pulled into a battle (e.g. miner started combat).
+ *  Mirrors the robust logic from hunter using escort-specific battle analysis.
+ */
+async function handleUnexpectedEscortBattle(
+  ctx: RoutineContext,
+  maxAttackTier: PirateTier,
+  minPiratesToFlee: number,
+  fleeThreshold: number,
+  fleeFromTier: PirateTier,
+  minerName: string,
+): Promise<void> {
+  const battleStatus = await getBattleStatus(ctx);
+  if (!battleStatus) return;
+
+  ctx.log("combat", `⚠️ Unexpectedly in battle (ID: ${battleStatus.battle_id})`);
+
+  const analysis = await analyzeEscortBattle(ctx, maxAttackTier, minPiratesToFlee, minerName);
+  if (!analysis.shouldJoin) {
+    ctx.log("combat", `⏭️ Skipping unexpected battle: ${analysis.reason}`);
+    return;
+  }
+
+  if (analysis.reason.includes("Already in battle")) {
+    ctx.log("combat", `Already participating on side ${analysis.sideId} — continuing fight`);
+  } else if (analysis.sideId !== undefined) {
+    ctx.log("combat", `✅ Joining unexpected battle on side ${analysis.sideId}: ${analysis.reason}`);
+    const engageResp = await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId.toString() });
+    if (engageResp.error) {
+      ctx.log("error", `Failed to join unexpected battle: ${engageResp.error.message}`);
+      return;
+    }
+  }
+
+  // Pick a real target from battle participants so we get the full combat loop
+  const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
+  const fakeTarget = enemy
+    ? ({
+        id: enemy.player_id || enemy.username || "",
+        name: enemy.username || enemy.player_id || "enemy",
+        type: "pirate",
+        faction: "pirate",
+        isNPC: true,
+        isPirate: true,
+        tier: (enemy as any).tier as PirateTier,
+      } as NearbyEntity)
+    : null;
+  await fightJoinedBattle(ctx, fakeTarget as any, fleeThreshold, fleeFromTier, maxAttackTier);
 }
 
 // ── Safe-system docking (reused from hunter) ─────────────────
@@ -890,128 +937,20 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "scan_system";
     await fetchSecurityLevel(ctx, bot.system);
 
-    // ── Check if we're already in battle (miner pulled us in) ──
-    const existingBattle = await getBattleStatus(ctx);
-    if (existingBattle && battleRef.state.inBattle) {
-      ctx.log("combat", `⚔️ Already in battle (${existingBattle.battle_id}) — running combat loop...`);
+    // Check if we got pulled into battle (e.g. miner started combat) — uses the same robust detection/init as hunter
+    await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName);
 
-      const analysis = await analyzeEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, minerName);
-      if (analysis.shouldJoin && analysis.sideId !== undefined) {
-        ctx.log("combat", `✅ Escort joining side ${analysis.sideId}: ${analysis.reason}`);
-
-        const opposingPirates = existingBattle.participants.filter(p => {
-          const u = (p.username || "").toLowerCase();
-          return (u.includes("pirate") || u.includes("drifter") ||
-                  u.includes("executioner") || u.includes("sentinel") ||
-                  u.includes("prowler") || u.includes("apex") ||
-                  u.includes("razor") || u.includes("striker") ||
-                  u.includes("rampart") || u.includes("stalwart") ||
-                  u.includes("bastion") || u.includes("onslaught") ||
-                  u.includes("iron") || u.includes("strike")) &&
-                 p.side_id !== analysis.sideId;
-        });
-
-        if (opposingPirates.length > 0) {
-          const targetPirate = opposingPirates.reduce((a, b) => {
-            const aLevel = getTierLevel((a as any).tier as PirateTier);
-            const bLevel = getTierLevel((b as any).tier as PirateTier);
-            return aLevel >= bLevel ? a : b;
-          });
-
-          const targetEntity: NearbyEntity = {
-            id: targetPirate.player_id,
-            name: targetPirate.username || targetPirate.player_id,
-            type: "pirate",
-            faction: "pirate",
-            isNPC: true,
-            isPirate: true,
-            tier: (targetPirate as any).tier as PirateTier,
-          };
-
-          const won = await fightJoinedBattle(ctx, targetEntity, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier);
-          if (won) {
-            totalKills++;
-            ctx.log("combat", `Kill #${totalKills} — escort protected the miner!`);
-            yield "loot";
-            await scavengeWrecks(ctx);
-          } else {
-            ctx.log("combat", "Escort retreated from battle — docking to repair");
-          }
-        } else {
-          ctx.log("combat", "No opposing pirates found in battle — standing by");
-        }
-      } else {
-        ctx.log("combat", `Not joining battle: ${analysis.reason}`);
-      }
-
-      const postBattleCheck = await getBattleStatus(ctx);
-      if (!postBattleCheck) {
-        battleRef.state.inBattle = false;
-        battleRef.state.battleId = null;
-        battleRef.state.isFleeing = false;
-        ctx.log("combat", "Battle ended");
-      }
-    } else if (existingBattle && !battleRef.state.inBattle) {
-      ctx.log("combat", `⚔️ New battle detected (${existingBattle.battle_id}) — analyzing...`);
+    // Sync local battleRef after possible battle handling (so proactive scan knows if still fighting)
+    const postUnexpected = await getBattleStatus(ctx);
+    if (postUnexpected) {
       battleRef.state.inBattle = true;
-      battleRef.state.battleId = existingBattle.battle_id;
-
-      const analysis = await analyzeEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, minerName);
-      if (analysis.shouldJoin && analysis.sideId !== undefined) {
-        ctx.log("combat", `✅ Escort joining side ${analysis.sideId}: ${analysis.reason}`);
-
-        const engageResp = await bot.exec("battle", { action: "engage", side_id: analysis.sideId.toString() });
-        if (engageResp.error) {
-          ctx.log("error", `Failed to join battle: ${engageResp.error.message}`);
-        } else {
-          const opposingPirates = existingBattle.participants.filter(p => {
-            const u = (p.username || "").toLowerCase();
-            return (u.includes("pirate") || u.includes("drifter") ||
-                    u.includes("executioner") || u.includes("sentinel") ||
-                    u.includes("prowler") || u.includes("apex") ||
-                    u.includes("razor") || u.includes("striker") ||
-                    u.includes("rampart") || u.includes("stalwart") ||
-                    u.includes("bastion") || u.includes("onslaught") ||
-                    u.includes("iron") || u.includes("strike")) &&
-                   p.side_id !== analysis.sideId;
-          });
-
-          if (opposingPirates.length > 0) {
-            const targetPirate = opposingPirates.reduce((a, b) => {
-              const aLevel = getTierLevel((a as any).tier as PirateTier);
-              const bLevel = getTierLevel((b as any).tier as PirateTier);
-              return aLevel >= bLevel ? a : b;
-            });
-
-            const targetEntity: NearbyEntity = {
-              id: targetPirate.player_id,
-              name: targetPirate.username || targetPirate.player_id,
-              type: "pirate",
-              faction: "pirate",
-              isNPC: true,
-              isPirate: true,
-              tier: (targetPirate as any).tier as PirateTier,
-            };
-
-            const joinedBattle = await getBattleStatus(ctx);
-            if (joinedBattle) {
-              const won = await fightJoinedBattle(ctx, targetEntity, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier);
-              if (won) {
-                totalKills++;
-                ctx.log("combat", `Kill #${totalKills} — escort protected the miner!`);
-                yield "loot";
-                await scavengeWrecks(ctx);
-              }
-            }
-          }
-        }
-
-        const postBattleCheck = await getBattleStatus(ctx);
-        if (!postBattleCheck) {
-          battleRef.state.inBattle = false;
-          battleRef.state.battleId = null;
-        }
-      }
+      battleRef.state.battleId = postUnexpected.battle_id;
+    } else {
+      battleRef.state.inBattle = false;
+      battleRef.state.battleId = null;
+      battleRef.state.isFleeing = false;
+      // Just finished a battle (possibly unexpected pull-in) — loot wrecks like hunter does after combat
+      await scavengeWrecks(ctx);
     }
 
     // ── Scan for nearby threats to engage proactively ──
@@ -1074,6 +1013,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       } else {
         ctx.log("escort", `No threats in ${bot.system} — standing by`);
+        await scavengeWrecks(ctx);
       }
     } else if (nearbyResp.error) {
       ctx.log("warn", `get_nearby failed: ${nearbyResp.error.message}`);

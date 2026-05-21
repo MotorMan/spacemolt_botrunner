@@ -11,6 +11,7 @@ import {
   navigateToSystem,
   collectFromStorage,
   recordMarketData,
+  sanitizeCredits,
   getSystemInfo,
   findStation,
   factionDonateProfit,
@@ -1030,7 +1031,7 @@ async function tryMissions(ctx: RoutineContext): Promise<void> {
       }
       if (!completeResp.error && completeResp.result) {
         const cr = completeResp.result as Record<string, unknown>;
-        const earned = (cr.credits_earned as number) ?? 0;
+        const earned = sanitizeCredits((cr.credits_earned as number) ?? 0);
         ctx.log("trade", `Mission complete! +${earned}cr`);
         activeMissionCount--;
         await bot.refreshStatus();
@@ -2644,13 +2645,13 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const sellResp = await bot.exec("sell", { item_id: route!.itemId, quantity: actualSellQty });
         if (!sellResp.error) {
           const sr = sellResp.result as Record<string, unknown> | undefined;
-          const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+          const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
           // Check how many actually sold
           await bot.refreshCargo();
           const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
           const sold = actualSellQty - afterSell;
           totalSold += sold;
-          sellRevenue += earned > 0 ? earned : sold * route!.sellPrice;
+          sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * route!.sellPrice);
           remaining = afterSell;
           if (remaining > 0) {
             ctx.log("trade", `Sold ${sold}x but ${remaining}x ${route!.itemName} still unsold — buyer demand exhausted`);
@@ -2731,12 +2732,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
             if (!sResp.error) {
               const sr = sResp.result as Record<string, unknown> | undefined;
-              const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? 0;
+              const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? 0);
               await bot.refreshCargo();
               const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
               const sold = remaining - afterSell;
               totalSold += sold;
-              sellRevenue += earned > 0 ? earned : sold * best.buyer.price;
+              sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * best.buyer.price);
               remaining = afterSell;
               ctx.log("trade", `Sold ${sold}x ${route!.itemName} at ${best.buyer.poiName} (${best.buyer.price}cr/ea)`);
               await recordMarketData(ctx);
@@ -2807,12 +2808,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
           if (!sResp.error) {
             const sr = sResp.result as Record<string, unknown> | undefined;
-            const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+            const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
             await bot.refreshCargo();
             const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
             const sold = remaining - afterSell;
             totalSold += sold;
-            sellRevenue += earned > 0 ? earned : sold * buyer.price;
+            sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * buyer.price);
             remaining = afterSell;
             ctx.log("trade", `Sold ${sold}x ${route!.itemName} at ${buyer.poiName} (${buyer.price}cr/ea)${remaining > 0 ? ` — ${remaining}x still unsold` : ""}`);
             await recordMarketData(ctx);
@@ -2930,9 +2931,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // (No need to deposit at trade destinations - faction storage may not exist here)
 
     // Profit = sell revenue + other sales - cost of market purchases
-    const actualProfit = sellRevenue + extraRevenue - investedCredits;
+    const actualProfit = sanitizeCredits(sellRevenue + extraRevenue - investedCredits);
     bot.stats.totalTrades++;
-    bot.stats.totalProfit += actualProfit;
+    bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + actualProfit);
 
     // Record market data
     await recordMarketData(ctx);

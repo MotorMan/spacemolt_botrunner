@@ -28,6 +28,7 @@ import {
   getBattleStatus,
   type BattleState,
   handleBattleNotifications,
+  sanitizeCredits,
   fleeFromBattle,
 } from "./common.js";
 import {
@@ -353,7 +354,7 @@ async function tryMissions(ctx: RoutineContext): Promise<void> {
       }
       if (!completeResp.error && completeResp.result) {
         const cr = completeResp.result as Record<string, unknown>;
-        const earned = (cr.credits_earned as number) ?? 0;
+        const earned = sanitizeCredits((cr.credits_earned as number) ?? 0);
         ctx.log("trade", `Mission complete! +${earned}cr`);
         activeMissionCount--;
         await bot.refreshStatus();
@@ -1194,9 +1195,9 @@ export const tradeBuyerRoutine: Routine = async function* (ctx: RoutineContext) 
     }
 
     // Complete trade session
-    const actualProfit = -totalSpent; // Negative since we're spending, not profiting
+    const actualProfit = sanitizeCredits(-totalSpent); // Negative since we're spending, not profiting
     bot.stats.totalTrades++;
-    bot.stats.totalProfit += actualProfit;
+    bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + actualProfit);
 
     await recordMarketData(ctx);
 

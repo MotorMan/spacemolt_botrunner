@@ -122,6 +122,14 @@ export function maxItemsForCargo(freeWeight: number, itemId: string): number {
   return Math.floor(freeWeight / getItemSize(itemId));
 }
 
+/** Ensure a credit/revenue/profit value is a safe integer. Game credits are integers; API and float math can produce .0000000002 etc. */
+export function sanitizeCredits(value: number | string | undefined | null): number {
+  if (value === undefined || value === null) return 0;
+  const n = typeof value === 'string' ? parseFloat(value) : value;
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n);
+}
+
 /** Check if a POI represents a station. */
 export function isStationPoi(poi: SystemPOI): boolean {
   return poi.has_base || (poi.type || "").toLowerCase() === "station";
@@ -626,6 +634,7 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
       bot.docked = true;
       ctx.log("system", "Managed to dock — checking storage, selling cargo, refueling...");
       await collectFromStorage(ctx);
+      await ensureInsured(ctx);
       await sellAllCargo(ctx);
       await bot.refreshStatus();
       const refuelResp = await bot.exec("refuel");
@@ -706,6 +715,7 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
       if (!dResp.error || dResp.error.message.includes("already")) {
         bot.docked = true;
         await collectFromStorage(ctx);
+        await ensureInsured(ctx);
       } else {
         ctx.log("error", `Dock at ${refuelStation.name} failed: ${dResp.error.message}`);
         return;
@@ -800,11 +810,12 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
         bot.poi = repairStation.id;
         const dResp = await bot.exec("dock");
         if (!dResp.error || dResp.error.message.includes("already")) {
-          bot.docked = true;
-          await collectFromStorage(ctx);
-        } else {
-          ctx.log("error", `Dock at ${repairStation.name} failed: ${dResp.error.message}`);
-          return;
+        bot.docked = true;
+        await collectFromStorage(ctx);
+        await ensureInsured(ctx);
+      } else {
+        ctx.log("error", `Dock at ${repairStation.name} failed: ${dResp.error.message}`);
+        return;
         }
       }
     }
@@ -813,6 +824,25 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
     await bot.refreshStatus();
     const endHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (endHull > startHull) ctx.log("system", `Repaired hull ${startHull}% → ${endHull}%`);
+  }
+}
+
+export async function topUpShields(ctx: RoutineContext, targetPct: number = 0.8): Promise<void> {
+  const { bot } = ctx;
+  if (!bot.maxShield || bot.maxShield <= 0) return;
+  await bot.refreshStatus();
+  const target = Math.floor(bot.maxShield * targetPct);
+  if (bot.shield >= target) return;
+  const deficit = target - bot.shield;
+  const needed = Math.ceil(deficit / 100);
+  const inventory = bot.inventory || [];
+  const have = inventory.filter(i => i.itemId === "shield_charge").reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const qty = Math.min(needed, have);
+  if (qty <= 0) return;
+  const resp = await bot.exec("use_item", { id: "shield_charge", quantity: qty });
+  if (!resp.error) {
+    ctx.log("combat", `Used ${qty}x shield_charge (+${qty * 100} shields to ~${Math.round(targetPct * 100)}%)`);
+    await bot.refreshStatus();
   }
 }
 
@@ -1095,6 +1125,7 @@ export async function ensureFueled(
       const dResp = await bot.exec("dock");
       if (!dResp.error || dResp.error.message.includes("already")) {
         bot.docked = true;
+        await ensureInsured(ctx);
       }
     }
     return true;
@@ -1111,6 +1142,7 @@ export async function ensureFueled(
     const dResp = await bot.exec("dock");
     if (!dResp.error || dResp.error.message.includes("already")) {
       bot.docked = true;
+      await ensureInsured(ctx);
     }
   }
 
@@ -1164,8 +1196,13 @@ export async function ensureFueled(
     const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
     const baseFuel = (poiResp as any)?.base?.fuel ?? 0;
     if (baseFuel <= 0) {
-      ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
-      return await emergencyFuelRecovery(ctx); // avoid the loop
+      const isHomeStation = nearest.poiId === "sol_station" || /sol central/i.test(nearest.poiName || "");
+      if (isHomeStation) {
+        ctx.log("system", `Proceeding to home ${nearest.poiName} despite base.fuel=0 (use faction storage for fuel cells)`);
+      } else {
+        ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
+        return await emergencyFuelRecovery(ctx); // avoid the loop
+      }
     }
   } catch {}
 
@@ -1227,6 +1264,7 @@ export async function ensureFueled(
   if (!dResp.error || dResp.error.message.includes("already")) {
     bot.docked = true;
     await collectFromStorage(ctx);
+    await ensureInsured(ctx);
   } else {
     ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error.message}`);
     return await emergencyFuelRecovery(ctx);
@@ -1277,6 +1315,59 @@ const HOME_STATION_POI = "sol_station";
 const HOME_STATION_NAME = "Sol Central";
 
 /**
+ * Robust travel to Sol Central (handles landing at distant planets like saturn after jump).
+ * Uses live getSystemInfo + mapStore fallback for correct POI id, plus retries for "unknown destination".
+ * Returns true if positioned at the home station POI.
+ */
+export async function travelToHomeStation(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  await bot.refreshStatus();
+  if (bot.poi === HOME_STATION_POI) return true;
+
+  // Resolve POI id (live local first, fallback to stored map data)
+  let stationPoi = HOME_STATION_POI;
+  try {
+    const { pois } = await getSystemInfo(ctx);
+    const live = pois.find(p => isStationPoi(p) && (p.id === HOME_STATION_POI || /sol central/i.test(p.name || "")));
+    if (live) stationPoi = live.id;
+    else {
+      const stored = mapStore.getSystem(HOME_SYSTEM)?.pois?.find((p: any) => p.id === HOME_STATION_POI || /sol central/i.test(p.name || ""));
+      if (stored) stationPoi = stored.id;
+    }
+  } catch {}
+
+  await ensureUndocked(ctx);
+
+  const attemptTravel = async (poi: string) => {
+    const r = await bot.exec("travel", { target_poi: poi });
+    const unk = !!(r.error && /unknown destination/i.test(r.error.message || ""));
+    return { resp: r, unknown: unk };
+  };
+
+  let { resp, unknown } = await attemptTravel(stationPoi);
+  if (unknown) {
+    ctx.log("warn", `${HOME_STATION_NAME} not in local travel list from ${bot.poi} — settling position and retry...`);
+    await ctx.sleep(1500);
+    await bot.refreshStatus();
+    ({ resp, unknown } = await attemptTravel(stationPoi));
+  }
+  if (unknown) {
+    ctx.log("warn", `Still unknown for ${HOME_STATION_NAME} — dock/undock at local station to update position then retry...`);
+    if (await ensureDocked(ctx, true)) {
+      await ensureUndocked(ctx);
+      ({ resp, unknown } = await attemptTravel(stationPoi));
+    }
+  }
+
+  if (resp.error && !resp.error.message.includes("already")) {
+    ctx.log("error", `Travel to ${HOME_STATION_NAME} failed: ${resp.error.message}`);
+    return false;
+  }
+  bot.poi = stationPoi;
+  return true;
+}
+
+/**
  * Navigate to Sol Central and deposit all non-fuel cargo to station storage.
  * Used when cargo is full during exploration. Returns true if deposit succeeded.
  */
@@ -1302,16 +1393,9 @@ export async function depositCargoAtHome(
     }
   }
 
-  // Travel to Sol Central station
-  await ensureUndocked(ctx);
-  if (bot.poi !== HOME_STATION_POI) {
-    ctx.log("travel", `Traveling to ${HOME_STATION_NAME}...`);
-    const tResp = await bot.exec("travel", { target_poi: HOME_STATION_POI });
-    if (tResp.error && !tResp.error.message.includes("already")) {
-      ctx.log("error", `Travel to ${HOME_STATION_NAME} failed: ${tResp.error.message}`);
-      return false;
-    }
-    bot.poi = HOME_STATION_POI;
+  // Travel to Sol Central station (robust)
+  if (!(await travelToHomeStation(ctx))) {
+    return false;
   }
 
   // Dock
@@ -1323,6 +1407,8 @@ export async function depositCargoAtHome(
     }
     bot.docked = true;
   }
+
+  await ensureInsured(ctx);
 
   // Collect any gifted credits/items from storage
   await collectFromStorage(ctx);
@@ -1805,6 +1891,7 @@ export async function refuelAtStation(
       return await emergencyFuelRecovery(ctx);
     }
     bot.docked = true;
+    await ensureInsured(ctx);
     // Parse fuel_warning from dock response (e.g. "Fuel reserves critically low (0%)")
     const warning = (dockResp as any)?.fuel_warning || "";
     if (warning.toLowerCase().includes("0%") || warning.toLowerCase().includes("critically low")) {
@@ -2636,9 +2723,11 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
     return;
   }
 
-  const insureResp = await bot.exec("buy_insurance");
+  const insureResp = await bot.exec("buy_insurance", { ticks: 9999 });
   if (!insureResp.error) {
-    ctx.log("info", `Insurance purchased for ${cost}cr`);
+    const r = insureResp.result as Record<string, unknown> | undefined;
+    const msg = (r?.message as string) || `Insurance purchased for ${cost}cr`;
+    ctx.log("info", msg);
     await bot.refreshStatus();
   } else if (insureResp.error.message.toLowerCase().includes("already")) {
     // silently skip

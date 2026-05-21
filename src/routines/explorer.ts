@@ -1179,9 +1179,29 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         // Smart selection: avoid dead-ends and pirate systems
         const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems);
         if (!random) {
-          ctx.log("error", "No valid non-blacklisted connections available! Explorer is trapped. Waiting before retry...");
-          await ctx.sleep(60000); // Wait 1 minute before retry
-          continue;
+          ctx.log("error", "No valid non-blacklisted connections available! Explorer is trapped. Attempting to backtrack...");
+          if (path.length >= 2) {
+            const backtrackTarget = path[path.length - 2];
+            const currentSystem = path[path.length - 1];
+            ctx.log("system", `Backtracking from ${currentSystem} to ${backtrackTarget}...`);
+            path.pop();
+            await ensureUndocked(ctx);
+            const backtrackResp = await bot.exec("jump", { target_system: backtrackTarget });
+            if (backtrackResp.error) {
+              ctx.log("error", `Backtrack failed: ${backtrackResp.error.message}`);
+              await ctx.sleep(60000);
+            } else {
+              ctx.log("travel", `Backtracked to ${backtrackTarget}`);
+              bot.stats.totalSystems++;
+              lastSystem = currentSystem;
+              await ctx.sleep(5000);
+            }
+            continue;
+          } else {
+            ctx.log("error", "No path to backtrack - explorer is completely trapped. Waiting before retry...");
+            await ctx.sleep(60000);
+            continue;
+          }
         }
         await ensureUndocked(ctx);
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
@@ -1227,8 +1247,28 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         lastSystem = systemId;
         continue;
       } else {
-        ctx.log("error", "No connections from this system — stuck! Waiting 60s...");
-        await ctx.sleep(60000);
+        ctx.log("error", "No connections from this system — attempting to backtrack...");
+        if (path.length >= 2) {
+          const backtrackTarget = path[path.length - 2];
+          const currentSystem = path[path.length - 1];
+          ctx.log("system", `Backtracking from ${currentSystem} to ${backtrackTarget}...`);
+          path.pop();
+          await ensureUndocked(ctx);
+          const backtrackResp = await bot.exec("jump", { target_system: backtrackTarget });
+          if (backtrackResp.error) {
+            ctx.log("error", `Backtrack failed: ${backtrackResp.error.message}`);
+            await ctx.sleep(60000);
+          } else {
+            ctx.log("travel", `Backtracked to ${backtrackTarget}`);
+            bot.stats.totalSystems++;
+            lastSystem = currentSystem;
+            await ctx.sleep(5000);
+          }
+          continue;
+        } else {
+          ctx.log("error", "No connections and no path to backtrack - explorer is completely trapped. Waiting 60s...");
+          await ctx.sleep(60000);
+        }
       }
       continue;
     }

@@ -18,6 +18,7 @@ import {
   ensureFueled,
   navigateToSystem,
   recordMarketData,
+  sanitizeCredits,
   factionDonateProfit,
   logFactionActivity,
   detectAndRecoverFromDeath,
@@ -1226,9 +1227,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             ctx.log("error", `Cargo recovery sell failed: ${sResp.error.message}`);
             break;
           }
-          // Get actual revenue from sell result
+          // Get actual revenue from sell result (sanitize to int — API can return floats like 123.0000000002)
           const sr = sResp.result as Record<string, unknown> | undefined;
-          const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+          const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
 
           // Wait for cargo update after sell
           await ctx.sleep(12000);
@@ -1289,9 +1290,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               // Wait for cargo update after sell
               await ctx.sleep(12000);
 
-              // Get actual revenue from sell result
+              // Get actual revenue from sell result (sanitize to int)
               const sr = sResp.result as Record<string, unknown> | undefined;
-              const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+              const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
 
               // Verify sale
               await bot.refreshCargo();
@@ -1299,7 +1300,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
                 const actuallySold = marketCheck.sellQty - afterSell;
                 if (actuallySold > 0) {
                   totalSold += actuallySold;
-                  const revenue = actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice;
+                  const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice);
                   ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} from full cargo — ${revenue}cr revenue (actual)`);
                 } else if (actualRevenue > 0) {
                   // Sale succeeded but cargo not updated - manually update and count as sold
@@ -1509,9 +1510,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               continue;
             }
 
-            // Get actual revenue from sell result
+            // Get actual revenue from sell result (sanitize to int)
             const sr = sResp.result as Record<string, unknown> | undefined;
-            const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+            const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
 
             // Wait for cargo update after successful sell
             await ctx.sleep(12000);
@@ -1542,7 +1543,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             } else {
               // Success
               orderTotalSold += soldThisAttempt;
-              const revenue = actualRevenue > 0 ? actualRevenue : soldThisAttempt * currentPrice;
+              const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : soldThisAttempt * currentPrice);
               totalSold += soldThisAttempt;
               totalRevenue += revenue;
               ctx.log("trade", `Sold ${soldThisAttempt}x ${route!.itemName} at ${currentPrice}cr — ${revenue}cr (order total: ${orderTotalSold}/${targetQty}, overall total: ${totalSold})`);
@@ -1600,7 +1601,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         await bot.refreshStatus();
         await recordMarketData(ctx);
         bot.stats.totalTrades++;
-        bot.stats.totalProfit += totalRevenue;
+        bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + totalRevenue);
         ctx.log("trade", `Faction sale complete: ${totalSold}x ${route!.itemName} — ${totalRevenue}cr revenue (actual)`);
         await factionDonateProfit(ctx, totalRevenue);
         // Complete trade session for in-station sale
@@ -1942,9 +1943,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             // Wait for cargo update after sell
             await ctx.sleep(12000);
 
-            // Get actual revenue from sell result
+            // Get actual revenue from sell result (sanitize to int — prevents 123.0000000002 from API)
             const sr = sResp.result as Record<string, unknown> | undefined;
-            const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+            const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
 
             // Verify sale by checking cargo after sell
             await bot.refreshCargo();
@@ -1966,16 +1967,16 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               }
               const revenue = actualRevenue;
               bot.stats.totalTrades++;
-              bot.stats.totalProfit += revenue;
+              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + revenue);
               ctx.log("trade", `Sold ${marketCheck.sellQty}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue (actual)`);
               await factionDonateProfit(ctx, revenue);
               // Complete trade session
               const actualProfit = revenue; // No acquisition cost for faction items
               await completeTradeSession(bot.username, revenue, actualProfit);
             } else {
-              const revenue = actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice;
+              const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice);
               bot.stats.totalTrades++;
-              bot.stats.totalProfit += revenue;
+              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + revenue);
               ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue (actual)`);
               await factionDonateProfit(ctx, revenue);
               // Complete trade session

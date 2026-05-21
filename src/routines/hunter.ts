@@ -19,6 +19,7 @@
  *   refuelThreshold — fuel % to trigger refuel stop (default: 40)
  *   repairThreshold — hull % to abort patrol and dock (default: 30)
  *   fleeThreshold   — hull % to flee an active fight (default: 20)
+ *   shieldRechargePct — post-battle shield % to top up to with shield_charge items (default: 80)
  *   onlyNPCs        — only attack NPC pirates, never players (default: true)
  */
 
@@ -54,6 +55,7 @@ import {
   checkAndFleeFromBattle,
   checkBattleAfterCommand,
   getItemSize,
+  topUpShields,
 } from "./common.js";
 
 import type { PirateTier, NearbyEntity } from "./battle.js";
@@ -113,6 +115,7 @@ function getHunterSettings(username?: string): {
   refuelThreshold: number;
   repairThreshold: number;
   fleeThreshold: number;
+  shieldRechargePct: number;
   onlyNPCs: boolean;
   autoCloak: boolean;
   ammoThreshold: number;
@@ -153,6 +156,7 @@ function getHunterSettings(username?: string): {
     refuelThreshold: (h.refuelThreshold as number) || 40,
     repairThreshold: (h.repairThreshold as number) || 30,
     fleeThreshold: (h.fleeThreshold as number) || 20,
+    shieldRechargePct: (h.shieldRechargePct as number) || 80,
     onlyNPCs: (h.onlyNPCs as boolean) !== false,
     autoCloak: (h.autoCloak as boolean) ?? false,
     ammoThreshold: (h.ammoThreshold as number) || 5,
@@ -914,6 +918,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
             abortPatrol = true;
           }
 
+          await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
           await bot.refreshStatus();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
         } else {
@@ -1275,6 +1280,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             abortPatrol = true;
           }
 
+          await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
           await bot.refreshStatus();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
         } else {
@@ -1557,14 +1563,16 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           }
 
           // Post-kill reload
-        const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
-        if (!hasAmmo) {
-          ctx.log("combat", "No ammo after kill — aborting to resupply");
-          break;
-        }
+          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          if (!hasAmmo) {
+            ctx.log("combat", "No ammo after kill — aborting to resupply");
+            break;
+          }
 
-        await bot.refreshStatus();
-        ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
+          await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+          await bot.refreshStatus();
+          ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
+
       } else {
         ctx.log("combat", "Retreated — waiting before next scan");
         await ctx.sleep(5000);
@@ -1695,7 +1703,8 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       id.includes("cell_pack") ||
       id.includes("plasma") ||
       id.includes("fuel_cell") ||
-      id.includes("repair_kit");
+      id.includes("repair_kit") ||
+      id.includes("shield_charge");
 
     if (isProtected || item.quantity <= 0) continue;
 
@@ -1724,6 +1733,10 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
   const currentFuel = bot.inventory
     .filter(i => i.itemId.toLowerCase().includes("fuel_cell"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+
+  const currentShield = bot.inventory
+    .filter(i => i.itemId.toLowerCase().includes("shield_charge"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
 
   // Check if we already have ammo in cargo (user may have placed it manually)
@@ -1850,6 +1863,31 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   }
   if (!gotRepairKits) {
     ctx.log("trade", "Repair kits: relying on faction storage");
+  }
+
+  const shieldIds = ["shield_charge"];
+  let gotShield = false;
+  const shieldToGet = Math.max(0, 20 - currentShield);
+  for (const shId of shieldIds) {
+    const shSize = getItemSize(shId);
+    const shQty = Math.min(shieldToGet, Math.floor(freeSpace / shSize));
+    if (shQty <= 0) continue;
+
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: shId,
+      quantity: shQty
+    });
+    if (!wResp.error) {
+      ctx.log("trade", `Withdrew ${shQty} ${shId} from faction storage`);
+      freeSpace -= shQty * shSize;
+      gotShield = true;
+      break;
+    }
+  }
+  if (!gotShield) {
+    ctx.log("trade", "Shield charges: relying on faction storage");
   }
 
   // 3. Military fuel cells — fill the rest (prefer faction storage)

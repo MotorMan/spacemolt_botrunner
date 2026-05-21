@@ -111,6 +111,7 @@ function getSalvagerSettings(username?: string): {
   maxRoamJumps: number;
   roamBaseSystems: string[];
   depositAtSalvageYard: boolean;
+  minimumFuelCells: number;
 
   // Flock salvaging settings
   flockEnabled: boolean;
@@ -157,6 +158,7 @@ function getSalvagerSettings(username?: string): {
     maxRoamJumps: (m.maxRoamJumps as number) || 0, // 0 = no roaming beyond neighbors
     roamBaseSystems: parseStringArray(botOverrides.roamBaseSystems ?? m.roamBaseSystems),
     depositAtSalvageYard: (m.depositAtSalvageYard as boolean) ?? false,
+    minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
 
     // Flock salvaging settings
     flockEnabled: (botOverrides.flockEnabled as boolean) ?? false,
@@ -479,6 +481,21 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
     const names = nonFuelCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
     ctx.log("salvage", `Startup: deposited ${names} — cargo clear for salvaging`);
+  }
+
+  // Startup: ensure min military fuel cells at home before first outing
+  if (homeSystem0 && bot.system === homeSystem0) {
+    await bot.refreshCargo();
+    let fuel0 = 0;
+    for (const item of bot.inventory) {
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) fuel0 += item.quantity;
+    }
+    const min0 = settings0.minimumFuelCells;
+    if (fuel0 < min0) {
+      const m0 = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: min0 });
+      if (!m0.error) ctx.log("salvage", `Startup: withdrew ${min0} military fuel cells from storage`);
+    }
   }
 
   // ── Flock salvaging integration ──
@@ -1005,6 +1022,24 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
+    // ── Fuel cell depletion check: return to home to restock military cells if critically low (prevents stranding far from base) ──
+    await bot.refreshCargo();
+    let fuelCellCount = 0;
+    for (const item of bot.inventory) {
+      if (item.itemId.toLowerCase().includes("fuel_cell")) fuelCellCount += item.quantity;
+    }
+    const lowOnFuelCells = fuelCellCount < 4;
+    if (lowOnFuelCells && !bot.towingWreck) {
+      ctx.log("salvage", `Fuel cells critically low (${fuelCellCount} remaining) — returning to home base to restock military fuel cells`);
+      if (homeSystem && bot.system !== homeSystem) {
+        const retFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (retFueled) {
+          await navigateToSystem(ctx, homeSystem, safetyOpts);
+        }
+      }
+      // if already home or after nav, the upcoming dock/unload will trigger the top-up to 20
+    }
+
     // ── Process towed wrecks: navigate to salvage yard if towing ──
     await bot.refreshStatus();
     let wasTowing = bot.towingWreck;
@@ -1338,7 +1373,31 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("trade", `Unloaded ${unloadedItems.join(", ")} → ${label}`);
     }
 
-    // Exact fuel cells for return home (route estimated_fuel)
+    // Top up to min military fuel cells when at home (ensures buffer even for 0-jump home routes at deposit time)
+    if (homeSystem && bot.system === homeSystem) {
+      await bot.refreshCargo();
+      let fuelInCargo = 0;
+      for (const item of bot.inventory) {
+        const lower = item.itemId.toLowerCase();
+        if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
+      }
+      const minFuel = settings.minimumFuelCells;
+      if (fuelInCargo < minFuel) {
+        const mil = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: minFuel });
+        if (!mil.error) {
+          ctx.log("salvage", `Withdrew ${minFuel} military fuel cells from storage`);
+        } else {
+          const prem = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: minFuel });
+          if (!prem.error) ctx.log("salvage", `Withdrew ${minFuel} premium fuel cells from storage`);
+          else {
+            const reg = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: minFuel * 2 });
+            if (!reg.error) ctx.log("salvage", `Withdrew fuel cells from storage`);
+          }
+        }
+      }
+    }
+
+    // Ensure fuel cells for return home + min buffer of military (route estimated_fuel)
     await bot.refreshCargo();
     let fuelInCargo = 0;
     for (const item of bot.inventory) {
@@ -1347,15 +1406,21 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
     try {
       const r = (await bot.exec("find_route", { target_system: homeSystem })).result as any;
-      if (r?.estimated_fuel && r?.fuel_available != null) {
+      if (r && r.estimated_fuel != null && r.fuel_available != null) {
         const deficit = Math.max(0, r.estimated_fuel - r.fuel_available);
         const needed = Math.ceil(deficit / 20);
-        if (fuelInCargo < needed) {
+        const minFuel = settings.minimumFuelCells;
+        if (fuelInCargo < Math.max(needed, minFuel)) {
           const isAtHome = homeSystem && bot.system === homeSystem;
-          let stillNeeded = needed - fuelInCargo;
+          let stillNeeded = Math.max(needed, minFuel) - fuelInCargo;
           if (isAtHome) {
-            const premResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
-            if (!premResp.error) stillNeeded = Math.max(0, stillNeeded - 50);
+            // Prefer military_fuel_cell (100 fuel, 3 space)
+            const milResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: Math.ceil(stillNeeded / 3) });
+            if (!milResp.error) stillNeeded = Math.max(0, stillNeeded - 100);
+            if (stillNeeded > 0) {
+              const premResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
+              if (!premResp.error) stillNeeded = Math.max(0, stillNeeded - 50);
+            }
             if (stillNeeded > 0) {
               const regResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
               if (!regResp.error) stillNeeded = 0;
@@ -1364,10 +1429,10 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
           if (stillNeeded > 0) {
             const free = Math.max(0, (bot.cargoMax || 50) - bot.cargo);
-            const buyQty = Math.min(Math.ceil(stillNeeded / 20), Math.floor(free));
+            const buyQty = Math.min(Math.ceil(stillNeeded / 3), Math.floor(free / 3));
             if (buyQty > 0) {
-              ctx.log("salvage", `Buying ${buyQty} fuel cells for return (last resort)`);
-              await bot.exec("buy", { item_id: "fuel_cell", quantity: buyQty });
+              ctx.log("salvage", `Buying ${buyQty} military fuel cells for return (last resort)`);
+              await bot.exec("buy", { item_id: "military_fuel_cell", quantity: buyQty });
             }
           }
         }

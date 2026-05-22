@@ -2133,7 +2133,18 @@ function renderProfileTopbar() {
         <option value="roam_system"${hunterMode === 'roam_system' ? ' selected' : ''}>Roam current system</option>
         <option value="stationary"${hunterMode === 'stationary' ? ' selected' : ''}>Stationary</option>
         <option value="patrol_systems"${hunterMode === 'patrol_systems' ? ' selected' : ''}>Patrol specific systems</option>
+        <option value="cycle_patrols"${hunterMode === 'cycle_patrols' ? ' selected' : ''}>Cycle patrols</option>
       </select>`;
+
+    const patrolCycleMode = botSettings.patrolCycleMode || 'random';
+    if (hunterMode === 'cycle_patrols') {
+      actions += `
+        <span class="profile-ore-label" style="margin-left:8px">Cycle Mode:</span>
+        <select id="profile-patrolCycleMode" onchange="saveProfilePatrolCycleMode()">
+          <option value="random"${patrolCycleMode === 'random' ? ' selected' : ''}>Random</option>
+          <option value="sequential"${patrolCycleMode === 'sequential' ? ' selected' : ''}>Sequential</option>
+        </select>`;
+    }
 
     // Per-bot hunter patrol profile selector (only meaningful when mode = patrol_systems)
     const hunterSettings = settings.hunter || {};
@@ -2395,6 +2406,19 @@ function saveProfileHunterSingleLoop() {
 
   const existing = settings[bot.username] || {};
   const updated = Object.assign({}, existing, { singleLoop });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfilePatrolCycleMode() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const sel = document.getElementById('profile-patrolCycleMode');
+  if (!sel) return;
+  const patrolCycleMode = sel.value;
+
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { patrolCycleMode });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
 }

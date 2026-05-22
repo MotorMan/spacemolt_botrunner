@@ -103,7 +103,9 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
 
 // ── Settings ─────────────────────────────────────────────────
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols";
+
+export type PatrolCycleMode = "random" | "sequential";
 
 export interface HunterPatrolProfile {
   name: string;
@@ -112,6 +114,7 @@ export interface HunterPatrolProfile {
 
 function getHunterSettings(username?: string): {
   mode: HunterMode;
+  patrolCycleMode: PatrolCycleMode;
   system: string;
   refuelThreshold: number;
   repairThreshold: number;
@@ -153,6 +156,7 @@ function getHunterSettings(username?: string): {
 
   return {
     mode: ((botOverrides.hunterMode as HunterMode) || (h.mode as HunterMode) || "roam_systems") as HunterMode,
+    patrolCycleMode: ((botOverrides.patrolCycleMode as PatrolCycleMode) || (h.patrolCycleMode as PatrolCycleMode) || "sequential") as PatrolCycleMode,
     system: (botOverrides.system as string) || (h.system as string) || "",
     refuelThreshold: (h.refuelThreshold as number) || 40,
     repairThreshold: (h.repairThreshold as number) || 30,
@@ -186,6 +190,13 @@ export function setHunterMode(username: string, mode: HunterMode): void {
 export function setPatrolSystems(username: string, systems: string[]): void {
   writeSettings({
     [username]: { patrolSystems: systems },
+  });
+}
+
+/** Persist patrol cycle mode (random or sequential) for a specific bot. */
+export function setPatrolCycleMode(username: string, mode: PatrolCycleMode): void {
+  writeSettings({
+    [username]: { patrolCycleMode: mode },
   });
 }
 
@@ -550,6 +561,10 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   }
   if (initialSettings.mode === "patrol_systems") {
     yield* patrolSystemsRoutine(ctx);
+    return;
+  }
+  if (initialSettings.mode === "cycle_patrols") {
+    yield* cyclePatrolsRoutine(ctx);
     return;
   }
 
@@ -1915,6 +1930,121 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       } else {
         ctx.log("trade", `Military fuel cells: relying on faction storage (${fuelQty} needed)`);
       }
+    }
+  }
+}
+
+// ── Cycle Patrols Routine (cycle through all patrol profiles) ─────
+
+async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshStatus();
+  let totalKills = 0;
+  let profileIndex = 0;
+
+  const all = readSettings();
+  const h = (all.hunter || {}) as any;
+  const hunterPatrols: HunterPatrolProfile[] = Array.isArray(h.hunterPatrols) ? h.hunterPatrols : [];
+  const settings = getHunterSettings(bot.username);
+
+  if (hunterPatrols.length === 0) {
+    ctx.log("error", "cycle_patrols mode but no hunterPatrols configured — falling back to roam_systems");
+    yield* roamSystemsRoutine(ctx);
+    return;
+  }
+
+  let nextShuffle: number[] | null = null;
+  let shuffleIndex = 0;
+
+  while (bot.state === "running") {
+    const cycleMode = settings.patrolCycleMode || "sequential";
+    let targetIndex: number;
+
+    if (cycleMode === "random") {
+      if (!nextShuffle || shuffleIndex >= nextShuffle.length) {
+        nextShuffle = [...Array(hunterPatrols.length).keys()].sort(() => Math.random() - 0.5);
+        shuffleIndex = 0;
+      }
+      targetIndex = nextShuffle[shuffleIndex];
+      shuffleIndex++;
+    } else {
+      targetIndex = profileIndex % hunterPatrols.length;
+      profileIndex++;
+    }
+
+    const profile = hunterPatrols[targetIndex];
+    if (!profile || !profile.patrolSystems || profile.patrolSystems.length === 0) {
+      ctx.log("error", `Invalid or empty patrol profile at index ${targetIndex} — skipping`);
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    ctx.log("info", `Cycle patrols: now patrolling "${profile.name}" (${profile.patrolSystems.length} systems)`);
+
+    const safetyOpts = {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
+      skipBlacklist: true,
+    };
+
+    for (const targetSystem of profile.patrolSystems) {
+      if (bot.state !== "running") break;
+
+      if (bot.system !== targetSystem) {
+        ctx.log("travel", `Cycle patrols: heading to ${targetSystem}...`);
+        const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
+        if (!arrived) {
+          ctx.log("error", `Could not reach ${targetSystem} — skipping`);
+          await ctx.sleep(5000);
+          continue;
+        }
+      }
+
+      await fetchSecurityLevel(ctx, bot.system);
+      const { pois } = await getSystemInfo(ctx);
+      const patrolPois = pois.filter(p => !isStationPoi(p));
+
+      if (patrolPois.length === 0) {
+        ctx.log("info", "No POIs — moving to next system");
+        continue;
+      }
+
+      for (const poi of patrolPois) {
+        if (bot.state !== "running") break;
+        await bot.exec("travel", { target_poi: poi.id });
+        bot.poi = poi.id;
+        await ctx.sleep(500);
+        const nearbyResp = await bot.exec("get_nearby");
+        if (nearbyResp.error) continue;
+        bot.trackNearbyPlayers(nearbyResp.result);
+        const entities = parseNearby(nearbyResp.result);
+        const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
+        for (const target of targets) {
+          await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+          if (won) {
+            totalKills++;
+            await scavengeWrecks(ctx);
+          }
+        }
+      }
+    }
+
+    if (settings.singleLoop) {
+      ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+      const hs = settings.homeStation || "";
+      const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+      if (hsys && hpoi) {
+        await navigateToSystem(ctx, hsys, safetyOpts);
+        const t = await bot.exec("travel", { target_poi: hpoi });
+        if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+      } else {
+        await navigateToSafeStation(ctx, safetyOpts);
+      }
+      await ensureHunterResupply(ctx);
+      profileIndex = 0;
     }
   }
 }

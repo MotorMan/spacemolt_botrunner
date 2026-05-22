@@ -439,6 +439,12 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       fcData = loadFCStationsData();
     }
 
+    const allStationsFull = fcData.stations.every(station => station.ordersUnsold >= settings.maxFuelCellsPerStation);
+    if (allStationsFull) {
+      ctx.log("fc", "All stations are at or above capacity — stopping routine");
+      return;
+    }
+
     // If we're in battle, re-issue flee command to ensure we stay in flee stance
     if (battleState.inBattle) {
       const now = Date.now();
@@ -683,25 +689,12 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
       }));
     }
 
-    // Calculate current unsold from active orders
     const currentUnsold = currentStationOrders.reduce((sum, o) => sum + o.remaining, 0);
-
-    // Check if station is already at or above cap
-    if (currentUnsold >= settings.maxFuelCellsPerStation) {
-      ctx.log("fc", `Station ${target.poiName} already has ${currentUnsold} unsold fuel cells (cap: ${settings.maxFuelCellsPerStation}) — skipping`);
-      targetIdx = (targetIdx + 1) % fcData.stations.length;
-      fcData.currentStationIndex = targetIdx;
-      saveFCStationsData(fcData);
-      continue;
-    }
-
-    // Calculate how many to place
-    const quantityToPlace = Math.min(availableQty, settings.maxFuelCellsPerStation - currentUnsold);
+    const quantityToPlace = availableQty;
     if (quantityToPlace <= 0) {
-      ctx.log("fc", `Cannot place orders at ${target.poiName}: ${currentUnsold} unsold, cap ${settings.maxFuelCellsPerStation}, available ${availableQty} — skipping`);
-      targetIdx = (targetIdx + 1) % fcData.stations.length;
-      fcData.currentStationIndex = targetIdx;
-      saveFCStationsData(fcData);
+      ctx.log("fc", `No fuel cells available — returning home`);
+      yield "return_home";
+      await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
       continue;
     }
 
@@ -714,7 +707,7 @@ export const fuelCellSellerRoutine: Routine = async function* (ctx: RoutineConte
 
     let price: number | null = null;
     price = await getOptimalPrice(ctx, marketData, settings);
-    ctx.log("fc", `Creating sell orders: ${quantityToPlace}x @ ${price}cr each (cap: ${settings.maxFuelCellsPerStation}, current unsold: ${currentUnsold})`);
+    ctx.log("fc", `Creating sell orders: ${quantityToPlace}x @ ${price}cr each (current unsold: ${currentUnsold})`);
 
     let ordersPlacedCount = 0;
 

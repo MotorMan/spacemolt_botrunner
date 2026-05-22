@@ -3260,6 +3260,20 @@ async function renderManualControls(isFreshRender) {
       <button class="sm" onclick="mcRefreshFactionStorage()" title="Refresh faction storage">Refresh</button>
     </div>
 
+    <!-- Phase 1: Module Loadout Preset Selector -->
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Module Loadout Preset</label>
+    </div>
+    <div class="cmd-group">
+      <label>Preset</label>
+      <select id="mc-module-preset-select" style="min-width:180px">
+        <option value="">-- Select Module Preset --</option>
+      </select>
+      <button class="primary sm" onclick="loadModulePresetInManualControls()">Load Preset</button>
+      <button class="primary sm" onclick="changeToModulePreset()" style="margin-left:6px;">Change Module Loadout</button>
+      <span id="mc-module-preset-status" style="font-size:11px;color:var(--text-dim);margin-left:8px"></span>
+    </div>
+
     <div class="cmd-group">
       <label>Gift Item</label>
       <select id="mc-gift-source">
@@ -3316,6 +3330,9 @@ async function renderManualControls(isFreshRender) {
   if (profileRecipes && profileRecipes.length > 0) showRecipeDetails();
   // Populate ship loadout dropdown
   mcPopulateLoadoutSelect();
+
+  // Populate module preset dropdown (Phase 1)
+  populateModulePresetSelect();
 }
 
 function showRecipeDetails() {
@@ -6932,12 +6949,13 @@ function renderMap() {
                         <div class="poi-resource-grid">
                           ${resources.map(resource => {
                             const resourceName = resource.name || catalogName(resource.resource_id) || resource.resource_id;
-                            const depletion = Math.round(resource.depletion_percent || 0);
                             const remaining = resource.remaining || 0;
                             const maxRemaining = resource.max_remaining || 1;
+                            const depletion = Math.round((1 - remaining / maxRemaining) * 100);
+                            const fullness = 100 - depletion;
                             const richness = resource.richness || 0;
                             const scanned = resource.last_scanned ? new Date(resource.last_scanned).toLocaleString() : 'Unknown';
-                            const depletionColor = depletion > 80 ? '#f44336' : depletion > 50 ? '#ff9800' : '#4caf50';
+                            const depletionColor = fullness > 80 ? '#4caf50' : fullness > 50 ? '#ff9800' : '#f44336';
                             return `
                               <div class="resource-card">
                                 <div class="resource-name">${esc(resourceName)}</div>
@@ -6952,8 +6970,8 @@ function renderMap() {
                                   </div>
                                 </div>
                                 <div class="resource-depletion-bar">
-                                  <div class="resource-depletion-fill" style="width:${depletion}%; background: ${depletionColor}"></div>
-                                  <div class="resource-depletion-text">${depletion}% depleted</div>
+                                  <div class="resource-depletion-fill" style="width:${fullness}%; background: ${depletionColor}"></div>
+                                  <div class="resource-depletion-text">${fullness}% full</div>
                                 </div>
                                 <div class="resource-scanned">Scanned: ${scanned}</div>
                               </div>
@@ -7077,6 +7095,7 @@ function renderGeneralSettings(panel) {
   const fightTier1Ships = general.fightTier1Ships ?? true;
   const maxTier0Ships = general.maxTier0Ships ?? 8;
   const hullFleeThreshold = general.hullFleeThreshold ?? 20;
+  const approvedFuelStations = Array.isArray(general.approvedFuelStations) ? general.approvedFuelStations : [];
 
   // Build station options from mapData
   let stationOpts = '<option value="">(not set)</option>';
@@ -7109,6 +7128,16 @@ function renderGeneralSettings(panel) {
         <div class="setting-hint">Home station where the cleanup agent deposits all collected items into faction storage. Used by cleanup, faction trader, and other routines.</div>
       </div>
       <select id="set-general-factionStation">${stationOpts}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Approved Fuel Stations</div>
+        <div class="setting-hint">Only buy fuel (credits) from these stations. Empty = allow all stations. Multi-select.</div>
+      </div>
+      <select id="set-general-approvedFuel" multiple size="6" style="min-width:280px;max-width:400px">
+        ${stationOpts.replace(/<option value=""/, '<option value="">(any station)</option>')}
+      </select>
     </div>
 
     <div class="setting-row">
@@ -7234,17 +7263,26 @@ function renderGeneralSettings(panel) {
          <input type="number" id="set-general-jumpBuffer" min="0" max="60" step="5" value="${general.jumpBuffer ?? 10}" style="width:80px" />
          <span style="color:var(--text-secondary);font-size:12px">s buffer</span>
        </div>
-     </div>
-
-     <div class="settings-save-bar">
-       <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
-     </div>
-   `;
+      </div>
+ 
+      <div class="settings-save-bar">
+        <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
+      </div>
+    `;
+  // Pre-select approved fuel stations
+  const approvedSel = document.getElementById('set-general-approvedFuel');
+  if (approvedSel) {
+    for (const opt of approvedSel.options) {
+      if (approvedFuelStations.includes(opt.value)) opt.selected = true;
+    }
+  }
 }
 
 function saveGeneralSettings() {
   const stationVal = document.getElementById('set-general-factionStation').value;
   const [factionStorageSystem, factionStorageStation] = stationVal ? stationVal.split('|') : ['', ''];
+  const approvedSelect = document.getElementById('set-general-approvedFuel');
+  const approvedFuelStations = approvedSelect ? Array.from(approvedSelect.selectedOptions).map(o => o.value).filter(v => v) : [];
   const s = {
     port: parseInt(document.getElementById('set-general-port').value) || 3000,
     factionDonatePct: parseInt(document.getElementById('set-general-donatePct').value) || 0,
@@ -7261,6 +7299,7 @@ function saveGeneralSettings() {
     jumpSpeed5: parseInt(document.getElementById('set-general-jumpSpeed5').value) || 50,
     jumpSpeed6: parseInt(document.getElementById('set-general-jumpSpeed6').value) || 30,
     jumpBuffer: parseInt(document.getElementById('set-general-jumpBuffer').value) || 10,
+    approvedFuelStations,
   };
   send({ type: 'saveSettings', routine: 'general', settings: s });
 }
@@ -8644,6 +8683,271 @@ async function updateShipLoadoutSelect() {
   
   if (loadBtn) loadBtn.disabled = loadoutNames.length === 0;
   if (deleteBtn) deleteBtn.disabled = loadoutNames.length === 0;
+}
+
+// ── Module Loadout Presets (Phase 1) ─────────────────────────────
+let _modulePresetsCache = null;
+
+async function loadModulePresetsForManual() {
+  if (_modulePresetsCache) return _modulePresetsCache;
+  try {
+    const res = await fetch('/api/module-loadouts');
+    const data = await res.json();
+    _modulePresetsCache = data.loadouts || {};
+    return _modulePresetsCache;
+  } catch (e) {
+    console.warn('Failed to load module presets for manual controls', e);
+    return {};
+  }
+}
+
+async function populateModulePresetSelect() {
+  const select = document.getElementById('mc-module-preset-select');
+  if (!select) return;
+
+  const presets = await loadModulePresetsForManual();
+  const names = Object.keys(presets).sort();
+
+  select.innerHTML = '<option value="">-- Select Module Preset --</option>' +
+    names.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('');
+}
+
+function loadModulePresetInManualControls() {
+  const select = document.getElementById('mc-module-preset-select');
+  const statusEl = document.getElementById('mc-module-preset-status');
+  if (!select || !select.value) {
+    if (statusEl) statusEl.textContent = 'Select a preset first';
+    return;
+  }
+
+  const presetName = select.value;
+  const bot = getProfileBot();
+  if (!bot) {
+    if (statusEl) statusEl.textContent = 'No bot selected';
+    return;
+  }
+
+  // Store the selected preset for this bot (for Phase 2+)
+  if (!window._selectedModulePreset) window._selectedModulePreset = {};
+  window._selectedModulePreset[bot.username] = presetName;
+
+  if (statusEl) {
+    statusEl.textContent = `Loaded: ${presetName}`;
+    statusEl.style.color = 'var(--green)';
+    setTimeout(() => {
+      if (statusEl) statusEl.style.color = 'var(--text-dim)';
+    }, 2000);
+  }
+
+  logResponse(`<span class="resp-cmd">Module preset "${presetName}" loaded for manual control</span>`);
+}
+
+// Phase 2: Change to selected module loadout (smart uninstall only)
+async function changeToModulePreset() {
+  const bot = getProfileBot();
+  const statusEl = document.getElementById('mc-module-preset-status');
+  if (!bot) {
+    if (statusEl) statusEl.textContent = 'No bot selected';
+    return;
+  }
+
+  const presetName = window._selectedModulePreset?.[bot.username];
+  if (!presetName) {
+    if (statusEl) statusEl.textContent = 'Load a preset first';
+    return;
+  }
+
+  // Fetch preset details
+  const presets = await loadModulePresetsForManual();
+  const preset = presets[presetName];
+  if (!preset || !preset.modules) {
+    if (statusEl) statusEl.textContent = 'Preset not found';
+    return;
+  }
+
+  // Build target module list (preserves duplicates like multiple cargo expanders)
+  const targetModules = [
+    ...(preset.modules.weapons || []),
+    ...(preset.modules.defense || []),
+    ...(preset.modules.utility || [])
+  ];
+
+  if (statusEl) {
+    statusEl.textContent = 'Checking current modules...';
+    statusEl.style.color = 'var(--yellow)';
+  }
+
+  // Get current ship modules via get_status
+  sendExec(bot.username, 'get_status', {}, (result) => {
+    if (!result.ok || !result.data) {
+      if (statusEl) statusEl.textContent = 'Failed to get ship status';
+      return;
+    }
+
+    // Modules are usually in result.data.modules or result.data.ship.modules
+    const currentModules = result.data.modules || result.data.ship?.modules || [];
+    const removedModules = []; // { catalogId, instanceId }
+
+    // Build a map of what we still need to install (handles duplicates)
+    const needed = [...targetModules];
+
+    for (const mod of currentModules) {
+      const catalogId = mod.type_id || mod.item_id || mod.definition_id;
+      const instanceId = mod.id || mod.module_id || mod.instance_id;
+
+      if (catalogId && instanceId) {
+        const idx = needed.indexOf(catalogId);
+        if (idx !== -1) {
+          needed.splice(idx, 1); // already have this one, keep it
+        } else {
+          // We don't want this module
+          removedModules.push({ catalogId, instanceId });
+        }
+      }
+    }
+
+    if (needed.length === 0 && removedModules.length === 0) {
+      if (statusEl) {
+        statusEl.textContent = 'Already matches preset';
+        statusEl.style.color = 'var(--green)';
+      }
+      logResponse(`<span class="resp-ok">Ship already has the correct modules for "${presetName}"</span>`);
+      return;
+    }
+
+    if (statusEl) statusEl.textContent = `Removing ${removedModules.length} module(s)...`;
+
+    logResponse(`<span class="resp-cmd">Removing ${removedModules.length} modules not in preset "${presetName}"</span>`);
+
+    // Uninstall extras one by one
+    let index = 0;
+    function uninstallNext() {
+      if (index >= removedModules.length) {
+        if (statusEl) {
+          statusEl.textContent = 'Uninstall complete';
+          statusEl.style.color = 'var(--green)';
+        }
+        logResponse(`<span class="resp-ok">Finished removing extra modules for "${presetName}"</span>`);
+
+        // Continue to Phase 3 (deposit/withdraw/cargo loop)
+        finishModuleLoadoutChange(bot, presetName, needed, removedModules);
+        return;
+      }
+
+      const modInfo = removedModules[index];
+      sendExec(bot.username, 'uninstall_mod', { module_id: modInfo.instanceId }, (res) => {
+        if (res.ok) {
+          logResponse(`<span class="resp-ok">Uninstalled ${modInfo.catalogId}</span>`);
+        } else {
+          logResponse(`<span class="resp-err">Failed to uninstall ${modInfo.catalogId}: ${res.error || 'unknown'}</span>`);
+        }
+        index++;
+        // Small delay between uninstalls
+        setTimeout(uninstallNext, 800);
+      });
+    }
+
+    uninstallNext();
+  });
+}
+
+// ── Phase 3: Full module loadout change (deposit → withdraw → cargo/install loop) ──
+async function finishModuleLoadoutChange(bot, presetName, neededModules, removedModules) {
+  const statusEl = document.getElementById('mc-module-preset-status');
+  if (!statusEl) return;
+
+  // Step 1: Deposit removed modules to faction (use catalog ID)
+  if (removedModules.length > 0) {
+    statusEl.textContent = `Depositing ${removedModules.length} modules to faction...`;
+    logResponse(`<span class="resp-cmd">Depositing removed modules to faction storage</span>`);
+
+    for (const mod of removedModules) {
+      await new Promise(resolve => {
+        sendExec(bot.username, 'storage', {
+          action: 'deposit',
+          target: 'faction',
+          item_id: mod.catalogId,
+          quantity: 1
+        }, () => resolve());
+      });
+      await new Promise(r => setTimeout(r, 400));
+    }
+    logResponse(`<span class="resp-ok">Deposited removed modules to faction</span>`);
+  }
+
+  // Step 2: Withdraw needed modules from faction → station storage
+  statusEl.textContent = `Withdrawing ${neededModules.length} modules from faction...`;
+  logResponse(`<span class="resp-cmd">Withdrawing needed modules from faction storage</span>`);
+
+  for (const modId of neededModules) {
+    await new Promise(resolve => {
+      sendExec(bot.username, 'storage', {
+        action: 'deposit',
+        target: 'self',
+        item_id: modId,
+        quantity: 1,
+        source: 'faction'
+      }, () => resolve());
+    });
+    await new Promise(r => setTimeout(r, 400));
+  }
+  logResponse(`<span class="resp-ok">Withdrawn needed modules to station storage</span>`);
+
+  // Step 3: Cargo + Install loop
+  statusEl.textContent = 'Starting cargo/install loop...';
+  logResponse(`<span class="resp-cmd">Beginning cargo → install loop</span>`);
+
+  let remaining = [...neededModules];
+
+  while (remaining.length > 0) {
+    // Get current cargo space
+    const cargoResult = await new Promise(resolve => {
+      sendExec(bot.username, 'get_cargo', {}, resolve);
+    });
+
+    const cargoUsed = cargoResult?.data?.cargo_used || 0;
+    const cargoMax = cargoResult?.data?.cargo_max || 100;
+    const spaceLeft = cargoMax - cargoUsed;
+    const modulesWeCanLoad = Math.floor(spaceLeft / 10);
+
+    if (modulesWeCanLoad <= 0) {
+      logResponse('<span class="resp-warn">Not enough cargo space. Waiting...</span>');
+      await new Promise(r => setTimeout(r, 2000));
+      continue;
+    }
+
+    const toLoad = remaining.splice(0, modulesWeCanLoad);
+
+    // Load from station storage into cargo
+    for (const modId of toLoad) {
+      await new Promise(resolve => {
+        sendExec(bot.username, 'storage', {
+          action: 'withdraw',
+          item_id: modId,
+          quantity: 1,
+          source: 'station'
+        }, () => resolve());
+      });
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    logResponse(`<span class="resp-cmd">Loaded ${toLoad.length} modules into cargo</span>`);
+
+    // Install from cargo
+    for (const modId of toLoad) {
+      await new Promise(resolve => {
+        sendExec(bot.username, 'install_mod', { module_id: modId }, resolve);
+      });
+      await new Promise(r => setTimeout(r, 600));
+    }
+
+    logResponse(`<span class="resp-ok">Installed ${toLoad.length} modules</span>`);
+    statusEl.textContent = `${remaining.length} modules remaining...`;
+  }
+
+  statusEl.textContent = 'Module loadout complete!';
+  statusEl.style.color = 'var(--green)';
+  logResponse(`<span class="resp-ok">Successfully changed to module loadout "${presetName}"</span>`);
 }
 
 // Populate ship loadout dropdown in manual controls
@@ -10679,7 +10983,7 @@ function esc(s) {
 }
 
 function num(n) {
-  return (n || 0).toLocaleString();
+  return Math.round(n || 0).toLocaleString();
 }
 
 // ── Missions ───────────────────────────────────────────────
@@ -12143,6 +12447,7 @@ function renderFactionFacilities(f, username) {
     ? '<div style="color:var(--yellow);font-size:11px;margin-bottom:12px">Bot must be docked at a station to manage facilities.</div>'
     : '';
 
+  factionFacilityCategory = 'faction';
   return `
     ${dockWarning}
     <div class="faction-section">
@@ -12153,6 +12458,10 @@ function renderFactionFacilities(f, username) {
     </div>
     <div class="faction-section" style="margin-top:16px">
       <div class="faction-section-title">Build New Facility</div>
+      <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
+        <button class="sm" id="ff-cat-faction" style="background:var(--accent);color:#fff" onclick="switchFactionFacilityCategory('faction','${esc(username)}')">Faction</button>
+        <button class="sm" id="ff-cat-production" onclick="switchFactionFacilityCategory('production','${esc(username)}')">Production</button>
+      </div>
       <div id="factionBuildableTypes">
         <button class="sm" onclick="fetchFactionBuildableTypes('${esc(username)}')" ${!docked ? 'disabled' : ''}>Show Available Types</button>
       </div>
@@ -12381,7 +12690,8 @@ function fetchFactionBuildableTypes(username) {
   const container = document.getElementById('factionBuildableTypes');
   if (!container) return;
   container.innerHTML = '<div class="faction-no-data">Loading available types...</div>';
-  sendExec(username, 'facility', { action: 'types', category: 'faction' }, (result) => {
+  const cat = factionFacilityCategory || 'faction';
+  sendExec(username, 'facility', { action: 'types', category: cat }, (result) => {
     if (!result.ok || !result.data) {
       container.innerHTML = `<div class="faction-no-data">${esc(result.error || 'Could not load types')}</div>`;
       return;
@@ -12484,16 +12794,285 @@ function renderFacilityTypeCard(t, username) {
   `;
 }
 
-function factionBuildFacility(username, facilityType) {
-  appendLine('system', `${username}: Building ${facilityType}...`);
-  sendExec(username, 'facility', { action: 'faction_build', facility_type: facilityType }, (result) => {
-    if (result.ok) {
-      appendLine('system', `${username}: ${facilityType} built!`);
-      fetchFactionFacilities(username);
-    } else {
-      appendLine('system', `Build failed: ${result.error || 'unknown'}`);
+function renderFactionProductionFromCache(username) {
+  const container = document.getElementById('factionBuildableTypes');
+  if (!container) return;
+  const prodTypes = personalFacilityTypes.filter(t => t._category === 'production');
+  if (prodTypes.length === 0) {
+    container.innerHTML = '<div class="faction-no-data">No cached production types</div>';
+    return;
+  }
+  container.innerHTML = prodTypes.map(t => {
+    const typeId = t.facility_type || t.type || t.id || '';
+    const name = t.name || typeId;
+    const level = t.level ?? t.tier ?? '';
+    const levelStr = level ? ` Level ${level}` : '';
+    return `<div class="faction-card" style="cursor:pointer" onclick="showFactionProductionDetail('${esc(username)}','${esc(typeId)}')">
+      <span class="fc-name">${esc(name)}${esc(levelStr)}</span>
+      <div class="fc-detail" style="margin-top:4px;font-size:11px;color:var(--text-dim)">Click for details and build options</div>
+    </div>`;
+  }).join('');
+}
+
+function showFactionProductionDetail(username, facilityType) {
+  const container = document.getElementById('factionBuildableTypes');
+  if (!container) return;
+  container.innerHTML = `<div class="faction-card"><div style="font-size:14px">Loading details for ${esc(facilityType)}...</div></div>`;
+  
+  sendExec(username, 'facility', { action: 'types', facility_type: facilityType }, (detailResult) => {
+    let detail = { facility_type: facilityType };
+    if (detailResult.ok && detailResult.data) {
+      const dd = detailResult.data;
+      detail = Array.isArray(dd) ? dd[0] : (dd.type || dd.facility || dd);
     }
+    
+    const name = detail.name || detail.facility_type || facilityType;
+    const level = detail.level ?? detail.tier ?? '';
+    const levelStr = level ? ` Level ${level}` : '';
+    const category = detail.category || 'production';
+    const desc = detail.description || detail.desc || '';
+    const buildCost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? 0;
+    const buildCostStr = buildCost ? `${Number(buildCost).toLocaleString()}cr` : '';
+    const labor = detail.labor_cost ?? detail.labor ?? '';
+    const laborStr = labor ? `${labor} labor` : '';
+    const buildTime = detail.build_time ?? detail.time ?? '';
+    const buildTimeStr = buildTime ? `${buildTime}s` : '';
+    
+    const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || detail.resources || [];
+    let matsHtml = '';
+    if (Array.isArray(mats) && mats.length > 0) {
+      matsHtml = '<div style="margin-top:8px"><span style="color:var(--text-dim)">Materials required:</span> ' +
+        mats.map(m => {
+          const mName = m.name || m.item_name || m.item_id || '?';
+          const mQty = m.quantity || m.count || m.amount || 1;
+          return `${mQty}x ${esc(mName)}`;
+        }).join(', ') + '</div>';
+    }
+    
+    const rawRecipe = detail.recipe || null;
+    let recipeDisplay = '';
+    if (rawRecipe && typeof rawRecipe === 'object') {
+      const recipeName = rawRecipe.name || rawRecipe.id || detail.recipe_id || '';
+      const craftingTime = rawRecipe.crafting_time || rawRecipe.time || '';
+      const timeStr = craftingTime ? ` (${craftingTime}s)` : '';
+      const inputs = rawRecipe.inputs || rawRecipe.components || rawRecipe.ingredients || [];
+      const outputs = rawRecipe.outputs || rawRecipe.output || rawRecipe.result || rawRecipe.produces || [];
+      const inputsStr = inputs.length > 0 ? inputs.map(i => `${i.quantity || 1}x ${i.name || i.item_id || '?'}`).join(', ') : '-';
+      const outputsStr = outputs.length > 0 ? outputs.map(o => `${o.quantity || 1}x ${o.name || o.item_id || '?'}`).join(', ') : '-';
+      recipeDisplay = `<span style="font-weight:600">${esc(recipeName)}${timeStr}</span><br/>` +
+        `<span style="color:var(--text-dim)">Inputs:</span> ${esc(inputsStr)}<br/>` +
+        `<span style="color:var(--text-dim)">Outputs:</span> <span style="color:var(--green)">${esc(outputsStr)}</span>`;
+    } else if (typeof rawRecipe === 'string') {
+      recipeDisplay = esc(rawRecipe);
+    }
+    let recipeHtml = recipeDisplay ? `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">Recipe: ${recipeDisplay}</div>` : '';
+    
+    const detailHtml = `
+      <div class="faction-card" style="padding:12px">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+          <div>
+            <div style="font-size:14px;font-weight:700;color:var(--text-bright)">${esc(name)}${esc(levelStr)}</div>
+            <div style="font-size:11px;color:var(--text-dim)">${esc(category)}</div>
+          </div>
+          <button class="sm" onclick="renderFactionProductionFromCache('${esc(username)}')">Back to List</button>
+        </div>
+        <div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>
+        ${buildCostStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Build Cost: ${esc(buildCostStr)}</div>` : ''}
+        ${laborStr ? `<div style="font-size:11px;color:var(--yellow);margin-top:2px">${esc(laborStr)}</div>` : ''}
+        ${buildTimeStr ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">Build Time: ${esc(buildTimeStr)}</div>` : ''}
+        ${matsHtml}
+        ${recipeHtml}
+        <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+          <button class="primary sm" style="width:100%" onclick="factionBuildFacility('${esc(username)}','${esc(facilityType)}')">Build Facility</button>
+        </div>
+        <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
+          This will withdraw required materials from faction storage and build the facility using faction_build.
+        </div>
+      </div>
+    `;
+    container.innerHTML = detailHtml;
   });
+}
+
+async function factionBuildFacility(username, facilityType) {
+  const container = document.getElementById('factionBuildableTypes');
+  if (!container) return;
+  
+  // Show progress UI (same style as personal)
+  let progressHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="font-size:14px;font-weight:700;color:var(--text-bright);margin-bottom:12px">Building: ${esc(facilityType)}</div>
+      <div id="build-progress" style="font-size:12px;color:var(--text)">
+        <div id="bp-step-1">Getting facility details...</div>
+        <div id="bp-step-2" style="color:var(--text-dim)">Checking faction storage...</div>
+        <div id="bp-step-3" style="color:var(--text-dim)">Withdrawing materials...</div>
+        <div id="bp-step-4" style="color:var(--text-dim)">Building facility...</div>
+      </div>
+      <div id="bp-status" style="margin-top:12px;font-size:11px"></div>
+      <div id="bp-actions" style="margin-top:12px;display:flex;gap:8px"></div>
+    </div>
+  `;
+  container.innerHTML = progressHtml;
+  
+  const updateStep = (step, status, color) => {
+    const el = document.getElementById(`bp-step-${step}`);
+    if (el) {
+      el.style.color = color || 'var(--text)';
+      el.textContent = status;
+    }
+  };
+  
+  const setStatus = (msg, color) => {
+    const el = document.getElementById('bp-status');
+    if (el) {
+      el.style.color = color || 'var(--text)';
+      el.textContent = msg;
+    }
+  };
+  
+  const showError = (msg) => {
+    setStatus('ERROR: ' + msg, 'var(--red)');
+    document.getElementById('bp-actions').innerHTML = '<button class="sm" onclick="fetchFactionBuildableTypes(\'' + esc(username) + '\')">Back to List</button>';
+  };
+  
+  const showSuccess = () => {
+    setStatus('Facility built successfully!', 'var(--green)');
+    document.getElementById('bp-actions').innerHTML = '<button class="primary sm" onclick="fetchFactionFacilities(\'' + esc(username) + '\')">View Faction Facilities</button>';
+  };
+  
+  // Step 1: Get facility type details
+  updateStep(1, 'Getting facility details...', 'var(--text)');
+  
+  const detailsResult = await new Promise(resolve => {
+    sendExec(username, 'facility', { action: 'types', facility_type: facilityType }, resolve);
+  });
+  
+  if (!detailsResult.ok || !detailsResult.data) {
+    showError(detailsResult.error || 'Failed to get facility details');
+    return;
+  }
+  
+  const d = detailsResult.data;
+  const detail = Array.isArray(d) ? d[0] : (d.type || d.facility || d);
+  
+  if (!detail) {
+    showError('Could not find facility type details');
+    return;
+  }
+  
+  const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || detail.resources || [];
+  const cost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? detail.credit_cost ?? 0;
+  
+  updateStep(1, `Got details for ${detail.name || facilityType}`, 'var(--green)');
+  updateStep(2, 'Checking faction storage...', 'var(--text)');
+  
+  // Step 2: Get faction storage
+  const storageResult = await new Promise(resolve => {
+    sendExec(username, 'view_faction_storage', {}, resolve);
+  });
+  
+  if (!storageResult.ok || !storageResult.data) {
+    showError(storageResult.error || 'Failed to get faction storage');
+    return;
+  }
+  
+  const factionItems = storageResult.data.items || storageResult.data.storage || [];
+  const factionCredits = storageResult.data.credits || 0;
+  
+  const missing = [];
+  if (cost > 0 && factionCredits < cost) {
+    missing.push(`${Number(cost - factionCredits).toLocaleString()} more credits needed (have ${Number(factionCredits).toLocaleString()})`);
+  }
+  
+  if (Array.isArray(mats) && mats.length > 0) {
+    for (const m of mats) {
+      const mId = m.item_id || m.name || m.resource || '?';
+      const mName = m.name || m.item_id || '?';
+      const mQty = m.quantity || m.count || m.amount || 1;
+      const available = factionItems.find(i => (i.item_id === mId || i.name === mId));
+      const availQty = available?.quantity || 0;
+      if (availQty < mQty) {
+        missing.push(`${mQty - availQty}x more ${mName} needed (have ${availQty})`);
+      }
+    }
+  }
+  
+  if (missing.length > 0) {
+    setStatus('Missing materials: ' + missing.join(', '), 'var(--orange)');
+    document.getElementById('bp-actions').innerHTML = `
+      <button class="sm" onclick="factionBuildFacilityConfirm('${esc(username)}','${esc(facilityType)}')">Try Anyway</button>
+      <button class="sm" onclick="fetchFactionBuildableTypes('${esc(username)}')">Cancel</button>
+    `;
+    return;
+  }
+  
+  updateStep(2, `Faction storage OK (${factionCredits.toLocaleString()} credits)`, 'var(--green)');
+  updateStep(3, 'Withdrawing materials...', 'var(--text)');
+  
+  // Step 3: (optional) withdraw if needed - for faction_build we can skip actual withdraw since it reads faction directly, but keep UI flow
+  updateStep(3, 'Materials ready in faction storage', 'var(--green)');
+  updateStep(4, 'Building facility...', 'var(--text)');
+  
+  // Step 4: Build using faction_build
+  const buildResult = await new Promise(resolve => {
+    sendExec(username, 'facility', { action: 'faction_build', facility_type: facilityType }, resolve);
+  });
+  
+  if (buildResult.ok) {
+    updateStep(4, 'Facility built!', 'var(--green)');
+    showSuccess();
+  } else {
+    showError(buildResult.error || 'Build failed');
+  }
+}
+
+async function factionBuildFacilityConfirm(username, facilityType) {
+  // Same progress UI + final faction_build (for "Try Anyway")
+  const container = document.getElementById('factionBuildableTypes');
+  if (!container) return;
+  
+  let progressHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="font-size:14px;font-weight:700;color:var(--text-bright);margin-bottom:12px">Building: ${esc(facilityType)}</div>
+      <div id="build-progress" style="font-size:12px;color:var(--text)">
+        <div id="bp-step-1">Getting facility details...</div>
+        <div id="bp-step-2">Checking faction storage...</div>
+        <div id="bp-step-3">Building facility...</div>
+      </div>
+      <div id="bp-status" style="margin-top:12px;font-size:11px"></div>
+      <div id="bp-actions" style="margin-top:12px;display:flex;gap:8px"></div>
+    </div>
+  `;
+  container.innerHTML = progressHtml;
+  
+  const updateStep = (step, status, color) => {
+    const el = document.getElementById(`bp-step-${step}`);
+    if (el) { el.style.color = color || 'var(--text)'; el.textContent = status; }
+  };
+  const setStatus = (msg, color) => {
+    const el = document.getElementById('bp-status');
+    if (el) { el.style.color = color || 'var(--text)'; el.textContent = msg; }
+  };
+  const showError = (msg) => {
+    setStatus('ERROR: ' + msg, 'var(--red)');
+    document.getElementById('bp-actions').innerHTML = '<button class="sm" onclick="fetchFactionBuildableTypes(\'' + esc(username) + '\')">Back to List</button>';
+  };
+  
+  updateStep(1, 'Getting facility details...', 'var(--text)');
+  const detailsResult = await new Promise(r => sendExec(username, 'facility', { action: 'types', facility_type: facilityType }, r));
+  updateStep(1, 'Got details', 'var(--green)');
+  updateStep(2, 'Checking faction storage...', 'var(--text)');
+  updateStep(2, 'Proceeding with build...', 'var(--green)');
+  updateStep(3, 'Building facility...', 'var(--text)');
+  
+  const buildResult = await new Promise(r => sendExec(username, 'facility', { action: 'faction_build', facility_type: facilityType }, r));
+  if (buildResult.ok) {
+    updateStep(3, 'Facility built!', 'var(--green)');
+    setStatus('Facility built successfully!', 'var(--green)');
+    document.getElementById('bp-actions').innerHTML = '<button class="primary sm" onclick="fetchFactionFacilities(\'' + esc(username) + '\')">View Faction Facilities</button>';
+  } else {
+    showError(buildResult.error || 'Build failed');
+  }
 }
 
 // Personal Facilities State
@@ -12510,6 +13089,7 @@ let personalFacilityVersion = null;
 let personalFacilityCategory = 'personal'; // 'personal' or 'production'
 let personalFacilityUpgrades = {}; // { facilityId: upgradeData }
 let factionFacilityUpgrades = {}; // { facilityId: upgradeData }
+let factionFacilityCategory = 'faction'; // 'faction' or 'production'
 
 // Load facilities from server cache (returns true if loaded successfully)
 async function loadFacilitiesCache() {
@@ -12737,6 +13317,35 @@ function switchPersonalFacilityCategory(category, username) {
     renderPersonalFacilityList(document.getElementById('personalFacilityTypes'), username);
   } else {
     fetchPersonalFacilityTypes(username);
+  }
+}
+
+function switchFactionFacilityCategory(category, username) {
+  factionFacilityCategory = category;
+  const factionBtn = document.getElementById('ff-cat-faction');
+  const productionBtn = document.getElementById('ff-cat-production');
+  if (factionBtn) {
+    if (category === 'faction') {
+      factionBtn.style.background = 'var(--accent)';
+      factionBtn.style.color = '#fff';
+    } else {
+      factionBtn.style.background = '';
+      factionBtn.style.color = '';
+    }
+  }
+  if (productionBtn) {
+    if (category === 'production') {
+      productionBtn.style.background = 'var(--accent)';
+      productionBtn.style.color = '#fff';
+    } else {
+      productionBtn.style.background = '';
+      productionBtn.style.color = '';
+    }
+  }
+  if (category === 'production' && personalFacilityTypes.some(t => t._category === 'production')) {
+    renderFactionProductionFromCache(username);
+  } else {
+    fetchFactionBuildableTypes(username);
   }
 }
 
@@ -14747,6 +15356,14 @@ function renderMinerSettings(panel) {
         <input type="number" id="set-miner-maxJumps" min="1" max="100" value="${settings.miner?.maxJumps ?? 10}" style="width:80px" />
       </div>
 
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Minimum Fuel Cells</div>
+          <div class="setting-hint">Minimum military fuel cells each miner must carry (military_fuel_cell = 100 fuel / 3 space). Default 20 prevents stranding at distant stations.</div>
+        </div>
+        <input type="number" id="set-miner-minimumFuelCells" min="5" max="100" value="${settings.miner?.minimumFuelCells ?? 20}" style="width:80px" />
+      </div>
+
 
 
       <div class="setting-row">
@@ -15004,6 +15621,7 @@ function saveMinerSettings() {
     ignoreDepletion: document.getElementById('set-miner-ignoreDepletion').checked,
     stayOutUntilFull: document.getElementById('set-miner-stayOutUntilFull').checked,
     maxJumps: parseInt(document.getElementById('set-miner-maxJumps').value) || 10,
+    minimumFuelCells: parseInt(document.getElementById('set-miner-minimumFuelCells').value) || 20,
 
     // Note: oreQuotas, gasQuotas, iceQuotas, deepCoreQuotas, radioactiveQuotas are managed in Miner Quotas settings page
     // They are preserved from existing settings when saving from this page
@@ -15488,6 +16106,7 @@ function renderHunterSettings(panel) {
   const refuelThreshold = h.refuelThreshold ?? 40;
   const repairThreshold = h.repairThreshold ?? 30;
   const fleeThreshold = h.fleeThreshold ?? 20;
+  const shieldRechargePct = h.shieldRechargePct ?? 80;
   const onlyNPCs = h.onlyNPCs !== false;
   const responseRange = h.responseRange ?? 3;
   const maxAttackTier = h.maxAttackTier || 'large';
@@ -15496,6 +16115,8 @@ function renderHunterSettings(panel) {
   const disableScanCommandForPirates = h.disableScanCommandForPirates ?? false;
   const hunterPatrols = Array.isArray(h.hunterPatrols) ? h.hunterPatrols : [];
   const singleLoop = h.singleLoop ?? false;
+  const hunterHomeSystem = h.homeSystem || '';
+  const hunterHomeStation = h.homeStation || '';
 
   const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
   const tierOpts = tierOptions.map(t => `<option value="${t}"${t === maxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
@@ -15509,6 +16130,19 @@ function renderHunterSettings(panel) {
   }
   if (currentSystem && !knownSystems.find(s => s.id === currentSystem)) {
     systemOpts.push(`<option value="${esc(currentSystem)}" selected>${esc(currentSystem)}</option>`);
+  }
+
+  // Build station options from mapData (exact pattern from CargoMover)
+  let homeStationOpts = '<option value="">(use nearest safe station)</option>';
+  for (const [sysId, sys] of Object.entries(mapData || {})) {
+    const sysName = sys.name || sysId;
+    for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
+      if (!poi.has_base) continue;
+      const val = sysId + '|' + poi.id;
+      const label = poi.base_name || poi.name || poi.id;
+      const sel = val === hunterHomeStation ? ' selected' : '';
+      homeStationOpts += `<option value="${val}"${sel}>${label} (${sysName})</option>`;
+    }
   }
 
   panel.innerHTML = `
@@ -15621,6 +16255,14 @@ function renderHunterSettings(panel) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Shield Recharge Target (%)</div>
+        <div class="setting-hint">After successful kills, auto-use shield_charge items from cargo to restore shields up to this % of max (100 per charge).</div>
+      </div>
+      <input type="number" id="set-hunter-shieldRechargePct" min="50" max="100" value="${shieldRechargePct}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Attack Mode</div>
         <div class="setting-hint">Restrict attacks to NPC pirates only, or also engage hostile players.</div>
       </div>
@@ -15695,6 +16337,16 @@ function renderHunterSettings(panel) {
       </select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home Station (Faction Storage)</div>
+        <div class="setting-hint">Home station with faction lockbox for resupply &amp; loot deposit on single-loop return. Format: systemId|stationPoiId (e.g. sol|sol_station). Set full dropdown in Return Home settings (shared).</div>
+      </div>
+      <select id="set-hunter-homeStation" style="width:320px" onchange="saveHunterSettings()">
+        ${homeStationOpts}
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
     </div>
@@ -15707,6 +16359,7 @@ function saveHunterSettings() {
     refuelThreshold: parseInt(document.getElementById('set-hunter-refuelThreshold').value) || 40,
     repairThreshold: parseInt(document.getElementById('set-hunter-repairThreshold').value) || 30,
     fleeThreshold: parseInt(document.getElementById('set-hunter-fleeThreshold').value) || 20,
+    shieldRechargePct: parseInt(document.getElementById('set-hunter-shieldRechargePct').value) || 80,
     onlyNPCs: document.getElementById('set-hunter-onlyNPCs').value === 'true',
     maxAttackTier: document.getElementById('set-hunter-maxAttackTier').value,
     fleeFromTier: document.getElementById('set-hunter-fleeFromTier').value,
@@ -15715,6 +16368,7 @@ function saveHunterSettings() {
     disableScanCommandForPirates: document.getElementById('set-hunter-disableScanCommandForPirates').value === 'true',
     disableWreckSalvaging: document.getElementById('set-hunter-disableWreckSalvaging').value === 'true',
     singleLoop: document.getElementById('set-hunter-singleLoop').value === 'true',
+    homeStation: document.getElementById('set-hunter-homeStation').value.trim(),
     hunterPatrols: Array.isArray(settings.hunter?.hunterPatrols) ? settings.hunter.hunterPatrols : [],
     botHunterPatrolAssignments: settings.hunter?.botHunterPatrolAssignments || {},
   };
@@ -17298,8 +17952,11 @@ function renderShipOverview(data, username) {
 
   const ship = extractShip(data);
   const rawShipName = ship.name || ship.ship_name || '';
-  const cls = ship.class || ship.ship_class || '';
-  const name = (rawShipName && rawShipName.toLowerCase() !== 'unnamed') ? rawShipName : (cls || '?');
+  const cls = ship.class || ship.ship_class || ship.class_name || '';
+  const customName = ship.custom_name || ship.customName || '';
+  const baseName = cls || '?';
+  let name = (rawShipName && rawShipName.toLowerCase() !== 'unnamed') ? rawShipName : baseName;
+  if (customName) name = `${baseName} - ${customName}`;
   const tier = ship.tier || '';
   const hull = ship.hull ?? ship.current_hull ?? '?';
   const maxHull = ship.max_hull ?? ship.hull_max ?? hull;
@@ -17375,7 +18032,7 @@ function renderShipOverview(data, username) {
 
   return `
     <div class="faction-section">
-      <div class="faction-section-title">${esc(name)} ${tier ? `<span class="count-badge">T${esc(String(tier))}</span>` : ''} ${cls ? `<span style="color:var(--text-dim);font-size:11px;font-weight:400">${esc(cls)}</span>` : ''}</div>
+      <div class="faction-section-title">${esc(name)} ${tier ? `<span class="count-badge">T${esc(String(tier))}</span>` : ''}${!customName && cls ? ` <span style="color:var(--text-dim);font-size:11px;font-weight:400">${esc(cls)}</span>` : ''}</div>
       <div style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
         <span style="font-size:11px;color:var(--text-dim)">Colors:</span>
         <input type="color" class="shipyard-color-preview" id="sy-color-primary" value="${esc(primary)}" title="Primary">
@@ -17480,7 +18137,10 @@ function renderFleetPanel(ships, username, error) {
       const rawName = s.name || s.ship_name || '';
       const cls = s.class_name || s.class || s.ship_class || s.ship_type || s.type || '';
       const classId = s.class_id || '';
-      const name = (rawName && rawName.toLowerCase() !== 'unnamed') ? rawName : (cls || classId || 'Unknown');
+      const customName = s.custom_name || s.customName || '';
+      const baseName = cls || classId || 'Unknown';
+      let name = (rawName && rawName.toLowerCase() !== 'unnamed') ? rawName : baseName;
+      if (customName) name = `${baseName} - ${customName}`;
       const rawLoc = s.location || s.system || '';
       const loc = resolveLocation(rawLoc) || rawLoc;
       const isActive = id === activeShipId || s.active || s.is_active;
@@ -17551,7 +18211,7 @@ function renderFleetPanel(ships, username, error) {
 
       html += `<div class="shipyard-ship-card">
         <div style="flex:1">
-          <div class="ssc-name">${esc(name)} ${cls && name !== cls ? `<span style="font-weight:400;color:var(--text-dim);font-size:11px">${esc(cls)}</span>` : ''} ${isActive ? '<span class="shipyard-active-badge">Active</span>' : ''}${buildBadge}${etaHtml}</div>
+          <div class="ssc-name">${esc(name)}${!customName && cls && name !== baseName ? ` <span style="font-weight:400;color:var(--text-dim);font-size:11px">${esc(cls)}</span>` : ''} ${isActive ? '<span class="shipyard-active-badge">Active</span>' : ''}${buildBadge}${etaHtml}</div>
           <div class="ssc-detail">${esc(loc)}${shipStoredInCarrier ? ` <span style="color:var(--cyan);font-size:10px">📦 Stored in: ${esc(shipStoredInCarrier)}</span>` : ''}</div>
           ${statsHtml}
         </div>

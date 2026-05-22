@@ -707,8 +707,8 @@ async function main(): Promise<void> {
             // Clear failure counter on success
             sessionRestoreFailures.delete(name);
             server.logSystem(`${name} session resumed (no login delay)`);
-            // Fetch catalog data if stale (first bot with active session triggers it)
-            if (catalogStore.isStale()) {
+            // Fetch catalog data if stale or server version changed (first bot with active session triggers it)
+            if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
               try {
                 await catalogStore.fetchAll(bot.api);
                 server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
@@ -745,8 +745,8 @@ async function main(): Promise<void> {
                 server.logSystem(`${name} forced login failed`);
                 return;
               }
-                // Fetch catalog data if stale (first logged-in bot triggers it)
-                if (catalogStore.isStale()) {
+                // Fetch catalog data if stale or server version changed (first logged-in bot triggers it)
+                if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
                   try {
                     await catalogStore.fetchAll(bot.api);
                     server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
@@ -778,8 +778,8 @@ async function main(): Promise<void> {
                   server.logSystem(`${name} login failed`);
                   return;
                 }
-              // Fetch catalog data if stale (first logged-in bot triggers it)
-              if (catalogStore.isStale()) {
+              // Fetch catalog data if stale or server version changed (first logged-in bot triggers it)
+              if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
                 try {
                   await catalogStore.fetchAll(bot.api);
                   server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
@@ -859,7 +859,15 @@ async function main(): Promise<void> {
 
   // Daily catalog refresh (24h)
   intervals.push(setInterval(async () => {
-    if (!catalogStore.isStale()) return;
+    // Check if stale OR server version changed
+    let needsRefresh = catalogStore.isStale();
+    if (!needsRefresh && bots.size > 0) {
+      const firstBot = bots.values().next().value;
+      if (firstBot?.api.getSession()) {
+        needsRefresh = await catalogStore.checkVersionChanged(firstBot.api);
+      }
+    }
+    if (!needsRefresh) return;
     // Find first bot with an active session
     for (const [, bot] of bots) {
       if (bot.api.getSession()) {

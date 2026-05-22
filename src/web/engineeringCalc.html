@@ -301,26 +301,6 @@
         return hasCpu || hasPower;
       });
 
-      // Add special modules not in catalog
-      modules.push({
-        id: 'cpu_co_processor',
-        name: 'CPU Co-Processor',
-        category: 'utility',
-        cpu_usage: 0,
-        power_usage: 3,
-        wear: 0,
-        cpu_bonus: 5
-      });
-      modules.push({
-        id: 'fuel_optimizer',
-        name: 'Fuel Optimizer',
-        category: 'utility',
-        cpu_usage: 3,
-        power_usage: 2,
-        wear: 0,
-        fuel_efficiency: 15
-      });
-
       // Group by category
       const categories = {
         weapons: modules.filter(m => getModuleCat(m) === 'weapons'),

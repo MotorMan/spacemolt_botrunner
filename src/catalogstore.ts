@@ -35,7 +35,7 @@ export interface CatalogRecipe {
 }
 
 export interface CatalogData {
-  version: 1;
+  version: string | null;
   lastFetched: string | null;
   items: Record<string, CatalogItem>;
   ships: Record<string, CatalogShip>;
@@ -74,7 +74,7 @@ class CatalogStore {
         // Corrupt file — start fresh
       }
     }
-    return { version: 1, lastFetched: null, items: {}, ships: {}, skills: {}, recipes: {} };
+    return { version: null, lastFetched: null, items: {}, ships: {}, skills: {}, recipes: {} };
   }
 
   private scheduleSave(): void {
@@ -121,6 +121,22 @@ class CatalogStore {
     return age > STALE_MS;
   }
 
+  /** Check if the server version has changed since last fetch. */
+  async checkVersionChanged(api: SpaceMoltAPI): Promise<boolean> {
+    if (this.data.version === null) return true;
+    try {
+      const versionResp = await api.execute("get_version");
+      if (!versionResp.error && versionResp.result) {
+        const v = versionResp.result as Record<string, unknown>;
+        const currentVersion = (v.version as string) || null;
+        return currentVersion !== this.data.version;
+      }
+    } catch {
+      // If we can't check, assume no change to avoid unnecessary fetch
+    }
+    return false;
+  }
+
   // ── Fetch from API ────────────────────────────────────────
 
   /** Paginate all 4 catalog types and store results. */
@@ -137,6 +153,18 @@ class CatalogStore {
   }
 
   private async _doFetchAll(api: SpaceMoltAPI): Promise<void> {
+    let serverVersion: string | null = null;
+    try {
+      const versionResp = await api.execute("get_version");
+      if (!versionResp.error && versionResp.result) {
+        const v = versionResp.result as Record<string, unknown>;
+        serverVersion = (v.version as string) || null;
+        debugLog("catalog", `Server version: ${serverVersion}`);
+      }
+    } catch (err) {
+      debugLog("catalog", `Failed to fetch server version: ${err}`);
+    }
+
     const types = ["items", "ships", "skills", "recipes"] as const;
     const results: Record<string, Record<string, unknown>> = {
       items: {},
@@ -189,6 +217,7 @@ class CatalogStore {
     this.data.ships = results.ships as Record<string, CatalogShip>;
     this.data.skills = results.skills as Record<string, CatalogSkill>;
     this.data.recipes = results.recipes as Record<string, CatalogRecipe>;
+    this.data.version = serverVersion;
     this.data.lastFetched = new Date().toISOString();
 
     this.dirty = true;
@@ -230,8 +259,9 @@ class CatalogStore {
   }
 
   /** Return full catalog data for WS broadcast / REST endpoint. */
-  getAll(): { items: Record<string, CatalogItem>; ships: Record<string, CatalogShip>; skills: Record<string, CatalogSkill>; recipes: Record<string, CatalogRecipe>; lastFetched: string | null } {
+  getAll(): { version: string | null; items: Record<string, CatalogItem>; ships: Record<string, CatalogShip>; skills: Record<string, CatalogSkill>; recipes: Record<string, CatalogRecipe>; lastFetched: string | null } {
     return {
+      version: this.data.version,
       items: this.data.items,
       ships: this.data.ships,
       skills: this.data.skills,

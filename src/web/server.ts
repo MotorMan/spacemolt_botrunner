@@ -730,6 +730,13 @@ export class WebServer {
         interface CraftingLoadoutFile {
           crafting?: Record<string, Record<string, number>>;
           ship?: Record<string, ShipLoadout>;
+          moduleLoadouts?: Record<string, ModuleLoadout>;
+        }
+
+        interface ModuleLoadout {
+          modules: { weapons: string[]; defense: string[]; utility: string[] };
+          shipId?: string;
+          savedAt?: string;
         }
 
         interface ShipLoadout {
@@ -791,6 +798,34 @@ export class WebServer {
             }
           }
           fileData.ship = loadouts;
+          writeFileSync(LOADOUTS_FILE, JSON.stringify(fileData, null, 2) + "\n", "utf-8");
+        }
+
+        function loadModuleLoadouts(): Record<string, ModuleLoadout> {
+          if (existsSync(LOADOUTS_FILE)) {
+            try {
+              const data: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              return data.moduleLoadouts || {};
+            } catch (err) {
+              console.warn(`Warning: corrupt craftingLoadouts.json (moduleLoadouts section) —`, err);
+            }
+          }
+          return {};
+        }
+
+        function saveModuleLoadouts(loadouts: Record<string, ModuleLoadout>): void {
+          if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+          let fileData: CraftingLoadoutFile = { crafting: {}, ship: {}, moduleLoadouts: loadouts };
+          if (existsSync(LOADOUTS_FILE)) {
+            try {
+              const existing: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              fileData.crafting = existing.crafting || {};
+              fileData.ship = existing.ship || {};
+            } catch (err) {
+              // ignore, use empty sections
+            }
+          }
+          fileData.moduleLoadouts = loadouts;
           writeFileSync(LOADOUTS_FILE, JSON.stringify(fileData, null, 2) + "\n", "utf-8");
         }
 
@@ -880,12 +915,47 @@ export class WebServer {
            if (!(name in loadouts)) {
              return Response.json({ error: "Loadout not found" }, { status: 404 });
            }
-           delete loadouts[name];
-           saveShipLoadouts(loadouts);
-           return Response.json({ ok: true, name });
-         }
+            delete loadouts[name];
+            saveShipLoadouts(loadouts);
+            return Response.json({ ok: true, name });
+          }
 
-         // Serve index.css
+          // GET /api/module-loadouts - Load all module loadouts for simulator
+          if (url.pathname === "/api/module-loadouts" && req.method === "GET") {
+            const loadouts = loadModuleLoadouts();
+            return Response.json({ loadouts });
+          }
+
+          // POST /api/module-loadouts - Save a module loadout preset
+          if (url.pathname === "/api/module-loadouts" && req.method === "POST") {
+            const body = await req.json() as { name: string; modules: { weapons: string[]; defense: string[]; utility: string[] }; shipId?: string };
+            if (!body?.name || !body?.modules) {
+              return Response.json({ error: "Missing name or modules" }, { status: 400 });
+            }
+            const loadouts = loadModuleLoadouts();
+            loadouts[body.name] = {
+              modules: body.modules,
+              shipId: body.shipId,
+              savedAt: new Date().toISOString()
+            };
+            saveModuleLoadouts(loadouts);
+            return Response.json({ ok: true, name: body.name });
+          }
+
+          // DELETE /api/module-loadouts/:name - Delete a module loadout
+          if (url.pathname.startsWith("/api/module-loadouts/") && req.method === "DELETE") {
+            const name = decodeURIComponent(url.pathname.slice("/api/module-loadouts/".length));
+            const loadouts = loadModuleLoadouts();
+            if (!(name in loadouts)) {
+              return Response.json({ error: "Loadout not found" }, { status: 404 });
+            }
+            delete loadouts[name];
+            saveModuleLoadouts(loadouts);
+            return Response.json({ ok: true, name });
+          }
+
+          // Serve index.css
+
         if (url.pathname === "/index.css") {
           const cssPath = join(import.meta.dir, "index.css");
           return new Response(readFileSync(cssPath, "utf-8"), {

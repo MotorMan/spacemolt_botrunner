@@ -795,7 +795,7 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   await bot.refreshStatus();
   const hullPct = bot.maxHull > 0 ? (bot.hull / bot.maxHull) * 100 : 100;
-  if (hullPct < 95) {
+  if (hullPct < 100) {
     const startHull = Math.round(hullPct);
 
     // Check if current station has repair service
@@ -813,7 +813,7 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
         bot.docked = true;
         await collectFromStorage(ctx);
         await ensureInsured(ctx);
-      } else {
+        } else {
         ctx.log("error", `Dock at ${repairStation.name} failed: ${dResp.error.message}`);
         return;
         }
@@ -829,20 +829,36 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
 
 export async function topUpShields(ctx: RoutineContext, targetPct: number = 0.8): Promise<void> {
   const { bot } = ctx;
-  if (!bot.maxShield || bot.maxShield <= 0) return;
+  if (!bot.maxShield || bot.maxShield <= 0) {
+    ctx.log("combat", `Shield recharge skipped: maxShield=${bot.maxShield}`);
+    return;
+  }
   await bot.refreshStatus();
+  await bot.refreshCargo();
   const target = Math.floor(bot.maxShield * targetPct);
-  if (bot.shield >= target) return;
+  if (bot.shield >= target) {
+    ctx.log("combat", `Shield recharge skipped: ${bot.shield}/${bot.maxShield} >= ${target} (${Math.round(targetPct * 100)}%)`);
+    return;
+  }
   const deficit = target - bot.shield;
   const needed = Math.ceil(deficit / 100);
   const inventory = bot.inventory || [];
-  const have = inventory.filter(i => i.itemId === "shield_charge").reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const shieldItem = inventory.find(i => 
+    i.itemId?.toLowerCase().includes("shield") && i.itemId?.toLowerCase().includes("charge")
+  );
+  const have = shieldItem?.quantity ?? 0;
   const qty = Math.min(needed, have);
-  if (qty <= 0) return;
-  const resp = await bot.exec("use_item", { id: "shield_charge", quantity: qty });
+  if (qty <= 0) {
+    ctx.log("combat", `No shield charges in cargo (need ${needed}, have ${have})`);
+    return;
+  }
+  ctx.log("combat", `Using ${qty}x shield_charge from ${have} available`);
+  const resp = await bot.exec("use_item", { id: shieldItem!.itemId, quantity: qty });
   if (!resp.error) {
     ctx.log("combat", `Used ${qty}x shield_charge (+${qty * 100} shields to ~${Math.round(targetPct * 100)}%)`);
     await bot.refreshStatus();
+  } else {
+    ctx.log("combat", `Shield recharge failed: ${resp.error.message}`);
   }
 }
 

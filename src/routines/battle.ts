@@ -17,6 +17,11 @@ export type PirateTier = "small" | "medium" | "large" | "capitol" | "boss";
  *
  * This function is kept for backward compatibility but simply waits 10s.
  * The real "wait" happens inside bot.exec() when it awaits the server response.
+ *
+ * Combat stance for hunter bots:
+ *   - FIRE (default): 100% damage dealt - ALWAYS use this stance
+ *   - NO BRACE: Never blocks firing to recover shields (missile ships would use this)
+ *   - NO RETREAT: Stay at engaged range, never move to inner/mid/outer
  */
 export async function waitForServerTick(
   ctx: RoutineContext,
@@ -685,13 +690,10 @@ export async function fightFreshBattle(
     }
   }
 
-  // Tactical combat loop
-  let consecutiveBraceTicks = 0;
-  let lastKnownEnemyZone = "outer";
-  let tickCount = 0;
+  // Tactical combat loop - always stay at engaged, never retreat or brace
   let lastHull = bot.hull;
+  let tickCount = 0;
 
-  // Set initial stance - wait for tick completion
   ctx.log("combat", `Setting initial stance to FIRE...`);
   await bot.exec("battle", { action: "stance", stance: "fire" });
   await ctx.sleep(10000);
@@ -702,7 +704,6 @@ export async function fightFreshBattle(
     if (bot.state !== "running") return false;
     tickCount++;
 
-    // Use non-locking getBattleStatus to check current state
     const status = await getBattleStatus(ctx);
     if (!status) {
       ctx.log("combat", `✅ ${target.name} eliminated — battle complete (${tickCount} ticks, victory!)`);
@@ -715,8 +716,7 @@ export async function fightFreshBattle(
 
     if (targetParticipant && targetParticipant.is_destroyed) {
       ctx.log("combat", `⚠️ ${target.name} marked destroyed but battle still active — waiting...`);
-      // Just loop back - getBattleStatus will show battle ended soon
-      await ctx.sleep(2000); // Brief pause before re-check
+      await ctx.sleep(2000);
       continue;
     }
 
@@ -726,58 +726,26 @@ export async function fightFreshBattle(
     const damageThisTick = Math.max(0, lastHull - bot.hull);
     lastHull = bot.hull;
 
-    // Log state (NO third-party flee — combat routines fight until hull is critical)
     const enemyStance = targetParticipant?.stance || "unknown";
     const enemyZone = targetParticipant?.zone || "unknown";
     ctx.log("combat", `Tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Shields=${shieldPct}% | Dmg=${damageThisTick}`);
 
-    // Decide action
     const zoneDirMap = { outer: 0, mid: 1, inner: 2, engaged: 3 };
     const enemyZoneNum = zoneDirMap[enemyZone as keyof typeof zoneDirMap] ?? 0;
     const ourZoneNum = zoneDirMap[ourCurrentZone as keyof typeof zoneDirMap] ?? 0;
-    const isHighDamageEnemy = damageThisTick > 50 || (target.tier && ["boss", "capitol", "large"].includes(target.tier));
-    const shieldsCritical = isHighDamageEnemy
-      ? (shieldPct < 40 || hullPct < 50)
-      : (shieldPct < 15 && hullPct < 70);
 
-    if (shieldsCritical && consecutiveBraceTicks < 3) {
-      ctx.log("combat", `🛡️ BRACE (${isHighDamageEnemy ? 'high-damage enemy' : 'shields critical'})`);
-      await bot.exec("battle", { action: "stance", stance: "brace" });
-      await ctx.sleep(10000);
-      consecutiveBraceTicks++;
-    } else if (shieldsCritical && consecutiveBraceTicks >= 3) {
-      ctx.log("combat", `⚔️ FIRE (braced ${consecutiveBraceTicks} ticks, switching back)`);
-      await bot.exec("battle", { action: "stance", stance: "fire" });
-      await ctx.sleep(10000);
-      consecutiveBraceTicks = 0;
-    } else if (consecutiveBraceTicks > 0) {
-      ctx.log("combat", `⚔️ FIRE (resuming after brace)`);
-      await bot.exec("battle", { action: "stance", stance: "fire" });
-      await ctx.sleep(10000);
-      consecutiveBraceTicks = 0;
-    } else {
-      if (enemyZoneNum > ourZoneNum) {
-        ctx.log("combat", `⚔️ ADVANCING (enemy in ${enemyZone}, we're in ${ourCurrentZone})`);
-        const advResp = await bot.exec("battle", { action: "advance" });
-        if (!advResp.error) {
-          await ctx.sleep(10000);
-          const newZoneNum = Math.min(3, ourZoneNum + 1);
-          ourCurrentZone = (["outer", "mid", "inner", "engaged"][newZoneNum]) as typeof ourCurrentZone;
-        }
-      } else if (enemyZoneNum <= ourZoneNum && ourZoneNum > 0) {
-        ctx.log("combat", `🔄 RETREAT (maintaining position in ${ourCurrentZone})`);
-        const retResp = await bot.exec("battle", { action: "retreat" });
-        if (!retResp.error) {
-          await ctx.sleep(10000);
-          const newZoneNum = Math.max(0, ourZoneNum - 1);
-          ourCurrentZone = (["outer", "mid", "inner", "engaged"][newZoneNum]) as typeof ourCurrentZone;
-        }
-      } else {
-        ctx.log("combat", `⚔️ ADVANCING to engage`);
-        await bot.exec("battle", { action: "advance" });
+    // Always FIRE stance - never brace
+    if (enemyZoneNum > ourZoneNum && ourZoneNum < 3) {
+      ctx.log("combat", `⚔️ ADVANCING to engaged (enemy in ${enemyZone})`);
+      const advResp = await bot.exec("battle", { action: "advance" });
+      if (!advResp.error) {
         await ctx.sleep(10000);
-        ourCurrentZone = "mid";
+        ourCurrentZone = "engaged";
       }
+    } else {
+      // Stay and fire - no retreat
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      await ctx.sleep(10000);
     }
   }
 }
@@ -793,16 +761,12 @@ export async function fightJoinedBattle(
 
   ctx.log("combat", `🎯 Fighting in joined battle${target ? ` — targeting ${target.name}` : ''}`);
 
-  // Set target and fire stance - start acting immediately
   ctx.log("combat", `Setting target and stance...`);
   if (target) {
     await bot.exec("battle", { action: "target", target_id: target.id });
   }
   await bot.exec("battle", { action: "stance", stance: "fire" });
-  // No artificial delay — battle is already running, act on next tick
 
-  // Tactical combat loop
-  let consecutiveBraceTicks = 0;
   let lastKnownEnemyZone = "outer";
   let tickCount = 0;
 
@@ -810,7 +774,6 @@ export async function fightJoinedBattle(
     if (bot.state !== "running") return false;
     tickCount++;
 
-    // Use non-locking getBattleStatus to check current state
     const status = await getBattleStatus(ctx);
     if (!status) {
       ctx.log("combat", `✅ Battle complete — victory! (${tickCount} ticks)`);
@@ -823,7 +786,6 @@ export async function fightJoinedBattle(
 
     if (targetParticipant && targetParticipant.is_destroyed && target) {
       ctx.log("combat", `⚠️ ${target.name} marked destroyed but battle still active — waiting...`);
-      // Brief pause before re-check (non-locking getBattleStatus will show battle ended)
       await ctx.sleep(2000);
       continue;
     }
@@ -832,7 +794,6 @@ export async function fightJoinedBattle(
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
 
-    // Track enemy zone
     if (targetParticipant && targetParticipant.zone) {
       if (targetParticipant.zone !== lastKnownEnemyZone) {
         const zoneDir = { outer: 0, mid: 1, inner: 2, engaged: 3 };
@@ -847,57 +808,29 @@ export async function fightJoinedBattle(
       }
     }
 
-    // Flee check (ONLY based on hull)
     if (hullPct <= fleeThreshold) {
       ctx.log("combat", `💀 Hull critical (${hullPct}%) — FLEEING!`);
       await emergencyFleeSpam(ctx, `hull at ${hullPct}%`);
       return false;
     }
 
-    // Log state
     const enemyStance = targetParticipant?.stance || "unknown";
     const enemyZone = targetParticipant?.zone || "unknown";
     ctx.log("combat", `Tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Shields=${shieldPct}%`);
 
-    // Decide action
     const zoneDirMap = { outer: 0, mid: 1, inner: 2, engaged: 3 };
     const enemyZoneNum = zoneDirMap[enemyZone as keyof typeof zoneDirMap] ?? 0;
     const ourZone = status.your_zone || "outer";
     const ourZoneNum = zoneDirMap[ourZone as keyof typeof zoneDirMap] ?? 0;
-    const isHighDamageEnemy = target && target.tier && ["boss", "capitol", "large"].includes(target.tier);
-    const shieldsCritical = isHighDamageEnemy
-      ? (shieldPct < 40 || hullPct < 50)
-      : (shieldPct < 15 && hullPct < 70);
 
-    if (shieldsCritical && consecutiveBraceTicks < 3) {
-      ctx.log("combat", `🛡️ BRACE (${isHighDamageEnemy ? 'high-damage enemy' : 'shields critical'})`);
-      await bot.exec("battle", { action: "stance", stance: "brace" });
+    // Always FIRE stance - never brace, never retreat
+    if (enemyZoneNum > ourZoneNum && ourZoneNum < 3) {
+      ctx.log("combat", `⚔️ ADVANCING to engaged (enemy in ${enemyZone})`);
+      await bot.exec("battle", { action: "advance" });
       await ctx.sleep(10000);
-      consecutiveBraceTicks++;
-    } else if (shieldsCritical && consecutiveBraceTicks >= 3) {
-      ctx.log("combat", `⚔️ FIRE (braced ${consecutiveBraceTicks} ticks, switching back)`);
-      await bot.exec("battle", { action: "stance", stance: "fire" });
-      await ctx.sleep(10000);
-      consecutiveBraceTicks = 0;
-    } else if (consecutiveBraceTicks > 0) {
-      ctx.log("combat", `⚔️ FIRE (resuming after brace)`);
-      await bot.exec("battle", { action: "stance", stance: "fire" });
-      await ctx.sleep(10000);
-      consecutiveBraceTicks = 0;
     } else {
-      if (enemyZoneNum > ourZoneNum) {
-        ctx.log("combat", `⚔️ ADVANCING (enemy in ${enemyZone}, we're in ${ourZone})`);
-        await bot.exec("battle", { action: "advance" });
-        await ctx.sleep(10000);
-      } else if (enemyZoneNum <= ourZoneNum && ourZoneNum > 0) {
-        ctx.log("combat", `🔄 RETREAT (maintaining position)`);
-        await bot.exec("battle", { action: "retreat" });
-        await ctx.sleep(10000);
-      } else {
-        ctx.log("combat", `⚔️ ADVANCING to engage`);
-        await bot.exec("battle", { action: "advance" });
-        await ctx.sleep(10000);
-      }
+      await bot.exec("battle", { action: "stance", stance: "fire" });
+      await ctx.sleep(10000);
     }
   }
 }

@@ -10,8 +10,9 @@
  *      insure ship, refuel, repair
  *
  * Combat stances:
- *   - Fire   (default): 100% damage dealt/taken
- *   - Brace  (shields critical): 0% damage dealt, shields regen 2x — use briefly to recover
+ *   - Fire   (default): 100% damage dealt — ALWAYS used
+ *   - No Brace: Never blocks firing to recover shields (missile ships would use this)
+ *   - No Retreat: Stay at engaged range, never move to inner/mid/outer (moving costs damage ticks)
  *   - Flee   (hull critical): auto-retreat — triggers when hull <= fleeThreshold
  *
  * Settings (data/settings.json under "hunter"):
@@ -1691,6 +1692,9 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
   // Always try to refuel when docked at home base (free fuel)
   await tryRefuel(ctx);
+
+  // Repair hull if damaged
+  await repairShip(ctx);
 
   await bot.refreshStatus();
   await bot.refreshCargo();

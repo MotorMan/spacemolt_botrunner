@@ -80,10 +80,11 @@
         <button class="sm" onclick="toggleRoutineGroupsLayout()" title="Switch back to Table view">📊 Groups View</button>
       </div>
     </div>
-     <div class="bot-table-wrap" id="originalTableWrap">
+<div class="bot-table-wrap" id="originalTableWrap">
        <div class="bot-table-header">
-         <span>Bots</span>
-         <span id="bandwidthDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">BW: 0.0 KB/s ↓ | 0.0 b/s ↑</span>
+          <span>Bots</span>
+          <span id="factionFuelDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">Fuel: 0.0K</span>
+          <span id="bandwidthDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">BW: 0.0 KB/s ↓ | 0.0 b/s ↑</span>
          <div style="display:flex;gap:8px;align-items:center;">
           <button class="sm" id="aiChatToggleBtn" onclick="toggleAiChat()" title="Enable/Disable AI Chat">
             <span id="aiChatToggleIcon">🔌</span> <span id="aiChatToggleText">AI Chat: Off</span>
@@ -846,6 +847,13 @@ async function fetchInitialData() {
       name: e.name || '?',
       quantity: e.quantity || 0,
     }));
+    factionFuelReserve = factionStorageRes?.factionFuelReserve || 0;
+    factionFuelCapacity = factionStorageRes?.factionFuelCapacity || 0;
+    const fuelDisplayEl = document.getElementById('factionFuelDisplay');
+    if (fuelDisplayEl) {
+      const fuelK = (factionFuelReserve / 1000).toFixed(1);
+      fuelDisplayEl.textContent = `Fuel: ${fuelK}K`;
+    }
     renderBots();
     renderStats();
     updateChatBotSelect();
@@ -1889,12 +1897,17 @@ function renderStats() {
 let _factionFundsInFlight = false;
 /** Fetch faction treasury in the background for the stats bar. */
 function refreshFactionFunds() {
+  const fuelDisplayEl = document.getElementById('factionFuelDisplay');
+  if (fuelDisplayEl) {
+    const fuelK = (factionFuelReserve / 1000).toFixed(1);
+    fuelDisplayEl.textContent = `Fuel: ${fuelK}K`;
+  }
   if (_factionFundsInFlight) return;
   // faction_info does not return credits/treasury — use view_faction_storage which does,
   // but it requires docking. Prefer a docked running bot; fall back to any docked bot.
   const docked = bots.filter(b => b.docked);
   const pick = docked.find(b => b.state === 'running') ?? docked[0] ?? null;
-  if (!pick) return; // no docked bot — try again next tick
+  if (!pick) return; // no docked bot — display already shows cached data
 
   _factionFundsInFlight = true;
   sendExec(pick.username, 'view_faction_storage', undefined, (result) => {
@@ -1908,6 +1921,16 @@ function refreshFactionFunds() {
         document.getElementById('statFaction').textContent = label;
         const pEl = document.getElementById('pStatFaction');
         if (pEl) pEl.textContent = label;
+      }
+      const fuelReserve = result.data.factionFuelReserve ?? 0;
+      const fuelCapacity = result.data.factionFuelCapacity ?? 0;
+      if (fuelCapacity > 0) {
+        factionFuelReserve = fuelReserve;
+        factionFuelCapacity = fuelCapacity;
+      }
+      if (fuelDisplayEl) {
+        const fuelK = (factionFuelReserve / 1000).toFixed(1);
+        fuelDisplayEl.textContent = `Fuel: ${fuelK}K`;
       }
     }
   });
@@ -10993,6 +11016,8 @@ let showConsolidatedMissions = false; // Toggle for consolidated view
 let factionSelectedBot = null;
 let factionData = null; // cached faction_info result
 let factionTreasury = null; // cached credit balance from view_faction_storage
+let factionFuelReserve = 0; // cached fuel reserve from view_faction_storage
+let factionFuelCapacity = 0; // cached fuel capacity from view_faction_storage
 let factionActivePanel = 'overview'; // overview | members | storage | facilities | diplomacy | intel | rooms | missions | activity
 let factionLogLines = [];       // all faction log entries
 let factionLogFilter = 'all';   // 'all' | 'deposit' | 'withdraw' | 'donation' | 'gift'
@@ -12293,12 +12318,19 @@ function fetchFactionStorage(username) {
     const d = result.data;
     const items = Array.isArray(d) ? d : (Array.isArray(d.items) ? d.items : Array.isArray(d.storage) ? d.storage : []);
     const credits = d.credits ?? d.treasury ?? null;
+    const fuelReserve = d.factionFuelReserve ?? 0;
+    const fuelCapacity = d.factionFuelCapacity ?? 0;
 
     let html = '';
     if (credits !== null) {
       html += `<div class="faction-storage-row"><span style="color:var(--yellow)">Credits</span><span>${Number(credits).toLocaleString()}cr</span></div>`;
     }
-    if (items.length === 0 && credits === null) {
+    if (fuelCapacity > 0) {
+      const fuelPct = Math.round((fuelReserve / fuelCapacity) * 100);
+      const fuelColor = fuelPct > 50 ? 'var(--green)' : fuelPct > 20 ? 'var(--yellow)' : 'var(--red)';
+      html += `<div class="faction-storage-row"><span style="color:${fuelColor}">Fuel</span><span>${Number(fuelReserve).toLocaleString()}/${Number(fuelCapacity).toLocaleString()}</span></div>`;
+    }
+    if (items.length === 0 && credits === null && fuelCapacity === 0) {
       html = '<div class="faction-no-data">Storage is empty</div>';
     } else {
       html += items.map(i => {
@@ -20828,7 +20860,13 @@ async function loadGlobalFactionStorage() {
       name: e.name || '?',
       quantity: e.quantity || 0,
     }));
+    factionFuelReserve = data.factionFuelReserve || 0;
     console.log('Loaded faction storage items:', globalFactionStorage.length);
+    const fuelDisplayEl = document.getElementById('factionFuelDisplay');
+    if (fuelDisplayEl) {
+      const fuelK = (factionFuelReserve / 1000).toFixed(1);
+      fuelDisplayEl.textContent = `Fuel: ${fuelK}K`;
+    }
     // Re-render market if visible
     if (document.getElementById('page-market')?.classList.contains('active')) {
       renderMarketTable();

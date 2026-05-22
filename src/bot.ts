@@ -137,6 +137,12 @@ export class Bot {
   /** Cached faction ID from last get_status (null if not in a faction). */
   faction: string | null = null;
 
+  /** Cached faction fuel reserve from last view_faction_storage. */
+  factionFuelReserve: number = 0;
+
+  /** Cached faction fuel capacity from last view_faction_storage. */
+  factionFuelCapacity: number = 0;
+
   /** Whether the bot's ship is currently cloaked. */
   isCloaked = false;
 
@@ -1009,9 +1015,11 @@ export class Bot {
         const cacheFile = join(process.cwd(), "data", "factionStorage.json");
         if (existsSync(cacheFile)) {
           const content = readFileSync(cacheFile, "utf-8");
-          const cached = JSON.parse(content) as { factionName: string; entries: any[] };
+          const cached = JSON.parse(content) as { factionName: string; entries: any[]; factionFuelReserve?: number; factionFuelCapacity?: number };
           this.faction = cached.factionName;
           this.factionStorage = cached.entries;
+          this.factionFuelReserve = cached.factionFuelReserve || 0;
+          this.factionFuelCapacity = cached.factionFuelCapacity || 0;
           this.log("info", `Loaded faction storage from cache: ${cached.factionName} (${cached.entries.length} items)`);
           return;
         }
@@ -1029,12 +1037,15 @@ export class Bot {
       // Don't reset factionStorage to empty on error - keep cached data
       return;
     }
-    const entries = this.parseItemList(resp.result);
+    const result = resp.result as Record<string, unknown>;
+    const entries = this.parseItemList(result);
     if (entries.length === 0) {
       this.log("warn", "Faction storage refresh returned 0 items");
     }
     this.factionStorage = entries;
-    updateFactionStorageCache(factionName, entries);
+    this.factionFuelReserve = (result.faction_fuel_reserve as number) || 0;
+    this.factionFuelCapacity = (result.faction_fuel_capacity as number) || 0;
+    updateFactionStorageCache(factionName, entries, this.factionFuelReserve, this.factionFuelCapacity);
   }
 
   /** Start running a routine. */

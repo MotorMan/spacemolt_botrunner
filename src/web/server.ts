@@ -500,7 +500,11 @@ export class WebServer {
             const data = JSON.parse(raw);
             // Normalize: entries may be under "entries" or "items"
             const items = data.entries || data.items || [];
-            return Response.json({ items });
+            return Response.json({
+              items,
+              factionFuelReserve: data.factionFuelReserve || 0,
+              factionFuelCapacity: data.factionFuelCapacity || 0,
+            });
           } catch {
             return Response.json({ items: [] });
           }

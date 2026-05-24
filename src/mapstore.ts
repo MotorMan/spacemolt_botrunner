@@ -193,6 +193,8 @@ export interface StoredSystem {
   id: string;
   name: string;
   security_level?: string;
+  /** Galactic coordinates (from get_map or public /api/map) */
+  position?: { x: number; y: number };
   connections: StoredConnection[];
   pois: StoredPOI[];
   /** Wormholes that have an exit in this system */
@@ -369,6 +371,22 @@ class MapStore {
       || (systemData.security as string)
       || (systemData.police_level as string)
       || sys.security_level;
+
+    // Merge position (supports nested "position": {x,y} from get_map and flat x,y from public /api/map)
+    let posX: number | undefined;
+    let posY: number | undefined;
+    const nestedPos = systemData.position as Record<string, unknown> | undefined;
+    if (nestedPos && typeof nestedPos.x === "number" && typeof nestedPos.y === "number") {
+      posX = nestedPos.x;
+      posY = nestedPos.y;
+    } else if (typeof systemData.x === "number" && typeof systemData.y === "number") {
+      posX = systemData.x as number;
+      posY = systemData.y as number;
+    }
+    if (typeof posX === "number" && typeof posY === "number") {
+      sys.position = { x: posX, y: posY };
+    }
+
     sys.last_updated = now();
 
     // Merge connections

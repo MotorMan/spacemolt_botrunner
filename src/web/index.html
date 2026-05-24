@@ -16163,6 +16163,8 @@ function renderHunterSettings(panel) {
   const repairThreshold = h.repairThreshold ?? 30;
   const fleeThreshold = h.fleeThreshold ?? 20;
   const shieldRechargePct = h.shieldRechargePct ?? 80;
+  const desiredShieldCharges = h.desiredShieldCharges ?? 20;
+  const desiredRepairKits = h.desiredRepairKits ?? 12;
   const onlyNPCs = h.onlyNPCs !== false;
   const responseRange = h.responseRange ?? 3;
   const maxAttackTier = h.maxAttackTier || 'large';
@@ -16319,6 +16321,22 @@ function renderHunterSettings(panel) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Desired Shield Charges</div>
+        <div class="setting-hint">Target number of shield_charge items to keep in cargo after resupply (for in-combat and post-battle top-ups).</div>
+      </div>
+      <input type="number" id="set-hunter-desiredShieldCharges" min="0" max="50" value="${desiredShieldCharges}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Desired Repair Kits</div>
+        <div class="setting-hint">Target number of repair kits (advanced + regular) to keep in cargo after resupply (for in-combat and post-battle field repairs).</div>
+      </div>
+      <input type="number" id="set-hunter-desiredRepairKits" min="0" max="30" value="${desiredRepairKits}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Attack Mode</div>
         <div class="setting-hint">Restrict attacks to NPC pirates only, or also engage hostile players.</div>
       </div>
@@ -16416,6 +16434,8 @@ function saveHunterSettings() {
     repairThreshold: parseInt(document.getElementById('set-hunter-repairThreshold').value) || 30,
     fleeThreshold: parseInt(document.getElementById('set-hunter-fleeThreshold').value) || 20,
     shieldRechargePct: parseInt(document.getElementById('set-hunter-shieldRechargePct').value) || 80,
+    desiredShieldCharges: parseInt(document.getElementById('set-hunter-desiredShieldCharges').value) || 20,
+    desiredRepairKits: parseInt(document.getElementById('set-hunter-desiredRepairKits').value) || 12,
     onlyNPCs: document.getElementById('set-hunter-onlyNPCs').value === 'true',
     maxAttackTier: document.getElementById('set-hunter-maxAttackTier').value,
     fleeFromTier: document.getElementById('set-hunter-fleeFromTier').value,

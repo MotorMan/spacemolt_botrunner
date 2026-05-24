@@ -827,18 +827,18 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
   }
 }
 
-export async function topUpShields(ctx: RoutineContext, targetPct: number = 0.8): Promise<void> {
+export async function topUpShields(ctx: RoutineContext, targetPct: number = 0.8): Promise<boolean> {
   const { bot } = ctx;
   if (!bot.maxShield || bot.maxShield <= 0) {
     ctx.log("combat", `Shield recharge skipped: maxShield=${bot.maxShield}`);
-    return;
+    return false;
   }
   await bot.refreshStatus();
   await bot.refreshCargo();
   const target = Math.floor(bot.maxShield * targetPct);
   if (bot.shield >= target) {
     ctx.log("combat", `Shield recharge skipped: ${bot.shield}/${bot.maxShield} >= ${target} (${Math.round(targetPct * 100)}%)`);
-    return;
+    return false;
   }
   const deficit = target - bot.shield;
   const needed = Math.ceil(deficit / 100);
@@ -850,15 +850,55 @@ export async function topUpShields(ctx: RoutineContext, targetPct: number = 0.8)
   const qty = Math.min(needed, have);
   if (qty <= 0) {
     ctx.log("combat", `No shield charges in cargo (need ${needed}, have ${have})`);
-    return;
+    return false;
   }
   ctx.log("combat", `Using ${qty}x shield_charge from ${have} available`);
   const resp = await bot.exec("use_item", { id: shieldItem!.itemId, quantity: qty });
   if (!resp.error) {
     ctx.log("combat", `Used ${qty}x shield_charge (+${qty * 100} shields to ~${Math.round(targetPct * 100)}%)`);
     await bot.refreshStatus();
+    return true;
   } else {
     ctx.log("combat", `Shield recharge failed: ${resp.error.message}`);
+    return false;
+  }
+}
+
+export async function useRepairKits(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  await bot.refreshStatus(); // ensure docked flag is fresh
+  if (bot.docked) {
+    return false; // never burn expensive repair kits at a station — repairShip() uses the station's repair command instead
+  }
+  await bot.refreshCargo();
+  const deficit = (bot.maxHull || 0) - (bot.hull || 0);
+  if (deficit <= 100) {
+    return false;
+  }
+  const inventory = bot.inventory || [];
+  // Prefer advanced (150 hull) then regular (50 hull)
+  let kitItem = inventory.find(i => (i.itemId || "").toLowerCase() === "advanced_repair_kit");
+  let hpPer = 150;
+  if (!kitItem || (kitItem.quantity ?? 0) <= 0) {
+    kitItem = inventory.find(i => (i.itemId || "").toLowerCase() === "repair_kit");
+    hpPer = 50;
+  }
+  const have = kitItem?.quantity ?? 0;
+  if (have <= 0) {
+    ctx.log("combat", `No repair kits in cargo (hull deficit ${deficit} > 100)`);
+    return false;
+  }
+  const needed = Math.ceil(deficit / hpPer);
+  const qty = Math.min(needed, have);
+  ctx.log("combat", `Using ${qty}x ${kitItem!.itemId} to repair ~${qty * hpPer} hull (deficit ${deficit})`);
+  const resp = await bot.exec("use_item", { id: kitItem!.itemId, quantity: qty });
+  if (!resp.error) {
+    ctx.log("combat", `Used ${qty}x ${kitItem!.itemId} (+~${qty * hpPer} hull)`);
+    await bot.refreshStatus();
+    return true;
+  } else {
+    ctx.log("combat", `Repair kit use failed: ${resp.error.message}`);
+    return false;
   }
 }
 

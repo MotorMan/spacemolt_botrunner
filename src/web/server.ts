@@ -730,11 +730,11 @@ export class WebServer {
 
         // Crafting Loadouts endpoints
         const LOADOUTS_FILE = join(DATA_DIR, "craftingLoadouts.json");
+        const MODULE_LOADOUTS_FILE = join(DATA_DIR, "moduleLoadouts.json");
 
         interface CraftingLoadoutFile {
           crafting?: Record<string, Record<string, number>>;
           ship?: Record<string, ShipLoadout>;
-          moduleLoadouts?: Record<string, ModuleLoadout>;
         }
 
         interface ModuleLoadout {
@@ -806,12 +806,34 @@ export class WebServer {
         }
 
         function loadModuleLoadouts(): Record<string, ModuleLoadout> {
+          // Dedicated file (preferred)
+          if (existsSync(MODULE_LOADOUTS_FILE)) {
+            try {
+              const data = JSON.parse(readFileSync(MODULE_LOADOUTS_FILE, "utf-8"));
+              return data || {};
+            } catch (err) {
+              console.warn(`Warning: corrupt moduleLoadouts.json —`, err);
+              return {};
+            }
+          }
+
+          // One-time migration from old craftingLoadouts.json
           if (existsSync(LOADOUTS_FILE)) {
             try {
-              const data: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
-              return data.moduleLoadouts || {};
+              const old: any = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              const migrated = old.moduleLoadouts || {};
+              if (Object.keys(migrated).length > 0) {
+                if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+                writeFileSync(MODULE_LOADOUTS_FILE, JSON.stringify(migrated, null, 2) + "\n", "utf-8");
+                console.log(`Migrated ${Object.keys(migrated).length} module presets to data/moduleLoadouts.json`);
+
+                // Strip from old file to prevent future mix-ups
+                delete old.moduleLoadouts;
+                writeFileSync(LOADOUTS_FILE, JSON.stringify(old, null, 2) + "\n", "utf-8");
+              }
+              return migrated;
             } catch (err) {
-              console.warn(`Warning: corrupt craftingLoadouts.json (moduleLoadouts section) —`, err);
+              console.warn(`Warning during module loadouts migration —`, err);
             }
           }
           return {};
@@ -819,18 +841,7 @@ export class WebServer {
 
         function saveModuleLoadouts(loadouts: Record<string, ModuleLoadout>): void {
           if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-          let fileData: CraftingLoadoutFile = { crafting: {}, ship: {}, moduleLoadouts: loadouts };
-          if (existsSync(LOADOUTS_FILE)) {
-            try {
-              const existing: CraftingLoadoutFile = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
-              fileData.crafting = existing.crafting || {};
-              fileData.ship = existing.ship || {};
-            } catch (err) {
-              // ignore, use empty sections
-            }
-          }
-          fileData.moduleLoadouts = loadouts;
-          writeFileSync(LOADOUTS_FILE, JSON.stringify(fileData, null, 2) + "\n", "utf-8");
+          writeFileSync(MODULE_LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
         }
 
         // GET /api/facilities - Get cached facility types

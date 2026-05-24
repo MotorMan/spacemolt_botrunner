@@ -21,6 +21,9 @@
  *   repairThreshold — hull % to abort patrol and dock (default: 30)
  *   fleeThreshold   — hull % to flee an active fight (default: 20)
  *   shieldRechargePct — post-battle shield % to top up to with shield_charge items (default: 80)
+ *   desiredShieldCharges — how many shield_charge the bot tries to keep stocked (default: 20)
+ *   desiredRepairKits    — how many repair kits (advanced + regular) the bot tries to keep stocked (default: 12)
+ *   Auto-uses repair kits (advanced_repair_kit preferred, then repair_kit) from cargo after fights when hull deficit > 100
  *   onlyNPCs        — only attack NPC pirates, never players (default: true)
  */
 
@@ -57,6 +60,7 @@ import {
   checkBattleAfterCommand,
   getItemSize,
   topUpShields,
+  useRepairKits,
 } from "./common.js";
 
 import type { PirateTier, NearbyEntity } from "./battle.js";
@@ -72,7 +76,7 @@ import {
   getWeaponModules,
 } from "./battle.js";
 
-async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier): Promise<void> {
+async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier, repairThreshold: number = 0): Promise<void> {
   const battleStatus = await getBattleStatus(ctx);
   if (!battleStatus) return;
 
@@ -98,7 +102,12 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
   // Pick a real target from battle participants so we get the full combat loop
   const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
   const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
-  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier);
+  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold);
+
+  // Ensure shields are topped up after handling/fighting an unexpected battle
+  const hsettings = getHunterSettings(ctx.bot.username);
+  await topUpShields(ctx, (hsettings.shieldRechargePct ?? 80) / 100);
+  await useRepairKits(ctx);
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -134,6 +143,8 @@ function getHunterSettings(username?: string): {
   singleLoop: boolean;
   homeSystem: string;
   homeStation: string;
+  desiredShieldCharges: number;
+  desiredRepairKits: number;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -176,6 +187,8 @@ function getHunterSettings(username?: string): {
     singleLoop: (h.singleLoop as boolean) ?? false,
     homeSystem: (botOverrides.homeSystem as string) || (botOverrides.hunterHomeSystem as string) || (h.homeSystem as string) || (all.return_home?.homeSystem as string) || "",
     homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || "",
+    desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
+    desiredRepairKits: (h.desiredRepairKits as number) ?? 12,
   };
 }
 
@@ -207,6 +220,17 @@ export function assignBotToHunterPatrol(username: string, patrolProfileName: str
   if (!h.botHunterPatrolAssignments) h.botHunterPatrolAssignments = {};
   h.botHunterPatrolAssignments[username] = patrolProfileName;
   writeSettings({ hunter: h });
+}
+
+/** Returns true if the bot is low on field repair consumables and should return to resupply. */
+function isLowOnFieldConsumables(inventory: any[] | undefined, minRepairKits = 5, minShieldCharges = 5): boolean {
+  const repair = (inventory || [])
+    .filter(i => (i.itemId || "").toLowerCase().includes("repair_kit"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const shields = (inventory || [])
+    .filter(i => (i.itemId || "").toLowerCase().includes("shield_charge"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+  return repair < minRepairKits || shields < minShieldCharges;
 }
 
 // ── Security level helpers ────────────────────────────────────
@@ -551,6 +575,9 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
     await ensureHunterResupply(ctx);
   }
 
+  // Field repair using cargo kits on routine start (in case started with battle damage and not docked)
+  await useRepairKits(ctx);
+
   if (initialSettings.mode === "roam_system") {
     yield* roamSystemRoutine(ctx);
     return;
@@ -772,7 +799,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               ctx.log("combat", `🚨 Threat(s) detected: ${threats.map(t => t.name).join(", ")}`);
               // Engage the threats
               for (const threat of threats) {
-                const won = await engageTarget(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+                const won = await engageTarget(ctx, threat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
                 if (!won) {
                   ctx.log("combat", "Retreated from threat — aborting patrol");
                   abortPatrol = true;
@@ -782,6 +809,10 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               if (abortPatrol) break;
             }
           }
+          // top up after engaging threats that interrupted travel
+          const tsettings = getHunterSettings(bot.username);
+          await topUpShields(ctx, (tsettings.shieldRechargePct ?? 80) / 100);
+          await useRepairKits(ctx);
         }
         continue;
       }
@@ -802,7 +833,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       bot.trackNearbyPlayers(nearbyResp.result);
 
       // Check if we got pulled into battle during scanning
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
 
       // Immediate reaction to pirate scan notification (NPC only, not player scans)
       if (nearbyResp.notifications) {
@@ -817,8 +848,12 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               const scanEntities = parseNearby(scanNearby.result);
               const scanTargets = scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
               for (const t of scanTargets) {
-                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
               }
+              // top up shields after immediate scan-target engagements (no per-target post-battle block)
+              const ssettings = getHunterSettings(bot.username);
+              await topUpShields(ctx, (ssettings.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
             }
             break;
           }
@@ -848,6 +883,8 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           abortPatrol = true;
           break;
         }
+
+        await useRepairKits(ctx); // use cargo kits if hull deficit >100 before engaging
 
         // CRITICAL: Check if we're already in battle before engaging
         // A pirate might have attacked us while we were doing other actions
@@ -879,7 +916,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         }
 
         yield "engage";
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
 
         if (won) {
           totalKills++;
@@ -904,7 +941,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               for (const newThreat of newThreats) {
                 if (bot.state !== "running") break;
                 
-                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
                 if (newWon) {
                   totalKills++;
                   patrolKills++;
@@ -935,6 +972,12 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           }
 
           await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+          await useRepairKits(ctx);
+          await bot.refreshCargo();
+          if (isLowOnFieldConsumables(bot.inventory)) {
+            ctx.log("combat", "Low on repair kits or shield charges — aborting patrol to resupply");
+            abortPatrol = true;
+          }
           await bot.refreshStatus();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
         } else {
@@ -1185,7 +1228,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       bot.trackNearbyPlayers(nearbyResp.result);
 
       // Check if we got pulled into battle during scanning
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
 
       // Immediate reaction to pirate scan notification (NPC only, not player scans)
       if (nearbyResp.notifications) {
@@ -1200,8 +1243,12 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               const scanEntities = parseNearby(scanNearby.result);
               const scanTargets = scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
               for (const t of scanTargets) {
-                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
               }
+              // top up shields after immediate scan-target engagements (no per-target post-battle block)
+              const ssettings = getHunterSettings(bot.username);
+              await topUpShields(ctx, (ssettings.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
             }
             break;
           }
@@ -1232,6 +1279,8 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           break;
         }
 
+        await useRepairKits(ctx); // use cargo kits if hull deficit >100 before engaging
+
         // Pre-fight ammo check
         const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
         if (!hasAmmo) {
@@ -1241,7 +1290,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         }
 
         yield "engage";
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
 
         if (won) {
           totalKills++;
@@ -1265,7 +1314,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               for (const newThreat of newThreats) {
                 if (bot.state !== "running") break;
 
-                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
                 if (newWon) {
                   totalKills++;
                   patrolKills++;
@@ -1297,6 +1346,12 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           }
 
           await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+          await useRepairKits(ctx);
+          await bot.refreshCargo();
+          if (isLowOnFieldConsumables(bot.inventory)) {
+            ctx.log("combat", "Low on repair kits or shield charges — aborting patrol to resupply");
+            abortPatrol = true;
+          }
           await bot.refreshStatus();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
         } else {
@@ -1483,7 +1538,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       bot.trackNearbyPlayers(nearbyResp.result);
 
       // Check if we got pulled into battle during scanning
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
 
       // Immediate reaction to pirate scan notification (NPC only, not player scans)
       if (nearbyResp.notifications) {
@@ -1498,8 +1553,12 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
               const scanEntities = parseNearby(scanNearby.result);
               const scanTargets = scanEntities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
               for (const t of scanTargets) {
-                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+                await engageTarget(ctx, t, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
               }
+              // top up shields after immediate scan-target engagements (no per-target post-battle block)
+              const ssettings = getHunterSettings(bot.username);
+              await topUpShields(ctx, (ssettings.shieldRechargePct ?? 80) / 100);
+              await useRepairKits(ctx);
             }
             break;
           }
@@ -1529,6 +1588,8 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         break;
       }
 
+      await useRepairKits(ctx); // use cargo kits if hull deficit >100 before engaging
+
       // Pre-fight ammo check
       const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
       if (!hasAmmo) {
@@ -1537,7 +1598,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         }
 
         yield "engage";
-        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+        const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
 
         if (won) {
           totalKills++;
@@ -1548,7 +1609,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         const safetyCheckResp = await bot.exec("get_nearby");
         if (!safetyCheckResp.error) {
           bot.trackNearbyPlayers(safetyCheckResp.result);
-          await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier);
+          await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
           const nearbyEntities = parseNearby(safetyCheckResp.result);
           const newThreats = nearbyEntities.filter(e =>
             isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier) &&
@@ -1561,7 +1622,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             for (const newThreat of newThreats) {
               if (bot.state !== "running") break;
 
-                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+                const newWon = await engageTarget(ctx, newThreat, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
                 if (newWon) {
                 totalKills++;
                 ctx.log("combat", `Kill #${totalKills} (additional threat)`);
@@ -1586,6 +1647,12 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           }
 
           await topUpShields(ctx, (settings.shieldRechargePct ?? 80) / 100);
+          await useRepairKits(ctx);
+          await bot.refreshCargo();
+          if (isLowOnFieldConsumables(bot.inventory)) {
+            ctx.log("combat", "Low on repair kits or shield charges — stopping to resupply");
+            break;
+          }
           await bot.refreshStatus();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
 
@@ -1667,11 +1734,21 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         const entities = parseNearby(nearbyResp.result);
         const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
         for (const target of targets) {
+          await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
-          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
           if (won) {
             totalKills++;
             await scavengeWrecks(ctx);
+            // top up shields (this path previously had no shield recharge after kills)
+            const csettings = getHunterSettings(bot.username);
+            await topUpShields(ctx, (csettings.shieldRechargePct ?? 80) / 100);
+            await useRepairKits(ctx);
+            await bot.refreshCargo();
+            if (isLowOnFieldConsumables(bot.inventory)) {
+              ctx.log("combat", "Low on repair kits or shield charges — stopping to resupply");
+              break;
+            }
           }
         }
       }
@@ -1697,7 +1774,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
 }
 
 /** Hunter resupply: ammo, advanced repair kits, and military fuel cells from faction storage or station. */
-async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
+export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
 
   if (!bot.docked) return;
@@ -1857,10 +1934,12 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     ctx.log("trade", "No suitable ammo found for equipped weapons — skipping ammo resupply");
   }
 
+  const hs = getHunterSettings(bot.username);
+  const desiredRepair = hs.desiredRepairKits ?? 12;
+
   // 2. Repair kits (~10) - try advanced first, then fallback to regular (top off only)
   const repairKits = ["advanced_repair_kit", "repair_kit"];
   let gotRepairKits = false;
-  const desiredRepair = 12;
   const repairToGet = Math.max(0, desiredRepair - currentRepair);
   for (const kitId of repairKits) {
     const kitSize = getItemSize(kitId);
@@ -1884,9 +1963,11 @@ async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     ctx.log("trade", "Repair kits: relying on faction storage");
   }
 
+  const desiredShield = hs.desiredShieldCharges ?? 20;
+
   const shieldIds = ["shield_charge"];
   let gotShield = false;
-  const shieldToGet = Math.max(0, 20 - currentShield);
+  const shieldToGet = Math.max(0, desiredShield - currentShield);
   for (const shId of shieldIds) {
     const shSize = getItemSize(shId);
     const shQty = Math.min(shieldToGet, Math.floor(freeSpace / shSize));
@@ -2022,11 +2103,21 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         const entities = parseNearby(nearbyResp.result);
         const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
         for (const target of targets) {
+          await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
           await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
-          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates);
+          const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
           if (won) {
             totalKills++;
             await scavengeWrecks(ctx);
+            // top up shields (this path previously had no shield recharge after kills)
+            const csettings = getHunterSettings(bot.username);
+            await topUpShields(ctx, (csettings.shieldRechargePct ?? 80) / 100);
+            await useRepairKits(ctx);
+            await bot.refreshCargo();
+            if (isLowOnFieldConsumables(bot.inventory)) {
+              ctx.log("combat", "Low on repair kits or shield charges — stopping to resupply");
+              break;
+            }
           }
         }
       }

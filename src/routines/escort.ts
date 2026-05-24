@@ -69,6 +69,7 @@ import {
   engageTarget as battleEngageTarget,
   fightJoinedBattle,
 } from "./battle.js";
+import { ensureHunterResupply } from "./hunter.js";
 
 // ── Tier helpers ─────────────────────────────────────────────
 
@@ -530,6 +531,13 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
   };
 
   await bot.refreshStatus();
+
+  if (bot.docked) {
+    await repairShip(ctx);
+    await tryRefuel(ctx);
+    await ensureHunterResupply(ctx);
+  }
+
   let totalKills = 0;
   let lastMinerSystemCheck = 0;
   const MINER_CHECK_INTERVAL_MS = 2_000;
@@ -626,6 +634,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
             const collectedFuelCells = await collectFuelCells(ctx);
             await tryRefuel(ctx); // Also refuel while we're here
             fueled = await ensureFueled(ctx, settings.refuelThreshold);
+            await ensureHunterResupply(ctx);
             if (collectedFuelCells) {
               ctx.log("escort", "Collected premium fuel cells and refueled at home system");
             } else {
@@ -701,6 +710,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         await collectFuelCells(ctx);
         await tryRefuel(ctx);
         fueled = await ensureFueled(ctx, settings.refuelThreshold);
+        await ensureHunterResupply(ctx);
 
         if (fueled) {
           ctx.log("escort", "Refueled and stocked up on premium fuel cells at home system");
@@ -733,6 +743,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         await tryRefuel(ctx);
         await ensureInsured(ctx);
         await bot.checkSkills();
+        await ensureHunterResupply(ctx);
         await ensureUndocked(ctx);
       }
       continue;
@@ -920,6 +931,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       if (docked) {
         await tryRefuel(ctx);
         await repairShip(ctx);
+        await ensureHunterResupply(ctx);
       }
       await ctx.sleep(15000);
       continue;
@@ -1165,6 +1177,8 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       if (settings.homeSystem && bot.system === settings.homeSystem) {
         await collectFuelCells(ctx);
       }
+
+      await ensureHunterResupply(ctx);
 
       yield "repair";
       await repairShip(ctx);

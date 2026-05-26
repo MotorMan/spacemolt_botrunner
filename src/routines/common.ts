@@ -2203,7 +2203,16 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
  */
 export async function fullSalvageWrecks(
   ctx: RoutineContext,
-  opts?: { fuelOnly?: boolean; enableTow?: boolean; minTowValue?: number; battleState?: BattleState },
+  opts?: {
+    fuelOnly?: boolean;
+    enableTow?: boolean;
+    minTowValue?: number;
+    battleState?: BattleState;
+    salvageCoop?: {
+      isWreckAvailable?: (wreckId: string) => boolean;
+      claimWreck?: (wreckId: string, action: "loot" | "tow") => void;
+    };
+  },
 ): Promise<{ itemsLooted: number; isTowing: boolean }> {
   const { bot } = ctx;
   if (bot.docked) return { itemsLooted: 0, isTowing: false };
@@ -2212,6 +2221,7 @@ export async function fullSalvageWrecks(
   const minTowValue = opts?.minTowValue ?? 500;
   const fuelOnly = opts?.fuelOnly ?? false;
   const battleState = opts?.battleState;
+  const coop = opts?.salvageCoop;
 
   const wrecksResp = await bot.exec("get_wrecks");
   const wrecks = parseWrecks(wrecksResp.result);
@@ -2231,6 +2241,15 @@ export async function fullSalvageWrecks(
     if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
       ctx.log("scavenge", "Cargo full — stopping salvage");
       break;
+    }
+
+    // Chat-based co-op: skip if another salvager already claimed this wreck
+    if (coop?.isWreckAvailable && !coop.isWreckAvailable(wreck.wreck_id)) {
+      ctx.log("scavenge", `Wreck ${wreck.name} claimed by another salvager — skipping`);
+      continue;
+    }
+    if (coop?.claimWreck) {
+      coop.claimWreck(wreck.wreck_id, "loot");
     }
 
     if (wreck.items.length > 0) {
@@ -2305,6 +2324,9 @@ export async function fullSalvageWrecks(
       }
 
       ctx.log("scavenge", `Attempting to tow wreck ${wreck.wreck_id} (${wreck.name})`);
+      if (coop?.claimWreck) {
+        coop.claimWreck(wreck.wreck_id, "tow");
+      }
       const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
       // Check for battle notifications after tow
       if (battleState && towResp.notifications && Array.isArray(towResp.notifications)) {

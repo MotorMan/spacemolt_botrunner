@@ -47,6 +47,12 @@ import {
   type FlockState,
   type FlockGroupConfig,
 } from "./flock.js";
+import {
+  broadcastSalvageClaim,
+  isWreckClaimedByOther,
+  registerSalvageChatHandler,
+  unregisterSalvageChatHandler,
+} from "../cooperation/salvageCooperation.js";
 
 // ── Temporary pirate blacklist (in-memory) ────────────────────
 const temporaryPirateBlacklist = new Map<string, number>(); // systemId -> expiresAt timestamp
@@ -456,6 +462,9 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
   };
   chatChannel.onMessage(bot.username, chatHandler);
 
+  // Register lightweight salvage co-op handler (chat-based wreck claiming for independent salvagers)
+  const salvageChatHandler = registerSalvageChatHandler(bot.username, (cat, msg) => ctx.log(cat as any, msg));
+
   // ── Startup: return home and dump non-fuel cargo to storage ──
   await bot.refreshCargo();
   const nonFuelCargo = bot.inventory.filter(i => {
@@ -738,8 +747,15 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       skipScanning = true;
     }
 
-    // Build list of POIs to visit (all non-station POIs — wrecks can spawn anywhere)
-    const visitPois = pois.filter(p => !isStationPoi(p));
+    const visitPois = pois;
+    const cur = (bot.poi || "").toLowerCase();
+    if (cur) {
+      const i = visitPois.findIndex(p => p.id.toLowerCase() === cur || p.name.toLowerCase() === cur);
+      if (i > 0) {
+        const f = visitPois.splice(i, 1)[0];
+        visitPois.unshift(f);
+      }
+    }
 
     // Flock coordination: Check for timeout
     let flockTimeoutExpired = false;
@@ -798,7 +814,6 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
 
-        // Check cargo before traveling
         await bot.refreshStatus();
         const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
         if (fillRatio >= cargoThresholdRatio) {
@@ -807,28 +822,28 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           break;
         }
 
-        // Check fuel
         const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         if (fuelPct < safetyOpts.fuelThresholdPct) {
           ctx.log("scavenge", `Fuel low (${fuelPct}%) — heading to station`);
           break;
         }
 
-        // Travel to POI
-        yield "travel_to_poi";
-        ctx.log("travel", `Traveling to ${poi.name}...`);
-        const travelResp = await bot.exec("travel", { target_poi: poi.id });
-        // Check for battle notifications after travel
-        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
-          ctx.log("combat", "Battle detected during travel to POI - initiating flee!");
-          battleState.isFleeing = false;
-          continue;
+        const atCur = bot.poi && (bot.poi.toLowerCase() === poi.id.toLowerCase() || bot.poi.toLowerCase() === poi.name.toLowerCase());
+        if (!atCur) {
+          yield "travel_to_poi";
+          ctx.log("travel", `Traveling to ${poi.name}...`);
+          const travelResp = await bot.exec("travel", { target_poi: poi.id });
+          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+            ctx.log("combat", "Battle detected during travel to POI - initiating flee!");
+            battleState.isFleeing = false;
+            continue;
+          }
+          if (travelResp.error && !travelResp.error.message.includes("already")) {
+            ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
+            continue;
+          }
+          bot.poi = poi.id;
         }
-        if (travelResp.error && !travelResp.error.message.includes("already")) {
-          ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
-          continue;
-        }
-        bot.poi = poi.id;
 
         // Pre-salvage battle check - prevents salvage command from freezing if battle starts
         const preSalvageBattleCheck = await getBattleStatus(ctx);
@@ -881,7 +896,15 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         } else {
           // Standard salvage
           result = settings.enableFullSalvage
-            ? await fullSalvageWrecks(ctx, { enableTow: settings.enableTowing, minTowValue: settings.minTowValue, battleState })
+            ? await fullSalvageWrecks(ctx, {
+                enableTow: settings.enableTowing,
+                minTowValue: settings.minTowValue,
+                battleState,
+                salvageCoop: {
+                  isWreckAvailable: (wid) => !isWreckClaimedByOther(wid, bot.username),
+                  claimWreck: (wid, action) => broadcastSalvageClaim(wid, poi.id, action, bot.username),
+                },
+              })
             : { itemsLooted: await scavengeWrecks(ctx), isTowing: false };
         }
 
@@ -962,9 +985,16 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         const arrived = await navigateToSystem(ctx, roamSystemId, travelOpts);
         if (!arrived) continue;
 
-        // Scan roam system POIs (all non-station POIs — wrecks can spawn anywhere)
         const { pois: roamPois } = await getSystemInfo(ctx);
-        const roamVisit = roamPois.filter(p => !isStationPoi(p));
+        const roamVisit = roamPois;
+        const curR = (bot.poi || "").toLowerCase();
+        if (curR) {
+          const i = roamVisit.findIndex(p => p.id.toLowerCase() === curR || p.name.toLowerCase() === curR);
+          if (i > 0) {
+            const f = roamVisit.splice(i, 1)[0];
+            roamVisit.unshift(f);
+          }
+        }
         if (roamVisit.length === 0) continue;
 
         for (const poi of roamVisit) {
@@ -981,16 +1011,19 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           const rFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
           if (rFuelPct < safetyOpts.fuelThresholdPct) break;
 
-          yield "travel_to_poi";
-          ctx.log("travel", `Traveling to ${poi.name} (${roamSystemId})...`);
-          const tResp = await bot.exec("travel", { target_poi: poi.id });
-          if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
-            ctx.log("combat", "Battle detected during roam travel - initiating flee!");
-            battleState.isFleeing = false;
-            break;
+          const atCurR = bot.poi && (bot.poi.toLowerCase() === poi.id.toLowerCase() || bot.poi.toLowerCase() === poi.name.toLowerCase());
+          if (!atCurR) {
+            yield "travel_to_poi";
+            ctx.log("travel", `Traveling to ${poi.name} (${roamSystemId})...`);
+            const tResp = await bot.exec("travel", { target_poi: poi.id });
+            if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
+              ctx.log("combat", "Battle detected during roam travel - initiating flee!");
+              battleState.isFleeing = false;
+              break;
+            }
+            if (tResp.error && !tResp.error.message.includes("already")) continue;
+            bot.poi = poi.id;
           }
-          if (tResp.error && !tResp.error.message.includes("already")) continue;
-          bot.poi = poi.id;
 
           // Pre-salvage battle check for roam system
           const preSalvageBattleCheck = await getBattleStatus(ctx);
@@ -1005,7 +1038,15 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
 
           yield "scavenge";
           const result = settings.enableFullSalvage
-            ? await fullSalvageWrecks(ctx, { enableTow: settings.enableTowing, minTowValue: settings.minTowValue, battleState })
+            ? await fullSalvageWrecks(ctx, {
+                enableTow: settings.enableTowing,
+                minTowValue: settings.minTowValue,
+                battleState,
+                salvageCoop: {
+                  isWreckAvailable: (wid) => !isWreckClaimedByOther(wid, bot.username),
+                  claimWreck: (wid, action) => broadcastSalvageClaim(wid, poi.id, action, bot.username),
+                },
+              })
             : { itemsLooted: await scavengeWrecks(ctx), isTowing: false };
           totalLooted += result.itemsLooted;
           if (result.itemsLooted > 0) {

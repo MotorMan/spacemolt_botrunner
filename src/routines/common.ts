@@ -2233,7 +2233,6 @@ export async function fullSalvageWrecks(
       break;
     }
 
-    // Step 1: Loot cargo from the wreck
     if (wreck.items.length > 0) {
       let candidates = [...wreck.items];
       if (fuelOnly) {
@@ -2242,24 +2241,30 @@ export async function fullSalvageWrecks(
         );
       }
 
-      // Sort: fuel cells first
       candidates.sort((a, b) => {
         const aPri = LOOT_PRIORITY.some(p => a.item_id.includes(p)) ? 0 : 1;
         const bPri = LOOT_PRIORITY.some(p => b.item_id.includes(p)) ? 0 : 1;
         return aPri - bPri;
       });
 
+      let remainingOnWreck = wreck.items.reduce((sum, it) => sum + (it.quantity || 0), 0);
+
       for (const item of candidates) {
         if (bot.state !== "running") break;
         if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) break;
+        if (remainingOnWreck <= 1) break;
+
+        let qty = item.quantity;
+        const maxSafe = remainingOnWreck - 1;
+        if (qty > maxSafe) qty = maxSafe;
+        if (qty <= 0) continue;
 
         const lootResp = await bot.exec("loot_wreck", {
           wreck_id: wreck.wreck_id,
           item_id: item.item_id,
-          quantity: item.quantity,
+          quantity: qty,
         });
 
-        // Check for battle notifications after loot
         if (battleState && lootResp.notifications && Array.isArray(lootResp.notifications)) {
           const battleDetected = await handleBattleNotifications(ctx, lootResp.notifications, battleState);
           if (battleDetected) {
@@ -2270,7 +2275,6 @@ export async function fullSalvageWrecks(
 
         if (lootResp.error) {
           const msg = lootResp.error.message.toLowerCase();
-          // CRITICAL: Check for battle interrupt - stop scavenging immediately
           if (lootResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
             ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
             return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
@@ -2280,7 +2284,8 @@ export async function fullSalvageWrecks(
         }
 
         totalLooted++;
-        lootedItems.push(`${item.quantity}x ${item.name}`);
+        lootedItems.push(`${qty}x ${item.name}`);
+        remainingOnWreck -= qty;
       }
     }
 

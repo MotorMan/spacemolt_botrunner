@@ -1657,9 +1657,9 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
 
       } else {
-        ctx.log("combat", "Retreated — waiting before next scan");
-        await ctx.sleep(5000);
-        break;
+        ctx.log("combat", `Could not engage ${target.name} (already gone, fighting, or retreated) — skipping to next target`);
+        await ctx.sleep(800);
+        // continue to try remaining targets in this scan instead of aborting the whole list
       }
     }
 

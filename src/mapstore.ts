@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from
 import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
 import { log } from "./ui.js";
+import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
 
 // ── Data model ──────────────────────────────────────────────
 
@@ -1900,6 +1901,67 @@ class MapStore {
     }
 
     return lines.join("\n");
+  }
+
+  getAllSystemPositions(): SystemPosition[] {
+    return Object.values(this.data.systems)
+      .filter((s) => s.position && typeof s.position.x === "number" && typeof s.position.y === "number")
+      .map((s) => ({
+        id: s.id,
+        x: s.position!.x,
+        y: s.position!.y,
+        name: s.name,
+      }));
+  }
+
+  calculatePathfinderBearing(fromSystemId: string, toSystemId: string): number | null {
+    const from = this.data.systems[fromSystemId.toLowerCase()];
+    const to = this.data.systems[toSystemId.toLowerCase()];
+    if (!from?.position || !to?.position) return null;
+    return calculatePathfinderBearing(from.position.x, from.position.y, to.position.x, to.position.y);
+  }
+
+  simulatePathfinderLanding(originSystemId: string, bearingDegrees: number): PathfinderResult | null {
+    const originSys = this.data.systems[originSystemId.toLowerCase()];
+    if (!originSys?.position) return null;
+    const origin: SystemPosition = {
+      id: originSys.id,
+      x: originSys.position.x,
+      y: originSys.position.y,
+      name: originSys.name,
+    };
+    const all = this.getAllSystemPositions();
+    return simulatePathfinderLanding(origin, bearingDegrees, all);
+  }
+
+  computeSafePathfinderBearing(fromSystemId: string, toSystemId: string): { bearing: number; safe: boolean; landing: PathfinderResult | null; blocker?: PathfinderResult } | null {
+    const fromSys = this.data.systems[fromSystemId.toLowerCase()];
+    const toSys = this.data.systems[toSystemId.toLowerCase()];
+    if (!fromSys?.position || !toSys?.position) return null;
+    const origin: SystemPosition = { id: fromSys.id, x: fromSys.position.x, y: fromSys.position.y, name: fromSys.name };
+    const target: SystemPosition = { id: toSys.id, x: toSys.position.x, y: toSys.position.y, name: toSys.name };
+    const all = this.getAllSystemPositions();
+    return computePathfinderBearingToTarget(origin, target, all);
+  }
+
+  getPathfinderLandingMargin(): number {
+    return PATHFINDER_LANDING_MARGIN;
+  }
+
+  getPathfinderSpeed(): number {
+    return PATHFINDER_SPEED;
+  }
+
+  reversePathfinderBearing(bearing: number): number {
+    return reverseBearing(bearing);
+  }
+
+  formatPathfinderBearing(bearing: number, decimals?: number): string {
+    return formatBearing(bearing, decimals);
+  }
+
+  getPathfinderTravelTime(proj: number): { ticks: number; seconds: number } {
+    return getPathfinderTravelTime(proj);
   }
 }
 

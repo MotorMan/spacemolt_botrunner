@@ -25,6 +25,7 @@
  *   autoCloak       — use cloak when available (default: false)
  *   ammoThreshold   — ammo level to trigger reload (default: 5)
  *   maxReloadAttempts — max reload retries (default: 3)
+ *   ignoreBlacklist   — bypass system blacklist when following miner/salvager into pirate systems (default: false)
  *
  * Home system is automatically determined from general.factionStorageSystem (default: "sol")
  */
@@ -32,7 +33,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { getBotChatChannel } from "../botmanager.js";
 import { mapStore } from "../mapstore.js";
-import { getSystemBlacklist } from "../web/server.js";
 import {
   findStation,
   isStationPoi,
@@ -128,6 +128,7 @@ function getEscortSettings(username?: string): {
   ammoThreshold: number;
   maxReloadAttempts: number;
   homeSystem: string;
+  ignoreBlacklist: boolean;
 } {
   const all = readSettings();
   const general = (all.general as Record<string, unknown>) || {};
@@ -146,6 +147,7 @@ function getEscortSettings(username?: string): {
     ammoThreshold: (e.ammoThreshold as number) || 5,
     maxReloadAttempts: (e.maxReloadAttempts as number) || 3,
     homeSystem: (botOverrides.homeSystem as string) || (e.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
+    ignoreBlacklist: (botOverrides.ignoreBlacklist as boolean) ?? (e.ignoreBlacklist as boolean) ?? false,
   };
 }
 
@@ -756,6 +758,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
       const jumpSafetyOpts = {
         ...safetyOpts,
+        skipBlacklist: settings.ignoreBlacklist,
         onJump: async (jumpNumber: number) => {
           // Check miner location after each jump
           if (ctx.getFleetStatus) {
@@ -885,6 +888,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
         const jumpSafetyOpts = {
           ...safetyOpts,
+          skipBlacklist: settings.ignoreBlacklist,
           onJump: async (jumpNumber: number) => {
             // Check miner location after each jump
             if (ctx.getFleetStatus) {
@@ -1119,7 +1123,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
           ctx.log("escort", `⚠ Miner ${minerName} has moved to ${minerBot.system} — following...`);
 
-          const arrived = await navigateToSystem(ctx, minerSystem, safetyOpts);
+          const arrived = await navigateToSystem(ctx, minerSystem, { ...safetyOpts, skipBlacklist: settings.ignoreBlacklist });
           if (arrived) {
             ctx.log("escort", `✓ Successfully followed miner to ${minerSystem}`);
             continue;

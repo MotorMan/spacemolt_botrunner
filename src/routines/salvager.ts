@@ -112,6 +112,7 @@ function getSalvagerSettings(username?: string): {
   roamBaseSystems: string[];
   depositAtSalvageYard: boolean;
   minimumFuelCells: number;
+  ignoreBlacklist: boolean;
 
   // Flock salvaging settings
   flockEnabled: boolean;
@@ -159,6 +160,7 @@ function getSalvagerSettings(username?: string): {
     roamBaseSystems: parseStringArray(botOverrides.roamBaseSystems ?? m.roamBaseSystems),
     depositAtSalvageYard: (m.depositAtSalvageYard as boolean) ?? false,
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
+    ignoreBlacklist: (botOverrides.ignoreBlacklist as boolean) ?? (m.ignoreBlacklist as boolean) ?? false,
 
     // Flock salvaging settings
     flockEnabled: (botOverrides.flockEnabled as boolean) ?? false,
@@ -227,32 +229,37 @@ async function flockSalvageWrecks(
 
     // Loot cargo from the wreck (same as standard salvage)
     if (wreck.items.length > 0) {
-      // Sort: fuel cells first
       const candidates = [...wreck.items].sort((a, b) => {
         const aPri = a.item_id.toLowerCase().includes("fuel") || a.item_id.toLowerCase().includes("energy") ? 0 : 1;
         const bPri = b.item_id.toLowerCase().includes("fuel") || b.item_id.toLowerCase().includes("energy") ? 0 : 1;
         return aPri - bPri;
       });
 
+      let remainingOnWreck = wreck.items.reduce((sum, it) => sum + (it.quantity || 0), 0);
+
       for (const item of candidates) {
         if (bot.state !== "running") break;
+        if (remainingOnWreck <= 1) break;
 
-        const lootResp = await bot.exec("loot_wreck", { wreck_id: wreck.wreck_id, item_id: item.item_id, quantity: item.quantity });
+        let qty = item.quantity;
+        const maxSafe = remainingOnWreck - 1;
+        if (qty > maxSafe) qty = maxSafe;
+        if (qty <= 0) continue;
+
+        const lootResp = await bot.exec("loot_wreck", { wreck_id: wreck.wreck_id, item_id: item.item_id, quantity: qty });
         if (lootResp.error) {
           if (lootResp.error.message.includes("already")) {
-            // Item already looted by someone else - continue to next item
             continue;
           }
-          // Other error - log and continue to next wreck
           ctx.log("warn", `Failed to loot ${item.name} from ${wreck.name}: ${lootResp.error.message}`);
           continue;
         }
 
-        totalLooted += item.quantity;
-        lootedItems.push(`${item.quantity}x ${item.name}`);
-        ctx.log("scavenge", `Looted ${item.quantity}x ${item.name} from ${wreck.name}`);
+        totalLooted += qty;
+        lootedItems.push(`${qty}x ${item.name}`);
+        ctx.log("scavenge", `Looted ${qty}x ${item.name} from ${wreck.name}`);
+        remainingOnWreck -= qty;
 
-        // Check cargo again after looting
         await bot.refreshStatus();
         if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
           ctx.log("scavenge", "Cargo full after looting — stopping salvage");
@@ -386,20 +393,20 @@ function findSystemsInRange(fromSystemId: string, maxHops: number): Array<{ syst
  * Build an ordered list of systems to roam through.
  * If roamBaseSystems are configured, use those as starting points (filtered by maxRoamJumps).
  * Otherwise, use the current system as the base.
- * Systems on the blacklist or temporarily blacklisted are excluded.
+ * Systems on the blacklist or temporarily blacklisted are excluded (unless ignoreTemporaryBlacklist is true).
  */
-function buildRoamList(currentSystem: string, maxRoamJumps: number, roamBaseSystems: string[], blacklist: string[]): string[] {
+function buildRoamList(currentSystem: string, maxRoamJumps: number, roamBaseSystems: string[], blacklist: string[], ignoreTemporaryBlacklist: boolean = false): string[] {
   const bases = roamBaseSystems.length > 0 ? roamBaseSystems : [currentSystem];
   const allSystems = new Set<string>();
   const blacklistLower = blacklist.map(b => b.toLowerCase());
 
   for (const base of bases) {
     // Always include the base (unless blacklisted or temporarily blacklisted)
-    if (!blacklistLower.some(b => b === base.toLowerCase()) && !isTemporarilyBlacklisted(base)) {
+    if (!blacklistLower.some(b => b === base.toLowerCase()) && (ignoreTemporaryBlacklist || !isTemporarilyBlacklisted(base))) {
       allSystems.add(base);
       // Add systems within range
       for (const sys of findSystemsInRange(base, maxRoamJumps)) {
-        if (!blacklistLower.some(b => b === sys.systemId.toLowerCase()) && !isTemporarilyBlacklisted(sys.systemId)) {
+        if (!blacklistLower.some(b => b === sys.systemId.toLowerCase()) && (ignoreTemporaryBlacklist || !isTemporarilyBlacklisted(sys.systemId))) {
           allSystems.add(sys.systemId);
         }
       }
@@ -587,6 +594,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
+      skipBlacklist: settings.ignoreBlacklist,
     };
 
     // ── Flock salvaging integration ──
@@ -680,9 +688,10 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Navigate to target system if configured ──
     const targetSystemId = settings.system || "";
     if (targetSystemId && targetSystemId !== bot.system) {
-      // Check if target system is blacklisted
-      const blacklist = getSystemBlacklist();
-      if (blacklist.some(b => b.toLowerCase() === targetSystemId.toLowerCase()) || isTemporarilyBlacklisted(targetSystemId)) {
+      // Check if target system is blacklisted (unless ignoreBlacklist is enabled)
+      const effectiveBlacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+      const targetIsBlacklisted = effectiveBlacklist.some(b => b.toLowerCase() === targetSystemId.toLowerCase()) || (!settings.ignoreBlacklist && isTemporarilyBlacklisted(targetSystemId));
+      if (targetIsBlacklisted) {
         ctx.log("error", `Target system ${targetSystemId} is blacklisted — salvaging locally instead`);
       } else {
         // Announce destination and signal escorts before traveling
@@ -903,8 +912,8 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Expand to roam systems if current system had no wrecks ──
     // Don't expand if already towing (need to deliver wreck first)
     if (!skipScanning && totalLooted === 0 && !cargoFull && !bot.towingWreck && bot.state === "running") {
-      const blacklist = getSystemBlacklist();
-      const roamList = buildRoamList(bot.system, settings.maxRoamJumps, settings.roamBaseSystems, blacklist);
+      const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+      const roamList = buildRoamList(bot.system, settings.maxRoamJumps, settings.roamBaseSystems, blacklist, settings.ignoreBlacklist);
 
       if (roamList.length > 0) {
         ctx.log("scavenge", `No wrecks locally — roaming across ${roamList.length} system(s): ${roamList.join(", ")}`);

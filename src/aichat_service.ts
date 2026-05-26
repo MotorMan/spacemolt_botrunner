@@ -63,6 +63,7 @@ const BLOCKED_EMPIRE_NPCS = [ //that is blocked from replying too, even though t
   "Director-General Darya Lim", //needs verification
   "The Convergence", //needs verification
   "Solarian Confederacy", //gives message about rep increase. bot responded to it under "solarian"
+  "Vex Nebulon", //Player that wanted to join guild, but i declined so i gave them ships! don't want AI responding to them. must do that in human mode.
 ];
 
 const EMPIRE_OFFICIAL_TAG = "[empire_official]";

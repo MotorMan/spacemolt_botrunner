@@ -23,6 +23,7 @@ import { escortRoutine } from "./routines/escort.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
+import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
 import { setLogSink } from "./ui.js";
@@ -186,6 +187,8 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleShutdown();
     case "manual_rescue_request":
       return handleManualRescueRequest(action);
+    case "pathfinder_calc":
+      return handlePathfinderCalc(action);
     default:
       return { ok: false, error: `Unknown action: ${(action as any).type}` };
   }
@@ -248,6 +251,66 @@ async function handleManualRescueRequest(action: WebAction): Promise<WebActionRe
 
   server.logSystem(`Manual rescue request queued: ${targetPlayer} at ${targetSystem}/${targetPOI} (for bot ${botName})`);
   return { ok: true, message: `Rescue request queued for ${targetPlayer}` };
+}
+
+async function handlePathfinderCalc(action: WebAction): Promise<WebActionResult> {
+  const p = (action.params || {}) as Record<string, unknown>;
+  const from = (p.from || p.origin || p.originSystem) as string | undefined;
+  const to = (p.to || p.target || p.targetSystem) as string | undefined;
+  const bearing = typeof p.bearing === "number" ? p.bearing : (typeof p.simulateBearing === "number" ? p.simulateBearing : undefined);
+  const originForSim = (p.originSystem || p.from || from) as string | undefined;
+  const precision = typeof p.precision === "number" ? Math.max(0, Math.min(20, p.precision)) : 12;
+
+  if (from && to) {
+    const res = mapStore.computeSafePathfinderBearing(from, to);
+    if (!res) return { ok: false, error: "Missing positions for one or both systems in map data" };
+    const travel = res.landing ? mapStore.getPathfinderTravelTime(res.landing.proj) : null;
+    return {
+      ok: true,
+      data: {
+        bearing: res.bearing,
+        bearingFormatted: formatBearing(res.bearing, precision),
+        safe: res.safe,
+        landing: res.landing,
+        blocker: res.blocker,
+        margin: mapStore.getPathfinderLandingMargin(),
+        precisionUsed: precision,
+        travelTime: travel,   // { ticks, seconds } — independent of ship speed
+      },
+    };
+  }
+
+  if (typeof bearing === "number" && originForSim) {
+    const landing = mapStore.simulatePathfinderLanding(originForSim, bearing);
+    const travel = landing ? mapStore.getPathfinderTravelTime(landing.proj) : null;
+    return {
+      ok: true,
+      data: {
+        bearing,
+        bearingFormatted: formatBearing(bearing, precision),
+        landing,
+        void: !landing,
+        margin: mapStore.getPathfinderLandingMargin(),
+        precisionUsed: precision,
+        travelTime: travel,
+      },
+    };
+  }
+
+  if (typeof bearing === "number") {
+    return {
+      ok: true,
+      data: {
+        bearing,
+        bearingFormatted: formatBearing(bearing, precision),
+        reverse: (bearing + 180) % 360,
+        reverseFormatted: formatBearing((bearing + 180) % 360, precision),
+        precisionUsed: precision,
+      },
+    };
+  }
+
+  return { ok: false, error: "Provide from+to for bearing calc, or originSystem+bearing to simulate, or just bearing for reverse" };
 }
 
 async function handleStart(action: WebAction): Promise<WebActionResult> {

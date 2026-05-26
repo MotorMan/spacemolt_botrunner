@@ -10,6 +10,7 @@ import { playerNameStore } from "./playernamestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 import { getFactionStorageCache, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
+import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, type PathfinderTravelRecord } from "./pathfinder.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -152,11 +153,10 @@ export class Bot {
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
-  /** Cached ship speed from last get_status (1-6, where 1 is slowest, 6 is fastest). */
   shipSpeed = 1;
-
-  /** Cached installed mod IDs from last refreshShipMods(). */
+  hasPathfinderDrive = false;
   installedMods: string[] = [];
+  lastKnownTick?: number;
 
   /** Accumulated stats for this bot. */
   stats: BotStats = { totalMined: 0, totalCrafted: 0, totalTrades: 0, totalProfit: 0, totalSystems: 0 };
@@ -316,8 +316,7 @@ export class Bot {
         // Refresh status to see where we actually are
         await this.refreshStatus();
 
-        // For jump: check if we're in the target system
-        if (command === "jump" && targetId) {
+        if (command === "jump" && targetId && !targetId.startsWith("bearing:")) {
           const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           if (normalizeSystemName(this.system) === normalizeSystemName(targetId)) {
             this.log("travel", `✓ Timeout check: confirmed at target ${targetId} — treating as success`);
@@ -519,6 +518,19 @@ export class Bot {
       this.log("customs", `✅ Customs clearance received (outcome: ${outcome}), resuming ${command}`);
     }
 
+    if (command === "jump") {
+      const t = (payload as Record<string, unknown> | undefined)?.target_system;
+      if (typeof t === "number") {
+        if (!this.hasPathfinderDrive) {
+          await this.refreshShipMods();
+        }
+        if (!this.hasPathfinderDrive) {
+          this.log("error", "Pathfinder jump attempted without Pathfinder Drive module.");
+          return { error: { code: "no_pathfinder_drive", message: "Pathfinder jumps require the Pathfinder Drive utility module installed." }, result: undefined, notifications: [] };
+        }
+      }
+    }
+
      this._lastAction = command;
      debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
 
@@ -530,23 +542,29 @@ export class Bot {
        const key = command + (payload ? JSON.stringify(payload) : "");
        this.pendingCommands.set(key, controller);
 
-        let resp: ApiResponse;
-        try {
-          // Use timeout for all commands to prevent indefinite hangs
-          let timeoutMs = 60000; // default 60s
-          let targetId = "";
-          if (command === "jump") {
-            timeoutMs = this.calculateJumpTimeout();
-            targetId = (payload as Record<string, unknown>)?.target_system as string || "";
-            this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
-          } else if (command === "mine" || command === "jettison") {
-            timeoutMs = 15000; // 15s for mining/jettison
-          } else if (command === "travel") {
-            timeoutMs = this.calculateTravelTimeout();
-            targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
-            this.log("travel", `Travel timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
-          }
-          resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
+         let resp: ApiResponse;
+         try {
+           let timeoutMs = 60000;
+           let targetId = "";
+           if (command === "jump") {
+             const t = (payload as Record<string, unknown>)?.target_system;
+             if (typeof t === "number") {
+               timeoutMs = 5000;
+               targetId = `bearing:${t.toFixed(4)}`;
+               this.log("travel", `Pathfinder jump to bearing ${t.toFixed(4)}° (immediate return, poll get_location for progress)`);
+             } else {
+               timeoutMs = this.calculateJumpTimeout();
+               targetId = (typeof t === "string" ? t : "") || "";
+               this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+             }
+           } else if (command === "mine" || command === "jettison") {
+             timeoutMs = 15000;
+           } else if (command === "travel") {
+             timeoutMs = this.calculateTravelTimeout();
+             targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
+             this.log("travel", `Travel timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+           }
+           resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
 
         // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
         // This prevents 502 errors from breaking routines mid-operation
@@ -873,6 +891,7 @@ export class Bot {
         } else if (ship.ammo != null) {
           this.ammo = ship.ammo as number;
         }
+        this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
       }
 
       // Cloak detection
@@ -1170,8 +1189,39 @@ export class Bot {
         if (typeof m === "string") return m;
         return (m.mod_id as string) || (m.id as string) || (m.name as string) || "";
       }).filter(Boolean);
+      this.hasPathfinderDrive = this.hasPathfinderModule(modules);
     }
     return this.installedMods;
+  }
+
+  private hasPathfinderModule(modules: Array<Record<string, unknown> | string>): boolean {
+    for (const m of modules) {
+      if (typeof m === "string") continue;
+      const mod = m as Record<string, unknown>;
+      const stats = mod.stats as Record<string, unknown> | undefined;
+      if (stats && stats.special === "pathfinder_drive") return true;
+      if (mod.type_id === "pathfinder_drive" || mod.module_id === "pathfinder_drive") return true;
+      const n = mod.name;
+      if (typeof n === "string" && n.toLowerCase().includes("pathfinder")) return true;
+      if (mod.special === "pathfinder_drive") return true;
+    }
+    return false;
+  }
+
+  async pollCurrentTick(): Promise<number | null> {
+    const resp = await this.exec("get_notifications");
+    if (resp.error || !resp.result) return null;
+    const r = resp.result as Record<string, unknown>;
+    let tick = r.current_tick as number | undefined;
+    if (typeof tick !== "number") {
+      const sc = r.structuredContent as Record<string, unknown> | undefined;
+      tick = sc?.current_tick as number | undefined;
+    }
+    if (typeof tick === "number") {
+      this.lastKnownTick = tick;
+      return tick;
+    }
+    return null;
   }
 
   /** Get the current cached level for a skill. Returns 0 if unknown. Call checkSkills() first to populate. */

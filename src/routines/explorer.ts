@@ -1165,7 +1165,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("warning", `Found ${blacklistedInConnections.length} blacklisted systems in current connections: ${blacklistedInConnections.map(c => c.id).join(', ')}`);
     }
 
-    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems);
+    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems, path);
     if (!nextSystem) {
       ctx.log("info", "All connected systems explored! Picking a random connection...");
       if (validConns.length > 0) {
@@ -1177,7 +1177,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
         // Smart selection: avoid dead-ends and pirate systems
-        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems);
+        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems, path);
         if (!random) {
           ctx.log("error", "No valid non-blacklisted connections available! Explorer is trapped. Attempting to backtrack...");
           if (path.length >= 2) {
@@ -3375,7 +3375,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  * 3. Among unvisited, prefer systems with fewer POIs (less explored)
  * Always avoids pirate systems, blacklisted systems, and systems we've fled from.
  */
-function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>): Connection | null {
+function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>, path: string[] = []): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
@@ -3413,8 +3413,24 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
   // Work with non-pirate connections first
   let candidates = nonPirateConns.length > 0 ? nonPirateConns : pirateConns;
 
+  // If we're seeing the same 3-system loop, penalize connections that are part of the current path
+  if (path && path.length >= 3) {
+    // Check last 3 systems for repeating pattern (A->B->C where next choices include A)
+    const last = path.slice(-3);
+    const loopSet = new Set(last);
+    const filtered = candidates.filter(c => !loopSet.has(c.id));
+    if (filtered.length > 0) {
+      candidates = filtered;
+    } else {
+      ctx.log("warning", "Loop avoidance: all immediate candidates were part of recent path — allowing them but deprioritizing");
+      // keep original candidates but they'll be deprioritized later
+    }
+  }
+
   // Priority 1: Systems not in map.json at all (completely unexplored)
   const unmapped = candidates.filter(c => !mapStore.getSystem(c.id));
+
+
   if (unmapped.length > 0) {
     // If multiple unmapped, prefer non-pirate
     const unmappedNonPirate = unmapped.filter(c => !isPirateSystem(c.id));
@@ -3465,7 +3481,7 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
  * 5. Systems with more connections (not a dead-end)
  * 6. Unexplored systems (not in map.json) over explored ones
  */
-function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>): Connection | null {
+function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>, path: string[] = []): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
@@ -3530,6 +3546,11 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     // Big bonus for systems not in map.json (completely unexplored)
     if (!isInMap) {
       score += 1000;
+    }
+
+    // Reduce selection of systems that are directly in the recent path to avoid 3-system loops
+    if (path && path.length >= 3 && path.slice(-3).includes(conn.id)) {
+      score -= 900; // large penalty to avoid selecting looped systems
     }
 
     // Bonus for systems with more connections (hubs, not dead-ends)

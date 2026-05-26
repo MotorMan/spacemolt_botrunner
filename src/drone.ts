@@ -22,8 +22,6 @@ export const COMBAT_PATROL_SCRIPT = `IF in_battle()
   ELSE
     STANCE "fire"
   END
-ELSE IF enemy_nearby()
-  ATTACK "nearest"
 ELSE IF pirate_nearby()
   ATTACK "nearest"
 ELSE

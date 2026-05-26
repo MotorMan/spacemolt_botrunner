@@ -772,6 +772,55 @@ async function sendRescueBill(
 const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
 
 /**
+ * Check if the given POI name (optionally in a system) is a wormhole entrance or exit.
+ * Wormhole POIs require an anomaly detector module to discover via survey and are
+ * only pathable/travelable by a ship that has personally revealed them. Rescue bots
+ * will almost never have done so for a random player's discovery, so we must decline
+ * MAYDAYs targeting these locations upfront and inform the player.
+ */
+function isWormholeEntranceOrExit(poiName: string, systemName?: string): boolean {
+  if (!poiName) return false;
+  const nameLower = poiName.toLowerCase().replace(/_/g, ' ').trim();
+
+  // Common generic wormhole POI names reported in MAYDAYs
+  if (nameLower === "wormhole entrance" || nameLower === "wormhole exit" ||
+      nameLower.includes("wormhole entrance") || nameLower.includes("wormhole exit")) {
+    return true;
+  }
+
+  // If we have map data for this system (from prior surveys by any bot), check the actual POI type
+  if (systemName) {
+    try {
+      const sys = mapStore.getSystem(systemName);
+      if (sys?.pois?.length) {
+        const matching = sys.pois.find(p => {
+          const pName = (p.name || "").toLowerCase().replace(/_/g, ' ').trim();
+          const pId = (p.id || "").toLowerCase().replace(/_/g, ' ').trim();
+          return pName === nameLower || pId === nameLower ||
+                 pName.includes(nameLower) || nameLower.includes(pName);
+        });
+        if (matching) {
+          const t = (matching.type || "").toLowerCase();
+          const id = (matching.id || "").toLowerCase();
+          if (t.includes("wormhole") || id.startsWith("wh_") || id.includes("wormhole")) {
+            return true;
+          }
+        }
+      }
+    } catch {
+      // map lookup failure - fall through to heuristics
+    }
+  }
+
+  // Heuristic for wh_ prefixed reported names (rare, but defensive)
+  if (nameLower.startsWith("wh_") || /wh_entrance|wh_exit/.test(nameLower)) {
+    return true;
+  }
+
+  return false;
+}
+
+/**
  * Check if a rescue target still needs rescue by verifying their current fuel and position.
  * Returns an object with:
  *   - needsRescue: whether the target still needs rescue
@@ -1721,6 +1770,12 @@ skipToReturnHome = true;
 
       let maydayTarget: RescueTarget | null = null;
       if (targets.length === 0) {
+        if (!isMaydayRescuePrimary) {
+          const ignoredMayday = getNextMayday();
+          if (ignoredMayday) markMaydayHandled(ignoredMayday);
+          await ctx.sleep(5000);
+          continue;
+        }
         const mayday = getNextMayday();
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
@@ -1745,6 +1800,38 @@ skipToReturnHome = true;
             continue;
           }
           ctx.log("mayday", `✓ Fuel check passed: ${mayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
+
+          // ── WORMHOLE POI CHECK: Decline MAYDAYs at wormhole entrances/exits ──
+          // These require an anomaly detector to locate (hidden until surveyed) and
+          // the rescue bot will not have discovered THIS particular wormhole, so travel
+          // to the POI will fail. Decline early and inform the player we can't reach them.
+          if (mayday.poi && isWormholeEntranceOrExit(mayday.poi, mayday.system)) {
+            ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target at wormhole POI "${mayday.poi}" (requires anomaly detector; unreachable by this rescue bot)`);
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+              try {
+                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: Their location (${mayday.system}/${mayday.poi}) is at a wormhole entrance or exit. These POIs are hidden until surveyed with an anomaly detector and are only reliably accessible to ships that personally discovered them. This rescue bot has not surveyed that wormhole, so you physically cannot reach them.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is at a wormhole entrance or exit that requires a special detector to find, and you have not discovered it yourself. Tell them you're sorry but you cannot get to that location. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
+                  currentSystem: ctx.bot.system,
+                  targetSystem: mayday.system,
+                  jumps: undefined,
+                  fuelRefueled: undefined,
+                  playerFuelPct: undefined,
+                });
+                ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender} (wormhole POI)`);
+              } catch (e) {
+                ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+              }
+            }
+            markMaydayHandled(mayday);
+            continue;
+          }
 
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
           const ghostThresholdOverride = normalizeSystemName(mayday.system) === normalizeSystemName(bot.system) ? Infinity : settings.ghostThreshold;
@@ -3874,6 +3961,14 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
 
       ctx.log("mayday", `🚨 MAYDAY received: ${nextMayday.sender} at ${nextMayday.system}/${nextMayday.poi} (${nextMayday.fuelPct}% fuel)`);
 
+      // ── PRIMARY MAYDAY BOT CHECK ──
+      const isMaydayRescuePrimary = isPrimaryMaydayRescueBot(bot.username);
+      if (!isMaydayRescuePrimary) {
+        ctx.log("mayday", `📡 Not primary MAYDAY rescue bot (${settings.maydayRescueBot || 'none configured'}) - ignoring this MAYDAY`);
+        markMaydayHandled(nextMayday);
+        continue;
+      }
+
       // ── Validate MAYDAY ──
       // Check if sender is a known player (from playerNames.json)
       const knownPlayer = isKnownPlayer(nextMayday.sender);
@@ -3894,7 +3989,39 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         markMaydayHandled(nextMayday);
         continue;
       }
-      ctx.log("mayday", `✓ Fuel check passed: ${nextMayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
+          ctx.log("mayday", `✓ Fuel check passed: ${nextMayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
+
+          // ── WORMHOLE POI CHECK: Decline MAYDAYs at wormhole entrances/exits ──
+          // These require an anomaly detector to locate (hidden until surveyed) and
+          // the rescue bot will not have discovered THIS particular wormhole, so travel
+          // to the POI will fail. Decline early and inform the player we can't reach them.
+          if (nextMayday.poi && isWormholeEntranceOrExit(nextMayday.poi, nextMayday.system)) {
+            ctx.log("mayday", `⚠️ Declining MAYDAY from ${nextMayday.sender} - target at wormhole POI "${nextMayday.poi}" (requires anomaly detector; unreachable by this rescue bot)`);
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+              try {
+                await aiChatService.sendPrivateMessage(ctx.bot, nextMayday.sender, {
+                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: Their location (${nextMayday.system}/${nextMayday.poi}) is at a wormhole entrance or exit. These POIs are hidden until surveyed with an anomaly detector and are only reliably accessible to ships that personally discovered them. This rescue bot has not surveyed that wormhole, so you physically cannot reach them.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is at a wormhole entrance or exit that requires a special detector to find, and you have not discovered it yourself. Tell them you're sorry but you cannot get to that location. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
+                  currentSystem: ctx.bot.system,
+                  targetSystem: nextMayday.system,
+                  jumps: undefined,
+                  fuelRefueled: undefined,
+                  playerFuelPct: undefined,
+                });
+                ctx.log("mayday", `📧 Sent MAYDAY decline message to ${nextMayday.sender} (wormhole POI)`);
+              } catch (e) {
+                ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+              }
+            }
+            markMaydayHandled(nextMayday);
+            continue;
+          }
 
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
           const ghostThresholdOverride = normalizeSystemName(nextMayday.system) === normalizeSystemName(bot.system) ? Infinity : settings.ghostThreshold;
@@ -3916,6 +4043,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       recordRescueRequest(nextMayday.sender);
 
       mayday = nextMayday;
+
     }
 
     // mayday is guaranteed to be set at this point (either from recovery or fresh)
@@ -4734,6 +4862,12 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
 
       let maydayTarget: RescueTarget | null = null;
       if (targets.length === 0) {
+        if (!isMaydayRescuePrimary) {
+          const ignoredMayday = getNextMayday();
+          if (ignoredMayday) markMaydayHandled(ignoredMayday);
+          await ctx.sleep(5000);
+          continue;
+        }
         const mayday = getNextMayday();
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
@@ -4759,6 +4893,38 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           }
           ctx.log("mayday", `✓ Fuel check passed: ${mayday.fuelPct}% <= ${settings.maydayFuelThreshold}% threshold`);
 
+          // ── WORMHOLE POI CHECK: Decline MAYDAYs at wormhole entrances/exits ──
+          // These require an anomaly detector to locate (hidden until surveyed) and
+          // the rescue bot will not have discovered THIS particular wormhole, so travel
+          // to the POI will fail. Decline early and inform the player we can't reach them.
+          if (mayday.poi && isWormholeEntranceOrExit(mayday.poi, mayday.system)) {
+            ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target at wormhole POI "${mayday.poi}" (requires anomaly detector; unreachable by this rescue bot)`);
+            const aiChatService = (globalThis as any).aiChatService;
+            if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
+              try {
+                await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
+                  situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
+
+REASON FOR DECLINE: Their location (${mayday.system}/${mayday.poi}) is at a wormhole entrance or exit. These POIs are hidden until surveyed with an anomaly detector and are only reliably accessible to ships that personally discovered them. This rescue bot has not surveyed that wormhole, so you physically cannot reach them.
+
+WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is at a wormhole entrance or exit that requires a special detector to find, and you have not discovered it yourself. Tell them you're sorry but you cannot get to that location. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
+
+IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
+                  currentSystem: ctx.bot.system,
+                  targetSystem: mayday.system,
+                  jumps: undefined,
+                  fuelRefueled: undefined,
+                  playerFuelPct: undefined,
+                });
+                ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender} (wormhole POI)`);
+              } catch (e) {
+                ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
+              }
+            }
+            markMaydayHandled(mayday);
+            continue;
+          }
+
           // ── RESCUE BLACKBOOK: Check if we should rescue this player ──
           const ghostThresholdOverride = normalizeSystemName(mayday.system) === normalizeSystemName(bot.system) ? Infinity : settings.ghostThreshold;
           const rescueDecision = shouldRescuePlayer(mayday.sender, ghostThresholdOverride);
@@ -4769,74 +4935,11 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
           }
           ctx.log("mayday", `✓ BlackBook check passed: ${rescueDecision.reason}`);
 
-          // ── RESCUE BLACKBOOK: Check if this is a duplicate MAYDAY (chat cache echo) ──
-          // Prevents re-triggering the same rescue we just completed
-          if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
-            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate of recently completed rescue (chat cache echo)`);
-            markMaydayHandled(mayday);
-            continue;
-          }
-          ctx.log("mayday_debug", `✓ Not a duplicate MAYDAY`);
+      // Record rescue request for blackbook tracking
+      recordRescueRequest(mayday.sender);
 
-          // Mark this MAYDAY as recently received to prevent processing duplicates
-          // This must be done BEFORE any other processing to catch rapid-fire duplicates
-          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
-          ctx.log("mayday_debug", `📝 Marked MAYDAY from ${mayday.sender} as recently received (5min cooldown)`);
+      // ── RESCUE COORDINATION: Check if another bot is already handling this ──
 
-          // ── PIRATE BASE PROXIMITY CHECK: Decline MAYDAYs too close to pirate bases ──
-          // This prevents the bot from getting stuck in loops trying to rescue players
-          // in systems that are blacklisted due to pirate base proximity
-          const pirateProximityThreshold = settings.maydayPirateProximityThreshold;
-          if (pirateProximityThreshold > 0 && mayday.system) {
-            // First check if this player is already locked out
-            if (isMaydayPirateLocked(mayday.sender)) {
-              ctx.log("mayday", `🔒 Ignoring MAYDAY from ${mayday.sender} - currently locked out (pirate base proximity)`);
-              markMaydayHandled(mayday);
-              continue;
-            }
-
-            // Check proximity to pirate bases
-            const pirateProximity = await checkPirateBaseProximity(ctx, mayday.system, pirateProximityThreshold);
-            if (pirateProximity) {
-              ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - too close to pirate base ${pirateProximity.pirateSystem} (${pirateProximity.jumps} jumps away)`);
-
-              // Add lockout to prevent repeated MAYDAY processing
-              const lockoutMinutes = settings.maydayPirateLockoutMinutes;
-              addMaydayPirateLockout(mayday.sender, lockoutMinutes);
-
-              // Send decline message to the player via private message
-              const aiChatService = (globalThis as any).aiChatService;
-              if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
-                try {
-                  await aiChatService.sendPrivateMessage(ctx.bot, mayday.sender, {
-                    situation: `YOU ARE DECLINING THIS MAYDAY RESCUE REQUEST. You will NOT be responding to their distress call.
-
-REASON FOR DECLINE: Their location (${mayday.system}/${mayday.poi}) is too close to a pirate base (${pirateProximity.pirateSystem}, only ${pirateProximity.jumps} jumps away). Your ships cannot safely navigate through blacklisted pirate systems due to safety restrictions.
-
-WHAT TO SAY: Send a brief, polite message explaining that you cannot respond to their MAYDAY because their location is in a restricted zone near pirate territory. Tell them you're sorry but you physically cannot reach them. Do NOT promise to come rescue them. Do NOT mention your own fuel level - their fuel level is what's critical, not yours.
-
-IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this clear in your message.`,
-                    currentSystem: ctx.bot.system,
-                    targetSystem: mayday.system,
-                    jumps: pirateProximity.jumps,
-                    fuelRefueled: undefined,
-                    playerFuelPct: undefined,
-                  });
-                  ctx.log("mayday", `📧 Sent MAYDAY decline message to ${mayday.sender}`);
-                } catch (e) {
-                  ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
-                }
-              }
-
-              markMaydayHandled(mayday);
-              continue;
-            }
-          }
-
-          // Record rescue request for blackbook tracking
-          recordRescueRequest(mayday.sender);
-
-          // ── RESCUE COORDINATION: Check if another bot is already handling this ──
           const handledBy = isRescueHandled(mayday.sender, mayday.system, mayday.poi, bot.username);
           if (handledBy) {
             ctx.log("rescue", `🤝 MAYDAY already being handled by ${handledBy.rescuerUsername} - skipping to avoid duplicate rescue`);

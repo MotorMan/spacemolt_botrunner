@@ -30,6 +30,7 @@ import {
   hasFullRadioactiveCapabilityCached,
   logRadioactiveCapability,
   isRadioactiveOre,
+  RADIOACTIVE_ORES,
 } from "./miner_radioactive.js";
 import {
   getActiveMiningSession,
@@ -4322,19 +4323,19 @@ if (effectiveTarget) {
           let newPoiName: string | null = null;
           let newSystemId: string | null = null;
 
-          // For deep core miners, implement efficient hidden POI rotation:
-          // 1. First, try to find another hidden POI with the SAME ore (high richness)
-          // 2. If none found, check if all hidden POIs for this ore are depleted (on timer)
-          // 3. If all hidden POIs depleted, switch to NEXT deep core ore in quota
-          // 4. Only mine low richness POIs when all hidden POIs are on timer
           const currentDeepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
           const isDeepCoreMiner = currentDeepCoreCap.canMineVisibleDeepCore;
+          const isRadioactiveMiner = miningType === "radioactive";
           let searchTarget = targetResource;
 
-          if (isDeepCoreMiner && effectiveTarget && isDeepCoreOre(effectiveTarget)) {
-            ctx.log("mining", `Deep core miner: ${effectiveTarget} depleted — searching for next hidden POI...`);
+          const isMiningDeepCoreOre = isDeepCoreOre(effectiveTarget);
+          const isMiningRadioactiveOre = isRadioactiveOre(effectiveTarget);
+          const isDeepCoreOrRadioactiveTarget = isMiningDeepCoreOre || (isMiningRadioactiveOre && isRadioactiveMiner);
+
+          if (isDeepCoreMiner && effectiveTarget && isDeepCoreOrRadioactiveTarget) {
+            const oreTypeLabel = isMiningDeepCoreOre ? "deep core ore" : "radioactive ore";
+            ctx.log("mining", `${oreTypeLabel} miner: ${effectiveTarget} depleted — searching for next hidden POI...`);
             
-            // Step 1: Search for another hidden POI with the SAME ore (high richness)
             const hiddenPoi = findBestHiddenPoiForOre(
               effectiveTarget,
               bot.system,
@@ -4342,18 +4343,16 @@ if (effectiveTarget) {
               maxJumps,
               settings.ignoreDepletion,
               depletionTimeoutMs,
-              50 // Minimum richness threshold
+              50
             );
             
             if (hiddenPoi) {
-              // Found another high-richness hidden POI for the same ore
               newTarget = effectiveTarget;
               newPoiId = hiddenPoi.poiId;
               newPoiName = hiddenPoi.poiName;
               newSystemId = hiddenPoi.systemId;
               ctx.log("mining", `Found hidden POI: ${effectiveTarget} @ ${hiddenPoi.poiName} in ${hiddenPoi.systemName} (${hiddenPoi.jumps} jumps, richness: ${hiddenPoi.richness})`);
             } else {
-              // Step 2: Check if all hidden POIs for this ore are depleted (on timer)
               const allHiddenDepleted = areAllHiddenPoisDepleted(
                 effectiveTarget,
                 bot.system,
@@ -4364,33 +4363,27 @@ if (effectiveTarget) {
               
               if (allHiddenDepleted) {
                 ctx.log("mining", `All hidden POIs for ${effectiveTarget} are depleted (on timer) — switching to next quota ore`);
-                // Step 3: Switch to the next deep core ore in the quota
-                // Get all deep core ores that have quotas or are available
-                const deepCoreQuotaEntries = Object.entries(quotas).filter(([oreId]) => isDeepCoreOre(oreId));
+                const quotaFilter = isMiningDeepCoreOre ? isDeepCoreOre : (_: string) => isRadioactiveOre(_) && isRadioactiveMiner;
+                const quotaEntries = Object.entries(quotas).filter(([oreId]) => quotaFilter(oreId));
 
-                // CRITICAL FIX: Sort by deficit to pick the next most needed ore
-                // When all quotas are met, cycle through by smallest surplus
                 await bot.refreshFactionStorage();
-                const sortedDeepCoreOres = deepCoreQuotaEntries
+                const sortedOres = quotaEntries
                   .map(([oreId, target]) => {
                     const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
                     const deficit = target - current;
                     return { oreId, deficit, current, target };
                   })
                   .sort((a, b) => {
-                    // First: ores with deficit > 0 (biggest first)
-                    // Then: ores with deficit <= 0 (smallest surplus first)
                     const aHasDeficit = a.deficit > 0;
                     const bHasDeficit = b.deficit > 0;
                     if (aHasDeficit && !bHasDeficit) return -1;
                     if (!aHasDeficit && bHasDeficit) return 1;
-                    if (aHasDeficit && bHasDeficit) return b.deficit - a.deficit; // biggest deficit first
-                    return a.deficit - b.deficit; // smallest surplus first
+                    if (aHasDeficit && bHasDeficit) return b.deficit - a.deficit;
+                    return a.deficit - b.deficit;
                   });
 
-                // Try each deep core ore in quota priority order
-                for (const quotaEntry of sortedDeepCoreOres) {
-                  if (quotaEntry.oreId === effectiveTarget) continue; // Skip current ore
+                for (const quotaEntry of sortedOres) {
+                  if (quotaEntry.oreId === effectiveTarget) continue;
                   
                   const nextHiddenPoi = findBestHiddenPoiForOre(
                     quotaEntry.oreId,
@@ -4412,20 +4405,17 @@ if (effectiveTarget) {
                   }
                 }
                 
-                // If no hidden POIs found for any quota ore, check if ALL hidden POIs are on timer
                 if (!newTarget) {
-                  // Check if there are ANY hidden POIs available for deep core ores
-                  // CRITICAL FIX: Check in quota priority order, not set order
                   let anyHiddenAvailable = false;
-                  for (const deepCoreOre of sortedDeepCoreOres.map(e => e.oreId)) {
+                  for (const oreEntry of sortedOres) {
                     const anyPoi = findBestHiddenPoiForOre(
-                      deepCoreOre,
+                      oreEntry.oreId,
                       bot.system,
                       bot.poi || "",
                       maxJumps,
                       settings.ignoreDepletion,
                       depletionTimeoutMs,
-                      30 // Lower threshold to be more inclusive
+                      30
                     );
                     if (anyPoi) {
                       anyHiddenAvailable = true;
@@ -4434,34 +4424,32 @@ if (effectiveTarget) {
                   }
 
                   if (!anyHiddenAvailable) {
-                    // Step 4: All hidden POIs are on depletion timer - fall back to low richness mining
-                    ctx.log("mining", "All hidden POIs depleted across all deep core ores — falling back to low richness mining");
+                    ctx.log("mining", "All hidden POIs depleted across all quota ores — falling back to low richness mining");
 
-                    // CRITICAL FIX: Try deep core ores in quota priority order, not set order
-                    for (const deepCoreOre of sortedDeepCoreOres.map(e => e.oreId)) {
+                    for (const oreEntry of sortedOres) {
                       const anyPoiResult = findBestHiddenPoiForOre(
-                        deepCoreOre,
+                        oreEntry.oreId,
                         bot.system,
                         bot.poi || "",
                         maxJumps,
                         settings.ignoreDepletion,
                         depletionTimeoutMs,
-                        0 // Accept any richness
+                        0
                       );
 
                       if (anyPoiResult) {
-                        newTarget = deepCoreOre;
+                        newTarget = oreEntry.oreId;
                         newPoiId = anyPoiResult.poiId;
                         newPoiName = anyPoiResult.poiName;
                         newSystemId = anyPoiResult.systemId;
-                        ctx.log("mining", `Found low richness deep core target: ${deepCoreOre} @ ${anyPoiResult.poiName} (${anyPoiResult.jumps} jumps, richness: ${anyPoiResult.richness})`);
+                        ctx.log("mining", `Found low richness target: ${oreEntry.oreId} @ ${anyPoiResult.poiName} (${anyPoiResult.jumps} jumps, richness: ${anyPoiResult.richness})`);
                         break;
                       }
                     }
                     
                     if (!newTarget) {
-                      ctx.log("mining", "No deep core ores available at all — waiting for depletion timers");
-                      stopReason = "all deep core POIs on depletion timer";
+                      ctx.log("mining", "No quota ores available at all — waiting for depletion timers");
+                      stopReason = "all hidden POIs on depletion timer";
                       break;
                     }
                   } else {
@@ -4471,14 +4459,12 @@ if (effectiveTarget) {
                   }
                 }
               } else {
-                // Not all hidden POIs are depleted, but none found with high richness
-                // This means there might be some low-richness ones - skip them for now
                 ctx.log("mining", `No high-richness hidden POIs for ${effectiveTarget} — switching to next quota ore`);
                 
-                // Switch to next quota ore (same logic as above)
-                const deepCoreQuotaEntries = Object.entries(quotas).filter(([oreId]) => isDeepCoreOre(oreId));
+                const quotaFilter = isMiningDeepCoreOre ? isDeepCoreOre : (_: string) => isRadioactiveOre(_) && isRadioactiveMiner;
+                const quotaEntries = Object.entries(quotas).filter(([oreId]) => quotaFilter(oreId));
                 await bot.refreshFactionStorage();
-                const sortedDeepCoreOres = deepCoreQuotaEntries
+                const sortedOres = quotaEntries
                   .map(([oreId, target]) => {
                     const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
                     const deficit = target - current;
@@ -4487,7 +4473,7 @@ if (effectiveTarget) {
                   .filter(entry => entry.deficit > 0)
                   .sort((a, b) => b.deficit - a.deficit);
                 
-                for (const quotaEntry of sortedDeepCoreOres) {
+                for (const quotaEntry of sortedOres) {
                   if (quotaEntry.oreId === effectiveTarget) continue;
                   
                   const nextHiddenPoi = findBestHiddenPoiForOre(
@@ -4511,13 +4497,13 @@ if (effectiveTarget) {
                 }
                 
                 if (!newTarget) {
-                  ctx.log("mining", "No alternative deep core ores with high richness — waiting for next cycle");
+                  ctx.log("mining", "No alternative quota ores with high richness — waiting for next cycle");
                   stopReason = "no high-richness hidden POIs available";
                   break;
                 }
               }
             }
-          } else if (isDeepCoreMiner && (!targetResource || !isDeepCoreOre(targetResource))) {
+          } else if (isDeepCoreMiner && (!targetResource || !isDeepCoreOrRadioactiveTarget)) {
             // Deep core miner without a specific target - search for any deep core ore
             // CRITICAL FIX: Use quota priority when searching for targets
             ctx.log("mining", "Deep core miner — searching for deep core ore target after depletion...");
@@ -4598,6 +4584,59 @@ if (effectiveTarget) {
                 stopReason = "no deep core ores available";
                 break;
               }
+            }
+          } else if (isRadioactiveMiner && (!targetResource || !isRadioactiveOre(targetResource))) {
+            ctx.log("mining", "Radioactive miner — searching for radioactive ore target after depletion...");
+            
+            const radioactiveQuotaEntries = Object.entries(quotas).filter(([oreId]) => isRadioactiveOre(oreId));
+            let oresToSearch: string[];
+
+            if (radioactiveQuotaEntries.length > 0) {
+              await bot.refreshFactionStorage();
+              const sortedEntries = radioactiveQuotaEntries
+                .map(([oreId, target]) => {
+                  const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
+                  return { oreId, deficit: target - current };
+                })
+                .sort((a, b) => {
+                  const aHasDeficit = a.deficit > 0;
+                  const bHasDeficit = b.deficit > 0;
+                  if (aHasDeficit && !bHasDeficit) return -1;
+                  if (!aHasDeficit && bHasDeficit) return 1;
+                  if (aHasDeficit && bHasDeficit) return b.deficit - a.deficit;
+                  return a.deficit - b.deficit;
+                });
+              oresToSearch = sortedEntries.map(e => e.oreId);
+              ctx.log("mining", `Radioactive search in quota priority order: ${oresToSearch.join(", ")}`);
+            } else {
+              oresToSearch = Array.from(RADIOACTIVE_ORES);
+            }
+
+            for (const radioactiveOre of oresToSearch) {
+              const hiddenPoiResult = findBestHiddenPoiForOre(
+                radioactiveOre,
+                bot.system,
+                bot.poi || "",
+                maxJumps,
+                settings.ignoreDepletion,
+                depletionTimeoutMs,
+                canMineHiddenRadioactive ? 50 : 0
+              );
+
+              if (hiddenPoiResult) {
+                newTarget = radioactiveOre;
+                newPoiId = hiddenPoiResult.poiId;
+                newPoiName = hiddenPoiResult.poiName;
+                newSystemId = hiddenPoiResult.systemId;
+                ctx.log("mining", `Found radioactive target: ${radioactiveOre} @ ${hiddenPoiResult.poiName} in ${hiddenPoiResult.systemName} (${hiddenPoiResult.jumps} jumps, richness: ${hiddenPoiResult.richness})`);
+                break;
+              }
+            }
+
+            if (!newTarget) {
+              ctx.log("mining", "No radioactive ores available — waiting for next cycle to retry");
+              stopReason = "no radioactive ores available";
+              break;
             }
           } else if (searchTarget) {
             ctx.log("mining", `Checking for configured global target ${resourceLabel}: ${searchTarget}...`);

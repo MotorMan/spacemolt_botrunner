@@ -1892,17 +1892,17 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
       if (member.credits >= BOT_WORKING_BALANCE) continue;
       const needed = BOT_WORKING_BALANCE - member.credits;
       // Withdraw from faction treasury
-      const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+      const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction
       if (withdrawResp.error) {
         ctx.log("coord", `Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
         break; // treasury likely empty
       }
       logFactionActivity(ctx, "withdraw", `Withdrew ${needed}cr from treasury for ${member.username}`);
-      const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
+      const giftResp = await bot.exec("storage", { action: 'deposit', target: member.username, item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - deposit credits to member's storage
       if (giftResp.error) {
         ctx.log("coord", `Gift to ${member.username} failed: ${giftResp.error.message}`);
         // Re-deposit withdrawn credits back
-        await bot.exec("faction_deposit_credits", { amount: needed });
+        await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - refund to faction storage
       } else {
         ctx.log("coord", `Sent ${needed}cr to ${member.username} (topped off to ${BOT_WORKING_BALANCE}cr)`);
         logFactionActivity(ctx, "gift", `Sent ${needed}cr to ${member.username} (top-off to ${BOT_WORKING_BALANCE}cr)`);

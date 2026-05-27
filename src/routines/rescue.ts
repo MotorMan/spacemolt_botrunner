@@ -1281,7 +1281,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
       ctx.log("rescue", `💰 ${member.username} has ${currentCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
 
       //const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
-      const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); //fixed by human!
+      const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction, not source=faction
       if (withdrawResp.error) {
         ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
         return false;
@@ -1289,10 +1289,10 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 
       ctx.log("rescue", `💰 Successfully withdrew ${needed}cr, sending to ${member.username}...`);
       //const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
-      const giftResp = await bot.exec("storage", { action: 'deposit', target: member.username, item_id: 'credits', quantity: needed }); //fixed by human!
+      const giftResp = await bot.exec("storage", { action: 'deposit', target: member.username, item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - deposit credits to member's storage
       if (giftResp.error) {
         ctx.log("rescue", `💰 Gift to ${member.username} failed: ${giftResp.error.message}`);
-        await bot.exec("faction_deposit_credits", { amount: needed });
+        await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - refund to faction storage
         return false;
       } else {
         ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
@@ -1325,17 +1325,17 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     const needed = targetAmount - actualCredits;
     ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
 
-    const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+    const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction, not source=faction
     if (withdrawResp.error) {
       ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
       return false;
     }
 
     ctx.log("rescue", `💰 Successfully withdrew ${needed}cr, sending to ${member.username}...`);
-    const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
+    const giftResp = await bot.exec("storage", { action: 'deposit', target: member.username, item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - deposit credits to member's storage
     if (giftResp.error) {
       ctx.log("rescue", `💰 Gift to ${member.username} failed: ${giftResp.error.message}`);
-      await bot.exec("faction_deposit_credits", { amount: needed });
+      await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - refund to faction storage
       return false;
     } else {
       ctx.log("rescue", `💰 Sent ${needed}cr to ${member.username} (topped off to ${targetAmount}cr)`);
@@ -1389,7 +1389,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     const needed = targetAmount - actualSelfCredits;
     ctx.log("rescue", `💰 Self has ${actualSelfCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
 
-    const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+    const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction, not source=faction
     if (withdrawResp.error) {
       ctx.log("rescue", `💰 Cannot withdraw ${needed}cr for self: ${withdrawResp.error.message}`);
       return false;
@@ -5690,6 +5690,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       });
       if (!arrived) {
         ctx.log("error", `Could not reach fleet target system ${target.system} for ${target.username} (or target moved during travel)`);
+        
+        const activeSession = getActiveRescueSession(bot.username);
+        if (activeSession) {
+          await failRescueSession(bot.username, `Could not reach target system ${target.system}`);
+        }
+        
+        if (isMaydayTarget) {
+          const mayday = getNextMayday();
+          if (mayday) markMaydayHandled(mayday);
+        }
+        
         await ctx.sleep(settings.scanIntervalSec * 1000);
         continue;
       }
@@ -5931,6 +5942,10 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           if (failures >= 3) {
             ctx.log("error", `❌ ${failureReason} — ABORTING after ${failures} consecutive failures`);
             await failRescueSession(bot.username, `Aborted after ${failures} consecutive navigation failures`);
+            if (isMaydayTarget) {
+              const mayday = getNextMayday();
+              if (mayday) markMaydayHandled(mayday);
+            }
             await ctx.sleep(settings.scanIntervalSec * 1000);
             continue;
           }
@@ -5940,6 +5955,10 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           ctx.log("error", `${failureReason} — will retry next scan`);
           if (recoveredSession) {
             await failRescueSession(bot.username, "Could not reach target system");
+            if (isMaydayTarget) {
+              const mayday = getNextMayday();
+              if (mayday) markMaydayHandled(mayday);
+            }
           }
         }
         await ctx.sleep(settings.scanIntervalSec * 1000);
@@ -5998,6 +6017,14 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         });
         if (!arrived2) {
           ctx.log("error", `Could not follow target to new system ${target.system}`);
+          const activeSession = getActiveRescueSession(bot.username);
+          if (activeSession) {
+            await failRescueSession(bot.username, `Could not follow target to ${target.system}`);
+          }
+          if (isMaydayTarget) {
+            const mayday = getNextMayday();
+            if (mayday) markMaydayHandled(mayday);
+          }
           await ctx.sleep(settings.scanIntervalSec * 1000);
           continue;
         }

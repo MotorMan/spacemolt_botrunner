@@ -450,11 +450,16 @@ async function callLlm(
   
   // For thinking-enabled models: prefer actual content over reasoning
   // The model returns reasoning in reasoning_content field, but the final response is in content
-  const responseContent = msg.content || "";
-  if (!responseContent && msg.reasoning_content) {
-    // If only reasoning content exists (model was cut off), use it as fallback
-    console.warn("LLM warning: Only reasoning_content available, model may have been interrupted");
-    return msg.reasoning_content;
+  let responseContent = msg.content || "";
+  
+  // Strip any <THINK>...</THINK> tags that might be embedded in the content
+  responseContent = responseContent.replace(/<THINK>[\s\S]*?<\/THINK>/gi, "").trim();
+  
+  // If content is empty or only had thinking tags, don't fall back to reasoning_content
+  // (that would send the thinking process as the message)
+  if (!responseContent) {
+    console.warn("LLM warning: No content available from model response");
+    return "";
   }
   
   return responseContent;
@@ -1635,6 +1640,12 @@ ${botContext}
     try {
       const response = await callLlm(llmMessages, settings);
       const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+      
+      // Don't send empty responses
+      if (!cleanResponse) {
+        this.logFn("ai_chat_debug", `Empty response from LLM, skipping message to ${msg.sender}`);
+        return "error";
+      }
 
       // Build chat command parameters
       const chatParams: Record<string, string> = {
@@ -1783,6 +1794,12 @@ Message:`;
     try {
       const response = await callLlm(llmMessages, settings);
       const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+      
+      // Don't send empty responses
+      if (!cleanResponse) {
+        this.logFn("ai_chat_debug", `Empty response from LLM, skipping private message to ${targetPlayer}`);
+        return { ok: false, error: "Empty response from AI" };
+      }
 
       // Send private message using: chat channel=private target_id="PlayerName" content="message"
       const chatResp = await bot.exec("chat", {
@@ -1916,6 +1933,12 @@ Message:`;
     try {
       const response = await callLlm(llmMessages, settings);
       const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+      
+      // Don't send empty responses
+      if (!cleanResponse) {
+        this.logFn("ai_chat_debug", `Empty response from LLM, skipping faction message`);
+        return { ok: false, error: "Empty response from AI" };
+      }
 
       // Send faction chat message
       const chatResp = await bot.exec("chat", {
@@ -2077,6 +2100,12 @@ They're warning you for not staying still. Respond defensively or apologetically
     try {
       const response = await callLlm(llmMessages, settings);
       const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+      
+      // Don't send empty responses
+      if (!cleanResponse) {
+        this.logFn("ai_chat_debug", `Empty response from LLM, skipping customs response`);
+        return;
+      }
 
       // Send chat message to system channel
       const chatResp = await bot.exec("chat", {

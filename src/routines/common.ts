@@ -2365,6 +2365,7 @@ export async function fullSalvageWrecks(
           ctx.log("scavenge", `Towed ${shipClass} wreck (${wreck.name}) - value: ${salvageValue}cr, speed penalty: 50%`);
           // Set towing flag immediately - server confirms tow in the response
           bot.towingWreck = true;
+          bot.towingWreckId = wreck.wreck_id;
           ctx.log("scavenge", `Set bot.towingWreck=true after successful tow`);
           break;
         } else {
@@ -2383,6 +2384,7 @@ export async function fullSalvageWrecks(
             // We are already towing - this is a signal to head to salvage yard
             ctx.log("warn", `Already towing a wreck — should head to salvage yard (${towResp.error.message})`);
             bot.towingWreck = true;
+            // Preserve existing towingWreckId
             break; // Stop scanning and go to salvage yard
           } else {
             // Someone else is towing this wreck - skip it and try another
@@ -2451,21 +2453,26 @@ export async function processTowedWrecks(
   const wrecksResp = await bot.exec("get_wrecks");
   const wrecks = parseWrecks(wrecksResp.result);
 
-  // Find the towed wreck in the list (it should still be accessible)
-  let modulesLooted = 0;
-  for (const wreck of wrecks) {
-    // Check modules array (not items)
-    if (wreck.modules.length === 0) {
-      ctx.log("scavenge", "📦 Towed wreck has no modules to loot");
-      break;
-    }
+  // Find the specific towed wreck by ID
+  const towedWreck = bot.towingWreckId ? wrecks.find(w => w.wreck_id === bot.towingWreckId) : wrecks[0];
+  if (!towedWreck) {
+    ctx.log("warn", "Towed wreck not found in get_wrecks response - may have been jettisoned or lost");
+    bot.towingWreck = false;
+    bot.towingWreckId = null;
+    return 0;
+  }
 
-    ctx.log("scavenge", `📦 Towed wreck ${wreck.name} contains ${wreck.modules.length} module(s): ${wreck.modules.map(m => m.name || m.type || m.type_id || m.id).join(", ")}`);
+  // Check modules array (not items)
+  let modulesLooted = 0;
+  if (towedWreck.modules.length === 0) {
+    ctx.log("scavenge", "📦 Towed wreck has no modules to loot");
+  } else {
+    ctx.log("scavenge", `📦 Towed wreck ${towedWreck.name} contains ${towedWreck.modules.length} module(s): ${towedWreck.modules.map(m => m.name || m.type || m.type_id || m.id).join(", ")}`);
 
     // Loot ALL modules and cargo from the wreck (no item_id specified = loots everything to cargo hold)
     // Check cargo space first
     await bot.refreshStatus();
-    const moduleCargoCost = wreck.modules.length * 10; // Typical module size is 10 each
+    const moduleCargoCost = towedWreck.modules.length * 10; // Typical module size is 10 each
     if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
       ctx.log("scavenge", `Cargo full while looting modules (${bot.cargo}/${bot.cargoMax}) — depositing items to make space...`);
 
@@ -2485,69 +2492,74 @@ export async function processTowedWrecks(
 
       if (!deposited) {
         ctx.log("warn", "No items to deposit — cannot make space for modules");
-        break;
-      }
-      
-      // Re-check cargo after deposit
-      await bot.refreshStatus();
-      if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
-        ctx.log("warn", "Still no cargo space after deposit — skipping module loot");
-        break;
-      }
-    }
-
-    // Loot ALL modules and cargo from wreck (no item_id = loots everything)
-    const lootResp = await bot.exec("loot_wreck", {
-      wreck_id: wreck.wreck_id,
-    });
-
-    if (lootResp.error) {
-      const msg = lootResp.error.message.toLowerCase();
-      // CRITICAL: Check for battle interrupt - stop immediately
-      if (lootResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
-        ctx.log("combat", `Module loot interrupted by battle! ${lootResp.error.message} - stopping!`);
-        return 0;
-      }
-      if (msg.includes("no_space") || msg.includes("not enough cargo")) {
-        ctx.log("scavenge", "Still no cargo space — depositing ALL current items and retrying...");
-        // Deposit all non-fuel items to make space
-        await bot.refreshCargo();
-        for (const cargoItem of bot.inventory) {
-          const lower = cargoItem.itemId.toLowerCase();
-          if (!lower.includes("fuel") && !lower.includes("energy_cell") && cargoItem.quantity > 0) {
-            await bot.exec("deposit_items", { item_id: cargoItem.itemId, quantity: cargoItem.quantity });
-          }
-        }
-        // Retry looting everything
-        const retryResp = await bot.exec("loot_wreck", {
-          wreck_id: wreck.wreck_id,
-        });
-        if (!retryResp.error) {
-          modulesLooted = wreck.modules.length;
-          ctx.log("scavenge", `✓ Looted all modules from wreck`);
-        } else {
-          const retryMsg = retryResp.error.message.toLowerCase();
-          // Check for battle interrupt on retry as well
-          if (retryResp.error.code === "battle_interrupt" || retryMsg.includes("interrupted by battle") || retryMsg.includes("interrupted by combat")) {
-            ctx.log("combat", `Module loot retry interrupted by battle! ${retryResp.error.message} - stopping!`);
-            return 0;
-          }
-          ctx.log("error", `Failed to loot modules after deposit: ${retryResp.error.message}`);
-        }
-      } else if (msg.includes("empty") || msg.includes("not found")) {
-        ctx.log("warn", "Wreck is empty or not found — stopping module loot");
       } else {
-        ctx.log("error", `Failed to loot modules: ${lootResp.error.message}`);
+        // Re-check cargo after deposit
+        await bot.refreshStatus();
+        if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
+          ctx.log("warn", "Still no cargo space after deposit — skipping module loot");
+        }
       }
-    } else {
-      modulesLooted = wreck.modules.length;
-      ctx.log("scavenge", `✓ Looted all modules from wreck`);
     }
 
-    if (modulesLooted > 0) {
-      ctx.log("scavenge", `✅ Successfully looted ${modulesLooted} module(s) from towed wreck`);
+    if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) <= bot.cargoMax) {
+      // Loot ALL modules and cargo from wreck (no item_id = loots everything)
+      const lootResp = await bot.exec("loot_wreck", {
+        wreck_id: towedWreck.wreck_id,
+      });
+
+      if (lootResp.error) {
+        const msg = lootResp.error.message.toLowerCase();
+        // CRITICAL: Check for battle interrupt - stop immediately
+        if (lootResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+          ctx.log("combat", `Module loot interrupted by battle! ${lootResp.error.message} - stopping!`);
+          return 0;
+        }
+        // Handle wreck_gone during initial loot attempt
+        if (msg.includes("wreck_gone") || msg.includes("empty") || msg.includes("not found")) {
+          ctx.log("warn", "Wreck no longer exists during initial loot — releasing tow");
+          await bot.exec("release_tow");
+          bot.towingWreck = false;
+          bot.towingWreckId = null;
+          return 0;
+        }
+        if (msg.includes("no_space") || msg.includes("not enough cargo")) {
+          ctx.log("scavenge", "Still no cargo space — depositing ALL current items and retrying...");
+          // Deposit all non-fuel items to make space
+          await bot.refreshCargo();
+          for (const cargoItem of bot.inventory) {
+            const lower = cargoItem.itemId.toLowerCase();
+            if (!lower.includes("fuel") && !lower.includes("energy_cell") && cargoItem.quantity > 0) {
+              await bot.exec("deposit_items", { item_id: cargoItem.itemId, quantity: cargoItem.quantity });
+            }
+          }
+          // Retry looting everything
+          const retryResp = await bot.exec("loot_wreck", {
+            wreck_id: towedWreck.wreck_id,
+          });
+          if (!retryResp.error) {
+            modulesLooted = towedWreck.modules.length;
+            ctx.log("scavenge", `✓ Looted all modules from wreck`);
+          } else {
+            const retryMsg = retryResp.error.message.toLowerCase();
+            // Check for battle interrupt on retry as well
+            if (retryResp.error.code === "battle_interrupt" || retryMsg.includes("interrupted by battle") || retryMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Module loot retry interrupted by battle! ${retryResp.error.message} - stopping!`);
+              return 0;
+            }
+            ctx.log("error", `Failed to loot modules after deposit: ${retryResp.error.message}`);
+          }
+        } else {
+          ctx.log("error", `Failed to loot modules: ${lootResp.error.message}`);
+        }
+      } else {
+        modulesLooted = towedWreck.modules.length;
+        ctx.log("scavenge", `✓ Looted all modules from wreck`);
+      }
     }
-    break; // Only process the first wreck (we're only towing one)
+  }
+
+  if (modulesLooted > 0) {
+    ctx.log("scavenge", `✅ Successfully looted ${modulesLooted} module(s) from towed wreck`);
   }
 
   // Step 2: Check salvaging skill level
@@ -2590,7 +2602,14 @@ export async function processTowedWrecks(
         if (errMsg.includes("not_towing")) {
           ctx.log("warn", `Server says not towing during scrap (attempt ${attempt}) — clearing tow flag`);
           bot.towingWreck = false;
-          break; // Stop retrying - we're no longer towing
+          bot.towingWreckId = null;
+          break;
+        } else if (errMsg.includes("wreck_gone")) {
+          ctx.log("warn", `Wreck no longer exists during scrap (attempt ${attempt}) — releasing tow`);
+          await bot.exec("release_tow");
+          bot.towingWreck = false;
+          bot.towingWreckId = null;
+          break;
         } else {
           ctx.log("error", `Scrap attempt ${attempt} failed: ${scrapResp.error.message}`);
         }
@@ -2635,7 +2654,14 @@ export async function processTowedWrecks(
         if (errMsg.includes("not_towing")) {
           ctx.log("warn", `Server says not towing during sell (attempt ${attempt}) — clearing tow flag`);
           bot.towingWreck = false;
-          break; // Stop retrying - we're no longer towing
+          bot.towingWreckId = null;
+          break;
+        } else if (errMsg.includes("wreck_gone")) {
+          ctx.log("warn", `Wreck no longer exists during sell (attempt ${attempt}) — releasing tow`);
+          await bot.exec("release_tow");
+          bot.towingWreck = false;
+          bot.towingWreckId = null;
+          break;
         } else {
           ctx.log("error", `Sell attempt ${attempt} failed: ${sellResp.error.message}`);
         }
@@ -2656,6 +2682,7 @@ export async function processTowedWrecks(
   if (processed > 0) {
     ctx.log("scavenge", `Successfully processed wreck (processed=${processed}) — clearing tow flag`);
     bot.towingWreck = false;
+    bot.towingWreckId = null;
   }
 
   await bot.refreshStatus();
@@ -2958,7 +2985,7 @@ export async function factionDonateProfit(ctx: RoutineContext, profit: number): 
   const donation = Math.floor(profit * (pct / 100));
   if (donation <= 0) return;
   if (bot.credits - donation < FACTION_DONATE_FLOOR) return;
-  const resp = await bot.exec("faction_deposit_credits", { amount: donation });
+  const resp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: donation }); // NEVER CHANGE THIS - deposit credits to faction storage
   if (!resp.error) {
     ctx.log("trade", `Donated ${donation}cr to faction treasury (${pct}% of ${profit}cr profit)`);
     logFactionActivity(ctx, "donation", `Deposited ${donation}cr (${pct}% of ${profit}cr profit)`);

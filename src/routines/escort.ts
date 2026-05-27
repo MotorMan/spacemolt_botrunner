@@ -560,11 +560,24 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     const settings = getEscortSettings(bot.username);
+    const minerName = settings.minerName;
+
+    // Handle any battle that may have started before we began this cycle
+    if (battleRef.state.inBattle || bot.isInBattle()) {
+      const battleStatus = await getBattleStatus(ctx);
+      if (battleStatus) {
+        ctx.log("combat", `⚠ Currently in battle (ID: ${battleStatus.battle_id}) — handling before proceeding`);
+        await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName);
+        // Skip the rest of this cycle after handling battle
+        await ctx.sleep(2000);
+        continue;
+      }
+    }
+
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
     };
-    const minerName = settings.minerName;
 
     if (!minerName) {
       ctx.log("error", "No minerName configured in escort settings — waiting 30s");
@@ -753,6 +766,20 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Follow miner immediately if signaled to a different system ──
     if (minerSystem && minerSystem !== bot.system) {
+      // Check if we're in battle before attempting to navigate
+      const battleStatus = await getBattleStatus(ctx);
+      if (battleStatus) {
+        ctx.log("combat", `⚠ Currently in battle (ID: ${battleStatus.battle_id}) — handling battle before navigation`);
+        await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName);
+        // Re-check battle status after handling
+        const postBattle = await getBattleStatus(ctx);
+        if (postBattle) {
+          ctx.log("combat", "Still in battle — skipping navigation this cycle");
+          await ctx.sleep(2000);
+          continue;
+        }
+      }
+
       ctx.log("escort", `Following miner to ${minerSystem} as signaled...`);
       yield "follow_signal";
 
@@ -760,6 +787,13 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         ...safetyOpts,
         skipBlacklist: settings.ignoreBlacklist,
         onJump: async (jumpNumber: number) => {
+          // Check for battle interruption during jumps
+          const jumpBattleStatus = await getBattleStatus(ctx);
+          if (jumpBattleStatus) {
+            ctx.log("combat", `⚠ Battle started during jump ${jumpNumber} (ID: ${jumpBattleStatus.battle_id}) — aborting navigation`);
+            await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName);
+            return false;
+          }
           // Check miner location after each jump
           if (ctx.getFleetStatus) {
             const fleetStatus = ctx.getFleetStatus();
@@ -768,7 +802,6 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
               ctx.log("escort", `⚠ Miner moved from ${minerSystem} to ${minerBot.system} during travel (after jump ${jumpNumber}) — recalculating route...`);
               minerSystem = minerBot.system;
               setMinerLocation(minerName, minerBot.system);
-              // Return false to abort current navigation and recalculate
               return false;
             }
             if (minerBot?.poi) {
@@ -785,8 +818,15 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         setMinerLocation(minerName, minerSystem);
         ctx.log("escort", `✓ Successfully joined miner in ${minerSystem}`);
       } else {
-        ctx.log("error", `Could not reach ${minerSystem} — will retry next cycle`);
-        consecutiveFailedChecks++;
+        ctx.log("error", `Could not reach ${minerSystem} — checking if battle interrupted...`);
+        // Check if battle started during navigation attempt
+        const navBattle = await getBattleStatus(ctx);
+        if (navBattle) {
+          ctx.log("combat", `⚠ Battle detected (ID: ${navBattle.battle_id}) — handling before retrying`);
+          await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName);
+        } else {
+          consecutiveFailedChecks++;
+        }
       }
       continue;
     }
@@ -864,6 +904,14 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
 
+        // Check for battle before navigating
+        const battleBeforeTravel = await getBattleStatus(ctx);
+        if (battleBeforeTravel) {
+          ctx.log("combat", `⚠ Currently in battle (ID: ${battleBeforeTravel.battle_id}) — handling battle before navigation`);
+          await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName);
+          continue;
+        }
+
         // Pre-navigation verification: check if miner is actually where we think
         let currentMinerLocation = minerSystem;
         if (ctx.getFleetStatus) {
@@ -890,6 +938,13 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
           ...safetyOpts,
           skipBlacklist: settings.ignoreBlacklist,
           onJump: async (jumpNumber: number) => {
+            // Check for battle interruption during jumps
+            const jumpBattle = await getBattleStatus(ctx);
+            if (jumpBattle) {
+              ctx.log("combat", `⚠ Battle started during jump ${jumpNumber} (ID: ${jumpBattle.battle_id}) — aborting navigation`);
+              await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName);
+              return false;
+            }
             // Check miner location after each jump
             if (ctx.getFleetStatus) {
               const fleetStatus = ctx.getFleetStatus();
@@ -899,7 +954,6 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
                 currentMinerLocation = minerBot.system;
                 minerSystem = minerBot.system;
                 setMinerLocation(minerName, minerBot.system);
-                // Return false to abort current navigation and recalculate
                 return false;
               }
               if (minerBot?.poi) {
@@ -912,8 +966,15 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
         const arrived = await navigateToSystem(ctx, currentMinerLocation, jumpSafetyOpts);
         if (!arrived) {
-          ctx.log("error", `Could not reach ${currentMinerLocation} — will retry next cycle`);
-          consecutiveFailedChecks++;
+          ctx.log("error", `Could not reach ${currentMinerLocation} — checking if battle interrupted...`);
+          // Check if battle started during navigation attempt
+          const navBattle = await getBattleStatus(ctx);
+          if (navBattle) {
+            ctx.log("combat", `⚠ Battle detected (ID: ${navBattle.battle_id}) — handling before retrying`);
+            await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName);
+          } else {
+            consecutiveFailedChecks++;
+          }
           await ctx.sleep(15000);
           continue;
         }

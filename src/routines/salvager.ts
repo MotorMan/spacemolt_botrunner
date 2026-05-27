@@ -305,6 +305,7 @@ async function flockSalvageWrecks(
             if (msg.includes("already_towing") || msg.includes("already towing")) {
               ctx.log("warn", `Already towing a wreck — heading to salvage yard`);
               bot.towingWreck = true;
+              // Don't clear towingWreckId since we're already towing
               return { itemsLooted: totalLooted, isTowing: true };
             } else {
               ctx.log("scavenge", `Wreck ${wreck.wreck_id} already being towed by another player`);
@@ -321,6 +322,7 @@ async function flockSalvageWrecks(
           if (salvageValue >= minTowValue) {
             ctx.log("scavenge", `Towed ${shipClass} wreck (${wreck.name}) - value: ${salvageValue}cr`);
             bot.towingWreck = true;
+            bot.towingWreckId = wreck.wreck_id;
             return { itemsLooted: totalLooted, isTowing: true };
           } else {
             ctx.log("scavenge", `Towed ${shipClass} wreck (${wreck.name}) but value ${salvageValue}cr below threshold ${minTowValue}cr - releasing`);

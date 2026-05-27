@@ -598,7 +598,7 @@ async function placeMarketOrders(
 
     // Withdraw from faction if needed
     if (fundingSource === "faction") {
-      const wResp = await bot.exec("faction_withdraw_credits", { amount: orderCost });
+      const wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: orderCost }); // NEVER CHANGE THIS
       if (wResp.error) continue;
       logFactionActivity(ctx, "withdraw", `Withdrew ${orderCost}cr for buy order on ${itemId}`);
     }
@@ -618,7 +618,7 @@ async function placeMarketOrders(
     } else {
       // Refund faction credits on failure
       if (fundingSource === "faction") {
-        await bot.exec("faction_deposit_credits", { amount: orderCost });
+        await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: orderCost }); // NEVER CHANGE THIS
       }
     }
   }
@@ -918,17 +918,17 @@ export const coordinatorRoutine: Routine = async function* (ctx: RoutineContext)
       if (member.credits >= BOT_WORKING_BALANCE) continue;
       const needed = BOT_WORKING_BALANCE - member.credits;
       // Withdraw from faction treasury
-      const withdrawResp = await bot.exec("faction_withdraw_credits", { amount: needed });
+      const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS
       if (withdrawResp.error) {
         ctx.log("coord", `Cannot withdraw ${needed}cr for ${member.username}: ${withdrawResp.error.message}`);
         break; // treasury likely empty
       }
       logFactionActivity(ctx, "withdraw", `Withdrew ${needed}cr from treasury for ${member.username}`);
-      const giftResp = await bot.exec("send_gift", { recipient: member.username, credits: needed });
+      const giftResp = await bot.exec("storage", { action: 'deposit', target: member.username, item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS
       if (giftResp.error) {
         ctx.log("coord", `Gift to ${member.username} failed: ${giftResp.error.message}`);
         // Re-deposit withdrawn credits back
-        await bot.exec("faction_deposit_credits", { amount: needed });
+        await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS
       } else {
         ctx.log("coord", `Sent ${needed}cr to ${member.username} (topped off to ${BOT_WORKING_BALANCE}cr)`);
         logFactionActivity(ctx, "gift", `Sent ${needed}cr to ${member.username} (top-off to ${BOT_WORKING_BALANCE}cr)`);

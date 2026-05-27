@@ -153,6 +153,9 @@ export class Bot {
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
+  /** The ID of the wreck being towed (if any). */
+  towingWreckId: string | null = null;
+
   shipSpeed = 1;
   hasPathfinderDrive = false;
   installedMods: string[] = [];

@@ -25,7 +25,7 @@ function getLocalIp(): string | null {
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request";
+  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc";
   bot?: string;
   routine?: string;
   username?: string;

@@ -112,6 +112,7 @@
     let selectedShip = null;
     let currentLoadout = { weapons: [], defense: [], utility: [] };
     let engineeringSkillLevel = 0;
+    let moduleSortMode = { weapons: 'none', defense: 'none', utility: 'none' };
 
     // ── Load Data ──────────────────────────────────────────
     async function loadData() {
@@ -220,8 +221,8 @@ function selectShip() {
       budget.innerHTML = `
         <div class="shipsim-resource-title">Resource Budget</div>
         <div class="shipsim-stat-grid">
-          <span class="shipsim-stat-label">CPU</span><span class="shipsim-stat-value">${cpuUsed}${engineeringSkillLevel > 0 ? ` (was ${baseCpuUsed})` : ''} / ${maxCpu}${cpuBonus > 0 ? ` (+${cpuBonus})` : ''}<div class="shipsim-bar"><div class="shipsim-bar-fill" style="width:${cpuPct}%;background:var(--magenta)"></div></div></span>
-          <span class="shipsim-stat-label">Power</span><span class="shipsim-stat-value">${powerUsed}${engineeringSkillLevel > 0 ? ` (was ${basePowerUsed})` : ''} / ${baseMaxPower}<div class="shipsim-bar"><div class="shipsim-bar-fill" style="width:${powerPct}%;background:var(--accent)"></div></div></span>
+          <span class="shipsim-stat-label">CPU</span><span class="shipsim-stat-value">${cpuUsed}${engineeringSkillLevel > 0 ? ` (was ${baseCpuUsed})` : ''} / ${maxCpu}${cpuBonus > 0 ? ` (+${cpuBonus})` : ''} (${cpuPct}% base)<div class="shipsim-bar"><div class="shipsim-bar-fill" style="width:${cpuPct}%;background:var(--magenta)"></div></div></span>
+          <span class="shipsim-stat-label">Power</span><span class="shipsim-stat-value">${powerUsed}${engineeringSkillLevel > 0 ? ` (was ${basePowerUsed})` : ''} / ${baseMaxPower} (${powerPct}% base)<div class="shipsim-bar"><div class="shipsim-bar-fill" style="width:${powerPct}%;background:var(--accent)"></div></div></span>
           <span class="shipsim-stat-label">Slots</span><span class="shipsim-stat-value">${slotsUsed} / ${totalSlots} used${weaponSlots ? ` (W:${currentLoadout.weapons.length}/${weaponSlots}` : ''}${defenseSlots ? ` D:${currentLoadout.defense.length}/${defenseSlots}` : ''}${utilitySlots ? ` U:${currentLoadout.utility.length}/${utilitySlots}` : ''}${totalSlots > 0 ? ')' : ''}</span>
         </div>
       `;
@@ -293,7 +294,31 @@ function selectShip() {
       titleDiv.innerHTML = `<span>${title}</span><span class="shipsim-module-slots">${currentLoadout[category].length}/${maxSlots} slots</span>`;
       div.appendChild(titleDiv);
 
-      // Create dropdown for module selection
+      const sortDiv = document.createElement('div');
+      sortDiv.style.marginBottom = '8px';
+      sortDiv.style.display = 'flex';
+      sortDiv.style.alignItems = 'center';
+      sortDiv.style.gap = '8px';
+      sortDiv.innerHTML = '<label style="font-size:11px;color:var(--text-dim);">Sort:</label>';
+
+      const sortSelect = document.createElement('select');
+      sortSelect.className = 'shipsim-sort-select';
+      sortSelect.style.padding = '4px 8px';
+      sortSelect.style.fontSize = '11px';
+      sortSelect.innerHTML = `
+        <option value="none">Default</option>
+        <option value="cpu">Sort by CPU (high to low)</option>
+        <option value="power">Sort by PWR (high to low)</option>
+        <option value="cpu_power">Lowest CPU, Highest PWR</option>
+      `;
+      sortSelect.value = moduleSortMode[category] || 'none';
+      sortSelect.onchange = () => {
+        moduleSortMode[category] = sortSelect.value;
+        renderModules();
+      };
+      sortDiv.appendChild(sortSelect);
+      div.appendChild(sortDiv);
+
       const selectDiv = document.createElement('div');
       selectDiv.className = 'shipsim-module-select';
 
@@ -301,7 +326,32 @@ function selectShip() {
       select.id = `moduleSelect_${category}`;
       select.innerHTML = '<option value="">Select a module to add...</option>';
 
-      modules.forEach(module => {
+      let sortedModules = [...modules];
+      const sortValue = moduleSortMode[category] || 'none';
+      if (sortValue === 'cpu') {
+        sortedModules.sort((a, b) => {
+          const aCpu = a.cpu_usage || a.cpu_cost || a.cpu || 0;
+          const bCpu = b.cpu_usage || b.cpu_cost || b.cpu || 0;
+          return bCpu - aCpu;
+        });
+      } else if (sortValue === 'power') {
+        sortedModules.sort((a, b) => {
+          const aPwr = a.power_usage || a.power_cost || a.power || 0;
+          const bPwr = b.power_usage || b.power_cost || b.power || 0;
+          return bPwr - aPwr;
+        });
+      } else if (sortValue === 'cpu_power') {
+        sortedModules.sort((a, b) => {
+          const aCpu = a.cpu_usage || a.cpu_cost || a.cpu || 0;
+          const bCpu = b.cpu_usage || b.cpu_cost || b.cpu || 0;
+          if (aCpu !== bCpu) return aCpu - bCpu;
+          const aPwr = a.power_usage || a.power_cost || a.power || 0;
+          const bPwr = b.power_usage || b.power_cost || b.power || 0;
+          return bPwr - aPwr;
+        });
+      }
+
+      sortedModules.forEach(module => {
         const option = document.createElement('option');
         option.value = module.id;
         const details = [];

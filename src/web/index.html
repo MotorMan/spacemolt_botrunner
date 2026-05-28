@@ -2296,6 +2296,7 @@ function renderProfileTopbar() {
     const globalMiner = (settings.escort || {}).minerName || '';
     const botMiner = botSettings.minerName || '';
     const effectiveMiner = botMiner || globalMiner;
+    const botIgnoreBlacklist = botSettings.ignoreBlacklist ?? false;
     // Build miner dropdown from known bots
     // Use bots array (from WebSocket) as primary source, fallback to discoveredBots
     const knownBotsList = [...new Set([
@@ -2312,7 +2313,10 @@ function renderProfileTopbar() {
     }
     actions += `
       <span class="profile-ore-label" style="margin-left:8px">Follow:</span>
-      <select id="profile-minerName" onclick="event.stopPropagation()" onchange="saveProfileEscortMiner()">${minerOpts.join('')}</select>`;
+      <select id="profile-minerName" onclick="event.stopPropagation()" onchange="saveProfileEscortMiner()">${minerOpts.join('')}</select>
+      <label style="margin-left:8px;font-size:11px;display:inline-flex;align-items:center;gap:3px;cursor:pointer" onclick="event.stopPropagation()">
+        <input type="checkbox" id="profile-escort-ignoreBlacklist"${botIgnoreBlacklist ? ' checked' : ''} onchange="saveProfileEscortIgnoreBlacklist()"> ignore blacklist
+      </label>`;
   }
 
   // Add flock controls
@@ -2513,6 +2517,17 @@ function saveProfileEscortMiner() {
   const minerName = sel.value;
   const existing = settings[bot.username] || {};
   const updated = Object.assign({}, existing, { minerName });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfileEscortIgnoreBlacklist() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const cb = document.getElementById('profile-escort-ignoreBlacklist');
+  if (!cb) return;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { ignoreBlacklist: cb.checked });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
 }
@@ -15929,6 +15944,7 @@ function renderSalvagerSettings(panel) {
   const maxRoamJumps = sv.maxRoamJumps ?? 0;
   const roamBaseSystems = Array.isArray(sv.roamBaseSystems) ? sv.roamBaseSystems.join(', ') : (sv.roamBaseSystems || '');
   const depositAtSalvageYard = sv.depositAtSalvageYard ?? false;
+  const ignoreBlacklist = sv.ignoreBlacklist ?? false;
 
   // Salvage yard stations list - mobile_capital is dynamic
   const mcLocation = mobileCapitol ? mobileCapitol.systemName || mobileCapitol.systemId : 'unknown (not discovered)';
@@ -16125,6 +16141,14 @@ function renderSalvagerSettings(panel) {
       <label class="checkbox-label"><input type="checkbox" id="set-salvager-depositAtSalvageYard"${depositAtSalvageYard ? ' checked' : ''}> Deposit cargo at salvage yard (don't return home)</label>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ignore Blacklist</div>
+        <div class="setting-hint">Allow this salvager to enter systems on the persistent blacklist and skip temporary pirate blacklists. Useful for escorted operations into pirate space to loot high-value wrecks.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-salvager-ignoreBlacklist"${ignoreBlacklist ? ' checked' : ''}> Ignore system blacklist</label>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveSalvagerSettings()">Save Settings</button>
     </div>
@@ -16150,6 +16174,7 @@ function saveSalvagerSettings() {
     maxRoamJumps: parseInt(document.getElementById('set-salvager-maxRoamJumps').value) || 0,
     roamBaseSystems: document.getElementById('set-salvager-roamBaseSystems').value,
     depositAtSalvageYard: document.getElementById('set-salvager-depositAtSalvageYard').checked,
+    ignoreBlacklist: document.getElementById('set-salvager-ignoreBlacklist').checked,
   };
   send({ type: 'saveSettings', routine: 'salvager', settings: s });
   settings.salvager = s;
@@ -16619,7 +16644,7 @@ function renderEscortSettings(panel) {
   const globalMaxAttackTier = e.maxAttackTier || 'large';
   const globalFleeFromTier = e.fleeFromTier || 'boss';
   const globalMinPiratesToFlee = e.minPiratesToFlee ?? 3;
-
+  const globalIgnoreBlacklist = e.ignoreBlacklist ?? false;
 
   const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
   const tierOpts = tierOptions.map(t => `<option value="${t}"${t === globalMaxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
@@ -16760,6 +16785,14 @@ function renderEscortSettings(panel) {
         </div>
         <input type="number" id="set-escort-minPiratesToFlee" min="1" max="10" value="${globalMinPiratesToFlee}">
       </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Ignore System Blacklist</div>
+          <div class="setting-hint">Allow this escort to follow its target into blacklisted systems (e.g. pirate bases when escorting salvagers). Bypasses the persistent system blacklist.</div>
+        </div>
+        <label class="checkbox-label"><input type="checkbox" id="set-escort-ignoreBlacklist"${globalIgnoreBlacklist ? ' checked' : ''}> Ignore system blacklist</label>
+      </div>
     </div>
 
     <div class="settings-save-bar">
@@ -16788,6 +16821,7 @@ function saveEscortSettings() {
     maxAttackTier: document.getElementById('set-escort-maxAttackTier').value,
     fleeFromTier: document.getElementById('set-escort-fleeFromTier').value,
     minPiratesToFlee: parseInt(document.getElementById('set-escort-minPiratesToFlee').value) || 3,
+    ignoreBlacklist: document.getElementById('set-escort-ignoreBlacklist').checked,
   };
   send({ type: 'saveSettings', routine: 'escort', settings: s });
   settings.escort = s;
@@ -17812,6 +17846,8 @@ let shipyardFleetData = null;
 let shipyardCatalogData = null;
 let shipyardMode = 'bots'; // 'bots' or 'simulator'
 
+const CARRIER_SHIP_IDS = ['iron_fleet', 'convoy', 'grand_transit'];
+
 function renderShipyardPage() {
   // Default to bots mode when opening shipyard tab
   shipyardMode = 'bots';
@@ -18213,12 +18249,13 @@ function renderFleetPanel(ships, username, error) {
       const rawName = s.name || s.ship_name || '';
       const cls = s.class_name || s.class || s.ship_class || s.ship_type || s.type || '';
       const classId = s.class_id || '';
+      const shipCls = cls || classId || '';
       const customName = s.custom_name || s.customName || '';
       const baseName = cls || classId || 'Unknown';
       let name = (rawName && rawName.toLowerCase() !== 'unnamed') ? rawName : baseName;
       if (customName) name = `${baseName} - ${customName}`;
-      const rawLoc = s.location || s.system || '';
-      const loc = resolveLocation(rawLoc) || rawLoc;
+      const rawLocation = s.location || s.system || '';
+      const loc = resolveLocation(rawLocation) || rawLocation;
       const isActive = id === activeShipId || s.active || s.is_active;
 
       // Parse stats — API returns "71/100" string format or numeric fields
@@ -18254,11 +18291,113 @@ function renderFleetPanel(ships, username, error) {
         : '';
       const etaHtml = buildEta ? `<span style="font-size:10px;color:var(--text-dim);margin-left:4px">${esc(String(buildEta))}</span>` : '';
 
-      // Build bot dropdown for gifting
+      const isLoadedOnCarrier = typeof rawLocation === 'string' && rawLocation.toLowerCase().includes('loaded on');
+      // Extract carrier name from "loaded on carrier <name>" or "loaded on <name>"
+      const loadedCarrierName = isLoadedOnCarrier ? rawLocation.replace(/^loaded on\s*(carrier\s*)?/i, '').trim().toLowerCase() : '';
+      // Debug: log the parsed loadedCarrierName
+      if (isLoadedOnCarrier) {
+        console.log('[fleet-debug] parsed loadedCarrierName:', loadedCarrierName, 'from rawLocation:', rawLocation);
+      }
+      
+      const botObj = bots.find(b => b.username === username);
+      const botLocation = botObj?.location || '';
+      const botSystem = botObj?.system || '';
+      
+const activeShip = shipyardShipData?.ship || shipyardShipData || {};
+      const activeShipName = ((activeShip?.name || activeShip?.ship_name) || '').toLowerCase();
+      const activeShipCustomName = ((activeShip?.custom_name || activeShip?.customName) || '').toLowerCase();
+      const activeShipClassId = ((activeShip?.class?.id || activeShip?.class_id || activeShip?.ship_type || activeShip?.type) || '').toLowerCase();
+      const activeShipClassName = ((activeShip?.class?.name || activeShip?.class?.class) || '').toLowerCase();
+      // Effective custom name: use custom_name if set, otherwise use name if it's not empty
+      const effectiveActiveCustomName = activeShipCustomName || (activeShipName || '');
+      // Check if this is a carrier by class (either 'carrier' in class name, or class.id/name matches carrier IDs)
+      const isCarrierByClass = activeShipClassName.includes('carrier') || activeShipClassId.includes('carrier');
+      const isCarrierById = activeShipClassId && CARRIER_SHIP_IDS.some(id => activeShipClassId.includes(id));
+      const isCarrierActive = isCarrierByClass || isCarrierById || CARRIER_SHIP_IDS.some(id => 
+        activeShipName.includes(id) || 
+        activeShipCustomName.includes(id) ||
+        effectiveActiveCustomName.includes(id)
+      );
+      // Also check if the ship's display name (name field) contains a carrier ID
+      // But only if we haven't already determined this is a carrier by class
+      const isCarrierByName = !isCarrierActive && activeShipName && CARRIER_SHIP_IDS.some(id => activeShipName.includes(id));
+      const storedInCarrierName = s.stored_in_ship || s.carrier_ship || s.stored_on || s.stored_in || s.carrier_name || '';
+      const shipStoredInCarrier = storedInCarrierName.toLowerCase();
+      
+      // A ship is at the station if it's at the same location/system as the bot (docked at station)
+      // Note: rawLocation for ships is typically the system ID, while botLocation is the full location string
+      // We need to check if the ship's system matches the bot's system
+      const shipSystem = rawLocation;  // rawLocation is the system ID for ships
+      const isShipAtStation = botObj?.docked && !isActive && !isLoadedOnCarrier && botLocation && botLocation.length > 0 &&
+        (shipSystem === botSystem || shipSystem === botObj?.system || shipSystem === (botObj?.location ? botObj.location.split(' - ')[0] : ''));
+      
+      // Check if ship is stored in the active carrier by ID match
+      const activeShipIdFromData = (activeShip?.id || activeShip?.ship_id || '').toString();
+      // Also check for the ship's ID in the ship object directly (ship.id is the ship's own ID, not the carrier's)
+      const isStoredInActiveCarrierById = isCarrierActive && shipStoredInCarrier && activeShipIdFromData && 
+        (shipStoredInCarrier === activeShipIdFromData || shipStoredInCarrier === String(activeShip?.id));
+      
+      // Check if ship is stored in the active carrier by name match
+      const isStoredInActiveCarrierByName = isCarrierActive && shipStoredInCarrier && (
+        shipStoredInCarrier === activeShipName ||
+        shipStoredInCarrier === activeShipCustomName ||
+        shipStoredInCarrier === effectiveActiveCustomName ||
+        shipStoredInCarrier === activeShipClassId ||
+        shipStoredInCarrier === activeShipClassName ||
+        (activeShipName && activeShipName.includes(shipStoredInCarrier)) ||
+        (activeShipCustomName && activeShipCustomName.includes(shipStoredInCarrier)) ||
+        (effectiveActiveCustomName && effectiveActiveCustomName.includes(shipStoredInCarrier)) ||
+        (activeShipClassId && activeShipClassId.includes(shipStoredInCarrier)) ||
+        (activeShipClassName && activeShipClassName.includes(shipStoredInCarrier)) ||
+        shipStoredInCarrier.includes(activeShipName) ||
+        shipStoredInCarrier.includes(activeShipCustomName) ||
+        shipStoredInCarrier.includes(effectiveActiveCustomName) ||
+        shipStoredInCarrier.includes(activeShipClassId) ||
+        shipStoredInCarrier.includes(activeShipClassName) ||
+        (isCarrierByName && shipStoredInCarrier.includes(activeShipName))
+      );
+      
+      const isUnloadFromActiveCarrier = isLoadedOnCarrier && loadedCarrierName && (
+        loadedCarrierName === activeShipName ||
+        loadedCarrierName === activeShipCustomName ||
+        loadedCarrierName === effectiveActiveCustomName ||
+        loadedCarrierName === activeShipClassId ||
+        loadedCarrierName === activeShipClassName ||
+        (activeShipName && activeShipName.includes(loadedCarrierName)) ||
+        (activeShipCustomName && activeShipCustomName.includes(loadedCarrierName)) ||
+        (effectiveActiveCustomName && effectiveActiveCustomName.includes(loadedCarrierName)) ||
+        (activeShipClassId && activeShipClassId.includes(loadedCarrierName)) ||
+        (activeShipClassName && activeShipClassName.includes(loadedCarrierName)) ||
+        loadedCarrierName.includes(activeShipName) ||
+        loadedCarrierName.includes(activeShipCustomName) ||
+        loadedCarrierName.includes(effectiveActiveCustomName) ||
+        loadedCarrierName.includes(activeShipClassId) ||
+        loadedCarrierName.includes(activeShipClassName) ||
+        (isCarrierByName && loadedCarrierName.includes(activeShipName))
+      );
+      
+      const isStoredInThisCarrier = isCarrierActive && (isStoredInActiveCarrierById || isStoredInActiveCarrierByName);
+      
+      const canLoadOntoCarrier = isCarrierActive && isShipAtStation;
+      const canUnloadFromCarrier = isCarrierActive && (isLoadedOnCarrier && isUnloadFromActiveCarrier || isStoredInThisCarrier);
+      
+      // Debug for carrier ships
+      if (isCarrierActive && (canLoadOntoCarrier || canUnloadFromCarrier)) {
+        console.log('[fleet-debug]', name, { 
+          canLoad: canLoadOntoCarrier, 
+          canUnload: canUnloadFromCarrier,
+          isShipAtStation, isLoadedOnCarrier, shipStoredInCarrier: shipStoredInCarrier ? `'${shipStoredInCarrier}'` : '(empty)',
+          loadedCarrierName: loadedCarrierName ? `'${loadedCarrierName}'` : '(empty)',
+          isStoredInThisCarrier, isUnloadFromActiveCarrier,
+          activeShipName: `'${activeShipName}'`, activeShipCustomName: `'${activeShipCustomName}'`, effectiveActiveCustomName: `'${effectiveActiveCustomName}'`,
+          botLocation: `'${botLocation}'`, botSystem: `'${botSystem}'`, shipSystem: `'${shipSystem}'`
+        });
+      }
+      
       const botOptions = bots.filter(b => b.username !== username).map(b =>
         `<option value="${esc(b.username)}">${esc(b.username)}</option>`
       ).join('');
-      const giftDropdown = !isActive && !isBuilding ? `
+      const giftDropdown = !isActive && !isBuilding && !isLoadedOnCarrier ? `
         <select class="ship-gift-bot-select" id="gift-select-${id}" onchange="handleGiftBotSelect('${esc(username)}','${esc(id)}',this)">
           <option value="">Gift to...</option>
           ${botOptions}
@@ -18267,36 +18406,28 @@ function renderFleetPanel(ships, username, error) {
         <input type="text" class="ship-gift-custom-input" id="gift-input-${id}" placeholder="Bot name..." style="display:none;width:120px;font-size:11px;padding:2px 6px;">
         <button class="sm" style="color:var(--cyan)" onclick="shipGift('${esc(username)}','${esc(id)}','${esc(name)}')">Gift</button>
       ` : '';
-
-      // Check if ship is at the same station as the carrier (for deposit)
-      const bot = bots.find(b => b.username === username);
-      const carrierStation = bot?.location || '';
-      const carrierName = shipyardShipData?.ship?.name || shipyardShipData?.ship?.ship_name || '';
-      const shipLocation = s.location || s.system || '';
-      const shipStoredInCarrier = s.stored_in_ship || s.carrier_ship || s.stored_on || '';
-      const isAtSameStation = bot?.docked && shipLocation === carrierStation && !isActive;
-      const isStoredInThisCarrier = carrierName && (shipStoredInCarrier === carrierName || s.carrier_name === carrierName);
-
-      // Deposit/Withdraw buttons
-      const depositBtn = isAtSameStation
-        ? `<button class="sm" style="color:var(--green)" onclick="shipDepositIntoCarrier('${esc(username)}','${esc(id)}','${esc(name)}')" title="Deposit into carrier">📦 Deposit</button>`
+      
+      const loadBtn = canLoadOntoCarrier
+        ? `<button class="sm" style="color:var(--green)" onclick="shipDepositIntoCarrier('${esc(username)}','${esc(id)}','${esc(name)}')" title="Load onto carrier">📦 Load</button>`
         : '';
-      const withdrawBtn = isStoredInThisCarrier
-        ? `<button class="sm" style="color:var(--cyan)" onclick="shipWithdrawFromCarrier('${esc(username)}','${esc(id)}','${esc(name)}')" title="Withdraw from carrier">📤 Withdraw</button>`
+      const unloadBtn = canUnloadFromCarrier
+        ? `<button class="sm" style="color:var(--cyan)" onclick="shipWithdrawFromCarrier('${esc(username)}','${esc(id)}','${esc(name)}')" title="Unload from carrier">📤 Unload</button>`
         : '';
 
+      const storedInCarrierDisplay = storedInCarrierName || '';
+
+      const shipIdDisplay = id ? ` <span class="ship-id" style="color:var(--text-dim);font-size:11px;font-weight:400">(${typeof id === 'number' ? id.toString(16) : id})</span>` : '';
       html += `<div class="shipyard-ship-card">
         <div style="flex:1">
-          <div class="ssc-name">${esc(name)}${!customName && cls && name !== baseName ? ` <span style="font-weight:400;color:var(--text-dim);font-size:11px">${esc(cls)}</span>` : ''} ${isActive ? '<span class="shipyard-active-badge">Active</span>' : ''}${buildBadge}${etaHtml}</div>
-          <div class="ssc-detail">${esc(loc)}${shipStoredInCarrier ? ` <span style="color:var(--cyan);font-size:10px">📦 Stored in: ${esc(shipStoredInCarrier)}</span>` : ''}</div>
+          <div class="ssc-name">${esc(name)}${shipIdDisplay}${!customName && cls && name !== baseName ? ` <span style="font-weight:400;color:var(--text-dim);font-size:11px">${esc(cls)}</span>` : ''} ${isActive ? '<span class="shipyard-active-badge">Active</span>' : ''}${buildBadge}${etaHtml}</div>
+          <div class="ssc-detail">${esc(loc)}${storedInCarrierDisplay ? ` <span style="color:var(--cyan);font-size:10px">📦 Stored in: ${esc(storedInCarrierDisplay)}</span>` : ''}${isLoadedOnCarrier ? ` <span style="color:var(--yellow);font-size:10px">📥 Loaded on: ${esc(loadedCarrierName)}</span>` : ''}</div>
           ${statsHtml}
         </div>
         <div class="ssc-actions">
-          ${!isActive && !isBuilding ? `<button class="sm" onclick="shipGoTo('${esc(username)}','${esc(id)}','${esc(rawLoc)}')">Go</button>` : ''}
-          ${!isActive && !isBuilding ? `<button class="sm" onclick="shipSwitch('${esc(username)}','${esc(id)}')">Switch</button>` : ''}
-          ${depositBtn}
-          ${withdrawBtn}
-          ${!isActive && !isBuilding ? `<button class="sm" style="color:var(--red)" onclick="shipSell('${esc(username)}','${esc(id)}','${esc(name)}')">Sell</button>` : ''}
+          ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" onclick="shipGoTo('${esc(username)}','${esc(id)}','${esc(rawLocation)}')">Go</button>` : ''}
+          ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" onclick="shipSwitch('${esc(username)}','${esc(id)}')">Switch</button>` : ''}
+          ${loadBtn}${unloadBtn}
+          ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" style="color:var(--red)" onclick="shipSell('${esc(username)}','${esc(id)}','${esc(name)}')">Sell</button>` : ''}
           ${giftDropdown}
         </div>
       </div>`;
@@ -18897,35 +19028,35 @@ function shipGift(username, shipId, name) {
   });
 }
 
-/** Deposit a ship into the carrier ship's storage */
+/** Load a ship from station into the active carrier's storage (bay) */
 function shipDepositIntoCarrier(username, shipId, shipName) {
   if (!shipId) return;
-  if (!confirm(`Deposit ${shipName || 'this ship'} into carrier storage? It will use cargo bays.`)) return;
+  if (!confirm(`Load ${shipName || 'this ship'} into the active carrier's storage?`)) return;
   
   sendExec(username, 'storage', { action: 'deposit', quantity: 1, item_id: shipId }, (result) => {
     if (result.ok) {
       const data = result.data || {};
       const storageTotal = data.storage_total ?? '?';
       const cargoRemaining = data.cargo_remaining ?? '?';
-      appendLine('system', `${username} deposited ${shipName || 'a ship'} into carrier (storage: ${storageTotal}, cargo remaining: ${cargoRemaining})`);
+      appendLine('system', `${username} loaded ${shipName || 'ship'} into carrier (storage: ${storageTotal}, cargo remaining: ${cargoRemaining})`);
       if (shipyardActivePanel === 'fleet') fetchFleetList(username);
     } else {
-      appendLine('system', `Deposit ship failed: ${result.error || 'unknown'}`);
+      appendLine('system', `Load ship failed: ${result.error || 'unknown'}`);
     }
   });
 }
 
-/** Withdraw a ship from the carrier ship's storage */
+/** Withdraw a ship from the carrier ship's storage to station */
 function shipWithdrawFromCarrier(username, shipId, shipName) {
   if (!shipId) return;
-  if (!confirm(`Withdraw ${shipName || 'this ship'} from carrier storage?`)) return;
+  if (!confirm(`Unload ${shipName || 'this ship'} from carrier storage? This will deposit it at the current station.`)) return;
   
   sendExec(username, 'storage', { action: 'withdraw', quantity: 1, item_id: shipId }, (result) => {
     if (result.ok) {
-      appendLine('system', `${username} withdrew ${shipName || 'a ship'} from carrier`);
+      appendLine('system', `${username} unloaded ${shipName || 'a ship'} from carrier`);
       if (shipyardActivePanel === 'fleet') fetchFleetList(username);
     } else {
-      appendLine('system', `Withdraw ship failed: ${result.error || 'unknown'}`);
+      appendLine('system', `Unload ship failed: ${result.error || 'unknown'}`);
     }
   });
 }

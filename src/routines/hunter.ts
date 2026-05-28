@@ -88,26 +88,30 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
     return;
   }
 
+  // Get hunter settings for shield recharge
+  const hsettings = getHunterSettings(ctx.bot.username);
+  const shieldRechargePct = (hsettings.shieldRechargePct ?? 80) / 100;
+
   if (analysis.reason.includes("Already in battle")) {
     ctx.log("combat", `Already participating on side ${analysis.sideId} — continuing fight`);
   } else {
     ctx.log("combat", `✅ Joining unexpected battle on side ${analysis.sideId}: ${analysis.reason}`);
     const engageResp = await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId!.toString() });
     if (engageResp.error) {
-      ctx.log("error", `Failed to join unexpected battle: ${engageResp.error.message}`);
-      return;
+      const errMsg = engageResp.error.message.toLowerCase();
+      if (errMsg.includes("already in a battle") || errMsg.includes("already_in_battle")) {
+        ctx.log("combat", `Already in battle — proceeding to fight`);
+      } else {
+        ctx.log("error", `Failed to join unexpected battle: ${engageResp.error.message}`);
+        return;
+      }
     }
   }
 
   // Pick a real target from battle participants so we get the full combat loop
   const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
   const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
-  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold);
-
-  // Ensure shields are topped up after handling/fighting an unexpected battle
-  const hsettings = getHunterSettings(ctx.bot.username);
-  await topUpShields(ctx, (hsettings.shieldRechargePct ?? 80) / 100);
-  await useRepairKits(ctx);
+  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, shieldRechargePct);
 }
 
 // ── Settings ─────────────────────────────────────────────────

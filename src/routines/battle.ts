@@ -658,6 +658,7 @@ export async function fightFreshBattle(
   repairThreshold: number = 0,
 ): Promise<boolean> {
   const { bot } = ctx;
+  const MAX_BATTLE_TICKS = 60;
 
   // Advance to engaged zone
   // NOTE: bot.exec("battle", ...) ALREADY BLOCKS until server tick (~10s)
@@ -709,6 +710,11 @@ export async function fightFreshBattle(
   while (true) {
     if (bot.state !== "running") return false;
     tickCount++;
+
+    if (tickCount > MAX_BATTLE_TICKS) {
+      ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
+      return true;
+    }
 
     const status = await getBattleStatus(ctx);
     if (!status) {
@@ -782,7 +788,16 @@ function pickRealBattleTarget(
   ourSideId?: number,
 ): NearbyEntity | null {
   if (!status?.participants || status.participants.length === 0) return null;
-  const ourSide = ourSideId ?? status.your_side_id;
+  
+  // Validate ourSideId - must be a valid number from the sides present
+  const validSides = status.sides?.map(s => s.side_id) || [];
+  const ourSide = (ourSideId !== undefined && validSides.includes(ourSideId)) 
+    ? ourSideId 
+    : status.your_side_id;
+  
+  // If we still don't have a valid side, we can't determine enemies
+  if (ourSide === undefined || ourSide === null) return null;
+  
   const enemies = status.participants.filter(p =>
     p.side_id !== ourSide &&
     !p.is_destroyed &&
@@ -810,8 +825,11 @@ export async function fightJoinedBattle(
   fleeFromTier: PirateTier,
   maxAttackTier: PirateTier,
   repairThreshold: number = 0,
+  canFlee: boolean = true,
+  shieldRechargePct: number = 80,
 ): Promise<boolean> {
   const { bot } = ctx;
+  const MAX_BATTLE_TICKS = 60;
 
   let currentTarget = target;
 
@@ -838,6 +856,26 @@ export async function fightJoinedBattle(
     await bot.exec("battle", { action: "target", target_id: currentTarget.id });
   }
   await bot.exec("battle", { action: "stance", stance: "fire" });
+  await ctx.sleep(10000);
+
+  // Ensure we're at engaged zone before entering combat loop
+  const postSetupStatus = await getBattleStatus(ctx);
+  let ourZone = postSetupStatus?.your_zone || "outer";
+  if (ourZone !== "engaged") {
+    ctx.log("combat", `Current zone: ${ourZone} — advancing to engaged...`);
+    const zoneOrder: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+    const ourZoneNum = zoneOrder[ourZone] ?? 0;
+    const targetZoneNum = zoneOrder["engaged"];
+    for (let z = ourZoneNum + 1; z <= targetZoneNum; z++) {
+      const zoneName = Object.keys(zoneOrder).find(k => zoneOrder[k] === z) || "engaged";
+      ctx.log("combat", `Advancing to ${zoneName}...`);
+      const advResp = await bot.exec("battle", { action: "advance" });
+      if (advResp.error) {
+        ctx.log("error", `Advance to ${zoneName} failed: ${advResp.error.message}`);
+      }
+      await ctx.sleep(10000);
+    }
+  }
 
   let lastKnownEnemyZone = "outer";
   let tickCount = 0;
@@ -845,6 +883,11 @@ export async function fightJoinedBattle(
   while (true) {
     if (bot.state !== "running") return false;
     tickCount++;
+
+    if (tickCount > MAX_BATTLE_TICKS) {
+      ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
+      return true;
+    }
 
     const status = await getBattleStatus(ctx);
     if (!status) {
@@ -901,6 +944,17 @@ export async function fightJoinedBattle(
       }
     }
 
+    // Shield recharge for escorts (even when repairThreshold is 0)
+    // shieldRechargePct is passed as percentage (e.g., 80 for 80%), convert to decimal for topUpShields
+    const shieldTargetPct = shieldRechargePct / 100;
+    if (shieldTargetPct > 0 && shieldPct < shieldTargetPct * 100) {
+      ctx.log("combat", `🛡️ Shields ${shieldPct}% < ${shieldTargetPct * 100}% — recharging...`);
+      if (await topUpShields(ctx, shieldTargetPct)) {
+        await ctx.sleep(10000);
+        continue;
+      }
+    }
+
     if (targetParticipant && targetParticipant.zone) {
       if (targetParticipant.zone !== lastKnownEnemyZone) {
         const zoneDir = { outer: 0, mid: 1, inner: 2, engaged: 3 };
@@ -915,7 +969,7 @@ export async function fightJoinedBattle(
       }
     }
 
-    if (hullPct <= fleeThreshold) {
+    if (canFlee && hullPct <= fleeThreshold) {
       ctx.log("combat", `💀 Hull critical (${hullPct}%) — FLEEING!`);
       await emergencyFleeSpam(ctx, `hull at ${hullPct}%`);
       return false;

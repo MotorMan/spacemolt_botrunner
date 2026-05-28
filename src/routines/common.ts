@@ -2101,6 +2101,12 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
   const { bot } = ctx;
   if (bot.docked) return 0; // can't scavenge while docked
 
+  // CRITICAL: Don't scavenge if we're in battle
+  if (bot.isInBattle()) {
+    ctx.log("combat", `Not scavenging while in battle`);
+    return 0;
+  }
+
   // Skip if cargo is already full or nearly full (less than 5 free)
   await bot.refreshStatus();
   if (bot.cargoMax > 0 && bot.cargoMax - bot.cargo < 5) return 0;
@@ -2160,7 +2166,7 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
       if (lootResp.error) {
         const errMsg = lootResp.error.message.toLowerCase();
         // CRITICAL: Check for battle interrupt - stop scavenging immediately
-        if (lootResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+        if (lootResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat") || errMsg.includes("in_battle") || errMsg.includes("cannot perform this action while in combat")) {
           ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
           return totalLooted;
         }

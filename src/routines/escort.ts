@@ -309,23 +309,17 @@ async function analyzeEscortBattle(
     const fleetSide = sideInfo.find(s => s.sideId === fleetInBattle.side_id);
     if (fleetSide) {
       const isMiner = (fleetInBattle.username || "").toLowerCase() === minerName.toLowerCase();
-      // Only join if there are actual pirates to fight on the opposing side
+      // Fleet member is in battle — escort MUST join to protect regardless of API pirate count
+      // The battle status API is buggy and may report 0 pirates even when pirates are present
       const opposingSide = sideInfo.find(s => s.sideId !== fleetSide.sideId);
-      if (opposingSide && opposingSide.pirateCount > 0) {
-        return {
-          shouldJoin: true,
-          sideId: fleetSide.sideId,
-          reason: `${isMiner ? 'Miner' : 'Fleet member'} ${fleetInBattle.username} is in battle — escort joining their side`,
-          pirateCount: opposingSide.pirateCount,
-        };
-      } else {
-        // No pirates to fight - don't join this battle
-        return {
-          shouldJoin: false,
-          reason: `Fleet member ${fleetInBattle.username} in battle but no pirates present — staying out`,
-          pirateCount: 0,
-        };
-      }
+      const reportedPirateCount = opposingSide?.pirateCount || 0;
+      ctx.log("combat", `   ⚠ Battle status API reports ${reportedPirateCount} pirates — but API is unreliable, joining anyway to protect ${isMiner ? 'miner' : 'fleet member'}`);
+      return {
+        shouldJoin: true,
+        sideId: fleetSide.sideId,
+        reason: `${isMiner ? 'Miner' : 'Fleet member'} ${fleetInBattle.username} is in battle — escort joining to protect`,
+        pirateCount: reportedPirateCount,
+      };
     }
   }
 
@@ -360,6 +354,7 @@ async function analyzeEscortBattle(
 
 /** Handle being unexpectedly pulled into a battle (e.g. miner started combat).
  *  Mirrors the robust logic from hunter using escort-specific battle analysis.
+ *  Escorts NEVER flee - they fight to protect the miner.
  */
 async function handleUnexpectedEscortBattle(
   ctx: RoutineContext,
@@ -377,12 +372,23 @@ async function handleUnexpectedEscortBattle(
   ctx.log("combat", `⚠️ Unexpectedly in battle (ID: ${battleStatus.battle_id})`);
 
   const analysis = await analyzeEscortBattle(ctx, maxAttackTier, minPiratesToFlee, minerName);
+  // If fleet member is in battle, analysis.shouldJoin is true regardless of reported pirate count
+  // The battle status API is buggy and reports 0 pirates even when pirates are present
   if (!analysis.shouldJoin) {
-    ctx.log("combat", `⏭️ Skipping unexpected battle: ${analysis.reason}`);
-    // Bot is in battle but there are no pirates to fight - flee immediately
-    ctx.log("combat", `🚨 Fleeing from battle with no valid targets...`);
-    await fleeFromBattle(ctx, true, 35000);
-    return;
+    ctx.log("combat", `Battle analysis: ${analysis.reason}`);
+    // Check if we're already in this battle by checking bot's battle state
+    const alreadyInBattle = ctx.bot.isInBattle();
+    if (alreadyInBattle) {
+      ctx.log("combat", `🚨 Already in battle — continuing to fight!`);
+    } else if (analysis.pirateCount === 0 && !alreadyInBattle) {
+      ctx.log("combat", `🛡️ No pirates reported and not in battle — waiting for resolution...`);
+      await ctx.sleep(5000);
+      return;
+    } else {
+      // Even with pirates but analysis says don't join (e.g., PvP), escorts still fight!
+      ctx.log("combat", `🚨 Escort fights regardless - protecting the miner!`);
+    }
+    // Continue to fight logic below...
   }
 
   if (analysis.reason.includes("Already in battle")) {
@@ -398,6 +404,18 @@ async function handleUnexpectedEscortBattle(
         ctx.log("error", `Failed to join unexpected battle: ${engageResp.error.message}`);
         return;
       }
+    }
+  } else {
+    // No sideId determined - but we have pirates, so pick any side with pirates
+    ctx.log("combat", `🚨 No side determined but pirates detected - picking side with pirates!`);
+    const sidesWithPirates = battleStatus.sides.filter(s => {
+      const sideParticipants = battleStatus.participants.filter(p => p.side_id === s.side_id);
+      return sideParticipants.some(p => p.username?.toLowerCase().includes("pirate") || p.username?.toLowerCase().includes("drifter"));
+    });
+    if (sidesWithPirates.length > 0) {
+      analysis.sideId = sidesWithPirates[0].side_id;
+      ctx.log("combat", `Joining side ${analysis.sideId} with pirates`);
+      await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId.toString() });
     }
   }
 
@@ -614,6 +632,8 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
+      skipBlacklist: settings.ignoreBlacklist,
+      isCombatBot: true,
     };
 
     if (!minerName) {

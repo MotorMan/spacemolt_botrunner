@@ -11,6 +11,7 @@ import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsCh
 import { getFactionStorageCache, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, type PathfinderTravelRecord } from "./pathfinder.js";
+import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -1005,6 +1006,39 @@ export class Bot {
   async refreshStorage(stationId?: string): Promise<void> {
     const resp = await this.exec("view_storage", stationId ? { station_id: stationId } : undefined);
     this.storage = this.parseItemList(resp.result);
+  }
+
+  /**
+   * Fetch tax estimate and save to data/taxes.json if changed.
+   * Only updates when tax values actually change to preserve history.
+   */
+  async updateTaxEstimate(): Promise<TaxEstimate | null> {
+    const resp = await this.exec("get_tax_estimate");
+    if (resp.error || !resp.result) {
+      this.log("warn", `get_tax_estimate failed: ${resp.error?.message}`);
+      return null;
+    }
+
+    const result = resp.result as Record<string, unknown>;
+    const estimate: TaxEstimate = {
+      botUsername: this.username,
+      timestamp: Date.now(),
+      taxable_income_to_date: (result.taxable_income_to_date as number) || 0,
+      income_tax_total: (result.income_tax_total as number) || 0,
+      property_tax_total: (result.property_tax_total as number) || 0,
+      assessed_property_value: (result.assessed_property_value as number) || 0,
+      last_assessed_at: (result.last_assessed_at as number) || 0,
+      data: result,
+    };
+
+    if (hasTaxEstimateChanged(this.username, estimate)) {
+      saveTaxEstimate(this.username, estimate);
+      this.log("system", `Tax estimate updated: income=${estimate.taxable_income_to_date}, income_tax=${estimate.income_tax_total}, property_tax=${estimate.property_tax_total}`);
+    } else {
+      this.log("system", "Tax estimate unchanged, skipping save");
+    }
+
+    return estimate;
   }
 
   /**

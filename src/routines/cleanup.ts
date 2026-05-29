@@ -172,10 +172,14 @@ function isHomeStation(stationId: string, poiId: string, homeSystem: string, hom
   for (const [sysId, sys] of Object.entries(allSystems)) {
     for (const poi of sys.pois) {
       const travelId = poi.base_id || poi.id;
-      if (travelId === stationId || travelId === poiId) {
+      if (travelId === stationId || travelId === poiId || poi.id === stationId || poi.id === poiId) {
         // Check if homeStation matches this station's base_name or name (case-insensitive)
-        if (poi.base_name && poi.base_name.toLowerCase().includes(lowerHome)) return true;
-        if (poi.name && poi.name.toLowerCase().includes(lowerHome)) return true;
+        // Normalize: replace underscores with spaces for comparison
+        const normalizedHome = lowerHome.replace(/_/g, ' ');
+        if (poi.base_name && poi.base_name.toLowerCase().includes(normalizedHome)) return true;
+        if (poi.name && poi.name.toLowerCase().includes(normalizedHome)) return true;
+        // Also check if poi.id matches (e.g., "sol_central" matches poi.id "sol_central")
+        if (poi.id.toLowerCase().includes(lowerHome)) return true;
       }
     }
   }
@@ -187,7 +191,7 @@ function isHomeStation(stationId: string, poiId: string, homeSystem: string, hom
       if (sysId !== "sol") continue;
       for (const poi of sys.pois) {
         const travelId = poi.base_id || poi.id;
-        if (travelId === stationId || travelId === poiId) {
+        if (travelId === stationId || travelId === poiId || poi.id === stationId || poi.id === poiId) {
           // Check if it's the central command station in sol
           if (poi.base_name && poi.base_name.toLowerCase().includes("central")) return true;
           if (poi.name && poi.name.toLowerCase().includes("central")) return true;
@@ -229,7 +233,8 @@ function getAllKnownStations(homeSystem: string, homeStation: string, focusStati
     for (const [sysId, sys] of Object.entries(allSystems)) {
       if (isPirateSystem(sysId)) continue;
       for (const poi of sys.pois) {
-        if (!poi.has_base) continue;
+        // Use base_id as the primary indicator - it means the station has storage
+        if (!poi.base_id) continue;
         if (poi.base_id === focusStationId || poi.id === focusStationId) {
           const travelId = poi.base_id || poi.id;
           if (isHomeStation(travelId, travelId, homeSystem, homeStation)) continue;
@@ -273,7 +278,9 @@ function getAllKnownStations(homeSystem: string, homeStation: string, focusStati
     // Skip pirate systems
     if (isPirateSystem(sysId)) continue;
     for (const poi of sys.pois) {
-      if (!poi.has_base) continue;
+      // Use base_id as the primary indicator - it means the station has storage
+      // has_base may be false in some cases even when base_id exists
+      if (!poi.base_id) continue;
       // Skip the home/faction storage station
       const travelId = poi.base_id || poi.id;
       if (isHomeStation(travelId, travelId, homeSystem, homeStation)) continue;
@@ -326,7 +333,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   
   // If we're already docked at a valid home station, just stay there
   const currentStation = bot.poi ? pois.find(p => p.id === bot.poi || p.base_id === bot.poi) : null;
-  if (currentStation && currentStation.has_base && currentStation.id !== settings.focusStationId) {
+  if (currentStation && isStationPoi(currentStation) && currentStation.id !== settings.focusStationId) {
     ctx.log("info", `Already at home station (${currentStation.base_id || currentStation.id})`);
     targetStation = currentStation;
   }
@@ -335,7 +342,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   if (settings.homeStation) {
     targetStation = pois.find(p => 
       isStationPoi(p) && 
-      (p.id === settings.homeStation || p.base_id === settings.homeStation || p.name?.toLowerCase() === settings.homeStation.toLowerCase())
+      (p.id === settings.homeStation || p.base_id === settings.homeStation || p.name?.toLowerCase().replace(/ /g, '_') === settings.homeStation.toLowerCase())
     );
     if (!targetStation) {
       // Also try matching by base_id (case-insensitive)
@@ -343,6 +350,15 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
         isStationPoi(p) && 
         p.base_id && 
         p.base_id.toLowerCase() === settings.homeStation.toLowerCase()
+      );
+    }
+    if (!targetStation) {
+      // Try matching by name with normalized spaces (e.g., "Sol Central" -> "sol central")
+      const normalizedHome = settings.homeStation.toLowerCase().replace(/_/g, ' ');
+      targetStation = pois.find(p => 
+        isStationPoi(p) && 
+        p.name && 
+        p.name.toLowerCase().includes(normalizedHome)
       );
     }
   }
@@ -353,7 +369,6 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   if (!targetStation) {
     targetStation = pois.find(p =>
       isStationPoi(p) &&
-      p.has_base &&
       p.base_id !== settings.focusStationId &&
       p.id !== settings.focusStationId
     );
@@ -363,7 +378,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   }
 
   // Final fallback: if still not found but we have a current station with base, use it
-  if (!targetStation && currentStation && currentStation.has_base) {
+  if (!targetStation && currentStation && isStationPoi(currentStation)) {
     targetStation = currentStation;
     ctx.log("info", `Using current station as home: ${targetStation.base_id || targetStation.id}`);
   }
@@ -390,7 +405,6 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     const { pois: solPois } = await getSystemInfo(ctx);
     targetStation = solPois.find(p =>
       isStationPoi(p) &&
-      p.has_base &&
       p.base_id !== settings.focusStationId &&
       p.id !== settings.focusStationId
     );
@@ -405,7 +419,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   }
 
   // For stations with bases, use base_id for travel (game API expects base_id for faction stations)
-  const targetPoiId = targetStation.base_id && targetStation.has_base ? targetStation.base_id : targetStation.id;
+  const targetPoiId = targetStation.base_id || targetStation.id;
 
   if (bot.poi !== targetPoiId) {
     ctx.log("travel", `Traveling to home station...`);

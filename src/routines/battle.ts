@@ -701,6 +701,10 @@ export async function fightFreshBattle(
   let lastHull = bot.hull;
   let tickCount = 0;
 
+  ctx.log("combat", `🎯 Targeting ${target.name}...`);
+  await bot.exec("battle", { action: "target", target_id: target.id });
+  await ctx.sleep(1000);
+
   ctx.log("combat", `Setting initial stance to FIRE...`);
   await bot.exec("battle", { action: "stance", stance: "fire" });
   await ctx.sleep(10000);
@@ -732,6 +736,16 @@ export async function fightFreshBattle(
       continue;
     }
 
+    if (!targetParticipant && target) {
+      const better = pickRealBattleTarget(status, status.your_side_id);
+      if (better && better.name !== target.name) {
+        ctx.log("combat", `🎯 Switching target to ${better.name} (previous target left the battle)`);
+        target = better;
+        await bot.exec("battle", { action: "target", target_id: better.id });
+        await ctx.sleep(300);
+      }
+    }
+
     await bot.refreshStatus();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
@@ -761,20 +775,17 @@ export async function fightFreshBattle(
     const enemyZone = targetParticipant?.zone || "unknown";
     ctx.log("combat", `Tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Shields=${shieldPct}% | Dmg=${damageThisTick}`);
 
-    const zoneDirMap = { outer: 0, mid: 1, inner: 2, engaged: 3 };
-    const enemyZoneNum = zoneDirMap[enemyZone as keyof typeof zoneDirMap] ?? 0;
-    const ourZoneNum = zoneDirMap[ourCurrentZone as keyof typeof zoneDirMap] ?? 0;
+    const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+    const enemyZoneNum = zoneDirMap[enemyZone] ?? 0;
+    const ourZoneNum = zoneDirMap[ourCurrentZone] ?? 0;
 
-    // Always FIRE stance - never brace
-    if (enemyZoneNum > ourZoneNum && ourZoneNum < 3) {
-      ctx.log("combat", `⚔️ ADVANCING to engaged (enemy in ${enemyZone})`);
-      const advResp = await bot.exec("battle", { action: "advance" });
-      if (!advResp.error) {
-        await ctx.sleep(10000);
-        ourCurrentZone = "engaged";
-      }
+    // Advance to engaged if enemy is in inner/mid and we're not there yet
+    if (enemyZoneNum >= 1 && ourZoneNum < 3) {
+      ctx.log("combat", `⚔️ Advancing to engaged (enemy in ${enemyZone})`);
+      await bot.exec("battle", { action: "advance" });
+      await ctx.sleep(10000);
+      ourCurrentZone = "engaged";
     } else {
-      // Stay and fire - no retreat
       await bot.exec("battle", { action: "stance", stance: "fire" });
       await ctx.sleep(10000);
     }
@@ -955,11 +966,17 @@ export async function fightJoinedBattle(
       }
     }
 
+    const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
+
+    const enemyZone = targetParticipant?.zone || "outer";
+    const enemyZoneNum = zoneDirMap[enemyZone] ?? 0;
+    const ourZone = status.your_zone || "outer";
+    const ourZoneNum = zoneDirMap[ourZone] ?? 0;
+
     if (targetParticipant && targetParticipant.zone) {
       if (targetParticipant.zone !== lastKnownEnemyZone) {
-        const zoneDir = { outer: 0, mid: 1, inner: 2, engaged: 3 };
-        const prevDir = zoneDir[lastKnownEnemyZone as keyof typeof zoneDir] ?? 0;
-        const newDir = zoneDir[targetParticipant.zone as keyof typeof zoneDir] ?? 0;
+        const prevDir = zoneDirMap[lastKnownEnemyZone] ?? 0;
+        const newDir = zoneDirMap[targetParticipant.zone] ?? 0;
         if (newDir > prevDir) {
           if (currentTarget) ctx.log("combat", `⚠️ ${currentTarget.name} advancing: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
         } else if (newDir < prevDir) {
@@ -976,17 +993,11 @@ export async function fightJoinedBattle(
     }
 
     const enemyStance = targetParticipant?.stance || "unknown";
-    const enemyZone = targetParticipant?.zone || "unknown";
     ctx.log("combat", `Tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Shields=${shieldPct}%`);
 
-    const zoneDirMap = { outer: 0, mid: 1, inner: 2, engaged: 3 };
-    const enemyZoneNum = zoneDirMap[enemyZone as keyof typeof zoneDirMap] ?? 0;
-    const ourZone = status.your_zone || "outer";
-    const ourZoneNum = zoneDirMap[ourZone as keyof typeof zoneDirMap] ?? 0;
-
-    // Always FIRE stance - never brace, never retreat
-    if (enemyZoneNum > ourZoneNum && ourZoneNum < 3) {
-      ctx.log("combat", `⚔️ ADVANCING to engaged (enemy in ${enemyZone})`);
+    // Advance to engaged if enemy is in inner/mid and we're not there yet
+    if (enemyZoneNum >= 1 && ourZoneNum < 3) {
+      ctx.log("combat", `⚔️ Advancing to engaged (enemy in ${enemyZone})`);
       await bot.exec("battle", { action: "advance" });
       await ctx.sleep(10000);
     } else {

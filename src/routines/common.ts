@@ -132,7 +132,7 @@ export function sanitizeCredits(value: number | string | undefined | null): numb
 
 /** Check if a POI represents a station. */
 export function isStationPoi(poi: SystemPOI): boolean {
-  return poi.has_base || (poi.type || "").toLowerCase() === "station";
+  return poi.has_base || !!poi.base_id || (poi.type || "").toLowerCase() === "station";
 }
 
 /** Find the first station POI in a list. Optionally filter by required service. */
@@ -1528,7 +1528,7 @@ export async function depositNonFuelCargo(ctx: RoutineContext): Promise<boolean>
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean; isCombatBot?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
@@ -1720,7 +1720,49 @@ export async function navigateToSystem(
         const battleNotifs = parseBattleNotifications(jumpResp.notifications);
         const hasBattle = battleNotifs.some(n => n.type === "battle_start" || n.type === "battle_hit");
         if (hasBattle) {
-          ctx.log("combat", "Battle detected during jump - initiating flee!");
+          // For hunters (skipBlacklist=true), they intentionally enter pirate systems - don't flee
+          // For other bots, flee on battle detection
+          if (opts.skipBlacklist) {
+            ctx.log("combat", "Battle detected during jump - hunter intentionally enters - continuing navigation");
+            inBattleDuringJump = true;
+            battleInterruptHandled = true;
+          } else {
+            ctx.log("combat", "Battle detected during jump - initiating flee!");
+            inBattleDuringJump = true;
+            battleInterruptHandled = true;
+            // Re-issue flee every cycle while in battle
+            const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+            if (fleeResp.error) {
+              ctx.log("error", `Flee command failed: ${fleeResp.error.message}`);
+            }
+            // Check if disengaged
+            const battleStatus = await getBattleStatus(ctx);
+            if (!battleStatus || !battleStatus.is_participant) {
+              ctx.log("combat", "Battle cleared - continuing navigation");
+              inBattleDuringJump = false;
+            } else {
+              // Still in battle - wait and continue to re-flee
+              await sleep(2000);
+              continue;
+            }
+          }
+        }
+      }
+
+      // CRITICAL: Check for battle interrupt error (jump timed out due to battle)
+      if (jumpResp.error && jumpResp.error.code === "battle_interrupt") {
+        ctx.log("combat", `Battle interrupt detected! ${jumpResp.error.message}`);
+        // For hunters (skipBlacklist=true), they intentionally enter pirate systems - join battle instead of flee
+        // For other bots, flee on battle interrupt
+        if (opts.skipBlacklist) {
+          ctx.log("combat", "Hunter detected battle interrupt - joining battle instead of fleeing");
+          inBattleDuringJump = true;
+          battleInterruptHandled = true;
+          // Don't flee - let the escort routine handle battle engagement
+          // Return false to signal navigation was interrupted by battle
+          return false;
+        } else {
+          ctx.log("combat", "Initiating flee!");
           inBattleDuringJump = true;
           battleInterruptHandled = true;
           // Re-issue flee every cycle while in battle
@@ -1733,35 +1775,13 @@ export async function navigateToSystem(
           if (!battleStatus || !battleStatus.is_participant) {
             ctx.log("combat", "Battle cleared - continuing navigation");
             inBattleDuringJump = false;
+            // Battle was cleared, but we still have an error - need to retry the jump
+            // Fall through to error handling below
           } else {
             // Still in battle - wait and continue to re-flee
             await sleep(2000);
             continue;
           }
-        }
-      }
-
-      // CRITICAL: Check for battle interrupt error (jump timed out due to battle)
-      if (jumpResp.error && jumpResp.error.code === "battle_interrupt") {
-        ctx.log("combat", `Battle interrupt detected! ${jumpResp.error.message} - initiating flee!`);
-        inBattleDuringJump = true;
-        battleInterruptHandled = true;
-        // Re-issue flee every cycle while in battle
-        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
-        if (fleeResp.error) {
-          ctx.log("error", `Flee command failed: ${fleeResp.error.message}`);
-        }
-        // Check if disengaged
-        const battleStatus = await getBattleStatus(ctx);
-        if (!battleStatus || !battleStatus.is_participant) {
-          ctx.log("combat", "Battle cleared - continuing navigation");
-          inBattleDuringJump = false;
-          // Battle was cleared, but we still have an error - need to retry the jump
-          // Fall through to error handling below
-        } else {
-          // Still in battle - wait and continue to re-flee
-          await sleep(2000);
-          continue;
         }
       }
 
@@ -1777,6 +1797,16 @@ export async function navigateToSystem(
       }
 
       const errorMsg = jumpResp.error.message.toLowerCase();
+
+      // Check for in_battle error - for escorts, this means they got pulled into a battle
+      // Return false to signal navigation was interrupted by battle so escort routine can handle it
+      if (errorMsg.includes("in_battle") || errorMsg.includes("in combat")) {
+        ctx.log("combat", `Jump failed due to battle: ${jumpResp.error.message}`);
+        if (opts.skipBlacklist) {
+          ctx.log("combat", "Escort detected battle - returning to let escort routine handle engagement");
+          return false;
+        }
+      }
 
       // Check if error is transient (network timeout, connection issue, etc.)
       // Note: battle_interrupt is handled separately above, so we don't include it here
@@ -1867,7 +1897,13 @@ export async function navigateToSystem(
     // Check for battle status after jump (in case we jumped into an active battle)
     const battleStatus = await getBattleStatus(ctx);
     if (battleStatus && battleStatus.is_participant) {
-      ctx.log("combat", `JUMPED INTO BATTLE! Battle ID: ${battleStatus.battle_id} - initiating emergency flee!`);
+      ctx.log("combat", `JUMPED INTO BATTLE! Battle ID: ${battleStatus.battle_id}`);
+      // For hunters/escorts (isCombatBot=true), they fight - never flee when jumping into battle
+      // isCombatBot indicates this is a hunter or escort that should always fight
+      if (opts.isCombatBot) {
+        ctx.log("combat", "COMBAT BOT: Intentionally entering battle - will fight, not flee!");
+        return false;
+      }
       await fleeFromBattle(ctx, true, 35000);
       return false; // Aborted navigation due to battle
     }

@@ -758,19 +758,21 @@ async function main(): Promise<void> {
     const FULL_LOGIN_DELAY_MS = 13000;
     let botIndex = 0;
 
-    for (const [name, bot] of bots) {
+for (const [name, bot] of bots) {
       const delay = botIndex * SESSION_RESUME_DELAY_MS;
-      const loginIndex = botIndex; // Capture for closure
+      const loginIndex = botIndex;
       botIndex++;
       setTimeout(() => {
-        // Try session resume first (fast, no rate limit)
         bot.resumeSession().then(async (ok) => {
           refreshStatusTable();
           if (ok) {
-            // Clear failure counter on success
             sessionRestoreFailures.delete(name);
             server.logSystem(`${name} session resumed (no login delay)`);
-            // Fetch catalog data if stale or server version changed (first bot with active session triggers it)
+            try {
+              await bot.updateTaxEstimate();
+            } catch (err) {
+              server.logSystem(`Tax collection failed for ${name}: ${err}`);
+            }
             if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
               try {
                 await catalogStore.fetchAll(bot.api);
@@ -779,7 +781,6 @@ async function main(): Promise<void> {
                 server.logSystem(`Catalog fetch failed: ${err}`);
               }
             }
-            // Session resumed, start routine if assigned
             const routineKey = assignments[name];
             if (routineKey && ROUTINES[routineKey]) {
               server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
@@ -788,35 +789,34 @@ async function main(): Promise<void> {
             return;
           }
 
-          // Session resume failed, record the failure
           const now = Date.now();
           const failures = sessionRestoreFailures.get(name) || [];
           failures.push(now);
-          // Keep only failures from the last minute
           const recentFailures = failures.filter(ts => now - ts < 60000);
           sessionRestoreFailures.set(name, recentFailures);
 
-          // Check if excessive failures (3 in past minute)
           if (recentFailures.length >= 3) {
             server.logSystem(`${name} session restore failed 3+ times in past minute, forcing immediate full login...`);
-            // Force full login immediately (no delay)
             bot.login().then(async (loginOk) => {
-              // Clear failure counter on successful login
               sessionRestoreFailures.delete(name);
               refreshStatusTable();
               if (!loginOk) {
                 server.logSystem(`${name} forced login failed`);
                 return;
               }
-                // Fetch catalog data if stale or server version changed (first logged-in bot triggers it)
-                if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
-                  try {
-                    await catalogStore.fetchAll(bot.api);
-                    server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
-                  } catch (err) {
-                    server.logSystem(`Catalog fetch failed: ${err}`);
-                  }
+              try {
+                await bot.updateTaxEstimate();
+              } catch (err) {
+                server.logSystem(`Tax collection failed for ${name}: ${err}`);
+              }
+              if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
+                try {
+                  await catalogStore.fetchAll(bot.api);
+                  server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                } catch (err) {
+                  server.logSystem(`Catalog fetch failed: ${err}`);
                 }
+              }
               const routineKey = assignments[name];
               if (!routineKey || !ROUTINES[routineKey]) {
                 server.logSystem(`${name} logged in but no routine assigned`);
@@ -829,27 +829,29 @@ async function main(): Promise<void> {
               refreshStatusTable();
             });
           } else {
-            // Normal case: schedule full login with rate-limited delay
             const loginDelay = loginIndex * FULL_LOGIN_DELAY_MS;
             server.logSystem(`${name} session expired (${recentFailures.length}/3 failures in past minute), scheduling full login in ${loginDelay / 1000}s...`);
             setTimeout(() => {
               bot.login().then(async (loginOk) => {
-                // Clear failure counter on successful login
                 sessionRestoreFailures.delete(name);
                 refreshStatusTable();
                 if (!loginOk) {
                   server.logSystem(`${name} login failed`);
                   return;
                 }
-              // Fetch catalog data if stale or server version changed (first logged-in bot triggers it)
-              if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
                 try {
-                  await catalogStore.fetchAll(bot.api);
-                  server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                  await bot.updateTaxEstimate();
                 } catch (err) {
-                  server.logSystem(`Catalog fetch failed: ${err}`);
+                  server.logSystem(`Tax collection failed for ${name}: ${err}`);
                 }
-              }
+                if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
+                  try {
+                    await catalogStore.fetchAll(bot.api);
+                    server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                  } catch (err) {
+                    server.logSystem(`Catalog fetch failed: ${err}`);
+                  }
+                }
                 const routineKey = assignments[name];
                 if (!routineKey || !ROUTINES[routineKey]) {
                   server.logSystem(`${name} logged in but no routine assigned`);

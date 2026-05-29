@@ -623,6 +623,23 @@
   </div>
 </div>
 
+<!-- Name Ship Modal -->
+<div class="modal-overlay" id="nameShipModal">
+  <div class="modal">
+    <h2>Name Ship</h2>
+    <div id="nameShipForm">
+      <label>Ship ID</label>
+      <input type="text" id="nameShipId" placeholder="Ship ID" disabled>
+      <label>New Name</label>
+      <input type="text" id="nameShipNewName" placeholder="Enter custom name">
+    </div>
+    <div class="modal-actions">
+      <button onclick="closeNameShipModal()">Cancel</button>
+      <button class="primary" onclick="submitNameShip()">Name Ship</button>
+    </div>
+  </div>
+</div>
+
 <script>
 // ── State ──────────────────────────────────────────────────
 let ws = null;
@@ -2245,7 +2262,7 @@ function renderProfileTopbar() {
       const sysData = mapData[sys.id];
       if (!sysData) continue;
       for (const poi of (sysData.pois || []).sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
-        if (!poi.has_base) continue;
+        if (!(poi.has_base || poi.base_id)) continue;
         const focusVal = poi.base_id || poi.id;
         const sel = focusVal === botFocus ? ' selected' : '';
         const label = poi.base_name || poi.name || poi.id;
@@ -7164,7 +7181,7 @@ function renderGeneralSettings(panel) {
   for (const [sysId, sys] of Object.entries(mapData)) {
     const sysName = sys.name || sysId;
     for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
-      if (!poi.has_base) continue;
+      if (!(poi.has_base || poi.base_id)) continue;
       const val = sysId + '|' + poi.id;
       const sel = (sysId === factionStorageSystem && poi.id === factionStorageStation) ? ' selected' : '';
       const label = poi.base_name || poi.name || poi.id;
@@ -7538,7 +7555,7 @@ function renderCleanupSettings(panel) {
   for (const [sysId, sys] of Object.entries(mapData)) {
     const sysName = sys.name || sysId;
     for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
-      if (!poi.has_base) continue;
+      if (!(poi.has_base || poi.base_id)) continue;
       const val = sysId + '|' + poi.id;
       // For deposit station
       const sel = (sysId === cleanupSystem && poi.id === cleanupStation) ? ' selected' : '';
@@ -7597,7 +7614,7 @@ function renderReturnHomeSettings(panel) {
   for (const [sysId, sys] of Object.entries(mapData)) {
     const sysName = sys.name || sysId;
     for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
-      if (!poi.has_base) continue;
+      if (!(poi.has_base || poi.base_id)) continue;
       const val = sysId + '|' + poi.id;
       const sel = (sysId === homeSystem && poi.id === homeStation) ? ' selected' : '';
       const label = poi.base_name || poi.name || poi.id;
@@ -8983,13 +9000,7 @@ async function finishModuleLoadoutChange(bot, presetName, neededModules, removed
     // Load from station storage into cargo
     for (const modId of toLoad) {
       await new Promise(resolve => {
-        sendExec(bot.username, 'storage', {
-          action: 'withdraw',
-          item_id: modId,
-          quantity: 1,
-          source: 'station'
-        }, () => resolve());
-      });
+        sendExec(bot.username, 'withdraw_items', {item_id: modId, quantity: 1}, () => resolve());}); //fixed by human because claude broke it on the game server, so we have to go back to the old command!
       await new Promise(r => setTimeout(r, 300));
     }
 
@@ -10361,7 +10372,7 @@ function renderFuelCellSellerSettings(panel) {
   let stationOpts = ['<option value="">(select station)</option>'];
   if (homeSystem && mapData[homeSystem]) {
     for (const poi of mapData[homeSystem].pois || []) {
-      if (!poi.has_base) continue;
+      if (!(poi.has_base || poi.base_id)) continue;
       const sel = poi.id === homeStation ? ' selected' : '';
       const label = poi.base_name || poi.name || poi.id;
       stationOpts.push(`<option value="${esc(poi.id)}"${sel}>${esc(label)}</option>`);
@@ -10482,7 +10493,7 @@ function updateFCSystemStations() {
 
   const stationOpts = ['<option value="">(select station)</option>'];
   for (const poi of mapData[homeSystem].pois || []) {
-    if (!poi.has_base) continue;
+    if (!(poi.has_base || poi.base_id)) continue;
     const label = poi.base_name || poi.name || poi.id;
     stationOpts.push(`<option value="${esc(poi.id)}">${esc(label)}</option>`);
   }
@@ -11042,6 +11053,17 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = String(s);
   return d.innerHTML;
+}
+
+function escJs(s) {
+  if (!s) return '';
+  let str = String(s);
+  // First decode any HTML entities that might be in the string
+  const txt = document.createElement('div');
+  txt.innerHTML = str;
+  str = txt.textContent || '';
+  // Now escape for JavaScript
+  return str.replace(/\\/g, '\\\\').replace(/'/g, "\\'").replace(/"/g, '\\"').replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/</g, '\\x3c').replace(/>/g, '\\x3e');
 }
 
 function num(n) {
@@ -16220,7 +16242,7 @@ function renderHunterSettings(panel) {
   for (const [sysId, sys] of Object.entries(mapData || {})) {
     const sysName = sys.name || sysId;
     for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
-      if (!poi.has_base) continue;
+      if (!(poi.has_base || poi.base_id)) continue;
       const val = sysId + '|' + poi.id;
       const label = poi.base_name || poi.name || poi.id;
       const sel = val === hunterHomeStation ? ' selected' : '';
@@ -17279,7 +17301,7 @@ function renderCargoMoverSettings(panel) {
   for (const [sysId, sys] of Object.entries(mapData)) {
     const sysName = sys.name || sysId;
     for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
-      if (!poi.has_base) continue;
+      if (!(poi.has_base || poi.base_id)) continue;
       const val = sysId + '|' + poi.id;
       const label = poi.base_name || poi.name || poi.id;
 
@@ -18098,6 +18120,9 @@ function renderShipOverview(data, username) {
     return `<div class="shipyard-bar"><div class="shipyard-bar-fill" style="width:${pct}%;background:${color}"></div></div>`;
   }
 
+  const shipIdVal = ship.id || ship.ship_id || '';
+  const shipNameForModal = escJs(name);
+
   // Module slots — check top-level enriched modules first, then ship object
   const modules = findModules(ship, data);
   const slots = ship.slots || ship.module_slots || {};
@@ -18165,6 +18190,7 @@ function renderShipOverview(data, username) {
     <div class="faction-section" style="display:flex;gap:6px;flex-wrap:wrap">
       <button class="sm" onclick="shipRepair('${esc(username)}')">Repair</button>
       <button class="sm" onclick="shipRefuel('${esc(username)}')">Refuel</button>
+      <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}','${shipIdVal}','${shipNameForModal}')">Name Ship</button>
     </div>
     <div class="faction-section"><div class="faction-section-title">Modules</div>${slotsHtml}</div>
     <details style="margin-top:12px">
@@ -18255,6 +18281,16 @@ function renderFleetPanel(ships, username, error) {
       let name = (rawName && rawName.toLowerCase() !== 'unnamed') ? rawName : baseName;
       if (customName) name = `${baseName} - ${customName}`;
       const rawLocation = s.location || s.system || '';
+      // For ships, location might be "System - Station" format or "loaded on carrier..." format
+      // We need to extract the system ID for comparison
+      let shipSystemId = '';
+      if (rawLocation && !rawLocation.toLowerCase().includes('loaded on')) {
+        // If it's a system name like "Jita - Station", try to find the system ID
+        const systemName = rawLocation.split(' - ')[0];
+        shipSystemId = Object.keys(mapData).find(key => mapData[key]?.name === systemName) || systemName;
+      } else {
+        shipSystemId = rawLocation;  // Keep as-is for loaded ships (will be "loaded on carrier...")
+      }
       const loc = resolveLocation(rawLocation) || rawLocation;
       const isActive = id === activeShipId || s.active || s.is_active;
 
@@ -18292,12 +18328,7 @@ function renderFleetPanel(ships, username, error) {
       const etaHtml = buildEta ? `<span style="font-size:10px;color:var(--text-dim);margin-left:4px">${esc(String(buildEta))}</span>` : '';
 
       const isLoadedOnCarrier = typeof rawLocation === 'string' && rawLocation.toLowerCase().includes('loaded on');
-      // Extract carrier name from "loaded on carrier <name>" or "loaded on <name>"
       const loadedCarrierName = isLoadedOnCarrier ? rawLocation.replace(/^loaded on\s*(carrier\s*)?/i, '').trim().toLowerCase() : '';
-      // Debug: log the parsed loadedCarrierName
-      if (isLoadedOnCarrier) {
-        console.log('[fleet-debug] parsed loadedCarrierName:', loadedCarrierName, 'from rawLocation:', rawLocation);
-      }
       
       const botObj = bots.find(b => b.username === username);
       const botLocation = botObj?.location || '';
@@ -18325,11 +18356,10 @@ const activeShip = shipyardShipData?.ship || shipyardShipData || {};
       const shipStoredInCarrier = storedInCarrierName.toLowerCase();
       
       // A ship is at the station if it's at the same location/system as the bot (docked at station)
-      // Note: rawLocation for ships is typically the system ID, while botLocation is the full location string
-      // We need to check if the ship's system matches the bot's system
-      const shipSystem = rawLocation;  // rawLocation is the system ID for ships
+      // shipSystemId is the system ID for ships (extracted from location or system field)
+      // botSystem is the bot's system ID
       const isShipAtStation = botObj?.docked && !isActive && !isLoadedOnCarrier && botLocation && botLocation.length > 0 &&
-        (shipSystem === botSystem || shipSystem === botObj?.system || shipSystem === (botObj?.location ? botObj.location.split(' - ')[0] : ''));
+        (shipSystemId === botSystem || shipSystemId === botObj?.system);
       
       // Check if ship is stored in the active carrier by ID match
       const activeShipIdFromData = (activeShip?.id || activeShip?.ship_id || '').toString();
@@ -18381,19 +18411,6 @@ const activeShip = shipyardShipData?.ship || shipyardShipData || {};
       const canLoadOntoCarrier = isCarrierActive && isShipAtStation;
       const canUnloadFromCarrier = isCarrierActive && (isLoadedOnCarrier && isUnloadFromActiveCarrier || isStoredInThisCarrier);
       
-      // Debug for carrier ships
-      if (isCarrierActive && (canLoadOntoCarrier || canUnloadFromCarrier)) {
-        console.log('[fleet-debug]', name, { 
-          canLoad: canLoadOntoCarrier, 
-          canUnload: canUnloadFromCarrier,
-          isShipAtStation, isLoadedOnCarrier, shipStoredInCarrier: shipStoredInCarrier ? `'${shipStoredInCarrier}'` : '(empty)',
-          loadedCarrierName: loadedCarrierName ? `'${loadedCarrierName}'` : '(empty)',
-          isStoredInThisCarrier, isUnloadFromActiveCarrier,
-          activeShipName: `'${activeShipName}'`, activeShipCustomName: `'${activeShipCustomName}'`, effectiveActiveCustomName: `'${effectiveActiveCustomName}'`,
-          botLocation: `'${botLocation}'`, botSystem: `'${botSystem}'`, shipSystem: `'${shipSystem}'`
-        });
-      }
-      
       const botOptions = bots.filter(b => b.username !== username).map(b =>
         `<option value="${esc(b.username)}">${esc(b.username)}</option>`
       ).join('');
@@ -18404,14 +18421,13 @@ const activeShip = shipyardShipData?.ship || shipyardShipData || {};
           <option value="__custom__">Enter name...</option>
         </select>
         <input type="text" class="ship-gift-custom-input" id="gift-input-${id}" placeholder="Bot name..." style="display:none;width:120px;font-size:11px;padding:2px 6px;">
-        <button class="sm" style="color:var(--cyan)" onclick="shipGift('${esc(username)}','${esc(id)}','${esc(name)}')">Gift</button>
+        <button class="sm" style="color:var(--cyan)" onclick="shipGift('${esc(username)}','${esc(id)}','${escJs(name)}')">Gift</button>
+        <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}','${esc(id)}','${escJs(name)}')">Name</button>
       ` : '';
       
-      const loadBtn = canLoadOntoCarrier
-        ? `<button class="sm" style="color:var(--green)" onclick="shipDepositIntoCarrier('${esc(username)}','${esc(id)}','${esc(name)}')" title="Load onto carrier">📦 Load</button>`
-        : '';
+      const loadBtn = `<button class="sm" style="color:var(--green)" onclick="shipDepositIntoCarrier('${esc(username)}','${esc(id)}','${escJs(name)}')" title="Load onto carrier">📦 Load Ship</button>`;
       const unloadBtn = canUnloadFromCarrier
-        ? `<button class="sm" style="color:var(--cyan)" onclick="shipWithdrawFromCarrier('${esc(username)}','${esc(id)}','${esc(name)}')" title="Unload from carrier">📤 Unload</button>`
+        ? `<button class="sm" style="color:var(--cyan)" onclick="shipWithdrawFromCarrier('${esc(username)}','${esc(id)}','${escJs(name)}')" title="Unload from carrier">📤 Unload</button>`
         : '';
 
       const storedInCarrierDisplay = storedInCarrierName || '';
@@ -18424,10 +18440,9 @@ const activeShip = shipyardShipData?.ship || shipyardShipData || {};
           ${statsHtml}
         </div>
         <div class="ssc-actions">
-          ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" onclick="shipGoTo('${esc(username)}','${esc(id)}','${esc(rawLocation)}')">Go</button>` : ''}
           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" onclick="shipSwitch('${esc(username)}','${esc(id)}')">Switch</button>` : ''}
           ${loadBtn}${unloadBtn}
-          ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" style="color:var(--red)" onclick="shipSell('${esc(username)}','${esc(id)}','${esc(name)}')">Sell</button>` : ''}
+          ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" style="color:var(--red)" onclick="shipSell('${esc(username)}','${esc(id)}','${escJs(name)}')">Sell</button>` : ''}
           ${giftDropdown}
         </div>
       </div>`;
@@ -18902,7 +18917,7 @@ function renderModItemsList(items, username, source) {
     const detail = detailParts.filter(Boolean).join(' | ');
     // For storage items, need to withdraw first then install
     const action = source === 'storage'
-      ? `shipWithdrawAndInstall('${esc(username)}','${esc(id)}','${esc(name)}')`
+      ? `shipWithdrawAndInstall('${esc(username)}','${esc(id)}','${escJs(name)}')`
       : `shipInstallMod('${esc(username)}','${esc(id)}')`;
     html += `<div class="shipyard-mod-row">
       <div style="flex:1;min-width:0">
@@ -18972,6 +18987,44 @@ function handleGiftBotSelect(username, shipId, selectEl) {
     inputEl.style.display = 'none';
     inputEl.value = '';
   }
+}
+
+function openNameShipModal(username, shipId, shipName) {
+  document.getElementById('nameShipId').value = shipId || '';
+  document.getElementById('nameShipNewName').value = '';
+  document.getElementById('nameShipModal').style.display = 'flex';
+  window._namingShipId = shipId;
+  window._namingBot = username;
+}
+
+function closeNameShipModal() {
+  document.getElementById('nameShipModal').style.display = 'none';
+  window._namingShipId = null;
+  window._namingBot = null;
+}
+
+function submitNameShip() {
+  const shipId = document.getElementById('nameShipId').value;
+  const newName = document.getElementById('nameShipNewName').value.trim();
+  if (!newName) {
+    appendLine('system', 'Please enter a name for the ship');
+    return;
+  }
+  const bot = window._namingBot;
+  if (!bot || !shipId) {
+    appendLine('system', 'Could not determine bot or ship ID');
+    return;
+  }
+  sendExec(bot, 'rename_ship', { ship_id: shipId, name: newName }, (result) => {
+    if (result.ok) {
+      appendLine('system', result.message || `Ship renamed to "${newName}"`);
+      closeNameShipModal();
+      if (shipyardActivePanel === 'fleet') fetchFleetList(bot);
+      else fetchShipDetails(bot);
+    } else {
+      appendLine('system', `Failed to name ship: ${result.error || 'unknown'}`);
+    }
+  });
 }
 
 /** Handle gift target dropdown selection in manual controls - show/hide custom name input */
@@ -20335,6 +20388,7 @@ function renderNavigationPanel(commanderBot, systemData) {
     p.type === 'station' || 
     p.type === 'base' || 
     (p.has_base !== undefined && p.has_base) ||
+    !!p.base_id ||
     p.type?.toLowerCase().includes('station') ||
     p.type?.toLowerCase().includes('base')
   );

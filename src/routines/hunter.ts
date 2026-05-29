@@ -237,6 +237,37 @@ function isLowOnFieldConsumables(inventory: any[] | undefined, minRepairKits = 5
   return repair < minRepairKits || shields < minShieldCharges;
 }
 
+async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<void> {
+  const battleStatus = await getBattleStatus(ctx);
+  if (!battleStatus) return;
+
+  ctx.log("combat", `⚠️ Navigation interrupted by battle (ID: ${battleStatus.battle_id}) - hunter fights, not flees!`);
+
+  const analysis = await analyzeExistingBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee);
+  if (!analysis.shouldJoin) {
+    ctx.log("combat", `Skipping battle: ${analysis.reason}`);
+    return;
+  }
+
+  if (analysis.sideId !== undefined) {
+    ctx.log("combat", `Joining battle on side ${analysis.sideId} - FIGHTING!`);
+    const engageResp = await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId.toString() });
+    if (engageResp.error) {
+      const errMsg = engageResp.error.message.toLowerCase();
+      if (errMsg.includes("already in a battle") || errMsg.includes("already_in_battle")) {
+        ctx.log("combat", "Already in battle — proceeding to fight");
+      } else {
+        ctx.log("error", `Failed to join battle: ${engageResp.error.message}`);
+        return;
+      }
+    }
+
+    const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
+    const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
+    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100);
+  }
+}
+
 // ── Security level helpers ────────────────────────────────────
 
 function isHuntableSystem(securityLevel: string | undefined): boolean {
@@ -622,6 +653,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
+      isCombatBot: true,
     };
     const patrolSystem = settings.system || "";
 
@@ -683,7 +715,14 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       // Override patrol target for this cycle
       const arrived = await navigateToSystem(ctx, alertTarget, safetyOpts);
       if (!arrived) {
-        ctx.log("error", `Could not reach ${alertTarget} — resuming normal patrol`);
+        // Check if battle interrupted navigation
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          ctx.log("combat", `Battle detected after navigation attempt - hunter fights, not flees!`);
+          await handleNavigationBattleInterrupt(ctx, settings);
+        } else {
+          ctx.log("error", `Could not reach ${alertTarget} — resuming normal patrol`);
+        }
       }
     }
 
@@ -694,7 +733,13 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       ctx.log("travel", `Navigating to configured patrol system ${patrolSystem}...`);
       const arrived = await navigateToSystem(ctx, patrolSystem, safetyOpts);
       if (!arrived) {
-        ctx.log("error", `Could not reach ${patrolSystem} — patrolling ${bot.system} instead`);
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
+          await handleNavigationBattleInterrupt(ctx, settings);
+        } else {
+          ctx.log("error", `Could not reach ${patrolSystem} — patrolling ${bot.system} instead`);
+        }
       }
     } else {
       await fetchSecurityLevel(ctx, bot.system);
@@ -707,14 +752,28 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         if (huntTarget) {
           const sys = mapStore.getSystem(huntTarget);
           ctx.log("travel", `Found huntable system: ${sys?.name || huntTarget} (${sys?.security_level}) — navigating...`);
-          await navigateToSystem(ctx, huntTarget, safetyOpts);
+          const huntArrived = await navigateToSystem(ctx, huntTarget, safetyOpts);
+          if (!huntArrived) {
+            const battleAfterNav = await getBattleStatus(ctx);
+            if (battleAfterNav) {
+              ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
+              await handleNavigationBattleInterrupt(ctx, settings);
+            }
+          }
         } else {
           const conns = mapStore.getConnections(bot.system);
           const unmapped = conns.find(c => !mapStore.getSystem(c.system_id)?.security_level);
           const target = unmapped ?? conns[0];
           if (target) {
             ctx.log("travel", `No huntable system mapped yet — scouting ${target.system_name || target.system_id}...`);
-            await navigateToSystem(ctx, target.system_id, safetyOpts);
+            const scoutArrived = await navigateToSystem(ctx, target.system_id, safetyOpts);
+            if (!scoutArrived) {
+              const battleAfterNav = await getBattleStatus(ctx);
+              if (battleAfterNav) {
+                ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
+                await handleNavigationBattleInterrupt(ctx, settings);
+              }
+            }
             await getSystemInfo(ctx);
             await fetchSecurityLevel(ctx, bot.system);
           } else {
@@ -1104,6 +1163,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
+      isCombatBot: true,
     };
 
     // ── Status ──
@@ -1463,6 +1523,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
+      isCombatBot: true,
     };
 
     // ── Status ──
@@ -1698,6 +1759,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
+      isCombatBot: true,
     };
 
     // Navigate to the target system in the list
@@ -1705,9 +1767,15 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
       ctx.log("travel", `Patrol systems: heading to ${targetSystem}...`);
       const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
       if (!arrived) {
-        ctx.log("error", `Could not reach ${targetSystem} — skipping`);
-        await ctx.sleep(5000);
-        continue;
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
+          await handleNavigationBattleInterrupt(ctx, settings);
+        } else {
+          ctx.log("error", `Could not reach ${targetSystem} — skipping`);
+          await ctx.sleep(5000);
+          continue;
+        }
       }
     }
 
@@ -2072,6 +2140,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
       skipBlacklist: true,
+      isCombatBot: true,
     };
 
     for (const targetSystem of profile.patrolSystems) {
@@ -2081,9 +2150,15 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         ctx.log("travel", `Cycle patrols: heading to ${targetSystem}...`);
         const arrived = await navigateToSystem(ctx, targetSystem, safetyOpts);
         if (!arrived) {
-          ctx.log("error", `Could not reach ${targetSystem} — skipping`);
-          await ctx.sleep(5000);
-          continue;
+          const battleAfterNav = await getBattleStatus(ctx);
+          if (battleAfterNav) {
+            ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
+            await handleNavigationBattleInterrupt(ctx, settings);
+          } else {
+            ctx.log("error", `Could not reach ${targetSystem} — skipping`);
+            await ctx.sleep(5000);
+            continue;
+          }
         }
       }
 

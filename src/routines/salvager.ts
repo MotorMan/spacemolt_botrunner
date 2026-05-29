@@ -31,8 +31,28 @@ import {
   type BattleState,
   handleBattleNotifications,
   fleeFromBattle,
+  parseWrecks,
 } from "./common.js";
 import { getSystemBlacklist } from "../web/server.js";
+import {
+  readFlockState,
+  registerFlockMember,
+  announceFlockTarget,
+  updateFlockPhase,
+  claimFlockWreck,
+  reportFlockWrecks,
+  getAvailableFlockWrecks,
+  setFlockTimeout,
+  isFlockTimeoutExpired,
+  type FlockState,
+  type FlockGroupConfig,
+} from "./flock.js";
+import {
+  broadcastSalvageClaim,
+  isWreckClaimedByOther,
+  registerSalvageChatHandler,
+  unregisterSalvageChatHandler,
+} from "../cooperation/salvageCooperation.js";
 
 // ── Temporary pirate blacklist (in-memory) ────────────────────
 const temporaryPirateBlacklist = new Map<string, number>(); // systemId -> expiresAt timestamp
@@ -97,11 +117,23 @@ function getSalvagerSettings(username?: string): {
   maxRoamJumps: number;
   roamBaseSystems: string[];
   depositAtSalvageYard: boolean;
+  minimumFuelCells: number;
+  ignoreBlacklist: boolean;
 
+  // Flock salvaging settings
+  flockEnabled: boolean;
+  flockName: string;
+  flockRole: "leader" | "follower";
+  allowIndependentTowing: boolean;
 } {
   const all = readSettings();
   const m = all.salvager || {};
-  const botOverrides = username ? (all[username] || {}) : {};
+  let botOverrides = username ? (all[username] || {}) : {};
+
+  // Include flock assignments
+  if (username && all.flock?.flockAssignments && typeof all.flock.flockAssignments === 'object' && (all.flock.flockAssignments as any)[username]) {
+    botOverrides = { ...botOverrides, ...(all.flock.flockAssignments as any)[username] };
+  }
 
   function parseDepositMode(val: unknown): DepositMode | null {
     if (val === "faction" || val === "sell" || val === "storage") return val;
@@ -133,8 +165,176 @@ function getSalvagerSettings(username?: string): {
     maxRoamJumps: (m.maxRoamJumps as number) || 0, // 0 = no roaming beyond neighbors
     roamBaseSystems: parseStringArray(botOverrides.roamBaseSystems ?? m.roamBaseSystems),
     depositAtSalvageYard: (m.depositAtSalvageYard as boolean) ?? false,
+    minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
+    ignoreBlacklist: (botOverrides.ignoreBlacklist as boolean) ?? (m.ignoreBlacklist as boolean) ?? false,
 
+    // Flock salvaging settings
+    flockEnabled: (botOverrides.flockEnabled as boolean) ?? false,
+    flockName: (botOverrides.flockName as string) || "",
+    flockRole: ((botOverrides.flockRole as string) === "leader" ? "leader" : "follower") as "leader" | "follower",
+    allowIndependentTowing: (m.allowIndependentTowing as boolean) ?? false,
   };
+}
+
+// ── Flock-coordinated salvage function ────────────────────────
+
+async function flockSalvageWrecks(
+  ctx: RoutineContext,
+  opts: {
+    enableTow: boolean;
+    minTowValue: number;
+    battleState: BattleState;
+    flockName: string;
+    username: string;
+    isLeader: boolean;
+    allowIndependentTowing: boolean;
+    timeoutExpired: boolean;
+    availableWrecks: Array<{ poiId: string; wreckId: string }>;
+  }
+): Promise<{ itemsLooted: number; isTowing: boolean }> {
+  const { bot } = ctx;
+  const {
+    enableTow,
+    minTowValue,
+    battleState,
+    flockName,
+    username,
+    isLeader,
+    allowIndependentTowing,
+    timeoutExpired,
+    availableWrecks,
+  } = opts;
+
+  if (bot.docked) return { itemsLooted: 0, isTowing: false };
+
+  const wrecksResp = await bot.exec("get_wrecks");
+  const allWrecks = parseWrecks(wrecksResp.result);
+  if (allWrecks.length > 0) {
+    ctx.log("scavenge", `get_wrecks found ${allWrecks.length} wreck(s)`);
+  }
+  if (allWrecks.length === 0) return { itemsLooted: 0, isTowing: bot.towingWreck };
+
+  let totalLooted = 0;
+  const lootedItems: string[] = [];
+
+  for (const wreck of allWrecks) {
+    if (bot.state !== "running") break;
+
+    await bot.refreshStatus();
+    if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
+      ctx.log("scavenge", "Cargo full — stopping salvage");
+      break;
+    }
+
+    // Check if this wreck is available for this bot
+    const wreckAvailable = availableWrecks.some(w => w.wreckId === wreck.wreck_id);
+    if (!wreckAvailable && !isLeader && !timeoutExpired) {
+      ctx.log("flock", `Wreck ${wreck.wreck_id} not available to this follower — skipping`);
+      continue;
+    }
+
+    // Loot cargo from the wreck (same as standard salvage)
+    if (wreck.items.length > 0) {
+      const candidates = [...wreck.items].sort((a, b) => {
+        const aPri = a.item_id.toLowerCase().includes("fuel") || a.item_id.toLowerCase().includes("energy") ? 0 : 1;
+        const bPri = b.item_id.toLowerCase().includes("fuel") || b.item_id.toLowerCase().includes("energy") ? 0 : 1;
+        return aPri - bPri;
+      });
+
+      let remainingOnWreck = wreck.items.reduce((sum, it) => sum + (it.quantity || 0), 0);
+
+      for (const item of candidates) {
+        if (bot.state !== "running") break;
+        if (remainingOnWreck <= 1) break;
+
+        let qty = item.quantity;
+        const maxSafe = remainingOnWreck - 1;
+        if (qty > maxSafe) qty = maxSafe;
+        if (qty <= 0) continue;
+
+        const lootResp = await bot.exec("loot_wreck", { wreck_id: wreck.wreck_id, item_id: item.item_id, quantity: qty });
+        if (lootResp.error) {
+          if (lootResp.error.message.includes("already")) {
+            continue;
+          }
+          ctx.log("warn", `Failed to loot ${item.name} from ${wreck.name}: ${lootResp.error.message}`);
+          continue;
+        }
+
+        totalLooted += qty;
+        lootedItems.push(`${qty}x ${item.name}`);
+        ctx.log("scavenge", `Looted ${qty}x ${item.name} from ${wreck.name}`);
+        remainingOnWreck -= qty;
+
+        await bot.refreshStatus();
+        if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
+          ctx.log("scavenge", "Cargo full after looting — stopping salvage");
+          return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
+        }
+      }
+    }
+
+    // Consider towing this wreck (flock-coordinated)
+    if (enableTow) {
+      // Check if we can claim this wreck
+      let canTow = false;
+
+      if (isLeader) {
+        // Leader can always tow
+        canTow = true;
+      } else if (timeoutExpired && allowIndependentTowing) {
+        // Timeout expired and independent towing allowed
+        canTow = true;
+        ctx.log("flock", `Timeout expired - allowing independent towing of ${wreck.name}`);
+      } else {
+        // Try to claim the wreck
+        const claimed = await claimFlockWreck(flockName, username, wreck.wreck_id.split("-")[0], wreck.wreck_id);
+        if (claimed) {
+          canTow = true;
+          ctx.log("flock", `Claimed wreck ${wreck.wreck_id} for towing`);
+        } else {
+          ctx.log("flock", `Failed to claim wreck ${wreck.wreck_id} - another bot got it`);
+        }
+      }
+
+      if (canTow) {
+        const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
+        if (towResp.error) {
+          const msg = towResp.error.message.toLowerCase();
+          if (msg.includes("already")) {
+            if (msg.includes("already_towing") || msg.includes("already towing")) {
+              ctx.log("warn", `Already towing a wreck — heading to salvage yard`);
+              bot.towingWreck = true;
+              // Don't clear towingWreckId since we're already towing
+              return { itemsLooted: totalLooted, isTowing: true };
+            } else {
+              ctx.log("scavenge", `Wreck ${wreck.wreck_id} already being towed by another player`);
+            }
+          } else {
+            ctx.log("warn", `Failed to tow ${wreck.name}: ${towResp.error.message}`);
+          }
+        } else {
+          // Successful tow - get value from response
+          const tr = towResp.result as any;
+          const salvageValue = (tr?.salvage_value as number) || 0;
+          const shipClass = (tr?.ship_class as string) || "unknown";
+
+          if (salvageValue >= minTowValue) {
+            ctx.log("scavenge", `Towed ${shipClass} wreck (${wreck.name}) - value: ${salvageValue}cr`);
+            bot.towingWreck = true;
+            bot.towingWreckId = wreck.wreck_id;
+            return { itemsLooted: totalLooted, isTowing: true };
+          } else {
+            ctx.log("scavenge", `Towed ${shipClass} wreck (${wreck.name}) but value ${salvageValue}cr below threshold ${minTowValue}cr - releasing`);
+            // Release the tow since it's not valuable enough
+            await bot.exec("release_tow");
+          }
+        }
+      }
+    }
+  }
+
+  return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
 }
 
 // ── Bot chat handler for escort queries ───────────────────────
@@ -201,20 +401,20 @@ function findSystemsInRange(fromSystemId: string, maxHops: number): Array<{ syst
  * Build an ordered list of systems to roam through.
  * If roamBaseSystems are configured, use those as starting points (filtered by maxRoamJumps).
  * Otherwise, use the current system as the base.
- * Systems on the blacklist or temporarily blacklisted are excluded.
+ * Systems on the blacklist or temporarily blacklisted are excluded (unless ignoreTemporaryBlacklist is true).
  */
-function buildRoamList(currentSystem: string, maxRoamJumps: number, roamBaseSystems: string[], blacklist: string[]): string[] {
+function buildRoamList(currentSystem: string, maxRoamJumps: number, roamBaseSystems: string[], blacklist: string[], ignoreTemporaryBlacklist: boolean = false): string[] {
   const bases = roamBaseSystems.length > 0 ? roamBaseSystems : [currentSystem];
   const allSystems = new Set<string>();
   const blacklistLower = blacklist.map(b => b.toLowerCase());
 
   for (const base of bases) {
     // Always include the base (unless blacklisted or temporarily blacklisted)
-    if (!blacklistLower.some(b => b === base.toLowerCase()) && !isTemporarilyBlacklisted(base)) {
+    if (!blacklistLower.some(b => b === base.toLowerCase()) && (ignoreTemporaryBlacklist || !isTemporarilyBlacklisted(base))) {
       allSystems.add(base);
       // Add systems within range
       for (const sys of findSystemsInRange(base, maxRoamJumps)) {
-        if (!blacklistLower.some(b => b === sys.systemId.toLowerCase()) && !isTemporarilyBlacklisted(sys.systemId)) {
+        if (!blacklistLower.some(b => b === sys.systemId.toLowerCase()) && (ignoreTemporaryBlacklist || !isTemporarilyBlacklisted(sys.systemId))) {
           allSystems.add(sys.systemId);
         }
       }
@@ -264,6 +464,9 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
   };
   chatChannel.onMessage(bot.username, chatHandler);
 
+  // Register lightweight salvage co-op handler (chat-based wreck claiming for independent salvagers)
+  const salvageChatHandler = registerSalvageChatHandler(bot.username, (cat, msg) => ctx.log(cat as any, msg));
+
   // ── Startup: return home and dump non-fuel cargo to storage ──
   await bot.refreshCargo();
   const nonFuelCargo = bot.inventory.filter(i => {
@@ -298,6 +501,27 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("salvage", `Startup: deposited ${names} — cargo clear for salvaging`);
   }
 
+  // Startup: ensure min military fuel cells at home before first outing
+  if (homeSystem0 && bot.system === homeSystem0) {
+    await bot.refreshCargo();
+    let fuel0 = 0;
+    for (const item of bot.inventory) {
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) fuel0 += item.quantity;
+    }
+    const min0 = settings0.minimumFuelCells;
+    if (fuel0 < min0) {
+      const m0 = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: min0 });
+      if (!m0.error) ctx.log("salvage", `Startup: withdrew ${min0} military fuel cells from storage`);
+    }
+  }
+
+  // ── Flock salvaging integration ──
+  let isFlockLeader = false;
+  let flockTargetSystemId = "";
+  let flockPhase: FlockState["phase"] = "gathering";
+  let flockGroup: FlockGroupConfig | undefined;
+
   while (bot.state === "running") {
     // Clean up expired temporary blacklists
     cleanupTemporaryBlacklist();
@@ -311,6 +535,8 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       await ctx.sleep(5000);
       continue;
     }
+
+
 
     // Periodic battle status check (backup detection in case notifications fail)
     // Check every cycle for fast detection
@@ -379,7 +605,74 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
       autoCloak: settings.autoCloak,
+      skipBlacklist: settings.ignoreBlacklist,
     };
+
+    // ── Flock salvaging integration ──
+    if (settings.flockEnabled && settings.flockName) {
+      // Find the flock group config for this bot
+      // Note: For now, we'll assume flock groups are defined in miner settings
+      // TODO: Add salvager-specific flock groups
+      const allSettings = readSettings();
+      const minerGroups = (allSettings.flock?.flockGroups as FlockGroupConfig[]) || [];
+      flockGroup = minerGroups.find(g => g.name === settings.flockName);
+
+      if (settings.flockRole === "leader") {
+        isFlockLeader = true;
+        ctx.log("flock", `Flock mode: LEADER of "${settings.flockName}"`);
+
+        // Register as leader
+        await registerFlockMember(settings.flockName, bot.username, true);
+
+        // Determine target system from flock group config
+        const groupSystem = flockGroup?.systemSalvage || settings.system || "";
+        flockTargetSystemId = groupSystem;
+        flockPhase = "gathering";
+
+        ctx.log("flock", `Leader target: salvage in system ${groupSystem || "any system"}`);
+
+        // Announce target to flock
+        await announceFlockTarget(
+          settings.flockName,
+          bot.username,
+          groupSystem,
+          "",
+          "",
+          "salvage",
+          "salvage"
+        );
+
+        // Set coordination timeout (5 minutes for others to grab wrecks)
+        await setFlockTimeout(settings.flockName, 5);
+      } else {
+        // Follower: read flock state and follow leader's decisions
+        const flockState = await readFlockState(settings.flockName);
+
+        if (!flockState) {
+          ctx.log("flock", `Flock mode: FOLLOWER of "${settings.flockName}" — waiting for leader...`);
+          await ctx.sleep(5000);
+          continue;
+        }
+
+        // Register as follower
+        const registered = await registerFlockMember(settings.flockName, bot.username, false);
+        if (!registered) {
+          ctx.log("error", "Failed to join flock — state may be stale");
+          await ctx.sleep(5000);
+          continue;
+        }
+
+        ctx.log("flock", `Flock mode: FOLLOWER of "${settings.flockName}" (leader: ${flockState.leader})`);
+
+        flockTargetSystemId = flockState.targetSystemId;
+        flockPhase = flockState.phase;
+      }
+    } else {
+      // Not in flock mode
+      isFlockLeader = false;
+      flockTargetSystemId = "";
+      flockPhase = "gathering";
+    }
 
     // ── Status + fuel/hull checks ──
     yield "get_status";
@@ -406,9 +699,10 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Navigate to target system if configured ──
     const targetSystemId = settings.system || "";
     if (targetSystemId && targetSystemId !== bot.system) {
-      // Check if target system is blacklisted
-      const blacklist = getSystemBlacklist();
-      if (blacklist.some(b => b.toLowerCase() === targetSystemId.toLowerCase()) || isTemporarilyBlacklisted(targetSystemId)) {
+      // Check if target system is blacklisted (unless ignoreBlacklist is enabled)
+      const effectiveBlacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+      const targetIsBlacklisted = effectiveBlacklist.some(b => b.toLowerCase() === targetSystemId.toLowerCase()) || (!settings.ignoreBlacklist && isTemporarilyBlacklisted(targetSystemId));
+      if (targetIsBlacklisted) {
         ctx.log("error", `Target system ${targetSystemId} is blacklisted — salvaging locally instead`);
       } else {
         // Announce destination and signal escorts before traveling
@@ -455,8 +749,24 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       skipScanning = true;
     }
 
-    // Build list of POIs to visit (all non-station POIs — wrecks can spawn anywhere)
-    const visitPois = pois.filter(p => !isStationPoi(p));
+    const visitPois = pois;
+    const cur = (bot.poi || "").toLowerCase();
+    if (cur) {
+      const i = visitPois.findIndex(p => p.id.toLowerCase() === cur || p.name.toLowerCase() === cur);
+      if (i > 0) {
+        const f = visitPois.splice(i, 1)[0];
+        visitPois.unshift(f);
+      }
+    }
+
+    // Flock coordination: Check for timeout
+    let flockTimeoutExpired = false;
+    if (settings.flockEnabled && settings.flockName) {
+      flockTimeoutExpired = await isFlockTimeoutExpired(settings.flockName);
+      if (flockTimeoutExpired) {
+        ctx.log("flock", "Flock coordination timeout expired - allowing independent operation");
+      }
+    }
 
     if (!skipScanning && visitPois.length === 0) {
       ctx.log("error", "No salvageable POIs in this system — waiting 60s");
@@ -506,7 +816,6 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
 
-        // Check cargo before traveling
         await bot.refreshStatus();
         const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
         if (fillRatio >= cargoThresholdRatio) {
@@ -515,28 +824,28 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           break;
         }
 
-        // Check fuel
         const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         if (fuelPct < safetyOpts.fuelThresholdPct) {
           ctx.log("scavenge", `Fuel low (${fuelPct}%) — heading to station`);
           break;
         }
 
-        // Travel to POI
-        yield "travel_to_poi";
-        ctx.log("travel", `Traveling to ${poi.name}...`);
-        const travelResp = await bot.exec("travel", { target_poi: poi.id });
-        // Check for battle notifications after travel
-        if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
-          ctx.log("combat", "Battle detected during travel to POI - initiating flee!");
-          battleState.isFleeing = false;
-          continue;
+        const atCur = bot.poi && (bot.poi.toLowerCase() === poi.id.toLowerCase() || bot.poi.toLowerCase() === poi.name.toLowerCase());
+        if (!atCur) {
+          yield "travel_to_poi";
+          ctx.log("travel", `Traveling to ${poi.name}...`);
+          const travelResp = await bot.exec("travel", { target_poi: poi.id });
+          if (await checkBattleAfterCommand(ctx, travelResp.notifications, "travel", battleState)) {
+            ctx.log("combat", "Battle detected during travel to POI - initiating flee!");
+            battleState.isFleeing = false;
+            continue;
+          }
+          if (travelResp.error && !travelResp.error.message.includes("already")) {
+            ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
+            continue;
+          }
+          bot.poi = poi.id;
         }
-        if (travelResp.error && !travelResp.error.message.includes("already")) {
-          ctx.log("error", `Travel to ${poi.name} failed: ${travelResp.error.message}`);
-          continue;
-        }
-        bot.poi = poi.id;
 
         // Pre-salvage battle check - prevents salvage command from freezing if battle starts
         const preSalvageBattleCheck = await getBattleStatus(ctx);
@@ -549,14 +858,61 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
 
+        // Flock coordination: Get wrecks and coordinate before salvaging
+        let availableWrecks: Array<{ poiId: string; wreckId: string }> = [];
+        if (settings.flockEnabled && settings.flockName && settings.enableFullSalvage) {
+          // Get wrecks at this POI for coordination
+          const wrecksResp = await bot.exec("get_wrecks");
+          const wrecks = parseWrecks(wrecksResp.result);
+          availableWrecks = wrecks.map((w: any) => ({ poiId: poi.id, wreckId: w.wreck_id }));
+
+          if (isFlockLeader) {
+            // Leader reports found wrecks
+            await reportFlockWrecks(settings.flockName, bot.username, availableWrecks);
+            ctx.log("flock", `Reported ${availableWrecks.length} wrecks at ${poi.name} to flock`);
+          } else {
+            // Follower gets available wrecks from flock state
+            const flockWrecks = await getAvailableFlockWrecks(settings.flockName, bot.username);
+            availableWrecks = flockWrecks.filter(w => w.poiId === poi.id);
+            ctx.log("flock", `Flock has ${availableWrecks.length} available wrecks at ${poi.name}`);
+          }
+        }
+
         // Salvage wrecks at this POI
         yield "scavenge";
-        const result = settings.enableFullSalvage
-          ? await fullSalvageWrecks(ctx, { enableTow: settings.enableTowing, minTowValue: settings.minTowValue, battleState })
-          : { itemsLooted: await scavengeWrecks(ctx), isTowing: false };
+        let result: { itemsLooted: number; isTowing: boolean };
+
+        if (settings.flockEnabled && settings.flockName && settings.enableFullSalvage) {
+          // Flock-coordinated salvage
+          result = await flockSalvageWrecks(ctx, {
+            enableTow: settings.enableTowing,
+            minTowValue: settings.minTowValue,
+            battleState,
+            flockName: settings.flockName,
+            username: bot.username,
+            isLeader: isFlockLeader,
+            allowIndependentTowing: settings.allowIndependentTowing,
+            timeoutExpired: flockTimeoutExpired,
+            availableWrecks,
+          });
+        } else {
+          // Standard salvage
+          result = settings.enableFullSalvage
+            ? await fullSalvageWrecks(ctx, {
+                enableTow: settings.enableTowing,
+                minTowValue: settings.minTowValue,
+                battleState,
+                salvageCoop: {
+                  isWreckAvailable: (wid) => !isWreckClaimedByOther(wid, bot.username),
+                  claimWreck: (wid, action) => broadcastSalvageClaim(wid, poi.id, action, bot.username),
+                },
+              })
+            : { itemsLooted: await scavengeWrecks(ctx), isTowing: false };
+        }
+
         totalLooted += result.itemsLooted;
 
-        ctx.log("scavenge", `fullSalvageWrecks returned: itemsLooted=${result.itemsLooted}, isTowing=${result.isTowing}, bot.towingWreck=${bot.towingWreck}`);
+        ctx.log("scavenge", `Salvage returned: itemsLooted=${result.itemsLooted}, isTowing=${result.isTowing}, bot.towingWreck=${bot.towingWreck}`);
 
         if (result.itemsLooted > 0) {
           ctx.log("scavenge", `Extracted ${result.itemsLooted} items at ${poi.name}`);
@@ -581,8 +937,8 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Expand to roam systems if current system had no wrecks ──
     // Don't expand if already towing (need to deliver wreck first)
     if (!skipScanning && totalLooted === 0 && !cargoFull && !bot.towingWreck && bot.state === "running") {
-      const blacklist = getSystemBlacklist();
-      const roamList = buildRoamList(bot.system, settings.maxRoamJumps, settings.roamBaseSystems, blacklist);
+      const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+      const roamList = buildRoamList(bot.system, settings.maxRoamJumps, settings.roamBaseSystems, blacklist, settings.ignoreBlacklist);
 
       if (roamList.length > 0) {
         ctx.log("scavenge", `No wrecks locally — roaming across ${roamList.length} system(s): ${roamList.join(", ")}`);
@@ -631,9 +987,16 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         const arrived = await navigateToSystem(ctx, roamSystemId, travelOpts);
         if (!arrived) continue;
 
-        // Scan roam system POIs (all non-station POIs — wrecks can spawn anywhere)
         const { pois: roamPois } = await getSystemInfo(ctx);
-        const roamVisit = roamPois.filter(p => !isStationPoi(p));
+        const roamVisit = roamPois;
+        const curR = (bot.poi || "").toLowerCase();
+        if (curR) {
+          const i = roamVisit.findIndex(p => p.id.toLowerCase() === curR || p.name.toLowerCase() === curR);
+          if (i > 0) {
+            const f = roamVisit.splice(i, 1)[0];
+            roamVisit.unshift(f);
+          }
+        }
         if (roamVisit.length === 0) continue;
 
         for (const poi of roamVisit) {
@@ -650,16 +1013,19 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           const rFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
           if (rFuelPct < safetyOpts.fuelThresholdPct) break;
 
-          yield "travel_to_poi";
-          ctx.log("travel", `Traveling to ${poi.name} (${roamSystemId})...`);
-          const tResp = await bot.exec("travel", { target_poi: poi.id });
-          if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
-            ctx.log("combat", "Battle detected during roam travel - initiating flee!");
-            battleState.isFleeing = false;
-            break;
+          const atCurR = bot.poi && (bot.poi.toLowerCase() === poi.id.toLowerCase() || bot.poi.toLowerCase() === poi.name.toLowerCase());
+          if (!atCurR) {
+            yield "travel_to_poi";
+            ctx.log("travel", `Traveling to ${poi.name} (${roamSystemId})...`);
+            const tResp = await bot.exec("travel", { target_poi: poi.id });
+            if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel", battleState)) {
+              ctx.log("combat", "Battle detected during roam travel - initiating flee!");
+              battleState.isFleeing = false;
+              break;
+            }
+            if (tResp.error && !tResp.error.message.includes("already")) continue;
+            bot.poi = poi.id;
           }
-          if (tResp.error && !tResp.error.message.includes("already")) continue;
-          bot.poi = poi.id;
 
           // Pre-salvage battle check for roam system
           const preSalvageBattleCheck = await getBattleStatus(ctx);
@@ -674,7 +1040,15 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
 
           yield "scavenge";
           const result = settings.enableFullSalvage
-            ? await fullSalvageWrecks(ctx, { enableTow: settings.enableTowing, minTowValue: settings.minTowValue, battleState })
+            ? await fullSalvageWrecks(ctx, {
+                enableTow: settings.enableTowing,
+                minTowValue: settings.minTowValue,
+                battleState,
+                salvageCoop: {
+                  isWreckAvailable: (wid) => !isWreckClaimedByOther(wid, bot.username),
+                  claimWreck: (wid, action) => broadcastSalvageClaim(wid, poi.id, action, bot.username),
+                },
+              })
             : { itemsLooted: await scavengeWrecks(ctx), isTowing: false };
           totalLooted += result.itemsLooted;
           if (result.itemsLooted > 0) {
@@ -698,6 +1072,24 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       if (totalLooted > 0) {
         ctx.log("scavenge", `Roam sweep: ${totalLooted} items looted`);
       }
+    }
+
+    // ── Fuel cell depletion check: return to home to restock military cells if critically low (prevents stranding far from base) ──
+    await bot.refreshCargo();
+    let fuelCellCount = 0;
+    for (const item of bot.inventory) {
+      if (item.itemId.toLowerCase().includes("fuel_cell")) fuelCellCount += item.quantity;
+    }
+    const lowOnFuelCells = fuelCellCount < 4;
+    if (lowOnFuelCells && !bot.towingWreck) {
+      ctx.log("salvage", `Fuel cells critically low (${fuelCellCount} remaining) — returning to home base to restock military fuel cells`);
+      if (homeSystem && bot.system !== homeSystem) {
+        const retFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        if (retFueled) {
+          await navigateToSystem(ctx, homeSystem, safetyOpts);
+        }
+      }
+      // if already home or after nav, the upcoming dock/unload will trigger the top-up to 20
     }
 
     // ── Process towed wrecks: navigate to salvage yard if towing ──
@@ -1032,6 +1424,72 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       const label = settings.depositMode === "sell" ? "market" : settings.depositMode === "faction" ? "faction" : "storage";
       ctx.log("trade", `Unloaded ${unloadedItems.join(", ")} → ${label}`);
     }
+
+    // Top up to min military fuel cells when at home (ensures buffer even for 0-jump home routes at deposit time)
+    if (homeSystem && bot.system === homeSystem) {
+      await bot.refreshCargo();
+      let fuelInCargo = 0;
+      for (const item of bot.inventory) {
+        const lower = item.itemId.toLowerCase();
+        if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
+      }
+      const minFuel = settings.minimumFuelCells;
+      if (fuelInCargo < minFuel) {
+        const mil = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: minFuel });
+        if (!mil.error) {
+          ctx.log("salvage", `Withdrew ${minFuel} military fuel cells from storage`);
+        } else {
+          const prem = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: minFuel });
+          if (!prem.error) ctx.log("salvage", `Withdrew ${minFuel} premium fuel cells from storage`);
+          else {
+            const reg = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: minFuel * 2 });
+            if (!reg.error) ctx.log("salvage", `Withdrew fuel cells from storage`);
+          }
+        }
+      }
+    }
+
+    // Ensure fuel cells for return home + min buffer of military (route estimated_fuel)
+    await bot.refreshCargo();
+    let fuelInCargo = 0;
+    for (const item of bot.inventory) {
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
+    }
+    try {
+      const r = (await bot.exec("find_route", { target_system: homeSystem })).result as any;
+      if (r && r.estimated_fuel != null && r.fuel_available != null) {
+        const deficit = Math.max(0, r.estimated_fuel - r.fuel_available);
+        const needed = Math.ceil(deficit / 20);
+        const minFuel = settings.minimumFuelCells;
+        if (fuelInCargo < Math.max(needed, minFuel)) {
+          const isAtHome = homeSystem && bot.system === homeSystem;
+          let stillNeeded = Math.max(needed, minFuel) - fuelInCargo;
+          if (isAtHome) {
+            // Prefer military_fuel_cell (100 fuel, 3 space)
+            const milResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "military_fuel_cell", quantity: Math.ceil(stillNeeded / 3) });
+            if (!milResp.error) stillNeeded = Math.max(0, stillNeeded - 100);
+            if (stillNeeded > 0) {
+              const premResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
+              if (!premResp.error) stillNeeded = Math.max(0, stillNeeded - 50);
+            }
+            if (stillNeeded > 0) {
+              const regResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
+              if (!regResp.error) stillNeeded = 0;
+            }
+            if (stillNeeded <= 0) ctx.log("salvage", `Withdrew fuel cells from faction storage`);
+          }
+          if (stillNeeded > 0) {
+            const free = Math.max(0, (bot.cargoMax || 50) - bot.cargo);
+            const buyQty = Math.min(Math.ceil(stillNeeded / 3), Math.floor(free / 3));
+            if (buyQty > 0) {
+              ctx.log("salvage", `Buying ${buyQty} military fuel cells for return (last resort)`);
+              await bot.exec("buy", { item_id: "military_fuel_cell", quantity: buyQty });
+            }
+          }
+        }
+      }
+    } catch {}
 
     await bot.refreshStatus();
 

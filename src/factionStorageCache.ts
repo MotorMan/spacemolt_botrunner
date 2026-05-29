@@ -11,6 +11,8 @@ export interface FactionStorageCache {
   factionName: string;
   lastUpdated: number;
   entries: FactionStorageEntry[];
+  factionFuelReserve?: number;
+  factionFuelCapacity?: number;
 }
 
 const DATA_DIR = join(process.cwd(), "data");
@@ -60,7 +62,9 @@ export function getFactionStorageCache(factionName: string): FactionStorageCache
 
 export function updateFactionStorageCache(
   factionName: string,
-  entries: FactionStorageEntry[]
+  entries: FactionStorageEntry[],
+  factionFuelReserve?: number,
+  factionFuelCapacity?: number,
 ): void {
   const now = Date.now();
   
@@ -69,6 +73,8 @@ export function updateFactionStorageCache(
       factionName,
       lastUpdated: now,
       entries,
+      factionFuelReserve,
+      factionFuelCapacity,
     };
     saveToDisk(cachedData);
     return;
@@ -78,6 +84,8 @@ export function updateFactionStorageCache(
   
   cachedData.lastUpdated = now;
   cachedData.entries = entries;
+  if (factionFuelReserve !== undefined) cachedData.factionFuelReserve = factionFuelReserve;
+  if (factionFuelCapacity !== undefined) cachedData.factionFuelCapacity = factionFuelCapacity;
 
   if (hasChanged) {
     pendingWrite = true;

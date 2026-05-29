@@ -23,6 +23,7 @@ import { escortRoutine } from "./routines/escort.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
+import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
 import { setLogSink } from "./ui.js";
@@ -62,6 +63,18 @@ export function getBot(name: string): Bot | undefined {
 /** Get the bot-to-bot chat channel service (for routines to use). */
 export function getBotChatChannel() {
   return botChatChannel;
+}
+
+/** Get total bandwidth usage across all bots in KB/s */
+export function getTotalBandwidth(): { inKBps: number; outKBps: number } {
+  let totalIn = 0;
+  let totalOut = 0;
+  for (const bot of bots.values()) {
+    const usage = bot.api.getBandwidthUsage();
+    totalIn += usage.inKBps;
+    totalOut += usage.outKBps;
+  }
+  return { inKBps: totalIn, outKBps: totalOut };
 }
 
 /** Send a chat message from a bot to other bots. */
@@ -174,6 +187,8 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleShutdown();
     case "manual_rescue_request":
       return handleManualRescueRequest(action);
+    case "pathfinder_calc":
+      return handlePathfinderCalc(action);
     default:
       return { ok: false, error: `Unknown action: ${(action as any).type}` };
   }
@@ -236,6 +251,66 @@ async function handleManualRescueRequest(action: WebAction): Promise<WebActionRe
 
   server.logSystem(`Manual rescue request queued: ${targetPlayer} at ${targetSystem}/${targetPOI} (for bot ${botName})`);
   return { ok: true, message: `Rescue request queued for ${targetPlayer}` };
+}
+
+async function handlePathfinderCalc(action: WebAction): Promise<WebActionResult> {
+  const p = (action.params || {}) as Record<string, unknown>;
+  const from = (p.from || p.origin || p.originSystem) as string | undefined;
+  const to = (p.to || p.target || p.targetSystem) as string | undefined;
+  const bearing = typeof p.bearing === "number" ? p.bearing : (typeof p.simulateBearing === "number" ? p.simulateBearing : undefined);
+  const originForSim = (p.originSystem || p.from || from) as string | undefined;
+  const precision = typeof p.precision === "number" ? Math.max(0, Math.min(20, p.precision)) : 12;
+
+  if (from && to) {
+    const res = mapStore.computeSafePathfinderBearing(from, to);
+    if (!res) return { ok: false, error: "Missing positions for one or both systems in map data" };
+    const travel = res.landing ? mapStore.getPathfinderTravelTime(res.landing.proj) : null;
+    return {
+      ok: true,
+      data: {
+        bearing: res.bearing,
+        bearingFormatted: formatBearing(res.bearing, precision),
+        safe: res.safe,
+        landing: res.landing,
+        blocker: res.blocker,
+        margin: mapStore.getPathfinderLandingMargin(),
+        precisionUsed: precision,
+        travelTime: travel,   // { ticks, seconds } — independent of ship speed
+      },
+    };
+  }
+
+  if (typeof bearing === "number" && originForSim) {
+    const landing = mapStore.simulatePathfinderLanding(originForSim, bearing);
+    const travel = landing ? mapStore.getPathfinderTravelTime(landing.proj) : null;
+    return {
+      ok: true,
+      data: {
+        bearing,
+        bearingFormatted: formatBearing(bearing, precision),
+        landing,
+        void: !landing,
+        margin: mapStore.getPathfinderLandingMargin(),
+        precisionUsed: precision,
+        travelTime: travel,
+      },
+    };
+  }
+
+  if (typeof bearing === "number") {
+    return {
+      ok: true,
+      data: {
+        bearing,
+        bearingFormatted: formatBearing(bearing, precision),
+        reverse: (bearing + 180) % 360,
+        reverseFormatted: formatBearing((bearing + 180) % 360, precision),
+        precisionUsed: precision,
+      },
+    };
+  }
+
+  return { ok: false, error: "Provide from+to for bearing calc, or originSystem+bearing to simulate, or just bearing for reverse" };
 }
 
 async function handleStart(action: WebAction): Promise<WebActionResult> {
@@ -625,6 +700,10 @@ async function main(): Promise<void> {
     server.logSystem(line);
   });
   AiChatService.setGetBotsFn(() => [...bots.values()]);
+  // Set up empire alert callback
+  aiChatService.setEmpireAlertCallback((sender, content, botUsername) => {
+    server.sendEmpireAlert(sender, content, botUsername);
+  });
   aiChatService.start();
   // Expose on globalThis for bot.ts to access
   (globalThis as any).aiChatService = aiChatService;
@@ -679,20 +758,22 @@ async function main(): Promise<void> {
     const FULL_LOGIN_DELAY_MS = 13000;
     let botIndex = 0;
 
-    for (const [name, bot] of bots) {
+for (const [name, bot] of bots) {
       const delay = botIndex * SESSION_RESUME_DELAY_MS;
-      const loginIndex = botIndex; // Capture for closure
+      const loginIndex = botIndex;
       botIndex++;
       setTimeout(() => {
-        // Try session resume first (fast, no rate limit)
         bot.resumeSession().then(async (ok) => {
           refreshStatusTable();
           if (ok) {
-            // Clear failure counter on success
             sessionRestoreFailures.delete(name);
             server.logSystem(`${name} session resumed (no login delay)`);
-            // Fetch catalog data if stale (first bot with active session triggers it)
-            if (catalogStore.isStale()) {
+            try {
+              await bot.updateTaxEstimate();
+            } catch (err) {
+              server.logSystem(`Tax collection failed for ${name}: ${err}`);
+            }
+            if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
               try {
                 await catalogStore.fetchAll(bot.api);
                 server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
@@ -700,7 +781,6 @@ async function main(): Promise<void> {
                 server.logSystem(`Catalog fetch failed: ${err}`);
               }
             }
-            // Session resumed, start routine if assigned
             const routineKey = assignments[name];
             if (routineKey && ROUTINES[routineKey]) {
               server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
@@ -709,38 +789,35 @@ async function main(): Promise<void> {
             return;
           }
 
-          // Session resume failed, record the failure
           const now = Date.now();
           const failures = sessionRestoreFailures.get(name) || [];
           failures.push(now);
-          // Keep only failures from the last minute
           const recentFailures = failures.filter(ts => now - ts < 60000);
           sessionRestoreFailures.set(name, recentFailures);
 
-          // Check if excessive failures (3 in past minute)
           if (recentFailures.length >= 3) {
             server.logSystem(`${name} session restore failed 3+ times in past minute, forcing immediate full login...`);
-            // Force full login immediately (no delay)
             bot.login().then(async (loginOk) => {
-              // Clear failure counter on successful login
               sessionRestoreFailures.delete(name);
-              server.logSystem(`DEBUG: ${name} forced login completed, ok=${loginOk}`);
               refreshStatusTable();
               if (!loginOk) {
                 server.logSystem(`${name} forced login failed`);
                 return;
               }
-                // Fetch catalog data if stale (first logged-in bot triggers it)
-                if (catalogStore.isStale()) {
-                  try {
-                    await catalogStore.fetchAll(bot.api);
-                    server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
-                  } catch (err) {
-                    server.logSystem(`Catalog fetch failed: ${err}`);
-                  }
+              try {
+                await bot.updateTaxEstimate();
+              } catch (err) {
+                server.logSystem(`Tax collection failed for ${name}: ${err}`);
+              }
+              if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
+                try {
+                  await catalogStore.fetchAll(bot.api);
+                  server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                } catch (err) {
+                  server.logSystem(`Catalog fetch failed: ${err}`);
                 }
+              }
               const routineKey = assignments[name];
-              server.logSystem(`DEBUG: ${name} routine assignment: ${routineKey || 'none'}`);
               if (!routineKey || !ROUTINES[routineKey]) {
                 server.logSystem(`${name} logged in but no routine assigned`);
                 return;
@@ -752,32 +829,30 @@ async function main(): Promise<void> {
               refreshStatusTable();
             });
           } else {
-            // Normal case: schedule full login with rate-limited delay
             const loginDelay = loginIndex * FULL_LOGIN_DELAY_MS;
             server.logSystem(`${name} session expired (${recentFailures.length}/3 failures in past minute), scheduling full login in ${loginDelay / 1000}s...`);
-            server.logSystem(`DEBUG: ${name} login scheduled with delay ${loginDelay}ms (index=${loginIndex})`);
             setTimeout(() => {
-              server.logSystem(`DEBUG: ${name} login timeout fired, calling bot.login()`);
               bot.login().then(async (loginOk) => {
-                // Clear failure counter on successful login
                 sessionRestoreFailures.delete(name);
-                server.logSystem(`DEBUG: ${name} login completed, ok=${loginOk}`);
                 refreshStatusTable();
                 if (!loginOk) {
                   server.logSystem(`${name} login failed`);
                   return;
                 }
-              // Fetch catalog data if stale (first logged-in bot triggers it)
-              if (catalogStore.isStale()) {
                 try {
-                  await catalogStore.fetchAll(bot.api);
-                  server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                  await bot.updateTaxEstimate();
                 } catch (err) {
-                  server.logSystem(`Catalog fetch failed: ${err}`);
+                  server.logSystem(`Tax collection failed for ${name}: ${err}`);
                 }
-              }
+                if (catalogStore.isStale() || await catalogStore.checkVersionChanged(bot.api)) {
+                  try {
+                    await catalogStore.fetchAll(bot.api);
+                    server.logSystem(`Catalog fetched (${catalogStore.getSummary()})`);
+                  } catch (err) {
+                    server.logSystem(`Catalog fetch failed: ${err}`);
+                  }
+                }
                 const routineKey = assignments[name];
-                server.logSystem(`DEBUG: ${name} routine assignment: ${routineKey || 'none'}`);
                 if (!routineKey || !ROUTINES[routineKey]) {
                   server.logSystem(`${name} logged in but no routine assigned`);
                   return;
@@ -849,7 +924,15 @@ async function main(): Promise<void> {
 
   // Daily catalog refresh (24h)
   intervals.push(setInterval(async () => {
-    if (!catalogStore.isStale()) return;
+    // Check if stale OR server version changed
+    let needsRefresh = catalogStore.isStale();
+    if (!needsRefresh && bots.size > 0) {
+      const firstBot = bots.values().next().value;
+      if (firstBot?.api.getSession()) {
+        needsRefresh = await catalogStore.checkVersionChanged(firstBot.api);
+      }
+    }
+    if (!needsRefresh) return;
     // Find first bot with an active session
     for (const [, bot] of bots) {
       if (bot.api.getSession()) {

@@ -18,6 +18,7 @@ class MockBot {
   public system = 'sol';
   public poi = 'sol_central';
   public towingWreck = false;
+  public towingWreckId: string | null = null;
   public cargo = 50;
   public cargoMax = 100;
   public fuel = 80;
@@ -69,6 +70,7 @@ class MockBot {
           };
         }
         this.towingWreck = false;
+        this.towingWreckId = null;
         return {
           result: { message: 'Tow released successfully' }
         };

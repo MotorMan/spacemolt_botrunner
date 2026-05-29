@@ -30,6 +30,10 @@ export interface QueuedRescue {
   attempts: number;
   /** Last attempt timestamp */
   lastAttemptAt?: number;
+  /** Bot that has claimed this rescue (prevents duplicate work) */
+  claimedBy?: string;
+  /** When this rescue was claimed */
+  claimedAt?: number;
 }
 
 export interface RescueQueueData {
@@ -223,6 +227,87 @@ export function incrementRescueAttempt(rescueId: string): void {
     rescue.lastAttemptAt = Date.now();
     saveRescueQueue(data);
   }
+}
+
+/**
+ * Claim a rescue for a specific bot to prevent duplicate work.
+ * Returns true if successfully claimed, false if already claimed by another bot.
+ */
+export function claimRescue(rescueId: string, botUsername: string): boolean {
+  const data = loadRescueQueue();
+
+  const rescue = data.pending.find(r => r.id === rescueId);
+  if (!rescue) {
+    return false; // Rescue not found
+  }
+
+  if (rescue.claimedBy && rescue.claimedBy !== botUsername) {
+    // Already claimed by another bot
+    return false;
+  }
+
+  // Claim it
+  rescue.claimedBy = botUsername;
+  rescue.claimedAt = Date.now();
+  saveRescueQueue(data);
+  return true;
+}
+
+/**
+ * Release a claim on a rescue (when completed, failed, or abandoned).
+ */
+export function releaseRescueClaim(rescueId: string, botUsername: string): void {
+  const data = loadRescueQueue();
+
+  const rescue = data.pending.find(r => r.id === rescueId);
+  if (rescue && rescue.claimedBy === botUsername) {
+    rescue.claimedBy = undefined;
+    rescue.claimedAt = undefined;
+    saveRescueQueue(data);
+  }
+}
+
+/**
+ * Check if a rescue is already claimed by another bot.
+ */
+export function isRescueClaimed(rescueId: string, excludeBot?: string): boolean {
+  const data = loadRescueQueue();
+
+  const rescue = data.pending.find(r => r.id === rescueId);
+  if (!rescue || !rescue.claimedBy) {
+    return false;
+  }
+
+  return rescue.claimedBy !== excludeBot;
+}
+
+/**
+ * Get all unclaimed rescues in a specific system.
+ */
+export function getUnclaimedRescuesInSystem(system: string): QueuedRescue[] {
+  const data = loadRescueQueue();
+  const normalize = (s: string) => s.toLowerCase().replace(/_/g, ' ').trim();
+  return data.pending.filter(
+    r => normalize(r.system) === normalize(system) && !r.completed && !r.claimedBy
+  );
+}
+
+/**
+ * Clean up stale claims (older than 30 minutes - assumes bot died or got stuck).
+ */
+export function cleanupStaleClaims(maxAgeMs: number = 30 * 60 * 1000): void {
+  const data = loadRescueQueue();
+  const now = Date.now();
+
+  data.pending.forEach(rescue => {
+    if (rescue.claimedAt && (now - rescue.claimedAt) > maxAgeMs) {
+      console.log(`[rescueQueue] Releasing stale claim on ${rescue.targetUsername} by ${rescue.claimedBy} (expired)`);
+      rescue.claimedBy = undefined;
+      rescue.claimedAt = undefined;
+    }
+  });
+
+  saveRescueQueue(data);
 }
 
 /**

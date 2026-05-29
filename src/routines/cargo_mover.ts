@@ -59,6 +59,12 @@ import {
   canClaimItemQuantity,
   cleanupStaleLocks,
 } from "./cargoMoverCoordination.js";
+import {
+  addInTransitItems,
+  removeInTransitItems,
+  getInTransitQuantity,
+  cleanupStaleInTransit,
+} from "./cargoMoverInTransit.js";
 
 /** Simple dock function that does NOT call collectFromStorage. */
 async function dockAtStation(ctx: RoutineContext): Promise<boolean> {
@@ -147,17 +153,65 @@ function getCargoMoverSettings(username?: string): CargoMoverSettings {
 }
 
 /** Resolve station ID to system ID using mapStore. */
-function resolveStationSystem(stationId: string): string | null {
+export function resolveStationSystem(stationId: string): string | null {
   if (!stationId) return null;
+
+  // Handle system|station format
+  let stationPart = stationId;
+  let systemPart: string | null = null;
+  if (stationId.includes('|')) {
+    const parts = stationId.split('|');
+    systemPart = parts[0];
+    stationPart = parts[1];
+  }
+
   const allSystems = mapStore.getAllSystems();
   for (const [sysId, sys] of Object.entries(allSystems)) {
+    // If we have a system part, only check that system
+    if (systemPart && sysId !== systemPart) continue;
+
     for (const poi of sys.pois) {
-      if (poi.id === stationId || poi.base_id === stationId) {
+      if (poi.id === stationPart || poi.base_id === stationPart) {
         return sysId;
       }
     }
   }
   return null;
+}
+
+/** Extract station ID from system|station format for travel commands. */
+function extractStationId(stationValue: string): string {
+  if (stationValue.includes('|')) {
+    return stationValue.split('|')[1];
+  }
+  return stationValue;
+}
+
+/** Get current system for mobile stations like mobile_capital or frontier_station. */
+export async function getMobileStationSystem(ctx: RoutineContext, stationId: string): Promise<string | null> {
+  if (stationId !== "mobile_capital" && stationId !== "frontier_station") return null;
+
+  const { bot } = ctx;
+
+  // Only query when docked to avoid conflicts
+  if (!bot.docked) {
+    ctx.log("warn", "Cannot query mobile station location while undocked");
+    return null;
+  }
+
+  const routeResp = await bot.exec("find_route", { target: stationId });
+  if (routeResp.error) {
+    ctx.log("error", `Failed to find route to ${stationId}: ${routeResp.error.message}`);
+    return null;
+  }
+
+  const routeData = routeResp.result as any;
+  if (!routeData.found) {
+    ctx.log("error", `Route to ${stationId} not found`);
+    return null;
+  }
+
+  return routeData.target_system;
 }
 
 interface MoveJob {
@@ -212,7 +266,25 @@ async function withdrawFromStorage(
       return { success: false, withdrawnQty: 0 };
     }
     const actualQty = Math.min(quantity, inFaction.quantity);
-    const wResp = await bot.exec("faction_withdraw_items", { item_id: itemId, quantity: actualQty });
+
+    // Step 1: Move from faction storage to station storage
+    const factionResp = await bot.exec("storage", { action: "deposit", target: "self", item_id: itemId, quantity: actualQty, source: "faction" });
+    if (factionResp.error) {
+      ctx.log("error", `Failed to move ${itemId} from faction to station storage: ${factionResp.error.message}`);
+      logCargoActivity(bot.username, "withdraw_failed", `Failed to move ${itemId} from faction storage: ${factionResp.error.message}`, {
+        itemId,
+        quantity,
+        location: `${bot.system}/${bot.poi}`,
+        error: factionResp.error.message,
+      });
+      return { success: false, withdrawnQty: 0 };
+    }
+
+    // Refresh station storage to verify the transfer
+    await bot.refreshStorage();
+
+    // Step 2: Withdraw from station storage to cargo
+    const wResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: actualQty });
     if (!wResp.error) {
       await bot.refreshCargo();
       const cargoAfter = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
@@ -231,19 +303,26 @@ async function withdrawFromStorage(
       const match = wResp.error.message.match(/only (\d+) available/);
       const availableSpace = match ? parseInt(match[1], 10) : Math.max(1, Math.floor(actualQty / 2));
       if (availableSpace > 0) {
-        const smallWResp = await bot.exec("faction_withdraw_items", { item_id: itemId, quantity: availableSpace });
-        if (!smallWResp.error) {
-          await bot.refreshCargo();
-          const cargoAfter = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
-          const withdrawn = Math.max(0, cargoAfter - cargoBefore);
-          ctx.log("cargo", `Withdraw successful (partial): got ${withdrawn}x ${itemId} from faction storage`);
-          logCargoActivity(bot.username, "withdraw_success", `Successfully withdrew ${withdrawn}x ${itemId} from faction storage (partial, cargo full)`, {
-            itemId,
-            itemName: inFaction.name || itemId,
-            quantity: withdrawn,
-            location: `${bot.system}/${bot.poi}`,
-          });
-          return { success: withdrawn > 0, withdrawnQty: withdrawn };
+        // Step 1: Move partial amount from faction to station storage
+        const smallFactionResp = await bot.exec("storage", { action: "deposit", target: "self", item_id: itemId, quantity: availableSpace, source: "faction" });
+        if (!smallFactionResp.error) {
+          // Refresh station storage
+          await bot.refreshStorage();
+          // Step 2: Withdraw partial amount from station to cargo
+          const smallWResp = await bot.exec("withdraw_items", { item_id: itemId, quantity: availableSpace });
+          if (!smallWResp.error) {
+            await bot.refreshCargo();
+            const cargoAfter = bot.inventory.find((i) => i.itemId === itemId)?.quantity || 0;
+            const withdrawn = Math.max(0, cargoAfter - cargoBefore);
+            ctx.log("cargo", `Withdraw successful (partial): got ${withdrawn}x ${itemId} from faction storage`);
+            logCargoActivity(bot.username, "withdraw_success", `Successfully withdrew ${withdrawn}x ${itemId} from faction storage (partial, cargo full)`, {
+              itemId,
+              itemName: inFaction.name || itemId,
+              quantity: withdrawn,
+              location: `${bot.system}/${bot.poi}`,
+            });
+            return { success: withdrawn > 0, withdrawnQty: withdrawn };
+          }
         }
       }
     }
@@ -535,28 +614,39 @@ function findMoveJobs(
     const totalAvailable = inStorage + inCargo;
     
     // Check how much is already claimed by other bots (quantity-based locking)
-    const availableQty = getAvailableItemQuantity(
+    let availableQty = getAvailableItemQuantity(
       configItem.itemId,
       totalAvailable,
       bot.username
     );
+
+    // Subtract items already in transit to this destination
+    const inTransitQty = getInTransitQuantity(configItem.itemId, settings.destinationStation);
+    availableQty = Math.max(0, availableQty - inTransitQty);
     
     const alreadyClaimed = getBotClaimedQuantity(bot.username, configItem.itemId);
-    
-    const targetQty = configItem.quantity > 0 ? configItem.quantity : availableQty;
 
-    ctx.log("cargo", `  ${configItem.itemName}: inStorage=${inStorage}, inCargo=${inCargo}, totalAvailable=${totalAvailable}, availableForBot=${availableQty}, alreadyClaimed=${alreadyClaimed} (storageType=${storageType})`);
+    // Calculate effective target considering items already in transit
+    const baseTargetQty = configItem.quantity > 0 ? configItem.quantity : availableQty;
+    const effectiveTargetQty = Math.max(0, baseTargetQty - inTransitQty);
 
-    if (targetQty > 0 && availableQty > 0) {
+    ctx.log("cargo", `  ${configItem.itemName}: inStorage=${inStorage}, inCargo=${inCargo}, totalAvailable=${totalAvailable}, availableForBot=${availableQty}, inTransit=${inTransitQty}, effectiveTarget=${effectiveTargetQty}, alreadyClaimed=${alreadyClaimed} (storageType=${storageType})`);
+
+    if (effectiveTargetQty > 0 && availableQty > 0) {
       const blacklist = getSystemBlacklist();
       const route = mapStore.findRoute(sourceSystem, destSystem, blacklist);
       const jumps = route ? route.length - 1 : 999;
 
+      // Limit available quantity to what fits in cargo for this item
+      const itemSize = getItemSize(configItem.itemId);
+      const maxCarry = Math.floor(bot.cargoMax / itemSize);
+      const claimableQty = Math.min(effectiveTargetQty, availableQty, maxCarry);
+
       jobs.push({
         itemId: configItem.itemId,
         itemName: configItem.itemName,
-        targetQty,
-        availableQty: Math.min(targetQty, availableQty),
+        targetQty: effectiveTargetQty,
+        availableQty: claimableQty,
         storageType,
         sourceSystem,
         sourceStation: settings.sourceStation,
@@ -570,6 +660,14 @@ function findMoveJobs(
       ctx.log("cargo", `  ${configItem.itemName}: no available quantity (all claimed by other bots or empty)`);
     }
   }
+
+  // Limit locked quantity per item to allow multiple bots to work on the same items
+  // Reduce maxCarry to allow concurrent access
+  jobs.forEach(job => {
+    const itemSize = getItemSize(job.itemId);
+    const maxCarryConcurrent = Math.floor(bot.cargoMax / itemSize / 2); // Allow 2 bots per item
+    job.availableQty = Math.min(job.availableQty, maxCarryConcurrent);
+  });
 
   return jobs;
 }
@@ -627,6 +725,12 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
   const cleanedLocks = cleanupStaleLocks();
   if (cleanedLocks > 0) {
     ctx.log("cargo", `Cleaned up ${cleanedLocks} stale coordination locks from previous sessions`);
+  }
+
+  // Cleanup stale in-transit items (24-hour threshold)
+  const cleanedTransit = cleanupStaleInTransit();
+  if (cleanedTransit > 0) {
+    ctx.log("cargo", `Cleaned up ${cleanedTransit} stale in-transit items from previous sessions`);
   }
 
   await bot.refreshStatus();
@@ -868,9 +972,9 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         ctx.log("system", "⛔ Stopping — emergency detected");
         return;
       }
-      if (bot.poi !== settings.destinationStation) {
+      if (bot.poi !== extractStationId(settings.destinationStation)) {
         ctx.log("travel", `Traveling to destination station ${settings.destinationStation}...`);
-        const tResp = await bot.exec("travel", { target_poi: settings.destinationStation });
+        const tResp = await bot.exec("travel", { target_poi: extractStationId(settings.destinationStation) });
         if (bot.state !== "running") {
           ctx.log("system", "⛔ Stopping — emergency detected");
           return;
@@ -897,12 +1001,53 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             continue;
           }
           if (!errMsg.includes("already")) {
-            ctx.log("error", `Travel to destination failed: ${tResp.error.message}`);
-            await ctx.sleep(30000);
-            continue;
+            // Check if it's a mobile station that moved
+            if (settings.destinationStation === "mobile_capital" && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
+              ctx.log("cargo", "Mobile capital not found at expected location during recovery, querying current system...");
+              const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
+              if (currentSystem) {
+                ctx.log("cargo", `Mobile capital is now in system ${currentSystem}`);
+                // Navigate to the new system
+                if (bot.system !== currentSystem) {
+                  ctx.log("travel", `Navigating to updated mobile capital system ${currentSystem} for recovery...`);
+                  const arrived = await navigateToSystem(ctx, currentSystem, safetyOpts);
+                  if (!arrived || bot.state !== "running") {
+                    if (bot.state !== "running") {
+                      ctx.log("system", "⛔ Stopping — emergency detected");
+                      return;
+                    }
+                    ctx.log("error", `Failed to reach updated mobile capital system ${currentSystem} for recovery`);
+                    await ctx.sleep(30000);
+                    continue;
+                  }
+                  ctx.log("cargo", `✅ Arrived at updated mobile capital system ${currentSystem} for recovery`);
+                }
+                // Retry travel to the station
+                const retryResp = await bot.exec("travel", { target_poi: extractStationId(settings.destinationStation) });
+                if (retryResp.error) {
+                  const retryErrMsg = retryResp.error.message.toLowerCase();
+                  if (!retryErrMsg.includes("already")) {
+                    ctx.log("error", `Still failed to travel to mobile capital after relocation during recovery: ${retryResp.error.message}`);
+                    await ctx.sleep(30000);
+                    continue;
+                  }
+                } else {
+        bot.poi = extractStationId(settings.destinationStation);
+                }
+              } else {
+                ctx.log("error", "Could not determine current location of mobile capital during recovery");
+                await ctx.sleep(30000);
+                continue;
+              }
+            } else {
+              ctx.log("error", `Travel to destination failed: ${tResp.error.message}`);
+              await ctx.sleep(30000);
+              continue;
+            }
           }
+        } else {
+        bot.poi = extractStationId(settings.destinationStation);
         }
-        bot.poi = settings.destinationStation;
       }
 
       // Dock at destination
@@ -925,7 +1070,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         for (const item of itemsToDeposit) {
           if (item.quantity <= 0) continue;
           const lower = item.itemId.toLowerCase();
-          if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+          if (lower === "fuel_cell" || lower === "premium_fuel_cell" || lower.includes("energy_cell")) continue;
 
           const depositResult = await depositToDestination(
             ctx,
@@ -1044,12 +1189,12 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         });
         return;
       }
-      if (bot.poi !== settings.sourceStation) {
+    if (bot.poi !== extractStationId(settings.sourceStation)) {
         ctx.log("travel", `Traveling to source station ${settings.sourceStation}...`);
         logCargoActivity(bot.username, "navigation", `Traveling to source station ${settings.sourceStation}`, {
           location: `${bot.system}: ${bot.poi} → ${settings.sourceStation}`,
         });
-        const tResp = await bot.exec("travel", { target_poi: settings.sourceStation });
+        const tResp = await bot.exec("travel", { target_poi: extractStationId(settings.sourceStation) });
         if (bot.state !== "running") {
           ctx.log("system", "⛔ Stopping — emergency detected");
           logCargoActivity(bot.username, "interruption", "Emergency detected during travel to source station", {
@@ -1087,7 +1232,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
             continue;
           }
         }
-        bot.poi = settings.sourceStation;
+        bot.poi = extractStationId(settings.sourceStation);
       }
 
       yield "dock_source";
@@ -1152,6 +1297,12 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     await bot.refreshFactionStorage();
 
     yield "find_jobs";
+    // Clean up any stale locks from other bots before checking availability
+    const staleCleaned = cleanupStaleLocks();
+    if (staleCleaned > 0) {
+      ctx.log("cargo", `Cleaned up ${staleCleaned} stale locks from other bots`);
+    }
+
     await bot.refreshStatus();
     // Re-find jobs now that storage is updated with cleared items
     let jobs = findMoveJobs(ctx, settings, sourceSystem, destSystem);
@@ -1164,7 +1315,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       continue;
     }
 
-    ctx.log("cargo", `📋 Found ${jobs.length} item(s) to move`);
+    ctx.log("cargo", `📋 Found ${jobs.length} item(s) to move (locked quantities limited for concurrent access)`);
     for (const job of jobs) {
       const itemSize = getItemSize(job.itemId);
       const totalCargoNeeded = job.availableQty * itemSize;
@@ -1268,13 +1419,30 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
 
         ctx.log("cargo", `Attempting to withdraw ${loadQty}x ${job.itemName} from ${job.storageType} (item size: ${itemSize}, cargo space: ${currentFree})`);
         yield "withdraw_items";
-        const withdrawResult = await withdrawFromStorage(ctx, job.itemId, loadQty, job.storageType);
-        ctx.log("cargo", `Withdraw result: success=${withdrawResult.success}, withdrawnQty=${withdrawResult.withdrawnQty}`);
+
+        // Retry failed withdrawals up to 3 times to handle temporary API issues
+        let withdrawResult = { success: false, withdrawnQty: 0 };
+        let retryCount = 0;
+        const maxRetries = 3;
+
+        while (retryCount < maxRetries) {
+          withdrawResult = await withdrawFromStorage(ctx, job.itemId, loadQty, job.storageType);
+          ctx.log("cargo", `Withdraw result: success=${withdrawResult.success}, withdrawnQty=${withdrawResult.withdrawnQty}${retryCount > 0 ? ` (retry ${retryCount}/${maxRetries - 1})` : ''}`);
+
+          if (withdrawResult.success && withdrawResult.withdrawnQty > 0) {
+            break; // Success
+          }
+
+          retryCount++;
+          if (retryCount < maxRetries) {
+            ctx.log("cargo", `Withdraw failed, retrying in 5 seconds... (${retryCount}/${maxRetries - 1})`);
+            await ctx.sleep(5000);
+          }
+        }
 
         if (!withdrawResult.success || withdrawResult.withdrawnQty <= 0) {
-          ctx.log("error", `Failed to withdraw ${job.itemId} from ${job.storageType} — marking as depleted`);
-          // Don't set remaining to 0 - just mark that we couldn't load this item
-          // It might still be available from storage but we hit a cargo limit or other issue
+          ctx.log("error", `Failed to withdraw ${job.itemId} from ${job.storageType} after ${maxRetries} attempts — marking as depleted`);
+          // After multiple retries, assume the item is truly unavailable
           failedThisIteration++;
           continue;
         }
@@ -1326,9 +1494,31 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       }
     }
 
+    // Track loaded items as in-transit before traveling
+    const loadedItems = [];
+    for (const [itemId, remaining] of jobRemaining) {
+      const originalQty = jobs.find(j => j.itemId === itemId)?.availableQty || 0;
+      const loadedQty = originalQty - remaining;
+      if (loadedQty > 0) {
+        const job = jobs.find(j => j.itemId === itemId);
+        if (job) {
+          loadedItems.push({
+            itemId,
+            itemName: job.itemName,
+            quantity: loadedQty,
+          });
+        }
+      }
+    }
+
+    if (loadedItems.length > 0) {
+      addInTransitItems(bot.username, settings.destinationStation, loadedItems);
+      ctx.log("cargo", `📦 Added ${loadedItems.length} item types to in-transit tracking (${loadedItems.reduce((sum, i) => sum + i.quantity, 0)} total items)`);
+    }
+
     // Now travel to destination and deliver what we loaded
     yield "travel_to_dest";
-    
+
     saveLastSession(bot.username, settings.sourceStation, settings.destinationStation,
       settings.items.map(i => ({ itemId: i.itemId, itemName: i.itemName, quantity: i.quantity, storageType: i.storageType || 'faction' })),
       currentTrip, "traveling_to_dest", bot.system, bot.poi || "", bot.docked);
@@ -1388,12 +1578,12 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       });
       return;
     }
-    if (bot.poi !== settings.destinationStation) {
+    if (bot.poi !== extractStationId(settings.destinationStation)) {
       ctx.log("travel", `Traveling to ${settings.destinationStation}...`);
       logCargoActivity(bot.username, "navigation", `Traveling to destination station ${settings.destinationStation}`, {
         location: `${bot.system}: ${bot.poi} → ${settings.destinationStation}`,
       });
-      const tResp = await bot.exec("travel", { target_poi: settings.destinationStation });
+      const tResp = await bot.exec("travel", { target_poi: extractStationId(settings.destinationStation) });
       if (bot.state !== "running") {
         ctx.log("system", "⛔ Stopping — emergency detected");
         logCargoActivity(bot.username, "interruption", "Emergency detected during travel to destination", {
@@ -1425,15 +1615,135 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           continue;
         }
         if (!errMsg.includes("already")) {
-          ctx.log("error", `Travel to dest failed: ${tResp.error.message}`);
-          logCargoActivity(bot.username, "error", `Travel to destination failed: ${tResp.error.message}`, {
-            location: `${bot.system}/${bot.poi}`,
-          });
-          allJobsCompleted = false;
-          break;
+          // Check if mobile capital moved and we got location info
+          if (settings.destinationStation === "mobile_capital" && errMsg.includes("jump to") && errMsg.includes("to find it")) {
+            // Parse the error message like "Jump to First Step to find it."
+            const match = tResp.error.message.match(/jump to (.+?) to find it/i);
+            if (match) {
+              const newSystemName = match[1];
+              ctx.log("cargo", `Mobile capital relocated to system: ${newSystemName}`);
+
+              // Update map store with new location
+              // We need to get the system ID from the name, or use the name directly
+              // For now, we'll query the current location and update the map
+              const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
+              if (currentSystem) {
+                // Update the map store
+                mapStore.updateMobileCapitolLocation(currentSystem, newSystemName, "mobile_capital");
+                ctx.log("cargo", `Updated map store: mobile capital now in ${newSystemName} (${currentSystem})`);
+
+                // Navigate to the new system
+                if (bot.system !== currentSystem) {
+                  ctx.log("travel", `Mobile capital moved - navigating to ${newSystemName} (${currentSystem})...`);
+                  const arrived = await navigateToSystem(ctx, currentSystem, safetyOpts);
+                  if (!arrived || bot.state !== "running") {
+                    if (bot.state !== "running") {
+                      ctx.log("system", "⛔ Stopping — emergency detected");
+                      return;
+                    }
+                    ctx.log("error", `Failed to reach mobile capital's new system ${currentSystem}`);
+                    logCargoActivity(bot.username, "error", `Failed to navigate to mobile capital's new system ${currentSystem}`, {
+                      location: `${bot.system}/${bot.poi}`,
+                    });
+                    allJobsCompleted = false;
+                    break;
+                  }
+                  ctx.log("cargo", `✅ Arrived at mobile capital's new system ${currentSystem}`);
+                }
+
+                // Retry travel to the mobile capital
+                const retryResp = await bot.exec("travel", { target_poi: extractStationId(settings.destinationStation) });
+                if (retryResp.error) {
+                  const retryErrMsg = retryResp.error.message.toLowerCase();
+                  if (!retryErrMsg.includes("already")) {
+                    ctx.log("error", `Still failed to travel to relocated mobile capital: ${retryResp.error.message}`);
+                    logCargoActivity(bot.username, "error", `Travel to relocated mobile capital failed: ${retryResp.error.message}`, {
+                      location: `${bot.system}/${bot.poi}`,
+                    });
+                    allJobsCompleted = false;
+                    break;
+                  }
+                } else {
+                  bot.poi = extractStationId(settings.destinationStation);
+                }
+              } else {
+                ctx.log("error", "Could not determine mobile capital's new location from error message");
+                logCargoActivity(bot.username, "error", "Could not parse mobile capital relocation from error message", {
+                  location: `${bot.system}/${bot.poi}`,
+                  error: tResp.error.message,
+                });
+                allJobsCompleted = false;
+                break;
+              }
+            } else {
+              ctx.log("error", "Could not parse new system name from mobile capital relocation error");
+              logCargoActivity(bot.username, "error", "Could not parse system name from mobile capital relocation error", {
+                location: `${bot.system}/${bot.poi}`,
+                error: tResp.error.message,
+              });
+              allJobsCompleted = false;
+              break;
+            }
+          }
+          // Check if it's a mobile station that moved (fallback for other cases)
+          else if (settings.destinationStation === "mobile_capital" && (errMsg.includes("not found") || errMsg.includes("does not exist") || errMsg.includes("not present"))) {
+            ctx.log("cargo", "Mobile capital not found at expected location, querying current system...");
+            const currentSystem = await getMobileStationSystem(ctx, "frontier_station");
+            if (currentSystem) {
+              ctx.log("cargo", `Mobile capital is now in system ${currentSystem}`);
+              // Navigate to the new system
+              if (bot.system !== currentSystem) {
+                ctx.log("travel", `Navigating to updated mobile capital system ${currentSystem}...`);
+                const arrived = await navigateToSystem(ctx, currentSystem, safetyOpts);
+                if (!arrived || bot.state !== "running") {
+                  if (bot.state !== "running") {
+                    ctx.log("system", "⛔ Stopping — emergency detected");
+                    return;
+                  }
+                  ctx.log("error", `Failed to reach updated mobile capital system ${currentSystem}`);
+                  logCargoActivity(bot.username, "error", `Failed to navigate to updated mobile capital system ${currentSystem}`, {
+                    location: `${bot.system}/${bot.poi}`,
+                  });
+                  allJobsCompleted = false;
+                  break;
+                }
+                ctx.log("cargo", `✅ Arrived at updated mobile capital system ${currentSystem}`);
+              }
+              // Retry travel to the station
+              const retryResp = await bot.exec("travel", { target_poi: extractStationId(settings.destinationStation) });
+              if (retryResp.error) {
+                const retryErrMsg = retryResp.error.message.toLowerCase();
+                if (!retryErrMsg.includes("already")) {
+                  ctx.log("error", `Still failed to travel to mobile capital after relocation: ${retryResp.error.message}`);
+                  logCargoActivity(bot.username, "error", `Travel to mobile capital failed after relocation: ${retryResp.error.message}`, {
+                    location: `${bot.system}/${bot.poi}`,
+                  });
+                  allJobsCompleted = false;
+                  break;
+                }
+              } else {
+          bot.poi = extractStationId(settings.destinationStation);
+              }
+            } else {
+              ctx.log("error", "Could not determine current location of mobile capital");
+              logCargoActivity(bot.username, "error", "Could not query current location of mobile capital", {
+                location: `${bot.system}/${bot.poi}`,
+              });
+              allJobsCompleted = false;
+              break;
+            }
+          } else {
+            ctx.log("error", `Travel to dest failed: ${tResp.error.message}`);
+            logCargoActivity(bot.username, "error", `Travel to destination failed: ${tResp.error.message}`, {
+              location: `${bot.system}/${bot.poi}`,
+            });
+            allJobsCompleted = false;
+            break;
+          }
         }
+      } else {
+        bot.poi = extractStationId(settings.destinationStation);
       }
-      bot.poi = settings.destinationStation;
     }
 
     yield "dock_dest";
@@ -1451,18 +1761,35 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
     });
 
     yield "deposit_items";
+
+    // Check destination storage BEFORE depositing to establish baseline
+    let destStorageBefore: Array<{ itemId: string; name: string; quantity: number }> = [];
+    let canVerifyDelivery = true;
+
+    if (settings.destinationStorageType === "faction") {
+      await bot.refreshFactionStorage();
+      destStorageBefore = [...bot.factionStorage];
+    } else if (settings.destinationStorageType === "personal") {
+      await bot.refreshStorage();
+      destStorageBefore = [...bot.storage];
+    } else if (settings.destinationStorageType === "send_gift") {
+      // Cannot verify gift deliveries - fall back to deposit function reporting
+      canVerifyDelivery = false;
+      ctx.log("cargo", `📦 Gift delivery selected - cannot verify actual delivery to recipient storage`);
+    }
+
     await bot.refreshCargo();
     // Deposit ALL items in cargo to the destination
     const itemsToDeposit = [...bot.inventory];
-    const deliveredItems: { itemId: string; quantity: number }[] = [];
 
     if (itemsToDeposit.length > 0) {
       ctx.log("cargo", `📦 Depositing ${itemsToDeposit.length} item type(s) to destination...`);
+      let depositErrors = 0;
       for (const item of itemsToDeposit) {
         if (item.quantity <= 0) continue;
-        // Skip fuel/energy cells
+        // Skip specific fuel cells used for operations
         const lower = item.itemId.toLowerCase();
-        if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+        if (lower === "fuel_cell" || lower === "premium_fuel_cell" || lower.includes("energy_cell")) continue;
 
         const depositResult = await depositToDestination(
           ctx,
@@ -1471,23 +1798,80 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           settings.destinationStorageType,
           settings.destinationBotName,
         );
-        if (depositResult.success) {
-          ctx.log("cargo", `✅ Delivered ${depositResult.depositedQty}x ${item.name}`);
-          deliveredItems.push({ itemId: item.itemId, quantity: depositResult.depositedQty });
-        } else {
+        if (!depositResult.success) {
           ctx.log("error", `❌ Failed to deliver ${item.quantity}x ${item.name}`);
-          allJobsCompleted = false;
+          depositErrors++;
         }
       }
+
+      let deliveredItems: { itemId: string; quantity: number }[] = [];
+
+      if (canVerifyDelivery) {
+        // Check destination storage AFTER depositing to count what actually arrived
+        let destStorageAfter: Array<{ itemId: string; name: string; quantity: number }> = [];
+        if (settings.destinationStorageType === "faction") {
+          await bot.refreshFactionStorage();
+          destStorageAfter = [...bot.factionStorage];
+        } else if (settings.destinationStorageType === "personal") {
+          await bot.refreshStorage();
+          destStorageAfter = [...bot.storage];
+        }
+
+        // Calculate what actually arrived by comparing before/after
+        const beforeMap = new Map(destStorageBefore.map(item => [item.itemId, item.quantity]));
+
+        for (const afterItem of destStorageAfter) {
+          const beforeQty = beforeMap.get(afterItem.itemId) || 0;
+          const arrivedQty = Math.max(0, afterItem.quantity - beforeQty);
+
+          if (arrivedQty > 0) {
+            deliveredItems.push({ itemId: afterItem.itemId, quantity: arrivedQty });
+            ctx.log("cargo", `✅ Verified delivery: ${arrivedQty}x ${afterItem.name} arrived at destination`);
+          }
+        }
+
+        if (deliveredItems.length > 0) {
+          ctx.log("cargo", `📊 Verified total delivery: ${deliveredItems.reduce((sum, d) => sum + d.quantity, 0)} items across ${deliveredItems.length} types`);
+        }
+
+        if (depositErrors > 0) {
+          ctx.log("warn", `⚠️ ${depositErrors} deposit operations reported errors, but verified ${deliveredItems.length} successful deliveries`);
+        }
+      } else {
+        // For gift deliveries, fall back to deposit function reporting
+        ctx.log("cargo", `📦 Using reported delivery quantities for gift delivery (cannot verify)`);
+        for (const item of itemsToDeposit) {
+          if (item.quantity <= 0) continue;
+          const lower = item.itemId.toLowerCase();
+          if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+
+          const depositResult = await depositToDestination(
+            ctx,
+            item.itemId,
+            item.quantity,
+            settings.destinationStorageType,
+            settings.destinationBotName,
+          );
+          if (depositResult.success) {
+            ctx.log("cargo", `✅ Reported delivery: ${depositResult.depositedQty}x ${item.name} to ${settings.destinationBotName}`);
+            deliveredItems.push({ itemId: item.itemId, quantity: depositResult.depositedQty });
+          }
+        }
+      }
+
       totalTrips++;
       currentTrip = totalTrips;
 
-      // Update delivery tracking after successful delivery
+      // Update delivery tracking with VERIFIED quantities
       if (deliveredItems.length > 0) {
         const itemIds = deliveredItems.map((d) => d.itemId);
         const quantities = deliveredItems.map((d) => d.quantity);
         updateDeliveryTracking(ctx, itemIds, quantities, settings);
-        
+
+        // Remove delivered items from in-transit tracking
+        removeInTransitItems(bot.username, settings.destinationStation, deliveredItems);
+        ctx.log("cargo", `📦 Removed ${deliveredItems.length} item types from in-transit tracking (${deliveredItems.reduce((sum, d) => sum + d.quantity, 0)} verified deliveries)`);
+
         // Update trip completion tracking
         for (const itemId of itemIds) {
           updateItemProgress(bot.username, itemId, { tripCompleted: true });
@@ -1500,6 +1884,9 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
         quantity: deliveredItems.reduce((sum, d) => sum + d.quantity, 0),
       });
     }
+
+    // Refuel at destination to prevent getting stuck on return journey
+    await tryRefuel(ctx);
 
     await bot.refreshCargo();
 
@@ -1594,12 +1981,12 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
       });
       return;
     }
-    if (bot.poi !== settings.sourceStation) {
+    if (bot.poi !== extractStationId(settings.sourceStation)) {
       ctx.log("travel", `Traveling back to ${settings.sourceStation}...`);
       logCargoActivity(bot.username, "navigation", `Returning to source station ${settings.sourceStation}`, {
         location: `${bot.system}: ${bot.poi} → ${settings.sourceStation}`,
       });
-      const tResp = await bot.exec("travel", { target_poi: settings.sourceStation });
+      const tResp = await bot.exec("travel", { target_poi: extractStationId(settings.sourceStation) });
       if (bot.state !== "running") {
         ctx.log("system", "⛔ Stopping — emergency detected");
         logCargoActivity(bot.username, "interruption", "Emergency detected during return travel", {
@@ -1637,7 +2024,7 @@ export const cargoMoverRoutine: Routine = async function* (ctx: RoutineContext) 
           continue;
         }
       }
-      bot.poi = settings.sourceStation;
+      bot.poi = extractStationId(settings.sourceStation);
     }
 
     if (!await dockAtStation(ctx)) {

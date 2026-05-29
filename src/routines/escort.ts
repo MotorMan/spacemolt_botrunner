@@ -25,6 +25,7 @@
  *   autoCloak       — use cloak when available (default: false)
  *   ammoThreshold   — ammo level to trigger reload (default: 5)
  *   maxReloadAttempts — max reload retries (default: 3)
+ *   ignoreBlacklist   — bypass system blacklist when following miner/salvager into pirate systems (default: false)
  *
  * Home system is automatically determined from general.factionStorageSystem (default: "sol")
  */
@@ -32,7 +33,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { getBotChatChannel } from "../botmanager.js";
 import { mapStore } from "../mapstore.js";
-import { getSystemBlacklist } from "../web/server.js";
 import {
   findStation,
   isStationPoi,
@@ -59,6 +59,8 @@ import {
   checkBattleAfterCommand,
   type BattleState,
   handleBattleNotifications,
+  topUpShields,
+  useRepairKits,
 } from "./common.js";
 import {
   type NearbyEntity,
@@ -66,11 +68,10 @@ import {
   parseNearby,
   isPirateTarget,
   ensureAmmoLoaded,
-  emergencyFleeSpam,
-  analyzeExistingBattle,
   engageTarget as battleEngageTarget,
   fightJoinedBattle,
 } from "./battle.js";
+import { ensureHunterResupply } from "./hunter.js";
 
 // ── Tier helpers ─────────────────────────────────────────────
 
@@ -92,6 +93,29 @@ function isTierTooHigh(pirateTier: PirateTier | undefined, maxTier: PirateTier):
   return getTierLevel(pirateTier) > getTierLevel(maxTier);
 }
 
+// ── Route helpers ─────────────────────────────────────────────
+
+function getJumpsToSystem(fromSystemId: string, toSystemId: string): number {
+  if (fromSystemId === toSystemId) return 0;
+
+  const visited = new Set<string>();
+  const queue: [string, number][] = [[fromSystemId, 0]];
+
+  while (queue.length > 0) {
+    const [current, jumps] = queue.shift()!;
+    if (current === toSystemId) return jumps;
+
+    for (const conn of mapStore.getConnections(current)) {
+      if (!visited.has(conn.system_id)) {
+        visited.add(conn.system_id);
+        queue.push([conn.system_id, jumps + 1]);
+      }
+    }
+  }
+
+  return -1; // not reachable
+}
+
 // ── Settings ─────────────────────────────────────────────────
 
 function getEscortSettings(username?: string): {
@@ -99,6 +123,7 @@ function getEscortSettings(username?: string): {
   refuelThreshold: number;
   repairThreshold: number;
   fleeThreshold: number;
+  shieldRechargePct: number;
   maxAttackTier: PirateTier;
   fleeFromTier: PirateTier;
   minPiratesToFlee: number;
@@ -106,6 +131,7 @@ function getEscortSettings(username?: string): {
   ammoThreshold: number;
   maxReloadAttempts: number;
   homeSystem: string;
+  ignoreBlacklist: boolean;
 } {
   const all = readSettings();
   const general = (all.general as Record<string, unknown>) || {};
@@ -117,6 +143,7 @@ function getEscortSettings(username?: string): {
     refuelThreshold: (e.refuelThreshold as number) || 40,
     repairThreshold: (e.repairThreshold as number) || 30,
     fleeThreshold: 0, // Escorts never flee - they protect at all costs
+    shieldRechargePct: (e.shieldRechargePct as number) || 80,
     maxAttackTier: ((e.maxAttackTier as PirateTier) || "boss") as PirateTier,
     fleeFromTier: ((e.fleeFromTier as PirateTier) || "boss") as PirateTier,
     minPiratesToFlee: (e.minPiratesToFlee as number) || 3,
@@ -124,7 +151,18 @@ function getEscortSettings(username?: string): {
     ammoThreshold: (e.ammoThreshold as number) || 5,
     maxReloadAttempts: (e.maxReloadAttempts as number) || 3,
     homeSystem: (botOverrides.homeSystem as string) || (e.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
+    ignoreBlacklist: (botOverrides.ignoreBlacklist as boolean) ?? (e.ignoreBlacklist as boolean) ?? false,
   };
+}
+
+function isLowOnFieldConsumables(inventory: any[] | undefined, minRepairKits = 5, minShieldCharges = 5): boolean {
+  const repair = (inventory || [])
+    .filter(i => (i.itemId || "").toLowerCase().includes("repair_kit"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+  const shields = (inventory || [])
+    .filter(i => (i.itemId || "").toLowerCase().includes("shield_charge"))
+    .reduce((sum, i) => sum + (i.quantity || 0), 0);
+  return repair < minRepairKits || shields < minShieldCharges;
 }
 
 // ── Miner tracking ───────────────────────────────────────────
@@ -271,11 +309,16 @@ async function analyzeEscortBattle(
     const fleetSide = sideInfo.find(s => s.sideId === fleetInBattle.side_id);
     if (fleetSide) {
       const isMiner = (fleetInBattle.username || "").toLowerCase() === minerName.toLowerCase();
+      // Fleet member is in battle — escort MUST join to protect regardless of API pirate count
+      // The battle status API is buggy and may report 0 pirates even when pirates are present
+      const opposingSide = sideInfo.find(s => s.sideId !== fleetSide.sideId);
+      const reportedPirateCount = opposingSide?.pirateCount || 0;
+      ctx.log("combat", `   ⚠ Battle status API reports ${reportedPirateCount} pirates — but API is unreliable, joining anyway to protect ${isMiner ? 'miner' : 'fleet member'}`);
       return {
         shouldJoin: true,
         sideId: fleetSide.sideId,
-        reason: `${isMiner ? 'Miner' : 'Fleet member'} ${fleetInBattle.username} is in battle — escort joining their side`,
-        pirateCount: fleetSide.pirateCount,
+        reason: `${isMiner ? 'Miner' : 'Fleet member'} ${fleetInBattle.username} is in battle — escort joining to protect`,
+        pirateCount: reportedPirateCount,
       };
     }
   }
@@ -307,6 +350,91 @@ async function analyzeEscortBattle(
     reason: `Escort joining side ${sideToJoin.sideId} (${sideToJoin.playerCount} player(s)) vs ${opposingPirateCount} pirate(s)`,
     pirateCount: opposingPirateCount,
   };
+}
+
+/** Handle being unexpectedly pulled into a battle (e.g. miner started combat).
+ *  Mirrors the robust logic from hunter using escort-specific battle analysis.
+ *  Escorts NEVER flee - they fight to protect the miner.
+ */
+async function handleUnexpectedEscortBattle(
+  ctx: RoutineContext,
+  maxAttackTier: PirateTier,
+  minPiratesToFlee: number,
+  fleeThreshold: number,
+  fleeFromTier: PirateTier,
+  minerName: string,
+  repairThreshold: number = 0,
+  shieldRechargePct: number = 80,
+): Promise<void> {
+  const battleStatus = await getBattleStatus(ctx);
+  if (!battleStatus) return;
+
+  ctx.log("combat", `⚠️ Unexpectedly in battle (ID: ${battleStatus.battle_id})`);
+
+  const analysis = await analyzeEscortBattle(ctx, maxAttackTier, minPiratesToFlee, minerName);
+  // If fleet member is in battle, analysis.shouldJoin is true regardless of reported pirate count
+  // The battle status API is buggy and reports 0 pirates even when pirates are present
+  if (!analysis.shouldJoin) {
+    ctx.log("combat", `Battle analysis: ${analysis.reason}`);
+    // Check if we're already in this battle by checking bot's battle state
+    const alreadyInBattle = ctx.bot.isInBattle();
+    if (alreadyInBattle) {
+      ctx.log("combat", `🚨 Already in battle — continuing to fight!`);
+    } else if (analysis.pirateCount === 0 && !alreadyInBattle) {
+      ctx.log("combat", `🛡️ No pirates reported and not in battle — waiting for resolution...`);
+      await ctx.sleep(5000);
+      return;
+    } else {
+      // Even with pirates but analysis says don't join (e.g., PvP), escorts still fight!
+      ctx.log("combat", `🚨 Escort fights regardless - protecting the miner!`);
+    }
+    // Continue to fight logic below...
+  }
+
+  if (analysis.reason.includes("Already in battle")) {
+    ctx.log("combat", `Already participating on side ${analysis.sideId} — continuing fight`);
+  } else if (analysis.sideId !== undefined) {
+    ctx.log("combat", `✅ Joining unexpected battle on side ${analysis.sideId}: ${analysis.reason}`);
+    const engageResp = await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId.toString() });
+    if (engageResp.error) {
+      const errMsg = engageResp.error.message.toLowerCase();
+      if (errMsg.includes("already in a battle") || errMsg.includes("already_in_battle")) {
+        ctx.log("combat", `Already in battle — proceeding to fight`);
+      } else {
+        ctx.log("error", `Failed to join unexpected battle: ${engageResp.error.message}`);
+        return;
+      }
+    }
+  } else {
+    // No sideId determined - but we have pirates, so pick any side with pirates
+    ctx.log("combat", `🚨 No side determined but pirates detected - picking side with pirates!`);
+    const sidesWithPirates = battleStatus.sides.filter(s => {
+      const sideParticipants = battleStatus.participants.filter(p => p.side_id === s.side_id);
+      return sideParticipants.some(p => p.username?.toLowerCase().includes("pirate") || p.username?.toLowerCase().includes("drifter"));
+    });
+    if (sidesWithPirates.length > 0) {
+      analysis.sideId = sidesWithPirates[0].side_id;
+      ctx.log("combat", `Joining side ${analysis.sideId} with pirates`);
+      await ctx.bot.exec("battle", { action: "engage", side_id: analysis.sideId.toString() });
+    }
+  }
+
+  // Pick a real target from battle participants so we get the full combat loop
+  const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
+  const fakeTarget = enemy
+    ? ({
+        id: enemy.player_id || enemy.username || "",
+        name: enemy.username || enemy.player_id || "enemy",
+        type: "pirate",
+        faction: "pirate",
+        isNPC: true,
+        isPirate: true,
+        tier: (enemy as any).tier as PirateTier,
+      } as NearbyEntity)
+    : null;
+  // shieldRechargePct is stored as percentage (80), convert to decimal for fightJoinedBattle
+  const shieldRechargePctDecimal = shieldRechargePct / 100;
+  await fightJoinedBattle(ctx, fakeTarget as any, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, shieldRechargePctDecimal);
 }
 
 // ── Safe-system docking (reused from hunter) ─────────────────
@@ -460,9 +588,16 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
   };
 
   await bot.refreshStatus();
+
+  if (bot.docked) {
+    await repairShip(ctx);
+    await tryRefuel(ctx);
+    await ensureHunterResupply(ctx);
+  }
+
   let totalKills = 0;
   let lastMinerSystemCheck = 0;
-  const MINER_CHECK_INTERVAL_MS = 10_000;
+  const MINER_CHECK_INTERVAL_MS = 2_000;
   let minerSystem: string | null = null;
   let consecutiveFailedChecks = 0;
   const MAX_FAILED_CHECKS = 5;
@@ -480,11 +615,26 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     const settings = getEscortSettings(bot.username);
+    const minerName = settings.minerName;
+
+    // Handle any battle that may have started before we began this cycle
+    if (battleRef.state.inBattle || bot.isInBattle()) {
+      const battleStatus = await getBattleStatus(ctx);
+      if (battleStatus) {
+        ctx.log("combat", `⚠ Currently in battle (ID: ${battleStatus.battle_id}) — handling before proceeding`);
+        await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName, 0, settings.shieldRechargePct);
+        // Skip the rest of this cycle after handling battle
+        await ctx.sleep(2000);
+        continue;
+      }
+    }
+
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
+      skipBlacklist: settings.ignoreBlacklist,
+      isCombatBot: true,
     };
-    const minerName = settings.minerName;
 
     if (!minerName) {
       ctx.log("error", "No minerName configured in escort settings — waiting 30s");
@@ -519,7 +669,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       } else if (escortSignal.systemId && (escortSignal.action === "jump" || escortSignal.action === "travel")) {
         minerSystem = escortSignal.systemId;
         setMinerLocation(minerName, escortSignal.systemId);
-        ctx.log("escort", `Miner signaled travel to ${escortSignal.systemId} — will follow after checks`);
+        ctx.log("escort", `Miner signaled travel to ${escortSignal.systemId} (target system) — will follow immediately`);
       }
     } else {
       ctx.log("escort", `⚠ No signals received from ${minerName}`);
@@ -556,6 +706,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
             const collectedFuelCells = await collectFuelCells(ctx);
             await tryRefuel(ctx); // Also refuel while we're here
             fueled = await ensureFueled(ctx, settings.refuelThreshold);
+            await ensureHunterResupply(ctx);
             if (collectedFuelCells) {
               ctx.log("escort", "Collected premium fuel cells and refueled at home system");
             } else {
@@ -631,6 +782,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         await collectFuelCells(ctx);
         await tryRefuel(ctx);
         fueled = await ensureFueled(ctx, settings.refuelThreshold);
+        await ensureHunterResupply(ctx);
 
         if (fueled) {
           ctx.log("escort", "Refueled and stocked up on premium fuel cells at home system");
@@ -663,6 +815,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         await tryRefuel(ctx);
         await ensureInsured(ctx);
         await bot.checkSkills();
+        await ensureHunterResupply(ctx);
         await ensureUndocked(ctx);
       }
       continue;
@@ -670,12 +823,34 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Follow miner immediately if signaled to a different system ──
     if (minerSystem && minerSystem !== bot.system) {
+      // Check if we're in battle before attempting to navigate
+      const battleStatus = await getBattleStatus(ctx);
+      if (battleStatus) {
+        ctx.log("combat", `⚠ Currently in battle (ID: ${battleStatus.battle_id}) — handling battle before navigation`);
+        await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName, 0, settings.shieldRechargePct);
+        // Re-check battle status after handling
+        const postBattle = await getBattleStatus(ctx);
+        if (postBattle) {
+          ctx.log("combat", "Still in battle — skipping navigation this cycle");
+          await ctx.sleep(2000);
+          continue;
+        }
+      }
+
       ctx.log("escort", `Following miner to ${minerSystem} as signaled...`);
       yield "follow_signal";
 
       const jumpSafetyOpts = {
         ...safetyOpts,
+        skipBlacklist: settings.ignoreBlacklist,
         onJump: async (jumpNumber: number) => {
+          // Check for battle interruption during jumps
+          const jumpBattleStatus = await getBattleStatus(ctx);
+          if (jumpBattleStatus) {
+            ctx.log("combat", `⚠ Battle started during jump ${jumpNumber} (ID: ${jumpBattleStatus.battle_id}) — aborting navigation`);
+            await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName, 0, settings.shieldRechargePct);
+            return false;
+          }
           // Check miner location after each jump
           if (ctx.getFleetStatus) {
             const fleetStatus = ctx.getFleetStatus();
@@ -684,7 +859,6 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
               ctx.log("escort", `⚠ Miner moved from ${minerSystem} to ${minerBot.system} during travel (after jump ${jumpNumber}) — recalculating route...`);
               minerSystem = minerBot.system;
               setMinerLocation(minerName, minerBot.system);
-              // Return false to abort current navigation and recalculate
               return false;
             }
             if (minerBot?.poi) {
@@ -701,8 +875,15 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         setMinerLocation(minerName, minerSystem);
         ctx.log("escort", `✓ Successfully joined miner in ${minerSystem}`);
       } else {
-        ctx.log("error", `Could not reach ${minerSystem} — will retry next cycle`);
-        consecutiveFailedChecks++;
+        ctx.log("error", `Could not reach ${minerSystem} — checking if battle interrupted...`);
+        // Check if battle started during navigation attempt
+        const navBattle = await getBattleStatus(ctx);
+        if (navBattle) {
+          ctx.log("combat", `⚠ Battle detected (ID: ${navBattle.battle_id}) — handling before retrying`);
+          await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName, 0, settings.shieldRechargePct);
+        } else {
+          consecutiveFailedChecks++;
+        }
       }
       continue;
     }
@@ -771,6 +952,23 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       if (minerSystem && minerSystem !== bot.system) {
+        // Check if too far behind
+        const jumpsAway = getJumpsToSystem(bot.system, minerSystem);
+        if (jumpsAway > 3) {
+          ctx.log("escort", `Miner is ${jumpsAway} jumps away — waiting to catch up rather than following immediately`);
+          minerSystem = null; // clear to avoid repeated attempts
+          await ctx.sleep(30000);
+          continue;
+        }
+
+        // Check for battle before navigating
+        const battleBeforeTravel = await getBattleStatus(ctx);
+        if (battleBeforeTravel) {
+          ctx.log("combat", `⚠ Currently in battle (ID: ${battleBeforeTravel.battle_id}) — handling battle before navigation`);
+          await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName, 0, settings.shieldRechargePct);
+          continue;
+        }
+
         // Pre-navigation verification: check if miner is actually where we think
         let currentMinerLocation = minerSystem;
         if (ctx.getFleetStatus) {
@@ -795,7 +993,15 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
         const jumpSafetyOpts = {
           ...safetyOpts,
+          skipBlacklist: settings.ignoreBlacklist,
           onJump: async (jumpNumber: number) => {
+            // Check for battle interruption during jumps
+            const jumpBattle = await getBattleStatus(ctx);
+            if (jumpBattle) {
+              ctx.log("combat", `⚠ Battle started during jump ${jumpNumber} (ID: ${jumpBattle.battle_id}) — aborting navigation`);
+              await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName, 0, settings.shieldRechargePct);
+              return false;
+            }
             // Check miner location after each jump
             if (ctx.getFleetStatus) {
               const fleetStatus = ctx.getFleetStatus();
@@ -805,7 +1011,6 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
                 currentMinerLocation = minerBot.system;
                 minerSystem = minerBot.system;
                 setMinerLocation(minerName, minerBot.system);
-                // Return false to abort current navigation and recalculate
                 return false;
               }
               if (minerBot?.poi) {
@@ -818,8 +1023,15 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
         const arrived = await navigateToSystem(ctx, currentMinerLocation, jumpSafetyOpts);
         if (!arrived) {
-          ctx.log("error", `Could not reach ${currentMinerLocation} — will retry next cycle`);
-          consecutiveFailedChecks++;
+          ctx.log("error", `Could not reach ${currentMinerLocation} — checking if battle interrupted...`);
+          // Check if battle started during navigation attempt
+          const navBattle = await getBattleStatus(ctx);
+          if (navBattle) {
+            ctx.log("combat", `⚠ Battle detected (ID: ${navBattle.battle_id}) — handling before retrying`);
+            await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName, 0, settings.shieldRechargePct);
+          } else {
+            consecutiveFailedChecks++;
+          }
           await ctx.sleep(15000);
           continue;
         }
@@ -841,6 +1053,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       if (docked) {
         await tryRefuel(ctx);
         await repairShip(ctx);
+        await ensureHunterResupply(ctx);
       }
       await ctx.sleep(15000);
       continue;
@@ -858,128 +1071,20 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "scan_system";
     await fetchSecurityLevel(ctx, bot.system);
 
-    // ── Check if we're already in battle (miner pulled us in) ──
-    const existingBattle = await getBattleStatus(ctx);
-    if (existingBattle && battleRef.state.inBattle) {
-      ctx.log("combat", `⚔️ Already in battle (${existingBattle.battle_id}) — running combat loop...`);
+    // Check if we got pulled into battle (e.g. miner started combat) — uses the same robust detection/init as hunter
+    await handleUnexpectedEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, minerName, 0, settings.shieldRechargePct);
 
-      const analysis = await analyzeEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, minerName);
-      if (analysis.shouldJoin && analysis.sideId !== undefined) {
-        ctx.log("combat", `✅ Escort joining side ${analysis.sideId}: ${analysis.reason}`);
-
-        const opposingPirates = existingBattle.participants.filter(p => {
-          const u = (p.username || "").toLowerCase();
-          return (u.includes("pirate") || u.includes("drifter") ||
-                  u.includes("executioner") || u.includes("sentinel") ||
-                  u.includes("prowler") || u.includes("apex") ||
-                  u.includes("razor") || u.includes("striker") ||
-                  u.includes("rampart") || u.includes("stalwart") ||
-                  u.includes("bastion") || u.includes("onslaught") ||
-                  u.includes("iron") || u.includes("strike")) &&
-                 p.side_id !== analysis.sideId;
-        });
-
-        if (opposingPirates.length > 0) {
-          const targetPirate = opposingPirates.reduce((a, b) => {
-            const aLevel = getTierLevel((a as any).tier as PirateTier);
-            const bLevel = getTierLevel((b as any).tier as PirateTier);
-            return aLevel >= bLevel ? a : b;
-          });
-
-          const targetEntity: NearbyEntity = {
-            id: targetPirate.player_id,
-            name: targetPirate.username || targetPirate.player_id,
-            type: "pirate",
-            faction: "pirate",
-            isNPC: true,
-            isPirate: true,
-            tier: (targetPirate as any).tier as PirateTier,
-          };
-
-          const won = await fightJoinedBattle(ctx, targetEntity, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier);
-          if (won) {
-            totalKills++;
-            ctx.log("combat", `Kill #${totalKills} — escort protected the miner!`);
-            yield "loot";
-            await scavengeWrecks(ctx);
-          } else {
-            ctx.log("combat", "Escort retreated from battle — docking to repair");
-          }
-        } else {
-          ctx.log("combat", "No opposing pirates found in battle — standing by");
-        }
-      } else {
-        ctx.log("combat", `Not joining battle: ${analysis.reason}`);
-      }
-
-      const postBattleCheck = await getBattleStatus(ctx);
-      if (!postBattleCheck) {
-        battleRef.state.inBattle = false;
-        battleRef.state.battleId = null;
-        battleRef.state.isFleeing = false;
-        ctx.log("combat", "Battle ended");
-      }
-    } else if (existingBattle && !battleRef.state.inBattle) {
-      ctx.log("combat", `⚔️ New battle detected (${existingBattle.battle_id}) — analyzing...`);
+    // Sync local battleRef after possible battle handling (so proactive scan knows if still fighting)
+    const postUnexpected = await getBattleStatus(ctx);
+    if (postUnexpected) {
       battleRef.state.inBattle = true;
-      battleRef.state.battleId = existingBattle.battle_id;
-
-      const analysis = await analyzeEscortBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, minerName);
-      if (analysis.shouldJoin && analysis.sideId !== undefined) {
-        ctx.log("combat", `✅ Escort joining side ${analysis.sideId}: ${analysis.reason}`);
-
-        const engageResp = await bot.exec("battle", { action: "engage", side_id: analysis.sideId.toString() });
-        if (engageResp.error) {
-          ctx.log("error", `Failed to join battle: ${engageResp.error.message}`);
-        } else {
-          const opposingPirates = existingBattle.participants.filter(p => {
-            const u = (p.username || "").toLowerCase();
-            return (u.includes("pirate") || u.includes("drifter") ||
-                    u.includes("executioner") || u.includes("sentinel") ||
-                    u.includes("prowler") || u.includes("apex") ||
-                    u.includes("razor") || u.includes("striker") ||
-                    u.includes("rampart") || u.includes("stalwart") ||
-                    u.includes("bastion") || u.includes("onslaught") ||
-                    u.includes("iron") || u.includes("strike")) &&
-                   p.side_id !== analysis.sideId;
-          });
-
-          if (opposingPirates.length > 0) {
-            const targetPirate = opposingPirates.reduce((a, b) => {
-              const aLevel = getTierLevel((a as any).tier as PirateTier);
-              const bLevel = getTierLevel((b as any).tier as PirateTier);
-              return aLevel >= bLevel ? a : b;
-            });
-
-            const targetEntity: NearbyEntity = {
-              id: targetPirate.player_id,
-              name: targetPirate.username || targetPirate.player_id,
-              type: "pirate",
-              faction: "pirate",
-              isNPC: true,
-              isPirate: true,
-              tier: (targetPirate as any).tier as PirateTier,
-            };
-
-            const joinedBattle = await getBattleStatus(ctx);
-            if (joinedBattle) {
-              const won = await fightJoinedBattle(ctx, targetEntity, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier);
-              if (won) {
-                totalKills++;
-                ctx.log("combat", `Kill #${totalKills} — escort protected the miner!`);
-                yield "loot";
-                await scavengeWrecks(ctx);
-              }
-            }
-          }
-        }
-
-        const postBattleCheck = await getBattleStatus(ctx);
-        if (!postBattleCheck) {
-          battleRef.state.inBattle = false;
-          battleRef.state.battleId = null;
-        }
-      }
+      battleRef.state.battleId = postUnexpected.battle_id;
+    } else {
+      battleRef.state.inBattle = false;
+      battleRef.state.battleId = null;
+      battleRef.state.isFleeing = false;
+      // Just finished a battle (possibly unexpected pull-in) — loot wrecks like hunter does after combat
+      await scavengeWrecks(ctx);
     }
 
     // ── Scan for nearby threats to engage proactively ──
@@ -1030,6 +1135,10 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
                 break;
               }
 
+              // In-combat repair/recharge
+              await topUpShields(ctx, settings.shieldRechargePct / 100);
+              await useRepairKits(ctx);
+
               await bot.refreshStatus();
               ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
             } else {
@@ -1042,6 +1151,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       } else {
         ctx.log("escort", `No threats in ${bot.system} — standing by`);
+        await scavengeWrecks(ctx);
       }
     } else if (nearbyResp.error) {
       ctx.log("warn", `get_nearby failed: ${nearbyResp.error.message}`);
@@ -1055,6 +1165,22 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         battleRef.state.battleId = null;
         battleRef.state.isFleeing = false;
         ctx.log("combat", "Battle state cleared — no longer in combat");
+
+        // Check if we need to return home to resupply after battle
+        await bot.refreshCargo();
+        if (isLowOnFieldConsumables(bot.inventory)) {
+          ctx.log("combat", "Low on repair kits or shield charges after battle — returning home to resupply");
+          const homeSystem = settings.homeSystem;
+          if (homeSystem && bot.system !== homeSystem) {
+            ctx.log("system", `Returning to home system ${homeSystem} to resupply...`);
+            const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+            if (arrived) {
+              await ensureHunterResupply(ctx);
+            }
+          } else if (homeSystem && bot.system === homeSystem) {
+            await ensureHunterResupply(ctx);
+          }
+        }
       }
     }
 
@@ -1095,6 +1221,15 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log("escort", `⚠ Miner ${minerName} has moved to ${minerBot.system} — following...`);
           minerSystem = minerBot.system;
           setMinerLocation(minerName, minerBot.system);
+
+          // Check if too far behind
+          const jumpsAway = getJumpsToSystem(bot.system, minerSystem);
+          if (jumpsAway > 3) {
+            ctx.log("escort", `Miner is ${jumpsAway} jumps away — waiting to catch up rather than following immediately`);
+            minerSystem = null; // clear to avoid repeated attempts
+            await ctx.sleep(30000);
+            continue;
+          }
         } else {
           ctx.log("escort", `✓ Miner ${minerName} still in ${bot.system}`);
         }
@@ -1112,11 +1247,21 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
 
         if (normalizeSystemName(minerBot.system) !== normalizeSystemName(bot.system)) {
-          ctx.log("escort", `⚠ Miner ${minerName} has moved to ${minerBot.system} — following...`);
           minerSystem = minerBot.system;
           setMinerLocation(minerName, minerBot.system);
 
-          const arrived = await navigateToSystem(ctx, minerSystem, safetyOpts);
+          // Check if too far behind
+          const jumpsAway = getJumpsToSystem(bot.system, minerSystem);
+          if (jumpsAway > 3) {
+            ctx.log("escort", `Miner is ${jumpsAway} jumps away — waiting to catch up rather than following immediately`);
+            minerSystem = null; // clear to avoid repeated attempts
+            await ctx.sleep(30000);
+            continue;
+          }
+
+          ctx.log("escort", `⚠ Miner ${minerName} has moved to ${minerBot.system} — following...`);
+
+          const arrived = await navigateToSystem(ctx, minerSystem, { ...safetyOpts, skipBlacklist: settings.ignoreBlacklist });
           if (arrived) {
             ctx.log("escort", `✓ Successfully followed miner to ${minerSystem}`);
             continue;
@@ -1174,6 +1319,8 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
       if (settings.homeSystem && bot.system === settings.homeSystem) {
         await collectFuelCells(ctx);
       }
+
+      await ensureHunterResupply(ctx);
 
       yield "repair";
       await repairShip(ctx);

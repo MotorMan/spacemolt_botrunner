@@ -10,6 +10,8 @@ import { playerNameStore } from "./playernamestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 import { getFactionStorageCache, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
+import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, type PathfinderTravelRecord } from "./pathfinder.js";
+import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -104,6 +106,8 @@ export class Bot {
   private pendingCommands = new Map<string, AbortController>();
   private lastSystem = "unknown";
   private lastPoi = "";
+  private _lastTimeoutLog = 0;
+  private _lastTimeoutCommand = "";
 
   // Cached game state from last get_status
   credits = 0;
@@ -135,6 +139,12 @@ export class Bot {
   /** Cached faction ID from last get_status (null if not in a faction). */
   faction: string | null = null;
 
+  /** Cached faction fuel reserve from last view_faction_storage. */
+  factionFuelReserve: number = 0;
+
+  /** Cached faction fuel capacity from last view_faction_storage. */
+  factionFuelCapacity: number = 0;
+
   /** Whether the bot's ship is currently cloaked. */
   isCloaked = false;
 
@@ -144,11 +154,13 @@ export class Bot {
   /** Whether the bot is currently towing a wreck. */
   towingWreck = false;
 
-  /** Cached ship speed from last get_status (1-6, where 1 is slowest, 6 is fastest). */
-  shipSpeed = 1;
+  /** The ID of the wreck being towed (if any). */
+  towingWreckId: string | null = null;
 
-  /** Cached installed mod IDs from last refreshShipMods(). */
+  shipSpeed = 1;
+  hasPathfinderDrive = false;
   installedMods: string[] = [];
+  lastKnownTick?: number;
 
   /** Accumulated stats for this bot. */
   stats: BotStats = { totalMined: 0, totalCrafted: 0, totalTrades: 0, totalProfit: 0, totalSystems: 0 };
@@ -185,8 +197,14 @@ export class Bot {
   private lastCustomsMessage: string = "";
   private lastCustomsMessageTime: number = 0;
 
+  /** Track last chat message content to prevent duplicate processing. */
+  private lastChatMessage: string = "";
+  private lastChatMessageTime: number = 0;
+  private lastChatSender: string = "";
+  private lastChatChannel: string = "";
+
   /** Cooldown after customs clears before new hold can start (prevents rapid re-triggering). */
-  private static readonly CUSTOMS_COOLDOWN_MS = 30000; // 30 seconds
+  private static readonly CUSTOMS_COOLDOWN_MS = 120000; // 2 minutes
 
   /** Optional callback for routing log output (e.g. to TUI). */
   onLog?: (username: string, category: string, message: string) => void;
@@ -288,12 +306,21 @@ export class Bot {
       return await Promise.race([apiPromise, timeoutPromise, abortPromise]) as ApiResponse;
     } catch (err) {
       if (err instanceof Error && (err.message === "TIMEOUT" || err.message === "ABORTED")) {
+        // Skip expensive position check on non-movement commands (get_cargo, get_status, etc.)
+        // to prevent timeout cascades during heavy combat
+        if (command !== "travel" && command !== "jump" && command !== "mine" && command !== "jettison") {
+          return {
+            error: { code: "timeout", message: `${command} timed out after ${timeoutMs / 1000}s` },
+            result: undefined,
+            notifications: [],
+          };
+        }
+
         this.log("warn", `${command} timed out after ${timeoutMs / 1000}s — checking position...`);
         // Refresh status to see where we actually are
         await this.refreshStatus();
 
-        // For jump: check if we're in the target system
-        if (command === "jump" && targetId) {
+        if (command === "jump" && targetId && !targetId.startsWith("bearing:")) {
           const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           if (normalizeSystemName(this.system) === normalizeSystemName(targetId)) {
             this.log("travel", `✓ Timeout check: confirmed at target ${targetId} — treating as success`);
@@ -343,7 +370,13 @@ export class Bot {
         }
 
         // Not at target — return timeout error so caller can retry
-        this.log("error", `${command} timed out — not at target ${targetId} (currently at ${this.system}/${this.poi})`);
+        // Debounce repeated identical timeout errors (common after battles)
+        const now = Date.now();
+        if (!this._lastTimeoutLog || now - this._lastTimeoutLog > 2000 || this._lastTimeoutCommand !== command) {
+          this.log("error", `${command} timed out — not at target ${targetId} (currently at ${this.system}/${this.poi})`);
+          this._lastTimeoutLog = now;
+          this._lastTimeoutCommand = command;
+        }
         return {
           error: { code: "timeout", message: `${command} timed out after ${timeoutMs / 1000}s` },
           result: undefined,
@@ -386,7 +419,10 @@ export class Bot {
     // Add buffer (1 game tick = 10s by default)
     const timeoutWithBuffer = baseTime + buffer;
 
-    return timeoutWithBuffer * 1000; // Convert to milliseconds
+    // Round up to next 10-second tick (game ticks every 10 seconds)
+    const roundedTimeout = Math.ceil(timeoutWithBuffer / 10) * 10;
+
+    return roundedTimeout * 1000; // Convert to milliseconds
   }
 
   /**
@@ -397,21 +433,21 @@ export class Bot {
    * Adds configurable buffer (default 5s) to the base travel time.
    */
   private calculateTravelTimeout(): number {
-    // Get travel times from settings or use defaults (shorter than jump times)
+    // Use same timeout as jumps to prevent station travel timeouts
     const settings = (this as any).settings || {};
     const generalSettings = settings.general || {};
 
-    const travelTimes: Record<number, number> = {
-      1: generalSettings.travelSpeed1 || 20,
-      2: generalSettings.travelSpeed2 || 18,
-      3: generalSettings.travelSpeed3 || 15,
-      4: generalSettings.travelSpeed4 || 12,
-      5: generalSettings.travelSpeed5 || 10,
-      6: generalSettings.travelSpeed6 || 8,
+    const jumpTimes: Record<number, number> = {
+      1: generalSettings.jumpSpeed1 || 80,
+      2: generalSettings.jumpSpeed2 || 70,
+      3: generalSettings.jumpSpeed3 || 60,
+      4: generalSettings.jumpSpeed4 || 50,
+      5: generalSettings.jumpSpeed5 || 40,
+      6: generalSettings.jumpSpeed6 || 30,
     };
 
-    const buffer = generalSettings.travelBuffer || 5;
-    let baseTime = travelTimes[this.shipSpeed] || 20;
+    const buffer = generalSettings.jumpBuffer || 10;
+    let baseTime = jumpTimes[this.shipSpeed] || 80;
 
     // Apply 50% speed penalty if towing a wreck
     if (this.towingWreck) {
@@ -421,7 +457,10 @@ export class Bot {
     // Add buffer
     const timeoutWithBuffer = baseTime + buffer;
 
-    return timeoutWithBuffer * 1000; // Convert to milliseconds
+    // Round up to next 10-second tick (game ticks every 10 seconds)
+    const roundedTimeout = Math.ceil(timeoutWithBuffer / 10) * 10;
+
+    return roundedTimeout * 1000; // Convert to milliseconds
   }
 
   log(category: string, message: string): void {
@@ -483,6 +522,19 @@ export class Bot {
       this.log("customs", `✅ Customs clearance received (outcome: ${outcome}), resuming ${command}`);
     }
 
+    if (command === "jump") {
+      const t = (payload as Record<string, unknown> | undefined)?.target_system;
+      if (typeof t === "number") {
+        if (!this.hasPathfinderDrive) {
+          await this.refreshShipMods();
+        }
+        if (!this.hasPathfinderDrive) {
+          this.log("error", "Pathfinder jump attempted without Pathfinder Drive module.");
+          return { error: { code: "no_pathfinder_drive", message: "Pathfinder jumps require the Pathfinder Drive utility module installed." }, result: undefined, notifications: [] };
+        }
+      }
+    }
+
      this._lastAction = command;
      debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
 
@@ -494,23 +546,29 @@ export class Bot {
        const key = command + (payload ? JSON.stringify(payload) : "");
        this.pendingCommands.set(key, controller);
 
-        let resp: ApiResponse;
-        try {
-          // Use timeout for all commands to prevent indefinite hangs
-          let timeoutMs = 60000; // default 60s
-          let targetId = "";
-          if (command === "jump") {
-            timeoutMs = this.calculateJumpTimeout();
-            targetId = (payload as Record<string, unknown>)?.target_system as string || "";
-            this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
-          } else if (command === "mine" || command === "jettison") {
-            timeoutMs = 15000; // 15s for mining/jettison
-          } else if (command === "travel") {
-            timeoutMs = this.calculateTravelTimeout();
-            targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
-            this.log("travel", `Travel timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
-          }
-          resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
+         let resp: ApiResponse;
+         try {
+           let timeoutMs = 60000;
+           let targetId = "";
+           if (command === "jump") {
+             const t = (payload as Record<string, unknown>)?.target_system;
+             if (typeof t === "number") {
+               timeoutMs = 5000;
+               targetId = `bearing:${t.toFixed(4)}`;
+               this.log("travel", `Pathfinder jump to bearing ${t.toFixed(4)}° (immediate return, poll get_location for progress)`);
+             } else {
+               timeoutMs = this.calculateJumpTimeout();
+               targetId = (typeof t === "string" ? t : "") || "";
+               this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+             }
+           } else if (command === "mine" || command === "jettison") {
+             timeoutMs = 15000;
+           } else if (command === "travel") {
+             timeoutMs = this.calculateTravelTimeout();
+             targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
+             this.log("travel", `Travel timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+           }
+           resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
 
         // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
         // This prevents 502 errors from breaking routines mid-operation
@@ -837,6 +895,7 @@ export class Bot {
         } else if (ship.ammo != null) {
           this.ammo = ship.ammo as number;
         }
+        this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
       }
 
       // Cloak detection
@@ -856,7 +915,7 @@ export class Bot {
       }
 
       // Add this bot to the player tracking so it appears in the web UI players tab
-      playerNameStore.add(this.username, this.faction || "", this.shipClass, this.system, this.poi);
+      playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
 
       // Debug: log tow-related fields from status
       if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
@@ -950,6 +1009,39 @@ export class Bot {
   }
 
   /**
+   * Fetch tax estimate and save to data/taxes.json if changed.
+   * Only updates when tax values actually change to preserve history.
+   */
+  async updateTaxEstimate(): Promise<TaxEstimate | null> {
+    const resp = await this.exec("get_tax_estimate");
+    if (resp.error || !resp.result) {
+      this.log("warn", `get_tax_estimate failed: ${resp.error?.message}`);
+      return null;
+    }
+
+    const result = resp.result as Record<string, unknown>;
+    const estimate: TaxEstimate = {
+      botUsername: this.username,
+      timestamp: Date.now(),
+      taxable_income_to_date: (result.taxable_income_to_date as number) || 0,
+      income_tax_total: (result.income_tax_total as number) || 0,
+      property_tax_total: (result.property_tax_total as number) || 0,
+      assessed_property_value: (result.assessed_property_value as number) || 0,
+      last_assessed_at: (result.last_assessed_at as number) || 0,
+      data: result,
+    };
+
+    if (hasTaxEstimateChanged(this.username, estimate)) {
+      saveTaxEstimate(this.username, estimate);
+      this.log("system", `Tax estimate updated: income=${estimate.taxable_income_to_date}, income_tax=${estimate.income_tax_total}, property_tax=${estimate.property_tax_total}`);
+    } else {
+      this.log("system", "Tax estimate unchanged, skipping save");
+    }
+
+    return estimate;
+  }
+
+  /**
    * Call view_storage and return the full response (including hint field).
    * Pass station_id to query a specific station remotely.
    */
@@ -979,9 +1071,11 @@ export class Bot {
         const cacheFile = join(process.cwd(), "data", "factionStorage.json");
         if (existsSync(cacheFile)) {
           const content = readFileSync(cacheFile, "utf-8");
-          const cached = JSON.parse(content) as { factionName: string; entries: any[] };
+          const cached = JSON.parse(content) as { factionName: string; entries: any[]; factionFuelReserve?: number; factionFuelCapacity?: number };
           this.faction = cached.factionName;
           this.factionStorage = cached.entries;
+          this.factionFuelReserve = cached.factionFuelReserve || 0;
+          this.factionFuelCapacity = cached.factionFuelCapacity || 0;
           this.log("info", `Loaded faction storage from cache: ${cached.factionName} (${cached.entries.length} items)`);
           return;
         }
@@ -999,12 +1093,15 @@ export class Bot {
       // Don't reset factionStorage to empty on error - keep cached data
       return;
     }
-    const entries = this.parseItemList(resp.result);
+    const result = resp.result as Record<string, unknown>;
+    const entries = this.parseItemList(result);
     if (entries.length === 0) {
       this.log("warn", "Faction storage refresh returned 0 items");
     }
     this.factionStorage = entries;
-    updateFactionStorageCache(factionName, entries);
+    this.factionFuelReserve = (result.faction_fuel_reserve as number) || 0;
+    this.factionFuelCapacity = (result.faction_fuel_capacity as number) || 0;
+    updateFactionStorageCache(factionName, entries, this.factionFuelReserve, this.factionFuelCapacity);
   }
 
   /** Start running a routine. */
@@ -1129,8 +1226,39 @@ export class Bot {
         if (typeof m === "string") return m;
         return (m.mod_id as string) || (m.id as string) || (m.name as string) || "";
       }).filter(Boolean);
+      this.hasPathfinderDrive = this.hasPathfinderModule(modules);
     }
     return this.installedMods;
+  }
+
+  private hasPathfinderModule(modules: Array<Record<string, unknown> | string>): boolean {
+    for (const m of modules) {
+      if (typeof m === "string") continue;
+      const mod = m as Record<string, unknown>;
+      const stats = mod.stats as Record<string, unknown> | undefined;
+      if (stats && stats.special === "pathfinder_drive") return true;
+      if (mod.type_id === "pathfinder_drive" || mod.module_id === "pathfinder_drive") return true;
+      const n = mod.name;
+      if (typeof n === "string" && n.toLowerCase().includes("pathfinder")) return true;
+      if (mod.special === "pathfinder_drive") return true;
+    }
+    return false;
+  }
+
+  async pollCurrentTick(): Promise<number | null> {
+    const resp = await this.exec("get_notifications");
+    if (resp.error || !resp.result) return null;
+    const r = resp.result as Record<string, unknown>;
+    let tick = r.current_tick as number | undefined;
+    if (typeof tick !== "number") {
+      const sc = r.structuredContent as Record<string, unknown> | undefined;
+      tick = sc?.current_tick as number | undefined;
+    }
+    if (typeof tick === "number") {
+      this.lastKnownTick = tick;
+      return tick;
+    }
+    return null;
   }
 
   /** Get the current cached level for a skill. Returns 0 if unknown. Call checkSkills() first to populate. */
@@ -1333,7 +1461,7 @@ export class Bot {
     this.customsHold.active = false;
     this.customsHold.aiResponseSent = false; // Reset for next customs stop
     this.customsClearedAt = Date.now(); // Set cooldown timestamp
-    this.log("customs", `✅ CUSTOMS CLEARED: ${outcome} (30s cooldown)`);
+    this.log("customs", `✅ CUSTOMS CLEARED: ${outcome} (2m cooldown)`);
   }
 
   /**
@@ -1342,10 +1470,10 @@ export class Bot {
   isCustomsHold(): boolean {
     if (!this.customsHold.active) return false;
 
-    // Auto-timeout after 30 seconds (customs ship should have arrived by then)
+    // Auto-timeout after 2 minutes (customs ship should have arrived by then)
     const elapsed = Date.now() - this.customsHold.since;
-    if (elapsed > 30000) {
-      this.log("customs", "⏰ CUSTOMS TIMEOUT: Proceeding after 30s wait");
+    if (elapsed > 120000) {
+      this.log("customs", "⏰ CUSTOMS TIMEOUT: Proceeding after 2m wait");
       this.customsHold.active = false;
       this.customsHold.outcome = "cleared";
       return false;
@@ -1378,7 +1506,7 @@ export class Bot {
   /**
    * Wait for customs hold to clear (blocks until cleared or timeout).
    */
-  async waitForCustomsClear(maxWaitMs: number = 30000): Promise<"cleared" | "contraband" | "evasion" | "timeout"> {
+  async waitForCustomsClear(maxWaitMs: number = 120000): Promise<"cleared" | "contraband" | "evasion" | "timeout"> {
     const startTime = Date.now();
     
     while (this.customsHold.active && Date.now() - startTime < maxWaitMs) {
@@ -1395,7 +1523,7 @@ export class Bot {
     if (this.customsHold.active) {
       this.customsHold.active = false;
       this.customsHold.outcome = "cleared";
-      this.log("customs", "⏰ Customs scan timeout - proceeding");
+      this.log("customs", "⏰ Customs scan timeout - proceeding after 2m");
       return "timeout";
     }
 
@@ -1430,12 +1558,23 @@ export class Bot {
           const sender = (data.sender as string) || "Unknown";
           const content = (data.content as string) || "";
 
-          // Skip messages from self (prevent processing our own AI responses)
-          if (sender === this.username) {
-            continue;
-          }
+           // Skip messages from self (prevent processing our own AI responses)
+           if (sender === this.username) {
+             continue;
+           }
 
-          this.log("chat", `Received [${channel}] ${sender}: ${content}`);
+           // Deduplicate chat messages: ignore if same sender, channel, content within 10 seconds
+           const now = Date.now();
+           if (sender === this.lastChatSender && channel === this.lastChatChannel && content === this.lastChatMessage && now - this.lastChatMessageTime < 10000) {
+             this.log("chat_debug", "Skipping duplicate chat message");
+             continue;
+           }
+           this.lastChatSender = sender;
+           this.lastChatChannel = channel;
+           this.lastChatMessage = content;
+           this.lastChatMessageTime = now;
+
+           this.log("chat", `Received [${channel}] ${sender}: ${content}`);
 
           // Track player name from chat (but NOT from MAYDAY messages - those can be fake/pirate names)
           // Also skip empire NPCs like customs agents and police
@@ -1459,7 +1598,7 @@ export class Bot {
               senderLower.includes("rim ranger");
             
             if (!contentLower.includes("mayday") && !isEmpireNpc) {
-              playerNameStore.add(sender, "", "", this.system, this.poi);
+              playerNameStore.add(sender, "", "", "", this.system, this.poi);
             } else if (isEmpireNpc) {
               debugLogForBot(this.username, "playernames:skip", `${this.username}`, `Ignored empire NPC sender: "${sender}"`);
             } else {
@@ -1590,8 +1729,8 @@ export class Bot {
             // End of isFromCustoms block - non-customs messages fall through
           }
 
-          // Route NON-customs messages to AI chat handler
-          if (aiChatService && typeof aiChatService.addChatMessage === "function") {
+           // Route NON-customs messages to AI chat handler
+           if (aiChatService && typeof aiChatService.addChatMessage === "function") {
             aiChatService.addChatMessage({
               sender,
               channel: channel as "local" | "faction" | "system" | "private",
@@ -1654,15 +1793,15 @@ export class Bot {
 
          debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
 
-         // Check if we should send a battle response to AI chat
-         const now = Date.now();
-         if (now - this.lastBattleResponseMs > Bot.BATTLE_RESPONSE_COOLDOWN_MS) {
-           // Only respond if we're taking damage or just entered battle
-           if (totalDamage > 0 || !this.currentBattle.inBattle) {
-             this.lastBattleResponseMs = now;
-             await this.sendBattleResponseToAI(attackerName, totalDamage);
-           }
-         }
+          // Check if we should send a battle response to AI chat
+          const now = Date.now();
+          if (now - this.lastBattleResponseMs > Bot.BATTLE_RESPONSE_COOLDOWN_MS) {
+            // Only respond if we're taking damage (target is us) or just entered battle
+            if ((totalDamage > 0 && targetName === this.username) || !this.currentBattle.inBattle) {
+              this.lastBattleResponseMs = now;
+              await this.sendBattleResponseToAI(attackerName, totalDamage);
+            }
+          }
        } else if (msgType === "battle_update" && data && typeof data === "object") {
          const battleId = (data.battle_id as string) || "";
          const tick = (data.tick as number) || 0;
@@ -1742,7 +1881,7 @@ export class Bot {
 
           // Track pirate name
           if (pirateName && pirateName !== "Unknown") {
-            playerNameStore.add(pirateName, pirateT, "", this.system, this.poi);
+            playerNameStore.add(pirateName, pirateT, "", "", this.system, this.poi);
           }
 
           // Combat chat alerts disabled — was spamming faction chat
@@ -2120,8 +2259,7 @@ export class Bot {
         // Try various field names for player/ship names
         const name = (entity.username as string) ||
                      (entity.name as string) ||
-                     (entity.player_name as string) ||
-                     (entity.ship_name as string);
+                     (entity.player_name as string);
 
         if (name && name.trim()) {
           const trimmedName = name.trim();
@@ -2138,7 +2276,7 @@ export class Bot {
           } else if (typeof entity.faction_id === "string" && entity.faction_id) {
             faction = entity.faction_id;
           }
-          // Extract ship info - try ship_class (from nearby array), then ship/ship_type/ship_name
+          // Extract ship info - try ship_class first (ship type), then ship/ship_type/ship_name
           let ship = "";
           if (typeof entity.ship_class === "string" && entity.ship_class) {
             ship = entity.ship_class;
@@ -2146,15 +2284,16 @@ export class Bot {
             ship = entity.ship;
           } else if (typeof entity.ship_type === "string" && entity.ship_type) {
             ship = entity.ship_type;
-          } else if (typeof entity.ship_name === "string" && entity.ship_name) {
-            ship = entity.ship_name;
           }
+          // Extract ship_name separately (personalized ship name)
+          const shipName = (entity.ship_name as string) || "";
           // Log status message if available
           if (typeof entity.status_message === "string" && entity.status_message) {
             debugLogForBot(this.username, "playernames:status", `${this.username}`, 
               `Player ${trimmedName}: ${entity.status_message}`);
           }
-          if (playerNameStore.add(trimmedName, faction, ship, this.system, this.poi)) {
+          const playerId = (entity.player_id as string) || "";
+          if (playerNameStore.add(trimmedName, faction, ship, shipName, this.system, this.poi, playerId)) {
             playerCount++;
           }
         }
@@ -2168,8 +2307,10 @@ export class Bot {
       const name = pirate.name as string;
       if (name && name.trim()) {
         const faction = (pirate.faction as string) || "";
-        const ship = (pirate.ship_type as string) || (pirate.ship as string) || "";
-        if (playerNameStore.addPirate(name, faction, ship, this.system, this.poi)) {
+        const ship = (pirate.ship_class as string) || (pirate.ship_type as string) || (pirate.ship as string) || "";
+        const shipName = (pirate.ship_name as string) || "";
+        const pirateId = (pirate.pirate_id as string) || (pirate.id as string) || "";
+        if (playerNameStore.addPirate(name, faction, ship, shipName, this.system, this.poi, pirateId)) {
           pirateCount++;
         }
       }
@@ -2181,8 +2322,10 @@ export class Bot {
       const name = npc.name as string;
       if (name && name.trim()) {
         const faction = (npc.faction as string) || "";
-        const ship = (npc.ship_type as string) || (npc.ship as string) || "";
-        if (playerNameStore.addEmpireNpc(name, faction, ship, this.system, this.poi)) {
+        const ship = (npc.ship_class as string) || (npc.ship_type as string) || (npc.ship as string) || "";
+        const shipName = (npc.ship_name as string) || "";
+        const npcId = (npc.npc_id as string) || "";
+        if (playerNameStore.addEmpireNpc(name, faction, ship, shipName, this.system, this.poi, npcId)) {
           empireNpcCount++;
         }
       }
@@ -2227,7 +2370,7 @@ export class Bot {
         // Ship class is directly available
         const ship = (agent.ship_class as string) || "";
         // System-wide, no specific POI
-        if (playerNameStore.add(trimmedName, faction, ship, this.system, "")) {
+        if (playerNameStore.add(trimmedName, faction, ship, "", this.system, "")) {
           agentCount++;
         }
       }
@@ -2250,7 +2393,7 @@ export class Bot {
     for (const member of members as Array<Record<string, unknown>>) {
       const name = (member.username as string) || (member.player_name as string) || (member.name as string);
       if (name && name.trim()) {
-        if (playerNameStore.add(name, '', '', this.system, this.poi)) {
+        if (playerNameStore.add(name, '', '', '', this.system, this.poi)) {
           count++;
         }
       }
@@ -2296,7 +2439,7 @@ export class Bot {
             nameLower.startsWith("[customs]") ||
             nameLower.startsWith("[police]");
           
-          if (!isEmpireNpc && playerNameStore.add(trimmedName, '', '', this.system, this.poi)) {
+          if (!isEmpireNpc && playerNameStore.add(trimmedName, '', '', '', this.system, this.poi)) {
             count++;
           }
         }

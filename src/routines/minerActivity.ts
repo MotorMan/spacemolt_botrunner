@@ -70,7 +70,6 @@ export function loadMinerActivity(): MinerActivityData {
         cachedData = null;
         return {};
       }
-      console.log("Loaded miner activity from", ACTIVITY_FILE);
       // Populate cache on load
       cachedData = JSON.stringify(parsed, null, 2) + "\n";
       return parsed;

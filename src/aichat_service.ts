@@ -54,6 +54,19 @@ interface BotLockInfo {
 
 const PERSONALITIES_DIR = join(process.cwd(), "data", "personalities");
 const MAP_FILE = join(process.cwd(), "data", "map.json");
+const IMPORTANT_MESSAGES_FILE = join(process.cwd(), "data", "IMPORTANTMESSAGES.json");
+
+const BLOCKED_EMPIRE_NPCS = [ //that is blocked from replying too, even though they don't have actual private message return functionality
+  "Chancellor Yusuf Delacroix",
+  "The Pathfinder, Siv Larkin",
+  "High Warlord Petra Kast", //needs verification
+  "Director-General Darya Lim", //needs verification
+  "The Convergence", //needs verification
+  "Solarian Confederacy", //gives message about rep increase. bot responded to it under "solarian"
+  "Vex Nebulon", //Player that wanted to join guild, but i declined so i gave them ships! don't want AI responding to them. must do that in human mode.
+];
+
+const EMPIRE_OFFICIAL_TAG = "[empire_official]";
 
 /**
  * Load and summarize map data for LLM context.
@@ -334,6 +347,49 @@ function escapeRegex(str: string): string {
   return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+interface ImportantMessage {
+  timestamp: string;
+  sender: string;
+  channel: string;
+  content: string;
+  botReceived: string;
+}
+
+function logImportantMessage(msg: ChatMessage): void {
+  try {
+    const dir = join(process.cwd(), "data");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+
+    let messages: ImportantMessage[] = [];
+    if (existsSync(IMPORTANT_MESSAGES_FILE)) {
+      const content = readFileSync(IMPORTANT_MESSAGES_FILE, "utf-8");
+      messages = JSON.parse(content);
+    }
+
+    messages.push({
+      timestamp: new Date().toISOString(),
+      sender: msg.sender,
+      channel: msg.channel,
+      content: msg.content,
+      botReceived: msg.botUsername || "unknown",
+    });
+
+    writeFileSync(IMPORTANT_MESSAGES_FILE, JSON.stringify(messages, null, 2) + "\n", "utf-8");
+  } catch (err) {
+    console.error("Error logging important message:", err);
+  }
+}
+
+function isEmpireOfficialMessage(msg: ChatMessage): boolean {
+  if (msg.content.includes(EMPIRE_OFFICIAL_TAG)) {
+    return true;
+  }
+  if (BLOCKED_EMPIRE_NPCS.includes(msg.sender)) {
+    return true;
+  }
+  return false;
+}
+
 /**
  * Check if a message is a general question.
  */
@@ -394,11 +450,16 @@ async function callLlm(
   
   // For thinking-enabled models: prefer actual content over reasoning
   // The model returns reasoning in reasoning_content field, but the final response is in content
-  const responseContent = msg.content || "";
-  if (!responseContent && msg.reasoning_content) {
-    // If only reasoning content exists (model was cut off), use it as fallback
-    console.warn("LLM warning: Only reasoning_content available, model may have been interrupted");
-    return msg.reasoning_content;
+  let responseContent = msg.content || "";
+  
+  // Strip any <THINK>...</THINK> tags that might be embedded in the content
+  responseContent = responseContent.replace(/<THINK>[\s\S]*?<\/THINK>/gi, "").trim();
+  
+  // If content is empty or only had thinking tags, don't fall back to reasoning_content
+  // (that would send the thinking process as the message)
+  if (!responseContent) {
+    console.warn("LLM warning: No content available from model response");
+    return "";
   }
   
   return responseContent;
@@ -411,6 +472,7 @@ export class AiChatService {
   private globalChatLock: BotLockInfo | null = null;
   private running = false;
   private logFn: (category: string, message: string) => void;
+  private empireAlertFn: ((sender: string, content: string, botUsername: string) => void) | null = null;
   
   // Duplicate detection: track message hashes seen in last 10 minutes
   private seenMessages = new Map<string, number>();
@@ -448,6 +510,10 @@ export class AiChatService {
     if (!existsSync(dataDir)) {
       mkdirSync(dataDir, { recursive: true });
     }
+  }
+
+  setEmpireAlertCallback(fn: (sender: string, content: string, botUsername: string) => void): void {
+    this.empireAlertFn = fn;
   }
 
   /**
@@ -629,6 +695,17 @@ export class AiChatService {
     // but we double-check here to prevent self-talk loops
     if (msg.sender === msg.botUsername) {
       this.logFn("ai_chat", `🚫 SELF-MESSAGE BLOCKED: ${msg.sender} === ${msg.botUsername} [${msg.channel}] "${msg.content.slice(0, 50)}"`);
+      return;
+    }
+
+    // CRITICAL: Block messages from Empire officials - these need human review
+    if (isEmpireOfficialMessage(msg)) {
+      this.logFn("ai_chat", `🚫 EMPIRE OFFICIAL BLOCKED: ${msg.sender} [${msg.channel}] "${msg.content.slice(0, 50)}"`);
+      logImportantMessage(msg);
+      // Trigger empire alert callback for web UI
+      if (this.empireAlertFn) {
+        this.empireAlertFn(msg.sender, msg.content, msg.botUsername || "unknown");
+      }
       return;
     }
 
@@ -1563,6 +1640,12 @@ ${botContext}
     try {
       const response = await callLlm(llmMessages, settings);
       const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+      
+      // Don't send empty responses
+      if (!cleanResponse) {
+        this.logFn("ai_chat_debug", `Empty response from LLM, skipping message to ${msg.sender}`);
+        return "error";
+      }
 
       // Build chat command parameters
       const chatParams: Record<string, string> = {
@@ -1711,6 +1794,12 @@ Message:`;
     try {
       const response = await callLlm(llmMessages, settings);
       const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+      
+      // Don't send empty responses
+      if (!cleanResponse) {
+        this.logFn("ai_chat_debug", `Empty response from LLM, skipping private message to ${targetPlayer}`);
+        return { ok: false, error: "Empty response from AI" };
+      }
 
       // Send private message using: chat channel=private target_id="PlayerName" content="message"
       const chatResp = await bot.exec("chat", {
@@ -1844,6 +1933,12 @@ Message:`;
     try {
       const response = await callLlm(llmMessages, settings);
       const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+      
+      // Don't send empty responses
+      if (!cleanResponse) {
+        this.logFn("ai_chat_debug", `Empty response from LLM, skipping faction message`);
+        return { ok: false, error: "Empty response from AI" };
+      }
 
       // Send faction chat message
       const chatResp = await bot.exec("chat", {
@@ -2005,6 +2100,12 @@ They're warning you for not staying still. Respond defensively or apologetically
     try {
       const response = await callLlm(llmMessages, settings);
       const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+      
+      // Don't send empty responses
+      if (!cleanResponse) {
+        this.logFn("ai_chat_debug", `Empty response from LLM, skipping customs response`);
+        return;
+      }
 
       // Send chat message to system channel
       const chatResp = await bot.exec("chat", {

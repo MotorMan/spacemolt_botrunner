@@ -2,7 +2,7 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, writeF
 import { join } from "path";
 import os from "os";
 import type { BotStatus } from "../bot.js";
-import { getBot } from "../botmanager.js";
+import { getBot, getTotalBandwidth } from "../botmanager.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
@@ -25,7 +25,7 @@ function getLocalIp(): string | null {
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request";
+  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc";
   bot?: string;
   routine?: string;
   username?: string;
@@ -231,6 +231,9 @@ export class WebServer {
   // Shutdown callback — set by botmanager
   onShutdown: (() => Promise<void>) | null = null;
 
+  // Empire official alert callback — set by botmanager
+  onEmpireAlert: ((sender: string, content: string) => void) | null = null;
+
   // Available routines — set by botmanager
   routines: string[] = [];
 
@@ -354,6 +357,10 @@ export class WebServer {
           const { getDiscoveredBots } = await import("../botmanager.js");
           const discovered = getDiscoveredBots();
           return Response.json({ usernames: discovered });
+        }
+        if (url.pathname === "/api/bandwidth") {
+          const bandwidth = getTotalBandwidth();
+          return Response.json(bandwidth);
         }
         if (url.pathname === "/api/map") {
           return Response.json({ systems: mapStore.getAllSystems() });
@@ -493,7 +500,11 @@ export class WebServer {
             const data = JSON.parse(raw);
             // Normalize: entries may be under "entries" or "items"
             const items = data.entries || data.items || [];
-            return Response.json({ items });
+            return Response.json({
+              items,
+              factionFuelReserve: data.factionFuelReserve || 0,
+              factionFuelCapacity: data.factionFuelCapacity || 0,
+            });
           } catch {
             return Response.json({ items: [] });
           }
@@ -719,10 +730,17 @@ export class WebServer {
 
         // Crafting Loadouts endpoints
         const LOADOUTS_FILE = join(DATA_DIR, "craftingLoadouts.json");
+        const MODULE_LOADOUTS_FILE = join(DATA_DIR, "moduleLoadouts.json");
 
         interface CraftingLoadoutFile {
           crafting?: Record<string, Record<string, number>>;
           ship?: Record<string, ShipLoadout>;
+        }
+
+        interface ModuleLoadout {
+          modules: { weapons: string[]; defense: string[]; utility: string[] };
+          shipId?: string;
+          savedAt?: string;
         }
 
         interface ShipLoadout {
@@ -785,6 +803,45 @@ export class WebServer {
           }
           fileData.ship = loadouts;
           writeFileSync(LOADOUTS_FILE, JSON.stringify(fileData, null, 2) + "\n", "utf-8");
+        }
+
+        function loadModuleLoadouts(): Record<string, ModuleLoadout> {
+          // Dedicated file (preferred)
+          if (existsSync(MODULE_LOADOUTS_FILE)) {
+            try {
+              const data = JSON.parse(readFileSync(MODULE_LOADOUTS_FILE, "utf-8"));
+              return data || {};
+            } catch (err) {
+              console.warn(`Warning: corrupt moduleLoadouts.json —`, err);
+              return {};
+            }
+          }
+
+          // One-time migration from old craftingLoadouts.json
+          if (existsSync(LOADOUTS_FILE)) {
+            try {
+              const old: any = JSON.parse(readFileSync(LOADOUTS_FILE, "utf-8"));
+              const migrated = old.moduleLoadouts || {};
+              if (Object.keys(migrated).length > 0) {
+                if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+                writeFileSync(MODULE_LOADOUTS_FILE, JSON.stringify(migrated, null, 2) + "\n", "utf-8");
+                console.log(`Migrated ${Object.keys(migrated).length} module presets to data/moduleLoadouts.json`);
+
+                // Strip from old file to prevent future mix-ups
+                delete old.moduleLoadouts;
+                writeFileSync(LOADOUTS_FILE, JSON.stringify(old, null, 2) + "\n", "utf-8");
+              }
+              return migrated;
+            } catch (err) {
+              console.warn(`Warning during module loadouts migration —`, err);
+            }
+          }
+          return {};
+        }
+
+        function saveModuleLoadouts(loadouts: Record<string, ModuleLoadout>): void {
+          if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+          writeFileSync(MODULE_LOADOUTS_FILE, JSON.stringify(loadouts, null, 2) + "\n", "utf-8");
         }
 
         // GET /api/facilities - Get cached facility types
@@ -873,12 +930,47 @@ export class WebServer {
            if (!(name in loadouts)) {
              return Response.json({ error: "Loadout not found" }, { status: 404 });
            }
-           delete loadouts[name];
-           saveShipLoadouts(loadouts);
-           return Response.json({ ok: true, name });
-         }
+            delete loadouts[name];
+            saveShipLoadouts(loadouts);
+            return Response.json({ ok: true, name });
+          }
 
-         // Serve index.css
+          // GET /api/module-loadouts - Load all module loadouts for simulator
+          if (url.pathname === "/api/module-loadouts" && req.method === "GET") {
+            const loadouts = loadModuleLoadouts();
+            return Response.json({ loadouts });
+          }
+
+          // POST /api/module-loadouts - Save a module loadout preset
+          if (url.pathname === "/api/module-loadouts" && req.method === "POST") {
+            const body = await req.json() as { name: string; modules: { weapons: string[]; defense: string[]; utility: string[] }; shipId?: string };
+            if (!body?.name || !body?.modules) {
+              return Response.json({ error: "Missing name or modules" }, { status: 400 });
+            }
+            const loadouts = loadModuleLoadouts();
+            loadouts[body.name] = {
+              modules: body.modules,
+              shipId: body.shipId,
+              savedAt: new Date().toISOString()
+            };
+            saveModuleLoadouts(loadouts);
+            return Response.json({ ok: true, name: body.name });
+          }
+
+          // DELETE /api/module-loadouts/:name - Delete a module loadout
+          if (url.pathname.startsWith("/api/module-loadouts/") && req.method === "DELETE") {
+            const name = decodeURIComponent(url.pathname.slice("/api/module-loadouts/".length));
+            const loadouts = loadModuleLoadouts();
+            if (!(name in loadouts)) {
+              return Response.json({ error: "Loadout not found" }, { status: 404 });
+            }
+            delete loadouts[name];
+            saveModuleLoadouts(loadouts);
+            return Response.json({ ok: true, name });
+          }
+
+          // Serve index.css
+
         if (url.pathname === "/index.css") {
           const cssPath = join(import.meta.dir, "index.css");
           return new Response(readFileSync(cssPath, "utf-8"), {
@@ -964,6 +1056,83 @@ export class WebServer {
         if (url.pathname === "/engineeringCalc.html") {
           const engineeringCalcPath = join(import.meta.dir, "engineeringCalc.html");
           return new Response(readFileSync(engineeringCalcPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve commandall.html for command all route
+        if (url.pathname === "/commandall.html") {
+          const commandallPath = join(import.meta.dir, "commandall.html");
+          return new Response(readFileSync(commandallPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve map.html for map route
+        if (url.pathname === "/map.html") {
+          const mapPath = join(import.meta.dir, "map.html");
+          return new Response(readFileSync(mapPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve market.html for market route
+        if (url.pathname === "/market.html") {
+          const marketPath = join(import.meta.dir, "market.html");
+          return new Response(readFileSync(marketPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve missions.html for missions route
+        if (url.pathname === "/missions.html") {
+          const missionsPath = join(import.meta.dir, "missions.html");
+          return new Response(readFileSync(missionsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve shipyard.html for shipyard route
+        if (url.pathname === "/shipyard.html") {
+          const shipyardPath = join(import.meta.dir, "shipyard.html");
+          return new Response(readFileSync(shipyardPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve stats.html for stats route
+        if (url.pathname === "/stats.html") {
+          const statsPath = join(import.meta.dir, "stats.html");
+          return new Response(readFileSync(statsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve settings.html for settings route
+        if (url.pathname === "/settings.html") {
+          const settingsPath = join(import.meta.dir, "settings.html");
+          return new Response(readFileSync(settingsPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",
@@ -1233,5 +1402,9 @@ export class WebServer {
         this.clients.delete(ws);
       }
     }
+  }
+
+  sendEmpireAlert(sender: string, content: string, botUsername: string): void {
+    this.broadcast({ type: "empireAlert", sender, content, botUsername });
   }
 }

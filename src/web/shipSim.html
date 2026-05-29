@@ -75,6 +75,14 @@
             <!-- Options populated by JavaScript -->
           </select>
         </div>
+        <div class="shipsim-skill-select">
+          <label>Module Preset:</label>
+          <select id="modulePresetSelect" style="flex:1; max-width: 300px;">
+            <option value="">-- Select preset --</option>
+          </select>
+          <button onclick="loadModulePreset()" style="padding:4px 10px;">Load</button>
+          <button onclick="saveCurrentAsModulePreset()" style="padding:4px 10px; margin-left:4px;">Save Current</button>
+        </div>
         <div class="shipsim-resource-budget" id="resourceBudget" style="display:none;">
           <!-- Resource budget with bars like regular shipyard -->
         </div>
@@ -104,6 +112,7 @@
     let selectedShip = null;
     let currentLoadout = { weapons: [], defense: [], utility: [] };
     let engineeringSkillLevel = 0;
+    let moduleSortMode = { weapons: 'none', defense: 'none', utility: 'none' };
 
     // ── Load Data ──────────────────────────────────────────
     async function loadData() {
@@ -212,8 +221,8 @@ function selectShip() {
       budget.innerHTML = `
         <div class="shipsim-resource-title">Resource Budget</div>
         <div class="shipsim-stat-grid">
-          <span class="shipsim-stat-label">CPU</span><span class="shipsim-stat-value">${cpuUsed}${engineeringSkillLevel > 0 ? ` (was ${baseCpuUsed})` : ''} / ${maxCpu}${cpuBonus > 0 ? ` (+${cpuBonus})` : ''}<div class="shipsim-bar"><div class="shipsim-bar-fill" style="width:${cpuPct}%;background:var(--magenta)"></div></div></span>
-          <span class="shipsim-stat-label">Power</span><span class="shipsim-stat-value">${powerUsed}${engineeringSkillLevel > 0 ? ` (was ${basePowerUsed})` : ''} / ${baseMaxPower}<div class="shipsim-bar"><div class="shipsim-bar-fill" style="width:${powerPct}%;background:var(--accent)"></div></div></span>
+          <span class="shipsim-stat-label">CPU</span><span class="shipsim-stat-value">${cpuUsed}${engineeringSkillLevel > 0 ? ` (was ${baseCpuUsed})` : ''} / ${maxCpu}${cpuBonus > 0 ? ` (+${cpuBonus})` : ''} (${cpuPct}% base)<div class="shipsim-bar"><div class="shipsim-bar-fill" style="width:${cpuPct}%;background:var(--magenta)"></div></div></span>
+          <span class="shipsim-stat-label">Power</span><span class="shipsim-stat-value">${powerUsed}${engineeringSkillLevel > 0 ? ` (was ${basePowerUsed})` : ''} / ${baseMaxPower} (${powerPct}% base)<div class="shipsim-bar"><div class="shipsim-bar-fill" style="width:${powerPct}%;background:var(--accent)"></div></div></span>
           <span class="shipsim-stat-label">Slots</span><span class="shipsim-stat-value">${slotsUsed} / ${totalSlots} used${weaponSlots ? ` (W:${currentLoadout.weapons.length}/${weaponSlots}` : ''}${defenseSlots ? ` D:${currentLoadout.defense.length}/${defenseSlots}` : ''}${utilitySlots ? ` U:${currentLoadout.utility.length}/${utilitySlots}` : ''}${totalSlots > 0 ? ')' : ''}</span>
         </div>
       `;
@@ -245,7 +254,10 @@ function selectShip() {
         return category.toLowerCase().includes('weapon') ||
                category.toLowerCase().includes('defense') ||
                category.toLowerCase().includes('utility') ||
-               category.toLowerCase().includes('module');
+               category.toLowerCase().includes('module') ||
+               category.toLowerCase().includes('mining') ||
+               category.toLowerCase().includes('cargo') ||
+               category.toLowerCase().includes('scanner');
       });
 
       // Group modules by category
@@ -254,26 +266,6 @@ function selectShip() {
         defense: modules.filter(m => (m.category || m.type || '').toLowerCase().includes('defense') || (m.category || m.type || '').toLowerCase().includes('shield') || (m.category || m.type || '').toLowerCase().includes('armor')),
         utility: modules.filter(m => (m.category || m.type || '').toLowerCase().includes('utility') || (m.category || m.type || '').toLowerCase().includes('mining') || (m.category || m.type || '').toLowerCase().includes('cargo'))
       };
-
-      // Add special modules not in catalog
-      categories.utility.push({
-        id: 'fuel_optimizer',
-        name: 'Fuel Optimizer',
-        category: 'utility',
-        cpu_usage: 3,
-        power_usage: 2,
-        wear: 0,
-        fuel_efficiency: 15
-      });
-      categories.utility.push({
-        id: 'cpu_co_processor',
-        name: 'CPU Co-Processor',
-        category: 'utility',
-        cpu_usage: 0,
-        power_usage: 3,
-        wear: 0,
-        cpu_bonus: 5
-      });
 
       container.innerHTML = '';
 
@@ -302,7 +294,31 @@ function selectShip() {
       titleDiv.innerHTML = `<span>${title}</span><span class="shipsim-module-slots">${currentLoadout[category].length}/${maxSlots} slots</span>`;
       div.appendChild(titleDiv);
 
-      // Create dropdown for module selection
+      const sortDiv = document.createElement('div');
+      sortDiv.style.marginBottom = '8px';
+      sortDiv.style.display = 'flex';
+      sortDiv.style.alignItems = 'center';
+      sortDiv.style.gap = '8px';
+      sortDiv.innerHTML = '<label style="font-size:11px;color:var(--text-dim);">Sort:</label>';
+
+      const sortSelect = document.createElement('select');
+      sortSelect.className = 'shipsim-sort-select';
+      sortSelect.style.padding = '4px 8px';
+      sortSelect.style.fontSize = '11px';
+      sortSelect.innerHTML = `
+        <option value="none">Default</option>
+        <option value="cpu">Sort by CPU (high to low)</option>
+        <option value="power">Sort by PWR (high to low)</option>
+        <option value="cpu_power">Lowest CPU, Highest PWR</option>
+      `;
+      sortSelect.value = moduleSortMode[category] || 'none';
+      sortSelect.onchange = () => {
+        moduleSortMode[category] = sortSelect.value;
+        renderModules();
+      };
+      sortDiv.appendChild(sortSelect);
+      div.appendChild(sortDiv);
+
       const selectDiv = document.createElement('div');
       selectDiv.className = 'shipsim-module-select';
 
@@ -310,7 +326,32 @@ function selectShip() {
       select.id = `moduleSelect_${category}`;
       select.innerHTML = '<option value="">Select a module to add...</option>';
 
-      modules.forEach(module => {
+      let sortedModules = [...modules];
+      const sortValue = moduleSortMode[category] || 'none';
+      if (sortValue === 'cpu') {
+        sortedModules.sort((a, b) => {
+          const aCpu = a.cpu_usage || a.cpu_cost || a.cpu || 0;
+          const bCpu = b.cpu_usage || b.cpu_cost || b.cpu || 0;
+          return bCpu - aCpu;
+        });
+      } else if (sortValue === 'power') {
+        sortedModules.sort((a, b) => {
+          const aPwr = a.power_usage || a.power_cost || a.power || 0;
+          const bPwr = b.power_usage || b.power_cost || b.power || 0;
+          return bPwr - aPwr;
+        });
+      } else if (sortValue === 'cpu_power') {
+        sortedModules.sort((a, b) => {
+          const aCpu = a.cpu_usage || a.cpu_cost || a.cpu || 0;
+          const bCpu = b.cpu_usage || b.cpu_cost || b.cpu || 0;
+          if (aCpu !== bCpu) return aCpu - bCpu;
+          const aPwr = a.power_usage || a.power_cost || a.power || 0;
+          const bPwr = b.power_usage || b.power_cost || b.power || 0;
+          return bPwr - aPwr;
+        });
+      }
+
+      sortedModules.forEach(module => {
         const option = document.createElement('option');
         option.value = module.id;
         const details = [];
@@ -352,35 +393,19 @@ function selectShip() {
       const moduleId = select.value;
       if (!moduleId) return;
 
-      // Find the module
-      const modules = Object.values(catalog.items || {}).filter(item => {
-        const categoryMatch = (item.category || item.type || '').toLowerCase().includes(category.slice(0, -1)); // Remove 's' from category
-        return categoryMatch;
-      });
+      // Find the module by ID (works for any category, including mining lasers, strip miners, etc.)
+      const allItems = Object.values(catalog.items || {});
+      let module = allItems.find(m => m.id === moduleId);
 
-      // Add special modules
-      if (category === 'utility') {
-        modules.push({
-          id: 'fuel_optimizer',
-          name: 'Fuel Optimizer',
-          category: 'utility',
-          cpu_usage: 3,
-          power_usage: 2,
-          wear: 0,
-          fuel_efficiency: 15
-        });
-        modules.push({
-          id: 'cpu_co_processor',
-          name: 'CPU Co-Processor',
-          category: 'utility',
-          cpu_usage: 0,
-          power_usage: 3,
-          wear: 0,
-          cpu_bonus: 5
-        });
+      // Fallback for any legacy hardcoded specials that might still be referenced
+      if (!module && category === 'utility') {
+        if (moduleId === 'fuel_optimizer') {
+          module = { id: 'fuel_optimizer', name: 'Fuel Optimizer', category: 'utility', cpu_usage: 3, power_usage: 2, wear: 0, fuel_efficiency: 15 };
+        } else if (moduleId === 'cpu_co_processor') {
+          module = { id: 'cpu_co_processor', name: 'CPU Co-Processor', category: 'utility', cpu_usage: 0, power_usage: 3, wear: 0, cpu_bonus: 5 };
+        }
       }
 
-      const module = modules.find(m => m.id === moduleId);
       if (!module) return;
 
       // Check slot limits
@@ -539,8 +564,92 @@ function selectShip() {
       return d.innerHTML;
     }
 
+    // ── Module Preset Loadouts ───────────────────────────
+    let modulePresets = {};
+
+    async function loadModulePresets() {
+      try {
+        const res = await fetch('/api/module-loadouts');
+        const data = await res.json();
+        modulePresets = data.loadouts || {};
+        const sel = document.getElementById('modulePresetSelect');
+        if (sel) {
+          sel.innerHTML = '<option value="">-- Select preset --</option>';
+          Object.keys(modulePresets).sort().forEach(name => {
+            const opt = document.createElement('option');
+            opt.value = name;
+            opt.textContent = name;
+            sel.appendChild(opt);
+          });
+        }
+      } catch (e) {
+        console.warn('Failed to load module presets', e);
+      }
+    }
+
+    function loadModulePreset() {
+      const sel = document.getElementById('modulePresetSelect');
+      if (!sel || !sel.value) return;
+      const preset = modulePresets[sel.value];
+      if (!preset || !preset.modules) return;
+
+      // Clear and apply
+      currentLoadout = { weapons: [], defense: [], utility: [] };
+      const allModules = Object.values(catalog.items || {});
+
+      ['weapons', 'defense', 'utility'].forEach(cat => {
+        (preset.modules[cat] || []).forEach(modId => {
+          const mod = allModules.find(m => m.id === modId);
+          if (mod) {
+            currentLoadout[cat].push(mod);
+          }
+        });
+      });
+
+      updateLoadout();
+      renderModules();
+      if (selectedShip) renderShipStats();
+    }
+
+    async function saveCurrentAsModulePreset() {
+      const name = prompt('Enter a name for this module preset:');
+      if (!name) return;
+
+      const payload = {
+        name,
+        shipId: selectedShip ? (selectedShip.id || selectedShip.name) : undefined,
+        modules: {
+          weapons: currentLoadout.weapons.map(m => m.id),
+          defense: currentLoadout.defense.map(m => m.id),
+          utility: currentLoadout.utility.map(m => m.id)
+        }
+      };
+
+      try {
+        const res = await fetch('/api/module-loadouts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        const data = await res.json();
+        if (data.ok) {
+          alert(`Saved preset "${name}"`);
+          await loadModulePresets(); // refresh dropdown
+          // auto-select the new one
+          const sel = document.getElementById('modulePresetSelect');
+          if (sel) sel.value = name;
+        } else {
+          alert('Save failed: ' + (data.error || 'Unknown error'));
+        }
+      } catch (e) {
+        alert('Save error: ' + e.message);
+      }
+    }
+
     // ── Initialize ─────────────────────────────────────────
     loadData();
+    // Load presets after initial data (in case catalog is ready)
+    setTimeout(loadModulePresets, 300);
   </script>
 </body>
 </html>

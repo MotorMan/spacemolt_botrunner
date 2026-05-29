@@ -73,15 +73,15 @@ export function loadTraderActivity(): TraderActivityData {
           console.warn(`Invalid trader activity data structure from ${file}`);
           continue;
         }
-        console.log(`Loaded trader activity from ${file}`);
-        return parsed;
+        //console.log(`Loaded trader activity from ${file}`);
+        //return parsed;
       }
     } catch (err) {
       console.warn(`Could not load ${file}:`, err);
     }
   }
   
-  console.warn("No valid trader activity file found. Starting with empty data.");
+  //console.warn("No valid trader activity file found. Starting with empty data.");
   return {};
 }
 

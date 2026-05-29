@@ -18,6 +18,7 @@ import {
   ensureFueled,
   navigateToSystem,
   recordMarketData,
+  sanitizeCredits,
   factionDonateProfit,
   logFactionActivity,
   detectAndRecoverFromDeath,
@@ -682,6 +683,20 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     let route: FactionSellRoute | null = null;
     let withdrawQty = 0;
 
+    // ── Always prioritize pending cargo or active session on restart ──
+    // This prevents using stale cached storage data when we're not at home.
+    await bot.refreshCargo();
+    const pendingCargo = bot.inventory.filter(i => {
+      const lower = i.itemId.toLowerCase();
+      return !lower.includes("fuel") && !lower.includes("energy_cell") && i.quantity > 0;
+    });
+    if (pendingCargo.length > 0 && !recoveredSession) {
+      ctx.log("trade", `Found ${pendingCargo.length} trade item(s) in cargo on startup — treating as recovery`);
+      clearFactionStorageCache();
+      bot.factionStorage = [];
+      recoveredSessionHandled = false;
+    }
+
     // ── Handle recovered session ──
     // If we have a recovered session that's in transit, at destination, selling, OR in buying state with cargo already loaded
     if (recoveredSession && (recoveredSession.state === "in_transit" || recoveredSession.state === "at_destination" || recoveredSession.state === "selling")) {
@@ -950,7 +965,34 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
       await bot.refreshFactionStorage();
       // Show helpful message if faction storage is empty at this station
       if (factionError && (factionError.includes("no_faction_storage") || factionError.includes("no storage"))) {
-        ctx.log("trade", `FACTION MODE: Bot is in a faction, but no faction storage at this station — travel to home station`);
+        ctx.log("trade", `FACTION MODE: Bot is in a faction, but no faction storage at this station — returning home`);
+        clearFactionStorageCache();
+        bot.factionStorage = [];
+        const homeSystem = settings.homeSystem || startSystem;
+        const homeStationPoi = settings.homeStation || null;
+        if (homeSystem && (bot.system !== homeSystem || (homeStationPoi && bot.poi !== homeStationPoi))) {
+          ctx.log("travel", `Heading home to access faction storage...`);
+          yield "return_home";
+          if (bot.system !== homeSystem) {
+            await ensureUndocked(ctx);
+            const homeFueled = await ensureFueled(ctx, settings.refuelThreshold);
+            if (homeFueled) {
+              await navigateToSystem(ctx, homeSystem, {
+                fuelThresholdPct: settings.refuelThreshold,
+                hullThresholdPct: settings.repairThreshold,
+              });
+            }
+          }
+          if (homeStationPoi && bot.poi !== homeStationPoi) {
+            await ensureUndocked(ctx);
+            const tResp = await bot.exec("travel", { target_poi: homeStationPoi });
+            if (!tResp.error || tResp.error.message.includes("already")) {
+              bot.poi = homeStationPoi;
+            }
+          }
+          await ctx.sleep(5000);
+          continue;
+        }
       } else {
         ctx.log("trade", `FACTION MODE: Bot is in a faction, using faction storage`);
       }
@@ -1185,9 +1227,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             ctx.log("error", `Cargo recovery sell failed: ${sResp.error.message}`);
             break;
           }
-          // Get actual revenue from sell result
+          // Get actual revenue from sell result (sanitize to int — API can return floats like 123.0000000002)
           const sr = sResp.result as Record<string, unknown> | undefined;
-          const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+          const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
 
           // Wait for cargo update after sell
           await ctx.sleep(12000);
@@ -1248,9 +1290,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               // Wait for cargo update after sell
               await ctx.sleep(12000);
 
-              // Get actual revenue from sell result
+              // Get actual revenue from sell result (sanitize to int)
               const sr = sResp.result as Record<string, unknown> | undefined;
-              const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+              const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
 
               // Verify sale
               await bot.refreshCargo();
@@ -1258,7 +1300,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
                 const actuallySold = marketCheck.sellQty - afterSell;
                 if (actuallySold > 0) {
                   totalSold += actuallySold;
-                  const revenue = actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice;
+                  const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice);
                   ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} from full cargo — ${revenue}cr revenue (actual)`);
                 } else if (actualRevenue > 0) {
                   // Sale succeeded but cargo not updated - manually update and count as sold
@@ -1343,23 +1385,22 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             //wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: wQty });
             wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: route!.itemId, quantity: wQty }); //fixed by human! withdraw from faction to cargo.
           }
-          // Handle no_faction_storage error — return home and retry
-          if (wResp.error && wResp.error.message.includes("no_faction_storage")) {
-            ctx.log("error", `No faction storage at current station — returning to home station`);
-            // Clear faction storage cache to prevent stale data
-            clearFactionStorageCache();
-            bot.factionStorage = [];
-            // Skip to return home
-            await ctx.sleep(30000);
-            break;
-          }
-        }
-
-        if (wResp.error) {
-          if (totalSold > 0) break;
-          ctx.log("error", `Withdraw failed: ${wResp.error.message}`);
-          break;
-        }
+          // Handle no_faction_storage error — abort current route and return home
+           if (wResp.error && wResp.error.message.includes("no_faction_storage")) {
+             ctx.log("error", `No faction storage here — aborting route and returning home`);
+             clearFactionStorageCache();
+             bot.factionStorage = [];
+             await ctx.sleep(10000);
+             // break out of in-station loop so we hit the final return-home block
+             break;
+           }
+         }
+ 
+         if (wResp.error) {
+           if (totalSold > 0) break;
+           ctx.log("error", `Withdraw failed: ${wResp.error.message}`);
+           break;
+         }
 
         // Verify item was actually withdrawn to cargo
         await bot.refreshCargo();
@@ -1386,7 +1427,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           } else {
             ctx.log("trade", `No viable buy orders for ${route!.itemName} — skipping`);
           }
-          continue;
+          break;
         }
 
         ctx.log("trade", `Processing ${initialMarketCheck.buyOrders.length} buy orders for ${route!.itemName} (min price: ${itemMinSellPrice}cr)`);
@@ -1469,9 +1510,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               continue;
             }
 
-            // Get actual revenue from sell result
+            // Get actual revenue from sell result (sanitize to int)
             const sr = sResp.result as Record<string, unknown> | undefined;
-            const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+            const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
 
             // Wait for cargo update after successful sell
             await ctx.sleep(12000);
@@ -1502,7 +1543,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             } else {
               // Success
               orderTotalSold += soldThisAttempt;
-              const revenue = actualRevenue > 0 ? actualRevenue : soldThisAttempt * currentPrice;
+              const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : soldThisAttempt * currentPrice);
               totalSold += soldThisAttempt;
               totalRevenue += revenue;
               ctx.log("trade", `Sold ${soldThisAttempt}x ${route!.itemName} at ${currentPrice}cr — ${revenue}cr (order total: ${orderTotalSold}/${targetQty}, overall total: ${totalSold})`);
@@ -1560,7 +1601,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         await bot.refreshStatus();
         await recordMarketData(ctx);
         bot.stats.totalTrades++;
-        bot.stats.totalProfit += totalRevenue;
+        bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + totalRevenue);
         ctx.log("trade", `Faction sale complete: ${totalSold}x ${route!.itemName} — ${totalRevenue}cr revenue (actual)`);
         await factionDonateProfit(ctx, totalRevenue);
         // Complete trade session for in-station sale
@@ -1688,23 +1729,22 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             //wResp = await bot.exec("faction_withdraw_items", { item_id: route!.itemId, quantity: qty });
             wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: route!.itemId, quantity: qty }); //fixed by human! should withdraw from faction to storage.
           }
-          // Handle no_faction_storage error — return home and retry
-          if (wResp.error && wResp.error.message.includes("no_faction_storage")) {
-            ctx.log("error", `No faction storage at current station — returning to home station`);
-            // Clear faction storage cache to prevent stale data
-            clearFactionStorageCache();
-            bot.factionStorage = [];
-            // Skip to return home
-            await ctx.sleep(30000);
-            break;
-          }
-        }
-
-        if (wResp.error) {
-          ctx.log("error", `Withdraw failed: ${wResp.error.message}`);
-          await ctx.sleep(30000);
-          continue;
-        }
+          // Handle no_faction_storage error — abort current route and return home
+           if (wResp.error && wResp.error.message.includes("no_faction_storage")) {
+             ctx.log("error", `No faction storage here — aborting route and returning home`);
+             clearFactionStorageCache();
+             bot.factionStorage = [];
+             await ctx.sleep(10000);
+             // continue will let us hit the final return-home block
+             continue;
+           }
+         }
+ 
+         if (wResp.error) {
+           ctx.log("error", `Withdraw failed: ${wResp.error.message}`);
+           await ctx.sleep(30000);
+           continue;
+         }
 
         const storageType = personalMode ? "personal storage" : "faction storage";
         ctx.log("trade", `Withdrew ${qty}x ${route!.itemName} from ${storageType}`);
@@ -1903,9 +1943,9 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             // Wait for cargo update after sell
             await ctx.sleep(12000);
 
-            // Get actual revenue from sell result
+            // Get actual revenue from sell result (sanitize to int — prevents 123.0000000002 from API)
             const sr = sResp.result as Record<string, unknown> | undefined;
-            const actualRevenue = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+            const actualRevenue = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
 
             // Verify sale by checking cargo after sell
             await bot.refreshCargo();
@@ -1927,16 +1967,16 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               }
               const revenue = actualRevenue;
               bot.stats.totalTrades++;
-              bot.stats.totalProfit += revenue;
+              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + revenue);
               ctx.log("trade", `Sold ${marketCheck.sellQty}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue (actual)`);
               await factionDonateProfit(ctx, revenue);
               // Complete trade session
               const actualProfit = revenue; // No acquisition cost for faction items
               await completeTradeSession(bot.username, revenue, actualProfit);
             } else {
-              const revenue = actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice;
+              const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice);
               bot.stats.totalTrades++;
-              bot.stats.totalProfit += revenue;
+              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + revenue);
               ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue (actual)`);
               await factionDonateProfit(ctx, revenue);
               // Complete trade session

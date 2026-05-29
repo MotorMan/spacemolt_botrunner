@@ -30,6 +30,7 @@ import {
   checkBattleAfterCommand,
   getBattleStatus,
   type BattleState,
+  getItemSize,
 } from "./common.js";
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
@@ -778,7 +779,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           const wormholeDestinationId = surveyResult.wormhole_destination_id as string | undefined;
           const wormholeExpiresIn = surveyResult.wormhole_expires_in as string | undefined;
 
-          if (wormholeExit && wormholeExit.type === "wormhole_exit" && wormholeDestinationId) {
+          if (wormholeExit && (wormholeExit.type === "wormhole_exit" || wormholeExit.type === "wormhole_entrance") && wormholeDestinationId) {
             ctx.log("info", `🌌 Wormhole detected: ${wormholeExit.name} -> ${wormholeDestination}`);
             
             // Register wormhole in mapStore
@@ -935,6 +936,40 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
       bot.poi = poi.id;
 
+      // ── Wormhole test: travel to wh POI then jump with same POI id ──
+      const isWormholePoi = poi.id.startsWith("wh_") || poi.type?.includes("wormhole");
+      if (isWormholePoi) {
+        ctx.log("info", `🌌 Testing wormhole ${poi.id}...`);
+        yield `test_wormhole_${poi.id}`;
+        const jumpResp = await bot.exec("jump", { target_poi: poi.id });
+        if (!jumpResp.error) {
+          const r = jumpResp.result as Record<string, unknown> | undefined;
+          if (r && r.action === "jumped") {
+            const fromSystem = (r.from_system as string) || systemId;
+            const exitPoi = (r.poi as string) || "";
+            const destSystem = (r.system as string) || "";
+            const destSystemId = (r.system_id as string) || "";
+            ctx.log("info", `🌌 Wormhole jumped: ${fromSystem} -> ${destSystem} (${exitPoi})`);
+            mapStore.registerWormhole(destSystemId || fromSystem, {
+              id: exitPoi || poi.id,
+              name: exitPoi || poi.name,
+              exit_system_id: destSystemId || fromSystem,
+              exit_system_name: destSystem || destSystemId,
+              exit_poi_id: exitPoi || poi.id,
+              exit_poi_name: exitPoi || poi.name,
+              destination_system_id: fromSystem,
+              destination_system_name: bot.system || fromSystem,
+            });
+            // Mark both entrance and exit POIs explored
+            mapStore.markExplored(systemId, poi.id);
+            if (destSystemId) mapStore.markExplored(destSystemId, exitPoi);
+          }
+        }
+        // Refresh status after wormhole jump
+        await bot.refreshStatus();
+        continue; // Skip normal POI visit, restart loop in new system
+      }
+
       // Scavenge wrecks/containers at each POI (only if enabled — unsafe near pirates)
       if (explorerSettings.scavengeEnabled) {
         yield "scavenge";
@@ -1010,12 +1045,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       const fuelCellCheck = await checkFuelCellInventory(ctx);
       // Only return if we previously had fuel cells (cargo was full with them) but now they're gone
       // This prevents unnecessary trips when we never loaded fuel cells in the first place
-      if (fuelCellCheck.totalFuelCells === 0) {
-        ctx.log("system", `Fuel cells depleted (0 remaining) — returning to home base to reload`);
+      if (fuelCellCheck.totalFuelCells < 3) {
+        ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock military fuel cells`);
         yield "return_to_home_fuel_cells";
         const returned = await returnToHomeBaseForFuelCells(ctx);
         if (returned) {
-          // After returning, restart the loop to continue exploration
           await bot.refreshStatus();
           ctx.log("info", `Returned to home base — continuing exploration`);
           continue;
@@ -1131,7 +1165,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("warning", `Found ${blacklistedInConnections.length} blacklisted systems in current connections: ${blacklistedInConnections.map(c => c.id).join(', ')}`);
     }
 
-    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems);
+    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems, path);
     if (!nextSystem) {
       ctx.log("info", "All connected systems explored! Picking a random connection...");
       if (validConns.length > 0) {
@@ -1143,11 +1177,31 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
         // Smart selection: avoid dead-ends and pirate systems
-        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems);
+        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems, path);
         if (!random) {
-          ctx.log("error", "No valid non-blacklisted connections available! Explorer is trapped. Waiting before retry...");
-          await ctx.sleep(60000); // Wait 1 minute before retry
-          continue;
+          ctx.log("error", "No valid non-blacklisted connections available! Explorer is trapped. Attempting to backtrack...");
+          if (path.length >= 2) {
+            const backtrackTarget = path[path.length - 2];
+            const currentSystem = path[path.length - 1];
+            ctx.log("system", `Backtracking from ${currentSystem} to ${backtrackTarget}...`);
+            path.pop();
+            await ensureUndocked(ctx);
+            const backtrackResp = await bot.exec("jump", { target_system: backtrackTarget });
+            if (backtrackResp.error) {
+              ctx.log("error", `Backtrack failed: ${backtrackResp.error.message}`);
+              await ctx.sleep(60000);
+            } else {
+              ctx.log("travel", `Backtracked to ${backtrackTarget}`);
+              bot.stats.totalSystems++;
+              lastSystem = currentSystem;
+              await ctx.sleep(5000);
+            }
+            continue;
+          } else {
+            ctx.log("error", "No path to backtrack - explorer is completely trapped. Waiting before retry...");
+            await ctx.sleep(60000);
+            continue;
+          }
         }
         await ensureUndocked(ctx);
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
@@ -1193,8 +1247,28 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         lastSystem = systemId;
         continue;
       } else {
-        ctx.log("error", "No connections from this system — stuck! Waiting 60s...");
-        await ctx.sleep(60000);
+        ctx.log("error", "No connections from this system — attempting to backtrack...");
+        if (path.length >= 2) {
+          const backtrackTarget = path[path.length - 2];
+          const currentSystem = path[path.length - 1];
+          ctx.log("system", `Backtracking from ${currentSystem} to ${backtrackTarget}...`);
+          path.pop();
+          await ensureUndocked(ctx);
+          const backtrackResp = await bot.exec("jump", { target_system: backtrackTarget });
+          if (backtrackResp.error) {
+            ctx.log("error", `Backtrack failed: ${backtrackResp.error.message}`);
+            await ctx.sleep(60000);
+          } else {
+            ctx.log("travel", `Backtracked to ${backtrackTarget}`);
+            bot.stats.totalSystems++;
+            lastSystem = currentSystem;
+            await ctx.sleep(5000);
+          }
+          continue;
+        } else {
+          ctx.log("error", "No connections and no path to backtrack - explorer is completely trapped. Waiting 60s...");
+          await ctx.sleep(60000);
+        }
       }
       continue;
     }
@@ -2536,16 +2610,17 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const tradeFuelSettings = getExplorerSettings(bot.username);
       if (tradeFuelSettings.returnToHomeOnFuelCellDepletion) {
         const fuelCellCheck = await checkFuelCellInventory(ctx);
-        if (fuelCellCheck.totalFuelCells === 0) {
-          ctx.log("system", `Fuel cells depleted (0 remaining) — returning to home base to reload`);
+        if (fuelCellCheck.totalFuelCells < 3) {
+          ctx.log("system", `Fuel cells almost depleted (${fuelCellCheck.totalFuelCells} remaining) — returning to home base to restock military fuel cells`);
           yield "return_to_home_fuel_cells";
           const returned = await returnToHomeBaseForFuelCells(ctx);
           if (returned) {
             await bot.refreshStatus();
-            ctx.log("info", `Returned to home base — continuing trade update`);
-            break; // Break to restart the while loop
+            ctx.log("info", `Returned to home base — continuing exploration`);
+            continue;
           }
         }
+        
       }
 
       // ── Check skills ──
@@ -2752,9 +2827,10 @@ function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps:
 }
 
 /**
- * Load fuel cells to max cargo capacity at faction home (Sol Central).
- * Uses storage to withdraw credits if needed, prioritizes home base where fuel cells are cheap and abundant.
- */
+  * Load fuel cells to max cargo capacity at faction home (Sol Central).
+  * Uses storage withdraw, prioritizes military_fuel_cell then premium then regular.
+  * Falls back to buying if faction withdraw fails.
+  */
 async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
 
@@ -2782,14 +2858,17 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   ) as Array<Record<string, unknown>>;
 
   let currentCargo = 0;
+  let militaryFuelCells = 0;
   let premiumFuelCells = 0;
   let regularFuelCells = 0;
   for (const item of cargoItems) {
     const itemId = (item.item_id as string) || "";
     const quantity = (item.quantity as number) || 0;
-    const spacePerItem = itemId === "premium_fuel_cell" ? 2 : 1;
+    const spacePerItem = getItemSize(itemId);
     currentCargo += quantity * spacePerItem;
-    if (itemId === "premium_fuel_cell") {
+    if (itemId === "military_fuel_cell") {
+      militaryFuelCells = quantity;
+    } else if (itemId === "premium_fuel_cell") {
       premiumFuelCells = quantity;
     } else if (itemId === "fuel_cell") {
       regularFuelCells = quantity;
@@ -2798,21 +2877,23 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
   const availableSpace = bot.cargoMax - currentCargo;
   if (availableSpace <= 0) {
-    ctx.log("info", `Cargo hold full — already loaded with ${premiumFuelCells} premium + ${regularFuelCells} regular fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
+    ctx.log("info", `Cargo hold full — already loaded with ${militaryFuelCells} military + ${premiumFuelCells} premium + ${regularFuelCells} regular fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // Premium fuel cells take 2 cargo space each, regular take 1
-  // Calculate max we can withdraw: premium uses 2 space, so use floor division
-  const maxPremiumWithdraw = Math.floor(availableSpace / 2);
-  // For regular, we can use all available space since they take 1 each
-  const maxRegularWithdraw = availableSpace;
+  const milSize = getItemSize("military_fuel_cell");
+  const premSize = getItemSize("premium_fuel_cell");
+  const regSize = getItemSize("fuel_cell");
 
-  // Try to withdraw premium_fuel_cell first (higher priority, takes 2 space each)
-  const premiumToWithdraw = Math.min(maxPremiumWithdraw, 402); // Cap at reasonable amount
-  ctx.log("trade", `Loading ${premiumToWithdraw} premium fuel cells from faction storage for long-range exploration...`);
-  //let withdrawResp = await bot.exec("withdraw_items", { item_id: "premium_fuel_cell", quantity: premiumToWithdraw, source: "faction", target: "cargo" });
-  let withdrawResp = await bot.exec("storage", { action: 'withdraw', item_id: "premium_fuel_cell", quantity: premiumToWithdraw, target: "faction"}); //fixed by human! this should be working!
+  // Calculate max we can withdraw: use floor division per size (military=3, premium=2, regular=1)
+  const maxMilWithdraw = Math.floor(availableSpace / milSize);
+  const maxPremWithdraw = Math.floor(availableSpace / premSize);
+  const maxRegWithdraw = availableSpace;
+
+  // Try to withdraw military_fuel_cell first (highest priority / density, 3 space each)
+  const milToWithdraw = Math.min(maxMilWithdraw, 300); // Cap at reasonable amount
+  ctx.log("trade", `Loading ${milToWithdraw} military fuel cells from faction storage for long-range exploration...`);
+  let withdrawResp = await bot.exec("storage", { action: 'withdraw', item_id: "military_fuel_cell", quantity: milToWithdraw, target: "faction"});
 
   // Check for battle after faction_withdraw_items
   if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
@@ -2823,17 +2904,17 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
   let loadedCount = 0;
   if (!withdrawResp.error) {
-    loadedCount = premiumToWithdraw;
-    const newPremium = premiumFuelCells + loadedCount;
-    const actualCargoUsed = loadedCount * 2;
-    ctx.log("trade", `Loaded ${loadedCount} premium fuel cells from faction storage (${actualCargoUsed} cargo space, ${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    loadedCount = milToWithdraw;
+    const newMil = militaryFuelCells + loadedCount;
+    const actualCargoUsed = loadedCount * milSize;
+    ctx.log("trade", `Loaded ${loadedCount} military fuel cells from faction storage (${actualCargoUsed} cargo space, ${newMil} military + ${premiumFuelCells} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // If premium withdraw failed, try regular fuel_cell
-  ctx.log("warn", `Could not withdraw premium fuel cells: ${withdrawResp.error.message} — trying regular fuel cells...`);
-  //withdrawResp = await bot.exec("faction_withdraw_items", { item_id: "fuel_cell", quantity: maxRegularWithdraw });
-  withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: maxRegularWithdraw }); //fixed by human!
+  // If military withdraw failed, try premium_fuel_cell
+  ctx.log("warn", `Could not withdraw military fuel cells: ${withdrawResp.error.message} — trying premium fuel cells...`);
+  const premToWithdraw = Math.min(maxPremWithdraw, 400);
+  withdrawResp = await bot.exec("storage", { action: 'withdraw', item_id: "premium_fuel_cell", quantity: premToWithdraw, target: "faction"});
 
   // Check for battle after faction_withdraw_items
   if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
@@ -2843,15 +2924,34 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   }
 
   if (!withdrawResp.error) {
-    loadedCount = maxRegularWithdraw;
-    const newRegular = regularFuelCells + loadedCount;
-    ctx.log("trade", `Loaded ${loadedCount} regular fuel cells from faction storage (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    loadedCount = premToWithdraw;
+    const newPrem = premiumFuelCells + loadedCount;
+    const actualCargoUsed = loadedCount * premSize;
+    ctx.log("trade", `Loaded ${loadedCount} premium fuel cells from faction storage (${actualCargoUsed} cargo space, ${militaryFuelCells} military + ${newPrem} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // If faction withdraw failed, try to buy premium fuel cells from station market as fallback
-  ctx.log("warn", `Could not withdraw regular fuel cells: ${withdrawResp.error.message} — trying to buy premium fuel cells from market...`);
-  const buyResp = await bot.exec("buy", { item_id: "premium_fuel_cell", quantity: premiumToWithdraw });
+  // If premium withdraw failed, try regular fuel_cell
+  ctx.log("warn", `Could not withdraw premium fuel cells: ${withdrawResp.error.message} — trying regular fuel cells...`);
+  withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: maxRegWithdraw });
+
+  // Check for battle after faction_withdraw_items
+  if (await checkBattleAfterCommand(ctx, withdrawResp.notifications, "faction_withdraw_items")) {
+    ctx.log("combat", "Battle detected during fuel cell withdraw - fleeing!");
+    await ctx.sleep(5000);
+    return false;
+  }
+
+  if (!withdrawResp.error) {
+    loadedCount = maxRegWithdraw;
+    const newRegular = regularFuelCells + loadedCount;
+    ctx.log("trade", `Loaded ${loadedCount} regular fuel cells from faction storage (${militaryFuelCells} military + ${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    return true;
+  }
+
+  // If faction withdraw failed, try to buy military fuel cells from station market as fallback
+  ctx.log("warn", `Could not withdraw regular fuel cells: ${withdrawResp.error.message} — trying to buy military fuel cells from market...`);
+  const buyResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: milToWithdraw });
 
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyResp.notifications, "buy")) {
@@ -2861,15 +2961,33 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   }
 
   if (!buyResp.error) {
-    loadedCount = premiumToWithdraw;
-    const newPremium = premiumFuelCells + loadedCount;
-    ctx.log("trade", `Bought ${loadedCount} premium fuel cells from market (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    loadedCount = milToWithdraw;
+    const newMil = militaryFuelCells + loadedCount;
+    ctx.log("trade", `Bought ${loadedCount} military fuel cells from market (${newMil} military + ${premiumFuelCells} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    return true;
+  }
+
+  // If military buy failed, try premium fuel_cell
+  ctx.log("warn", `Could not buy military fuel cells: ${buyResp.error.message} — trying premium fuel cells...`);
+  const buyPremResp = await bot.exec("buy", { item_id: "premium_fuel_cell", quantity: premToWithdraw });
+
+  // Check for battle after buy
+  if (await checkBattleAfterCommand(ctx, buyPremResp.notifications, "buy")) {
+    ctx.log("combat", "Battle detected during fuel cell purchase - fleeing!");
+    await ctx.sleep(5000);
+    return false;
+  }
+
+  if (!buyPremResp.error) {
+    loadedCount = premToWithdraw;
+    const newPrem = premiumFuelCells + loadedCount;
+    ctx.log("trade", `Bought ${loadedCount} premium fuel cells from market (${militaryFuelCells} military + ${newPrem} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
   // If premium buy failed, try regular fuel_cell
-  ctx.log("warn", `Could not buy premium fuel cells: ${buyResp.error.message} — trying regular fuel cells...`);
-  const buyRegularResp = await bot.exec("buy", { item_id: "fuel_cell", quantity: maxRegularWithdraw });
+  ctx.log("warn", `Could not buy premium fuel cells: ${buyPremResp.error.message} — trying regular fuel cells...`);
+  const buyRegularResp = await bot.exec("buy", { item_id: "fuel_cell", quantity: maxRegWithdraw });
 
   // Check for battle after buy
   if (await checkBattleAfterCommand(ctx, buyRegularResp.notifications, "buy")) {
@@ -2879,13 +2997,13 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
   }
 
   if (!buyRegularResp.error) {
-    loadedCount = maxRegularWithdraw;
+    loadedCount = maxRegWithdraw;
     const newRegular = regularFuelCells + loadedCount;
-    ctx.log("trade", `Bought ${loadedCount} regular fuel cells from market (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    ctx.log("trade", `Bought ${loadedCount} regular fuel cells from market (${militaryFuelCells} military + ${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // If buy also failed, try to withdraw credits and retry with premium
+  // If buy also failed, try to withdraw credits and retry with military first
   const buyErrorMsg = (buyRegularResp.error.message || "").toLowerCase();
   if (buyErrorMsg.includes("credit") || buyErrorMsg.includes("not enough") || buyErrorMsg.includes("insufficient")) {
     ctx.log("trade", "Not enough credits — withdrawing from storage...");
@@ -2900,8 +3018,8 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
 
     if (!withdrawCreditsResp.error) {
       await bot.refreshStatus();
-      ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying premium fuel cell purchase...`);
-      const retryResp = await bot.exec("buy", { item_id: "premium_fuel_cell", quantity: premiumToWithdraw });
+      ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying military fuel cell purchase...`);
+      const retryResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: milToWithdraw });
 
       // Check for battle after retry buy
       if (await checkBattleAfterCommand(ctx, retryResp.notifications, "buy")) {
@@ -2911,15 +3029,33 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
       }
 
       if (!retryResp.error) {
-        loadedCount = premiumToWithdraw;
-        const newPremium = premiumFuelCells + loadedCount;
-        ctx.log("trade", `Loaded ${loadedCount} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+        loadedCount = milToWithdraw;
+        const newMil = militaryFuelCells + loadedCount;
+        ctx.log("trade", `Loaded ${loadedCount} military fuel cells (${newMil} military + ${premiumFuelCells} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+        return true;
+      }
+
+      // If military retry failed, try premium
+      ctx.log("warn", `Could not buy military fuel cells: ${retryResp.error.message} — trying premium...`);
+      const retryPremResp = await bot.exec("buy", { item_id: "premium_fuel_cell", quantity: premToWithdraw });
+
+      // Check for battle after retry buy
+      if (await checkBattleAfterCommand(ctx, retryPremResp.notifications, "buy")) {
+        ctx.log("combat", "Battle detected during retry fuel cell purchase - fleeing!");
+        await ctx.sleep(5000);
+        return false;
+      }
+
+      if (!retryPremResp.error) {
+        loadedCount = premToWithdraw;
+        const newPrem = premiumFuelCells + loadedCount;
+        ctx.log("trade", `Loaded ${loadedCount} premium fuel cells (${militaryFuelCells} military + ${newPrem} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
         return true;
       }
 
       // If premium retry failed, try regular
-      ctx.log("warn", `Could not buy premium fuel cells: ${retryResp.error.message} — trying regular...`);
-      const retryRegularResp = await bot.exec("buy", { item_id: "fuel_cell", quantity: maxRegularWithdraw });
+      ctx.log("warn", `Could not buy premium fuel cells: ${retryPremResp.error.message} — trying regular...`);
+      const retryRegularResp = await bot.exec("buy", { item_id: "fuel_cell", quantity: maxRegWithdraw });
 
       // Check for battle after retry buy
       if (await checkBattleAfterCommand(ctx, retryRegularResp.notifications, "buy")) {
@@ -2929,9 +3065,9 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
       }
 
       if (!retryRegularResp.error) {
-        loadedCount = maxRegularWithdraw;
+        loadedCount = maxRegWithdraw;
         const newRegular = regularFuelCells + loadedCount;
-        ctx.log("trade", `Loaded ${loadedCount} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+        ctx.log("trade", `Loaded ${loadedCount} regular fuel cells (${militaryFuelCells} military + ${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
         return true;
       }
       ctx.log("error", `Still could not buy fuel cells: ${retryRegularResp.error.message}`);
@@ -3056,10 +3192,10 @@ async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolea
 }
 
 /**
- * Load cargo hold with fuel cells for long journeys.
- * Fills cargo to max capacity with fuel cells.
- * Prioritizes premium_fuel_cell over regular fuel_cell.
- */
+  * Load cargo hold with fuel cells for long journeys.
+  * Fills cargo to max capacity with fuel cells.
+  * Prioritizes military_fuel_cell (3 space, 100 fuel) over premium_fuel_cell over regular fuel_cell.
+  */
 async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   const { bot, log } = ctx;
 
@@ -3137,14 +3273,17 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   ) as Array<Record<string, unknown>>;
 
   let currentCargo = 0;
+  let militaryFuelCells = 0;
   let premiumFuelCells = 0;
   let regularFuelCells = 0;
   for (const item of cargoItems) {
     const itemId = (item.item_id as string) || "";
     const quantity = (item.quantity as number) || 0;
-    const spacePerItem = itemId === "premium_fuel_cell" ? 2 : 1;
+    const spacePerItem = getItemSize(itemId);
     currentCargo += quantity * spacePerItem;
-    if (itemId === "premium_fuel_cell") {
+    if (itemId === "military_fuel_cell") {
+      militaryFuelCells = quantity;
+    } else if (itemId === "premium_fuel_cell") {
       premiumFuelCells = quantity;
     } else if (itemId === "fuel_cell") {
       regularFuelCells = quantity;
@@ -3153,19 +3292,22 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
 
   const availableSpace = bot.cargoMax - currentCargo;
   if (availableSpace <= 0) {
-    log("info", `Cargo hold full — already loaded with ${premiumFuelCells} premium + ${regularFuelCells} regular fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
+    log("info", `Cargo hold full — already loaded with ${militaryFuelCells} military + ${premiumFuelCells} premium + ${regularFuelCells} regular fuel cells (${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
-  // Premium fuel cells take 2 cargo space each, regular take 1
-  const maxPremiumWithdraw = Math.floor(availableSpace / 2);
+  const milSize = getItemSize("military_fuel_cell");
+  const premSize = getItemSize("premium_fuel_cell");
+
+  const maxMilWithdraw = Math.floor(availableSpace / milSize);
+  const maxPremWithdraw = Math.floor(availableSpace / premSize);
   const maxRegularWithdraw = availableSpace;
 
-  // Try to buy premium fuel cells first
-  log("trade", `Loading ${maxPremiumWithdraw} premium fuel cells for long journey...`);
+  // Try to buy military fuel cells first (best density)
+  log("trade", `Loading ${maxMilWithdraw} military fuel cells for long journey...`);
   const buyResp = await bot.exec("buy", {
-    item_id: "premium_fuel_cell",
-    quantity: maxPremiumWithdraw
+    item_id: "military_fuel_cell",
+    quantity: maxMilWithdraw
   });
 
   // Check for battle after buy
@@ -3176,13 +3318,33 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   }
 
   if (!buyResp.error) {
-    const newPremium = premiumFuelCells + maxPremiumWithdraw;
-    log("trade", `Bought ${maxPremiumWithdraw} premium fuel cells (${newPremium} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    const newMil = militaryFuelCells + maxMilWithdraw;
+    log("trade", `Bought ${maxMilWithdraw} military fuel cells (${newMil} military + ${premiumFuelCells} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+    return true;
+  }
+
+  // If military buy failed, try premium fuel cells
+  log("warn", `Could not buy military fuel cells: ${buyResp.error.message} — trying premium fuel cells...`);
+  const buyPremResp = await bot.exec("buy", {
+    item_id: "premium_fuel_cell",
+    quantity: maxPremWithdraw
+  });
+
+  // Check for battle after buy
+  if (await checkBattleAfterCommand(ctx, buyPremResp.notifications, "buy")) {
+    log("combat", "Battle detected during fuel cell purchase - fleeing!");
+    await ctx.sleep(5000);
+    return false;
+  }
+
+  if (!buyPremResp.error) {
+    const newPrem = premiumFuelCells + maxPremWithdraw;
+    log("trade", `Bought ${maxPremWithdraw} premium fuel cells (${militaryFuelCells} military + ${newPrem} premium + ${regularFuelCells} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
     return true;
   }
 
   // If premium buy failed, try regular fuel_cell
-  log("warn", `Could not buy premium fuel cells: ${buyResp.error.message} — trying regular fuel cells...`);
+  log("warn", `Could not buy premium fuel cells: ${buyPremResp.error.message} — trying regular fuel cells...`);
   const buyRegularResp = await bot.exec("buy", {
     item_id: "fuel_cell",
     quantity: maxRegularWithdraw
@@ -3201,7 +3363,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
   }
 
   const newRegular = regularFuelCells + maxRegularWithdraw;
-  log("trade", `Bought ${maxRegularWithdraw} regular fuel cells (${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
+  log("trade", `Bought ${maxRegularWithdraw} regular fuel cells (${militaryFuelCells} military + ${premiumFuelCells} premium + ${newRegular} regular, ${bot.cargo}/${bot.cargoMax} cargo)`);
   return true;
 }
 
@@ -3213,7 +3375,7 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  * 3. Among unvisited, prefer systems with fewer POIs (less explored)
  * Always avoids pirate systems, blacklisted systems, and systems we've fled from.
  */
-function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>): Connection | null {
+function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>, path: string[] = []): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
@@ -3251,8 +3413,24 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
   // Work with non-pirate connections first
   let candidates = nonPirateConns.length > 0 ? nonPirateConns : pirateConns;
 
+  // If we're seeing the same 3-system loop, penalize connections that are part of the current path
+  if (path && path.length >= 3) {
+    // Check last 3 systems for repeating pattern (A->B->C where next choices include A)
+    const last = path.slice(-3);
+    const loopSet = new Set(last);
+    const filtered = candidates.filter(c => !loopSet.has(c.id));
+    if (filtered.length > 0) {
+      candidates = filtered;
+    } else {
+      ctx.log("warning", "Loop avoidance: all immediate candidates were part of recent path — allowing them but deprioritizing");
+      // keep original candidates but they'll be deprioritized later
+    }
+  }
+
   // Priority 1: Systems not in map.json at all (completely unexplored)
   const unmapped = candidates.filter(c => !mapStore.getSystem(c.id));
+
+
   if (unmapped.length > 0) {
     // If multiple unmapped, prefer non-pirate
     const unmappedNonPirate = unmapped.filter(c => !isPirateSystem(c.id));
@@ -3303,7 +3481,7 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
  * 5. Systems with more connections (not a dead-end)
  * 6. Unexplored systems (not in map.json) over explored ones
  */
-function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>): Connection | null {
+function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>, path: string[] = []): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
@@ -3368,6 +3546,11 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     // Big bonus for systems not in map.json (completely unexplored)
     if (!isInMap) {
       score += 1000;
+    }
+
+    // Reduce selection of systems that are directly in the recent path to avoid 3-system loops
+    if (path && path.length >= 3 && path.slice(-3).includes(conn.id)) {
+      score -= 900; // large penalty to avoid selecting looped systems
     }
 
     // Bonus for systems with more connections (hubs, not dead-ends)

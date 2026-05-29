@@ -11,6 +11,7 @@ import {
   navigateToSystem,
   collectFromStorage,
   recordMarketData,
+  sanitizeCredits,
   getSystemInfo,
   findStation,
   factionDonateProfit,
@@ -1030,7 +1031,7 @@ async function tryMissions(ctx: RoutineContext): Promise<void> {
       }
       if (!completeResp.error && completeResp.result) {
         const cr = completeResp.result as Record<string, unknown>;
-        const earned = (cr.credits_earned as number) ?? 0;
+        const earned = sanitizeCredits((cr.credits_earned as number) ?? 0);
         ctx.log("trade", `Mission complete! +${earned}cr`);
         activeMissionCount--;
         await bot.refreshStatus();
@@ -1187,6 +1188,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     const settings = getTraderSettings(bot.username);
+    const homeSystem = settings.homeSystem || startSystem;
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
@@ -2008,7 +2010,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("trade", `Cleared cargo: ${depositSummary.join(", ")}`);
       }
 
-      // Ensure we have enough fuel cells for the route
+      // Ensure we have enough fuel cells for the route + return home (exact calc)
       await bot.refreshCargo();
       await bot.refreshStatus();
       let fuelInCargo = 0;
@@ -2016,12 +2018,34 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const lower = item.itemId.toLowerCase();
         if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
       }
-      if (fuelInCargo < RESERVE_FUEL_CELLS) { //why are we not checking if we are at home base first???
-        const freeSpace = getFreeSpace(bot);
-        const needed = Math.min(RESERVE_FUEL_CELLS - fuelInCargo, maxItemsForCargo(freeSpace, "fuel_cell"));
-        if (needed > 0) {
-          ctx.log("trade", `Buying ${needed} fuel cells for ${candidate.jumps}-jump route...`);
-          await bot.exec("buy", { item_id: "fuel_cell", quantity: needed }); //this needs to be changed to check if it's at home base, and if so, withdraw the premium_fuel_cell's!
+      let needed = RESERVE_FUEL_CELLS;
+      try {
+        const r = (await bot.exec("find_route", { target_system: homeSystem })).result as any;
+        if (r?.estimated_fuel && r?.fuel_available) {
+          const deficit = Math.max(0, r.estimated_fuel - r.fuel_available);
+          needed = Math.ceil(deficit / 20); // regular fuel_cell = 20 fuel
+          ctx.log("trade", `Exact return fuel: need ${needed} cells (${deficit} fuel deficit)`);
+        }
+      } catch {}
+      if (fuelInCargo < needed) {
+        const isAtHome = homeSystem && bot.system === homeSystem;
+        let stillNeeded = needed - fuelInCargo;
+        if (isAtHome) {
+          const prem = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "premium_fuel_cell", quantity: Math.ceil(stillNeeded / 2.5) });
+          if (!prem.error) stillNeeded = Math.max(0, stillNeeded - 50);
+          if (stillNeeded > 0) {
+            const reg = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: "fuel_cell", quantity: Math.ceil(stillNeeded / 20) });
+            if (!reg.error) stillNeeded = 0;
+          }
+          if (stillNeeded <= 0) ctx.log("trade", `Withdrew fuel cells from faction storage`);
+        }
+        if (stillNeeded > 0) {
+          const freeSpace = getFreeSpace(bot);
+          const buyQty = Math.min(Math.ceil(stillNeeded / 20), maxItemsForCargo(freeSpace, "fuel_cell"));
+          if (buyQty > 0) {
+            ctx.log("trade", `Buying ${buyQty} fuel cells for return trip (last resort)`);
+            await bot.exec("buy", { item_id: "fuel_cell", quantity: buyQty });
+          }
         }
       }
 
@@ -2621,13 +2645,13 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         const sellResp = await bot.exec("sell", { item_id: route!.itemId, quantity: actualSellQty });
         if (!sellResp.error) {
           const sr = sellResp.result as Record<string, unknown> | undefined;
-          const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+          const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
           // Check how many actually sold
           await bot.refreshCargo();
           const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
           const sold = actualSellQty - afterSell;
           totalSold += sold;
-          sellRevenue += earned > 0 ? earned : sold * route!.sellPrice;
+          sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * route!.sellPrice);
           remaining = afterSell;
           if (remaining > 0) {
             ctx.log("trade", `Sold ${sold}x but ${remaining}x ${route!.itemName} still unsold — buyer demand exhausted`);
@@ -2708,12 +2732,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
             if (!sResp.error) {
               const sr = sResp.result as Record<string, unknown> | undefined;
-              const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? 0;
+              const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? 0);
               await bot.refreshCargo();
               const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
               const sold = remaining - afterSell;
               totalSold += sold;
-              sellRevenue += earned > 0 ? earned : sold * best.buyer.price;
+              sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * best.buyer.price);
               remaining = afterSell;
               ctx.log("trade", `Sold ${sold}x ${route!.itemName} at ${best.buyer.poiName} (${best.buyer.price}cr/ea)`);
               await recordMarketData(ctx);
@@ -2784,12 +2808,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           const sResp = await bot.exec("sell", { item_id: route!.itemId, quantity: remaining });
           if (!sResp.error) {
             const sr = sResp.result as Record<string, unknown> | undefined;
-            const earned = (sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0;
+            const earned = sanitizeCredits((sr?.credits_earned as number) ?? (sr?.total as number) ?? (sr?.revenue as number) ?? 0);
             await bot.refreshCargo();
             const afterSell = bot.inventory.find(i => i.itemId === route!.itemId)?.quantity ?? 0;
             const sold = remaining - afterSell;
             totalSold += sold;
-            sellRevenue += earned > 0 ? earned : sold * buyer.price;
+            sellRevenue += sanitizeCredits(earned > 0 ? earned : sold * buyer.price);
             remaining = afterSell;
             ctx.log("trade", `Sold ${sold}x ${route!.itemName} at ${buyer.poiName} (${buyer.price}cr/ea)${remaining > 0 ? ` — ${remaining}x still unsold` : ""}`);
             await recordMarketData(ctx);
@@ -2808,8 +2832,6 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       // Check if we've recovered our investment
       const totalRevenue = sellRevenue + extraRevenue;
       const isProfitable = totalRevenue >= investedCredits;
-      const homeSystem = settings.homeSystem || startSystem;
-      
       if (!isProfitable && investedCredits > 0 && homeSystem) {
         // Unprofitable trade — return home and deposit to faction storage
         ctx.log("trade", `${remaining}x ${route.itemName} still unsold — trade unprofitable (spent ${investedCredits}cr, earned ${totalRevenue}cr) — returning to home system ${homeSystem} to deposit`);
@@ -2909,9 +2931,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // (No need to deposit at trade destinations - faction storage may not exist here)
 
     // Profit = sell revenue + other sales - cost of market purchases
-    const actualProfit = sellRevenue + extraRevenue - investedCredits;
+    const actualProfit = sanitizeCredits(sellRevenue + extraRevenue - investedCredits);
     bot.stats.totalTrades++;
-    bot.stats.totalProfit += actualProfit;
+    bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + actualProfit);
 
     // Record market data
     await recordMarketData(ctx);
@@ -2937,7 +2959,6 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     await factionDonateProfit(ctx, actualProfit);
 
     // ── Check for next trade before considering excess credit deposit ──
-    const homeSystem = settings.homeSystem || startSystem;
     yield "seek_next_trade";
     await bot.refreshStatus();
     await bot.refreshCargo();

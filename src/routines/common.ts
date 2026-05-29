@@ -122,9 +122,17 @@ export function maxItemsForCargo(freeWeight: number, itemId: string): number {
   return Math.floor(freeWeight / getItemSize(itemId));
 }
 
+/** Ensure a credit/revenue/profit value is a safe integer. Game credits are integers; API and float math can produce .0000000002 etc. */
+export function sanitizeCredits(value: number | string | undefined | null): number {
+  if (value === undefined || value === null) return 0;
+  const n = typeof value === 'string' ? parseFloat(value) : value;
+  if (!Number.isFinite(n)) return 0;
+  return Math.round(n);
+}
+
 /** Check if a POI represents a station. */
 export function isStationPoi(poi: SystemPOI): boolean {
-  return poi.has_base || (poi.type || "").toLowerCase() === "station";
+  return poi.has_base || !!poi.base_id || (poi.type || "").toLowerCase() === "station";
 }
 
 /** Find the first station POI in a list. Optionally filter by required service. */
@@ -170,6 +178,15 @@ export const PIRATE_SYSTEMS = [
 export function isPirateSystem(systemId: string): boolean {
   const lower = systemId.toLowerCase();
   return PIRATE_SYSTEMS.some(ps => lower === ps || lower.includes(ps));
+}
+
+/** Returns true if stationId is on the approved fuel list (or list is empty/unset = allow all).
+ *  Reads from bot.settings.general.approvedFuelStations (string[] of station ids). */
+export function isApprovedFuelStation(stationId: string, settings: any): boolean {
+  const general = settings?.general || {};
+  const approved: string[] | undefined = general.approvedFuelStations;
+  if (!approved || approved.length === 0) return true;
+  return approved.includes(stationId);
 }
 
 /** Find a station with a salvage yard service. Returns null if none found. */
@@ -617,6 +634,7 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
       bot.docked = true;
       ctx.log("system", "Managed to dock — checking storage, selling cargo, refueling...");
       await collectFromStorage(ctx);
+      await ensureInsured(ctx);
       await sellAllCargo(ctx);
       await bot.refreshStatus();
       const refuelResp = await bot.exec("refuel");
@@ -697,6 +715,7 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
       if (!dResp.error || dResp.error.message.includes("already")) {
         bot.docked = true;
         await collectFromStorage(ctx);
+        await ensureInsured(ctx);
       } else {
         ctx.log("error", `Dock at ${refuelStation.name} failed: ${dResp.error.message}`);
         return;
@@ -713,6 +732,10 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
       const msg = resp.error.message.toLowerCase();
       if (msg.includes("already full") || msg.includes("tank_full") || msg.includes("max")) {
         break;
+      }
+      if (msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves")) {
+        ctx.log("error", `Station out of fuel — cannot refuel here (${resp.error.message})`);
+        return; // bail out immediately, do not wait
       }
       if (msg.includes("credit") || msg.includes("fuel_source") || msg.includes("insufficient")) {
         const sold = await sellAllCargo(ctx);
@@ -748,8 +771,8 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
     const refuelResp = await bot.exec("refuel");
     if (refuelResp.error) {
       const msg = refuelResp.error.message.toLowerCase();
-      if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
-        ctx.log("error", `Cannot refuel: no fuel cells available at station`);
+      if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves")) {
+        ctx.log("error", `Cannot refuel: ${msg.includes("station") ? "station out of fuel" : "no fuel cells available"} — will not retry infinitely`);
         break;
       }
     }
@@ -772,7 +795,7 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
   await bot.refreshStatus();
   const hullPct = bot.maxHull > 0 ? (bot.hull / bot.maxHull) * 100 : 100;
-  if (hullPct < 95) {
+  if (hullPct < 100) {
     const startHull = Math.round(hullPct);
 
     // Check if current station has repair service
@@ -787,11 +810,12 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
         bot.poi = repairStation.id;
         const dResp = await bot.exec("dock");
         if (!dResp.error || dResp.error.message.includes("already")) {
-          bot.docked = true;
-          await collectFromStorage(ctx);
+        bot.docked = true;
+        await collectFromStorage(ctx);
+        await ensureInsured(ctx);
         } else {
-          ctx.log("error", `Dock at ${repairStation.name} failed: ${dResp.error.message}`);
-          return;
+        ctx.log("error", `Dock at ${repairStation.name} failed: ${dResp.error.message}`);
+        return;
         }
       }
     }
@@ -800,6 +824,81 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
     await bot.refreshStatus();
     const endHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (endHull > startHull) ctx.log("system", `Repaired hull ${startHull}% → ${endHull}%`);
+  }
+}
+
+export async function topUpShields(ctx: RoutineContext, targetPct: number = 0.8): Promise<boolean> {
+  const { bot } = ctx;
+  if (!bot.maxShield || bot.maxShield <= 0) {
+    ctx.log("combat", `Shield recharge skipped: maxShield=${bot.maxShield}`);
+    return false;
+  }
+  await bot.refreshStatus();
+  await bot.refreshCargo();
+  const target = Math.floor(bot.maxShield * targetPct);
+  if (bot.shield >= target) {
+    ctx.log("combat", `Shield recharge skipped: ${bot.shield}/${bot.maxShield} >= ${target} (${Math.round(targetPct * 100)}%)`);
+    return false;
+  }
+  const deficit = target - bot.shield;
+  const needed = Math.ceil(deficit / 100);
+  const inventory = bot.inventory || [];
+  const shieldItem = inventory.find(i => 
+    i.itemId?.toLowerCase().includes("shield") && i.itemId?.toLowerCase().includes("charge")
+  );
+  const have = shieldItem?.quantity ?? 0;
+  const qty = Math.min(needed, have);
+  if (qty <= 0) {
+    ctx.log("combat", `No shield charges in cargo (need ${needed}, have ${have})`);
+    return false;
+  }
+  ctx.log("combat", `Using ${qty}x shield_charge from ${have} available`);
+  const resp = await bot.exec("use_item", { id: shieldItem!.itemId, quantity: qty });
+  if (!resp.error) {
+    ctx.log("combat", `Used ${qty}x shield_charge (+${qty * 100} shields to ~${Math.round(targetPct * 100)}%)`);
+    await bot.refreshStatus();
+    return true;
+  } else {
+    ctx.log("combat", `Shield recharge failed: ${resp.error.message}`);
+    return false;
+  }
+}
+
+export async function useRepairKits(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  await bot.refreshStatus(); // ensure docked flag is fresh
+  if (bot.docked) {
+    return false; // never burn expensive repair kits at a station — repairShip() uses the station's repair command instead
+  }
+  await bot.refreshCargo();
+  const deficit = (bot.maxHull || 0) - (bot.hull || 0);
+  if (deficit <= 100) {
+    return false;
+  }
+  const inventory = bot.inventory || [];
+  // Prefer advanced (150 hull) then regular (50 hull)
+  let kitItem = inventory.find(i => (i.itemId || "").toLowerCase() === "advanced_repair_kit");
+  let hpPer = 150;
+  if (!kitItem || (kitItem.quantity ?? 0) <= 0) {
+    kitItem = inventory.find(i => (i.itemId || "").toLowerCase() === "repair_kit");
+    hpPer = 50;
+  }
+  const have = kitItem?.quantity ?? 0;
+  if (have <= 0) {
+    ctx.log("combat", `No repair kits in cargo (hull deficit ${deficit} > 100)`);
+    return false;
+  }
+  const needed = Math.ceil(deficit / hpPer);
+  const qty = Math.min(needed, have);
+  ctx.log("combat", `Using ${qty}x ${kitItem!.itemId} to repair ~${qty * hpPer} hull (deficit ${deficit})`);
+  const resp = await bot.exec("use_item", { id: kitItem!.itemId, quantity: qty });
+  if (!resp.error) {
+    ctx.log("combat", `Used ${qty}x ${kitItem!.itemId} (+~${qty * hpPer} hull)`);
+    await bot.refreshStatus();
+    return true;
+  } else {
+    ctx.log("combat", `Repair kit use failed: ${resp.error.message}`);
+    return false;
   }
 }
 
@@ -1007,6 +1106,11 @@ export async function safetyCheck(
 
   const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (fuelPct < opts.fuelThresholdPct) {
+    if (bot.isCustomsHold()) {
+      ctx.log("customs", "Fuel low but customs hold active - waiting for clearance before refueling");
+      const outcome = await bot.waitForCustomsClear();
+      ctx.log("customs", `Customs cleared (outcome: ${outcome}) - proceeding with refueling`);
+    }
     const ok = await ensureFueled(ctx, opts.fuelThresholdPct);
     if (!ok) return false;
   }
@@ -1014,10 +1118,10 @@ export async function safetyCheck(
 }
 
 /**
- * Ensure the bot has adequate fuel. If below threshold:
- * 1. Jettison non-fuel cargo to make room, scavenge nearby fuel cells
- * 2. Try to refuel at a station in the current system
- * 3. If no local station, find the nearest known system with a station and navigate there
+ * Ensure the bot has adequate fuel. Priority order:
+ * 1. Use fuel cells / premium_fuel_cell / x_fuel_cell from cargo first — do NOT go to a station
+ * 2. Adapt behaviour when docked at a station that is out of fuel
+ * 3. Only travel to a station when cargo fuel cells are fully exhausted
  * Returns true if fuel is now adequate, false if stranded.
  */
 export async function ensureFueled(
@@ -1032,109 +1136,131 @@ export async function ensureFueled(
 
   ctx.log("system", `Fuel low (${fuelPct}%) — need to refuel (threshold: ${thresholdPct}%)...`);
 
-  // Step 1: Try local station first — dock and refuel with credits, no cargo loss
+  // ── STEP 1: Convert all cargo fuel cells to fuel ────────────────────────
+  // premium_fuel_cell, military_fuel_cell, x_fuel_cell, fuel_cell are consumed
+  // via the refuel command even while docked at a station.
+  await bot.refreshStatus();
+  const wasDocked = bot.docked;
   const { pois } = await getSystemInfo(ctx);
-  const localStation = findStation(pois);
+  const dockingStation = wasDocked ? pois.find(p => isStationPoi(p) && p.id === bot.poi) : undefined;
 
-  if (localStation) {
-    ctx.log("system", `Station found in current system: ${localStation.name}`);
-    const ok = await refuelAtStation(ctx, localStation, thresholdPct);
-    if (ok) return true;
-    // refuelAtStation failed — try emergency
-    return await emergencyFuelRecovery(ctx);
+  // Undock first so cargo fuel cells are used one at a time (refuel undocked = use cargo)
+  if (wasDocked) {
+    ctx.log("system", "Undocking to use cargo fuel cells before reaching for station fuel...");
+    await ensureUndocked(ctx);
   }
 
-  // Step 2: No local station — check if fuel cells in cargo can get us above threshold
-  // Only use fuel cells if they can meet the threshold, otherwise go directly to station
-  if (!bot.docked) {
-    // First, check how many fuel cells we have and if they can get us above threshold
-    const cargoResp = await bot.exec("get_cargo");
-    let totalFuelCells = 0;
-    let hasPremiumFuelCells = false;
-    let hasRegularFuelCells = false;
-    
-    if (cargoResp.result && typeof cargoResp.result === "object") {
-      const cResult = cargoResp.result as Record<string, unknown>;
-      const cargoItems = (
-        Array.isArray(cResult) ? cResult :
-        Array.isArray(cResult.items) ? (cResult.items as Array<Record<string, unknown>>) :
-        Array.isArray(cResult.cargo) ? (cResult.cargo as Array<Record<string, unknown>>) :
-        []
-      );
-      
-      for (const item of cargoItems) {
-        const itemId = (item.item_id as string) || "";
-        const quantity = (item.quantity as number) || 0;
-        if (itemId === "premium_fuel_cell") {
-          totalFuelCells += quantity * 50; // premium gives 50 fuel each
-          hasPremiumFuelCells = true;
-        } else if (itemId.includes("fuel_cell")) {
-          totalFuelCells += quantity * 20; // regular gives ~20 fuel each
-          hasRegularFuelCells = true;
-        }
+  let cargoFuelAttempts = 0;
+  const maxCargoFuelAttempts = 40; // generous cap; 20 x premium = 1,000 fuel units
+  while (fuelPct < thresholdPct && cargoFuelAttempts < maxCargoFuelAttempts && bot.state === "running") {
+    const resp = await bot.exec("refuel");
+    if (resp.error) {
+      const msg = resp.error.message.toLowerCase();
+      if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("no fuel")) {
+        ctx.log("system", "Cargo fuel cells exhausted — refuel from cargo done");
+        break;
+      }
+      // Other errors: abort cargo refuel attempts
+      ctx.log("error", `Cargo refuel error: ${resp.error.message}`);
+      break;
+    }
+    cargoFuelAttempts++;
+    await bot.refreshStatus();
+    fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (fuelPct >= thresholdPct) {
+      ctx.log("system", `Refueled from cargo fuel cells — fuel now ${fuelPct}%`);
+      return true;
+    }
+  }
+
+  // If cargo got us healthy, done — re-dock if we were previously docked
+  if (fuelPct >= thresholdPct) {
+    if (dockingStation) {
+      await bot.exec("travel", { target_poi: dockingStation.id });
+      bot.poi = dockingStation.id;
+      const dResp = await bot.exec("dock");
+      if (!dResp.error || dResp.error.message.includes("already")) {
+        bot.docked = true;
+        await ensureInsured(ctx);
       }
     }
+    return true;
+  }
 
-    // Calculate if fuel cells can get us above threshold
-    const fuelNeeded = bot.maxFuel > 0 ? ((thresholdPct / 100) * bot.maxFuel) - bot.fuel : 0;
-    const canReachThresholdWithFuelCells = totalFuelCells >= fuelNeeded;
+  // Cargo fuel cells fully used and we're still low — ── STEP 2 ───────────
 
-    if (canReachThresholdWithFuelCells) {
-      ctx.log("system", `Sufficient fuel cells in cargo (${hasPremiumFuelCells ? "premium+" : ""}${hasRegularFuelCells ? "regular" : ""}) — using cargo fuel cells to refuel`);
-      
-      // Use fuel cells from cargo
-      let cargoRefuelAttempts = 0;
-      while (fuelPct < thresholdPct && cargoRefuelAttempts < 20) {
-        const refuelResp = await bot.exec("refuel");
-        if (refuelResp.error) {
-          const msg = refuelResp.error.message.toLowerCase();
-          if (msg.includes("no fuel") || msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
-            ctx.log("system", "No fuel cells in cargo — skipping cargo refuel");
-          }
-          break; // error or no fuel cells
-        }
-        cargoRefuelAttempts++;
+  // If we undocked and happened to be parked at a docking station, return there before
+  // deciding whether to use station fuel or go elsewhere.
+  if (wasDocked && dockingStation) {
+    ctx.log("system", `Returning to ${dockingStation.name} to attempt station refuel...`);
+    const trResp = await bot.exec("travel", { target_poi: dockingStation.id });
+    bot.poi = dockingStation.id;
+    const dResp = await bot.exec("dock");
+    if (!dResp.error || dResp.error.message.includes("already")) {
+      bot.docked = true;
+      await ensureInsured(ctx);
+    }
+  }
+
+  // ── STEP 3: Try station fuel (credits) — only after cargo cells are empty ──
+  // At this point bot.docked is only true if we were already docked when fuel became low,
+  // or if we re-docked in Step 2 above.
+  if (bot.docked) {
+    const station = dockingStation || (await getSystemInfo(ctx)).pois.find(p => isStationPoi(p) && p.id === bot.poi);
+    if (station) {
+      ctx.log("system", `Cargo fuel cells empty — attempting station refuel at ${station.name}...`);
+      const ok = await refuelAtStation(ctx, station, thresholdPct);
+      if (ok) return true;
+      // Station refuel failed (out of fuel, out of credits, etc.)
+    }
+  }
+
+  // ── STEP 4: Scavenge wrecks as last resort ──────────────────────────────
+  if (bot.fuel <= 1) {
+    ctx.log("system", "Nearly out of fuel — scavenging for fuel cells...");
+    const looted = await scavengeWrecks(ctx, { fuelOnly: true });
+    if (looted > 0) {
+      const scavRefuel = await bot.exec("refuel");
+      if (!scavRefuel.error) {
         await bot.refreshStatus();
-        const newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-        if (newFuelPct > fuelPct) {
-          ctx.log("system", `Refueled from cargo fuel cell — fuel now ${newFuelPct}%`);
-          fuelPct = newFuelPct;
-        }
+        fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         if (fuelPct >= thresholdPct) {
-          ctx.log("system", `Refueled from cargo — fuel now ${fuelPct}%`);
+          ctx.log("system", `Scavenged fuel cells — fuel now ${fuelPct}%`);
           return true;
         }
       }
-    } else {
-      ctx.log("system", `Insufficient fuel cells in cargo to reach ${thresholdPct}% threshold — going directly to station`);
-    }
-
-    // Step 3: Nearly out of fuel — scavenge wrecks for fuel as last resort (never jettison cargo)
-    if (bot.fuel <= 1) {
-      ctx.log("system", "Nearly out of fuel — scavenging for fuel cells...");
-      const looted = await scavengeWrecks(ctx, { fuelOnly: true });
-      if (looted > 0) {
-        const scavRefuel = await bot.exec("refuel");
-        if (!scavRefuel.error) {
-          await bot.refreshStatus();
-          fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-          if (fuelPct >= thresholdPct) {
-            ctx.log("system", `Scavenged fuel cells — fuel now ${fuelPct}%`);
-            return true;
-          }
-        }
-      }
     }
   }
 
-  // Step 4: No local station — find nearest known system with one
+  // ── STEP 5: Find nearest known station with fuel (respect approved + actual fuel level) ────────────────────────
   ctx.log("system", "No station in current system — searching known map for nearest station...");
   const blacklist = getSystemBlacklist();
-  const nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
+  let nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
+  // Enforce approvedFuelStations if configured
+  const settings = (ctx as any).bot?.settings || {};
+  if (nearest && !isApprovedFuelStation(nearest.poiId, settings)) {
+    // try next one by re-querying without the bad one (simple: fall back to any other)
+    nearest = null; // will hit emergency or continue search below
+  }
   if (!nearest) {
     ctx.log("error", "No known station in mapped systems — emergency recovery...");
     return await emergencyFuelRecovery(ctx);
   }
+
+  // Check live fuel level via get_poi (base.fuel) or dock fuel_warning before committing
+  try {
+    const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
+    const baseFuel = (poiResp as any)?.base?.fuel ?? 0;
+    if (baseFuel <= 0) {
+      const isHomeStation = nearest.poiId === "sol_station" || /sol central/i.test(nearest.poiName || "");
+      if (isHomeStation) {
+        ctx.log("system", `Proceeding to home ${nearest.poiName} despite base.fuel=0 (use faction storage for fuel cells)`);
+      } else {
+        ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
+        return await emergencyFuelRecovery(ctx); // avoid the loop
+      }
+    }
+  } catch {}
 
   ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)`);
 
@@ -1194,8 +1320,9 @@ export async function ensureFueled(
   if (!dResp.error || dResp.error.message.includes("already")) {
     bot.docked = true;
     await collectFromStorage(ctx);
+    await ensureInsured(ctx);
   } else {
-    ctx.log("error", `Dock failed: ${dResp.error.message}`);
+    ctx.log("error", `Dock failed at ${nearest.poiName}: ${dResp.error.message}`);
     return await emergencyFuelRecovery(ctx);
   }
 
@@ -1213,9 +1340,9 @@ export async function ensureFueled(
       const refuelResp = await bot.exec("refuel");
       if (refuelResp.error) {
         const msg = refuelResp.error.message.toLowerCase();
-        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
+        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty")) {
           ctx.log("error", `Cannot refuel: no fuel cells available at station — will not retry infinitely`);
-          break;
+          return false; // bail immediately, don't loop back
         }
       }
       await bot.refreshStatus();
@@ -1244,6 +1371,59 @@ const HOME_STATION_POI = "sol_station";
 const HOME_STATION_NAME = "Sol Central";
 
 /**
+ * Robust travel to Sol Central (handles landing at distant planets like saturn after jump).
+ * Uses live getSystemInfo + mapStore fallback for correct POI id, plus retries for "unknown destination".
+ * Returns true if positioned at the home station POI.
+ */
+export async function travelToHomeStation(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  await bot.refreshStatus();
+  if (bot.poi === HOME_STATION_POI) return true;
+
+  // Resolve POI id (live local first, fallback to stored map data)
+  let stationPoi = HOME_STATION_POI;
+  try {
+    const { pois } = await getSystemInfo(ctx);
+    const live = pois.find(p => isStationPoi(p) && (p.id === HOME_STATION_POI || /sol central/i.test(p.name || "")));
+    if (live) stationPoi = live.id;
+    else {
+      const stored = mapStore.getSystem(HOME_SYSTEM)?.pois?.find((p: any) => p.id === HOME_STATION_POI || /sol central/i.test(p.name || ""));
+      if (stored) stationPoi = stored.id;
+    }
+  } catch {}
+
+  await ensureUndocked(ctx);
+
+  const attemptTravel = async (poi: string) => {
+    const r = await bot.exec("travel", { target_poi: poi });
+    const unk = !!(r.error && /unknown destination/i.test(r.error.message || ""));
+    return { resp: r, unknown: unk };
+  };
+
+  let { resp, unknown } = await attemptTravel(stationPoi);
+  if (unknown) {
+    ctx.log("warn", `${HOME_STATION_NAME} not in local travel list from ${bot.poi} — settling position and retry...`);
+    await ctx.sleep(1500);
+    await bot.refreshStatus();
+    ({ resp, unknown } = await attemptTravel(stationPoi));
+  }
+  if (unknown) {
+    ctx.log("warn", `Still unknown for ${HOME_STATION_NAME} — dock/undock at local station to update position then retry...`);
+    if (await ensureDocked(ctx, true)) {
+      await ensureUndocked(ctx);
+      ({ resp, unknown } = await attemptTravel(stationPoi));
+    }
+  }
+
+  if (resp.error && !resp.error.message.includes("already")) {
+    ctx.log("error", `Travel to ${HOME_STATION_NAME} failed: ${resp.error.message}`);
+    return false;
+  }
+  bot.poi = stationPoi;
+  return true;
+}
+
+/**
  * Navigate to Sol Central and deposit all non-fuel cargo to station storage.
  * Used when cargo is full during exploration. Returns true if deposit succeeded.
  */
@@ -1269,16 +1449,9 @@ export async function depositCargoAtHome(
     }
   }
 
-  // Travel to Sol Central station
-  await ensureUndocked(ctx);
-  if (bot.poi !== HOME_STATION_POI) {
-    ctx.log("travel", `Traveling to ${HOME_STATION_NAME}...`);
-    const tResp = await bot.exec("travel", { target_poi: HOME_STATION_POI });
-    if (tResp.error && !tResp.error.message.includes("already")) {
-      ctx.log("error", `Travel to ${HOME_STATION_NAME} failed: ${tResp.error.message}`);
-      return false;
-    }
-    bot.poi = HOME_STATION_POI;
+  // Travel to Sol Central station (robust)
+  if (!(await travelToHomeStation(ctx))) {
+    return false;
   }
 
   // Dock
@@ -1290,6 +1463,8 @@ export async function depositCargoAtHome(
     }
     bot.docked = true;
   }
+
+  await ensureInsured(ctx);
 
   // Collect any gifted credits/items from storage
   await collectFromStorage(ctx);
@@ -1353,7 +1528,7 @@ export async function depositNonFuelCargo(ctx: RoutineContext): Promise<boolean>
 export async function navigateToSystem(
   ctx: RoutineContext,
   targetSystemId: string,
-  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean },
+  opts: { fuelThresholdPct: number; hullThresholdPct: number; noJettison?: boolean; autoCloak?: boolean; onJump?: (jumpNumber: number) => Promise<boolean>; onBeforeJump?: (nextSystem: string, jumpNumber: number) => Promise<void>; skipBlacklist?: boolean; isCombatBot?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_JUMPS = 199;
@@ -1402,11 +1577,18 @@ export async function navigateToSystem(
         const blacklistedOnRoute = serverRouteSystemIds.find(
           sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
         );
+        // Also validate that the route actually starts from our current system
+        const routeStartsHere = serverRouteSystemIds[0] && 
+          normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
         if (blacklistedOnRoute) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route`);
+        } else if (!routeStartsHere) {
+          ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route`);
         } else {
           nextSystem = routeData.route[1].system_id;
+          const fullRoute = routeData.route.map(r => r.system_id).join(" → ");
           ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
+          ctx.log("debug", `Server returned full route for ${targetSystemId}: ${fullRoute}`);
         }
       }
 
@@ -1455,7 +1637,7 @@ export async function navigateToSystem(
     }
 
     // Fuel check — MUST have adequate fuel before jumping
-    const fueled = await ensureFueled(ctx, Math.max(opts.fuelThresholdPct, 25), { noJettison: opts.noJettison });
+    const fueled = await ensureFueled(ctx, Math.max(opts.fuelThresholdPct, 1), { noJettison: opts.noJettison }); //changed to 1.
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;
@@ -1494,11 +1676,18 @@ export async function navigateToSystem(
         const blacklistedOnRoute = serverRouteSystemIds.find(
           sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
         );
+        // Also validate that the route actually starts from our current system
+        const routeStartsHere = serverRouteSystemIds[0] && 
+          normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
         if (blacklistedOnRoute) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route (post-fuel)`);
+        } else if (!routeStartsHere) {
+          ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route (post-fuel)`);
         } else {
           nextSystem = routeData.route[1].system_id;
+          const fullRoute = routeData.route.map(r => r.system_id).join(" → ");
           ctx.log("travel", `Server route: ${routeData.total_jumps} jump${routeData.total_jumps !== 1 ? "s" : ""} — next: ${nextSystem}`);
+          ctx.log("debug", `Server returned full route for ${targetSystemId}: ${fullRoute}`);
         }
       }
 
@@ -1531,7 +1720,49 @@ export async function navigateToSystem(
         const battleNotifs = parseBattleNotifications(jumpResp.notifications);
         const hasBattle = battleNotifs.some(n => n.type === "battle_start" || n.type === "battle_hit");
         if (hasBattle) {
-          ctx.log("combat", "Battle detected during jump - initiating flee!");
+          // For hunters (skipBlacklist=true), they intentionally enter pirate systems - don't flee
+          // For other bots, flee on battle detection
+          if (opts.skipBlacklist) {
+            ctx.log("combat", "Battle detected during jump - hunter intentionally enters - continuing navigation");
+            inBattleDuringJump = true;
+            battleInterruptHandled = true;
+          } else {
+            ctx.log("combat", "Battle detected during jump - initiating flee!");
+            inBattleDuringJump = true;
+            battleInterruptHandled = true;
+            // Re-issue flee every cycle while in battle
+            const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
+            if (fleeResp.error) {
+              ctx.log("error", `Flee command failed: ${fleeResp.error.message}`);
+            }
+            // Check if disengaged
+            const battleStatus = await getBattleStatus(ctx);
+            if (!battleStatus || !battleStatus.is_participant) {
+              ctx.log("combat", "Battle cleared - continuing navigation");
+              inBattleDuringJump = false;
+            } else {
+              // Still in battle - wait and continue to re-flee
+              await sleep(2000);
+              continue;
+            }
+          }
+        }
+      }
+
+      // CRITICAL: Check for battle interrupt error (jump timed out due to battle)
+      if (jumpResp.error && jumpResp.error.code === "battle_interrupt") {
+        ctx.log("combat", `Battle interrupt detected! ${jumpResp.error.message}`);
+        // For hunters (skipBlacklist=true), they intentionally enter pirate systems - join battle instead of flee
+        // For other bots, flee on battle interrupt
+        if (opts.skipBlacklist) {
+          ctx.log("combat", "Hunter detected battle interrupt - joining battle instead of fleeing");
+          inBattleDuringJump = true;
+          battleInterruptHandled = true;
+          // Don't flee - let the escort routine handle battle engagement
+          // Return false to signal navigation was interrupted by battle
+          return false;
+        } else {
+          ctx.log("combat", "Initiating flee!");
           inBattleDuringJump = true;
           battleInterruptHandled = true;
           // Re-issue flee every cycle while in battle
@@ -1544,35 +1775,13 @@ export async function navigateToSystem(
           if (!battleStatus || !battleStatus.is_participant) {
             ctx.log("combat", "Battle cleared - continuing navigation");
             inBattleDuringJump = false;
+            // Battle was cleared, but we still have an error - need to retry the jump
+            // Fall through to error handling below
           } else {
             // Still in battle - wait and continue to re-flee
             await sleep(2000);
             continue;
           }
-        }
-      }
-
-      // CRITICAL: Check for battle interrupt error (jump timed out due to battle)
-      if (jumpResp.error && jumpResp.error.code === "battle_interrupt") {
-        ctx.log("combat", `Battle interrupt detected! ${jumpResp.error.message} - initiating flee!`);
-        inBattleDuringJump = true;
-        battleInterruptHandled = true;
-        // Re-issue flee every cycle while in battle
-        const fleeResp = await bot.exec("battle", { action: "stance", stance: "flee" });
-        if (fleeResp.error) {
-          ctx.log("error", `Flee command failed: ${fleeResp.error.message}`);
-        }
-        // Check if disengaged
-        const battleStatus = await getBattleStatus(ctx);
-        if (!battleStatus || !battleStatus.is_participant) {
-          ctx.log("combat", "Battle cleared - continuing navigation");
-          inBattleDuringJump = false;
-          // Battle was cleared, but we still have an error - need to retry the jump
-          // Fall through to error handling below
-        } else {
-          // Still in battle - wait and continue to re-flee
-          await sleep(2000);
-          continue;
         }
       }
 
@@ -1588,6 +1797,16 @@ export async function navigateToSystem(
       }
 
       const errorMsg = jumpResp.error.message.toLowerCase();
+
+      // Check for in_battle error - for escorts, this means they got pulled into a battle
+      // Return false to signal navigation was interrupted by battle so escort routine can handle it
+      if (errorMsg.includes("in_battle") || errorMsg.includes("in combat")) {
+        ctx.log("combat", `Jump failed due to battle: ${jumpResp.error.message}`);
+        if (opts.skipBlacklist) {
+          ctx.log("combat", "Escort detected battle - returning to let escort routine handle engagement");
+          return false;
+        }
+      }
 
       // Check if error is transient (network timeout, connection issue, etc.)
       // Note: battle_interrupt is handled separately above, so we don't include it here
@@ -1640,7 +1859,24 @@ export async function navigateToSystem(
         if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
 
         // Recalculate route from CURRENT position (may have changed during wait, use blacklist)
-        const retryRoute = mapStore.findRoute(bot.system, targetSystemId, blacklist);
+        // For "systems not connected" errors, always do a full server re-query to avoid stale bad hops
+        let retryRoute = mapStore.findRoute(bot.system, targetSystemId, blacklist);
+        if (!retryRoute || retryRoute.length <= 1) {
+          ctx.log("travel", `No mapped route after wait — querying server for fresh route to ${targetSystemId}`);
+          const retryResp = await bot.exec("find_route", { target_system: targetSystemId });
+          const retryData = retryResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number } | null;
+          if (!retryResp.error && retryData?.found && retryData.route && retryData.route.length > 1) {
+            const ids = retryData.route.map(r => r.system_id);
+            const startsHere = ids[0] && normalizeSystemName(ids[0]) === normalizeSystemName(bot.system);
+            if (startsHere) {
+              retryRoute = ids;
+              const full = ids.join(" → ");
+              ctx.log("debug", `Fresh server route after wait for ${targetSystemId}: ${full}`);
+            } else {
+              ctx.log("warn", `Fresh server route after wait rejected — does not start at ${bot.system}`);
+            }
+          }
+        }
         if (retryRoute && retryRoute.length > 1) {
           nextSystem = retryRoute[1];
           ctx.log("travel", `Route recalculated after wait: ${retryRoute.length - 1} jump${retryRoute.length - 1 !== 1 ? "s" : ""} remaining`);
@@ -1661,18 +1897,27 @@ export async function navigateToSystem(
     // Check for battle status after jump (in case we jumped into an active battle)
     const battleStatus = await getBattleStatus(ctx);
     if (battleStatus && battleStatus.is_participant) {
-      ctx.log("combat", `JUMPED INTO BATTLE! Battle ID: ${battleStatus.battle_id} - initiating emergency flee!`);
+      ctx.log("combat", `JUMPED INTO BATTLE! Battle ID: ${battleStatus.battle_id}`);
+      // For hunters/escorts (isCombatBot=true), they fight - never flee when jumping into battle
+      // isCombatBot indicates this is a hunter or escort that should always fight
+      if (opts.isCombatBot) {
+        ctx.log("combat", "COMBAT BOT: Intentionally entering battle - will fight, not flee!");
+        return false;
+      }
       await fleeFromBattle(ctx, true, 35000);
       return false; // Aborted navigation due to battle
     }
 
     // Check for pirates in the new system and flee if detected
-    const nearbyResp = await bot.exec("get_nearby");
-    if (nearbyResp.result && typeof nearbyResp.result === "object") {
-      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result, true);
-      if (fled) {
-        // We fled - navigation is aborted, caller will need to handle new position
-        return false;
+    // Hunters (skipBlacklist) intentionally enter pirate systems — do NOT flee
+    if (!opts.skipBlacklist) {
+      const nearbyResp = await bot.exec("get_nearby");
+      if (nearbyResp.result && typeof nearbyResp.result === "object") {
+        const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result, true);
+        if (fled) {
+          // We fled - navigation is aborted, caller will need to handle new position
+          return false;
+        }
       }
     }
 
@@ -1738,6 +1983,13 @@ export async function refuelAtStation(
       return await emergencyFuelRecovery(ctx);
     }
     bot.docked = true;
+    await ensureInsured(ctx);
+    // Parse fuel_warning from dock response (e.g. "Fuel reserves critically low (0%)")
+    const warning = (dockResp as any)?.fuel_warning || "";
+    if (warning.toLowerCase().includes("0%") || warning.toLowerCase().includes("critically low")) {
+      ctx.log("error", `Station reports 0 fuel on dock — aborting refuel here`);
+      return false;
+    }
   }
 
   // Collect any gifted credits/items (may help pay for fuel)
@@ -1756,8 +2008,8 @@ export async function refuelAtStation(
       const refuelResp = await bot.exec("refuel");
       if (refuelResp.error) {
         const msg = refuelResp.error.message.toLowerCase();
-        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells")) {
-          ctx.log("error", `Cannot refuel: no fuel cells available at station — will not retry infinitely`);
+        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves")) {
+          ctx.log("error", `Cannot refuel: ${msg.includes("station") ? "station out of fuel" : "no fuel cells available"} — will not retry infinitely`);
           break;
         }
       }
@@ -1834,7 +2086,7 @@ interface Wreck {
 }
 
 /** Parse wreck list from get_wrecks response. */
-function parseWrecks(result: unknown): Wreck[] {
+export function parseWrecks(result: unknown): Wreck[] {
   if (!result || typeof result !== "object") return [];
   const r = result as Record<string, unknown>;
   const rawList = (
@@ -1884,6 +2136,12 @@ function parseWrecks(result: unknown): Wreck[] {
 export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: boolean }): Promise<number> {
   const { bot } = ctx;
   if (bot.docked) return 0; // can't scavenge while docked
+
+  // CRITICAL: Don't scavenge if we're in battle
+  if (bot.isInBattle()) {
+    ctx.log("combat", `Not scavenging while in battle`);
+    return 0;
+  }
 
   // Skip if cargo is already full or nearly full (less than 5 free)
   await bot.refreshStatus();
@@ -1944,7 +2202,7 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
       if (lootResp.error) {
         const errMsg = lootResp.error.message.toLowerCase();
         // CRITICAL: Check for battle interrupt - stop scavenging immediately
-        if (lootResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
+        if (lootResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat") || errMsg.includes("in_battle") || errMsg.includes("cannot perform this action while in combat")) {
           ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
           return totalLooted;
         }
@@ -1987,7 +2245,16 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
  */
 export async function fullSalvageWrecks(
   ctx: RoutineContext,
-  opts?: { fuelOnly?: boolean; enableTow?: boolean; minTowValue?: number; battleState?: BattleState },
+  opts?: {
+    fuelOnly?: boolean;
+    enableTow?: boolean;
+    minTowValue?: number;
+    battleState?: BattleState;
+    salvageCoop?: {
+      isWreckAvailable?: (wreckId: string) => boolean;
+      claimWreck?: (wreckId: string, action: "loot" | "tow") => void;
+    };
+  },
 ): Promise<{ itemsLooted: number; isTowing: boolean }> {
   const { bot } = ctx;
   if (bot.docked) return { itemsLooted: 0, isTowing: false };
@@ -1996,6 +2263,7 @@ export async function fullSalvageWrecks(
   const minTowValue = opts?.minTowValue ?? 500;
   const fuelOnly = opts?.fuelOnly ?? false;
   const battleState = opts?.battleState;
+  const coop = opts?.salvageCoop;
 
   const wrecksResp = await bot.exec("get_wrecks");
   const wrecks = parseWrecks(wrecksResp.result);
@@ -2017,7 +2285,15 @@ export async function fullSalvageWrecks(
       break;
     }
 
-    // Step 1: Loot cargo from the wreck
+    // Chat-based co-op: skip if another salvager already claimed this wreck
+    if (coop?.isWreckAvailable && !coop.isWreckAvailable(wreck.wreck_id)) {
+      ctx.log("scavenge", `Wreck ${wreck.name} claimed by another salvager — skipping`);
+      continue;
+    }
+    if (coop?.claimWreck) {
+      coop.claimWreck(wreck.wreck_id, "loot");
+    }
+
     if (wreck.items.length > 0) {
       let candidates = [...wreck.items];
       if (fuelOnly) {
@@ -2026,24 +2302,30 @@ export async function fullSalvageWrecks(
         );
       }
 
-      // Sort: fuel cells first
       candidates.sort((a, b) => {
         const aPri = LOOT_PRIORITY.some(p => a.item_id.includes(p)) ? 0 : 1;
         const bPri = LOOT_PRIORITY.some(p => b.item_id.includes(p)) ? 0 : 1;
         return aPri - bPri;
       });
 
+      let remainingOnWreck = wreck.items.reduce((sum, it) => sum + (it.quantity || 0), 0);
+
       for (const item of candidates) {
         if (bot.state !== "running") break;
         if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) break;
+        if (remainingOnWreck <= 1) break;
+
+        let qty = item.quantity;
+        const maxSafe = remainingOnWreck - 1;
+        if (qty > maxSafe) qty = maxSafe;
+        if (qty <= 0) continue;
 
         const lootResp = await bot.exec("loot_wreck", {
           wreck_id: wreck.wreck_id,
           item_id: item.item_id,
-          quantity: item.quantity,
+          quantity: qty,
         });
 
-        // Check for battle notifications after loot
         if (battleState && lootResp.notifications && Array.isArray(lootResp.notifications)) {
           const battleDetected = await handleBattleNotifications(ctx, lootResp.notifications, battleState);
           if (battleDetected) {
@@ -2054,7 +2336,6 @@ export async function fullSalvageWrecks(
 
         if (lootResp.error) {
           const msg = lootResp.error.message.toLowerCase();
-          // CRITICAL: Check for battle interrupt - stop scavenging immediately
           if (lootResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
             ctx.log("combat", `Loot interrupted by battle! ${lootResp.error.message} - stopping salvage!`);
             return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
@@ -2064,7 +2345,8 @@ export async function fullSalvageWrecks(
         }
 
         totalLooted++;
-        lootedItems.push(`${item.quantity}x ${item.name}`);
+        lootedItems.push(`${qty}x ${item.name}`);
+        remainingOnWreck -= qty;
       }
     }
 
@@ -2084,6 +2366,9 @@ export async function fullSalvageWrecks(
       }
 
       ctx.log("scavenge", `Attempting to tow wreck ${wreck.wreck_id} (${wreck.name})`);
+      if (coop?.claimWreck) {
+        coop.claimWreck(wreck.wreck_id, "tow");
+      }
       const towResp = await bot.exec("tow_wreck", { wreck_id: wreck.wreck_id });
       // Check for battle notifications after tow
       if (battleState && towResp.notifications && Array.isArray(towResp.notifications)) {
@@ -2122,6 +2407,7 @@ export async function fullSalvageWrecks(
           ctx.log("scavenge", `Towed ${shipClass} wreck (${wreck.name}) - value: ${salvageValue}cr, speed penalty: 50%`);
           // Set towing flag immediately - server confirms tow in the response
           bot.towingWreck = true;
+          bot.towingWreckId = wreck.wreck_id;
           ctx.log("scavenge", `Set bot.towingWreck=true after successful tow`);
           break;
         } else {
@@ -2140,6 +2426,7 @@ export async function fullSalvageWrecks(
             // We are already towing - this is a signal to head to salvage yard
             ctx.log("warn", `Already towing a wreck — should head to salvage yard (${towResp.error.message})`);
             bot.towingWreck = true;
+            // Preserve existing towingWreckId
             break; // Stop scanning and go to salvage yard
           } else {
             // Someone else is towing this wreck - skip it and try another
@@ -2208,21 +2495,26 @@ export async function processTowedWrecks(
   const wrecksResp = await bot.exec("get_wrecks");
   const wrecks = parseWrecks(wrecksResp.result);
 
-  // Find the towed wreck in the list (it should still be accessible)
-  let modulesLooted = 0;
-  for (const wreck of wrecks) {
-    // Check modules array (not items)
-    if (wreck.modules.length === 0) {
-      ctx.log("scavenge", "📦 Towed wreck has no modules to loot");
-      break;
-    }
+  // Find the specific towed wreck by ID
+  const towedWreck = bot.towingWreckId ? wrecks.find(w => w.wreck_id === bot.towingWreckId) : wrecks[0];
+  if (!towedWreck) {
+    ctx.log("warn", "Towed wreck not found in get_wrecks response - may have been jettisoned or lost");
+    bot.towingWreck = false;
+    bot.towingWreckId = null;
+    return 0;
+  }
 
-    ctx.log("scavenge", `📦 Towed wreck ${wreck.name} contains ${wreck.modules.length} module(s): ${wreck.modules.map(m => m.name || m.type || m.type_id || m.id).join(", ")}`);
+  // Check modules array (not items)
+  let modulesLooted = 0;
+  if (towedWreck.modules.length === 0) {
+    ctx.log("scavenge", "📦 Towed wreck has no modules to loot");
+  } else {
+    ctx.log("scavenge", `📦 Towed wreck ${towedWreck.name} contains ${towedWreck.modules.length} module(s): ${towedWreck.modules.map(m => m.name || m.type || m.type_id || m.id).join(", ")}`);
 
     // Loot ALL modules and cargo from the wreck (no item_id specified = loots everything to cargo hold)
     // Check cargo space first
     await bot.refreshStatus();
-    const moduleCargoCost = wreck.modules.length * 10; // Typical module size is 10 each
+    const moduleCargoCost = towedWreck.modules.length * 10; // Typical module size is 10 each
     if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
       ctx.log("scavenge", `Cargo full while looting modules (${bot.cargo}/${bot.cargoMax}) — depositing items to make space...`);
 
@@ -2242,69 +2534,74 @@ export async function processTowedWrecks(
 
       if (!deposited) {
         ctx.log("warn", "No items to deposit — cannot make space for modules");
-        break;
-      }
-      
-      // Re-check cargo after deposit
-      await bot.refreshStatus();
-      if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
-        ctx.log("warn", "Still no cargo space after deposit — skipping module loot");
-        break;
-      }
-    }
-
-    // Loot ALL modules and cargo from wreck (no item_id = loots everything)
-    const lootResp = await bot.exec("loot_wreck", {
-      wreck_id: wreck.wreck_id,
-    });
-
-    if (lootResp.error) {
-      const msg = lootResp.error.message.toLowerCase();
-      // CRITICAL: Check for battle interrupt - stop immediately
-      if (lootResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
-        ctx.log("combat", `Module loot interrupted by battle! ${lootResp.error.message} - stopping!`);
-        return 0;
-      }
-      if (msg.includes("no_space") || msg.includes("not enough cargo")) {
-        ctx.log("scavenge", "Still no cargo space — depositing ALL current items and retrying...");
-        // Deposit all non-fuel items to make space
-        await bot.refreshCargo();
-        for (const cargoItem of bot.inventory) {
-          const lower = cargoItem.itemId.toLowerCase();
-          if (!lower.includes("fuel") && !lower.includes("energy_cell") && cargoItem.quantity > 0) {
-            await bot.exec("deposit_items", { item_id: cargoItem.itemId, quantity: cargoItem.quantity });
-          }
-        }
-        // Retry looting everything
-        const retryResp = await bot.exec("loot_wreck", {
-          wreck_id: wreck.wreck_id,
-        });
-        if (!retryResp.error) {
-          modulesLooted = wreck.modules.length;
-          ctx.log("scavenge", `✓ Looted all modules from wreck`);
-        } else {
-          const retryMsg = retryResp.error.message.toLowerCase();
-          // Check for battle interrupt on retry as well
-          if (retryResp.error.code === "battle_interrupt" || retryMsg.includes("interrupted by battle") || retryMsg.includes("interrupted by combat")) {
-            ctx.log("combat", `Module loot retry interrupted by battle! ${retryResp.error.message} - stopping!`);
-            return 0;
-          }
-          ctx.log("error", `Failed to loot modules after deposit: ${retryResp.error.message}`);
-        }
-      } else if (msg.includes("empty") || msg.includes("not found")) {
-        ctx.log("warn", "Wreck is empty or not found — stopping module loot");
       } else {
-        ctx.log("error", `Failed to loot modules: ${lootResp.error.message}`);
+        // Re-check cargo after deposit
+        await bot.refreshStatus();
+        if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
+          ctx.log("warn", "Still no cargo space after deposit — skipping module loot");
+        }
       }
-    } else {
-      modulesLooted = wreck.modules.length;
-      ctx.log("scavenge", `✓ Looted all modules from wreck`);
     }
 
-    if (modulesLooted > 0) {
-      ctx.log("scavenge", `✅ Successfully looted ${modulesLooted} module(s) from towed wreck`);
+    if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) <= bot.cargoMax) {
+      // Loot ALL modules and cargo from wreck (no item_id = loots everything)
+      const lootResp = await bot.exec("loot_wreck", {
+        wreck_id: towedWreck.wreck_id,
+      });
+
+      if (lootResp.error) {
+        const msg = lootResp.error.message.toLowerCase();
+        // CRITICAL: Check for battle interrupt - stop immediately
+        if (lootResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
+          ctx.log("combat", `Module loot interrupted by battle! ${lootResp.error.message} - stopping!`);
+          return 0;
+        }
+        // Handle wreck_gone during initial loot attempt
+        if (msg.includes("wreck_gone") || msg.includes("empty") || msg.includes("not found")) {
+          ctx.log("warn", "Wreck no longer exists during initial loot — releasing tow");
+          await bot.exec("release_tow");
+          bot.towingWreck = false;
+          bot.towingWreckId = null;
+          return 0;
+        }
+        if (msg.includes("no_space") || msg.includes("not enough cargo")) {
+          ctx.log("scavenge", "Still no cargo space — depositing ALL current items and retrying...");
+          // Deposit all non-fuel items to make space
+          await bot.refreshCargo();
+          for (const cargoItem of bot.inventory) {
+            const lower = cargoItem.itemId.toLowerCase();
+            if (!lower.includes("fuel") && !lower.includes("energy_cell") && cargoItem.quantity > 0) {
+              await bot.exec("deposit_items", { item_id: cargoItem.itemId, quantity: cargoItem.quantity });
+            }
+          }
+          // Retry looting everything
+          const retryResp = await bot.exec("loot_wreck", {
+            wreck_id: towedWreck.wreck_id,
+          });
+          if (!retryResp.error) {
+            modulesLooted = towedWreck.modules.length;
+            ctx.log("scavenge", `✓ Looted all modules from wreck`);
+          } else {
+            const retryMsg = retryResp.error.message.toLowerCase();
+            // Check for battle interrupt on retry as well
+            if (retryResp.error.code === "battle_interrupt" || retryMsg.includes("interrupted by battle") || retryMsg.includes("interrupted by combat")) {
+              ctx.log("combat", `Module loot retry interrupted by battle! ${retryResp.error.message} - stopping!`);
+              return 0;
+            }
+            ctx.log("error", `Failed to loot modules after deposit: ${retryResp.error.message}`);
+          }
+        } else {
+          ctx.log("error", `Failed to loot modules: ${lootResp.error.message}`);
+        }
+      } else {
+        modulesLooted = towedWreck.modules.length;
+        ctx.log("scavenge", `✓ Looted all modules from wreck`);
+      }
     }
-    break; // Only process the first wreck (we're only towing one)
+  }
+
+  if (modulesLooted > 0) {
+    ctx.log("scavenge", `✅ Successfully looted ${modulesLooted} module(s) from towed wreck`);
   }
 
   // Step 2: Check salvaging skill level
@@ -2347,7 +2644,14 @@ export async function processTowedWrecks(
         if (errMsg.includes("not_towing")) {
           ctx.log("warn", `Server says not towing during scrap (attempt ${attempt}) — clearing tow flag`);
           bot.towingWreck = false;
-          break; // Stop retrying - we're no longer towing
+          bot.towingWreckId = null;
+          break;
+        } else if (errMsg.includes("wreck_gone")) {
+          ctx.log("warn", `Wreck no longer exists during scrap (attempt ${attempt}) — releasing tow`);
+          await bot.exec("release_tow");
+          bot.towingWreck = false;
+          bot.towingWreckId = null;
+          break;
         } else {
           ctx.log("error", `Scrap attempt ${attempt} failed: ${scrapResp.error.message}`);
         }
@@ -2392,7 +2696,14 @@ export async function processTowedWrecks(
         if (errMsg.includes("not_towing")) {
           ctx.log("warn", `Server says not towing during sell (attempt ${attempt}) — clearing tow flag`);
           bot.towingWreck = false;
-          break; // Stop retrying - we're no longer towing
+          bot.towingWreckId = null;
+          break;
+        } else if (errMsg.includes("wreck_gone")) {
+          ctx.log("warn", `Wreck no longer exists during sell (attempt ${attempt}) — releasing tow`);
+          await bot.exec("release_tow");
+          bot.towingWreck = false;
+          bot.towingWreckId = null;
+          break;
         } else {
           ctx.log("error", `Sell attempt ${attempt} failed: ${sellResp.error.message}`);
         }
@@ -2413,6 +2724,7 @@ export async function processTowedWrecks(
   if (processed > 0) {
     ctx.log("scavenge", `Successfully processed wreck (processed=${processed}) — clearing tow flag`);
     bot.towingWreck = false;
+    bot.towingWreckId = null;
   }
 
   await bot.refreshStatus();
@@ -2563,9 +2875,11 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
     return;
   }
 
-  const insureResp = await bot.exec("buy_insurance");
+  const insureResp = await bot.exec("buy_insurance", { ticks: 9999 });
   if (!insureResp.error) {
-    ctx.log("info", `Insurance purchased for ${cost}cr`);
+    const r = insureResp.result as Record<string, unknown> | undefined;
+    const msg = (r?.message as string) || `Insurance purchased for ${cost}cr`;
+    ctx.log("info", msg);
     await bot.refreshStatus();
   } else if (insureResp.error.message.toLowerCase().includes("already")) {
     // silently skip
@@ -2640,9 +2954,13 @@ export function readSettings(): Record<string, Record<string, unknown>> {
     const { join } = require("path");
     const file = join(process.cwd(), "data", "settings.json");
     if (existsSync(file)) {
-      return JSON.parse(readFileSync(file, "utf-8"));
+      const content = readFileSync(file, "utf-8");
+      const parsed = JSON.parse(content);
+      return parsed;
+    } else {
     }
-  } catch { /* use defaults */ }
+  } catch (error) {
+  }
   return {};
 }
 
@@ -2709,7 +3027,7 @@ export async function factionDonateProfit(ctx: RoutineContext, profit: number): 
   const donation = Math.floor(profit * (pct / 100));
   if (donation <= 0) return;
   if (bot.credits - donation < FACTION_DONATE_FLOOR) return;
-  const resp = await bot.exec("faction_deposit_credits", { amount: donation });
+  const resp = await bot.exec("storage", { action: 'deposit', target: 'faction', item_id: 'credits', quantity: donation }); // NEVER CHANGE THIS - deposit credits to faction storage
   if (!resp.error) {
     ctx.log("trade", `Donated ${donation}cr to faction treasury (${pct}% of ${profit}cr profit)`);
     logFactionActivity(ctx, "donation", `Deposited ${donation}cr (${pct}% of ${profit}cr profit)`);
@@ -3641,7 +3959,7 @@ export async function emergencyFleeFromPirates(
         jumpCompleted = true;
         // Issue flee IMMEDIATELY - don't wait for jump promise to resolve
         // The jump command can't be cancelled, but we need to start fleeing NOW
-        fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${err.message}`));
+        fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${(err as Error).message}`));
         fleeIssued = true;
         return;
       }
@@ -3653,7 +3971,7 @@ export async function emergencyFleeFromPirates(
         battleDetectedDuringJump = true;
         jumpCompleted = true;
         // Issue flee IMMEDIATELY
-        fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${err.message}`));
+        fleeFromBattle(ctx).catch(err => ctx.log("error", `Emergency flee failed: ${(err as Error).message}`));
         fleeIssued = true;
         return;
       }
@@ -3894,8 +4212,8 @@ export async function checkCustomsInspection(
   ctx.log("customs", "⏱️ Mandatory customs wait - 2 second delay...");
   await sleep(2000);
 
-  // Wait for customs inspection (up to 5 seconds total)
-  const result = await waitForCustomsInspection(bot, (cat, msg) => bot.log(cat, msg), systemToCheck, 5000);
+  // Wait for customs inspection (up to 90 seconds total)
+  const result = await waitForCustomsInspection(bot, (cat, msg) => bot.log(cat, msg), systemToCheck, 90000);
 
   // If customs ship is expected but not yet visible, poll for it
   if (result.wasStopped && result.outcome === "timeout") {

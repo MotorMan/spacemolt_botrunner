@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, copyFileSync } from
 import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
 import { log } from "./ui.js";
+import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
 
 // ── Data model ──────────────────────────────────────────────
 
@@ -193,6 +194,8 @@ export interface StoredSystem {
   id: string;
   name: string;
   security_level?: string;
+  /** Galactic coordinates (from get_map or public /api/map) */
+  position?: { x: number; y: number };
   connections: StoredConnection[];
   pois: StoredPOI[];
   /** Wormholes that have an exit in this system */
@@ -369,6 +372,22 @@ class MapStore {
       || (systemData.security as string)
       || (systemData.police_level as string)
       || sys.security_level;
+
+    // Merge position (supports nested "position": {x,y} from get_map and flat x,y from public /api/map)
+    let posX: number | undefined;
+    let posY: number | undefined;
+    const nestedPos = systemData.position as Record<string, unknown> | undefined;
+    if (nestedPos && typeof nestedPos.x === "number" && typeof nestedPos.y === "number") {
+      posX = nestedPos.x;
+      posY = nestedPos.y;
+    } else if (typeof systemData.x === "number" && typeof systemData.y === "number") {
+      posX = systemData.x as number;
+      posY = systemData.y as number;
+    }
+    if (typeof posX === "number" && typeof posY === "number") {
+      sys.position = { x: posX, y: posY };
+    }
+
     sys.last_updated = now();
 
     // Merge connections
@@ -1055,7 +1074,7 @@ class MapStore {
   findNearestStation(systemId: string): StoredPOI | null {
     const sys = this.data.systems[systemId];
     if (!sys) return null;
-    return sys.pois.find((p) => p.has_base) ?? null;
+    return sys.pois.find((p) => p.has_base || !!p.base_id) ?? null;
   }
 
   /** BFS to find the nearest known system that has a station (excluding pirate and blacklisted systems). Returns { systemId, poiId, poiName, hops } or null. */
@@ -1127,7 +1146,7 @@ class MapStore {
   }
 
   /** Find all locations where a specific ore/resource has been mined or scanned. Checks both ores_found (mining history) and resources (scan data) so hidden POIs are included. */
-  findOreLocations(oreId: string): Array<{
+findOreLocations(oreId: string): Array<{
     systemId: string;
     systemName: string;
     poiId: string;
@@ -1164,7 +1183,7 @@ class MapStore {
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
       if (this.isPirateSystem(sysId)) continue;
-      const hasStation = sys.pois.some((p) => p.has_base);
+      const hasStation = sys.pois.some((p) => p.has_base || !!p.base_id);
       for (const poi of sys.pois) {
         // Check both ores_found (mining history) AND resources (scan data)
         // Hidden POIs often only have data in resources (from get_poi scans)
@@ -1550,8 +1569,8 @@ class MapStore {
       // Skip pirate systems
       if (this.isPirateSystem(sysId)) continue;
       for (const poi of sys.pois) {
-        // Only include POIs with a dockable station (has_base)
-        if (!poi.has_base) continue;
+        // Only include POIs with a dockable station (has_base or base_id)
+        if (!(poi.has_base || poi.base_id)) continue;
         for (const m of poi.market) {
           if (m.best_buy !== null && m.buy_quantity > 0) {
             results.push({
@@ -1578,8 +1597,8 @@ class MapStore {
       // Skip pirate systems
       if (this.isPirateSystem(sysId)) continue;
       for (const poi of sys.pois) {
-        // Only include POIs with a dockable station (has_base)
-        if (!poi.has_base) continue;
+        // Only include POIs with a dockable station (has_base or base_id)
+        if (!(poi.has_base || poi.base_id)) continue;
         for (const m of poi.market) {
           if (m.best_sell !== null && m.sell_quantity > 0) {
             results.push({
@@ -1616,8 +1635,8 @@ class MapStore {
       // Skip pirate systems
       if (this.isPirateSystem(sysId)) continue;
       for (const poi of sys.pois) {
-        // Only include POIs with a dockable station
-        if (!poi.has_base) continue;
+        // Only include POIs with a dockable station (has_base or base_id)
+        if (!(poi.has_base || poi.base_id)) continue;
         for (const m of poi.market) {
           if (itemId && m.item_id !== itemId) continue;
           if (m.best_sell !== null && m.best_sell > 0 && m.sell_quantity > 0) {
@@ -1882,6 +1901,67 @@ class MapStore {
     }
 
     return lines.join("\n");
+  }
+
+  getAllSystemPositions(): SystemPosition[] {
+    return Object.values(this.data.systems)
+      .filter((s) => s.position && typeof s.position.x === "number" && typeof s.position.y === "number")
+      .map((s) => ({
+        id: s.id,
+        x: s.position!.x,
+        y: s.position!.y,
+        name: s.name,
+      }));
+  }
+
+  calculatePathfinderBearing(fromSystemId: string, toSystemId: string): number | null {
+    const from = this.data.systems[fromSystemId.toLowerCase()];
+    const to = this.data.systems[toSystemId.toLowerCase()];
+    if (!from?.position || !to?.position) return null;
+    return calculatePathfinderBearing(from.position.x, from.position.y, to.position.x, to.position.y);
+  }
+
+  simulatePathfinderLanding(originSystemId: string, bearingDegrees: number): PathfinderResult | null {
+    const originSys = this.data.systems[originSystemId.toLowerCase()];
+    if (!originSys?.position) return null;
+    const origin: SystemPosition = {
+      id: originSys.id,
+      x: originSys.position.x,
+      y: originSys.position.y,
+      name: originSys.name,
+    };
+    const all = this.getAllSystemPositions();
+    return simulatePathfinderLanding(origin, bearingDegrees, all);
+  }
+
+  computeSafePathfinderBearing(fromSystemId: string, toSystemId: string): { bearing: number; safe: boolean; landing: PathfinderResult | null; blocker?: PathfinderResult } | null {
+    const fromSys = this.data.systems[fromSystemId.toLowerCase()];
+    const toSys = this.data.systems[toSystemId.toLowerCase()];
+    if (!fromSys?.position || !toSys?.position) return null;
+    const origin: SystemPosition = { id: fromSys.id, x: fromSys.position.x, y: fromSys.position.y, name: fromSys.name };
+    const target: SystemPosition = { id: toSys.id, x: toSys.position.x, y: toSys.position.y, name: toSys.name };
+    const all = this.getAllSystemPositions();
+    return computePathfinderBearingToTarget(origin, target, all);
+  }
+
+  getPathfinderLandingMargin(): number {
+    return PATHFINDER_LANDING_MARGIN;
+  }
+
+  getPathfinderSpeed(): number {
+    return PATHFINDER_SPEED;
+  }
+
+  reversePathfinderBearing(bearing: number): number {
+    return reverseBearing(bearing);
+  }
+
+  formatPathfinderBearing(bearing: number, decimals?: number): string {
+    return formatBearing(bearing, decimals);
+  }
+
+  getPathfinderTravelTime(proj: number): { ticks: number; seconds: number } {
+    return getPathfinderTravelTime(proj);
   }
 }
 

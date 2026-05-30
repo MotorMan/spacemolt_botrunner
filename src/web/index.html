@@ -489,57 +489,106 @@
      <iframe id="shipsforsaleFrame" src="/shipsforsale.html"></iframe>
    </div>
 
-   <!-- ══ Stats Tab ══ -->
-  <div class="tab-page" id="page-stats">
-    <div class="stats-page-header">
-      <h3>Fleet Statistics</h3>
-      <div class="stats-toggle" id="statsToggle">
-        <button class="active" onclick="setStatsPeriod('today')">Today</button>
-        <button onclick="setStatsPeriod('week')">Week</button>
-        <button onclick="setStatsPeriod('all')">All Time</button>
-      </div>
-    </div>
-    <div class="stats-bar" id="statsBarPersist">
-      <span class="stats-title">Totals</span>
-      <div class="stat-item"><span class="stat-value" id="pStatMined">0</span><span class="stat-label">Ores Mined</span></div>
-      <div class="stat-item"><span class="stat-value" id="pStatCrafted">0</span><span class="stat-label">Items Crafted</span></div>
-      <div class="stat-item"><span class="stat-value" id="pStatTrades">0</span><span class="stat-label">Trades</span></div>
-      <div class="stat-item"><span class="stat-value" id="pStatProfit">0</span><span class="stat-label">Trade Profit</span></div>
-      <div class="stat-item"><span class="stat-value" id="pStatSystems">0</span><span class="stat-label">Explored</span></div>
-      <div class="stat-item"><span class="stat-value" id="pStatFaction">-</span><span class="stat-label">Faction Funds</span></div>
-    </div>
-    <div style="display:flex;gap:16px;flex:1;min-height:0;overflow:hidden">
-      <div class="bot-table-wrap" style="flex:1;overflow:auto">
-        <div class="bot-table-header"><span>Per-Bot Breakdown</span></div>
-        <div class="bot-table-scroll">
-          <table class="bot-table" id="statsTable">
-            <thead><tr>
-              <th style="text-align:left;padding:6px 12px">Bot</th>
-              <th style="text-align:right;padding:6px 12px">Mined</th>
-              <th style="text-align:right;padding:6px 12px">Crafted</th>
-              <th style="text-align:right;padding:6px 12px">Trades</th>
-              <th style="text-align:right;padding:6px 12px">Profit</th>
-              <th style="text-align:right;padding:6px 12px">Systems</th>
-            </tr></thead>
-            <tbody id="statsTableBody"></tbody>
-          </table>
-        </div>
-      </div>
-      <div class="bot-table-wrap" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
-        <div class="bot-table-header">
-          <span>Faction Activity</span>
-          <div class="faction-log-filters" id="statsLogFilters">
-            <button class="faction-log-filter-btn active" onclick="setStatsLogFilter('all')">All</button>
-            <button class="faction-log-filter-btn" onclick="setStatsLogFilter('deposit')">Deposit</button>
-            <button class="faction-log-filter-btn" onclick="setStatsLogFilter('withdraw')">Withdraw</button>
-            <button class="faction-log-filter-btn" onclick="setStatsLogFilter('donation')">Donation</button>
-            <button class="faction-log-filter-btn" onclick="setStatsLogFilter('gift')">Gift</button>
-          </div>
-        </div>
-        <div id="statsActivityLog" class="faction-log-content" style="flex:1;min-height:0"></div>
-      </div>
-    </div>
-  </div>
+<!-- ══ Stats Tab ══ -->
+   <div class="tab-page" id="page-stats">
+     <div class="stats-page-header">
+       <h3>Fleet Statistics</h3>
+       <div class="stats-toggle" id="statsToggle">
+         <button class="active" onclick="setStatsPeriod('today')">Today</button>
+         <button onclick="setStatsPeriod('week')">Week</button>
+         <button onclick="setStatsPeriod('all')">All Time</button>
+       </div>
+     </div>
+     <div class="stats-bar" id="statsBarPersist">
+       <span class="stats-title">Totals</span>
+       <div class="stat-item"><span class="stat-value" id="pStatMined">0</span><span class="stat-label">Ores Mined</span></div>
+       <div class="stat-item"><span class="stat-value" id="pStatCrafted">0</span><span class="stat-label">Items Crafted</span></div>
+       <div class="stat-item"><span class="stat-value" id="pStatTrades">0</span><span class="stat-label">Trades</span></div>
+       <div class="stat-item"><span class="stat-value" id="pStatProfit">0</span><span class="stat-label">Trade Profit</span></div>
+       <div class="stat-item"><span class="stat-value" id="pStatSystems">0</span><span class="stat-label">Explored</span></div>
+       <div class="stat-item"><span class="stat-value" id="pStatFaction">-</span><span class="stat-label">Faction Funds</span></div>
+     </div>
+     
+     <!-- Taxes Tab Navigation -->
+     <div class="stats-taxes-nav" id="statsTaxesNav" style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+       <span class="stats-title">View:</span>
+       <button class="active" id="statsTabMain" onclick="switchStatsView('main')">Main</button>
+       <button id="statsTabTaxes" onclick="switchStatsView('taxes')">Taxes</button>
+     </div>
+     
+     <!-- Main Stats View -->
+     <div id="statsMainView">
+       <div class="stats-bar" id="statsBarTaxes">
+         <span class="stats-title">Taxes</span>
+         <div class="stat-item"><span class="stat-value" id="pStatIncomeTax">0</span><span class="stat-label">Income Tax</span></div>
+         <div class="stat-item"><span class="stat-value" id="pStatPropertyTax">0</span><span class="stat-label">Property Tax</span></div>
+         <div class="stat-item"><span class="stat-value" id="pStatTaxableIncome">0</span><span class="stat-label">Taxable Income</span></div>
+       </div>
+       <div style="display:flex;gap:16px;flex:1;min-height:0;overflow:hidden">
+         <div class="bot-table-wrap" style="flex:1;overflow:auto">
+           <div class="bot-table-header"><span>Per-Bot Breakdown</span></div>
+           <div class="bot-table-scroll">
+             <table class="bot-table" id="statsTable">
+               <thead><tr>
+                 <th style="text-align:left;padding:6px 12px">Bot</th>
+                 <th style="text-align:right;padding:6px 12px">Mined</th>
+                 <th style="text-align:right;padding:6px 12px">Crafted</th>
+                 <th style="text-align:right;padding:6px 12px">Trades</th>
+                 <th style="text-align:right;padding:6px 12px">Profit</th>
+                 <th style="text-align:right;padding:6px 12px">Systems</th>
+               </tr></thead>
+               <tbody id="statsTableBody"></tbody>
+             </table>
+           </div>
+         </div>
+         <div class="bot-table-wrap" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
+           <div class="bot-table-header">
+             <span>Faction Activity</span>
+             <div class="faction-log-filters" id="statsLogFilters">
+               <button class="faction-log-filter-btn active" onclick="setStatsLogFilter('all')">All</button>
+               <button class="faction-log-filter-btn" onclick="setStatsLogFilter('deposit')">Deposit</button>
+               <button class="faction-log-filter-btn" onclick="setStatsLogFilter('withdraw')">Withdraw</button>
+               <button class="faction-log-filter-btn" onclick="setStatsLogFilter('donation')">Donation</button>
+               <button class="faction-log-filter-btn" onclick="setStatsLogFilter('gift')">Gift</button>
+             </div>
+           </div>
+           <div id="statsActivityLog" class="faction-log-content" style="flex:1;min-height:0"></div>
+         </div>
+       </div>
+     </div>
+     
+     <!-- Taxes View (hidden by default) -->
+     <div id="statsTaxesView" style="display:none">
+       <div class="stats-bar">
+         <span class="stats-title">Fleet Tax Summary</span>
+         <div class="stat-item"><span class="stat-value" id="taxTotalIncome">0</span><span class="stat-label">Total Taxable Income</span></div>
+         <div class="stat-item"><span class="stat-value" id="taxTotalIncomeTax">0</span><span class="stat-label">Total Income Tax</span></div>
+         <div class="stat-item"><span class="stat-value" id="taxTotalPropertyTax">0</span><span class="stat-label">Total Property Tax</span></div>
+         <div class="stat-item"><span class="stat-value" id="taxTotalAssessed">0</span><span class="stat-label">Total Assessed Value</span></div>
+       </div>
+       <div class="bot-table-wrap" style="flex:1;overflow:auto">
+         <div class="bot-table-header">
+           <span>Tax History by Bot</span>
+           <div style="display:flex;gap:8px">
+             <input type="text" class="filter-input" placeholder="🔍 Search bots..." id="taxSearch" oninput="filterTaxBots()">
+           </div>
+         </div>
+         <div class="bot-table-scroll">
+           <table class="bot-table" id="taxTable">
+             <thead><tr>
+               <th style="text-align:left;padding:6px 12px">Bot</th>
+               <th style="text-align:right;padding:6px 12px">Taxable Income</th>
+               <th style="text-align:right;padding:6px 12px">Income Tax</th>
+               <th style="text-align:right;padding:6px 12px">Property Tax</th>
+               <th style="text-align:right;padding:6px 12px">Assessed Value</th>
+               <th style="text-align:right;padding:6px 12px">Last Updated</th>
+             </tr></thead>
+             <tbody id="taxTableBody"></tbody>
+           </table>
+         </div>
+       </div>
+     </div>
+   </div>
 
   <!-- ══ Bot Profile Page (hidden by default) ══ -->
   <div class="profile-page" id="page-profile">
@@ -771,7 +820,7 @@ function switchTab(name) {
   if (name === 'missions') renderMissionsPage();
   if (name === 'faction') renderFactionPage();
   if (name === 'shipyard') renderShipyardPage();
-  if (name === 'stats') { renderStatsTab(); refreshFactionFunds(); }
+  if (name === 'stats') { renderStatsTab(); refreshFactionFunds(); loadTaxesDataAndRender(); }
   if (name === 'commandall') {
     const frame = document.getElementById('commandallFrame');
     if (frame) frame.src = frame.src;
@@ -967,6 +1016,10 @@ async function fetchInitialData() {
         }
         // Load faction log
         factionLogLines = msg.logs?.faction || [];
+        // Load taxes data if stats tab is active
+        if (document.getElementById('page-stats')?.classList.contains('active')) {
+          loadTaxesDataAndRender();
+        }
         break;
       case 'mapData':
         mapData = msg.data.systems || msg.data || {};
@@ -1884,6 +1937,92 @@ function renderStatsActivityLog() {
   }
   log.innerHTML = filtered.map(l => `<div class="log-entry">${formatFactionLogLine(l)}</div>`).join('');
   log.scrollTop = 0;
+}
+
+// ── Taxes Tab ──────────────────────────────────────────────────
+let statsTaxesView = 'main';
+let taxesData = null;
+let taxesLoaded = false;
+
+async function loadTaxesData() {
+  if (taxesLoaded) return;
+  try {
+    const res = await fetch('/api/taxes');
+    if (res.ok) {
+      taxesData = await res.json();
+      taxesLoaded = true;
+    }
+  } catch (err) {
+    console.warn('Failed to load taxes data:', err);
+  }
+}
+
+async function switchStatsView(view) {
+  statsTaxesView = view;
+  document.getElementById('statsTabMain').classList.toggle('active', view === 'main');
+  document.getElementById('statsTabTaxes').classList.toggle('active', view === 'taxes');
+  document.getElementById('statsMainView').style.display = view === 'main' ? '' : 'none';
+  document.getElementById('statsTaxesView').style.display = view === 'taxes' ? '' : 'none';
+  if (view === 'taxes') {
+    if (!taxesLoaded) {
+      await loadTaxesData();
+    }
+    renderTaxesTab();
+  }
+}
+
+function loadTaxesBar() {
+  const fleetTotals = taxesData.fleetTotals || {};
+  document.getElementById('pStatIncomeTax').textContent = num(fleetTotals.totalIncomeTax || 0);
+  document.getElementById('pStatPropertyTax').textContent = num(fleetTotals.totalPropertyTax || 0);
+  document.getElementById('pStatTaxableIncome').textContent = num(fleetTotals.totalIncome || 0);
+}
+
+function formatTimestamp(ts) {
+  const d = new Date(ts);
+  return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+}
+
+function num(value) {
+  if (value == null) return '0';
+  return value.toLocaleString();
+}
+
+function renderTaxesTab() {
+  const data = taxesData || {};
+  const fleetTotals = data.fleetTotals || {};
+  document.getElementById('taxTotalIncome').textContent = num(fleetTotals.totalIncome || 0);
+  document.getElementById('taxTotalIncomeTax').textContent = num(fleetTotals.totalIncomeTax || 0);
+  document.getElementById('taxTotalPropertyTax').textContent = num(fleetTotals.totalPropertyTax || 0);
+  document.getElementById('taxTotalAssessed').textContent = num(fleetTotals.totalAssessedValue || 0);
+  
+  const bots = data.bots || {};
+  const tbody = document.getElementById('taxTableBody');
+  const entries = Object.entries(bots);
+  
+  if (entries.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" style="padding:24px;text-align:center;color:var(--text-dim)">No tax data yet. Start bots and let them collect taxes on restart.</td></tr>';
+    return;
+  }
+  
+  tbody.innerHTML = entries.map(([botName, data]) => {
+    const estimate = data.lastTaxEstimate || {};
+    const lastUpdated = estimate.timestamp ? formatTimestamp(estimate.timestamp) : '-';
+    return `<tr>
+      <td style="padding:6px 12px;font-weight:500;color:var(--text-bright)">${esc(botName)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(estimate.taxable_income_to_date || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(estimate.income_tax_total || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(estimate.property_tax_total || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(estimate.assessed_property_value || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${esc(lastUpdated)}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadTaxesDataAndRender() {
+  await loadTaxesData();
+  loadTaxesBar();
+  renderTaxesTab();
 }
 
 function renderStats() {

@@ -1542,10 +1542,21 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── CRITICAL FIX: Always refresh faction storage at cycle start ──
     // This ensures quota decisions are based on fresh data, not stale cached state
     // Works from anywhere (doesn't require being docked)
-    await bot.refreshFactionStorage();
+    // BUT: Skip if we're in the middle of navigation (not docked, traveling to ore)
+    const isTravelingToOre = recoveredSession?.state === "traveling_to_ore";
+    if (bot.docked) {
+      await bot.refreshFactionStorage();
+    } else if (isTravelingToOre) {
+      ctx.log("mining", "Skipping faction storage refresh - in travel phase, will refresh after reaching target");
+    } else if (bot.system === homeSystem) {
+      // At home system but not docked - might be refueling or just passed through
+      await bot.refreshFactionStorage();
+    }
+    // If not docked and not at home and not traveling - use cached data (safe for quota decisions)
 
     // Top up fuel cells from faction storage when at home (runs every cycle)
-    if (homeSystem && bot.system === homeSystem) {
+    // CRITICAL: Only attempt storage operations when DOCKED at home system
+    if (homeSystem && bot.system === homeSystem && bot.docked) {
       await bot.refreshCargo();
       let fuelInCargo = 0;
       for (const item of bot.inventory) {
@@ -5416,6 +5427,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     }
 
     // Exact fuel cells reserve for return home — prefer withdraw from faction storage at home base
+    // CRITICAL: Only withdraw from faction storage when DOCKED at home system
     await bot.refreshCargo();
     let fuelInCargo = 0;
     for (const item of bot.inventory) {
@@ -5429,7 +5441,8 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
         const needed = Math.ceil(deficit / 20);
         const minFuel = settings.minimumFuelCells;
         if (fuelInCargo < Math.max(needed, minFuel)) {
-          const isAtHome = homeSystem && bot.system === homeSystem;
+          // CRITICAL: Only withdraw from faction storage if DOCKED at home system
+          const isAtHome = homeSystem && bot.system === homeSystem && bot.docked;
           let stillNeeded = Math.max(needed, minFuel) - fuelInCargo;
           if (isAtHome) {
             // Prefer military_fuel_cell (100 fuel, 3 space)

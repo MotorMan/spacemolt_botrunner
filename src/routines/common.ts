@@ -536,6 +536,12 @@ export async function analyzeMarket(ctx: RoutineContext): Promise<void> {
 export async function collectFromStorage(ctx: RoutineContext, minBalance: number = 0): Promise<void> {
   const { bot } = ctx;
 
+  // CRITICAL: Only collect from storage if docked
+  if (!bot.docked) {
+    ctx.log("system", "Not docked - skipping storage collection");
+    return;
+  }
+
   const storageResp = await bot.exec("view_storage");
   if (!storageResp.result || typeof storageResp.result !== "object") return;
 

@@ -19,7 +19,7 @@ export interface ApiResponse {
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
-const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-5-27-26-Statico-Rocks-Version";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-5-29-26-Statico-Rocks-Version";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;

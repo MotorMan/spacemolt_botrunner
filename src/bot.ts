@@ -1028,7 +1028,6 @@ export class Bot {
       property_tax_total: (result.property_tax_total as number) || 0,
       assessed_property_value: (result.assessed_property_value as number) || 0,
       last_assessed_at: (result.last_assessed_at as number) || 0,
-      data: result,
     };
 
     if (hasTaxEstimateChanged(this.username, estimate)) {
@@ -1087,9 +1086,18 @@ export class Bot {
       return;
     }
 
+    // CRITICAL: view_storage with target: "faction" requires being docked at a station
+    // If not docked, skip the API call and keep cached data
+    if (!this.docked) {
+      return;
+    }
+
     const resp = await this.exec("view_storage", { target: "faction" });
     if (resp.error) {
-      this.log("error", `Error refreshing faction storage: ${resp.error.message}`);
+      // Don't log error if we're not docked - this is expected behavior
+      if (this.docked) {
+        this.log("error", `Error refreshing faction storage: ${resp.error.message}`);
+      }
       // Don't reset factionStorage to empty on error - keep cached data
       return;
     }

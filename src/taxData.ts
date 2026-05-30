@@ -12,7 +12,6 @@ export interface TaxEstimate {
   property_tax_total: number;
   assessed_property_value: number;
   last_assessed_at: number;
-  data: Record<string, unknown>;
 }
 
 export interface TaxesData {
@@ -57,12 +56,7 @@ export function hasTaxEstimateChanged(
     return true;
   }
   const last = botData.lastTaxEstimate;
-  return (
-    last.taxable_income_to_date !== newEstimate.taxable_income_to_date ||
-    last.income_tax_total !== newEstimate.income_tax_total ||
-    last.property_tax_total !== newEstimate.property_tax_total ||
-    last.assessed_property_value !== newEstimate.assessed_property_value
-  );
+  return last.last_assessed_at !== newEstimate.last_assessed_at;
 }
 
 export function saveTaxEstimate(botUsername: string, estimate: TaxEstimate): void {

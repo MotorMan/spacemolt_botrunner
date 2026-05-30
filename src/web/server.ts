@@ -61,6 +61,7 @@ const SETTINGS_FILE = join(DATA_DIR, "settings.json");
 const STATS_FILE = join(DATA_DIR, "stats.json");
 const MAIN_LOG_FILE = join(DATA_DIR, "main_logs.json");
 const FACILITIES_FILE = join(DATA_DIR, "facilities.json");
+const TAXES_FILE = join(DATA_DIR, "taxes.json");
 
 interface CachedFacilities {
   version: string;
@@ -446,6 +447,40 @@ export class WebServer {
         }
         if (url.pathname === "/api/stats") {
           return Response.json(this.statsData.daily);
+        }
+        if (url.pathname === "/api/taxes") {
+          const taxesPath = join(DATA_DIR, "taxes.json");
+          if (!existsSync(taxesPath)) {
+            return Response.json({ bots: {}, fleetTotals: {} });
+          }
+          try {
+            const raw = readFileSync(taxesPath, "utf-8");
+            const taxes = JSON.parse(raw);
+            const bots: Record<string, { lastTaxEstimate?: any; history: any[] }> = {};
+            let totalIncome = 0, totalIncomeTax = 0, totalPropertyTax = 0, totalAssessedValue = 0;
+            for (const [botName, data] of Object.entries(taxes)) {
+              const botData = data as { lastTaxEstimate?: any; history: any[] };
+              bots[botName] = botData;
+              if (botData.lastTaxEstimate) {
+                totalIncome += botData.lastTaxEstimate.taxable_income_to_date || 0;
+                totalIncomeTax += botData.lastTaxEstimate.income_tax_total || 0;
+                totalPropertyTax += botData.lastTaxEstimate.property_tax_total || 0;
+                totalAssessedValue += botData.lastTaxEstimate.assessed_property_value || 0;
+              }
+            }
+            return Response.json({
+              bots,
+              fleetTotals: {
+                totalIncome,
+                totalIncomeTax,
+                totalPropertyTax,
+                totalAssessedValue,
+                botCount: Object.keys(taxes).length
+              }
+            });
+          } catch {
+            return Response.json({ bots: {}, fleetTotals: {} });
+          }
         }
         if (url.pathname === "/api/catalog") {
           return Response.json(catalogStore.getAll());

@@ -297,7 +297,7 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
 };
 
 // Commands that use payload.action for the action (like facility and battle)
-const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage']);
+const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet']);
 
 // ── Response cache ────────────────────────────────────────────
 

@@ -26,10 +26,6 @@ interface FlockAssignment {
 }
 
 interface Settings {
-  flock?: {
-    flockGroups?: FlockGroup[];
-    assignments?: { [username: string]: FlockAssignment };
-  };
   miner?: any; // Should not be used
 }
 
@@ -38,62 +34,57 @@ let mockSettings: Settings = {};
 
 // Simulate the frontend functions with mock send
 function saveFlockGroupingSettings(groups: FlockGroup[]) {
+  mockGroups = groups;
   mockSend({ type: 'saveSettings', routine: 'flock', settings: {
     flockGroups: groups,
-    assignments: mockSettings.flock?.assignments || {}
+    assignments: mockAssignments
   } });
-  if (!mockSettings.flock) mockSettings.flock = {};
-  mockSettings.flock.flockGroups = groups;
 }
 
-function assignBotToFlock(botUsername: string, flockName: string, flockRole: string) {
-  if (!mockSettings.flock) mockSettings.flock = {};
-  if (!mockSettings.flock.assignments) mockSettings.flock.assignments = {};
+let mockAssignments: { [username: string]: FlockAssignment } = {};
 
-  mockSettings.flock.assignments[botUsername] = {
+function assignBotToFlock(botUsername: string, flockName: string, flockRole: string) {
+  mockAssignments[botUsername] = {
     flockEnabled: true,
     flockName: flockName,
     flockRole: flockRole
   };
 
   mockSend({ type: 'saveSettings', routine: 'flock', settings: {
-    flockGroups: mockSettings.flock.flockGroups || [],
-    assignments: mockSettings.flock.assignments
+    flockGroups: mockGroups,
+    assignments: mockAssignments
   } });
 }
 
 function saveProfileFlock(botUsername: string, flockName: string, isLeader: boolean) {
-  if (!mockSettings.flock) mockSettings.flock = {};
-  if (!mockSettings.flock.assignments) mockSettings.flock.assignments = {};
-
   if (flockName) {
-    mockSettings.flock.assignments[botUsername] = {
+    mockAssignments[botUsername] = {
       flockEnabled: true,
       flockName: flockName,
       flockRole: isLeader ? 'leader' : 'follower'
     };
   } else {
-    delete mockSettings.flock.assignments[botUsername];
+    delete mockAssignments[botUsername];
   }
 
   mockSend({ type: 'saveSettings', routine: 'flock', settings: {
-    flockGroups: mockSettings.flock.flockGroups || [],
-    assignments: mockSettings.flock.assignments
+    flockGroups: mockGroups,
+    assignments: mockAssignments
   } });
 }
 
 function removeBotFromFlock(botUsername: string) {
-  if (mockSettings.flock?.assignments) {
-    delete mockSettings.flock.assignments[botUsername];
-    mockSend({ type: 'saveSettings', routine: 'flock', settings: {
-      flockGroups: mockSettings.flock.flockGroups || [],
-      assignments: mockSettings.flock.assignments
-    } });
-  }
+  delete mockAssignments[botUsername];
+  mockSend({ type: 'saveSettings', routine: 'flock', settings: {
+    flockGroups: mockGroups,
+    assignments: mockAssignments
+  } });
 }
 
+let mockGroups: FlockGroup[] = [];
+
 function buildFlockGroupRows(): string {
-  const groups = mockSettings.flock?.flockGroups || [];
+  const groups = mockGroups;
   let rows = '';
   for (const group of groups) {
     rows += `<tr data-flock-group="${group.name}">
@@ -115,7 +106,7 @@ function buildFlockGroupRows(): string {
 }
 
 function buildFlockAssignmentsRows(): string {
-  const flockAssignments = mockSettings.flock?.assignments || {};
+  const flockAssignments = mockAssignments;
   let rows = '';
   for (const [botUsername, botSettings] of Object.entries(flockAssignments)) {
     if (botSettings.flockEnabled && botSettings.flockName) {
@@ -177,14 +168,15 @@ describe('Flock Settings Frontend Logic', () => {
   };
 
   beforeEach(() => {
-    mockSettings = {};
+    mockGroups = [];
+    mockAssignments = {};
     mockSend.mockClear();
   });
 
   test('saveFlockGroupingSettings saves groups to flock section', () => {
     saveFlockGroupingSettings(testGroups);
 
-    expect(mockSettings.flock?.flockGroups).toEqual(testGroups);
+    expect(mockGroups).toEqual(testGroups);
     expect(mockSend).toHaveBeenCalledWith({
       type: 'saveSettings',
       routine: 'flock',
@@ -193,13 +185,13 @@ describe('Flock Settings Frontend Logic', () => {
         assignments: {}
       }
     });
-    expect(mockSettings.miner).toBeUndefined(); // Should not use miner section
+    expect(mockSettings.miner).toBeUndefined();
   });
 
   test('assignBotToFlock saves assignment to flock section', () => {
     assignBotToFlock('TestBot', 'Rad', 'follower');
 
-    expect(mockSettings.flock?.assignments?.TestBot).toEqual({
+    expect(mockAssignments['TestBot']).toEqual({
       flockEnabled: true,
       flockName: 'Rad',
       flockRole: 'follower'
@@ -209,7 +201,7 @@ describe('Flock Settings Frontend Logic', () => {
       routine: 'flock',
       settings: {
         flockGroups: [],
-        assignments: mockSettings.flock?.assignments
+        assignments: mockAssignments
       }
     });
   });
@@ -217,23 +209,22 @@ describe('Flock Settings Frontend Logic', () => {
   test('saveProfileFlock saves profile assignment correctly', () => {
     saveProfileFlock('ProfileBot', 'Gas', true);
 
-    expect(mockSettings.flock?.assignments?.ProfileBot).toEqual({
+    expect(mockAssignments['ProfileBot']).toEqual({
       flockEnabled: true,
       flockName: 'Gas',
       flockRole: 'leader'
     });
 
-    // Test removing assignment
     saveProfileFlock('ProfileBot', '', false);
-    expect(mockSettings.flock?.assignments?.ProfileBot).toBeUndefined();
+    expect(mockAssignments['ProfileBot']).toBeUndefined();
   });
 
   test('removeBotFromFlock removes assignment', () => {
-    mockSettings.flock = { assignments: { 'TestBot': { flockEnabled: true, flockName: 'Rad', flockRole: 'follower' } } };
+    mockAssignments['TestBot'] = { flockEnabled: true, flockName: 'Rad', flockRole: 'follower' };
 
     removeBotFromFlock('TestBot');
 
-    expect(mockSettings.flock?.assignments?.TestBot).toBeUndefined();
+    expect(mockAssignments['TestBot']).toBeUndefined();
     expect(mockSend).toHaveBeenCalledWith({
       type: 'saveSettings',
       routine: 'flock',
@@ -245,7 +236,7 @@ describe('Flock Settings Frontend Logic', () => {
   });
 
   test('buildFlockGroupRows generates correct HTML', () => {
-    mockSettings.flock = { flockGroups: testGroups };
+    mockGroups = testGroups;
 
     const rows = buildFlockGroupRows();
 
@@ -260,7 +251,7 @@ describe('Flock Settings Frontend Logic', () => {
   });
 
   test('buildFlockAssignmentsRows generates correct HTML', () => {
-    mockSettings.flock = { assignments: testAssignments };
+    mockAssignments = testAssignments;
 
     const rows = buildFlockAssignmentsRows();
 
@@ -272,7 +263,7 @@ describe('Flock Settings Frontend Logic', () => {
   });
 
   test('buildFlockAssignmentsRows shows empty message when no assignments', () => {
-    mockSettings.flock = { assignments: {} };
+    mockAssignments = {};
 
     const rows = buildFlockAssignmentsRows();
 
@@ -295,14 +286,10 @@ describe('Flock Settings Frontend Logic', () => {
     assignBotToFlock('Anagene Ayers', 'Rad', 'leader');
     assignBotToFlock('Becky Bray', 'Rad', 'follower');
 
-    expect(mockSettings).toEqual({
-      flock: {
-        flockGroups: testGroups,
-        assignments: {
-          'Anagene Ayers': { flockEnabled: true, flockName: 'Rad', flockRole: 'leader' },
-          'Becky Bray': { flockEnabled: true, flockName: 'Rad', flockRole: 'follower' }
-        }
-      }
+    expect(mockGroups).toEqual(testGroups);
+    expect(mockAssignments).toEqual({
+      'Anagene Ayers': { flockEnabled: true, flockName: 'Rad', flockRole: 'leader' },
+      'Becky Bray': { flockEnabled: true, flockName: 'Rad', flockRole: 'follower' }
     });
   });
 });

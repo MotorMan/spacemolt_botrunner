@@ -181,12 +181,19 @@ export function isPirateSystem(systemId: string): boolean {
 }
 
 /** Returns true if stationId is on the approved fuel list (or list is empty/unset = allow all).
- *  Reads from bot.settings.general.approvedFuelStations (string[] of station ids). */
-export function isApprovedFuelStation(stationId: string, settings: any): boolean {
+ *  Reads from bot.settings.general.approvedFuelStations (string[] of "system|poiId" or plain poiId entries).
+ *  When systemId is provided, matches "system|poiId" entries exactly; poiId-only entries always match. */
+export function isApprovedFuelStation(stationId: string, settings: any, systemId?: string): boolean {
   const general = settings?.general || {};
   const approved: string[] | undefined = general.approvedFuelStations;
   if (!approved || approved.length === 0) return true;
-  return approved.includes(stationId);
+  if (approved.includes(stationId)) return true;
+  if (systemId) {
+    const combined = `${systemId}|${stationId}`;
+    return approved.includes(combined);
+  }
+  // No systemId: check if any entry is "system|stationId" format
+  return approved.some(a => a.endsWith(`|${stationId}`));
 }
 
 /** Find a station with a salvage yard service. Returns null if none found. */
@@ -710,9 +717,19 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
   // Check if current station has refuel service
   const { pois } = await getSystemInfo(ctx);
   const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+  if (currentStation) {
+    if (!isApprovedFuelStation(currentStation.id, bot.settings, bot.system)) {
+      ctx.log("system", `Station ${currentStation.name} is not on approved fuel list — skipping refuel here`);
+      return;
+    }
+  }
   if (currentStation?.services && currentStation.services.refuel === false) {
     const refuelStation = findStation(pois, "refuel");
     if (refuelStation && refuelStation.id !== currentStation.id) {
+      if (!isApprovedFuelStation(refuelStation.id, bot.settings, bot.system)) {
+        ctx.log("system", `Refuel station ${refuelStation.name} is not in approved fuel list — skipping`);
+        return;
+      }
       await bot.exec("undock");
       bot.docked = false;
       await bot.exec("travel", { target_poi: refuelStation.id });
@@ -1238,19 +1255,34 @@ export async function ensureFueled(
     }
   }
 
-  // ── STEP 5: Find nearest known station with fuel (respect approved + actual fuel level) ────────────────────────
-  ctx.log("system", "No station in current system — searching known map for nearest station...");
+  // ── STEP 5: Find nearest approved station with fuel ────────────────────────
+  ctx.log("system", "No station in current system — searching known map for nearest approved station...");
   const blacklist = getSystemBlacklist();
-  let nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
-  // Enforce approvedFuelStations if configured
   const settings = (ctx as any).bot?.settings || {};
-  if (nearest && !isApprovedFuelStation(nearest.poiId, settings)) {
-    // try next one by re-querying without the bad one (simple: fall back to any other)
-    nearest = null; // will hit emergency or continue search below
-  }
-  if (!nearest) {
-    ctx.log("error", "No known station in mapped systems — emergency recovery...");
-    return await emergencyFuelRecovery(ctx);
+  const general = settings?.general || {};
+  const approvedFuelStations: string[] | undefined = general.approvedFuelStations;
+  let nearest: { systemId: string; poiId: string; poiName: string; hops: number } | null = null;
+  if (approvedFuelStations && approvedFuelStations.length > 0) {
+    const approvedSet = new Set<string>();
+    for (const entry of approvedFuelStations) {
+      approvedSet.add(entry);
+      const parts = entry.split("|");
+      if (parts.length === 2) approvedSet.add(parts[1]);
+    }
+    nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet);
+    if (!nearest) {
+      ctx.log("error", "No known approved station reachable — emergency recovery...");
+      return await emergencyFuelRecovery(ctx);
+    }
+    ctx.log("travel", `Nearest approved station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)`);
+  } else {
+    // No approved list configured — allow all (original behavior)
+    nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
+    if (!nearest) {
+      ctx.log("error", "No known station in mapped systems — emergency recovery...");
+      return await emergencyFuelRecovery(ctx);
+    }
+    ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)`);
   }
 
   // Check live fuel level via get_poi (base.fuel) or dock fuel_warning before committing
@@ -1962,6 +1994,12 @@ export async function refuelAtStation(
 ): Promise<boolean> {
   const { bot } = ctx;
   await bot.refreshStatus();
+
+  if (!isApprovedFuelStation(station.id, bot.settings, bot.system)) {
+    ctx.log("system", `Refuel skipped at ${station.name} — not on approved fuel list`);
+    return false;
+  }
+
   const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (fuelPct >= thresholdPct) return true;
 
@@ -2031,8 +2069,8 @@ export async function refuelAtStation(
 
   await bot.refreshStatus();
   newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  if (newFuelPct < 10) {
-    ctx.log("error", `Fuel critically low (${newFuelPct}%) — staying docked at ${station.name}`);
+  if (newFuelPct < thresholdPct) {
+    ctx.log("error", `Could not refuel at ${station.name} — fuel still at ${newFuelPct}% (threshold: ${thresholdPct}%)`);
     return false;
   }
 
@@ -2988,6 +3026,7 @@ export function writeSettings(updates: Record<string, Record<string, unknown>>):
 
   // Deep merge: update each routine section
   for (const [key, val] of Object.entries(updates)) {
+    if (key === "flock") continue;
     existing[key] = { ...(existing[key] || {}), ...val };
   }
 
@@ -4178,7 +4217,199 @@ export function parsePiratesFromBattleParticipants(battleParticipants: unknown[]
   };
 }
 
-// ── Customs Inspection ───────────────────────────────────────
+// ── Fleet Commands ───────────────────────────────────────────
+
+export interface FleetMember {
+  player_id: string;
+  username: string;
+  is_leader: boolean;
+  system_id?: string;
+  poi_id?: string;
+  ship?: Record<string, unknown>;
+  modules?: Array<Record<string, unknown>>;
+  fuel_per_jump?: number;
+  cargo?: Array<Record<string, unknown>>;
+}
+
+export interface FleetStatusResponse {
+  action: string;
+  in_fleet: boolean;
+  fleet_id: string;
+  leader: string;
+  is_leader: boolean;
+  members: FleetMember[];
+  max_size: number;
+  system_id: string;
+  poi_id: string;
+  pending_invite?: boolean;
+  invites?: Array<{ player_id: string; username: string }>;
+}
+
+export interface FleetCreateResponse {
+  action: string;
+  fleet_id: string;
+  max_size: number;
+  message: string;
+}
+
+export async function fleetCreate(ctx: RoutineContext): Promise<{ success: boolean; fleetId?: string; message: string }> {
+  const { bot } = ctx;
+  const resp = await bot.exec("fleet", { action: "create" });
+  if (resp.error) {
+    return { success: false, message: resp.error.message };
+  }
+  const result = resp.result as Record<string, unknown>;
+  const structuredContent = (result?.structuredContent as FleetCreateResponse) || result;
+  return {
+    success: true,
+    fleetId: structuredContent.fleet_id as string,
+    message: structuredContent.message as string,
+  };
+}
+
+export interface FleetInviteResponse {
+  action: string;
+  fleet_id: string;
+  message: string;
+  invited: string[];
+}
+
+export async function fleetStatus(ctx: RoutineContext): Promise<FleetStatusResponse | null> {
+  const { bot } = ctx;
+  const resp = await bot.exec("fleet", { action: "status" });
+  if (resp.error) {
+    return null;
+  }
+  const result = resp.result as Record<string, unknown>;
+  const structuredContent = (result?.structuredContent as FleetStatusResponse) || result;
+  return structuredContent;
+}
+
+export async function fleetInvite(ctx: RoutineContext, playerId: string): Promise<{ success: boolean; message: string }> {
+  const { bot } = ctx;
+  const resp = await bot.exec("fleet", { action: "invite", id: playerId });
+  if (resp.error) {
+    return { success: false, message: resp.error.message };
+  }
+  const result = resp.result as Record<string, unknown>;
+  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
+  return {
+    success: true,
+    message: structuredContent.message as string,
+  };
+}
+
+export async function fleetKick(ctx: RoutineContext, playerId: string): Promise<{ success: boolean; message: string }> {
+  const { bot } = ctx;
+  const resp = await bot.exec("fleet", { action: "kick", id: playerId });
+  if (resp.error) {
+    return { success: false, message: resp.error.message };
+  }
+  const result = resp.result as Record<string, unknown>;
+  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
+  return {
+    success: true,
+    message: structuredContent.message as string,
+  };
+}
+
+export async function fleetLeave(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
+  const { bot } = ctx;
+  const resp = await bot.exec("fleet", { action: "leave" });
+  if (resp.error) {
+    return { success: false, message: resp.error.message };
+  }
+  const result = resp.result as Record<string, unknown>;
+  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
+  return {
+    success: true,
+    message: structuredContent.message as string,
+  };
+}
+
+export async function fleetDisband(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
+  const { bot } = ctx;
+  const resp = await bot.exec("fleet", { action: "disband" });
+  if (resp.error) {
+    return { success: false, message: resp.error.message };
+  }
+  const result = resp.result as Record<string, unknown>;
+  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
+  return {
+    success: true,
+    message: structuredContent.message as string,
+  };
+}
+
+export async function fleetAccept(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
+  const { bot } = ctx;
+  const resp = await bot.exec("fleet", { action: "accept" });
+  if (resp.error) {
+    return { success: false, message: resp.error.message };
+  }
+  const result = resp.result as Record<string, unknown>;
+  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
+  return {
+    success: true,
+    message: structuredContent.message as string,
+  };
+}
+
+export async function fleetDecline(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
+  const { bot } = ctx;
+  const resp = await bot.exec("fleet", { action: "decline" });
+  if (resp.error) {
+    return { success: false, message: resp.error.message };
+  }
+  const result = resp.result as Record<string, unknown>;
+  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
+  return {
+    success: true,
+    message: structuredContent.message as string,
+  };
+}
+
+export async function fleetJump(ctx: RoutineContext, targetSystem: string): Promise<{ success: boolean; message: string }> {
+  const { bot } = ctx;
+  const resp = await bot.exec("fleet", { action: "jump", target_system: targetSystem });
+  if (resp.error) {
+    return { success: false, message: resp.error.message };
+  }
+  return { success: true, message: "Fleet jump commanded" };
+}
+
+export async function fleetDock(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
+  const { bot } = ctx;
+  const resp = await bot.exec("fleet", { action: "dock" });
+  if (resp.error) {
+    return { success: false, message: resp.error.message };
+  }
+  return { success: true, message: "Fleet dock commanded" };
+}
+
+export async function fleetUndock(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
+  const { bot } = ctx;
+  const resp = await bot.exec("fleet", { action: "undock" });
+  if (resp.error) {
+    return { success: false, message: resp.error.message };
+  }
+  return { success: true, message: "Fleet undock commanded" };
+}
+
+export function getFleetMemberByUsername(status: FleetStatusResponse | null, username: string): FleetMember | null {
+  if (!status?.members) return null;
+  const lower = username.toLowerCase();
+  return status.members.find(m => m.username.toLowerCase() === lower) || null;
+}
+
+export function isFleetLeader(status: FleetStatusResponse | null, username: string): boolean {
+  if (!status) return false;
+  if (status.is_leader) return true;
+  const member = getFleetMemberByUsername(status, username);
+  return member?.is_leader ?? false;
+}
+
+// ── Customs Inspection ───────────────────────────────────────────
 
 /**
  * Check for customs inspection when entering a new system.

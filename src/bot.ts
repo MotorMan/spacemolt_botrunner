@@ -44,9 +44,10 @@ export interface BotStatus {
   docked: boolean;
   lastAction: string;
   error: string | null;
-   shipName: string;
-   shipClass: string;
-   hull: number;
+  shipName: string;
+  shipClass: string;
+  tier: number | null;
+  hull: number;
   maxHull: number;
   shield: number;
   maxShield: number;
@@ -118,10 +119,11 @@ export class Bot {
   location = "unknown";
   system = "unknown";
   poi = "";
-  docked = false;
-   shipName = "";
-   shipClass = "";
-   hull = 0;
+docked = false;
+  shipName = "";
+  shipClass = "";
+  tier: number | null = null;
+  hull = 0;
   maxHull = 0;
   shield = 0;
   maxShield = 0;
@@ -863,6 +865,7 @@ export class Bot {
         const shipType = (ship.ship_type as string) || (ship.type as string) || "";
         this.shipName = (rawName && rawName.toLowerCase() !== "unnamed" ? rawName : shipType) || this.shipName;
         this.shipClass = shipType;
+        this.tier = (ship.tier as number) ?? null;
         this.fuel = (ship.fuel as number) ?? this.fuel;
         this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
         this.cargo = (ship.cargo_used as number) ?? this.cargo;
@@ -2489,9 +2492,10 @@ export class Bot {
       docked: this.docked,
       lastAction: this._lastAction,
       error: this._error,
-       shipName: this.shipName,
-       shipClass: this.shipClass,
-       hull: this.hull,
+      shipName: this.shipName,
+      shipClass: this.shipClass,
+      tier: this.tier,
+      hull: this.hull,
       maxHull: this.maxHull,
       shield: this.shield,
       maxShield: this.maxShield,

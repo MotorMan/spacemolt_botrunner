@@ -24,6 +24,7 @@
        <div class="top-tab" data-tab="players" onclick="switchTab('players')">Players</div>
        <div class="top-tab" data-tab="shipsforsale" onclick="switchTab('shipsforsale')">Ships For Sale</div>
        <div class="top-tab" data-tab="settings" onclick="switchTab('settings')">Settings</div>
+       <div class="top-tab" data-tab="fa" onclick="switchTab('fa')">FA</div>
     </div>
   </div>
   <div class="header-right">
@@ -484,12 +485,17 @@
      <iframe id="playersFrame" src="/players.html"></iframe>
    </div>
 
-   <!-- ══ Ships For Sale Tab ══ -->
-   <div class="tab-page" id="page-shipsforsale">
-     <iframe id="shipsforsaleFrame" src="/shipsforsale.html"></iframe>
-   </div>
+    <!-- ══ Ships For Sale Tab ══ -->
+    <div class="tab-page" id="page-shipsforsale">
+      <iframe id="shipsforsaleFrame" src="/shipsforsale.html"></iframe>
+    </div>
 
-<!-- ══ Stats Tab ══ -->
+    <!-- ══ Forensic Analysis Tab ══ -->
+    <div class="tab-page" id="page-fa">
+      <iframe id="faFrame" src="/fa.html"></iframe>
+    </div>
+
+  <!-- ══ Stats Tab ══ -->
    <div class="tab-page" id="page-stats">
      <div class="stats-page-header">
        <h3>Fleet Statistics</h3>
@@ -695,6 +701,7 @@ let ws = null;
 let bots = [];
 let routines = [];
 let settings = {};
+let flockSettings = { flockGroups: [], assignments: {} };
 let knownSystems = [];
 let knownOres = [];
 let mobileCapitol = null;     // { systemId, systemName, poiId, discoveredAt }
@@ -840,6 +847,10 @@ function switchTab(name) {
     const frame = document.getElementById('shipsforsaleFrame');
     if (frame) frame.src = frame.src;
   }
+  if (name === 'fa') {
+    const frame = document.getElementById('faFrame');
+    if (frame) frame.src = frame.src;
+  }
 }
 
 // ── WebSocket ──────────────────────────────────────────────
@@ -848,17 +859,20 @@ let wsInitTimer = null;
 /** Fetch initial data via REST API as fallback if WebSocket is slow */
 async function fetchInitialData() {
   try {
-    const [botsRes, discoveredRes, routinesRes, settingsRes, mapRes, statsRes, catalogRes, mainLogsRes, factionStorageRes] = await Promise.all([
+    const [botsRes, discoveredRes, routinesRes, settingsRes, flockRes, mapRes, statsRes, catalogRes, mainLogsRes, factionStorageRes] = await Promise.all([
       fetch('/api/bots').then(r => r.json()),
       fetch('/api/bots/discovered').then(r => r.json()),
       fetch('/api/routines').then(r => r.json()),
       fetch('/api/settings').then(r => r.json()),
+      fetch('/api/flock/settings').then(r => r.json()).catch(() => ({ flockGroups: [], assignments: {} })),
       fetch('/data/map.json').then(r => r.json()),
       fetch('/api/stats').then(r => r.json()),
       fetch('/api/catalog').then(r => r.json()),
       fetch('/api/logs/main').then(r => r.json()),
       fetch('/api/faction-storage').then(r => r.json()).catch(() => ({ items: [] })), // Best effort
     ]);
+    settings = settingsRes || {};
+    flockSettings = flockRes || { flockGroups: [], assignments: {} };
 
     // Merge discovered bots with status data (discovered gives us usernames even if not logged in)
     const statusBots = botsRes || [];
@@ -2476,9 +2490,9 @@ function renderProfileTopbar() {
   }
 
   // Add flock controls
-  const flockAssignments = settings.flock?.assignments || {};
+  const flockAssignments = flockSettings.assignments || {};
   const botFlock = flockAssignments[bot.username];
-  const flockGroups = settings.flock?.flockGroups || [];
+  const flockGroups = flockSettings.flockGroups || [];
   const flockOpts = [`<option value=""${!botFlock?.flockName ? ' selected' : ''}>None</option>`];
   for (const group of flockGroups) {
     const sel = group.name === botFlock?.flockName ? ' selected' : '';
@@ -2698,22 +2712,21 @@ function saveProfileFlock() {
   const flockName = flockSel.value;
   const isLeader = leaderChk.checked;
 
-  if (!settings.flock) settings.flock = {};
-  if (!settings.flock.assignments) settings.flock.assignments = {};
+  if (!flockSettings.assignments) flockSettings.assignments = {};
 
   if (flockName) {
-    settings.flock.assignments[bot.username] = {
+    flockSettings.assignments[bot.username] = {
       flockEnabled: true,
       flockName: flockName,
       flockRole: isLeader ? 'leader' : 'follower'
     };
   } else {
-    delete settings.flock.assignments[bot.username];
+    delete flockSettings.assignments[bot.username];
   }
 
   send({ type: 'saveSettings', routine: 'flock', settings: {
-    flockGroups: settings.flock.flockGroups || [],
-    assignments: settings.flock.assignments
+    flockGroups: flockSettings.flockGroups || [],
+    assignments: flockSettings.assignments
   } });
 }
 
@@ -15007,7 +15020,7 @@ function saveExplorerBotFocus(botName) {
 // ── Flock Mining Helpers ──────────────────────────────────────────
 
 function buildFlockGroupRows() {
-  const groups = settings.flock?.flockGroups || [];
+  const groups = flockSettings.flockGroups || [];
   let rows = '';
   for (const group of groups) {
     rows += `<tr data-flock-group="${esc(group.name)}">
@@ -15029,7 +15042,7 @@ function buildFlockGroupRows() {
 }
 
 function buildFlockGroupOptions(selectedName) {
-  const groups = settings.flock?.flockGroups || [];
+  const groups = flockSettings.flockGroups || [];
   let opts = '';
   for (const group of groups) {
     const selected = group.name === selectedName ? ' selected' : '';
@@ -15040,7 +15053,7 @@ function buildFlockGroupOptions(selectedName) {
 
 function buildFlockAssignmentsRows() {
   let rows = '';
-  const flockAssignments = settings.flock?.assignments || {};
+  const flockAssignments = flockSettings.assignments || {};
   for (const bot of bots) {
     const botSettings = flockAssignments[bot.username];
     if (botSettings && botSettings.flockEnabled && botSettings.flockName) {
@@ -15059,17 +15072,14 @@ function buildFlockAssignmentsRows() {
 }
 
 function removeBotFromFlock(botUsername) {
-  if (!settings.flock) settings.flock = {};
-  if (!settings.flock.assignments) settings.flock.assignments = {};
-  delete settings.flock.assignments[botUsername];
+  if (!flockSettings.assignments) flockSettings.assignments = {};
+  delete flockSettings.assignments[botUsername];
 
-  // Send to server
   send({ type: 'saveSettings', routine: 'flock', settings: {
-    flockGroups: settings.flock.flockGroups || [],
-    assignments: settings.flock.assignments
+    flockGroups: flockSettings.flockGroups || [],
+    assignments: flockSettings.assignments
   } });
 
-  // Refresh the assignments table
   document.getElementById('flock-assignments-tbody').innerHTML = buildFlockAssignmentsRows();
 }
 
@@ -15151,7 +15161,7 @@ async function loadFlockMembers(flockName) {
       if (state && state.members && state.members.length > 0) {
         const leader = state.leader || 'unknown';
         // Get maxMembers from the flock group config in settings
-        const flockGroup = (settings.flock?.flockGroups || []).find(g => g.name === flockName);
+        const flockGroup = (flockSettings.flockGroups || []).find(g => g.name === flockName);
         const maxMembers = flockGroup?.maxMembers;
         const membersList = state.members.map(m => {
           const isLeader = m === leader;
@@ -17359,11 +17369,10 @@ function assignBotToFlock() {
   }
 
   // Initialize flock assignments if not exists
-  if (!settings.flock) settings.flock = {};
-  if (!settings.flock.assignments) settings.flock.assignments = {};
+  if (!flockSettings.assignments) flockSettings.assignments = {};
 
   // Save assignment
-  settings.flock.assignments[botUsername] = {
+  flockSettings.assignments[botUsername] = {
     flockEnabled: true,
     flockName: flockName,
     flockRole: flockRole
@@ -17371,11 +17380,10 @@ function assignBotToFlock() {
 
   // Send to server
   send({ type: 'saveSettings', routine: 'flock', settings: {
-    flockGroups: settings.flock.flockGroups || [],
-    assignments: settings.flock.assignments
+    flockGroups: flockSettings.flockGroups || [],
+    assignments: flockSettings.assignments
   } });
 
-  // Refresh the assignments table
   document.getElementById('flock-assignments-tbody').innerHTML = buildFlockAssignmentsRows();
 
   // Clear the form
@@ -17411,10 +17419,9 @@ function saveFlockGroupingSettings() {
 
   send({ type: 'saveSettings', routine: 'flock', settings: {
     flockGroups: flockGroups,
-    assignments: settings.flock?.assignments || {}
+    assignments: flockSettings.assignments || {}
   } });
-  if (!settings.flock) settings.flock = {};
-  settings.flock.flockGroups = flockGroups;
+  flockSettings.flockGroups = flockGroups;
 }
 
 // ── Cargo Mover settings ────────────────────────────────────────
@@ -21270,3 +21277,5 @@ updateBandwidthDisplay(); // Initial update
 </script>
 </body>
 </html>
+
+

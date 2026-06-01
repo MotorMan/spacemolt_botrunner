@@ -50,10 +50,11 @@ import {
   engageInBattle,
 } from "./common.js";
 import {
+  readFlockSettings,
   readFlockState,
-  writeFlockState,
   registerFlockMember,
   unregisterFlockMember,
+  broadcastFlockHeartbeat,
   announceFlockTarget,
   updateFlockPhase,
   clearFlockState,
@@ -307,7 +308,7 @@ interface FlockGroupConfig {
   [key: string]: unknown; // Add index signature for compatibility
 }
 
-function getMinerSettings(username?: string): {
+async function getMinerSettings(username?: string): Promise<{
   miningType: MiningType;
   depositMode: DepositMode;
   depositFallback: DepositMode;
@@ -346,14 +347,14 @@ function getMinerSettings(username?: string): {
   flockName: string;
   flockRole: FlockRole;
   flockGroups: FlockGroupConfig[];
-} {
+}> {
   const all = readSettings();
   const m = all.miner || {};
+  const flockCfg = await readFlockSettings();
   let botOverrides = username ? (all[username] || {}) : {};
 
-  // Include flock assignments
-  if (username && all.flock?.flockAssignments && typeof all.flock.flockAssignments === 'object' && (all.flock.flockAssignments as any)[username]) {
-    botOverrides = { ...botOverrides, ...(all.flock.flockAssignments as any)[username] };
+  if (username && flockCfg.assignments[username]) {
+    botOverrides = { ...botOverrides, ...flockCfg.assignments[username] };
   }
 
   function parseDepositMode(val: unknown): DepositMode | null {
@@ -376,8 +377,8 @@ function getMinerSettings(username?: string): {
     return null;
   }
 
-  // Parse flock groups from settings
-  const rawFlockGroups = (all.flock?.flockGroups as FlockGroupConfig[]) || [];
+  // Parse flock groups from flock settings
+  const rawFlockGroups = flockCfg.flockGroups || [];
   const flockGroups: FlockGroupConfig[] = rawFlockGroups.map((g: Record<string, unknown>) => ({
     name: (g.name as string) || "unnamed_flock",
     targetOre: (g.targetOre as string) || (g.target_ore as string) || "",
@@ -432,7 +433,7 @@ function getMinerSettings(username?: string): {
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
 
     // Flock mining settings
-    flockEnabled: (botOverrides.flockEnabled as boolean) ?? false,
+    flockEnabled: (botOverrides.flockEnabled === true || botOverrides.flockEnabled === "true"),
     flockName: (botOverrides.flockName as string) || "",
     flockRole: parseFlockRole(botOverrides.flockRole) ?? "follower",
     flockGroups,
@@ -1014,7 +1015,7 @@ export function findFirstAvailableQuotaTarget(
   quotas: Record<string, number>,
   factionStorage: Array<{ itemId: string; quantity: number }>,
   miningType: "ore" | "gas" | "ice" | "radioactive",
-  settings: ReturnType<typeof getMinerSettings>,
+  settings: Awaited<ReturnType<typeof getMinerSettings>>,
   mapStore: any,
   depletionTimeoutMs: number,
   canMineHiddenRadioactive: boolean,
@@ -1259,7 +1260,7 @@ async function signalEscort(
 /**
  * Dump all non-fuel cargo at the current station. Used when returning home early due to depletion.
  */
-async function dumpCargo(ctx: RoutineContext, settings: ReturnType<typeof getMinerSettings>): Promise<void> {
+async function dumpCargo(ctx: RoutineContext, settings: Awaited<ReturnType<typeof getMinerSettings>>): Promise<void> {
   const { bot } = ctx;
   await bot.refreshCargo();
   const cargoItems = bot.inventory.filter(i => {
@@ -1438,7 +1439,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
   await bot.refreshStatus();
-  const settings0 = getMinerSettings(bot.username);
+  const settings0 = await getMinerSettings(bot.username);
   const homeSystem = settings0.homeSystem || bot.system;
   const cargoThresholdRatio = settings0.cargoThreshold / 100;
 
@@ -1531,7 +1532,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       isFleeing: false,
     };
 
-    const settings = getMinerSettings(bot.username);
+    const settings = await getMinerSettings(bot.username);
     const cargoThresholdRatio = settings.cargoThreshold / 100;
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,
@@ -1596,12 +1597,15 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let flockMiningType: FlockState["miningType"] = "ore";
     let flockPhase: FlockState["phase"] = "gathering";
     let flockGroup: FlockGroupConfig | undefined;
+    let lastFlockHeartbeat = 0;
 
     if (settings.flockEnabled && settings.flockName) {
-      // Find the flock group config for this bot
       flockGroup = settings.flockGroups.find(g => g.name === settings.flockName);
-      
-      if (settings.flockRole === "leader") {
+
+      if (!flockGroup) {
+        ctx.log("warn", `Flock group "${settings.flockName}" not found — running solo`);
+
+      } else if (settings.flockRole === "leader") {
         isFlockLeader = true;
         ctx.log("flock", `Flock mode: LEADER of "${settings.flockName}"`);
         
@@ -1686,6 +1690,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           ctx.log("flock", `Following leader to: ${flockTargetPoiName || flockTargetSystemId || "TBD"} (${flockTargetResource || "any"}, ${flockMiningType})`);
         }
       }
+    }
+
+    // ── Leader: broadcast immediate heartbeat to let followers know we're alive ──
+    if (isFlockLeader && settings.flockEnabled && settings.flockName) {
+      await broadcastFlockHeartbeat(settings.flockName, bot.username);
+      lastFlockHeartbeat = Date.now();
     }
 
      // ── Re-evaluate mining type and target from settings each cycle ──
@@ -1961,7 +1971,12 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const { pois: currentPois } = await getSystemInfo(ctx);
         const currentStation = findStation(currentPois);
         if (currentStation) {
-          await refuelAtStation(ctx, currentStation, safetyOpts.fuelThresholdPct);
+          const refueled = await refuelAtStation(ctx, currentStation, safetyOpts.fuelThresholdPct);
+          if (!refueled) {
+            ctx.log("error", "Could not refuel before return — waiting for fuel to restock, will retry next cycle");
+            await ctx.sleep(30000);
+            continue;
+          }
         }
       }
       const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
@@ -2019,7 +2034,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       } else if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
         // Check if deep core quota is met
-        const settings = getMinerSettings(bot.username);
+        const settings = await getMinerSettings(bot.username);
         const quotas = settings.deepCoreQuotas;
         const targetQuota = quotas[effectiveTarget];
         if (targetQuota !== undefined) {
@@ -2746,7 +2761,7 @@ if (effectiveTarget) {
       }
 
       // Announce destination and signal escorts before jumping
-      const minerSettings = getMinerSettings(bot.username);
+      const minerSettings = await getMinerSettings(bot.username);
       // Send chat message to escort channel
       const chatChannel = getBotChatChannel();
       chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Going to ${targetSystemId}` });
@@ -2792,7 +2807,12 @@ if (effectiveTarget) {
         }
         const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!returnFueled && currentStationPoi) {
-          await refuelAtStation(ctx, currentStationPoi, safetyOpts.fuelThresholdPct);
+          const refueled = await refuelAtStation(ctx, currentStationPoi, safetyOpts.fuelThresholdPct);
+          if (!refueled) {
+            ctx.log("error", "Could not refuel before return — waiting for fuel to restock, will retry next cycle");
+            await ctx.sleep(30000);
+            continue;
+          }
         }
         
         const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
@@ -3195,7 +3215,12 @@ if (effectiveTarget) {
               }
               const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
               if (!returnFueled && stationPoi) {
-                await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+                const refueled = await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+                if (!refueled) {
+                  ctx.log("error", "Could not refuel before return — waiting for fuel to restock, will retry next cycle");
+                  await ctx.sleep(30000);
+                  continue;
+                }
               }
               const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
               if (!homeArrived) {
@@ -3307,7 +3332,12 @@ if (effectiveTarget) {
       }
       const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
       if (!returnFueled && stationPoi) {
-        await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+        const refueled = await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+        if (!refueled) {
+          ctx.log("error", "Could not refuel before travel to POI — waiting for fuel to restock, will retry next cycle");
+          await ctx.sleep(30000);
+          continue;
+        }
       }
       const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
       if (!homeArrived) {
@@ -3696,6 +3726,12 @@ if (effectiveTarget) {
     const BATTLE_CHECK_INTERVAL_MS = 8_000; // Check battle status every 8 seconds (< 1 game tick)
 
     while (bot.state === "running") {
+      const harvestNow = Date.now();
+      if (isFlockLeader && settings.flockEnabled && settings.flockName && (harvestNow - lastFlockHeartbeat) > 30_000) {
+        await broadcastFlockHeartbeat(settings.flockName, bot.username);
+        lastFlockHeartbeat = harvestNow;
+      }
+
       await bot.refreshStatus();
 
       const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
@@ -3904,7 +3940,12 @@ if (effectiveTarget) {
                     }
                     const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
                     if (!returnFueled && stationPoi) {
-                      await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+                      const refueled = await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+                      if (!refueled) {
+                        ctx.log("error", "Could not refuel before return — waiting for fuel to restock, will retry next cycle");
+                        await ctx.sleep(30000);
+                        continue;
+                      }
                     }
                     const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
                     if (!homeArrived) {
@@ -4094,11 +4135,24 @@ if (effectiveTarget) {
                           if (recoveredSession) {
                             await updateMiningSession(bot.username, { state: "returning_home" });
                           }
-                          const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-                          if (!returnFueled && stationPoi) {
-                            await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
-                          }
-                          const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+                     const returnFueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+                     if (!returnFueled && stationPoi) {
+                       const refueled = await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+                       if (!refueled) {
+                         ctx.log("error", "Could not refuel before return — waiting for fuel to restock, will retry next cycle");
+                         await ctx.sleep(30000);
+                         continue;
+                       }
+                     }
+      if (!returnFueled && stationPoi) {
+        const refueled = await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
+        if (!refueled) {
+          ctx.log("error", "Could not refuel before travel to POI — waiting for fuel to restock, will retry next cycle");
+          await ctx.sleep(30000);
+          continue;
+        }
+      }
+      const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
                           if (!homeArrived) {
                             ctx.log("error", "Failed to return to home system — will retry next cycle");
                           }
@@ -5336,7 +5390,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     yield "dock";
 
     // Signal escorts that we're docking (they should stay on patrol)
-    const minerDockSettings = getMinerSettings(bot.username);
+    const minerDockSettings = await getMinerSettings(bot.username);
     await signalEscort(ctx, "dock", undefined, "chat");
 
     // Signal flock that we're docking
@@ -5509,6 +5563,11 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     await bot.refreshStatus();
     const endFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Cycle done — ${bot.credits} credits, ${endFuel}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
+
+    if (isFlockLeader && settings.flockEnabled && settings.flockName) {
+      await broadcastFlockHeartbeat(settings.flockName, bot.username);
+      lastFlockHeartbeat = Date.now();
+    }
   }
 
   // Unregister chat handler

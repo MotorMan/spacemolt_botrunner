@@ -209,6 +209,20 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
   const s = action.settings;
   if (!routine || !s) return { ok: false, error: "Routine and settings required" };
 
+  if (routine === "flock") {
+    const { writeFileSync, existsSync, mkdirSync } = await import("fs");
+    const { join } = await import("path");
+    const flockFile = join(process.cwd(), "data", "flock.json");
+    const dir = join(process.cwd(), "data");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const current = existsSync(flockFile) ? JSON.parse(require("fs").readFileSync(flockFile, "utf-8")) : { flockGroups: [], assignments: {} };
+    if (s.flockGroups !== undefined) current.flockGroups = s.flockGroups;
+    if (s.assignments !== undefined) current.assignments = s.assignments;
+    writeFileSync(flockFile, JSON.stringify(current, null, 2) + "\n", "utf-8");
+    server.logSystem(`Flock settings saved`);
+    return { ok: true, message: `flock settings saved` };
+  }
+
   server.saveRoutineSettings(routine, s);
   server.logSystem(`Settings saved for ${routine}`);
   return { ok: true, message: `${routine} settings saved`, settings: server.settings };

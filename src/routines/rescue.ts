@@ -1772,9 +1772,12 @@ skipToReturnHome = true;
       if (targets.length === 0) {
         if (!isMaydayRescuePrimary) {
           const ignoredMayday = getNextMayday();
-          if (ignoredMayday) markMaydayHandled(ignoredMayday);
-          await ctx.sleep(5000);
-          continue;
+          if (ignoredMayday) {
+            markMaydayHandled(ignoredMayday);
+            await ctx.sleep(5000);
+            continue;
+          }
+          // No pending MAYDAY — fall through to idle/return-home check below
         }
         const mayday = getNextMayday();
         if (mayday) {
@@ -1786,6 +1789,7 @@ skipToReturnHome = true;
           if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (rapid-fire protection)`);
             markMaydayHandled(mayday);
+            markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
             continue;
           }
           // Mark as received IMMEDIATELY to catch subsequent rapid duplicates
@@ -4921,9 +4925,12 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
       if (targets.length === 0) {
         if (!isMaydayRescuePrimary) {
           const ignoredMayday = getNextMayday();
-          if (ignoredMayday) markMaydayHandled(ignoredMayday);
-          await ctx.sleep(5000);
-          continue;
+          if (ignoredMayday) {
+            markMaydayHandled(ignoredMayday);
+            await ctx.sleep(5000);
+            continue;
+          }
+          // No pending MAYDAY — fall through to idle/return-home check below
         }
         const mayday = getNextMayday();
         if (mayday) {

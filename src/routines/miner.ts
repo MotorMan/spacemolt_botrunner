@@ -341,6 +341,7 @@ async function getMinerSettings(username?: string): Promise<{
   stayOutUntilFull: boolean;
     maxJumps: number;
     minimumFuelCells: number;
+    noMidMiningRetarget: boolean;
 
   // Flock mining settings
   flockEnabled: boolean;
@@ -431,6 +432,7 @@ async function getMinerSettings(username?: string): Promise<{
     stayOutUntilFull: (m.stayOutUntilFull as boolean) ?? false,
     maxJumps: (m.maxJumps as number) ?? 10,
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
+    noMidMiningRetarget: (m.noMidMiningRetarget as boolean) ?? false,
 
     // Flock mining settings
     flockEnabled: (botOverrides.flockEnabled === true || botOverrides.flockEnabled === "true"),
@@ -1510,9 +1512,21 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
   }
 
-  // ── Startup: accept missions ──
-  await completeActiveMissions(ctx);
-  await checkAndAcceptMinerMissions(ctx);
+   // ── Startup: accept missions ──
+   await completeActiveMissions(ctx);
+   await checkAndAcceptMinerMissions(ctx);
+
+   // ── Startup: unload cargo if docked at home with existing cargo ──
+   if (bot.docked && bot.system === homeSystem) {
+     await bot.refreshCargo();
+     const nonFuelCargo = bot.inventory.filter(
+       i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell")
+     );
+     if (nonFuelCargo.length > 0) {
+       ctx.log("mining", `Startup: found ${nonFuelCargo.length} cargo items docked at home — unloading`);
+       await dumpCargo(ctx, settings0);
+     }
+   }
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -2417,18 +2431,58 @@ if (effectiveTarget) {
           targetSystemId = bot.system;
         }
       } else {
-        // Use new scoring system that factors in remaining resources, depletion, and distance
         const blacklist = getSystemBlacklist();
-        let scoredLocations = mapStore.findBestMiningLocation(effectiveTarget, bot.system, blacklist)
-          .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId)) // keep only valid type/non-depleted
-          .map(loc => {
-            const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-            const jumps = route ? route.length - 1 : 999;
-            return { ...loc, jumps };
-          })
-          .filter(loc => loc.jumps <= maxJumps);
+        let scoredLocations: Array<{
+          systemId: string;
+          systemName: string;
+          poiId: string;
+          poiName: string;
+          resourceId: string;
+          totalMined: number;
+          hasStation: boolean;
+          remaining: number;
+          maxRemaining: number;
+          depletionPercent: number;
+          minutesSinceScan: number;
+          jumpsAway: number;
+          isHidden: boolean;
+          richness: number;
+          score: number;
+          jumps: number;
+        }> = [];
 
-        if (scoredLocations.length === 0) {
+        if (configuredSystem) {
+          const isCommonOre = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
+          const systemLocations = (isCommonOre
+            ? mapStore.findClosestMiningLocationsInSystem(effectiveTarget, configuredSystem, bot.system, blacklist)
+            : mapStore.findBestMiningLocationInSystem(effectiveTarget, configuredSystem, bot.system, blacklist))
+            .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+            .map(loc => {
+              const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+              const jumps = route ? route.length - 1 : 999;
+              return { ...loc, jumps };
+            });
+
+          if (systemLocations.length > 0) {
+            scoredLocations = systemLocations;
+          } else {
+            ctx.log("warn", `Configured system ${configuredSystem} has no valid ${effectiveTarget} POIs — mining locally instead`);
+            scoredLocations = [];
+            targetSystemId = bot.system;
+          }
+        } else {
+          const scoredLocationsLocal = mapStore.findBestMiningLocation(effectiveTarget, bot.system, blacklist)
+            .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+            .map(loc => {
+              const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+              const jumps = route ? route.length - 1 : 999;
+              return { ...loc, jumps };
+            })
+            .filter(loc => loc.jumps <= maxJumps);
+          scoredLocations = scoredLocationsLocal;
+        }
+
+        if (scoredLocations.length === 0 && !configuredSystem) {
           ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
           targetSystemId = bot.system;
 
@@ -2573,36 +2627,20 @@ if (effectiveTarget) {
             }
           }
 
-          // CRITICAL FIX: Always prefer configured harvesting system if set (manual override)
-          let chosenLoc: typeof scoredLocations[0] | undefined;
-          if (configuredSystem) {
-            chosenLoc = scoredLocations.find(loc => loc.systemId === configuredSystem);
-            if (chosenLoc) {
-              const hiddenTag = chosenLoc.isHidden ? " [HIDDEN POI]" : "";
-              const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available, richness: ${chosenLoc.richness})`;
-              ctx.log("mining", `Found ${effectiveTarget} in configured harvesting system ${configuredSystem} (${chosenLoc.jumps} jumps)${hiddenTag} ${scanInfo} — manual override active`);
-            }
-          }
-          // If no location in configured system, prefer current system (0 jumps)
-          if (!chosenLoc) {
-            chosenLoc = scoredLocations.find(loc => loc.systemId === bot.system);
-            if (chosenLoc) {
-              const hiddenTag = chosenLoc.isHidden ? " [HIDDEN POI]" : "";
-              const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available, richness: ${chosenLoc.richness})`;
-              ctx.log("mining", `Found ${effectiveTarget} in current system ${bot.system}${hiddenTag} ${scanInfo}`);
-            }
-          }
-          // Pick best scored location (already sorted by composite score)
-          if (!chosenLoc) {
-            chosenLoc = scoredLocations[0];
-            const hiddenTag = chosenLoc.isHidden ? " [HIDDEN POI]" : "";
-            const scanInfo = chosenLoc.minutesSinceScan === Infinity ? "(never scanned)" : `(${chosenLoc.remaining.toLocaleString()}/${chosenLoc.maxRemaining.toLocaleString()}, ${chosenLoc.depletionPercent.toFixed(1)}% available, richness: ${chosenLoc.richness}, score: ${chosenLoc.score})`;
-            ctx.log("mining", `Selected ${effectiveTarget} at ${chosenLoc.poiName} in ${chosenLoc.systemName} (${chosenLoc.jumps} jumps)${hiddenTag} ${scanInfo}`);
+          // CRITICAL: With no configured system, pick the top remaining scored location.
+          // Any upgrades within a session are already bounded by scoredLocations[] created above.
+          const chosenLoc = scoredLocations.length > 0 ? scoredLocations[0] : undefined;
+
+          if (!chosenLoc && !configuredSystem) {
+            ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
+            targetSystemId = bot.system;
           }
 
-          targetSystemId = chosenLoc.systemId;
-          targetPoiId = chosenLoc.poiId;
-          targetPoiName = chosenLoc.poiName;
+          if (chosenLoc) {
+            targetSystemId = chosenLoc.systemId;
+            targetPoiId = chosenLoc.poiId;
+            targetPoiName = chosenLoc.poiName;
+          }
 
           // Create mining session if we don't have one and we're targeting a specific POI
           if (!recoveredSession && targetPoiId) {
@@ -4074,13 +4112,14 @@ if (effectiveTarget) {
                 mapStore.markOreDepleted(bot.system, bot.poi, effectiveTarget);
                 
                 // If stayOutUntilFull is enabled and cargo is not full, search for new POI
-                if (settings.stayOutUntilFull) {
+                if (settings.stayOutUntilFull && !settings.noMidMiningRetarget) {
                   const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
                   if (fillRatio < cargoThresholdRatio) {
                     ctx.log("mining", "stayOutUntilFull enabled and cargo not full — searching for next POI...");
-                    // Search for next available POI with same target
+                    const searchSystem = configuredSystem || bot.system;
                     const newLocs = mapStore.findOreLocations(effectiveTarget).filter(loc => {
                       if (loc.poiId === bot.poi && loc.systemId === bot.system) return false; // Skip current POI
+                      if (loc.systemId !== searchSystem) return false; // HARD GATE: stay within configured system
                       const sys = mapStore.getSystem(loc.systemId);
                       const poi = sys?.pois.find(p => p.id === loc.poiId);
                       if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
@@ -4387,6 +4426,14 @@ if (effectiveTarget) {
           let newPoiId: string | null = null;
           let newPoiName: string | null = null;
           let newSystemId: string | null = null;
+
+          if (settings.noMidMiningRetarget) {
+            ctx.log("mining", "Mid-mining retarget is disabled — returning home to deposit (one round trip)");
+            stopReason = "no mid-mining retarget";
+            await failMiningSession(bot.username, stopReason);
+            recoveredSession = null;
+            break;
+          }
 
           const currentDeepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
           const isDeepCoreMiner = currentDeepCoreCap.canMineVisibleDeepCore;
@@ -5265,17 +5312,19 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
     const isDepleted = stopReason && stopReason.includes("depleted");
     const isFuelLowStop = stopReason && stopReason.includes("fuel low");
-    
+
     // CRITICAL FIX: When stopping due to fuel low mid-mining and stayOutUntilFull is enabled:
     // - Don't deposit cargo at the refuel station
     // - Refuel and continue mining instead of returning home
     // This prevents depositing at random stations during refuel detours
     const isCargoFull = fillRatio >= cargoThresholdRatio;
     const shouldStayOutDueToFuel = isFuelLowStop && settings.stayOutUntilFull && !isCargoFull;
-    
-    const shouldReturnHome = settings.stayOutUntilFull
-      ? ((fillRatio >= cargoThresholdRatio || isDepleted) && bot.system !== homeSystem && homeSystem)
-      : (bot.system !== homeSystem && homeSystem);
+
+    const shouldReturnHome = settings.noMidMiningRetarget
+      ? (bot.system !== homeSystem && homeSystem)
+      : (settings.stayOutUntilFull
+        ? ((fillRatio >= cargoThresholdRatio || isDepleted) && bot.system !== homeSystem && homeSystem)
+        : (bot.system !== homeSystem && homeSystem));
 
     if (shouldStayOutDueToFuel) {
       // CRITICAL FIX: Fuel low stop with stayOutUntilFull enabled - refuel and continue mining

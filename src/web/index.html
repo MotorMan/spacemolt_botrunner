@@ -15559,23 +15559,15 @@ function renderMinerSettings(panel) {
       </div>
     </div>
 
-    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+	<div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
       <div class="setting-row">
         <div>
-          <div class="setting-label">Depletion Timeout (Hours)</div>
-          <div class="setting-hint">How long to wait before re-checking depleted mining locations. Default is 3 hours.</div>
-        </div>
-        <input type="number" id="set-miner-depletionTimeoutHours" min="1" max="24" value="${settings.miner?.depletionTimeoutHours || 3}" style="width:80px" />
-      </div>
-
-      <div class="setting-row">
-        <div>
-          <div class="setting-label">Ignore Depletion Markings</div>
-          <div class="setting-hint">When enabled, miners will ignore depletion markings and continue mining at target POIs. Useful when multiple ores exist at a POI and one gets marked depleted prematurely.</div>
+          <div class="setting-label">No Mid-Mining Retargeting</div>
+          <div class="setting-hint">When enabled, miners will only do a single round trip: go out, mine, and return home. No retargeting to another POI mid-mining. Reduces refueling and stranding due to fuel cost of remote station travel.</div>
         </div>
         <label style="display:flex;align-items:center;gap:8px">
-          <input type="checkbox" id="set-miner-ignoreDepletion"${settings.miner?.ignoreDepletion ? ' checked' : ''} />
-          <span>Ignore depletion</span>
+          <input type="checkbox" id="set-miner-noMidMiningRetarget"${m.noMidMiningRetarget ? ' checked' : ''} />
+          <span>Disallow mid-mining retarget</span>
         </label>
       </div>
 
@@ -15585,7 +15577,7 @@ function renderMinerSettings(panel) {
           <div class="setting-hint">When enabled, miners will continue to the next POI with target ore instead of returning home when a POI is depleted. Saves time and fuel by staying out until cargo is full.</div>
         </div>
         <label style="display:flex;align-items:center;gap:8px">
-          <input type="checkbox" id="set-miner-stayOutUntilFull"${settings.miner?.stayOutUntilFull ? ' checked' : ''} />
+          <input type="checkbox" id="set-miner-stayOutUntilFull"${m.stayOutUntilFull ? ' checked' : ''} />
           <span>Stay out until cargo full</span>
         </label>
       </div>
@@ -15595,7 +15587,7 @@ function renderMinerSettings(panel) {
           <div class="setting-label">Max Jump Distance</div>
           <div class="setting-hint">Maximum number of jumps the miner will travel to reach a mining location. Prevents miners from traveling across the galaxy. Default is 10 jumps.</div>
         </div>
-        <input type="number" id="set-miner-maxJumps" min="1" max="100" value="${settings.miner?.maxJumps ?? 10}" style="width:80px" />
+        <input type="number" id="set-miner-maxJumps" min="1" max="100" value="${m.maxJumps ?? 10}" style="width:80px" />
       </div>
 
       <div class="setting-row">
@@ -15603,8 +15595,28 @@ function renderMinerSettings(panel) {
           <div class="setting-label">Minimum Fuel Cells</div>
           <div class="setting-hint">Minimum military fuel cells each miner must carry (military_fuel_cell = 100 fuel / 3 space). Default 20 prevents stranding at distant stations.</div>
         </div>
-        <input type="number" id="set-miner-minimumFuelCells" min="5" max="100" value="${settings.miner?.minimumFuelCells ?? 20}" style="width:80px" />
+        <input type="number" id="set-miner-minimumFuelCells" min="5" max="100" value="${m.minimumFuelCells ?? 20}" style="width:80px" />
       </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Depletion Timeout (Hours)</div>
+          <div class="setting-hint">How long to wait before re-checking depleted mining locations. Default is 3 hours.</div>
+        </div>
+        <input type="number" id="set-miner-depletionTimeoutHours" min="1" max="24" value="${m.depletionTimeoutHours ?? 3}" style="width:80px" />
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Ignore Depletion Markings</div>
+          <div class="setting-hint">When enabled, miners will ignore depletion markings and continue mining at target POIs. Useful when multiple ores exist at a POI and one gets marked depleted prematurely.</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="set-miner-ignoreDepletion"${m.ignoreDepletion ? ' checked' : ''} />
+          <span>Ignore depletion</span>
+        </label>
+      </div>
+    </div>
 
 
 
@@ -15861,6 +15873,7 @@ function saveMinerSettings() {
     repairThreshold: parseInt(document.getElementById('set-miner-repairThreshold').value) || 40,
     depletionTimeoutHours: parseInt(document.getElementById('set-miner-depletionTimeoutHours').value) || 3,
     ignoreDepletion: document.getElementById('set-miner-ignoreDepletion').checked,
+    noMidMiningRetarget: document.getElementById('set-miner-noMidMiningRetarget').checked,
     stayOutUntilFull: document.getElementById('set-miner-stayOutUntilFull').checked,
     maxJumps: parseInt(document.getElementById('set-miner-maxJumps').value) || 10,
     minimumFuelCells: parseInt(document.getElementById('set-miner-minimumFuelCells').value) || 20,

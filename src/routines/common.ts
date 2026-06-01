@@ -618,10 +618,7 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
   const { bot } = ctx;
   await bot.refreshStatus();
 
-  const fuelPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : bot.fuel;
-  if (fuelPct > 5) return true; // not actually stranded
-
-  ctx.log("error", "EMERGENCY: Stranded with no fuel — attempting recovery...");
+  ctx.log("error", "EMERGENCY: Fuel target not met — attempting recovery...");
 
   // First: scavenge nearby wrecks/containers for fuel cells
   if (!bot.docked) {
@@ -649,10 +646,8 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
       await collectFromStorage(ctx);
       await ensureInsured(ctx);
       await sellAllCargo(ctx);
-      await bot.refreshStatus();
-      const refuelResp = await bot.exec("refuel");
-      if (!refuelResp.error) {
-        await bot.refreshStatus();
+      await tryRefuel(ctx);
+      if (!bot.docked || bot.fuel >= 50) {
         ctx.log("system", `Recovery successful! Fuel: ${bot.fuel}/${bot.maxFuel}`);
         return true;
       }
@@ -662,10 +657,8 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
   // If docked but still can't refuel, sell cargo and try again
   if (bot.docked) {
     await sellAllCargo(ctx);
-    await bot.refreshStatus();
-    const refuelResp = await bot.exec("refuel");
-    if (!refuelResp.error) {
-      await bot.refreshStatus();
+    await tryRefuel(ctx);
+    if (bot.fuel >= 50) {
       ctx.log("system", `Recovery successful! Fuel: ${bot.fuel}/${bot.maxFuel}`);
       return true;
     }
@@ -682,9 +675,9 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
       }
       // Try selling + refueling each cycle
       await sellAllCargo(ctx);
-      const retryResp = await bot.exec("refuel");
-      if (!retryResp.error) {
-        await bot.refreshStatus();
+      await tryRefuel(ctx);
+      await bot.refreshStatus();
+      if (bot.fuel >= 50) {
         ctx.log("system", `Refuel succeeded after wait! Fuel: ${bot.fuel}/${bot.maxFuel}`);
         return true;
       }
@@ -1215,13 +1208,17 @@ export async function ensureFueled(
   // If we undocked and happened to be parked at a docking station, return there before
   // deciding whether to use station fuel or go elsewhere.
   if (wasDocked && dockingStation) {
-    ctx.log("system", `Returning to ${dockingStation.name} to attempt station refuel...`);
-    const trResp = await bot.exec("travel", { target_poi: dockingStation.id });
-    bot.poi = dockingStation.id;
-    const dResp = await bot.exec("dock");
-    if (!dResp.error || dResp.error.message.includes("already")) {
-      bot.docked = true;
-      await ensureInsured(ctx);
+    if (!isApprovedFuelStation(dockingStation.id, bot.settings, bot.system)) {
+      ctx.log("system", `${dockingStation.name} is not on approved fuel list — not returning there to refuel`);
+    } else {
+      ctx.log("system", `Returning to ${dockingStation.name} to attempt station refuel...`);
+      const trResp = await bot.exec("travel", { target_poi: dockingStation.id });
+      bot.poi = dockingStation.id;
+      const dResp = await bot.exec("dock");
+      if (!dResp.error || dResp.error.message.includes("already")) {
+        bot.docked = true;
+        await ensureInsured(ctx);
+      }
     }
   }
 
@@ -1395,10 +1392,15 @@ export async function ensureFueled(
 
   await bot.refreshStatus();
   newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+  if (newFuel < thresholdPct) {
+    ctx.log("error", `Could not refuel — fuel still at ${newFuel}% (threshold: ${thresholdPct}%)`);
+    return false;
+  }
+
   ctx.log("system", "Undocking...");
   await bot.exec("undock");
   bot.docked = false;
-  return newFuel >= 10;
+  return true;
 }
 
 // ── Cargo deposit ──────────────────────────────────────────

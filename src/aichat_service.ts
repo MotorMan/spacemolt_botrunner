@@ -1012,8 +1012,8 @@ export class AiChatService {
     isLastRound: boolean = false
   ): Promise<"sent" | "failed"> {
     // Check conversation limits (cooldown, consecutive responses)
-    // Use channel + human sender as key (not responder) so only one bot responds per conversation
-    const participants = [humanSender]; // Don't include responder - conversation is per channel+sender
+    // Use channel + human sender + responder as key so each bot tracks independently
+    const participants = [humanSender, responder.username];
     const limits = this.checkConversationLimits(msg.channel, participants);
     if (!limits.allowed) {
       this.logFn("ai_chat", `Skipping: ${limits.reason}`);

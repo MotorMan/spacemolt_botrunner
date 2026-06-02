@@ -1790,7 +1790,7 @@ skipToReturnHome = true;
           // This MUST happen first, before any other processing, to prevent MASS SPAM
           // when multiple MAYDAY messages arrive in quick succession
           if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
-            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (rapid-fire protection)`);
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (1-hour cooldown)`);
             markMaydayHandled(mayday);
             markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
             continue;
@@ -1799,7 +1799,7 @@ skipToReturnHome = true;
           // ── DECLINED MAYDAY CHECK: Prevent spam for already-declined rescues ──
           // This prevents the bot from sending multiple decline messages for the same MAYDAY
           if (isMaydayDeclined(mayday.sender, mayday.system, mayday.poi)) {
-            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - previously declined (5min cooldown)`);
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - previously declined (1-hour cooldown)`);
             markMaydayHandled(mayday);
             markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
             continue;
@@ -1807,7 +1807,7 @@ skipToReturnHome = true;
           
           // Mark as received IMMEDIATELY to catch subsequent rapid duplicates
           markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
-          ctx.log("mayday_debug", `📝 MAYDAY from ${mayday.sender} marked as received (5min cooldown active)`);
+          ctx.log("mayday_debug", `📝 MAYDAY from ${mayday.sender} marked as received (1-hour cooldown active)`);
 
           // Check if sender is a known player (from playerNames.json)
           const knownPlayer = isKnownPlayer(mayday.sender);
@@ -3950,7 +3950,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       // This MUST happen first, before any other processing, to prevent MASS SPAM
       // when multiple MAYDAY messages arrive in quick succession
       if (isMaydayDuplicate(bot.username, nextMayday.sender, nextMayday.system, nextMayday.poi)) {
-        ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - duplicate detected (rapid-fire protection)`);
+        ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - duplicate detected (1-hour cooldown)`);
         markMaydayHandled(nextMayday);
         continue;
       }
@@ -3958,14 +3958,14 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       // ── DECLINED MAYDAY CHECK: Prevent spam for already-declined rescues ──
       // This prevents the bot from sending multiple decline messages for the same MAYDAY
       if (isMaydayDeclined(nextMayday.sender, nextMayday.system, nextMayday.poi)) {
-        ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - previously declined (5min cooldown)`);
+        ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - previously declined (1-hour cooldown)`);
         markMaydayHandled(nextMayday);
         continue;
       }
       
       // Mark as received IMMEDIATELY to catch subsequent rapid duplicates
       markMaydayReceived(nextMayday.sender, nextMayday.system, nextMayday.poi);
-      ctx.log("mayday_debug", `📝 MAYDAY from ${nextMayday.sender} marked as received (5min cooldown active)`);
+      ctx.log("mayday_debug", `📝 MAYDAY from ${nextMayday.sender} marked as received (1-hour cooldown active)`);
 
       // ── Validate MAYDAY ──
       // Check if sender is a known player (from playerNames.json)

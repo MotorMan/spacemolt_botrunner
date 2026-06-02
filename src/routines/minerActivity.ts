@@ -11,10 +11,9 @@ const ACTIVITY_FILE = join(DATA_DIR, "minerActivity.json");
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 100;
-const WRITE_INTERVAL_MS = 60000; // Write to disk once per minute
+const WRITE_INTERVAL_MS = 60000;
 
-// In-memory cache of miner activity data
-let cachedData: string | null = null;
+let cachedData: MinerActivityData = {};
 let writeTimer: NodeJS.Timeout | null = null;
 let isFlushPending = false;
 
@@ -53,100 +52,83 @@ export interface MinerActivityData {
   };
 }
 
-export function loadMinerActivity(): MinerActivityData {
-  // Try main file
+function ensureDataDir(): void {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function readFromFile(): MinerActivityData {
   try {
     if (existsSync(ACTIVITY_FILE)) {
       const content = readFileSync(ACTIVITY_FILE, "utf-8").trim();
-      if (!content) {
-        console.warn("Empty miner activity file");
-        cachedData = null;
-        return {};
+      if (content) {
+        const parsed = JSON.parse(content);
+        if (typeof parsed === "object" && parsed !== null) {
+          return parsed;
+        }
       }
-      const parsed = JSON.parse(content);
-      // Basic validation
-      if (typeof parsed !== "object" || parsed === null) {
-        console.warn("Invalid miner activity data structure");
-        cachedData = null;
-        return {};
-      }
-      // Populate cache on load
-      cachedData = JSON.stringify(parsed, null, 2) + "\n";
-      return parsed;
     }
   } catch (err) {
     console.warn("Could not load miner activity:", err);
   }
-  
-  console.warn("No valid miner activity file found. Starting with empty data.");
-  cachedData = null;
   return {};
 }
 
-async function saveWithRetry(data: string, ctx?: { sleep: (ms: number) => Promise<void> }): Promise<boolean> {
+function writeToFile(data: MinerActivityData): boolean {
+  try {
+    ensureDataDir();
+    writeFileSync(ACTIVITY_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    return true;
+  } catch (err: any) {
+    console.warn("Failed to write miner activity:", err?.message || err);
+    return false;
+  }
+}
+
+export function loadMinerActivity(): MinerActivityData {
+  cachedData = readFromFile();
+  return cachedData;
+}
+
+async function saveWithRetry(data: MinerActivityData): Promise<boolean> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
-    try {
-      // Write directly to the activity file
-      writeFileSync(ACTIVITY_FILE, data, "utf-8");
-      return true;
-    } catch (err: any) {
-      console.warn(`Save attempt ${attempt}/${MAX_RETRIES} failed:`, err?.message || err);
-      
-      if (attempt < MAX_RETRIES) {
-        // Exponential backoff
-        const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-        if (ctx) {
-          await ctx.sleep(delay);
-        } else {
-          await new Promise(resolve => setTimeout(resolve, delay));
-        }
-      }
+    if (writeToFile(data)) return true;
+    
+    if (attempt < MAX_RETRIES) {
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS * Math.pow(2, attempt - 1)));
     }
   }
-  
   return false;
 }
 
 export async function saveMinerActivity(data: MinerActivityData): Promise<void> {
-  try {
-    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
-    
-    const jsonData = JSON.stringify(data, null, 2) + "\n";
-    
-    // Update in-memory cache
-    cachedData = jsonData;
-    
-    // Schedule a write if one isn't already pending
-    if (!isFlushPending) {
-      isFlushPending = true;
-      if (writeTimer) {
-        clearTimeout(writeTimer);
-      }
-      writeTimer = setTimeout(async () => {
-        isFlushPending = false;
-        writeTimer = null;
-        const success = await saveWithRetry(cachedData!);
-        if (!success) {
-          console.error("FAILED to save minerActivity.json after all retries! Data may be lost.");
-          console.error("Last known data structure keys:", Object.keys(JSON.parse(cachedData!)).join(", "));
-        }
-      }, WRITE_INTERVAL_MS);
+  ensureDataDir();
+  cachedData = data;
+  
+  const fileExists = existsSync(ACTIVITY_FILE);
+  
+  if (!fileExists) {
+    const success = await saveWithRetry(cachedData);
+    if (!success) {
+      console.error("FAILED to create minerActivity.json! Data may be lost.");
     }
-  } catch (err) {
-    console.error("Unexpected error in saveMinerActivity:", err);
+    return;
+  }
+  
+  if (!isFlushPending) {
+    isFlushPending = true;
+    if (writeTimer) clearTimeout(writeTimer);
+    writeTimer = setTimeout(async () => {
+      isFlushPending = false;
+      writeTimer = null;
+      const success = await saveWithRetry(cachedData);
+      if (!success) {
+        console.error("FAILED to save minerActivity.json after all retries! Data may be lost.");
+      }
+    }, WRITE_INTERVAL_MS);
   }
 }
 
-/**
- * Force an immediate write of cached data to disk.
- * Used during shutdown to ensure no data loss.
- */
 export async function flushMinerActivity(): Promise<boolean> {
-  if (cachedData === null) {
-    return true; // Nothing to flush
-  }
-  
-  // Clear any pending timer
   if (writeTimer) {
     clearTimeout(writeTimer);
     writeTimer = null;
@@ -161,17 +143,15 @@ export async function flushMinerActivity(): Promise<boolean> {
 }
 
 function getBotActivity(botUsername: string) {
-  const data = loadMinerActivity();
-  if (!data[botUsername]) {
-    data[botUsername] = { activeSession: undefined, lastCompletedSession: undefined, sessionHistory: [] };
+  if (!cachedData[botUsername]) {
+    cachedData[botUsername] = { activeSession: undefined, lastCompletedSession: undefined, sessionHistory: [] };
   }
-  return data[botUsername]!;
+  return cachedData[botUsername]!;
 }
 
-async function saveBotActivity(botUsername: string, activity: ReturnType<typeof getBotActivity>): Promise<void> {
-  const data = loadMinerActivity();
-  data[botUsername] = activity;
-  await saveMinerActivity(data);
+async function saveBotActivity(botUsername: string, activity: { activeSession?: MiningSession; lastCompletedSession?: MiningSession; sessionHistory?: MiningSession[] }): Promise<void> {
+  cachedData[botUsername] = activity;
+  await saveMinerActivity(cachedData);
 }
 
 export async function startMiningSession(session: MiningSession): Promise<void> {

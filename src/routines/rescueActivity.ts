@@ -235,11 +235,70 @@ export async function clearActiveRescueSession(botUsername: string): Promise<voi
 const recentMaydayReceived = new Map<string, number>();
 
 /**
+ * Track MAYDAYs that have been declined (no route, wormhole, etc).
+ * This prevents the bot from spamming decline messages for the same MAYDAY.
+ * 
+ * Key: normalized "playername|system|poi"
+ * Value: timestamp when MAYDAY was declined
+ * 
+ * Entries expire after 5 minutes.
+ */
+const declinedMaydays = new Map<string, number>();
+
+/**
  * Normalize a MAYDAY identifier for deduplication.
  */
 function normalizeMaydayKey(player: string, system: string, poi?: string): string {
   const normalize = (s: string) => s.toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
   return `${normalize(player)}|${normalize(system)}|${normalize(poi || '')}`;
+}
+
+/**
+ * Check if a MAYDAY has been declined recently (within the last 5 minutes).
+ * This prevents spamming decline messages for the same MAYDAY.
+ * 
+ * @returns true if this MAYDAY was recently declined, false if it's new
+ */
+export function isMaydayDeclined(player: string, system: string, poi?: string): boolean {
+  const maydayKey = normalizeMaydayKey(player, system, poi);
+  const now = Date.now();
+  const fiveMinutes = 5 * 60 * 1000;
+
+  const declinedAt = declinedMaydays.get(maydayKey);
+  if (declinedAt) {
+    const timeSinceDeclined = now - declinedAt;
+    if (timeSinceDeclined < fiveMinutes) {
+      return true;
+    } else {
+      declinedMaydays.delete(maydayKey);
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Mark a MAYDAY as declined. This prevents the bot from sending
+ * another decline message for the same MAYDAY within the cooldown period.
+ */
+export function markMaydayDeclined(player: string, system: string, poi?: string): void {
+  const maydayKey = normalizeMaydayKey(player, system, poi);
+  declinedMaydays.set(maydayKey, Date.now());
+  cleanupExpiredDeclinedMaydays();
+}
+
+/**
+ * Clean up expired entries from the declined MAYDAYs map.
+ */
+function cleanupExpiredDeclinedMaydays(): void {
+  const now = Date.now();
+  const fiveMinutes = 5 * 60 * 1000;
+  
+  for (const [key, timestamp] of declinedMaydays.entries()) {
+    if (now - timestamp >= fiveMinutes) {
+      declinedMaydays.delete(key);
+    }
+  }
 }
 
 /**

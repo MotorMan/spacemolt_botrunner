@@ -43,6 +43,8 @@ import {
   failRescueSession,
   isMaydayDuplicate,
   markMaydayReceived,
+  isMaydayDeclined,
+  markMaydayDeclined,
   type RescueSession,
 } from "./rescueActivity.js";
 import { isKnownPlayer } from "../playernames.js";
@@ -1792,6 +1794,16 @@ skipToReturnHome = true;
             markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
             continue;
           }
+          
+          // ── DECLINED MAYDAY CHECK: Prevent spam for already-declined rescues ──
+          // This prevents the bot from sending multiple decline messages for the same MAYDAY
+          if (isMaydayDeclined(mayday.sender, mayday.system, mayday.poi)) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - previously declined (5min cooldown)`);
+            markMaydayHandled(mayday);
+            markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
+            continue;
+          }
+          
           // Mark as received IMMEDIATELY to catch subsequent rapid duplicates
           markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
           ctx.log("mayday_debug", `📝 MAYDAY from ${mayday.sender} marked as received (5min cooldown active)`);
@@ -1879,6 +1891,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               // Add lockout to prevent repeated MAYDAY processing
               const lockoutMinutes = settings.maydayPirateLockoutMinutes;
               addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+              markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
 
               // Send decline message to the player via private message
               const aiChatService = (globalThis as any).aiChatService;
@@ -1946,6 +1959,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
             addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             const aiChatService = (globalThis as any).aiChatService;
             if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
               try {
@@ -1990,6 +2004,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - NO VIABLE ROUTE to ${mayday.system}`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
             addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             const aiChatService = (globalThis as any).aiChatService;
             if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
               try {
@@ -3938,6 +3953,15 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
         markMaydayHandled(nextMayday);
         continue;
       }
+      
+      // ── DECLINED MAYDAY CHECK: Prevent spam for already-declined rescues ──
+      // This prevents the bot from sending multiple decline messages for the same MAYDAY
+      if (isMaydayDeclined(nextMayday.sender, nextMayday.system, nextMayday.poi)) {
+        ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${nextMayday.sender} - previously declined (5min cooldown)`);
+        markMaydayHandled(nextMayday);
+        continue;
+      }
+      
       // Mark as received IMMEDIATELY to catch subsequent rapid duplicates
       markMaydayReceived(nextMayday.sender, nextMayday.system, nextMayday.poi);
       ctx.log("mayday_debug", `📝 MAYDAY from ${nextMayday.sender} marked as received (5min cooldown active)`);
@@ -3970,6 +3994,7 @@ export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext
       // to the POI will fail. Decline early and inform the player we can't reach them.
       if (nextMayday.poi && isWormholeEntranceOrExit(nextMayday.poi, nextMayday.system)) {
         ctx.log("mayday", `⚠️ Declining MAYDAY from ${nextMayday.sender} - target at wormhole POI "${nextMayday.poi}" (requires anomaly detector; unreachable by this rescue bot)`);
+        markMaydayDeclined(nextMayday.sender, nextMayday.system, nextMayday.poi);
         const aiChatService = (globalThis as any).aiChatService;
         if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
           try {
@@ -4961,6 +4986,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
             addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             const aiChatService = (globalThis as any).aiChatService;
             if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
               try {
@@ -5005,6 +5031,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - NO VIABLE ROUTE to ${mayday.system}`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
             addMaydayPirateLockout(mayday.sender, lockoutMinutes);
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             const aiChatService = (globalThis as any).aiChatService;
             if (aiChatService && typeof aiChatService.sendPrivateMessage === "function") {
               try {

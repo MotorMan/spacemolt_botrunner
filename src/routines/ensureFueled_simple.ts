@@ -44,8 +44,8 @@ export async function ensureFueled(
 
   try {
     const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
-    const baseFuel = (poiResp as any)?.base?.fuel ?? 0;
-    if (baseFuel <= 0 && nearest.poiId !== "sol_station") {
+    const fuel = (poiResp as any)?.base?.fuel;
+    if (fuel !== null && fuel !== undefined && fuel <= 0 && nearest.poiId !== "sol_station") {
       ctx.log("system", `Approved station ${nearest.poiName} reports 0 fuel — will try anyway`);
     }
   } catch {}

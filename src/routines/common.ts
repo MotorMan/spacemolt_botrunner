@@ -1255,10 +1255,11 @@ export async function ensureFueled(
   }
 
   // Check if the nearest station has fuel before traveling there
+  // Only skip if we have explicit confirmation of 0 fuel, not missing/unknown data
   try {
     const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
-    const baseFuel = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel ?? 0;
-    if (baseFuel <= 0) {
+    const fuel = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
+    if (fuel !== null && fuel !== undefined && fuel <= 0) {
       ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
       return false;
     }

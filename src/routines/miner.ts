@@ -2498,11 +2498,8 @@ if (effectiveTarget) {
             );
             ctx.log("mining", `Alternative search result: ${alternativeTarget || 'none'}`);
             if (alternativeTarget) {
-              ctx.log("mining", `Switching to alternative target ${alternativeTarget} with accessible locations`);
-              effectiveTarget = alternativeTarget;
-
-              // Re-search locations for the new target
-              const newLocations = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+              // Re-search locations for the alternative target (use alternativeTarget, not effectiveTarget)
+              const altLocations = mapStore.findOreLocations(alternativeTarget).filter(loc => {
                 const sys = mapStore.getSystem(loc.systemId);
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
                 if (!poi) return true;
@@ -2521,14 +2518,15 @@ if (effectiveTarget) {
                 if (settings.ignoreDepletion) return true;
                 const sys = mapStore.getSystem(loc.systemId);
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
-                const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+                const oreEntry = poi?.ores_found.find(o => o.item_id === alternativeTarget);
                 if (!oreEntry?.depleted) return true;
                 return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
               });
 
-              if (newLocations.length > 0) {
-                const newScoredLocations = mapStore.findBestMiningLocation(effectiveTarget, bot.system, blacklist)
-                  .filter(loc => newLocations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+              if (altLocations.length > 0) {
+                // Check if any locations are within range
+                const altScoredLocations = mapStore.findBestMiningLocation(alternativeTarget, bot.system, blacklist)
+                  .filter(loc => altLocations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
                   .map(loc => {
                     const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
                     return { ...loc, jumps: route ? route.length - 1 : 999 };
@@ -2541,15 +2539,17 @@ if (effectiveTarget) {
                     return a.jumps - b.jumps;
                   });
 
-                if (newScoredLocations.length > 0) {
-                  scoredLocations = newScoredLocations;
-                  // Set target to the best new location
-                  targetSystemId = newScoredLocations[0].systemId;
-                  targetPoiId = newScoredLocations[0].poiId;
-                  targetPoiName = newScoredLocations[0].poiName;
-                  ctx.log("mining", `Found ${newScoredLocations.length} locations for ${effectiveTarget} within ${maxJumps} jumps`);
+                if (altScoredLocations.length > 0) {
+                  // Only switch if there are locations WITHIN RANGE
+                  ctx.log("mining", `Switching to alternative target ${alternativeTarget} with accessible locations`);
+                  effectiveTarget = alternativeTarget;
+                  scoredLocations = altScoredLocations;
+                  targetSystemId = altScoredLocations[0].systemId;
+                  targetPoiId = altScoredLocations[0].poiId;
+                  targetPoiName = altScoredLocations[0].poiName;
+                  ctx.log("mining", `Found ${altScoredLocations.length} locations for ${effectiveTarget} within ${maxJumps} jumps`);
                 } else {
-                  ctx.log("warn", `Alternative target ${effectiveTarget} has no locations within ${maxJumps} jumps either`);
+                  ctx.log("warn", `Alternative target ${alternativeTarget} has no locations within ${maxJumps} jumps — will mine locally`);
                 }
               } else {
                 ctx.log("warn", `No accessible locations found for alternative target ${alternativeTarget}`);
@@ -3140,7 +3140,7 @@ if (effectiveTarget) {
           const maxRemaining = (targetResource?.max_remaining as number) ?? 0;
           
           // CRITICAL FIX: Only mark depleted if we have CONFIRMED evidence of 0 remaining
-          // AND the max_remaining was previously > 0 (proves it was actually mined/scanned)
+          // AND the POI previously had this ore recorded
           // This prevents false depletion markers from POIs that were never properly checked
           if (remaining <= 0 && maxRemaining > 0) {
             // Double-check: verify this isn't a stale/incorrect reading
@@ -3149,9 +3149,9 @@ if (effectiveTarget) {
             const existingPoi = sysData?.pois.find(p => p.id === miningPoi!.id);
             const existingOreEntry = existingPoi?.ores_found.find(o => o.item_id === effectiveTarget);
 
-            // If we have prior evidence this POI had resources, mark it depleted
-            // Otherwise, log a warning and don't mark it (prevents false positives)
-            if (existingOreEntry || maxRemaining > 0) {
+            // Only mark depleted if we have prior evidence this POI had this ore before
+            // This prevents marking depletion on POIs that were never scanned for this ore
+            if (existingOreEntry) {
               ctx.log("mining", `Pre-scan: ${effectiveTarget} depleted at ${miningPoi!.name} (${remaining}/${maxRemaining}) — marking depleted and searching for alternative`);
               mapStore.markOreDepleted(bot.system, miningPoi!.id, effectiveTarget);
               // Don't travel here — fall through to depletion handling below
@@ -3691,6 +3691,7 @@ if (effectiveTarget) {
 
         let targetAvailable = false;
         let targetRemaining = 0;
+        let targetMaxRemaining = 0;
 
         for (const res of resources) {
           const resId = (res.resource_id as string) || (res.id as string) || "";
@@ -3699,6 +3700,7 @@ if (effectiveTarget) {
 
           if (resId === effectiveTarget) {
             targetRemaining = remaining;
+            targetMaxRemaining = maxRemaining;
             // Resource is available if it has remaining > 0
             targetAvailable = remaining > 0 && maxRemaining > 0;
             break;
@@ -3708,8 +3710,9 @@ if (effectiveTarget) {
         if (!targetAvailable) {
           ctx.log("mining", `Target resource ${effectiveTarget} not available at ${miningPoi?.name || bot.poi} (remaining: ${targetRemaining})`);
 
-          // Mark as depleted if it was actually depleted (not just temporarily unavailable)
-          if (targetRemaining <= 0) {
+          // Mark as depleted only if we have CONFIRMED evidence (targetMaxRemaining > 0 means it was scanned)
+          // and remaining is 0. Don't mark if targetMaxRemaining is 0 (ore wasn't in the scan results at all).
+          if (targetRemaining <= 0 && targetMaxRemaining > 0) {
             mapStore.markOreDepleted(bot.system, bot.poi, effectiveTarget);
             ctx.log("mining", `Marked ${effectiveTarget} as depleted at ${bot.poi}`);
           }

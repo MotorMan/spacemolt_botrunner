@@ -764,7 +764,7 @@ async function main(): Promise<void> {
 
   if (bots.size > 0) {
     const assignments = server.getBotAssignments();
-    server.logSystem(`Found ${bots.size} saved bot(s): ${[...bots.keys()].join(", ")}`);
+    server.logSystem(`Found ${bots.size} saved bot(s): ${[...bots.keys()].sort((a, b) => a.localeCompare(b)).join(", ")}`);
     server.logSystem(`Bot assignments: ${JSON.stringify(assignments)}`);
     // Push initial bot list to UI immediately (shows as "idle" with default values)
     refreshStatusTable();
@@ -774,7 +774,7 @@ async function main(): Promise<void> {
     const FULL_LOGIN_DELAY_MS = 13000;
     let botIndex = 0;
 
-for (const [name, bot] of bots) {
+ for (const [name, bot] of [...bots.entries()].sort(([a], [b]) => a.localeCompare(b))) {
       const delay = botIndex * SESSION_RESUME_DELAY_MS;
       const loginIndex = botIndex;
       botIndex++;

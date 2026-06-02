@@ -24,6 +24,7 @@ export interface EntityDetail {
   faction: string;
   ship: string;
   shipName?: string;
+  firstSeen: string;
   lastSeen: string;
   system: string;
   poi: string;
@@ -96,6 +97,13 @@ export class PlayerNameStore {
         lastUpdated: data.lastUpdated || new Date().toISOString(),
         counts: data.counts || { players: 0, pirates: 0, empire_npcs: 0 },
       };
+      for (const category of ["players", "pirates", "empire_npcs"] as const) {
+        for (const entity of Object.values(this.fullPlayerInfo[category])) {
+          if (!entity.firstSeen) {
+            entity.firstSeen = entity.lastSeen;
+          }
+        }
+      }
       // Recalculate counts
       this.fullPlayerInfo.counts.players = Object.keys(this.fullPlayerInfo.players).length;
       this.fullPlayerInfo.counts.pirates = Object.keys(this.fullPlayerInfo.pirates).length;
@@ -112,6 +120,7 @@ export class PlayerNameStore {
         lastUpdated: new Date().toISOString(),
         counts: { players: 0, pirates: 0, empire_npcs: 0 },
       };
+      this.saveFullPlayerInfo();
     }
   }
 
@@ -289,6 +298,7 @@ export class PlayerNameStore {
       entity.shipName = shipName || entity.shipName;
       entity.lastSeen = now;
     } else {
+      const firstSeen = isNew ? now : this.fullPlayerInfo.players[normalized]?.firstSeen || now;
       this.fullPlayerInfo.players[normalized] = {
         name: name,
         type: "player",
@@ -296,6 +306,7 @@ export class PlayerNameStore {
         faction: faction,
         ship: ship,
         shipName: shipName || undefined,
+        firstSeen: firstSeen,
         lastSeen: now,
         system: system,
         poi: poi,
@@ -354,6 +365,7 @@ export class PlayerNameStore {
       entity.shipName = shipName || entity.shipName;
       entity.lastSeen = now;
     } else {
+      const firstSeen = isNew ? now : this.fullPlayerInfo.pirates[normalized]?.firstSeen || now;
       this.fullPlayerInfo.pirates[normalized] = {
         name: name,
         type: "pirate",
@@ -361,6 +373,7 @@ export class PlayerNameStore {
         faction: faction,
         ship: ship,
         shipName: shipName || undefined,
+        firstSeen: firstSeen,
         lastSeen: now,
         system: system,
         poi: poi,
@@ -419,6 +432,7 @@ export class PlayerNameStore {
       entity.shipName = shipName || entity.shipName;
       entity.lastSeen = now;
     } else {
+      const firstSeen = isNew ? now : this.fullPlayerInfo.empire_npcs[normalized]?.firstSeen || now;
       this.fullPlayerInfo.empire_npcs[normalized] = {
         name: name,
         type: "empire_npc",
@@ -426,6 +440,7 @@ export class PlayerNameStore {
         faction: faction,
         ship: ship,
         shipName: shipName || undefined,
+        firstSeen: firstSeen,
         lastSeen: now,
         system: system,
         poi: poi,

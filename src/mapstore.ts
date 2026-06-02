@@ -33,6 +33,8 @@ export interface ResourceRecord {
   max_remaining: number;
   depletion_percent: number;
   last_scanned: string;
+  depleted?: boolean;
+  depleted_at?: string;
 }
 
 /** Depletion timeout in milliseconds - POIs can be re-checked after this long. */
@@ -1312,8 +1314,9 @@ findOreLocations(oreId: string): Array<{
     const scored = locations
       .filter(loc => !blacklistSet.has(loc.systemId.toLowerCase()))
       .filter(loc => {
-        // Skip completely exhausted locations (0% remaining)
-        if (loc.depletionPercent <= 0 && loc.remaining <= 0) return false;
+        // Skip completely exhausted locations (0 remaining AND was scanned with maxRemaining > 0)
+        // Don't filter out unsurveyed locations (where maxRemaining is also 0)
+        if (loc.remaining <= 0 && loc.maxRemaining > 0) return false;
         // Skip nearly-depleted locations (>90% depleted = <10% available)
         if (loc.depletionPercent > 90) return false;
         return true;

@@ -1079,7 +1079,15 @@ export function findFirstAvailableQuotaTarget(
       }
       const sys = mapStore.getSystem(loc.systemId);
       const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
+      // Check both ores_found (mining history) AND resources (scan data) for depletion status
+      // Hidden POIs often only have data in resources (from get_poi scans)
       const oreEntry = poi?.ores_found.find((o: any) => o.item_id === entry.resourceId);
+      const resourceEntry = poi?.resources?.find((r: any) => r.resource_id === entry.resourceId);
+      // If resourceEntry exists and shows depleted, check expiry
+      if (resourceEntry?.depleted) {
+        return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
+      }
+      // Otherwise check ores_found depletion
       if (!oreEntry?.depleted) return true;
       // Depleted but expired - can re-check
       return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
@@ -2412,7 +2420,14 @@ if (effectiveTarget) {
               }
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
+              // Check both ores_found (mining history) AND resources (scan data) for depletion status
               const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+              const resourceEntry = poi?.resources?.find(r => r.resource_id === effectiveTarget);
+              // If resourceEntry exists and shows depleted, check expiry
+              if (resourceEntry?.depleted) {
+                return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
+              }
+              // Otherwise check ores_found depletion
               if (!oreEntry?.depleted) return true;
               return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
             });
@@ -3210,7 +3225,14 @@ if (effectiveTarget) {
           if (settings.ignoreDepletion) return true;
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
+          // Check both ores_found (mining history) AND resources (scan data) for depletion status
           const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+          const resourceEntry = poi?.resources?.find(r => r.resource_id === effectiveTarget);
+          // If resourceEntry exists and shows depleted, check expiry
+          if (resourceEntry?.depleted) {
+            return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
+          }
+          // Otherwise check ores_found depletion
           if (!oreEntry?.depleted) return true;
           return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
         });
@@ -3906,7 +3928,20 @@ if (effectiveTarget) {
           }).filter(loc => {
             const sys = mapStore.getSystem(loc.systemId);
             const poi = sys?.pois.find(p => p.id === loc.poiId);
+            // Check both ores_found (mining history) AND resources (scan data) for depletion status
             const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+            const resourceEntry = poi?.resources?.find(r => r.resource_id === effectiveTarget);
+            // If resourceEntry exists and shows depleted, check expiry
+            if (resourceEntry?.depleted) {
+              if (settings.ignoreDepletion) {
+                if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+                  return false;
+                }
+                return true;
+              }
+              return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
+            }
+            // Otherwise check ores_found depletion
             if (!oreEntry?.depleted) return true;
             if (settings.ignoreDepletion) {
               if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
@@ -4015,7 +4050,14 @@ if (effectiveTarget) {
                       // Check if target POI is still available
                       const sys = mapStore.getSystem(bestLoc.systemId);
                       const poi = sys?.pois.find(p => p.id === bestLoc.poiId);
+                      // Check both ores_found and resources for depletion status
                       const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+                      const resourceEntry = poi?.resources?.find(r => r.resource_id === effectiveTarget);
+                      // If resourceEntry exists and shows depleted, check expiry
+                      if (resourceEntry?.depleted && !isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs)) {
+                        ctx.log("mining", `Target POI ${bestLoc.poiName} depleted by another bot during travel (jump ${jumpNumber}) — aborting richness upgrade`);
+                        return false;
+                      }
                       if (oreEntry && oreEntry.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) {
                         ctx.log("mining", `Target POI ${bestLoc.poiName} depleted by another bot during travel (jump ${jumpNumber}) — aborting richness upgrade`);
                         return false;
@@ -4132,7 +4174,21 @@ if (effectiveTarget) {
                     }).filter(loc => {
                       const sys = mapStore.getSystem(loc.systemId);
                       const poi = sys?.pois.find(p => p.id === loc.poiId);
+                      // Check both ores_found (mining history) AND resources (scan data) for depletion status
                       const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+                      const resourceEntry = poi?.resources?.find(r => r.resource_id === effectiveTarget);
+                      // If resourceEntry exists and shows depleted, check expiry
+                      if (resourceEntry?.depleted) {
+                        if (!settings.ignoreDepletion) {
+                          return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
+                        }
+                        // Even with ignoreDepletion, skip completely exhausted POIs
+                        if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+                          return false;
+                        }
+                        return true;
+                      }
+                      // Otherwise check ores_found depletion
                       if (!oreEntry?.depleted) return true;
                       // Even with ignoreDepletion, skip completely exhausted POIs
                       if (settings.ignoreDepletion) {
@@ -4935,6 +4991,13 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
 
                   // Check if not depleted (or expired)
                   const oreEntry = poi.ores_found.find(o => o.item_id === loc.resourceId || o.item_id === effectiveTarget);
+                  const resourceEntry = poi.resources?.find(r => r.resource_id === loc.resourceId || r.resource_id === effectiveTarget);
+                  // Check both ores_found and resources for depletion status
+                  if (resourceEntry?.depleted) {
+                    // Skip completely exhausted POIs regardless of settings
+                    if (loc.remaining <= 0 && loc.maxRemaining > 0) continue;
+                    if (!isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs)) continue;
+                  }
                   if (oreEntry?.depleted) {
                     // Skip completely exhausted POIs regardless of settings
                     if (loc.remaining <= 0 && loc.maxRemaining > 0) continue;

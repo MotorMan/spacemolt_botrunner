@@ -52,7 +52,7 @@ const sessionRestoreFailures: Map<string, number[]> = new Map();
 
 /** Get list of discovered bot usernames (for API use). */
 export function getDiscoveredBots(): string[] {
-  return [...bots.keys()];
+  return [...bots.keys()].sort((a, b) => a.localeCompare(b));
 }
 
 /** Get a bot by name (for API use). */
@@ -157,7 +157,9 @@ function setupBotLogging(bot: Bot): void {
 }
 
 function refreshStatusTable(): void {
-  const statuses = [...bots.values()].map((b) => b.status());
+  const statuses = [...bots.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, b]) => b.status());
   server.updateBotStatus(statuses);
 }
 
@@ -444,7 +446,7 @@ async function handleEmergencyReturn(): Promise<WebActionResult> {
       sendBotChat: (content: string, channel: string, recipients?: string[], metadata?: Record<string, unknown>) => {
         sendBotChatMessage(botName, content, channel as BotChatChannel, recipients, metadata);
       },
-      getAllBotNames: () => [...bots.keys()],
+    getAllBotNames: () => [...bots.keys()].sort((a, b) => a.localeCompare(b)),
       getBotAssignments: () => server.getBotAssignments(),
     };
 

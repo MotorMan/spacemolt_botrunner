@@ -2574,14 +2574,13 @@ if (effectiveTarget) {
           // If we have a recovered session, check if the best scored location is
           // significantly better than the session's current POI. If so, abandon
           // the old session and start fresh at the better location.
+        if (scoredLocations.length > 0 && scoredLocations[0].poiId) {
           if (recoveredSession) {
             const bestLoc = scoredLocations[0];
             const sessionPoiId = recoveredSession.targetPoiId;
             const sessionPoiName = recoveredSession.targetPoiName;
 
-            // Check if best location is different from session's POI
             if (bestLoc.poiId !== sessionPoiId) {
-              // Hidden POI always wins over regular POIs for deep core mining
               const bestIsHidden = bestLoc.isHidden;
               const sessionIsHidden = sessionPoiId ? (() => {
                 const sys = mapStore.getSystem(recoveredSession.targetSystemId);
@@ -2596,15 +2595,12 @@ if (effectiveTarget) {
                 shouldUpgrade = true;
                 upgradeReason = `hidden POI upgrade (${bestLoc.poiName} vs ${sessionPoiName})`;
               } else if (!bestIsHidden && !sessionIsHidden) {
-                // Both regular POIs — check if best is significantly better
-                // Compare: remaining pool size + richness + score
                 const sessionSys = mapStore.getSystem(recoveredSession.targetSystemId);
                 const sessionPoi = sessionSys?.pois.find(p => p.id === sessionPoiId);
                 const sessionResource = sessionPoi?.resources?.find(r => r.resource_id === effectiveTarget);
                 const sessionRemaining = sessionResource?.remaining ?? 0;
                 const sessionRichness = sessionResource?.richness ?? 0;
 
-                // Upgrade if new location has 2x+ remaining OR 2x+ richness OR 50+ point score advantage
                 if (bestLoc.remaining >= sessionRemaining * 2 && bestLoc.remaining > 1000) {
                   shouldUpgrade = true;
                   upgradeReason = `much larger pool (${bestLoc.remaining.toLocaleString()} vs ${sessionRemaining.toLocaleString()})`;
@@ -2626,10 +2622,9 @@ if (effectiveTarget) {
               }
             }
           }
+        }
 
-          // CRITICAL: With no configured system, pick the top remaining scored location.
-          // Any upgrades within a session are already bounded by scoredLocations[] created above.
-          const chosenLoc = scoredLocations.length > 0 ? scoredLocations[0] : undefined;
+        const chosenLoc = scoredLocations.length > 0 ? scoredLocations[0] : undefined;
 
           if (!chosenLoc && !configuredSystem) {
             ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
@@ -3934,7 +3929,7 @@ if (effectiveTarget) {
                 return a.jumps - b.jumps;
               });
 
-            if (scoredLocations.length > 0) {
+            if (scoredLocations.length > 0 && scoredLocations[0].poiId) {
               const bestLoc = scoredLocations[0];
               const bestRichness = bestLoc.richness ?? 0;
               const bestRemaining = bestLoc.remaining ?? 0;

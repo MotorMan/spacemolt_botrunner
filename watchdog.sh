@@ -29,9 +29,11 @@ while true; do
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting SpaceMolt BotRunner..."
     echo ""
 
+    set +e
     cd "$SCRIPT_DIR"
     bun run src/botmanager.ts
     EXIT_CODE=$?
+    set -e
 
     echo ""
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] BotRunner exited with code $EXIT_CODE"

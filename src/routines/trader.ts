@@ -1537,11 +1537,31 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     
     // ── Fuel + hull check + mods ──
     yield "maintenance";
-    // Only refuel if actually below threshold - tryRefuel always tries to reach 95%
     await bot.refreshStatus();
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelPct < settings.refuelThreshold) {
-      await tryRefuel(ctx);
+      const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+      if (!fueled) {
+        ctx.log("error", "Fuel low and cannot refuel — going home");
+        const ok = await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+        if (ok) {
+          const { pois: homePois } = await getSystemInfo(ctx);
+          const homeStation = findStation(homePois);
+          if (homeStation) {
+            await bot.exec("travel", { target_poi: homeStation.id });
+            bot.poi = homeStation.id;
+            const dResp = await bot.exec("dock");
+            if (!dResp.error || dResp.error.message.includes("already")) {
+              bot.docked = true;
+              await ensureFueled(ctx, settings.refuelThreshold);
+              await ctx.sleep(30000);
+              continue;
+            }
+          }
+        }
+        await ctx.sleep(30000);
+        continue;
+      }
     } else {
       ctx.log("trade", `Fuel at ${fuelPct}% (above ${settings.refuelThreshold}% threshold) - skipping refuel`);
     }
@@ -3044,7 +3064,27 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Maintenance ──
     yield "post_trade_maintenance";
-    await tryRefuel(ctx);
+    await bot.refreshStatus();
+    const postFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (postFuelPct < settings.refuelThreshold) {
+      const fueled2 = await ensureFueled(ctx, settings.refuelThreshold);
+      if (!fueled2) {
+        ctx.log("error", "Fuel low post-trade and cannot refuel — returning home first");
+        await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+        const { pois: homePois } = await getSystemInfo(ctx);
+        const homeStation = findStation(homePois);
+        if (homeStation) {
+          await bot.exec("travel", { target_poi: homeStation.id });
+          bot.poi = homeStation.id;
+          const dResp = await bot.exec("dock");
+          if (!dResp.error || dResp.error.message.includes("already")) {
+            bot.docked = true;
+            await ensureFueled(ctx, settings.refuelThreshold);
+          }
+        }
+        continue;
+      }
+    }
     await repairShip(ctx);
 
     // ── Check skills ──

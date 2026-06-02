@@ -422,7 +422,7 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
     }
   }
 
-  // No station in current system — find nearest known station
+  // No station in current system — find nearest station
   ctx.log("system", "No station in current system — searching for nearest station...");
   const blacklist = getSystemBlacklist();
   const nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
@@ -647,8 +647,9 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
       await ensureInsured(ctx);
       await sellAllCargo(ctx);
       await tryRefuel(ctx);
-      if (!bot.docked || bot.fuel >= 50) {
-        ctx.log("system", `Recovery successful! Fuel: ${bot.fuel}/${bot.maxFuel}`);
+      const pct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
+      if (!bot.docked || pct >= 30) {
+        ctx.log("system", `Recovery successful! Fuel: ${bot.fuel}/${bot.maxFuel} (${pct}%)`);
         return true;
       }
     }
@@ -658,8 +659,9 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
   if (bot.docked) {
     await sellAllCargo(ctx);
     await tryRefuel(ctx);
-    if (bot.fuel >= 50) {
-      ctx.log("system", `Recovery successful! Fuel: ${bot.fuel}/${bot.maxFuel}`);
+    const pct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
+    if (pct >= 30) {
+      ctx.log("system", `Recovery successful! Fuel: ${bot.fuel}/${bot.maxFuel} (${pct}%)`);
       return true;
     }
 
@@ -669,7 +671,7 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
       await sleep(REFUEL_WAIT_INTERVAL);
       await bot.refreshStatus();
       const fuelNow = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-      if (fuelNow > 5) {
+      if (fuelNow >= 30) {
         ctx.log("system", `Fuel recovered to ${fuelNow}% — resuming`);
         return true;
       }
@@ -677,8 +679,9 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
       await sellAllCargo(ctx);
       await tryRefuel(ctx);
       await bot.refreshStatus();
-      if (bot.fuel >= 50) {
-        ctx.log("system", `Refuel succeeded after wait! Fuel: ${bot.fuel}/${bot.maxFuel}`);
+      const afterPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
+      if (afterPct >= 30) {
+        ctx.log("system", `Refuel succeeded after wait! Fuel: ${bot.fuel}/${bot.maxFuel} (${afterPct}%)`);
         return true;
       }
       ctx.log("system", `Waiting at station for fuel... (${w + 1}/${REFUEL_WAIT_RETRIES})`);
@@ -711,7 +714,7 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
   const { pois } = await getSystemInfo(ctx);
   const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
   if (currentStation) {
-    if (!isApprovedFuelStation(currentStation.id, bot.settings, bot.system)) {
+    if (!isApprovedFuelStation(currentStation.id, readSettings(), bot.system)) {
       ctx.log("system", `Station ${currentStation.name} is not on approved fuel list — skipping refuel here`);
       return;
     }
@@ -719,7 +722,7 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
   if (currentStation?.services && currentStation.services.refuel === false) {
     const refuelStation = findStation(pois, "refuel");
     if (refuelStation && refuelStation.id !== currentStation.id) {
-      if (!isApprovedFuelStation(refuelStation.id, bot.settings, bot.system)) {
+      if (!isApprovedFuelStation(refuelStation.id, readSettings(), bot.system)) {
         ctx.log("system", `Refuel station ${refuelStation.name} is not in approved fuel list — skipping`);
         return;
       }
@@ -1134,11 +1137,10 @@ export async function safetyCheck(
 }
 
 /**
- * Ensure the bot has adequate fuel. Priority order:
- * 1. Use fuel cells / premium_fuel_cell / x_fuel_cell from cargo first — do NOT go to a station
- * 2. Adapt behaviour when docked at a station that is out of fuel
- * 3. Only travel to a station when cargo fuel cells are fully exhausted
- * Returns true if fuel is now adequate, false if stranded.
+ * Ensure the bot has adequate fuel.
+ * If an approved fuel station list is configured and fuel is low,
+ * go directly to the nearest approved station and refuel.
+ * Returns true when fuel is adequate, false otherwise.
  */
 export async function ensureFueled(
   ctx: RoutineContext,
@@ -1167,7 +1169,7 @@ export async function ensureFueled(
   }
 
   let cargoFuelAttempts = 0;
-  const maxCargoFuelAttempts = 40; // generous cap; 20 x premium = 1,000 fuel units
+  const maxCargoFuelAttempts = 40;
   while (fuelPct < thresholdPct && cargoFuelAttempts < maxCargoFuelAttempts && bot.state === "running") {
     const resp = await bot.exec("refuel");
     if (resp.error) {
@@ -1176,7 +1178,6 @@ export async function ensureFueled(
         ctx.log("system", "Cargo fuel cells exhausted — refuel from cargo done");
         break;
       }
-      // Other errors: abort cargo refuel attempts
       ctx.log("error", `Cargo refuel error: ${resp.error.message}`);
       break;
     }
@@ -1189,50 +1190,35 @@ export async function ensureFueled(
     }
   }
 
-  // If cargo got us healthy, done — re-dock if we were previously docked
   if (fuelPct >= thresholdPct) {
-    if (dockingStation) {
-      await bot.exec("travel", { target_poi: dockingStation.id });
-      bot.poi = dockingStation.id;
-      const dResp = await bot.exec("dock");
-      if (!dResp.error || dResp.error.message.includes("already")) {
-        bot.docked = true;
-        await ensureInsured(ctx);
-      }
-    }
     return true;
   }
 
-  // Cargo fuel cells fully used and we're still low — ── STEP 2 ───────────
-
-  // If we undocked and happened to be parked at a docking station, return there before
-  // deciding whether to use station fuel or go elsewhere.
+  // If we undocked and were previously docked, return there before trying station fuel
   if (wasDocked && dockingStation) {
-    if (!isApprovedFuelStation(dockingStation.id, bot.settings, bot.system)) {
-      ctx.log("system", `${dockingStation.name} is not on approved fuel list — not returning there to refuel`);
-    } else {
-      ctx.log("system", `Returning to ${dockingStation.name} to attempt station refuel...`);
-      const trResp = await bot.exec("travel", { target_poi: dockingStation.id });
-      bot.poi = dockingStation.id;
-      const dResp = await bot.exec("dock");
-      if (!dResp.error || dResp.error.message.includes("already")) {
-        bot.docked = true;
-        await ensureInsured(ctx);
-      }
+    ctx.log("system", `Returning to ${dockingStation.name} to attempt station refuel...`);
+    const trResp = await bot.exec("travel", { target_poi: dockingStation.id });
+    bot.poi = dockingStation.id;
+    const dResp = await bot.exec("dock");
+    if (!dResp.error || dResp.error.message.includes("already")) {
+      bot.docked = true;
+      await ensureInsured(ctx);
     }
   }
 
-  // ── STEP 3: Try station fuel (credits) — only after cargo cells are empty ──
-  // At this point bot.docked is only true if we were already docked when fuel became low,
-  // or if we re-docked in Step 2 above.
-  if (bot.docked) {
-    const station = dockingStation || (await getSystemInfo(ctx)).pois.find(p => isStationPoi(p) && p.id === bot.poi);
-    if (station) {
-      ctx.log("system", `Cargo fuel cells empty — attempting station refuel at ${station.name}...`);
-      const ok = await refuelAtStation(ctx, station, thresholdPct);
-      if (ok) return true;
-      // Station refuel failed (out of fuel, out of credits, etc.)
-    }
+  // Check for approved fuel stations
+  const approvedFuelStations = (readSettings()?.general as any)?.approvedFuelStations as string[] | undefined;
+
+  if (!approvedFuelStations || approvedFuelStations.length === 0) {
+    ctx.log("warn", "No approved fuel stations configured — skipping refuel");
+    return false;
+  }
+
+  const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
+  if (currentStation && isApprovedFuelStation(currentStation.id, readSettings(), bot.system)) {
+    ctx.log("system", `Cargo fuel cells empty — attempting station refuel at ${currentStation.name}...`);
+    const ok = await refuelAtStation(ctx, currentStation, thresholdPct);
+    if (ok) return true;
   }
 
   // ── STEP 4: Scavenge wrecks as last resort ──────────────────────────────
@@ -1252,66 +1238,35 @@ export async function ensureFueled(
     }
   }
 
-  // ── STEP 5: Find nearest approved station with fuel ────────────────────────
-  ctx.log("system", "No station in current system — searching known map for nearest approved station...");
+  // ── STEP 5: Find nearest known station with fuel ────────────────────────
+  ctx.log("system", "No station in current system — searching known map for nearest station...");
   const blacklist = getSystemBlacklist();
-  const settings = (ctx as any).bot?.settings || {};
-  const general = settings?.general || {};
-  const approvedFuelStations: string[] | undefined = general.approvedFuelStations;
-  let nearest: { systemId: string; poiId: string; poiName: string; hops: number } | null = null;
-  if (approvedFuelStations && approvedFuelStations.length > 0) {
-    const approvedSet = new Set<string>();
-    for (const entry of approvedFuelStations) {
-      approvedSet.add(entry);
-      const parts = entry.split("|");
-      if (parts.length === 2) approvedSet.add(parts[1]);
-    }
-    nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet);
-    if (!nearest) {
-      ctx.log("error", "No known approved station reachable — emergency recovery...");
-      return await emergencyFuelRecovery(ctx);
-    }
-    ctx.log("travel", `Nearest approved station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)`);
-  } else {
-    // No approved list configured — allow all (original behavior)
-    nearest = mapStore.findNearestStationSystem(bot.system, blacklist);
-    if (!nearest) {
-      ctx.log("error", "No known station in mapped systems — emergency recovery...");
-      return await emergencyFuelRecovery(ctx);
-    }
-    ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)`);
+  const approvedSet = new Set<string>();
+  for (const entry of approvedFuelStations) {
+    approvedSet.add(entry);
+    const parts = entry.split("|");
+    if (parts.length === 2) approvedSet.add(parts[1]);
   }
 
-  // Check live fuel level via get_poi (base.fuel) or dock fuel_warning before committing
+  let nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet);
+  if (!nearest) {
+    ctx.log("error", "No approved refuel station reachable");
+    return false;
+  }
+
   try {
     const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
     const baseFuel = (poiResp as any)?.base?.fuel ?? 0;
-    if (baseFuel <= 0) {
-      const isHomeStation = nearest.poiId === "sol_station" || /sol central/i.test(nearest.poiName || "");
-      if (isHomeStation) {
-        ctx.log("system", `Proceeding to home ${nearest.poiName} despite base.fuel=0 (use faction storage for fuel cells)`);
-      } else {
-        ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
-        return await emergencyFuelRecovery(ctx); // avoid the loop
-      }
+    if (baseFuel <= 0 && nearest.poiId !== "sol_station") {
+      ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
+      return false;
     }
   } catch {}
 
   ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)`);
 
-  // Navigate there — use navigateToSystem if in a different system
   if (nearest.systemId !== bot.system) {
-    // Check if we have enough fuel for at least one jump
-    await bot.refreshStatus();
-    const curFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-    if (curFuel < 10) {
-      ctx.log("error", `Fuel too low (${curFuel}%) to reach station — emergency recovery...`);
-      return await emergencyFuelRecovery(ctx);
-    }
-
     await ensureUndocked(ctx);
-
-    // Jump system by system toward the station
     const route = mapStore.findRoute(bot.system, nearest.systemId, blacklist);
     if (route && route.length > 1) {
       for (let i = 1; i < route.length; i++) {
@@ -1319,7 +1274,7 @@ export async function ensureFueled(
         await bot.refreshStatus();
         const preFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         if (preFuel < 10) {
-          ctx.log("error", `Fuel critical (${preFuel}%) mid-route — emergency recovery...`);
+          ctx.log("error", `Fuel too low (${preFuel}%) to reach station — emergency recovery...`);
           return await emergencyFuelRecovery(ctx);
         }
         ctx.log("travel", `Jumping to ${route[i]} (${i}/${route.length - 1})...`);
@@ -1330,7 +1285,6 @@ export async function ensureFueled(
         }
       }
     } else {
-      // Direct jump
       ctx.log("travel", `Direct jump to ${nearest.systemId}...`);
       const jumpResp = await bot.exec("jump", { target_system: nearest.systemId });
       if (jumpResp.error) {
@@ -1340,7 +1294,6 @@ export async function ensureFueled(
     }
   }
 
-  // Now in the station system — travel, dock, refuel
   await bot.refreshStatus();
   await ensureUndocked(ctx);
   ctx.log("travel", `Traveling to ${nearest.poiName}...`);
@@ -1366,7 +1319,6 @@ export async function ensureFueled(
   let newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   ctx.log("system", `Refueled at ${nearest.poiName} — Fuel: ${newFuel}%`);
 
-  // CRITICAL: Do NOT undock until fuel is adequate
   if (newFuel < thresholdPct) {
     ctx.log("system", `Fuel still below threshold (${newFuel}% < ${thresholdPct}%) — staying docked and waiting...`);
     for (let w = 0; w < REFUEL_WAIT_RETRIES && bot.state === "running"; w++) {
@@ -1377,7 +1329,7 @@ export async function ensureFueled(
         const msg = refuelResp.error.message.toLowerCase();
         if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty")) {
           ctx.log("error", `Cannot refuel: no fuel cells available at station — will not retry infinitely`);
-          return false; // bail immediately, don't loop back
+          return false;
         }
       }
       await bot.refreshStatus();
@@ -1392,15 +1344,10 @@ export async function ensureFueled(
 
   await bot.refreshStatus();
   newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  if (newFuel < thresholdPct) {
-    ctx.log("error", `Could not refuel — fuel still at ${newFuel}% (threshold: ${thresholdPct}%)`);
-    return false;
-  }
-
   ctx.log("system", "Undocking...");
   await bot.exec("undock");
   bot.docked = false;
-  return true;
+  return newFuel >= 10;
 }
 
 // ── Cargo deposit ──────────────────────────────────────────
@@ -1997,7 +1944,7 @@ export async function refuelAtStation(
   const { bot } = ctx;
   await bot.refreshStatus();
 
-  if (!isApprovedFuelStation(station.id, bot.settings, bot.system)) {
+  if (!isApprovedFuelStation(station.id, readSettings(), bot.system)) {
     ctx.log("system", `Refuel skipped at ${station.name} — not on approved fuel list`);
     return false;
   }

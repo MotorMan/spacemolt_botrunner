@@ -744,6 +744,7 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
 
   // Call refuel repeatedly until full or until it fails
   let consecutiveErrors = 0;
+  const isSolCentralLoop = currentStation?.id === "sol_station" || currentStation?.id === "sol_central";
   for (let i = 0; i < 10 && bot.state === "running"; i++) {
     const resp = await bot.exec("refuel");
     if (resp.error) {
@@ -752,7 +753,8 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
       if (msg.includes("already full") || msg.includes("tank_full") || msg.includes("max")) {
         break;
       }
-      if (msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves")) {
+      // Sol Central is always assumed to have fuel
+      if (!isSolCentralLoop && (msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves"))) {
         ctx.log("error", `Station out of fuel — cannot refuel here (${resp.error.message})`);
         return; // bail out immediately, do not wait
       }
@@ -781,6 +783,7 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
   }
 
   // Fuel still low — wait at station and retry periodically
+  const isSolCentral = currentStation?.id === "sol_station" || currentStation?.id === "sol_central";
   for (let attempt = 1; attempt <= REFUEL_WAIT_RETRIES && bot.state === "running"; attempt++) {
     ctx.log("system", `Fuel still at ${fuelPct}% — waiting at station (attempt ${attempt}/${REFUEL_WAIT_RETRIES})...`);
     await sleep(REFUEL_WAIT_INTERVAL);
@@ -790,7 +793,7 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
     const refuelResp = await bot.exec("refuel");
     if (refuelResp.error) {
       const msg = refuelResp.error.message.toLowerCase();
-      if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves")) {
+      if (!isSolCentral && (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves"))) {
         ctx.log("error", `Cannot refuel: ${msg.includes("station") ? "station out of fuel" : "no fuel cells available"} — will not retry infinitely`);
         break;
       }
@@ -1255,15 +1258,17 @@ export async function ensureFueled(
   }
 
   // Check if the nearest station has fuel before traveling there
-  // Only skip if we have explicit confirmation of 0 fuel, not missing/unknown data
-  try {
-    const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
-    const fuel = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
-    if (fuel !== null && fuel !== undefined && fuel <= 0) {
-      ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
-      return false;
-    }
-  } catch {}
+  // Sol Central is always assumed to have fuel (faction station with guaranteed supply)
+  if (nearest.poiId !== "sol_station" && nearest.poiId !== "sol_central") {
+    try {
+      const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
+      const fuel = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel;
+      if (fuel !== null && fuel !== undefined && fuel <= 0) {
+        ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
+        return false;
+      }
+    } catch {}
+  }
 
   ctx.log("travel", `Nearest station: ${nearest.poiName} in ${nearest.systemId} (${nearest.hops} jump${nearest.hops !== 1 ? "s" : ""} away)`);
 
@@ -1980,8 +1985,10 @@ export async function refuelAtStation(
     bot.docked = true;
     await ensureInsured(ctx);
     // Parse fuel_warning from dock response (e.g. "Fuel reserves critically low (0%)")
+    // Sol Central is always assumed to have fuel (faction station with guaranteed supply)
+    const isSolCentral = station.id === "sol_station" || station.id === "sol_central";
     const warning = (dockResp as any)?.fuel_warning || "";
-    if (warning.toLowerCase().includes("0%") || warning.toLowerCase().includes("critically low")) {
+    if (!isSolCentral && (warning.toLowerCase().includes("0%") || warning.toLowerCase().includes("critically low"))) {
       ctx.log("error", `Station reports 0 fuel on dock — aborting refuel here`);
       return false;
     }
@@ -2003,7 +2010,8 @@ export async function refuelAtStation(
       const refuelResp = await bot.exec("refuel");
       if (refuelResp.error) {
         const msg = refuelResp.error.message.toLowerCase();
-        if (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves")) {
+        const isSolCentralRetry = station.id === "sol_station" || station.id === "sol_central";
+        if (!isSolCentralRetry && (msg.includes("no_fuel_cells") || msg.includes("no fuel cells") || msg.includes("station_fuel_empty") || msg.includes("station's fuel reserves"))) {
           ctx.log("error", `Cannot refuel: ${msg.includes("station") ? "station out of fuel" : "no fuel cells available"} — will not retry infinitely`);
           break;
         }

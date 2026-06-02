@@ -1,3 +1,8 @@
+import type { RoutineContext } from "../bot.js";
+import { readSettings, getSystemInfo, isStationPoi, isApprovedFuelStation, ensureUndocked, refuelAtStation, ensureInsured } from "./common.js";
+import { getSystemBlacklist } from "../web/server.js";
+import { mapStore } from "../mapstore.js";
+
 export async function ensureFueled(
   ctx: RoutineContext,
   thresholdPct: number,
@@ -45,7 +50,7 @@ export async function ensureFueled(
   try {
     const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
     const fuel = (poiResp as any)?.base?.fuel;
-    if (fuel !== null && fuel !== undefined && fuel <= 0 && nearest.poiId !== "sol_station") {
+    if (fuel !== null && fuel !== undefined && fuel <= 0 && nearest.poiId !== "sol_station" && nearest.poiId !== "sol_central") {
       ctx.log("system", `Approved station ${nearest.poiName} reports 0 fuel — will try anyway`);
     }
   } catch {}

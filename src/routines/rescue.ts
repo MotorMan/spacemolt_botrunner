@@ -749,13 +749,14 @@ async function sendRescueBill(
     try {
       const result = await aiChatService.sendPrivateMessage(ctx.bot, targetUsername, {
         situation: isMayday
-          ? `You responded to their MAYDAY distress call and successfully refueled them. You are now sending them an invoice for the rescue service. Total bill: ${bill.total} credits (${bill.jumpCost} for ${jumpsToTarget + jumpsToHome} jumps, ${bill.fuelCost} for ${fuelDelivered} fuel units).`
-          : `You completed a fuel transfer mission to help them with their low fuel situation. You are now sending them an invoice for the rescue service. Total bill: ${bill.total} credits (${bill.jumpCost} for ${jumpsToTarget + jumpsToHome} jumps, ${bill.fuelCost} for ${fuelDelivered} fuel units).`,
+          ? `You responded to their MAYDAY distress call and successfully refueled them. You are now sending them an invoice for the rescue service.`
+          : `You completed a fuel transfer mission to help them with their low fuel situation. You are now sending them an invoice for the rescue service.`,
         currentSystem: ctx.bot.system,
         targetSystem: '',
         jumps: jumpsToTarget + jumpsToHome,
         fuelRefueled: fuelDelivered,
         playerFuelPct: undefined,
+        credits: bill.total,
       });
       if (result.ok) {
         ctx.log("rescue", `📧 Sent rescue invoice to ${targetUsername}: ${bill.total} credits (${bill.jumpCost} jumps + ${bill.fuelCost} fuel)`);

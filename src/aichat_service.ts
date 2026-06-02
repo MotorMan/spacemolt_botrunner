@@ -1740,6 +1740,7 @@ ${botContext}
       jumps?: number;
       fuelRefueled?: number;
       playerFuelPct?: number;
+      credits?: number;
     },
     personality?: string
   ): Promise<{ ok: boolean; message?: string; error?: string }> {
@@ -1765,16 +1766,18 @@ Context:
 IMPORTANT NOTES ABOUT FUEL:
 ${context.playerFuelPct !== undefined ? `- The STRANDED PILOT'S fuel level is ${context.playerFuelPct}% (this is THEIR fuel, NOT yours)` : `- Fuel levels are not specified - focus on the situation described`}
 ${context.fuelRefueled !== undefined ? `- You transferred ${context.fuelRefueled} fuel units to the stranded pilot` : ''}
+${context.credits !== undefined ? `- The rescue invoice totals ${context.credits} credits` : ''}
 - NEVER confuse the stranded pilot's fuel level with your own fuel level
 - When referring to fuel, always clarify whose fuel you're talking about
 
 Task:
 Generate a brief radio transmission message (max 2 sentences) to send via private chat to the stranded pilot.
+If an invoice was sent, ALWAYS mention the credit amount in your message.
 
 Style:
 - Keep it natural and in-character
 - Be concise (this is a radio transmission)
-- Include relevant details (ETA, jumps, etc.) if provided
+- Include relevant details (ETA, jumps, credits, etc.) if provided
 - Don't be overly verbose
 - Use 1st person ("I", "me", "my") when talking about yourself`;
 
@@ -1784,6 +1787,7 @@ Situation: ${context.situation}
 ${context.jumps ? `Jumps remaining: ${context.jumps}` : ""}
 ${context.fuelRefueled ? `Fuel transferred: ${context.fuelRefueled}` : ""}
 ${context.playerFuelPct ? `Their fuel before: ${context.playerFuelPct}%` : ""}
+${context.credits !== undefined ? `Invoice total: ${context.credits} credits` : ""}
 
 Message:`;
 

@@ -1194,8 +1194,16 @@ export async function ensureFueled(
     return true;
   }
 
-  // If we undocked and were previously docked, return there before trying station fuel
-  if (wasDocked && dockingStation) {
+  // Check for approved fuel stations FIRST
+  const approvedFuelStations = (readSettings()?.general as any)?.approvedFuelStations as string[] | undefined;
+
+  if (!approvedFuelStations || approvedFuelStations.length === 0) {
+    ctx.log("warn", "No approved fuel stations configured — skipping refuel");
+    return false;
+  }
+
+  // If we undocked and were previously docked, only return there if it's APPROVED
+  if (wasDocked && dockingStation && isApprovedFuelStation(dockingStation.id, readSettings(), bot.system)) {
     ctx.log("system", `Returning to ${dockingStation.name} to attempt station refuel...`);
     const trResp = await bot.exec("travel", { target_poi: dockingStation.id });
     bot.poi = dockingStation.id;
@@ -1204,14 +1212,6 @@ export async function ensureFueled(
       bot.docked = true;
       await ensureInsured(ctx);
     }
-  }
-
-  // Check for approved fuel stations
-  const approvedFuelStations = (readSettings()?.general as any)?.approvedFuelStations as string[] | undefined;
-
-  if (!approvedFuelStations || approvedFuelStations.length === 0) {
-    ctx.log("warn", "No approved fuel stations configured — skipping refuel");
-    return false;
   }
 
   const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
@@ -1254,10 +1254,11 @@ export async function ensureFueled(
     return false;
   }
 
+  // Check if the nearest station has fuel before traveling there
   try {
     const poiResp = await bot.exec("get_poi", { poi_id: nearest.poiId });
-    const baseFuel = (poiResp as any)?.base?.fuel ?? 0;
-    if (baseFuel <= 0 && nearest.poiId !== "sol_station") {
+    const baseFuel = (poiResp as any)?.result?.base?.fuel ?? (poiResp as any)?.base?.fuel ?? 0;
+    if (baseFuel <= 0) {
       ctx.log("system", `Skipping ${nearest.poiName} — station reports 0 fuel`);
       return false;
     }

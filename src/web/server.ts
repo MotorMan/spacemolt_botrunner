@@ -563,20 +563,23 @@ export class WebServer {
           });
         }
         if (url.pathname === "/api/faction-storage") {
-          // Return faction shared warehouse contents
-          const factionStoragePath = join(process.cwd(), "data", "factionStorage.json");
+          // Return faction shared warehouse contents for a specific station
+          const station = url.searchParams.get("station") || "";
+          const faction = url.searchParams.get("faction") || "";
+          const factionStoragePath = join(process.cwd(), "data", "factionStorage", `${faction}::${station || "default"}.json`);
           if (!existsSync(factionStoragePath)) {
             return Response.json({ items: [] });
           }
           try {
             const raw = readFileSync(factionStoragePath, "utf-8");
             const data = JSON.parse(raw);
-            // Normalize: entries may be under "entries" or "items"
             const items = data.entries || data.items || [];
             return Response.json({
               items,
               factionFuelReserve: data.factionFuelReserve || 0,
               factionFuelCapacity: data.factionFuelCapacity || 0,
+              factionName: data.factionName,
+              station: data.station,
             });
           } catch {
             return Response.json({ items: [] });

@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, writeFileSync } from "fs";
+import { existsSync, readFileSync, writeFileSync, mkdirSync, readdirSync, renameSync } from "fs";
 import { join } from "path";
 
 export interface FactionStorageEntry {
@@ -9,6 +9,7 @@ export interface FactionStorageEntry {
 
 export interface FactionStorageCache {
   factionName: string;
+  station: string;
   lastUpdated: number;
   entries: FactionStorageEntry[];
   factionFuelReserve?: number;
@@ -16,46 +17,126 @@ export interface FactionStorageCache {
 }
 
 const DATA_DIR = join(process.cwd(), "data");
-const CACHE_FILE = join(DATA_DIR, "factionStorage.json");
+const CACHE_DIR = join(DATA_DIR, "factionStorage");
+const cacheStore = new Map<string, { data: FactionStorageCache; lastWritten: number }>();
+const stationToKeyMap = new Map<string, string>();
 
-const MIN_WRITE_INTERVAL = 10 * 60 * 1000; // 10 minutes
-let cachedData: FactionStorageCache | null = null;
-let lastWritten: number = 0;
-let pendingWrite = false;
+function getCacheKey(factionName: string, station: string): string {
+  return `${factionName}::${station || "default"}`;
+}
 
-function loadFromDisk(): FactionStorageCache | null {
+function sanitizeFilename(key: string): string {
+  return key.replace(/::/g, "--");
+}
+
+function checkExistingCacheFiles(): void {
   try {
-    if (existsSync(CACHE_FILE)) {
-      const content = readFileSync(CACHE_FILE, "utf-8");
+    if (!existsSync(CACHE_DIR)) return;
+    const files = readdirSync(CACHE_DIR);
+    for (const file of files) {
+      if (file.includes("::") && file.endsWith(".json")) {
+        const oldPath = join(CACHE_DIR, file);
+        const newPath = join(CACHE_DIR, file.replace(/::/g, "--"));
+        renameSync(oldPath, newPath);
+      }
+    }
+  } catch (e) {
+    console.log("Error checking cache files:", e);
+  }
+}
+
+function loadFromDisk(factionName: string, station: string): FactionStorageCache | null {
+  try {
+    const key = getCacheKey(factionName, station);
+    const cacheFile = join(CACHE_DIR, `${sanitizeFilename(key)}.json`);
+    if (existsSync(cacheFile)) {
+      const content = readFileSync(cacheFile, "utf-8");
       return JSON.parse(content) as FactionStorageCache;
     }
   } catch (e) {
-    // Silently return null on error
   }
   return null;
 }
 
-function saveToDisk(data: FactionStorageCache): void {
-  const now = Date.now();
-  if (now - lastWritten < MIN_WRITE_INTERVAL && !pendingWrite) {
-    return;
+function ensureCacheDir(): void {
+  if (!existsSync(DATA_DIR)) {
+    mkdirSync(DATA_DIR, { recursive: true });
   }
-  lastWritten = now;
-  pendingWrite = false;
+  if (!existsSync(CACHE_DIR)) {
+    mkdirSync(CACHE_DIR, { recursive: true });
+  }
+}
+
+function saveToDisk(key: string, data: FactionStorageCache): void {
   try {
-    writeFileSync(CACHE_FILE, JSON.stringify(data, null, 2), "utf-8");
+    ensureCacheDir();
+    const cacheFile = join(CACHE_DIR, `${sanitizeFilename(key)}.json`);
+    writeFileSync(cacheFile, JSON.stringify(data, null, 2), "utf-8");
   } catch (e) {
     console.log("Error writing faction storage cache:", e);
   }
 }
 
-export function getFactionStorageCache(factionName: string): FactionStorageCache | null {
-  if (cachedData && cachedData.factionName === factionName) {
-    return cachedData;
+function migrateOldCache(): void {
+  try {
+    const oldCacheFile = join(DATA_DIR, "factionStorage.json");
+    if (existsSync(oldCacheFile)) {
+      const content = readFileSync(oldCacheFile, "utf-8");
+      const oldData = JSON.parse(content) as { factionName: string; entries: FactionStorageEntry[]; factionFuelReserve?: number; factionFuelCapacity?: number };
+      if (oldData.factionName && oldData.entries && oldData.entries.length > 0) {
+        const key = getCacheKey(oldData.factionName, "default");
+        const data: FactionStorageCache = {
+          factionName: oldData.factionName,
+          station: "default",
+          lastUpdated: Date.now(),
+          entries: oldData.entries,
+          factionFuelReserve: oldData.factionFuelReserve,
+          factionFuelCapacity: oldData.factionFuelCapacity,
+        };
+        cacheStore.set(key, { data, lastWritten: Date.now() });
+        stationToKeyMap.set("default", key);
+        saveToDisk(key, data);
+      }
+    }
+  } catch (e) {
+    console.log("Error migrating old faction storage cache:", e);
   }
-  cachedData = loadFromDisk();
-  if (cachedData && cachedData.factionName === factionName) {
-    return cachedData;
+}
+
+ensureCacheDir();
+migrateOldCache();
+checkExistingCacheFiles();
+
+export function getFactionStorageCache(factionName: string, station: string = ""): FactionStorageCache | null {
+  const key = getCacheKey(factionName, station);
+  const entry = cacheStore.get(key);
+  if (entry && entry.data) {
+    return entry.data;
+  }
+  const loaded = loadFromDisk(factionName, station);
+  if (loaded) {
+    cacheStore.set(key, { data: loaded, lastWritten: 0 });
+    return loaded;
+  }
+  return null;
+}
+
+export function getFactionStorageCacheByStationOnly(station: string): FactionStorageCache | null {
+  const key = stationToKeyMap.get(station);
+  if (key) {
+    const entry = cacheStore.get(key);
+    if (entry?.data) return entry.data;
+  }
+  const keys = getAllFactionStorageKeys();
+  for (const k of keys) {
+    const [factionName, st] = k.split("::");
+    if (st === station) {
+      const entry = cacheStore.get(k);
+      if (entry?.data) {
+        stationToKeyMap.set(station, k);
+        return entry.data;
+      }
+    }
   }
   return null;
 }
@@ -63,50 +144,75 @@ export function getFactionStorageCache(factionName: string): FactionStorageCache
 export function updateFactionStorageCache(
   factionName: string,
   entries: FactionStorageEntry[],
+  station?: string,
   factionFuelReserve?: number,
   factionFuelCapacity?: number,
 ): void {
+  const st = station || "";
+  const key = getCacheKey(factionName, st);
   const now = Date.now();
   
-  if (!cachedData || cachedData.factionName !== factionName) {
-    cachedData = {
+  if (st) {
+    stationToKeyMap.set(st, key);
+  }
+  
+  const entry = cacheStore.get(key);
+  
+  if (!entry) {
+    const data: FactionStorageCache = {
       factionName,
+      station: st,
       lastUpdated: now,
       entries,
       factionFuelReserve,
       factionFuelCapacity,
     };
-    saveToDisk(cachedData);
+    cacheStore.set(key, { data, lastWritten: now });
+    saveToDisk(key, data);
     return;
   }
 
-  const hasChanged = JSON.stringify(cachedData.entries) !== JSON.stringify(entries);
-  
-  cachedData.lastUpdated = now;
-  cachedData.entries = entries;
-  if (factionFuelReserve !== undefined) cachedData.factionFuelReserve = factionFuelReserve;
-  if (factionFuelCapacity !== undefined) cachedData.factionFuelCapacity = factionFuelCapacity;
+  entry.data.lastUpdated = now;
+  entry.data.entries = entries;
+  entry.data.station = st;
+  if (factionFuelReserve !== undefined) entry.data.factionFuelReserve = factionFuelReserve;
+  if (factionFuelCapacity !== undefined) entry.data.factionFuelCapacity = factionFuelCapacity;
 
-  if (hasChanged) {
-    pendingWrite = true;
-    saveToDisk(cachedData);
-  }
+  cacheStore.set(key, { data: entry.data, lastWritten: now });
+  saveToDisk(key, entry.data);
 }
 
-export function isFactionStorageCacheStale(factionName: string, maxAgeMs: number = 5 * 60 * 1000): boolean {
-  const cached = getFactionStorageCache(factionName);
+export function isFactionStorageCacheStale(factionName: string, station?: string, maxAgeMs: number = 5 * 60 * 1000): boolean {
+  const cached = getFactionStorageCache(factionName, station);
   if (!cached) return true;
   return Date.now() - cached.lastUpdated > maxAgeMs;
 }
 
-export function flushFactionStorageCache(): void {
-  if (cachedData) {
-    lastWritten = 0;
-    pendingWrite = false;
-    saveToDisk(cachedData);
+export function flushFactionStorageCache(factionName?: string, station?: string): void {
+  if (factionName) {
+    const key = getCacheKey(factionName, station || "");
+    const entry = cacheStore.get(key);
+    if (entry) {
+      saveToDisk(key, entry.data);
+    }
+  } else {
+    cacheStore.forEach((entry, key) => {
+      saveToDisk(key, entry.data);
+    });
   }
 }
 
 export function clearFactionStorageCache(): void {
-  cachedData = null;
+  cacheStore.clear();
+}
+
+export function getAllFactionStorageKeys(): string[] {
+  const keys: string[] = [];
+  cacheStore.forEach((_value, key) => keys.push(key));
+  return keys;
+}
+
+export function getFactionStorageCacheByStation(factionName: string, station: string): FactionStorageCache | undefined {
+  const key = getCacheKey(factionName, station);
+  return cacheStore.get(key)?.data;
 }

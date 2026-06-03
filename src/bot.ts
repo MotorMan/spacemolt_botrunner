@@ -8,7 +8,7 @@ import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
-import { getFactionStorageCache, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
+import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, type PathfinderTravelRecord } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
@@ -671,7 +671,8 @@ docked = false;
         // Update faction storage cache whenever view_storage is called for faction
         if (command === "view_storage" && payload?.target === "faction" && !resp.error && this.faction) {
           const entries = this.parseItemList(resp.result);
-          updateFactionStorageCache(this.faction, entries);
+          const station = (payload.station_id as string) || this.poi;
+          updateFactionStorageCache(this.faction, entries, station);
         }
 
         if (resp.error) {
@@ -853,9 +854,7 @@ docked = false;
         this.location;
 
       // Faction membership
-      if (!this.faction) {
-        this.faction = (p.faction_id as string) ?? (p.faction as string) ?? null;
-      }
+      this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
 
        // Ship fields
       const ship = r.ship as Record<string, unknown> | undefined;
@@ -1065,20 +1064,17 @@ docked = false;
   /** Fetch faction storage contents and cache them. Silently returns empty on error. */
   async refreshFactionStorage(): Promise<void> {
     let factionName = this.faction;
+    const station = this.poi;
     if (!factionName) {
       // Try to load from cache to get faction name and storage
       try {
-        const { existsSync, readFileSync } = await import("fs");
-        const { join } = await import("path");
-        const cacheFile = join(process.cwd(), "data", "factionStorage.json");
-        if (existsSync(cacheFile)) {
-          const content = readFileSync(cacheFile, "utf-8");
-          const cached = JSON.parse(content) as { factionName: string; entries: any[]; factionFuelReserve?: number; factionFuelCapacity?: number };
+        const cached = getFactionStorageCacheByStationOnly(station);
+        if (cached && cached.entries.length > 0) {
           this.faction = cached.factionName;
-          this.factionStorage = cached.entries;
+          this.factionStorage = cached.entries.map(e => ({ itemId: e.itemId, name: e.name || e.itemId, quantity: e.quantity }));
           this.factionFuelReserve = cached.factionFuelReserve || 0;
           this.factionFuelCapacity = cached.factionFuelCapacity || 0;
-          this.log("info", `Loaded faction storage from cache: ${cached.factionName} (${cached.entries.length} items)`);
+          this.log("info", `Loaded faction storage from cache: ${cached.factionName} at ${station} (${cached.entries.length} items)`);
           return;
         }
       } catch (e) {
@@ -1112,7 +1108,7 @@ docked = false;
     this.factionStorage = entries;
     this.factionFuelReserve = (result.faction_fuel_reserve as number) || 0;
     this.factionFuelCapacity = (result.faction_fuel_capacity as number) || 0;
-    updateFactionStorageCache(factionName, entries, this.factionFuelReserve, this.factionFuelCapacity);
+    updateFactionStorageCache(factionName, entries, station, this.factionFuelReserve, this.factionFuelCapacity);
   }
 
   /** Start running a routine. */

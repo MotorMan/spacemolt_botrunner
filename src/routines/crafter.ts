@@ -1,5 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { catalogStore } from "../catalogstore.js";
+import { updateFactionStorageCache } from "../factionStorageCache.js";
 import {
   ensureDocked,
   tryRefuel,
@@ -15,8 +16,9 @@ import {
 
 async function refreshFactionStorageDirectly(ctx: RoutineContext, bot: any): Promise<void> {
   const factionName = bot.faction;
+  const station = bot.poi;
   if (!factionName) {
-    // But let's still try to fetch faction storage to see if it works
+    return;
   }
 
   const resp = await bot.exec("view_storage", { target: "faction" });
@@ -26,25 +28,9 @@ async function refreshFactionStorageDirectly(ctx: RoutineContext, bot: any): Pro
     return;
   }
 
-  if (Array.isArray(resp.result)) {
-    // Process array directly
-  } else if (typeof resp.result === 'object') {
-    const r = resp.result as Record<string, unknown>;
-
-    // Check all possible array field names
-    const possibleArrays = ['items', 'cargo', 'storage', 'stored_items', 'faction_items', 'faction_storage', 'data', 'result'];
-    let foundArray = false;
-    for (const key of possibleArrays) {
-      if (Array.isArray(r[key])) {
-        foundArray = true;
-        break;
-      }
-    }
-  }
-
-  // Try to parse the items
   const items = parseFactionStorageItems(resp.result);
   bot.factionStorage = items;
+  updateFactionStorageCache(factionName, items, station);
 }
 
 function parseFactionStorageItems(result: unknown): Array<{itemId: string, name: string, quantity: number}> {

@@ -1,4 +1,4 @@
-﻿# SpaceMolt Bot Runner
+# SpaceMolt Bot Runner
 
 > **A comprehensive fleet manager for [SpaceMolt](https://www.spacemolt.com) — manage unlimited automated bots from a single web dashboard.**
 
@@ -11,7 +11,7 @@
 - [What It Does](#what-it-does)
 - [Quick Start](#quick-start)
 - [Architecture](#architecture)
-- [Bot Routines (21 Available)](#bot-routines)
+- [Bot Routines (20 Available)](#bot-routines)
   - [Economic Routines](#economic-routines)
   - [Combat Routines](#combat-routines)
   - [Coordination Routines](#coordination-routines)
@@ -38,8 +38,8 @@
 Bot Runner is a **complete fleet management system** for [SpaceMolt](https://www.spacemolt.com), a text-based space MMO designed for AI agents. It provides:
 
 - **Web Dashboard** — real-time monitoring, controls, and management at `http://localhost:3000`
-- **21 Automated Routines** — mining, exploring, trading, combat, crafting, rescue, fuel selling, and more
-- **Multi-Bot Coordination** — flock mining, fleet combat, cargo hauling, trade routes
+- **20 Automated Routines** — mining, exploring, trading, combat, crafting, rescue, fuel selling, fuel transport, and more
+- **Multi-Bot Coordination** — flock mining, fleet combat, cargo hauling, trade routes, fuel logistics
 - **AI-Powered Features** — LLM-driven autonomous play, intelligent chat responses, standalone CLI commander
 - **Faction Management** — full in-game faction controls from your browser
 - **Galaxy Map** — auto-built exploration data with filtering, pathfinding, and resource overlays
@@ -48,7 +48,7 @@ Bot Runner is a **complete fleet management system** for [SpaceMolt](https://www
 
 **Key Capabilities:**
 - Run unlimited bots, each with independent routines and configurations
-- Coordinate multiple bots for complex operations (flock mining, fleet combat, cargo moving, rescue cooperation)
+- Coordinate multiple bots for complex operations (flock mining, fleet combat, cargo moving, rescue cooperation, fuel logistics)
 - Monitor everything from a live web dashboard with real-time WebSocket status updates
 - Execute any game command manually from bot profile pages
 - AI chat service with per-bot personalities, conversation memory, and channel-aware responses
@@ -60,6 +60,9 @@ Bot Runner is a **complete fleet management system** for [SpaceMolt](https://www
 - Skill level tracking with level-up notifications
 - Player name discovery and persistent entity tracking (players, pirates, empire NPCs)
 - Drone script management (mining, combat, repair, salvage, scout)
+- Fuel transport logistics — move fuel cells between faction storage stations
+- Pathfinder bearing calculations and travel time estimates
+- Tax estimate tracking and comparison
 
 **Architecture Highlights:**
 - Single Bun process — no database, no external services
@@ -68,6 +71,7 @@ Bot Runner is a **complete fleet management system** for [SpaceMolt](https://www
 - WebSocket push architecture from server to all connected browser tabs
 - Session token persistence for instant reconnection across restarts
 - Graceful shutdown with stats flush, bot stop, and optional session clearing on mass disconnect
+
 ---
 
 ## Quick Start
@@ -136,15 +140,22 @@ Open `http://localhost:3000` in your browser. Use `PORT=8080 bun start` for a di
 
 | Module | File | Purpose |
 |--------|------|---------|
-| **BotManager** | `src/botmanager.ts` (~960 lines) | Entry point — discovers bots, starts web server, routes actions, manages AI chat service, mass disconnect detector |
-| **Bot** | `src/bot.ts` (~1250 lines) | Bot class — login, exec, status caching, routine runner, battle state, customs holds, skill tracking |
-| **API Client** | `src/api.ts` (~840 lines) | SpaceMolt REST client (V2) — session management, response caching, rate limiting, 502/524 retry, bandwidth monitoring |
-| **Web Server** | `src/web/server.ts` (~1325 lines) | Bun.serve HTTP + WebSocket server, settings persistence, stats flushing, map data serving |
+| **BotManager** | `src/botmanager.ts` (~1050 lines) | Entry point — discovers bots, starts web server, routes actions, manages AI chat service, mass disconnect detector, registers all 20 routines |
+| **Bot** | `src/bot.ts` (~2525 lines) | Bot class — login, exec, status caching, routine runner, battle state, customs holds, skill tracking, pathfinder state |
+| **API Client** | `src/api.ts` (~841 lines) | SpaceMolt REST client (V2) — session management, response caching, rate limiting, 502/524 retry, bandwidth monitoring, command-to-tool mapping |
+| **Web Server** | `src/web/server.ts` (~1498 lines) | Bun.serve HTTP + WebSocket server, settings persistence, stats flushing, map data serving, fleet stats, bandwidth API |
 | **Dashboard SPA** | `src/web/index.html` (~877KB) | Single-page application — dashboard, map, market, faction, shipyard, missions, stats, settings, bot profiles |
-| **AI Chat Service** | `src/aichat_service.ts` (~2156 lines) | Global background service — monitors chat, per-bot personalities, conversation history, empire official filtering |
-| **Map Store** | `src/mapstore.ts` (~1893 lines) | Galaxy map persistence — systems, POIs, connections, resources, market data, wormholes, BFS pathfinding |
-| **Catalog Store** | `src/catalogstore.ts` (~332 lines) | Game catalog cache — items, ships, skills, recipes with 24h auto-refresh |
+| **AI Chat Service** | `src/aichat_service.ts` (~2191 lines) | Global background service — monitors chat, per-bot personalities, conversation history, empire official filtering, map summary integration |
+| **Map Store** | `src/mapstore.ts` (~2131 lines) | Galaxy map persistence — systems, POIs, connections, resources, market data, wormholes, BFS pathfinding, pathfinder bearing calculations |
+| **Catalog Store** | `src/catalogstore.ts` (~362 lines) | Game catalog cache — items, ships, skills, recipes with 24h auto-refresh |
 | **Session Manager** | `src/session.ts` (~118 lines) | Credential and session token persistence per bot |
+| **Pathfinder** | `src/pathfinder.ts` | BFS pathfinding, bearing calculations, travel time estimates, landing predictions |
+| **UI** | `src/ui.ts` (~509 lines) | Log routing, notification parsing, LLM debug formatting, YAML output, color-coded categories |
+| **Debug** | `src/debug.ts` (~135 lines) | Per-bot and global debug logging, log rotation (200MB max) |
+| **Customs** | `src/customs.ts` (~576 lines) | Confederacy Customs inspection service — detection, hold blocking, statistics, AI coordination |
+| **Player Name Store** | `src/playernamestore.ts` (~720 lines) | Persistent player/pirate/NPC entity tracking with full details |
+| **Faction Storage Cache** | `src/factionStorageCache.ts` (~218 lines) | Faction storage cache with debounced writes, per-station tracking |
+| **Pilot Skill Tracker** | `src/pilotSkillTracker.ts` (~283 lines) | Pilot skill level tracking, XP gain logging, level-up detection |
 
 ### Data Flow
 
@@ -186,15 +197,29 @@ No database required. All state is stored as JSON files in `data/`:
 | `skills.json` | Skill gain event log |
 | `factionStorage.json` | Faction storage cache |
 | `fcStations.json` | Fuel cell seller station tracking |
+| `fuelTransfer.json` | Fuel transport trip tracking |
 | `marketDetails.json` | Detailed market order data |
 | `shipsForSale.json` | Ship listing data |
 | `rawMissions.json` | Raw mission data from explorers |
 | `facilities.json` | Facility type definitions |
+| `taxes.json` | Tax estimate data |
+| `main_logs.json` | Main log buffers (activity, broadcast, system, faction) |
+| `IMPORTANTMESSAGES.json` | Important message tracking for AI chat |
+| `personalities/*.md` | Per-bot AI chat personality definitions |
+| `flock_signals/*` | Flock mining coordination files |
+| `escort_signals/*` | Escort coordination files |
+| `flock.json` | Flock group settings and assignments |
+| `craftingLoadouts.json` | Crafting loadout configurations |
+| `craft-goals.json` | Crafting goal configurations |
+| `logs/debug.log` | Global debug log |
+| `logs/{botName}_debug.log` | Per-bot debug logs |
+| `logs/activity/{botName}_activity.log` | Per-bot activity logs |
+
 ---
 
 ## Bot Routines
 
-The system includes **21 distinct automated routines**, each designed for specific gameplay roles. Bots can switch between routines at any time from the dashboard. Each routine is an async generator that yields state names as it progresses, allowing clean interruption and resumption.
+The system includes **20 distinct automated routines**, each designed for specific gameplay roles. Bots can switch between routines at any time from the dashboard. Each routine is an async generator that yields state names as it progresses, allowing clean interruption and resumption.
 
 ### Economic Routines
 
@@ -215,9 +240,10 @@ Automated resource extraction with advanced coordination. (~5450 lines — the l
 - **Battle interrupt handling** — detects combat during mining, flees immediately
 - **Death detection and recovery** — handles respawn at home base
 - **Persistent mining sessions** — activity tracking in `data/minerActivity.json` for crash recovery
+- **Radioactive mining detection** — auto-detects radioactive equipment via `src/routines/miner_radioactive.ts`
 
 #### 🔄 Trader
-Automated buy/sell trading between stations with route optimization. (~3100 lines)
+Automated buy/sell trading between stations with route optimization. (~3107 lines)
 
 - **Trade route management** with working balance tracking (200k credits default)
 - **Multi-bot coordination** — trade route locking via `data/tradeCoordination.json` prevents conflicts
@@ -230,7 +256,7 @@ Automated buy/sell trading between stations with route optimization. (~3100 line
 - **Death and recovery** — handles destruction and respawn
 
 #### 🛒 Trade Buyer
-Bulk purchasing of configured items from markets. (~1225 lines) Not actually tested yet!
+Bulk purchasing of configured items from markets. (~1226 lines)
 
 - **Configurable max spend** per item and total budget
 - **Price limits** per item — won't buy above configured max price
@@ -241,7 +267,7 @@ Bulk purchasing of configured items from markets. (~1225 lines) Not actually tes
 - **Mod management** — ensures cargo mods fitted for maximum haul
 
 #### 🏭 Faction Trader
-Trading focused on faction economy — liquidates faction storage items. (~2050 lines)
+Trading focused on faction economy — liquidates faction storage items. (~2052 lines)
 
 - **Withdraws items from faction storage** and sells at best known buyer station
 - **Never buys from markets** — pure liquidation routine
@@ -263,9 +289,10 @@ Automated crafting with intelligent material sourcing. (~1920 lines)
 - **Filters out ship passive recipes** (cannot be crafted manually)
 - **Crafting plan calculation** with profit analysis
 - **Persistent crafting loadouts** in `data/craftingLoadouts.json`
+- **Crafting goal management** via `src/routines/craft-goals.ts`
 
 #### 🚚 Cargo Mover
-Hauls specified items from source to destination station. (~2060 lines) this is still buggy and overshoots and misses cargo.
+Hauls specified items from source to destination station. (~2059 lines)
 
 - **Multi-bot coordination** — item quantity locking allows 3-4 bots to work together on the same haul
 - **Persistent activity tracking** in `data/cargoMoverActivity.json` for interruption recovery
@@ -273,11 +300,12 @@ Hauls specified items from source to destination station. (~2060 lines) this is 
 - **Automatic cleanup and resumption** after crashes/restarts
 - **Destination types:** faction storage, personal storage, or `send_gift` to another bot
 - **Source types:** faction storage or personal station storage
-- **In-transit tracking** — prevents duplicate pickup after partial delivery
+- **In-transit tracking** — prevents duplicate pickup after partial delivery via `src/routines/cargoMoverInTransit.ts`
 - **Configurable per-item quantities** with total delivery targets
+- **Coordination** via `src/routines/cargoMoverCoordination.ts`
 
 #### 🧹 Cleanup
-Consolidates scattered station storage to faction home base. (~1120 lines)
+Consolidates scattered station storage to faction home base. (~1123 lines)
 
 - **Storage hint detection** — parses `view_storage` hint field to discover which stations have stored items/credits
 - **Remote station inspection** via `view_storage(station_id=...)` before traveling
@@ -288,21 +316,34 @@ Consolidates scattered station storage to faction home base. (~1120 lines)
 - **Focus station mode** — can target a single specific station
 
 #### ⛽ Fuel Cell Seller
-Travels to non-pirate stations posting fuel cell sell orders. (~800 lines) future mod is remote faction fuel cell mover
+Travels to non-pirate stations posting fuel cell sell orders. (~798 lines)
 
 - **Starts at faction home base** with maximum fuel cells
 - **Auto-pricing** — midpoint between min/max or manual price override
-- **Tracks placed orders** in `data/fcStations.json`
+- **Tracks placed orders** in `data/fcStations.json` with order history, remaining quantities, and fill tracking
 - **Visits each configured station** and creates sell orders
 - **Returns home to restock** and repeats
 - **Pirate system avoidance** — only visits safe stations
+- **Order status tracking** — monitors active orders, filled quantities, and unsold inventory
+
+#### 🚛 Fuel Transport
+Transfers fuel cells (and other items) from faction home storage to remote faction stations. (~535 lines)
+
+- **Withdraws from home faction storage** and delivers to remote stations
+- **Deposits to faction or personal storage** at destination — tries faction first, falls back to personal
+- **Configurable stations and items** — target quantities per station per item
+- **Trip tracking** — persistent delivery records in `data/fuelTransfer.json` with full event history
+- **Auto-routing** — navigates home to withdraw, then to each remote station
+- **Cargo-aware** — calculates item size and available cargo space before withdrawing
+- **Battle and death handling** — standard safety checks integrated
+- **Fleet activity logging** — logs deposits to faction activity via `logFactionActivity`
 
 ---
 
 ### Combat Routines
 
 #### 🎯 Hunter
-Patrols systems hunting pirate NPCs for bounties and loot. (~1515 lines) this is already out of date! multi-bot support with specified patrol routes(duplicate systems to be added later)
+Patrols systems hunting pirate NPCs for bounties and loot. (~1515 lines)
 
 - **Combat stances:** Fire (default), Brace (shields critical), Flee (hull critical)
 - **Pirate tier filtering** (small/medium/large/capitol/boss) — configurable max attack tier
@@ -315,19 +356,19 @@ Patrols systems hunting pirate NPCs for bounties and loot. (~1515 lines) this is
 - **Battle analysis** — evaluates existing battles before joining
 
 #### ⚓ Fleet Hunter Commander
-Leads a fleet of subordinate hunter bots in coordinated combat. (~1900 lines) currently still not very functional, just barely fights. no real need for it, as a single Axiomata can kill bosses in 10 ticks.
+Leads a fleet of subordinate hunter bots in coordinated combat. (~1897 lines)
 
 - **Decides patrol systems and POIs** for the fleet
 - **Fleet commands:** MOVE, ATTACK, FLEE, REGROUP, HOLD, PATROL
 - **Fire modes:** Focus fire (all target one) or spread fire (independent targets)
-- **Local fleet communication** — in-memory event system (no faction chat spam)
+- **Local fleet communication** — in-memory event system (no faction chat spam) via `src/fleet_comm.ts`
 - **Optional faction chat broadcast** for wider coordination
 - **Post-patrol logistics** — dock, repair, resupply automation
 - **BFS-based safe system finding** for emergency retreat
 - **Manual mode** — allows human to take control via dashboard
 
 #### 🛡️ Fleet Hunter Subordinate
-Follows commander's orders in fleet combat operations. (~640 lines)
+Follows commander's orders in fleet combat operations. (~637 lines)
 
 - **Receives and executes** fleet commands via local communication
 - **Combat stance management** (fire/brace/flee)
@@ -336,7 +377,7 @@ Follows commander's orders in fleet combat operations. (~640 lines)
 - **Battle commands:** BATTLE_ADVANCE, BATTLE_RETREAT, BATTLE_STANCE, BATTLE_TARGET
 
 #### 🔧 Salvager
-Travels POI to POI scavenging wrecks for valuable loot. (~1400 lines) may still be broken.
+Travels POI to POI scavenging wrecks for valuable loot. (~1405 lines)
 
 - **Full salvage mode** — complete wreck processing including modules
 - **Towing support** — tow wrecks to salvage yard stations for maximum value
@@ -354,9 +395,9 @@ Travels POI to POI scavenging wrecks for valuable loot. (~1400 lines) may still 
 ### Coordination Routines
 
 #### 🛡️ Escort
-Follows and protects a specified bot (typically a miner). (~1250 lines) haven't gotten to test combat in a while, but in theroy it can attack.
+Follows and protects a specified bot (typically a miner). (~1254 lines)
 
-- **Tracks target's position** via bot-to-bot chat channel, fleet status, or file-based coordination
+- **Tracks target's position** via bot-to-bot chat channel, fleet status, or file-based coordination via `src/cooperation/rescueCooperation.ts`
 - **Multiple escorts** can follow one target simultaneously
 - **Engages threats automatically** — both proactive (scanning) and reactive (battle pull)
 - **Combat stance management** (fire/brace/flee)
@@ -366,20 +407,21 @@ Follows and protects a specified bot (typically a miner). (~1250 lines) haven't 
 - **Signal channel** — configurable communication channel for coordination
 
 #### 🤖 AI
-Uses an LLM to play SpaceMolt autonomously. (~920 lines) really it's just a basic copy/paste from commander i think. full AI control to just 1 bot.
+Uses an LLM to play SpaceMolt autonomously. (~920 lines)
 
 - **Works with Ollama, LM Studio, vLLM, OpenAI, Anthropic, Groq, xAI, Mistral, OpenRouter** — any OpenAI-compatible endpoint
-- **Tool-calling:** Game actions exposed as AI tools (execute any command, query state, read/write memory)
+- **Tool-calling:** Game actions exposed as AI tools (execute any command, query state, read/write memory) via `src/tools.ts`
 - **Persistent memory** in `data/ai_memory.json` — goals, insights, decisions across sessions
 - **Captain's log entries** for periodic state summaries and long-term context
 - **TODO tracking** — goal-oriented behavior with task lists
-- **Session handoff** — clean restarts with state preservation
+- **Session handoff** — clean restarts with state preservation via `src/loop.ts`
 - **Context compaction** — handles long-running sessions by summarizing older messages (55% context budget)
-- **OpenAPI spec loading** — fetches game command documentation for the LLM
+- **OpenAPI spec loading** — fetches game command documentation for the LLM via `src/schema.ts`
 - **Configurable model, cycle interval, max tool calls per cycle**
+- **Model resolution** via `src/model.ts` using `pi-ai` library
 
 #### 📊 Coordinator
-Market analysis and craft order management. (~960 lines) not used anymore. kinda pointless unless you really wana craft what it thinks is the best, but it never worked right.
+Market analysis and craft order management. (~957 lines)
 
 - **Fetches global market data** from `https://game.spacemolt.com/api/market`
 - **Auto-adjusts** ore mining targets and craft limits based on market demand
@@ -394,22 +436,23 @@ Market analysis and craft order management. (~960 lines) not used anymore. kinda
 ### Utility Routines
 
 #### 🆘 Rescue / Fuel Rescue
-Monitors fleet for stranded bots, delivers fuel cells or credits. (~6570 lines — the most complex routine)
+Monitors fleet for stranded bots, delivers fuel cells or credits. (~6573 lines — the most complex routine)
 
-- **MAYDAY handling** — parses emergency distress messages with regex, validates legitimacy (fuel threshold check)
+- **MAYDAY handling** — parses emergency distress messages with regex via `src/mayday.ts`, validates legitimacy (fuel threshold check)
 - **Pirate awareness** — BFS-based pirate stronghold proximity checks, MAYDAY lockouts near pirate bases
 - **Pirate trap detection** — detects false flag operations using own bot names
-- **Rescue cooperation** — multi-bot coordination via bot chat channel (distance-based priority, round-robin for ties)
-- **Rescue queue** — route-optimized batch rescues with persistent queue in `data/rescueQueue.json`
-- **Rescue BlackBook** — player reputation tracking (ghosts, successful rescues, billing) in `data/rescueBlackBook.json`
+- **Rescue cooperation** — multi-bot coordination via bot chat channel (distance-based priority, round-robin for ties) via `src/cooperation/rescueCooperation.ts`
+- **Rescue queue** — route-optimized batch rescues with persistent queue in `data/rescueQueue.json` via `src/rescueQueue.ts`
+- **Rescue BlackBook** — player reputation tracking (ghosts, successful rescues, billing) in `data/rescueBlackBook.json` via `src/rescueBlackBook.ts`
 - **Rescue billing system** — charges per jump and fuel delivered
 - **Target verification** before rescue (checks if target still needs help)
 - **Customs inspection awareness** during rescue operations
 - **Consecutive failure tracking** — aborts after 3 failed attempts to prevent spam loops
 - **Blacklist validation** — refuses rescues to unreachable systems
-- **Manual rescue requests** — dashboard-initiated rescues via the bot profile page
-- **Persistent rescue sessions** — activity tracking in `data/rescueActivity.json`
+- **Manual rescue requests** — dashboard-initiated rescues via `src/manualrescue.ts` and the bot profile page
+- **Persistent rescue sessions** — activity tracking in `data/rescueActivity.json` via `src/routines/rescueActivity.ts`
 - **Claim system** — bots claim rescues to prevent duplicate work, with 5-minute expiry
+- **Rescue coordination tracking** — multi-bot announcement tracking via `src/rescuecoordination.ts`
 
 #### 🧭 Explorer
 Systematically maps the galaxy by visiting every POI. (~3560 lines)
@@ -431,7 +474,7 @@ Systematically maps the galaxy by visiting every POI. (~3560 lines)
 - **Security level fetching** — records system security for route planning
 
 #### 🏠 Return Home
-Navigates bot back to configured home base. (~360 lines)
+Navigates bot back to configured home base. (~363 lines)
 
 - **Emergency trigger** from dashboard — stops all running bots and sends them home
 - **Per-bot home system/station** configuration with global fallback
@@ -445,6 +488,7 @@ Keeps bot running and ready to receive manual commands. (~30 lines)
 
 - **Minimal loop**, standing by for fleet-wide commands from the "Command All" dashboard tab
 - **Emergency override** capability — can interrupt other routines
+
 ---
 
 ## Web Dashboard Features
@@ -458,7 +502,7 @@ The dashboard is a **comprehensive single-page application** (~877KB HTML + 78KB
 - **Search/filter** by routine, status, name
 - **Bulk start/stop** for idle/running bots
 - **Emergency Return Home** button — stops all bots, waits for them to fully stop, then sends them home
-- **Bandwidth monitor** — real-time inbound/outbound bandwidth usage across all bots
+- **Bandwidth monitor** — real-time inbound/outbound bandwidth usage across all bots via `/api/bandwidth`
 - **Color-coded state indicators** — idle (gray), running (green), stopping (yellow), error (red)
 
 ### Command All Tab
@@ -472,7 +516,7 @@ The dashboard is a **comprehensive single-page application** (~877KB HTML + 78KB
 - **Filterable** by security level (high, medium, low, lawless, frontier)
 - **Resource overlays** showing ore, gas, ice locations with richness data
 - **Station markers** with market data, services, and mission info
-- **Pathfinding display** between systems with BFS-calculated routes
+- **Pathfinding display** between systems with BFS-calculated routes and pathfinder bearings
 - **Wormhole tracking** — shown with destination and time remaining
 - **Pirate sighting indicators** — systems with recent pirate activity
 - **System detail panel** — click any system to see full POI list, connections, market data, missions
@@ -513,7 +557,7 @@ The dashboard is a **comprehensive single-page application** (~877KB HTML + 78KB
 - **Per-bot activity log** — full history of bot actions
 
 ### Settings Tab
-- **Per-routine configuration** for all 21 routines
+- **Per-routine configuration** for all 20 routines
 - **Per-bot overrides** for individual customization
 - **Global settings** — port, home system, blacklist, faction storage
 - **Settings saved** to `data/settings.json` with corruption recovery
@@ -534,6 +578,14 @@ Click any bot name to access full manual control panel:
 - **Custom Commands:** execute any game API call manually with raw parameter input
 - **Activity log** — per-bot action history
 - **Ship info** — current module list, ammo counts, cargo contents
+
+### Additional Pages
+
+- **Engineering Calculator** (`src/web/engineeringCalc.html`) — ship engineering calculations
+- **Player Browser** (`src/web/players.html`) — browse known players, pirates, empire NPCs
+- **Ship Marketplace** (`src/web/shipsforsale.html`) — browse ships for sale across the galaxy
+- **Ship Simulator** (`src/web/shipSim.html`) — compare ship stats and simulate combat
+
 ---
 
 ## Advanced Multi-Bot Coordination
@@ -542,7 +594,7 @@ Click any bot name to access full manual control panel:
 Multiple miner bots coordinate to mine together at the same location, enabling protection by combat escorts.
 
 - **Leader-Follower Model:** One bot decides where to mine, others follow
-- **File-Based Coordination:** Shared JSON files in `data/flock_signals/` for communication
+- **File-Based Coordination:** Shared JSON files in `data/flock_signals/` for communication via `src/routines/flock.ts`
 - **Multiple Groups:** Configure multiple flocks, each targeting different ores
 - **Automatic Target Selection:** Leader chooses optimal mining location based on richness and distance
 - **Synchronized Navigation:** Followers wait for leader to jump first, then follow
@@ -552,30 +604,30 @@ Multiple miner bots coordinate to mine together at the same location, enabling p
 - **Rally system** — bots gather at a designated system before traveling to mining location
 
 ### Bot-to-Bot Chat Channel
-In-memory, client-side communication for fast coordination **without** API calls.
+In-memory, client-side communication for fast coordination **without** API calls via `src/bot_chat_channel.ts`.
 
 - **Zero API calls** — pure in-process messaging
 - **4 channels:** `fleet`, `escort`, `coordination`, `general`
 - **Directed or broadcast** messaging — send to specific bots or all
 - **Message history** (last 100 messages retained per channel)
 - **Metadata support** for structured data (coordinates, timestamps, etc.)
-- **Used by:** Escort, Fleet Hunter, Cargo Mover, Commander routines
+- **Used by:** Escort, Fleet Hunter, Cargo Mover, Commander, Fuel Transport routines
 - **Global logging** — all messages logged to system panel for human monitoring
 
 ### Fleet Combat
-Coordinated multi-bot combat with commander/subordinate hierarchy.
+Coordinated multi-bot combat with commander/subordinate hierarchy via `src/fleet_comm.ts`.
 
 - **Fleet Commands:** MOVE, ATTACK, FLEE, REGROUP, HOLD, PATROL
 - **Battle Commands:** BATTLE_ADVANCE, BATTLE_RETREAT, BATTLE_STANCE, BATTLE_TARGET
 - **Fire Modes:** Focus fire (all target one) or spread fire (independent targets)
-- **Fleet Communication Service** (`src/fleet_comm.ts`) — in-memory command broadcasting
+- **Fleet Communication Service** — in-memory command broadcasting
 - **Optional Faction Broadcast** for wider coordination with non-bot allies
 - **Post-Patrol Logistics** — dock, repair, resupply automation
 - **BFS-based safe system finding** for emergency retreat
 - **Fleet state tracking** — hunting enabled/disabled, manual/auto mode, current target
 
 ### Trade Coordination
-Prevents multiple bots from competing on the same trade routes.
+Prevents multiple bots from competing on the same trade routes via `src/routines/traderCoordination.ts`.
 
 - **Route Locking** via `data/tradeCoordination.json`
 - **Item-level locking** — prevents two bots from buying the same item at the same station
@@ -584,24 +636,34 @@ Prevents multiple bots from competing on the same trade routes.
 - **Stale lock cleanup** — automatically releases locks from crashed bots
 
 ### Cargo Mover Coordination
-Allows 3-4 bots to work together on the same cargo haul.
+Allows 3-4 bots to work together on the same cargo haul via `src/routines/cargoMoverCoordination.ts` and `src/routines/cargoMoverInTransit.ts`.
 
-- **Item Quantity Locking** via `data/cargoMoverCoordination.json` — prevents over-commitment
+- **Item Quantity Locking** — prevents over-commitment
 - **Persistent Activity Tracking** in `data/cargoMoverActivity.json` for crash recovery
 - **Automatic Resumption** after interruptions — picks up where it left off
 - **In-Transit Tracking** — tracks items currently being carried to prevent duplicate pickup
 - **Per-bot claimed quantity** — each bot knows exactly how much it's responsible for
 
 ### Rescue Cooperation
-Multi-bot rescue coordination with distance-based priority.
+Multi-bot rescue coordination with distance-based priority via `src/cooperation/rescueCooperation.ts`.
 
 - **Claim System:** Bots claim rescues via bot chat channel with distance and timestamp
 - **Distance Optimization:** Closer bot (fewer jumps) takes priority
 - **Round-Robin:** For equidistant bots, alternates who takes the rescue
 - **Claim Expiry:** 5-minute timeout prevents stale claims
 - **Partner Bot Caching** for faster coordination
-- **Announcement parsing** — reads rescue announcements in faction chat to avoid duplicate work
+- **Announcement parsing** — reads rescue announcements in faction chat to avoid duplicate work via `src/rescuecoordination.ts`
 - **10-minute rescue active window** — assumes rescue completed or failed after this period
+
+### Fuel Transport Coordination
+Fuel transport bots coordinate to keep remote faction stations stocked.
+
+- **Station prioritization** — services stations in configured order
+- **Quantity targeting** — delivers until remote station reaches target quantity
+- **Failsafe deposit** — tries faction deposit first, falls back to personal storage
+- **Trip tracking** — full delivery history with timestamps and event logs in `data/fuelTransfer.json`
+- **Cargo optimization** — calculates item size and available cargo space
+
 ---
 
 ## AI Integration
@@ -610,18 +672,19 @@ Multi-bot rescue coordination with distance-based priority.
 Bots can play the game autonomously using LLMs via the `pi-ai` library.
 
 - **Model Support:** Ollama, LM Studio, vLLM, OpenAI, Anthropic, Groq, xAI, Mistral, OpenRouter — any OpenAI-compatible endpoint
-- **Tool-Calling:** Game actions exposed as AI tools — execute any game command, query state, read/write memory
+- **Tool-Calling:** Game actions exposed as AI tools — execute any game command, query state, read/write memory via `src/tools.ts`
 - **Persistent Memory:** `data/ai_memory.json` stores goals, insights, and decisions across sessions
 - **Captain's Log:** Periodic state summaries written to `captains_log_add` for long-term context
 - **TODO Tracking:** Goal-oriented behavior with task lists (`update_todo` / `read_todo`)
-- **Session Handoff:** Clean restarts with state preservation — the LLM picks up where it left off
+- **Session Handoff:** Clean restarts with state preservation via `src/loop.ts` — the LLM picks up where it left off
 - **Context Compaction:** Handles long-running sessions by summarizing older messages (55% of context window budget, minimum 10 recent messages preserved)
-- **OpenAPI Spec Loading:** Fetches game command documentation from the server for the LLM's reference
+- **OpenAPI Spec Loading:** Fetches game command documentation from the server via `src/schema.ts` for the LLM's reference
+- **Model Resolution:** `src/model.ts` resolves model strings to pi-ai provider instances
 - **Configurable:** model, base URL, API key, cycle interval, max tool calls per cycle, captain's log frequency
 - **Max 30 tool rounds per turn** with 120-second LLM timeout and 3 retries on failure
 
 ### AI Chat Service
-Global background service that monitors chat and responds with personality.
+Global background service that monitors chat and responds with personality via `src/aichat_service.ts`.
 
 - **Runs independently** of bot routines — monitors all bots' chat simultaneously
 - **Per-Bot Personalities:** `data/personalities/{bot-name}.md` — markdown files defining each bot's character
@@ -633,6 +696,7 @@ Global background service that monitors chat and responds with personality.
 - **Mayday Coordination:** AI-powered emergency response integration
 - **Customs Responses:** Personality-based customs interaction
 - **Admin Broadcast Detection:** Routes admin messages to the broadcast panel
+- **Important Messages File:** `data/IMPORTANTMESSAGES.json` tracks messages that should not be responded to
 
 ### Commander CLI
 Standalone AI commander tool (`src/commander.ts`, ~462 lines) for direct LLM-driven gameplay.
@@ -647,6 +711,7 @@ Standalone AI commander tool (`src/commander.ts`, ~462 lines) for direct LLM-dri
   bun run src/commander.ts --model anthropic/claude-sonnet-4-20250514 --session explorer "explore unknown systems"
   ```
 - **Cross-platform binaries** released via GitHub Actions (Linux x64/ARM64, macOS x64/ARM64, Windows x64)
+
 ---
 
 ## Combat System
@@ -683,12 +748,13 @@ Standalone AI commander tool (`src/commander.ts`, ~462 lines) for direct LLM-dri
 - **Wreck scavenging** during routine operations (miner, explorer)
 - **Weapon module tracking** — per-module ammo counts from `get_status`
 - **Battle analysis** — evaluates whether to join existing battles based on pirate count and tier
+
 ---
 
 ## Rescue & Emergency Systems
 
 ### MAYDAY System
-Parses emergency distress messages from chat.
+Parses emergency distress messages from chat via `src/mayday.ts`.
 
 - **Regex-based parsing** of MAYDAY messages: `"MAYDAY: <player> is stranded at <poi> in <system> with <current>/<max> fuel!"`
 - **Legitimacy validation** — fuel must be below threshold (default 25%) to prevent ambushes
@@ -698,7 +764,7 @@ Parses emergency distress messages from chat.
 - **False flag detection** — ignores MAYDAY from own bot names
 
 ### Rescue Queue
-Route-optimized batch rescues.
+Route-optimized batch rescues via `src/rescueQueue.ts`.
 
 - **Persistent queue** in `data/rescueQueue.json` — survives restarts
 - **Attempt tracking** and failure handling — max 3 attempts per rescue
@@ -707,7 +773,7 @@ Route-optimized batch rescues.
 - **Stale claim cleanup** — 5-minute expiry on claims
 
 ### Rescue BlackBook
-Player reputation tracking for rescue decisions.
+Player reputation tracking for rescue decisions via `src/rescueBlackBook.ts`.
 
 - **Tracks per player:** rescue requests, ghost count, successful rescues, total credits billed
 - **Manual override** support — `always` or `never` rescue per player
@@ -725,15 +791,17 @@ Automated billing for rescue services.
 ### Emergency Features
 - **Emergency Return Home:** Dashboard button stops all running bots (15s timeout), waits for full stop, then starts all bots with `return_home` routine
 - **Emergency Warp Stabilizer detection:** Auto-stops routine if stabilizer triggers — logs emergency and requires new stabilizer before resuming
-- **Mass disconnect handling:** Graceful shutdown + restart + session clearing when 5+ bots lose sessions within 5 seconds
+- **Mass disconnect handling:** Graceful shutdown + restart + session clearing when 5+ bots lose sessions within 5 seconds via `src/massdisconnect.ts`
 - **Emergency fuel recovery:** Sell cargo, scavenge wrecks for fuel cells, wait for rescue, or dock and wait for station restock
 - **Death detection and recovery:** All routines handle death/respawn — hull <= 0 detection with state reset on respawn
+- **Reconnection queue** — global sequential reconnection with 25s delays via `src/reconnectqueue.ts` to avoid rate limiting during mass recovery
+
 ---
 
 ## Galaxy Map & Exploration
 
 ### Map Store
-Auto-built galaxy map from explorer data with persistent storage.
+Auto-built galaxy map from explorer data with persistent storage via `src/mapstore.ts`.
 
 - **System BFS pathfinding** for route calculation between any two systems
 - **Station finding** with hop counting and service filtering
@@ -750,6 +818,7 @@ Auto-built galaxy map from explorer data with persistent storage.
 - **POI classification** — scenic, resource, station types with visit-once vs. re-scan logic
 - **Hidden POI tracking** — wormholes, secret ore belts with reveal difficulty ratings
 - **15-second periodic push** to dashboard keeps map data current
+- **Pathfinder integration** — bearing calculations and travel time estimates via `src/pathfinder.ts`
 
 ### Explorer Features
 - **Systematic galaxy mapping** — visits every POI in every system
@@ -771,6 +840,7 @@ Auto-built galaxy map from explorer data with persistent storage.
 - **Auto-accepts exploration missions** when available
 - **Direct-to-unknown** navigation — jumps toward unexplored systems efficiently
 - **Group-unknowns** — prioritizes systems with multiple unknown POIs
+
 ---
 
 ## Security & Robustness
@@ -808,7 +878,7 @@ Auto-built galaxy map from explorer data with persistent storage.
 - **Duplicate message prevention** — tracks last customs message content and timestamp
 
 ### Mass Disconnect Detector
-- **Monitors** for mass session invalidations across multiple bots
+- **Monitors** for mass session invalidations across multiple bots via `src/massdisconnect.ts`
 - **Triggers graceful shutdown** with restart when 5+ unique bots lose sessions within 5 seconds
 - **Clears session files** on restart to avoid invalid session loops
 - **Watchdog integration** — exit code 100 triggers `watchdog.bat` restart after 30-second delay
@@ -816,21 +886,24 @@ Auto-built galaxy map from explorer data with persistent storage.
 ### Other Robustness Features
 - **Settings corruption recovery** — falls back to defaults if `settings.json` is corrupt
 - **Queue cleanup** for stale entries across all queue systems
-- **Player name store** — persistent discovery and deduplication of all entity names
-- **HTTP response caching** for external API calls (OpenAPI spec, global market) with ETag support
+- **Player name store** — persistent discovery and deduplication of all entity names via `src/playernamestore.ts`
+- **HTTP response caching** for external API calls (OpenAPI spec, global market) with ETag support via `src/httpcache.ts`
 - **Debug logging** — per-bot logging to `data/logs/{botName}_debug.log` and global `data/logs/debug.log`
 - **Activity logging** — per-bot compact activity logs in `data/logs/activity/`
-- **Skill level tracking** — detects and logs skill level-ups across all bots
+- **Skill level tracking** — detects and logs skill level-ups across all bots via `src/pilotSkillTracker.ts`
 - **Bandwidth monitoring** — tracks per-bot inbound/outbound bandwidth in KB/s
 - **Position logging** — CSV log of all bot position changes in `data/bot_positions.csv`
 - **Graceful shutdown** — flushes all persistent data, stops bots, clears queues on exit
+- **Log rotation** — 200MB max per bot debug log, rotated to `old-logs/` directory
+- **Faction storage cache** — debounced writes, per-station tracking via `src/factionStorageCache.ts`
+
 ---
 
 ## Drone Support
 
-Drone script templates and API commands for automated drone deployment.
+Drone script templates and API commands for automated drone deployment via `src/drone.ts`.
 
-### Script Templates (`src/drone.ts`)
+### Script Templates
 
 | Template | Purpose |
 |----------|---------|
@@ -866,6 +939,7 @@ From the dashboard:
 3. If resume fails, schedules full login (13s stagger for rate limit avoidance)
 4. After successful login, auto-starts the bot's assigned routine
 5. Catalog data is fetched if stale (24h TTL)
+
 ---
 
 ## Project Structure
@@ -873,28 +947,26 @@ From the dashboard:
 ```
 spacemolt_botrunner/
 ├── src/
-│   ├── botmanager.ts              # Entry point — discovers bots, starts web server, routes actions
-│   ├── bot.ts                     # Bot class — login, exec, status caching, routine runner, battle state
-│   ├── api.ts                     # SpaceMolt REST client (V2) with session management, caching, retry
+│   ├── botmanager.ts              # Entry point — discovers bots, starts web server, routes actions, registers 20 routines
+│   ├── bot.ts                     # Bot class — login, exec, status caching, routine runner, battle state, customs holds, skill tracking
+│   ├── api.ts                     # SpaceMolt REST client (V2) with session management, caching, retry, bandwidth monitoring
 │   ├── session.ts                 # Credential and session token persistence
 │   ├── ui.ts                      # Log routing, notification parsing, LLM debug formatting, YAML output
-│   ├── debug.ts                   # Per-bot and global debug logging
-│   ├── mapstore.ts                # Galaxy map persistence with BFS pathfinding
+│   ├── debug.ts                   # Per-bot and global debug logging, log rotation
+│   ├── mapstore.ts                # Galaxy map persistence with BFS pathfinding and pathfinder bearings
 │   ├── catalogstore.ts            # Game catalog cache (items, ships, skills, recipes)
-│   ├── aichat_service.ts          # Global AI chat service (~2156 lines)
+│   ├── aichat_service.ts          # Global AI chat service (~2191 lines)
 │   ├── customs.ts                 # Confederacy Customs inspection service
 │   ├── mayday.ts                  # MAYDAY emergency rescue parser and queue
 │   ├── rescueQueue.ts             # Rescue queue with route optimization
 │   ├── rescueBlackBook.ts         # Player rescue reputation tracking
 │   ├── manualrescue.ts            # Manual rescue request queue
 │   ├── rescuecoordination.ts      # Multi-bot rescue announcement tracking
-│   ├── cooperation/
-│   │   └── rescueCooperation.ts   # Inter-bot rescue cooperation via chat channel
-│   ├── fleet_comm.ts              # Fleet communication service (in-memory command broadcast)
-│   ├── bot_chat_channel.ts        # In-memory bot-to-bot chat (4 channels, zero API calls)
+│   ├── pathfinder.ts              # BFS pathfinding, bearing calculations, travel time estimates
+│   ├── taxData.ts                 # Tax estimate tracking and comparison
 │   ├── playernames.ts             # Player name verification utility
 │   ├── playernamestore.ts         # Persistent player/pirate/NPC entity store
-│   ├── reconnectqueue.ts          # Global reconnection queue with sequential processing
+│   ├── reconnectqueue.ts          # Global reconnection queue with sequential processing (25s delays)
 │   ├── massdisconnect.ts          # Mass disconnect detector (5+ bots in 5 seconds)
 │   ├── httpcache.ts               # HTTP response caching with ETag/If-None-Match support
 │   ├── factionStorageCache.ts     # Faction storage cache with debounced writes
@@ -905,8 +977,14 @@ spacemolt_botrunner/
 │   ├── loop.ts                    # AI agent loop with context compaction and retry
 │   ├── schema.ts                  # Game command schema fetcher (OpenAPI spec parser)
 │   ├── model.ts                   # LLM model resolution (pi-ai integration)
+│   ├── cooperation/
+│   │   └── rescueCooperation.ts   # Inter-bot rescue cooperation via chat channel
+│   ├── fleet_comm.ts              # Fleet communication service (in-memory command broadcast)
+│   ├── bot_chat_channel.ts        # In-memory bot-to-bot chat (4 channels, zero API calls)
+│   ├── types/
+│   │   └── game.ts                # Comprehensive game type definitions (~631 lines)
 │   ├── routines/
-│   │   ├── common.ts              # Shared utilities (~4031 lines — navigation, docking, combat, etc.)
+│   │   ├── common.ts              # Shared utilities (~4505 lines — navigation, docking, combat, customs, etc.)
 │   │   ├── miner.ts               # Mining routine (~5450 lines)
 │   │   ├── explorer.ts            # Exploration routine (~3560 lines)
 │   │   ├── crafter.ts             # Crafting routine (~1920 lines)
@@ -926,6 +1004,8 @@ spacemolt_botrunner/
 │   │   ├── fleet_hunter_commander.ts  # Fleet combat commander (~1897 lines)
 │   │   ├── fleet_hunter_subordinate.ts # Fleet combat wingman (~637 lines)
 │   │   ├── fuelCellSeller.ts      # Fuel cell seller routine (~798 lines)
+│   │   ├── fuelTransfer.ts        # Fuel transport routine (~535 lines)
+│   │   ├── fuelTransferTracking.ts # Fuel transport trip tracking and persistence
 │   │   ├── battle.ts              # Shared battle logic — nearby parsing, tier analysis, engagement
 │   │   ├── flock.ts               # Generic flock coordination system (mining/salvage)
 │   │   ├── miner_radioactive.ts   # Radioactive mining capability detection
@@ -939,6 +1019,7 @@ spacemolt_botrunner/
 │   │   ├── cargoMoverInTransit.ts # In-transit item tracking
 │   │   ├── factionStorageV2.ts    # Faction storage V2 helpers
 │   │   ├── factionTraderCoordination.ts # Faction trader buy order locking
+│   │   ├── ensureFueled_simple.ts # Simplified fuel management helper
 │   │   ├── temp_helpers.ts        # Temporary helper utilities
 │   │   └── __tests__/             # Routine unit tests
 │   │       ├── battle_tick.test.ts
@@ -951,7 +1032,7 @@ spacemolt_botrunner/
 │   │       └── return_home.test.ts
 │   │
 │   ├── web/
-│   │   ├── server.ts              # Bun.serve HTTP + WebSocket server (~1325 lines)
+│   │   ├── server.ts              # Bun.serve HTTP + WebSocket server (~1498 lines)
 │   │   ├── index.html             # Dashboard SPA (~877KB)
 │   │   ├── index.css              # Stylesheet (~78KB)
 │   │   ├── commandall.html        # Command All tab standalone
@@ -999,6 +1080,7 @@ spacemolt_botrunner/
 │   ├── factionStorage.json        # Faction storage cache
 │   ├── facilities.json            # Facility type definitions
 │   ├── fcStations.json            # Fuel cell seller station tracking
+│   ├── fuelTransfer.json          # Fuel transport trip tracking
 │   ├── marketDetails.json         # Detailed market order data
 │   ├── shipsForSale.json          # Ship listing data
 │   ├── rawMissions.json           # Raw mission data
@@ -1007,21 +1089,29 @@ spacemolt_botrunner/
 │   ├── rescueActivity.json        # Rescue session tracking
 │   ├── cargoMoverActivity.json    # Cargo movement tracking
 │   ├── cargoMoverCoordination.json # Cargo multi-bot coordination
+│   ├── cargoMoverInTransit.json   # In-transit item tracking
 │   ├── craft-goals.json           # Crafting goal configurations
 │   ├── craftingLoadouts.json      # Crafting loadout configurations
 │   ├── tradeCoordination.json     # Trade route locking
+│   ├── taxes.json                 # Tax estimate data
 │   ├── personalities/             # AI chat personality definitions (*.md files)
 │   ├── flock_signals/             # Flock mining coordination files
 │   ├── escort_signals/            # Escort coordination files
-│   └── logs/                      # Log files
-│       ├── debug.log              # Global debug log
-│       ├── {botName}_debug.log    # Per-bot debug logs
-│       └── activity/              # Per-bot activity logs
+│   ├── logs/                      # Log files
+│   │   ├── debug.log              # Global debug log
+│   │   ├── {botName}_debug.log    # Per-bot debug logs
+│   │   └── activity/              # Per-bot activity logs
+│   └── factionStorage/            # Faction storage cache files
 │
 ├── sessions/                      # Bot credentials and session tokens (gitignored)
 │   └── <username>/
 │       ├── credentials.json       # Bot credentials
-│       └── session.json           # Session tokens
+│       ├── session.json           # Session tokens
+│       └── TODO.md                # AI routine TODO tracking
+│
+├── old-logs/                      # Rotated log files
+│   ├── {botName}_debug_*.log
+│   └── activity/                  # Rotated activity logs
 │
 ├── watchdog.bat                   # Windows auto-restart watchdog
 ├── package.json                   # Bun project config
@@ -1033,6 +1123,7 @@ spacemolt_botrunner/
 ├── openapi-v2.json                # OpenAPI v2 spec (local copy)
 └── .github/workflows/release.yml  # CI/CD for cross-platform releases
 ```
+
 ---
 
 ## Configuration
@@ -1164,6 +1255,12 @@ All settings are stored in `data/settings.json` and configurable via the web UI.
 - `priceOverride` — manual price (0 = auto)
 - `refuelThreshold`, `repairThreshold`
 
+#### Fuel Transport
+- `stations` — array of remote stations to service (format: `system|station` or just `station`)
+- `items` — array of `{ itemId, itemName, targetQuantity }` to transport
+- `refuelThreshold` — fuel threshold for travel (default: 35%)
+- `repairThreshold` — hull threshold for repairs (default: 40%)
+
 #### Coordinator
 - `cycleIntervalSec` — market analysis interval (default: 300)
 - `minProfitMargin`, `maxCraftLimit`
@@ -1193,6 +1290,7 @@ Any routine setting can be overridden per-bot by adding a key matching the bot's
 ```
 
 The bot-specific value takes precedence over the routine default.
+
 ---
 
 ## Testing
@@ -1274,6 +1372,7 @@ npm test
 - `tests/battle-interrupt-helpers.ts` (~400 lines) — Mock bot, scenario builders, assertion helpers
 - `tests/BATTLE_INTERRUPT_TESTING.md` — Full testing documentation
 - `tests/QUICK_START.md` — Quick start guide for running tests
+
 ---
 
 ## About SpaceMolt

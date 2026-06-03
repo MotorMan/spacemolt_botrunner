@@ -1,3 +1,5 @@
+import { updateFactionStorageCache } from "../factionStorageCache.js";
+
 export function parseFactionStorageItems(result: unknown): Array<{ itemId: string; name: string; quantity: number }> {
   if (!result || typeof result !== "object") return [];
 
@@ -45,7 +47,7 @@ export function parseFactionStorageItems(result: unknown): Array<{ itemId: strin
   }).filter(i => i.itemId && i.quantity > 0);
 }
 
-async function refreshFactionStorageV2(ctx: any, bot: any): Promise<void> {
+async function refreshFactionStorageV2(ctx: any, bot: any, factionName: string, station: string): Promise<void> {
   try {
     const resp = await bot.exec("view_storage", { target: "faction" });
     if (resp.error) {
@@ -59,8 +61,9 @@ async function refreshFactionStorageV2(ctx: any, bot: any): Promise<void> {
     }
     const items = parseFactionStorageItems(resp.result);
     bot.factionStorage = items;
+    updateFactionStorageCache(factionName, items, station);
     if (items.length > 0) {
-      ctx.log("trade", "Faction storage: " + items.length + " item types (" + items.reduce((sum, i) => sum + i.quantity, 0) + " total)");
+      ctx.log("trade", "Faction storage: " + items.length + " item types (" + items.reduce((sum: number, i: { quantity: number }) => sum + i.quantity, 0) + " total)");
     }
   } catch (err) {
     ctx.log("error", "Error refreshing faction storage: " + err);

@@ -115,7 +115,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       if (fuelPct < refuelThreshold) {
         ctx.log("system", `Fuel at ${fuelPct}% — refueling before departure...`);
         const { pois } = await getSystemInfo(ctx);
-        const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isApprovedFuelStation(p.id, readSettings()));
+        const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isApprovedFuelStation(p.id, readSettings(), bot.system));
         if (currentStation) {
           await ensureFueled(ctx, refuelThreshold);
           await ensureDocked(ctx, true);
@@ -139,7 +139,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       if (fuelPct < refuelThreshold) {
         ctx.log("system", `Fuel at ${fuelPct}% — refueling before departure...`);
         const { pois } = await getSystemInfo(ctx);
-        const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isApprovedFuelStation(p.id, readSettings()));
+        const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isApprovedFuelStation(p.id, readSettings(), bot.system));
         if (currentStation) {
           await ensureFueled(ctx, refuelThreshold);
           await ensureDocked(ctx, true);
@@ -163,7 +163,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     if (fuelPct < refuelThreshold) {
       ctx.log("system", `Fuel at ${fuelPct}% — refueling before return journey...`);
       const { pois } = await getSystemInfo(ctx);
-      const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isApprovedFuelStation(p.id, readSettings()));
+      const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isApprovedFuelStation(p.id, readSettings(), bot.system));
       if (currentStation) {
         await ensureFueled(ctx, refuelThreshold);
         await ensureDocked(ctx, true);
@@ -197,7 +197,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
     // Try to refuel at current location if docked
     if (bot.docked) {
       const { pois } = await getSystemInfo(ctx);
-      const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isApprovedFuelStation(p.id, readSettings()));
+      const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isApprovedFuelStation(p.id, readSettings(), bot.system));
       if (currentStation) {
         const ok = await ensureFueled(ctx, refuelThreshold);
         if (!ok) {
@@ -342,7 +342,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   if (dockedFuelPct < refuelThreshold) {
     ctx.log("system", `Fuel at ${dockedFuelPct}% — refueling at home station...`);
     const { pois } = await getSystemInfo(ctx);
-    const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isApprovedFuelStation(p.id, readSettings()));
+    const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi && isApprovedFuelStation(p.id, readSettings(), bot.system));
     if (currentStation) {
       await ensureFueled(ctx, refuelThreshold);
       await ensureDocked(ctx, true);

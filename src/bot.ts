@@ -8,7 +8,7 @@ import { mapStore } from "./mapstore.js";
 import { addMaydayRequest, parseMaydayMessage } from "./mayday.js";
 import { playerNameStore } from "./playernamestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
-import { getFactionStorageCache, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
+import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, type PathfinderTravelRecord } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
@@ -44,9 +44,10 @@ export interface BotStatus {
   docked: boolean;
   lastAction: string;
   error: string | null;
-   shipName: string;
-   shipClass: string;
-   hull: number;
+  shipName: string;
+  shipClass: string;
+  tier: number | null;
+  hull: number;
   maxHull: number;
   shield: number;
   maxShield: number;
@@ -118,10 +119,11 @@ export class Bot {
   location = "unknown";
   system = "unknown";
   poi = "";
-  docked = false;
-   shipName = "";
-   shipClass = "";
-   hull = 0;
+docked = false;
+  shipName = "";
+  shipClass = "";
+  tier: number | null = null;
+  hull = 0;
   maxHull = 0;
   shield = 0;
   maxShield = 0;
@@ -669,7 +671,8 @@ export class Bot {
         // Update faction storage cache whenever view_storage is called for faction
         if (command === "view_storage" && payload?.target === "faction" && !resp.error && this.faction) {
           const entries = this.parseItemList(resp.result);
-          updateFactionStorageCache(this.faction, entries);
+          const station = (payload.station_id as string) || this.poi;
+          updateFactionStorageCache(this.faction, entries, station);
         }
 
         if (resp.error) {
@@ -851,9 +854,7 @@ export class Bot {
         this.location;
 
       // Faction membership
-      if (!this.faction) {
-        this.faction = (p.faction_id as string) ?? (p.faction as string) ?? null;
-      }
+      this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
 
        // Ship fields
       const ship = r.ship as Record<string, unknown> | undefined;
@@ -863,6 +864,7 @@ export class Bot {
         const shipType = (ship.ship_type as string) || (ship.type as string) || "";
         this.shipName = (rawName && rawName.toLowerCase() !== "unnamed" ? rawName : shipType) || this.shipName;
         this.shipClass = shipType;
+        this.tier = (ship.tier as number) ?? null;
         this.fuel = (ship.fuel as number) ?? this.fuel;
         this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
         this.cargo = (ship.cargo_used as number) ?? this.cargo;
@@ -1028,7 +1030,6 @@ export class Bot {
       property_tax_total: (result.property_tax_total as number) || 0,
       assessed_property_value: (result.assessed_property_value as number) || 0,
       last_assessed_at: (result.last_assessed_at as number) || 0,
-      data: result,
     };
 
     if (hasTaxEstimateChanged(this.username, estimate)) {
@@ -1063,20 +1064,17 @@ export class Bot {
   /** Fetch faction storage contents and cache them. Silently returns empty on error. */
   async refreshFactionStorage(): Promise<void> {
     let factionName = this.faction;
+    const station = this.poi;
     if (!factionName) {
       // Try to load from cache to get faction name and storage
       try {
-        const { existsSync, readFileSync } = await import("fs");
-        const { join } = await import("path");
-        const cacheFile = join(process.cwd(), "data", "factionStorage.json");
-        if (existsSync(cacheFile)) {
-          const content = readFileSync(cacheFile, "utf-8");
-          const cached = JSON.parse(content) as { factionName: string; entries: any[]; factionFuelReserve?: number; factionFuelCapacity?: number };
+        const cached = getFactionStorageCacheByStationOnly(station);
+        if (cached && cached.entries.length > 0) {
           this.faction = cached.factionName;
-          this.factionStorage = cached.entries;
+          this.factionStorage = cached.entries.map(e => ({ itemId: e.itemId, name: e.name || e.itemId, quantity: e.quantity }));
           this.factionFuelReserve = cached.factionFuelReserve || 0;
           this.factionFuelCapacity = cached.factionFuelCapacity || 0;
-          this.log("info", `Loaded faction storage from cache: ${cached.factionName} (${cached.entries.length} items)`);
+          this.log("info", `Loaded faction storage from cache: ${cached.factionName} at ${station} (${cached.entries.length} items)`);
           return;
         }
       } catch (e) {
@@ -1087,9 +1085,18 @@ export class Bot {
       return;
     }
 
+    // CRITICAL: view_storage with target: "faction" requires being docked at a station
+    // If not docked, skip the API call and keep cached data
+    if (!this.docked) {
+      return;
+    }
+
     const resp = await this.exec("view_storage", { target: "faction" });
     if (resp.error) {
-      this.log("error", `Error refreshing faction storage: ${resp.error.message}`);
+      // Don't log error if we're not docked - this is expected behavior
+      if (this.docked) {
+        this.log("error", `Error refreshing faction storage: ${resp.error.message}`);
+      }
       // Don't reset factionStorage to empty on error - keep cached data
       return;
     }
@@ -1101,7 +1108,7 @@ export class Bot {
     this.factionStorage = entries;
     this.factionFuelReserve = (result.faction_fuel_reserve as number) || 0;
     this.factionFuelCapacity = (result.faction_fuel_capacity as number) || 0;
-    updateFactionStorageCache(factionName, entries, this.factionFuelReserve, this.factionFuelCapacity);
+    updateFactionStorageCache(factionName, entries, station, this.factionFuelReserve, this.factionFuelCapacity);
   }
 
   /** Start running a routine. */
@@ -2481,9 +2488,10 @@ export class Bot {
       docked: this.docked,
       lastAction: this._lastAction,
       error: this._error,
-       shipName: this.shipName,
-       shipClass: this.shipClass,
-       hull: this.hull,
+      shipName: this.shipName,
+      shipClass: this.shipClass,
+      tier: this.tier,
+      hull: this.hull,
       maxHull: this.maxHull,
       shield: this.shield,
       maxShield: this.maxShield,

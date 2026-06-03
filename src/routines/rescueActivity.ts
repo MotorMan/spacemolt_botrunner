@@ -39,8 +39,8 @@ export interface RescueSession {
   completedAt?: string;
   state: RescueSessionState;
   notes?: string;
-  consecutiveFailures?: number; // Track consecutive navigation failures
-  lastFailureReason?: string; // Track the last failure reason
+  consecutiveFailures?: number;
+  lastFailureReason?: string;
 }
 
 export interface RescueActivityData {
@@ -52,7 +52,6 @@ export interface RescueActivityData {
 }
 
 export function loadRescueActivity(): RescueActivityData {
-  // Try main file first, then fallback to backup
   const filesToTry = [ACTIVITY_FILE, ACTIVITY_FILE_BACKUP];
   
   for (const file of filesToTry) {
@@ -64,7 +63,6 @@ export function loadRescueActivity(): RescueActivityData {
           continue;
         }
         const parsed = JSON.parse(content);
-        // Basic validation
         if (typeof parsed !== "object" || parsed === null) {
           console.warn(`Invalid rescue activity data structure from ${file}`);
           continue;
@@ -84,10 +82,8 @@ export function loadRescueActivity(): RescueActivityData {
 async function saveWithRetry(data: string, ctx?: { sleep: (ms: number) => Promise<void> }): Promise<boolean> {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
-      // Step 1: Create backup of existing file if it exists
       if (existsSync(ACTIVITY_FILE)) {
         try {
-          // Copy current to backup (read + write to avoid rename issues during crash)
           const content = readFileSync(ACTIVITY_FILE, "utf-8");
           writeFileSync(ACTIVITY_FILE_BACKUP, content, "utf-8");
         } catch (backupErr) {
@@ -95,19 +91,14 @@ async function saveWithRetry(data: string, ctx?: { sleep: (ms: number) => Promis
         }
       }
       
-      // Step 2: Write to temp file first
       writeFileSync(ACTIVITY_FILE_TEMP, data, "utf-8");
       
-      // Step 3: Atomic rename from temp to actual file
       renameSync(ACTIVITY_FILE_TEMP, ACTIVITY_FILE);
       
-      // Step 4: Clean up temp file if it still exists (rename should remove it)
       if (existsSync(ACTIVITY_FILE_TEMP)) {
         try {
           unlinkSync(ACTIVITY_FILE_TEMP);
-        } catch (_) {
-          // Ignore cleanup errors
-        }
+        } catch (_) {}
       }
       
       return true;
@@ -115,7 +106,6 @@ async function saveWithRetry(data: string, ctx?: { sleep: (ms: number) => Promis
       console.warn(`Save attempt ${attempt}/${MAX_RETRIES} failed:`, err?.message || err);
       
       if (attempt < MAX_RETRIES) {
-        // Exponential backoff
         const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
         if (ctx) {
           await ctx.sleep(delay);
@@ -230,9 +220,20 @@ export async function clearActiveRescueSession(botUsername: string): Promise<voi
  * Key: normalized "playername|system|poi" 
  * Value: timestamp when MAYDAY was first received
  * 
- * Entries expire after 5 minutes.
+ * Entries expire after 1 hour (matching the in-game command cooldown).
  */
 const recentMaydayReceived = new Map<string, number>();
+
+/**
+ * Track MAYDAYs that have been declined (no route, wormhole, etc).
+ * This prevents the bot from spamming decline messages for the same MAYDAY.
+ * 
+ * Key: normalized "playername|system|poi"
+ * Value: timestamp when MAYDAY was declined
+ * 
+ * Entries expire after 1 hour (matching the in-game command cooldown).
+ */
+const declinedMaydays = new Map<string, number>();
 
 /**
  * Normalize a MAYDAY identifier for deduplication.
@@ -243,8 +244,58 @@ function normalizeMaydayKey(player: string, system: string, poi?: string): strin
 }
 
 /**
- * Check if a MAYDAY was recently received (within the last 5 minutes).
+ * Check if a MAYDAY has been declined recently (within the last hour).
+ * This prevents the bot from spamming decline messages for the same MAYDAY.
+ * The 1-hour cooldown matches the in-game command cooldown period.
+ * 
+ * @returns true if this MAYDAY was recently declined, false if it's new
+ */
+export function isMaydayDeclined(player: string, system: string, poi?: string): boolean {
+  const maydayKey = normalizeMaydayKey(player, system, poi);
+  const now = Date.now();
+  const oneHour = 60 * 60 * 1000; // 1 hour in milliseconds
+
+  const declinedAt = declinedMaydays.get(maydayKey);
+  if (declinedAt) {
+    const timeSinceDeclined = now - declinedAt;
+    if (timeSinceDeclined < oneHour) {
+      return true;
+    } else {
+      declinedMaydays.delete(maydayKey);
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Mark a MAYDAY as declined. This prevents the bot from sending
+ * another decline message for the same MAYDAY within the cooldown period.
+ */
+export function markMaydayDeclined(player: string, system: string, poi?: string): void {
+  const maydayKey = normalizeMaydayKey(player, system, poi);
+  declinedMaydays.set(maydayKey, Date.now());
+  cleanupExpiredDeclinedMaydays();
+}
+
+/**
+ * Clean up expired entries from the declined MAYDAYs map.
+ */
+function cleanupExpiredDeclinedMaydays(): void {
+  const now = Date.now();
+  const oneHour = 60 * 60 * 1000;
+  
+  for (const [key, timestamp] of declinedMaydays.entries()) {
+    if (now - timestamp >= oneHour) {
+      declinedMaydays.delete(key);
+    }
+  }
+}
+
+/**
+ * Check if a MAYDAY was recently received (within the last hour).
  * This prevents processing duplicate MAYDAY messages from the server.
+ * The 1-hour cooldown matches the in-game command cooldown period.
  * 
  * @returns true if this MAYDAY was recently processed, false if it's new
  */
@@ -256,14 +307,14 @@ export function isMaydayDuplicate(
 ): boolean {
   const maydayKey = normalizeMaydayKey(player, system, poi);
   const now = Date.now();
-  const fiveMinutes = 5 * 60 * 1000;
+  const oneHour = 60 * 60 * 1000; // 1 hour in milliseconds
 
   // Check if we recently received this MAYDAY (regardless of completion status)
   const receivedAt = recentMaydayReceived.get(maydayKey);
   if (receivedAt) {
     const timeSinceReceived = now - receivedAt;
     
-    if (timeSinceReceived < fiveMinutes) {
+    if (timeSinceReceived < oneHour) {
       // Still within the cooldown window - this is a duplicate
       return true;
     } else {
@@ -277,11 +328,11 @@ export function isMaydayDuplicate(
   const lastCompleted = activity.lastCompletedSession;
 
   if (lastCompleted) {
-    // Check if completed within last 5 minutes (prevent stale matches)
+    // Check if completed within last hour (prevent stale matches)
     const completedAt = new Date(lastCompleted.completedAt || lastCompleted.lastUpdatedAt).getTime();
     const timeSinceCompleted = now - completedAt;
 
-    if (timeSinceCompleted < fiveMinutes) {
+    if (timeSinceCompleted < oneHour) {
       // Normalize for comparison (case-insensitive, handle spaces/underscores)
       const normalize = (s: string) => s.toLowerCase().replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
 
@@ -302,6 +353,7 @@ export function isMaydayDuplicate(
 /**
  * Mark a MAYDAY as recently received. This should be called when a MAYDAY
  * is first processed (after validation passes).
+ * Entries expire after 1 hour (matching the in-game command cooldown).
  */
 export function markMaydayReceived(
   player: string,
@@ -320,10 +372,10 @@ export function markMaydayReceived(
  */
 function cleanupExpiredMaydayReceived(): void {
   const now = Date.now();
-  const fiveMinutes = 5 * 60 * 1000;
+  const oneHour = 60 * 60 * 1000;
   
   for (const [key, timestamp] of recentMaydayReceived.entries()) {
-    if (now - timestamp >= fiveMinutes) {
+    if (now - timestamp >= oneHour) {
       recentMaydayReceived.delete(key);
     }
   }

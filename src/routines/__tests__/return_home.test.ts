@@ -1,6 +1,22 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { returnHomeRoutine } from "../return_home.js";
 import { createMockBot, createMockContext } from "../../test_helpers.js";
+import * as common from "../common.js";
+
+vi.mock("../common.js");
+
+const {
+  checkAndFleeFromBattle,
+  readSettings,
+  getSystemInfo,
+  isStationPoi,
+  findStation,
+  ensureDocked,
+  ensureUndocked,
+  navigateToSystem,
+  refuelAtStation,
+  repairShip,
+} = vi.mocked(common);
 
 describe("Return Home Routine", () => {
   let mockBot: any;
@@ -41,14 +57,16 @@ describe("Return Home Routine", () => {
     readSettings.mockReturnValue({
       return_home: { homeSystem: "homeSystem", homeStation: "homeStation" },
     });
-    getSystemInfo.mockResolvedValue({
+getSystemInfo.mockResolvedValue({
       pois: [
-        { id: "homeStation", name: "Home Station", type: "station" },
-        { id: "otherStation", name: "Other Station", type: "station" },
+        { id: "homeStation", name: "Home Station", type: "station", has_base: true, base_id: null, services: null },
+        { id: "otherStation", name: "Other Station", type: "station", has_base: true, base_id: null, services: null },
       ],
+      connections: [],
+      systemId: "homeSystem",
     });
     isStationPoi.mockReturnValue(true);
-    findStation.mockReturnValue({ id: "homeStation", name: "Home Station", type: "station" });
+    findStation.mockReturnValue({ id: "homeStation", name: "Home Station", type: "station", has_base: true, base_id: null, services: null });
     ensureDocked.mockResolvedValue(true);
   });
 

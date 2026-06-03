@@ -143,7 +143,7 @@
 
     function populateSkillSelect() {
       const select = document.getElementById('engineeringSkillSelect');
-      for (let i = 0; i <= 50; i++) {
+      for (let i = 0; i <= 100; i++) {
         const option = document.createElement('option');
         option.value = i.toString();
         const reduction = i > 0 ? ` (-${i}% CPU/Power)` : ' (No bonus)';
@@ -260,11 +260,16 @@ function selectShip() {
                category.toLowerCase().includes('scanner');
       });
 
+      // Hidden modules that are not in catalog but available on some ships
+      const hiddenUtilityModules = [
+        { id: 'onboard_hydrogen_refinery', name: 'Onboard Hydrogen Refinery', category: 'utility', cpu_usage: 22, power_usage: 56, wear: 0, size: 10 }
+      ];
+
       // Group modules by category
       const categories = {
         weapons: modules.filter(m => (m.category || m.type || '').toLowerCase().includes('weapon')),
         defense: modules.filter(m => (m.category || m.type || '').toLowerCase().includes('defense') || (m.category || m.type || '').toLowerCase().includes('shield') || (m.category || m.type || '').toLowerCase().includes('armor')),
-        utility: modules.filter(m => (m.category || m.type || '').toLowerCase().includes('utility') || (m.category || m.type || '').toLowerCase().includes('mining') || (m.category || m.type || '').toLowerCase().includes('cargo'))
+        utility: [...modules.filter(m => (m.category || m.type || '').toLowerCase().includes('utility') || (m.category || m.type || '').toLowerCase().includes('mining') || (m.category || m.type || '').toLowerCase().includes('cargo')), ...hiddenUtilityModules]
       };
 
       container.innerHTML = '';
@@ -403,6 +408,8 @@ function selectShip() {
           module = { id: 'fuel_optimizer', name: 'Fuel Optimizer', category: 'utility', cpu_usage: 3, power_usage: 2, wear: 0, fuel_efficiency: 15 };
         } else if (moduleId === 'cpu_co_processor') {
           module = { id: 'cpu_co_processor', name: 'CPU Co-Processor', category: 'utility', cpu_usage: 0, power_usage: 3, wear: 0, cpu_bonus: 5 };
+        } else if (moduleId === 'onboard_hydrogen_refinery') {
+          module = { id: 'onboard_hydrogen_refinery', name: 'Onboard Hydrogen Refinery', category: 'utility', cpu_usage: 22, power_usage: 56, wear: 0, size: 10 };
         }
       }
 
@@ -596,10 +603,17 @@ function selectShip() {
       // Clear and apply
       currentLoadout = { weapons: [], defense: [], utility: [] };
       const allModules = Object.values(catalog.items || {});
+      const hiddenUtilityModules = {
+        'onboard_hydrogen_refinery': { id: 'onboard_hydrogen_refinery', name: 'Onboard Hydrogen Refinery', category: 'utility', cpu_usage: 22, power_usage: 56, wear: 0, size: 10 }
+      };
 
       ['weapons', 'defense', 'utility'].forEach(cat => {
         (preset.modules[cat] || []).forEach(modId => {
-          const mod = allModules.find(m => m.id === modId);
+          let mod = allModules.find(m => m.id === modId);
+          // Also check hidden modules for utility category
+          if (!mod && cat === 'utility' && hiddenUtilityModules[modId]) {
+            mod = hiddenUtilityModules[modId];
+          }
           if (mod) {
             currentLoadout[cat].push(mod);
           }

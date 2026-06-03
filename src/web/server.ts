@@ -61,6 +61,8 @@ const SETTINGS_FILE = join(DATA_DIR, "settings.json");
 const STATS_FILE = join(DATA_DIR, "stats.json");
 const MAIN_LOG_FILE = join(DATA_DIR, "main_logs.json");
 const FACILITIES_FILE = join(DATA_DIR, "facilities.json");
+const TAXES_FILE = join(DATA_DIR, "taxes.json");
+const FLOCK_FILE = join(DATA_DIR, "flock.json");
 
 interface CachedFacilities {
   version: string;
@@ -142,7 +144,31 @@ export function getSystemBlacklist(): string[] {
 
 function saveSettings(s: RoutineSettings): void {
   if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  const { writeFileSync } = require("fs");
   writeFileSync(SETTINGS_FILE, JSON.stringify(s, null, 2) + "\n", "utf-8");
+}
+
+// ── Flock settings persistence (separate file) ──────────────
+
+interface FlockSettingsData {
+  flockGroups: Record<string, unknown>[];
+  assignments: Record<string, Record<string, unknown>>;
+}
+
+function loadFlockSettings(): FlockSettingsData {
+  if (existsSync(FLOCK_FILE)) {
+    try {
+      return JSON.parse(readFileSync(FLOCK_FILE, "utf-8")) as FlockSettingsData;
+    } catch (err) {
+      console.warn(`Warning: corrupt flock.json, starting fresh —`, err);
+    }
+  }
+  return { flockGroups: [], assignments: {} };
+}
+
+function saveFlockSettings(data: FlockSettingsData): void {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  writeFileSync(FLOCK_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
 }
 
 // ── Stats persistence ─────────────────────────────────────
@@ -240,8 +266,8 @@ export class WebServer {
   constructor(port: number = 3000) {
     this.port = port;
     this.settings = loadSettings();
+    delete (this.settings as Record<string, unknown>).flock;
     this.statsData = loadStats();
-    // Load persisted main logs
     const mainLogs = loadMainLogs();
     this.activityLog = mainLogs.activity.slice(-MAX_LOG_BUFFER);
     this.broadcastLog = mainLogs.broadcast.slice(-MAX_LOG_BUFFER);
@@ -280,12 +306,11 @@ export class WebServer {
    *  Called periodically to catch external writes (e.g., from bot routines). */
   reloadSettingsFromDisk(): void {
     const diskSettings = loadSettings();
-    // Check if settings actually changed
+    delete (diskSettings as Record<string, unknown>).flock;
     const diskJson = JSON.stringify(diskSettings);
     const memJson = JSON.stringify(this.settings);
     if (diskJson !== memJson) {
       this.settings = diskSettings;
-      // Broadcast settings update to all connected clients
       for (const ws of this.clients) {
         try {
           ws.send(JSON.stringify({
@@ -426,15 +451,16 @@ export class WebServer {
         if (url.pathname === "/api/settings") {
           // GET: Return current settings
           if (req.method === "GET") {
-            return Response.json(this.settings);
+            const settings = { ...this.settings };
+            delete settings.flock;
+            return Response.json(settings);
           }
           // POST: Save settings
           if (req.method === "POST") {
             const updates = await req.json() as Record<string, unknown>;
-            // Merge updates into this.settings (deep merge for nested objects)
             for (const [key, value] of Object.entries(updates)) {
+              if (key === "flock") continue;
               if (typeof value === 'object' && value !== null && !Array.isArray(value) && key in this.settings && typeof this.settings[key] === 'object' && this.settings[key] !== null) {
-                // Deep merge nested objects
                 this.settings[key] = { ...this.settings[key], ...value };
               } else {
                 this.settings[key] = value as Record<string, unknown>;
@@ -444,8 +470,55 @@ export class WebServer {
             return Response.json(this.settings);
           }
         }
+        if (url.pathname === "/api/flock/settings") {
+          if (req.method === "GET") {
+            return Response.json(loadFlockSettings());
+          }
+          if (req.method === "POST") {
+            const updates = await req.json() as Record<string, unknown>;
+            const current = loadFlockSettings();
+            if (updates.flockGroups !== undefined) current.flockGroups = updates.flockGroups as FlockSettingsData["flockGroups"];
+            if (updates.assignments !== undefined) current.assignments = updates.assignments as FlockSettingsData["assignments"];
+            saveFlockSettings(current);
+            return Response.json(current);
+          }
+        }
         if (url.pathname === "/api/stats") {
           return Response.json(this.statsData.daily);
+        }
+        if (url.pathname === "/api/taxes") {
+          const taxesPath = join(DATA_DIR, "taxes.json");
+          if (!existsSync(taxesPath)) {
+            return Response.json({ bots: {}, fleetTotals: {} });
+          }
+          try {
+            const raw = readFileSync(taxesPath, "utf-8");
+            const taxes = JSON.parse(raw);
+            const bots: Record<string, { lastTaxEstimate?: any; history: any[] }> = {};
+            let totalIncome = 0, totalIncomeTax = 0, totalPropertyTax = 0, totalAssessedValue = 0;
+            for (const [botName, data] of Object.entries(taxes)) {
+              const botData = data as { lastTaxEstimate?: any; history: any[] };
+              bots[botName] = botData;
+              if (botData.lastTaxEstimate) {
+                totalIncome += botData.lastTaxEstimate.taxable_income_to_date || 0;
+                totalIncomeTax += botData.lastTaxEstimate.income_tax_total || 0;
+                totalPropertyTax += botData.lastTaxEstimate.property_tax_total || 0;
+                totalAssessedValue += botData.lastTaxEstimate.assessed_property_value || 0;
+              }
+            }
+            return Response.json({
+              bots,
+              fleetTotals: {
+                totalIncome,
+                totalIncomeTax,
+                totalPropertyTax,
+                totalAssessedValue,
+                botCount: Object.keys(taxes).length
+              }
+            });
+          } catch {
+            return Response.json({ bots: {}, fleetTotals: {} });
+          }
         }
         if (url.pathname === "/api/catalog") {
           return Response.json(catalogStore.getAll());
@@ -490,20 +563,23 @@ export class WebServer {
           });
         }
         if (url.pathname === "/api/faction-storage") {
-          // Return faction shared warehouse contents
-          const factionStoragePath = join(process.cwd(), "data", "factionStorage.json");
+          // Return faction shared warehouse contents for a specific station
+          const station = url.searchParams.get("station") || "";
+          const faction = url.searchParams.get("faction") || "";
+          const factionStoragePath = join(process.cwd(), "data", "factionStorage", `${faction}::${station || "default"}.json`);
           if (!existsSync(factionStoragePath)) {
             return Response.json({ items: [] });
           }
           try {
             const raw = readFileSync(factionStoragePath, "utf-8");
             const data = JSON.parse(raw);
-            // Normalize: entries may be under "entries" or "items"
             const items = data.entries || data.items || [];
             return Response.json({
               items,
               factionFuelReserve: data.factionFuelReserve || 0,
               factionFuelCapacity: data.factionFuelCapacity || 0,
+              factionName: data.factionName,
+              station: data.station,
             });
           } catch {
             return Response.json({ items: [] });
@@ -1063,6 +1139,17 @@ export class WebServer {
           });
         }
 
+        // Serve fa.html for Forensic Analysis route
+        if (url.pathname === "/fa.html") {
+          const faPath = join(import.meta.dir, "fa.html");
+          return new Response(readFileSync(faPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve commandall.html for command all route
         if (url.pathname === "/commandall.html") {
           const commandallPath = join(import.meta.dir, "commandall.html");
@@ -1183,6 +1270,7 @@ export class WebServer {
                   faction: this.factionLog,
                 },
                 botLogs: botLogsObj,
+                flockSettings: loadFlockSettings(),
               }));
 
               // Send large data separately to avoid blocking with JSON serialization

@@ -1,0 +1,459 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Forensic Analysis - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    .fa-layout { display: flex; flex-direction: column; height: 100vh; padding: 12px; gap: 10px; }
+    .fa-header { flex-shrink: 0; }
+    .fa-header h3 { margin: 0 0 4px 0; font-size: 16px; }
+    .fa-header p { margin: 0; color: var(--text-dim); font-size: 12px; }
+    .fa-controls { flex-shrink: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .fa-controls select { background: var(--bg-card); color: var(--text); border: 1px solid var(--border); padding: 6px 10px; border-radius: 4px; font-size: 13px; min-width: 180px; }
+    .fa-controls button { background: var(--accent); color: #fff; border: none; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 13px; font-weight: 500; }
+    .fa-controls button:hover { opacity: 0.9; }
+    .fa-controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .fa-cat-group { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+    .fa-cat-btn { padding: 5px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    .fa-stats { flex-shrink: 0; display: flex; gap: 10px; flex-wrap: wrap; }
+    .fa-stat-card { background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; padding: 8px 14px; min-width: 130px; }
+    .fa-stat-label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px; }
+    .fa-stat-value { font-size: 18px; font-weight: 600; margin-top: 2px; }
+    .fa-stat-value.credits-in { color: #4ade80; }
+    .fa-stat-value.credits-out { color: #f97316; }
+    .fa-stat-value.net { color: var(--accent); }
+    .fa-stat-value.count { color: var(--text); }
+    .fa-body { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+    .fa-log-header { display: flex; justify-content: space-between; align-items: center; padding: 0 4px; }
+    .fa-log-header span { font-size: 12px; color: var(--text-dim); text-transform: uppercase; letter-spacing: 0.4px; }
+    .fa-log-header button { background: none; border: 1px solid var(--border); color: var(--text-dim); padding: 3px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+    .fa-log-header button:hover { color: var(--text); border-color: var(--text-dim); }
+    .fa-log { flex: 1; min-height: 0; overflow-y: auto; background: var(--bg-card); border: 1px solid var(--border); border-radius: 6px; padding: 8px; font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; }
+    .fa-row { padding: 3px 6px; border-bottom: 1px solid rgba(255,255,255,0.03); display: flex; gap: 10px; }
+    .fa-row:hover { background: rgba(88,166,255,0.04); }
+    .fa-row .ts { color: var(--text-dim); min-width: 70px; }
+    .fa-row .cat { min-width: 60px; font-weight: 600; }
+    .fa-row .cat.ship { color: #d2a8ff; }
+    .fa-row .cat.faction { color: #bc8cff; }
+    .fa-row .cat.trading { color: #d29922; }
+    .fa-row .cat.combat { color: #f85149; }
+    .fa-row .cat.mission { color: #39d2c0; }
+    .fa-row .cat.crafting { color: #3fb950; }
+    .fa-row .cat.salvage { color: #ff7b72; }
+    .fa-row .cat.storage { color: #79c0ff; }
+    .fa-row .cat.skill { color: #a78bfa; }
+    .fa-row .cat.other { color: #8b949e; }
+    .fa-row .amt { min-width: 90px; text-align: right; font-weight: 600; }
+    .fa-row .amt.in { color: #4ade80; }
+    .fa-row .amt.out { color: #f97316; }
+    .fa-row .msg { flex: 1; color: var(--text); word-break: break-word; }
+    .fa-empty { color: var(--text-dim); padding: 20px; text-align: center; }
+    .fa-status { font-size: 12px; color: var(--text-dim); padding: 4px 0; }
+    .fa-status.err { color: #f85149; }
+    .fa-status.loading { color: #58a6ff; }
+  </style>
+</head>
+<body>
+<div class="fa-layout">
+  <div class="fa-header">
+    <h3>Forensic Analysis</h3>
+    <p>Track credits in/out and category activity per bot. Paste JSON directly or load via get_action_log.</p>
+  </div>
+
+  <div class="fa-controls">
+    <select id="faBotSelect"><option value="">-- select bot --</option></select>
+    <div class="fa-cat-group" id="faCatGroup">
+      <button class="fa-cat-btn" data-cat="" style="background:rgba(88,166,255,0.2);color:#58a6ff;border-color:#58a6ff;">all</button>
+      <button class="fa-cat-btn" data-cat="trading" style="background:#1a1a2e;color:#555;border-color:#333;">trading</button>
+      <button class="fa-cat-btn" data-cat="ship" style="background:#1a1a2e;color:#555;border-color:#333;">ship</button>
+      <button class="fa-cat-btn" data-cat="faction" style="background:#1a1a2e;color:#555;border-color:#333;">faction</button>
+      <button class="fa-cat-btn" data-cat="combat" style="background:#1a1a2e;color:#555;border-color:#333;">combat</button>
+      <button class="fa-cat-btn" data-cat="mission" style="background:#1a1a2e;color:#555;border-color:#333;">mission</button>
+      <button class="fa-cat-btn" data-cat="crafting" style="background:#1a1a2e;color:#555;border-color:#333;">crafting</button>
+      <button class="fa-cat-btn" data-cat="salvage" style="background:#1a1a2e;color:#555;border-color:#333;">salvage</button>
+      <button class="fa-cat-btn" data-cat="storage" style="background:#1a1a2e;color:#555;border-color:#333;">storage</button>
+      <button class="fa-cat-btn" data-cat="skill" style="background:#1a1a2e;color:#555;border-color:#333;">skill</button>
+      <button class="fa-cat-btn" data-cat="other" style="background:#1a1a2e;color:#555;border-color:#333;">other</button>
+    </div>
+    <input type="number" id="faPageInput" value="1" min="1" style="width:50px;background:var(--bg-card);color:var(--text);border:1px solid var(--border);padding:6px 6px;border-radius:4px;font-size:13px;text-align:center;" title="Page number">
+    <button id="faLoadBtn" onclick="loadActionLog()">Load Log</button>
+    <button id="faPasteBtn" onclick="openPasteModal()">Paste JSON</button>
+    <button id="faExportBtn" onclick="exportResults()" style="background:#21262d">Export</button>
+    <span id="faCooldown" style="font-size:11px;color:var(--text-dim);display:none;">Wait 1s...</span>
+  </div>
+
+  <div class="fa-stats" id="faStats">
+    <div class="fa-stat-card"><div class="fa-stat-label">Credits In</div><div class="fa-stat-value credits-in" id="faCreditsIn">0</div></div>
+    <div class="fa-stat-card"><div class="fa-stat-label">Credits Out</div><div class="fa-stat-value credits-out" id="faCreditsOut">0</div></div>
+    <div class="fa-stat-card"><div class="fa-stat-label">Net</div><div class="fa-stat-value net" id="faNet">0</div></div>
+    <div class="fa-stat-card"><div class="fa-stat-label">Entries</div><div class="fa-stat-value count" id="faEntryCount">0</div></div>
+    <div class="fa-stat-card"><div class="fa-stat-label">Filtered</div><div class="fa-stat-value count" id="faFilteredCount">0</div></div>
+  </div>
+
+  <div class="fa-body">
+    <div id="faStatus" class="fa-status">Initializing connection...</div>
+    <div class="fa-log-header">
+      <span>Action Log Entries</span>
+      <button onclick="clearFaResults()">Clear</button>
+    </div>
+    <div class="fa-log" id="faLog">
+      <div class="fa-empty">Select a bot, choose categories, then click <b>Load Log</b>.<br>Use <b>Paste JSON</b> for bulk data from get_action_log.</div>
+    </div>
+  </div>
+</div>
+
+<div id="faPasteModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:100;display:none;align-items:center;justify-content:center;">
+  <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:16px;width:90%;max-width:700px;max-height:85vh;display:flex;flex-direction:column;gap:10px;">
+    <div style="display:flex;justify-content:space-between;align-items:center;">
+      <strong style="font-size:14px;">Paste get_action_log JSON Result</strong>
+      <button onclick="closePasteModal()" style="background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:16px;">✕</button>
+    </div>
+    <textarea id="faPasteInput" style="flex:1;min-height:300px;background:var(--bg-input);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:8px;font-family:Consolas,Monaco,monospace;font-size:12px;resize:vertical;" placeholder='Paste JSON array here, e.g. [{"category":"faction","action":"deposit","credits":5000000,"timestamp":"2026-05-31T12:00:00Z"}, ...]'></textarea>
+    <div style="display:flex;gap:8px;justify-content:flex-end;">
+      <button onclick="closePasteModal()" style="background:#21262d;color:var(--text);border:1px solid var(--border);padding:6px 14px;border-radius:4px;cursor:pointer;">Cancel</button>
+      <button onclick="parsePastedJson()" style="background:var(--accent);color:#fff;border:none;padding:6px 14px;border-radius:4px;cursor:pointer;">Parse</button>
+    </div>
+  </div>
+</div>
+
+<script>
+  let ws = null;
+  let bots = [];
+  let reconnectDelay = 1000;
+  let rawEntries = [];
+  let filteredEntries = [];
+  let creditsIn = 0;
+  let creditsOut = 0;
+  let pendingLoad = false;
+  let activeCat = '';
+  let seenIds = new Set();
+
+  // ── Helpers ─────────────────────────────────────────────
+  function esc(s) {
+    if (!s) return '';
+    const d = document.createElement('div');
+    d.textContent = String(s);
+    return d.innerHTML;
+  }
+
+  function fmt(n) {
+    if (n === 0) return '0';
+    const sign = n > 0 ? '+' : '';
+    return sign + n.toLocaleString('en-US');
+  }
+
+  // ── State restoration ───────────────────────────────────
+  async function fetchInitialData() {
+    try {
+      const [botsRes, discoveredRes] = await Promise.all([
+        fetch('/api/bots').then(r => r.json()),
+        fetch('/api/bots/discovered').then(r => r.json()),
+      ]);
+      const statusBots = botsRes || [];
+      const discovered = discoveredRes?.usernames || [];
+      const statusByUsername = new Map(statusBots.map(b => [b.username, b]));
+      const botSet = new Set([...discovered, ...statusBots.map(b => b.username)]);
+      bots = [...botSet].map(username => {
+        const status = statusByUsername.get(username);
+        if (status) return status;
+        return { username, state: 'idle', routine: null, credits: 0, location: 'unknown', system: 'unknown' };
+      });
+      renderBotSelect();
+    } catch (err) {
+      console.warn('[FA] fetchInitialData failed:', err);
+    }
+  }
+
+  function renderBotSelect() {
+    const sel = document.getElementById('faBotSelect');
+    const cur = sel.value;
+    sel.innerHTML = '<option value="">-- select bot --</option>' +
+      bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}${b.state === 'running' ? ' ●' : ''}</option>`).join('');
+    if (cur && [...sel.options].some(o => o.value === cur)) sel.value = cur;
+  }
+
+  // ── WebSocket ───────────────────────────────────────────
+  function connect() {
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    ws = new WebSocket(`${proto}//${location.host}/ws`);
+
+    let wsInitTimer = setTimeout(() => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        fetchInitialData();
+      }
+    }, 500);
+
+    ws.onopen = () => {
+      clearTimeout(wsInitTimer);
+      reconnectDelay = 1000;
+      fetchInitialData();
+    };
+
+    ws.onclose = () => {
+      setTimeout(connect, reconnectDelay);
+      reconnectDelay = Math.min(reconnectDelay * 2, 10000);
+    };
+
+    ws.onerror = () => {};
+
+    ws.onmessage = (ev) => {
+      let msg;
+      try { msg = JSON.parse(ev.data); } catch { return; }
+      switch (msg.type) {
+        case 'init':
+          clearTimeout(wsInitTimer);
+          bots = msg.bots || [];
+          renderBotSelect();
+          break;
+        case 'status':
+          bots = msg.bots || [];
+          renderBotSelect();
+          break;
+        case 'execResult':
+          handleExecResult(msg);
+          break;
+        case 'actionResult':
+          if (msg.error) {
+            setFaStatus('Error: ' + esc(msg.error), true);
+          } else if (msg.message) {
+            setFaStatus(esc(msg.message), false);
+          }
+          break;
+      }
+    };
+  }
+
+  // ── Exec via WebSocket ──────────────────────────────────
+  const execCallbacks = new Map();
+
+  function sendExec(bot, command, params, callback) {
+    const seq = Date.now();
+    execCallbacks.set(seq, callback);
+    ws.send(JSON.stringify({ type: 'exec', bot, command, params, _seq: seq }));
+  }
+
+  function handleExecResult(msg) {
+    const cb = execCallbacks.get(msg._seq);
+    if (cb) {
+      execCallbacks.delete(msg._seq);
+      cb(msg);
+    }
+  }
+
+  // ── Load Action Log ─────────────────────────────────────
+  function loadActionLog() {
+    if (pendingLoad) {
+      setFaStatus('Cooldown: wait 1 second before loading again.', false, true);
+      return;
+    }
+    const bot = document.getElementById('faBotSelect').value;
+    if (!bot) { alert('Select a bot first'); return; }
+    if (ws && ws.readyState !== WebSocket.OPEN) { alert('Not connected to server'); return; }
+
+    const page = Math.max(1, parseInt(document.getElementById('faPageInput').value) || 1);
+    const params = activeCat ? { category: activeCat, page } : { page };
+    const label = activeCat || 'all';
+    setFaStatus('Loading action log for ' + esc(bot) + ' (category: ' + label + ', page ' + page + ')...', false, true);
+
+    sendExec(bot, 'get_action_log', params, (result) => {
+      document.getElementById('faLoadBtn').disabled = false;
+      if (result.error) {
+        setFaStatus('Error: ' + esc(result.error), true);
+        return;
+      }
+      const data = result.data || {};
+      const entries = parseEntries(data);
+      setFaStatus('Loaded ' + entries.length + ' entries for ' + esc(bot) + ' (page ' + page + ')', false, false);
+      ingestEntries(entries);
+      renderResults();
+    });
+  }
+
+  // ── Parse ───────────────────────────────────────────────
+  function parseEntries(data) {
+    const arr = Array.isArray(data) ? data : (data.entries || data.results || data.log || []);
+    return arr.map((e, i) => {
+      const category = e.category || e.cat || e.type || 'unknown';
+      const timestamp = e.created_at || e.timestamp || e.time || e.ts || '';
+      const eventType = e.event_type || e.action || e.subtype || e.event || '';
+      const summary = e.summary || e.message || e.msg || e.description || '';
+      const d = e.data || {};
+      const credits = typeof d.credits === 'number' ? d.credits
+        : typeof d.total_cost === 'number' ? -d.total_cost
+        : typeof d.cost === 'number' ? -d.cost : 0;
+      const itemId = d.item_id || d.itemId || d.item || '';
+      const id = e.id ?? e._i ?? i;
+      return { id, category, timestamp, eventType, summary, credits, itemId, raw: e };
+    });
+  }
+
+  function ingestEntries(entries) {
+    for (const e of entries) {
+      if (!seenIds.has(e.id)) {
+        seenIds.add(e.id);
+        rawEntries.push(e);
+      }
+    }
+    applyFilter();
+    renderResults();
+  }
+
+  function applyFilter() {
+    filteredEntries = activeCat ? rawEntries.filter(e => e.category === activeCat) : rawEntries;
+    creditsIn = 0;
+    creditsOut = 0;
+    for (const e of filteredEntries) {
+      if (e.credits > 0) creditsIn += e.credits;
+      else if (e.credits < 0) creditsOut += Math.abs(e.credits);
+    }
+    document.getElementById('faCreditsIn').textContent = fmt(creditsIn);
+    document.getElementById('faCreditsOut').textContent = fmt(creditsOut);
+    document.getElementById('faNet').textContent = fmt(creditsIn - creditsOut);
+    document.getElementById('faEntryCount').textContent = rawEntries.length;
+    document.getElementById('faFilteredCount').textContent = filteredEntries.length;
+  }
+
+  // ── Render ──────────────────────────────────────────────
+  function renderResults() {
+    const log = document.getElementById('faLog');
+    if (filteredEntries.length === 0) {
+      log.innerHTML = '<div class="fa-empty">No entries match current filter.<br>Load a log or paste JSON to begin.</div>';
+      return;
+    }
+    const rows = filteredEntries.map(e => {
+      const ts = e.timestamp ? e.timestamp.replace('T', ' ').substring(0, 19) : '--:--:--';
+      const catClass = esc(e.category.toLowerCase());
+      const amtClass = e.credits > 0 ? 'in' : (e.credits < 0 ? 'out' : '');
+      const amtStr = e.credits !== 0 ? fmt(e.credits) : '-';
+      const details = [esc(e.eventType), esc(e.summary)].filter(Boolean).join(' - ');
+      return `<div class="fa-row"><span class="ts">${esc(ts)}</span><span class="cat ${catClass}">${esc(e.category)}</span><span class="amt ${amtClass}">${amtStr}</span><span class="msg">${details}</span></div>`;
+    }).join('');
+    log.innerHTML = rows;
+  }
+
+  function clearFaResults() {
+    rawEntries = [];
+    filteredEntries = [];
+    seenIds = new Set();
+    creditsIn = 0;
+    creditsOut = 0;
+    document.getElementById('faCreditsIn').textContent = '0';
+    document.getElementById('faCreditsOut').textContent = '0';
+    document.getElementById('faNet').textContent = '0';
+    document.getElementById('faEntryCount').textContent = '0';
+    document.getElementById('faFilteredCount').textContent = '0';
+    document.getElementById('faLog').innerHTML = '<div class="fa-empty">Cleared. Load new data.</div>';
+    setFaStatus('', false, false);
+  }
+
+  function setFaStatus(text, isErr, isLoading) {
+    const el = document.getElementById('faStatus');
+    if (!el) return;
+    if (!text && !isErr && !isLoading) { el.textContent = ''; el.className = 'fa-status'; return; }
+    el.textContent = text;
+    el.className = 'fa-status' + (isErr ? ' err' : '') + (isLoading ? ' loading' : '');
+  }
+
+  // ── Category toggles (single-select, inline styles) ────
+  function styleCatBtn(btn, active) {
+    if (!btn) return;
+    if (active) {
+      btn.style.background = 'rgba(88,166,255,0.2)';
+      btn.style.color = '#58a6ff';
+      btn.style.borderColor = '#58a6ff';
+    } else {
+      btn.style.background = '#1a1a2e';
+      btn.style.color = '#555';
+      btn.style.borderColor = '#333';
+    }
+  }
+
+  document.getElementById('faCatGroup').addEventListener('click', (ev) => {
+    const btn = ev.target.closest('.fa-cat-btn');
+    if (!btn) return;
+    const cat = btn.dataset.cat;
+    activeCat = cat;
+    document.querySelectorAll('#faCatGroup .fa-cat-btn').forEach(b => styleCatBtn(b, false));
+    if (activeCat === '') {
+      styleCatBtn(document.querySelector('#faCatGroup .fa-cat-btn[data-cat=""]'), true);
+    } else {
+      styleCatBtn(btn, true);
+    }
+    applyFilter();
+    renderResults();
+  });
+
+  // Apply initial styles on load
+  function initCatStyles() {
+    document.querySelectorAll('#faCatGroup .fa-cat-btn').forEach(b => {
+      styleCatBtn(b, b.dataset.cat === '');
+    });
+  }
+
+  // ── Paste JSON Modal ────────────────────────────────────
+  function openPasteModal() {
+    const modal = document.getElementById('faPasteModal');
+    modal.style.display = 'flex';
+    document.getElementById('faPasteInput').value = '';
+    document.getElementById('faPasteInput').focus();
+  }
+
+  function closePasteModal() {
+    document.getElementById('faPasteModal').style.display = 'none';
+  }
+
+  function parsePastedJson() {
+    const raw = document.getElementById('faPasteInput').value.trim();
+    if (!raw) { closePasteModal(); return; }
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (e) {
+      alert('Invalid JSON: ' + e.message);
+      return;
+    }
+    const entries = parseEntries(data);
+    closePasteModal();
+    setFaStatus('Parsed ' + entries.length + ' entries from pasted JSON', false, false);
+    ingestEntries(entries);
+    renderResults();
+  }
+
+  // Close modal on Escape
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closePasteModal();
+  });
+
+  // Close modal on backdrop click
+  document.getElementById('faPasteModal').addEventListener('click', (e) => {
+    if (e.target.id === 'faPasteModal') closePasteModal();
+  });
+
+  // ── Export ──────────────────────────────────────────────
+  function exportResults() {
+    if (filteredEntries.length === 0) { alert('No data to export'); return; }
+    const rows = [
+      ['timestamp', 'category', 'credits', 'eventType', 'itemId', 'summary'],
+      ...filteredEntries.map(e => [
+        e.timestamp || '', e.category || '', e.credits ?? 0, e.eventType || '', e.itemId || '', e.summary || ''
+      ])
+    ];
+    const csv = rows.map(r => r.map(c => '"' + String(c).replace(/"/g, '""') + '"').join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'fa_export_' + (document.getElementById('faBotSelect').value || 'all') + '_' + new Date().toISOString().slice(0,10) + '.csv';
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  // ── Initialize ──────────────────────────────────────────
+  initCatStyles();
+  fetchInitialData();
+  connect();
+</script>
+</body>
+</html>

@@ -24,6 +24,7 @@
        <div class="top-tab" data-tab="players" onclick="switchTab('players')">Players</div>
        <div class="top-tab" data-tab="shipsforsale" onclick="switchTab('shipsforsale')">Ships For Sale</div>
        <div class="top-tab" data-tab="settings" onclick="switchTab('settings')">Settings</div>
+       <div class="top-tab" data-tab="fa" onclick="switchTab('fa')">FA</div>
     </div>
   </div>
   <div class="header-right">
@@ -362,6 +363,7 @@
         <div class="sidebar-item" onclick="switchSettingsTab('escort')">Escort</div>
         <div class="sidebar-item" onclick="switchSettingsTab('fleet_hunter')">Fleet Hunter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cargo_mover')">CargoMover</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('fuel_transport')">Fuel Transport</div>
       </div>
       <div class="settings-panel" id="settingsContent">
         <!-- filled by JS -->
@@ -484,62 +486,116 @@
      <iframe id="playersFrame" src="/players.html"></iframe>
    </div>
 
-   <!-- ══ Ships For Sale Tab ══ -->
-   <div class="tab-page" id="page-shipsforsale">
-     <iframe id="shipsforsaleFrame" src="/shipsforsale.html"></iframe>
-   </div>
+    <!-- ══ Ships For Sale Tab ══ -->
+    <div class="tab-page" id="page-shipsforsale">
+      <iframe id="shipsforsaleFrame" src="/shipsforsale.html"></iframe>
+    </div>
 
-   <!-- ══ Stats Tab ══ -->
-  <div class="tab-page" id="page-stats">
-    <div class="stats-page-header">
-      <h3>Fleet Statistics</h3>
-      <div class="stats-toggle" id="statsToggle">
-        <button class="active" onclick="setStatsPeriod('today')">Today</button>
-        <button onclick="setStatsPeriod('week')">Week</button>
-        <button onclick="setStatsPeriod('all')">All Time</button>
-      </div>
+    <!-- ══ Forensic Analysis Tab ══ -->
+    <div class="tab-page" id="page-fa">
+      <iframe id="faFrame" src="/fa.html"></iframe>
     </div>
-    <div class="stats-bar" id="statsBarPersist">
-      <span class="stats-title">Totals</span>
-      <div class="stat-item"><span class="stat-value" id="pStatMined">0</span><span class="stat-label">Ores Mined</span></div>
-      <div class="stat-item"><span class="stat-value" id="pStatCrafted">0</span><span class="stat-label">Items Crafted</span></div>
-      <div class="stat-item"><span class="stat-value" id="pStatTrades">0</span><span class="stat-label">Trades</span></div>
-      <div class="stat-item"><span class="stat-value" id="pStatProfit">0</span><span class="stat-label">Trade Profit</span></div>
-      <div class="stat-item"><span class="stat-value" id="pStatSystems">0</span><span class="stat-label">Explored</span></div>
-      <div class="stat-item"><span class="stat-value" id="pStatFaction">-</span><span class="stat-label">Faction Funds</span></div>
-    </div>
-    <div style="display:flex;gap:16px;flex:1;min-height:0;overflow:hidden">
-      <div class="bot-table-wrap" style="flex:1;overflow:auto">
-        <div class="bot-table-header"><span>Per-Bot Breakdown</span></div>
-        <div class="bot-table-scroll">
-          <table class="bot-table" id="statsTable">
-            <thead><tr>
-              <th style="text-align:left;padding:6px 12px">Bot</th>
-              <th style="text-align:right;padding:6px 12px">Mined</th>
-              <th style="text-align:right;padding:6px 12px">Crafted</th>
-              <th style="text-align:right;padding:6px 12px">Trades</th>
-              <th style="text-align:right;padding:6px 12px">Profit</th>
-              <th style="text-align:right;padding:6px 12px">Systems</th>
-            </tr></thead>
-            <tbody id="statsTableBody"></tbody>
-          </table>
-        </div>
-      </div>
-      <div class="bot-table-wrap" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
-        <div class="bot-table-header">
-          <span>Faction Activity</span>
-          <div class="faction-log-filters" id="statsLogFilters">
-            <button class="faction-log-filter-btn active" onclick="setStatsLogFilter('all')">All</button>
-            <button class="faction-log-filter-btn" onclick="setStatsLogFilter('deposit')">Deposit</button>
-            <button class="faction-log-filter-btn" onclick="setStatsLogFilter('withdraw')">Withdraw</button>
-            <button class="faction-log-filter-btn" onclick="setStatsLogFilter('donation')">Donation</button>
-            <button class="faction-log-filter-btn" onclick="setStatsLogFilter('gift')">Gift</button>
-          </div>
-        </div>
-        <div id="statsActivityLog" class="faction-log-content" style="flex:1;min-height:0"></div>
-      </div>
-    </div>
-  </div>
+
+  <!-- ══ Stats Tab ══ -->
+   <div class="tab-page" id="page-stats">
+     <div class="stats-page-header">
+       <h3>Fleet Statistics</h3>
+       <div class="stats-toggle" id="statsToggle">
+         <button class="active" onclick="setStatsPeriod('today')">Today</button>
+         <button onclick="setStatsPeriod('week')">Week</button>
+         <button onclick="setStatsPeriod('all')">All Time</button>
+       </div>
+     </div>
+     <div class="stats-bar" id="statsBarPersist">
+       <span class="stats-title">Totals</span>
+       <div class="stat-item"><span class="stat-value" id="pStatMined">0</span><span class="stat-label">Ores Mined</span></div>
+       <div class="stat-item"><span class="stat-value" id="pStatCrafted">0</span><span class="stat-label">Items Crafted</span></div>
+       <div class="stat-item"><span class="stat-value" id="pStatTrades">0</span><span class="stat-label">Trades</span></div>
+       <div class="stat-item"><span class="stat-value" id="pStatProfit">0</span><span class="stat-label">Trade Profit</span></div>
+       <div class="stat-item"><span class="stat-value" id="pStatSystems">0</span><span class="stat-label">Explored</span></div>
+       <div class="stat-item"><span class="stat-value" id="pStatFaction">-</span><span class="stat-label">Faction Funds</span></div>
+     </div>
+     
+     <!-- Taxes Tab Navigation -->
+     <div class="stats-taxes-nav" id="statsTaxesNav" style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+       <span class="stats-title">View:</span>
+       <button class="active" id="statsTabMain" onclick="switchStatsView('main')">Main</button>
+       <button id="statsTabTaxes" onclick="switchStatsView('taxes')">Taxes</button>
+     </div>
+     
+     <!-- Main Stats View -->
+     <div id="statsMainView">
+       <div class="stats-bar" id="statsBarTaxes">
+         <span class="stats-title">Taxes</span>
+         <div class="stat-item"><span class="stat-value" id="pStatIncomeTax">0</span><span class="stat-label">Income Tax</span></div>
+         <div class="stat-item"><span class="stat-value" id="pStatPropertyTax">0</span><span class="stat-label">Property Tax</span></div>
+         <div class="stat-item"><span class="stat-value" id="pStatTaxableIncome">0</span><span class="stat-label">Taxable Income</span></div>
+       </div>
+       <div style="display:flex;gap:16px;flex:1;min-height:0;overflow:hidden">
+         <div class="bot-table-wrap" style="flex:1;overflow:auto">
+           <div class="bot-table-header"><span>Per-Bot Breakdown</span></div>
+           <div class="bot-table-scroll">
+             <table class="bot-table" id="statsTable">
+               <thead><tr>
+                 <th style="text-align:left;padding:6px 12px">Bot</th>
+                 <th style="text-align:right;padding:6px 12px">Mined</th>
+                 <th style="text-align:right;padding:6px 12px">Crafted</th>
+                 <th style="text-align:right;padding:6px 12px">Trades</th>
+                 <th style="text-align:right;padding:6px 12px">Profit</th>
+                 <th style="text-align:right;padding:6px 12px">Systems</th>
+               </tr></thead>
+               <tbody id="statsTableBody"></tbody>
+             </table>
+           </div>
+         </div>
+         <div class="bot-table-wrap" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
+           <div class="bot-table-header">
+             <span>Faction Activity</span>
+             <div class="faction-log-filters" id="statsLogFilters">
+               <button class="faction-log-filter-btn active" onclick="setStatsLogFilter('all')">All</button>
+               <button class="faction-log-filter-btn" onclick="setStatsLogFilter('deposit')">Deposit</button>
+               <button class="faction-log-filter-btn" onclick="setStatsLogFilter('withdraw')">Withdraw</button>
+               <button class="faction-log-filter-btn" onclick="setStatsLogFilter('donation')">Donation</button>
+               <button class="faction-log-filter-btn" onclick="setStatsLogFilter('gift')">Gift</button>
+             </div>
+           </div>
+           <div id="statsActivityLog" class="faction-log-content" style="flex:1;min-height:0"></div>
+         </div>
+       </div>
+     </div>
+     
+     <!-- Taxes View (hidden by default) -->
+     <div id="statsTaxesView" style="display:none">
+       <div class="stats-bar">
+         <span class="stats-title">Fleet Tax Summary</span>
+         <div class="stat-item"><span class="stat-value" id="taxTotalIncome">0</span><span class="stat-label">Total Taxable Income</span></div>
+         <div class="stat-item"><span class="stat-value" id="taxTotalIncomeTax">0</span><span class="stat-label">Total Income Tax</span></div>
+         <div class="stat-item"><span class="stat-value" id="taxTotalPropertyTax">0</span><span class="stat-label">Total Property Tax</span></div>
+         <div class="stat-item"><span class="stat-value" id="taxTotalAssessed">0</span><span class="stat-label">Total Assessed Value</span></div>
+       </div>
+       <div class="bot-table-wrap" style="flex:1;overflow:auto">
+         <div class="bot-table-header">
+           <span>Tax History by Bot</span>
+           <div style="display:flex;gap:8px">
+             <input type="text" class="filter-input" placeholder="🔍 Search bots..." id="taxSearch" oninput="filterTaxBots()">
+           </div>
+         </div>
+         <div class="bot-table-scroll">
+           <table class="bot-table" id="taxTable">
+             <thead><tr>
+               <th style="text-align:left;padding:6px 12px">Bot</th>
+               <th style="text-align:right;padding:6px 12px">Taxable Income</th>
+               <th style="text-align:right;padding:6px 12px">Income Tax</th>
+               <th style="text-align:right;padding:6px 12px">Property Tax</th>
+               <th style="text-align:right;padding:6px 12px">Assessed Value</th>
+               <th style="text-align:right;padding:6px 12px">Last Updated</th>
+             </tr></thead>
+             <tbody id="taxTableBody"></tbody>
+           </table>
+         </div>
+       </div>
+     </div>
+   </div>
 
   <!-- ══ Bot Profile Page (hidden by default) ══ -->
   <div class="profile-page" id="page-profile">
@@ -646,6 +702,7 @@ let ws = null;
 let bots = [];
 let routines = [];
 let settings = {};
+let flockSettings = { flockGroups: [], assignments: {} };
 let knownSystems = [];
 let knownOres = [];
 let mobileCapitol = null;     // { systemId, systemName, poiId, discoveredAt }
@@ -771,7 +828,7 @@ function switchTab(name) {
   if (name === 'missions') renderMissionsPage();
   if (name === 'faction') renderFactionPage();
   if (name === 'shipyard') renderShipyardPage();
-  if (name === 'stats') { renderStatsTab(); refreshFactionFunds(); }
+  if (name === 'stats') { renderStatsTab(); refreshFactionFunds(); loadTaxesDataAndRender(); }
   if (name === 'commandall') {
     const frame = document.getElementById('commandallFrame');
     if (frame) frame.src = frame.src;
@@ -791,6 +848,10 @@ function switchTab(name) {
     const frame = document.getElementById('shipsforsaleFrame');
     if (frame) frame.src = frame.src;
   }
+  if (name === 'fa') {
+    const frame = document.getElementById('faFrame');
+    if (frame) frame.src = frame.src;
+  }
 }
 
 // ── WebSocket ──────────────────────────────────────────────
@@ -799,17 +860,20 @@ let wsInitTimer = null;
 /** Fetch initial data via REST API as fallback if WebSocket is slow */
 async function fetchInitialData() {
   try {
-    const [botsRes, discoveredRes, routinesRes, settingsRes, mapRes, statsRes, catalogRes, mainLogsRes, factionStorageRes] = await Promise.all([
+    const [botsRes, discoveredRes, routinesRes, settingsRes, flockRes, mapRes, statsRes, catalogRes, mainLogsRes, factionStorageRes] = await Promise.all([
       fetch('/api/bots').then(r => r.json()),
       fetch('/api/bots/discovered').then(r => r.json()),
       fetch('/api/routines').then(r => r.json()),
       fetch('/api/settings').then(r => r.json()),
+      fetch('/api/flock/settings').then(r => r.json()).catch(() => ({ flockGroups: [], assignments: {} })),
       fetch('/data/map.json').then(r => r.json()),
       fetch('/api/stats').then(r => r.json()),
       fetch('/api/catalog').then(r => r.json()),
       fetch('/api/logs/main').then(r => r.json()),
       fetch('/api/faction-storage').then(r => r.json()).catch(() => ({ items: [] })), // Best effort
     ]);
+    settings = settingsRes || {};
+    flockSettings = flockRes || { flockGroups: [], assignments: {} };
 
     // Merge discovered bots with status data (discovered gives us usernames even if not logged in)
     const statusBots = botsRes || [];
@@ -944,6 +1008,7 @@ async function fetchInitialData() {
         knownSystems = msg.knownSystems || [];
         knownOres = msg.knownOres || [];
         mobileCapitol = msg.mobileCapitol || null;
+        flockSettings = msg.flockSettings || { flockGroups: [], assignments: {} };
         renderBots();
         setTimeout(refreshFactionFunds, 2000);
         updateChatBotSelect();
@@ -967,6 +1032,10 @@ async function fetchInitialData() {
         }
         // Load faction log
         factionLogLines = msg.logs?.faction || [];
+        // Load taxes data if stats tab is active
+        if (document.getElementById('page-stats')?.classList.contains('active')) {
+          loadTaxesDataAndRender();
+        }
         break;
       case 'mapData':
         mapData = msg.data.systems || msg.data || {};
@@ -1886,6 +1955,92 @@ function renderStatsActivityLog() {
   log.scrollTop = 0;
 }
 
+// ── Taxes Tab ──────────────────────────────────────────────────
+let statsTaxesView = 'main';
+let taxesData = null;
+let taxesLoaded = false;
+
+async function loadTaxesData() {
+  if (taxesLoaded) return;
+  try {
+    const res = await fetch('/api/taxes');
+    if (res.ok) {
+      taxesData = await res.json();
+      taxesLoaded = true;
+    }
+  } catch (err) {
+    console.warn('Failed to load taxes data:', err);
+  }
+}
+
+async function switchStatsView(view) {
+  statsTaxesView = view;
+  document.getElementById('statsTabMain').classList.toggle('active', view === 'main');
+  document.getElementById('statsTabTaxes').classList.toggle('active', view === 'taxes');
+  document.getElementById('statsMainView').style.display = view === 'main' ? '' : 'none';
+  document.getElementById('statsTaxesView').style.display = view === 'taxes' ? '' : 'none';
+  if (view === 'taxes') {
+    if (!taxesLoaded) {
+      await loadTaxesData();
+    }
+    renderTaxesTab();
+  }
+}
+
+function loadTaxesBar() {
+  const fleetTotals = taxesData.fleetTotals || {};
+  document.getElementById('pStatIncomeTax').textContent = num(fleetTotals.totalIncomeTax || 0);
+  document.getElementById('pStatPropertyTax').textContent = num(fleetTotals.totalPropertyTax || 0);
+  document.getElementById('pStatTaxableIncome').textContent = num(fleetTotals.totalIncome || 0);
+}
+
+function formatTimestamp(ts) {
+  const d = new Date(ts);
+  return d.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
+}
+
+function num(value) {
+  if (value == null) return '0';
+  return value.toLocaleString();
+}
+
+function renderTaxesTab() {
+  const data = taxesData || {};
+  const fleetTotals = data.fleetTotals || {};
+  document.getElementById('taxTotalIncome').textContent = num(fleetTotals.totalIncome || 0);
+  document.getElementById('taxTotalIncomeTax').textContent = num(fleetTotals.totalIncomeTax || 0);
+  document.getElementById('taxTotalPropertyTax').textContent = num(fleetTotals.totalPropertyTax || 0);
+  document.getElementById('taxTotalAssessed').textContent = num(fleetTotals.totalAssessedValue || 0);
+  
+  const bots = data.bots || {};
+  const tbody = document.getElementById('taxTableBody');
+  const entries = Object.entries(bots);
+  
+  if (entries.length === 0) {
+    tbody.innerHTML = '<tr><td colspan="6" style="padding:24px;text-align:center;color:var(--text-dim)">No tax data yet. Start bots and let them collect taxes on restart.</td></tr>';
+    return;
+  }
+  
+  tbody.innerHTML = entries.map(([botName, data]) => {
+    const estimate = data.lastTaxEstimate || {};
+    const lastUpdated = estimate.timestamp ? formatTimestamp(estimate.timestamp) : '-';
+    return `<tr>
+      <td style="padding:6px 12px;font-weight:500;color:var(--text-bright)">${esc(botName)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(estimate.taxable_income_to_date || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(estimate.income_tax_total || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(estimate.property_tax_total || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(estimate.assessed_property_value || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${esc(lastUpdated)}</td>
+    </tr>`;
+  }).join('');
+}
+
+async function loadTaxesDataAndRender() {
+  await loadTaxesData();
+  loadTaxesBar();
+  renderTaxesTab();
+}
+
 function renderStats() {
   let mined = 0, crafted = 0, trades = 0, profit = 0, credits = 0, systems = 0, active = 0;
   for (const b of bots) {
@@ -2337,9 +2492,9 @@ function renderProfileTopbar() {
   }
 
   // Add flock controls
-  const flockAssignments = settings.flock?.assignments || {};
+  const flockAssignments = flockSettings.assignments || {};
   const botFlock = flockAssignments[bot.username];
-  const flockGroups = settings.flock?.flockGroups || [];
+  const flockGroups = flockSettings.flockGroups || [];
   const flockOpts = [`<option value=""${!botFlock?.flockName ? ' selected' : ''}>None</option>`];
   for (const group of flockGroups) {
     const sel = group.name === botFlock?.flockName ? ' selected' : '';
@@ -2559,22 +2714,21 @@ function saveProfileFlock() {
   const flockName = flockSel.value;
   const isLeader = leaderChk.checked;
 
-  if (!settings.flock) settings.flock = {};
-  if (!settings.flock.assignments) settings.flock.assignments = {};
+  if (!flockSettings.assignments) flockSettings.assignments = {};
 
   if (flockName) {
-    settings.flock.assignments[bot.username] = {
+    flockSettings.assignments[bot.username] = {
       flockEnabled: true,
       flockName: flockName,
       flockRole: isLeader ? 'leader' : 'follower'
     };
   } else {
-    delete settings.flock.assignments[bot.username];
+    delete flockSettings.assignments[bot.username];
   }
 
   send({ type: 'saveSettings', routine: 'flock', settings: {
-    flockGroups: settings.flock.flockGroups || [],
-    assignments: settings.flock.assignments
+    flockGroups: flockSettings.flockGroups || [],
+    assignments: flockSettings.assignments
   } });
 }
 
@@ -7161,6 +7315,8 @@ function renderSettingsPanel() {
     renderFleetHunterSettings(panel);
   } else if (activeSettingsTab === 'cargo_mover') {
     renderCargoMoverSettings(panel);
+  } else if (activeSettingsTab === 'fuel_transport') {
+    renderFuelTransportSettings(panel);
   }
 }
 
@@ -12540,7 +12696,6 @@ function renderFactionFacilities(f, username) {
     ? '<div style="color:var(--yellow);font-size:11px;margin-bottom:12px">Bot must be docked at a station to manage facilities.</div>'
     : '';
 
-  factionFacilityCategory = 'faction';
   return `
     ${dockWarning}
     <div class="faction-section">
@@ -12568,17 +12723,18 @@ function renderFactionFacilities(f, username) {
   `;
 }
 
-function fetchFactionFacilities(username) {
+async function fetchFactionFacilities(username) {
   const container = document.getElementById('factionFacilitiesList');
   if (!container) return;
   container.innerHTML = '<div class="faction-no-data">Loading...</div>';
-  sendExec(username, 'facility', { action: 'faction_list' }, (result) => {
+  sendExec(username, 'facility', { action: 'faction_list' }, async (result) => {
     if (!result.ok || !result.data) {
       container.innerHTML = `<div class="faction-no-data">${esc(result.error || 'No facilities found')}</div>`;
       return;
     }
     const d = result.data;
-    const facilities = Array.isArray(d) ? d : (Array.isArray(d.faction_facilities) ? d.faction_facilities : []);
+    let facilities = Array.isArray(d) ? d : (Array.isArray(d.faction_facilities) ? d.faction_facilities : []);
+    
     if (facilities.length === 0) {
       container.innerHTML = '<div class="faction-no-data">No faction facilities at this station.</div>';
       return;
@@ -12779,51 +12935,96 @@ function factionUpgradeFacility(username, facilityId, facilityType) {
   })();
 }
 
-function fetchFactionBuildableTypes(username) {
+let factionFacilityTypes = [];
+let factionFacilityDetails = {};
+let factionFacilityLoading = false;
+let factionFacilityPageSize = 20;
+let factionFacilityCategory = 'faction';
+
+async function fetchFactionBuildableTypes(username) {
   const container = document.getElementById('factionBuildableTypes');
   if (!container) return;
   container.innerHTML = '<div class="faction-no-data">Loading available types...</div>';
   const cat = factionFacilityCategory || 'faction';
-  sendExec(username, 'facility', { action: 'types', category: cat }, (result) => {
+  
+  factionFacilityTypes = [];
+  factionFacilityLoading = true;
+  
+  let page = 0;
+  let hasMore = true;
+  
+  while (hasMore) {
+    container.innerHTML = `<div class="faction-no-data">Loading ${cat} types (page ${page + 1})...</div>`;
+    
+    const result = await new Promise(resolve => {
+      sendExec(username, 'facility', { action: 'types', category: cat, page: page }, resolve);
+    });
+    
     if (!result.ok || !result.data) {
       container.innerHTML = `<div class="faction-no-data">${esc(result.error || 'Could not load types')}</div>`;
+      factionFacilityLoading = false;
       return;
     }
+    
     const d = result.data;
     const types = Array.isArray(d) ? d : (Array.isArray(d.types) ? d.types : Array.isArray(d.facilities) ? d.facilities : []);
+    const totalPages = d.total_pages || 1;
+    
     if (types.length === 0) {
-      container.innerHTML = `<div class="faction-no-data">No faction facility types found in response</div>
-        <pre style="font-size:10px;color:var(--text-dim);margin-top:4px;white-space:pre-wrap">${esc(JSON.stringify(d, null, 2))}</pre>`;
+      container.innerHTML = `<div class="faction-no-data">No faction facility types found in response</div>`;
+      factionFacilityLoading = false;
       return;
     }
-    // Render placeholders, then fetch full details for each type
-    container.innerHTML = types.map(t => {
-      const typeId = t.facility_type || t.type || t.id || '';
-      return `<div id="fac-type-${esc(typeId)}" class="faction-card" style="opacity:0.5">
-        <div class="fc-name">${esc(t.name || typeId)}</div>
-        <div class="fc-detail">Loading details...</div>
-      </div>`;
-    }).join('');
-    // Fetch full details for each type
-    for (const t of types) {
-      const typeId = t.facility_type || t.type || t.id || '';
-      if (!typeId) continue;
-      sendExec(username, 'facility', { action: 'types', facility_type: typeId }, (detailResult) => {
-        const el = document.getElementById(`fac-type-${typeId}`);
-        if (!el) return;
-        el.style.opacity = '1';
-        if (!detailResult.ok || !detailResult.data) {
-          // Fall back to summary data from the list
-          el.innerHTML = renderFacilityTypeCard(t, username);
-          return;
-        }
-        // Detail might be a single object or wrapped
-        const dd = detailResult.data;
-        const detail = Array.isArray(dd) ? dd[0] : (dd.type || dd.facility || dd);
-        el.innerHTML = renderFacilityTypeCard(detail || t, username);
-      });
+    
+    factionFacilityTypes.push(...types);
+    
+    hasMore = types.length >= factionFacilityPageSize && page < totalPages - 1;
+    page++;
+    
+    if (hasMore) {
+      await new Promise(resolve => setTimeout(resolve, 2000));
     }
-  });
+  }
+  
+  factionFacilityLoading = false;
+  
+  renderFactionBuildableTypesList(username);
+}
+
+function renderFactionBuildableTypesList(username) {
+  const container = document.getElementById('factionBuildableTypes');
+  if (!container) return;
+  
+  const types = factionFacilityTypes;
+  if (types.length === 0) {
+    container.innerHTML = '<div class="faction-no-data">No faction facility types found</div>';
+    return;
+  }
+  
+  container.innerHTML = types.map(t => {
+    const typeId = t.facility_type || t.type || t.id || '';
+    return `<div id="fac-type-${esc(typeId)}" class="faction-card" style="opacity:0.5">
+      <div class="fc-name">${esc(t.name || typeId)}</div>
+      <div class="fc-detail">Loading details...</div>
+    </div>`;
+  }).join('');
+  
+  for (const t of types) {
+    const typeId = t.facility_type || t.type || t.id || '';
+    if (!typeId) continue;
+    sendExec(username, 'facility', { action: 'types', facility_type: typeId }, (detailResult) => {
+      const el = document.getElementById(`fac-type-${typeId}`);
+      if (!el) return;
+      el.style.opacity = '1';
+      if (!detailResult.ok || !detailResult.data) {
+        el.innerHTML = renderFacilityTypeCard(t, username);
+        return;
+      }
+      const dd = detailResult.data;
+      const detail = Array.isArray(dd) ? dd[0] : (dd.type || dd.facility || dd);
+      el.innerHTML = renderFacilityTypeCard(detail || t, username);
+    });
+  }
 }
 
 function renderFacilityTypeCard(t, username) {
@@ -12890,7 +13091,7 @@ function renderFacilityTypeCard(t, username) {
 function renderFactionProductionFromCache(username) {
   const container = document.getElementById('factionBuildableTypes');
   if (!container) return;
-  const prodTypes = personalFacilityTypes.filter(t => t._category === 'production');
+  const prodTypes = factionFacilityTypes.filter(t => t._category === 'production');
   if (prodTypes.length === 0) {
     container.innerHTML = '<div class="faction-no-data">No cached production types</div>';
     return;
@@ -13182,7 +13383,6 @@ let personalFacilityVersion = null;
 let personalFacilityCategory = 'personal'; // 'personal' or 'production'
 let personalFacilityUpgrades = {}; // { facilityId: upgradeData }
 let factionFacilityUpgrades = {}; // { facilityId: upgradeData }
-let factionFacilityCategory = 'faction'; // 'faction' or 'production'
 
 // Load facilities from server cache (returns true if loaded successfully)
 async function loadFacilitiesCache() {
@@ -13435,7 +13635,7 @@ function switchFactionFacilityCategory(category, username) {
       productionBtn.style.color = '';
     }
   }
-  if (category === 'production' && personalFacilityTypes.some(t => t._category === 'production')) {
+  if (category === 'production' && factionFacilityTypes.some(t => t._category === 'production')) {
     renderFactionProductionFromCache(username);
   } else {
     fetchFactionBuildableTypes(username);
@@ -14868,7 +15068,7 @@ function saveExplorerBotFocus(botName) {
 // ── Flock Mining Helpers ──────────────────────────────────────────
 
 function buildFlockGroupRows() {
-  const groups = settings.flock?.flockGroups || [];
+  const groups = flockSettings.flockGroups || [];
   let rows = '';
   for (const group of groups) {
     rows += `<tr data-flock-group="${esc(group.name)}">
@@ -14890,7 +15090,7 @@ function buildFlockGroupRows() {
 }
 
 function buildFlockGroupOptions(selectedName) {
-  const groups = settings.flock?.flockGroups || [];
+  const groups = flockSettings.flockGroups || [];
   let opts = '';
   for (const group of groups) {
     const selected = group.name === selectedName ? ' selected' : '';
@@ -14901,7 +15101,7 @@ function buildFlockGroupOptions(selectedName) {
 
 function buildFlockAssignmentsRows() {
   let rows = '';
-  const flockAssignments = settings.flock?.assignments || {};
+  const flockAssignments = flockSettings.assignments || {};
   for (const bot of bots) {
     const botSettings = flockAssignments[bot.username];
     if (botSettings && botSettings.flockEnabled && botSettings.flockName) {
@@ -14920,17 +15120,14 @@ function buildFlockAssignmentsRows() {
 }
 
 function removeBotFromFlock(botUsername) {
-  if (!settings.flock) settings.flock = {};
-  if (!settings.flock.assignments) settings.flock.assignments = {};
-  delete settings.flock.assignments[botUsername];
+  if (!flockSettings.assignments) flockSettings.assignments = {};
+  delete flockSettings.assignments[botUsername];
 
-  // Send to server
   send({ type: 'saveSettings', routine: 'flock', settings: {
-    flockGroups: settings.flock.flockGroups || [],
-    assignments: settings.flock.assignments
+    flockGroups: flockSettings.flockGroups || [],
+    assignments: flockSettings.assignments
   } });
 
-  // Refresh the assignments table
   document.getElementById('flock-assignments-tbody').innerHTML = buildFlockAssignmentsRows();
 }
 
@@ -15012,7 +15209,7 @@ async function loadFlockMembers(flockName) {
       if (state && state.members && state.members.length > 0) {
         const leader = state.leader || 'unknown';
         // Get maxMembers from the flock group config in settings
-        const flockGroup = (settings.flock?.flockGroups || []).find(g => g.name === flockName);
+        const flockGroup = (flockSettings.flockGroups || []).find(g => g.name === flockName);
         const maxMembers = flockGroup?.maxMembers;
         const membersList = state.members.map(m => {
           const isLeader = m === leader;
@@ -15410,23 +15607,15 @@ function renderMinerSettings(panel) {
       </div>
     </div>
 
-    <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+	<div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
       <div class="setting-row">
         <div>
-          <div class="setting-label">Depletion Timeout (Hours)</div>
-          <div class="setting-hint">How long to wait before re-checking depleted mining locations. Default is 3 hours.</div>
-        </div>
-        <input type="number" id="set-miner-depletionTimeoutHours" min="1" max="24" value="${settings.miner?.depletionTimeoutHours || 3}" style="width:80px" />
-      </div>
-
-      <div class="setting-row">
-        <div>
-          <div class="setting-label">Ignore Depletion Markings</div>
-          <div class="setting-hint">When enabled, miners will ignore depletion markings and continue mining at target POIs. Useful when multiple ores exist at a POI and one gets marked depleted prematurely.</div>
+          <div class="setting-label">No Mid-Mining Retargeting</div>
+          <div class="setting-hint">When enabled, miners will only do a single round trip: go out, mine, and return home. No retargeting to another POI mid-mining. Reduces refueling and stranding due to fuel cost of remote station travel.</div>
         </div>
         <label style="display:flex;align-items:center;gap:8px">
-          <input type="checkbox" id="set-miner-ignoreDepletion"${settings.miner?.ignoreDepletion ? ' checked' : ''} />
-          <span>Ignore depletion</span>
+          <input type="checkbox" id="set-miner-noMidMiningRetarget"${m.noMidMiningRetarget ? ' checked' : ''} />
+          <span>Disallow mid-mining retarget</span>
         </label>
       </div>
 
@@ -15436,7 +15625,7 @@ function renderMinerSettings(panel) {
           <div class="setting-hint">When enabled, miners will continue to the next POI with target ore instead of returning home when a POI is depleted. Saves time and fuel by staying out until cargo is full.</div>
         </div>
         <label style="display:flex;align-items:center;gap:8px">
-          <input type="checkbox" id="set-miner-stayOutUntilFull"${settings.miner?.stayOutUntilFull ? ' checked' : ''} />
+          <input type="checkbox" id="set-miner-stayOutUntilFull"${m.stayOutUntilFull ? ' checked' : ''} />
           <span>Stay out until cargo full</span>
         </label>
       </div>
@@ -15446,7 +15635,7 @@ function renderMinerSettings(panel) {
           <div class="setting-label">Max Jump Distance</div>
           <div class="setting-hint">Maximum number of jumps the miner will travel to reach a mining location. Prevents miners from traveling across the galaxy. Default is 10 jumps.</div>
         </div>
-        <input type="number" id="set-miner-maxJumps" min="1" max="100" value="${settings.miner?.maxJumps ?? 10}" style="width:80px" />
+        <input type="number" id="set-miner-maxJumps" min="1" max="100" value="${m.maxJumps ?? 10}" style="width:80px" />
       </div>
 
       <div class="setting-row">
@@ -15454,8 +15643,28 @@ function renderMinerSettings(panel) {
           <div class="setting-label">Minimum Fuel Cells</div>
           <div class="setting-hint">Minimum military fuel cells each miner must carry (military_fuel_cell = 100 fuel / 3 space). Default 20 prevents stranding at distant stations.</div>
         </div>
-        <input type="number" id="set-miner-minimumFuelCells" min="5" max="100" value="${settings.miner?.minimumFuelCells ?? 20}" style="width:80px" />
+        <input type="number" id="set-miner-minimumFuelCells" min="5" max="100" value="${m.minimumFuelCells ?? 20}" style="width:80px" />
       </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Depletion Timeout (Hours)</div>
+          <div class="setting-hint">How long to wait before re-checking depleted mining locations. Default is 3 hours.</div>
+        </div>
+        <input type="number" id="set-miner-depletionTimeoutHours" min="1" max="24" value="${m.depletionTimeoutHours ?? 3}" style="width:80px" />
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Ignore Depletion Markings</div>
+          <div class="setting-hint">When enabled, miners will ignore depletion markings and continue mining at target POIs. Useful when multiple ores exist at a POI and one gets marked depleted prematurely.</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="set-miner-ignoreDepletion"${m.ignoreDepletion ? ' checked' : ''} />
+          <span>Ignore depletion</span>
+        </label>
+      </div>
+    </div>
 
 
 
@@ -15712,6 +15921,7 @@ function saveMinerSettings() {
     repairThreshold: parseInt(document.getElementById('set-miner-repairThreshold').value) || 40,
     depletionTimeoutHours: parseInt(document.getElementById('set-miner-depletionTimeoutHours').value) || 3,
     ignoreDepletion: document.getElementById('set-miner-ignoreDepletion').checked,
+    noMidMiningRetarget: document.getElementById('set-miner-noMidMiningRetarget').checked,
     stayOutUntilFull: document.getElementById('set-miner-stayOutUntilFull').checked,
     maxJumps: parseInt(document.getElementById('set-miner-maxJumps').value) || 10,
     minimumFuelCells: parseInt(document.getElementById('set-miner-minimumFuelCells').value) || 20,
@@ -17220,11 +17430,10 @@ function assignBotToFlock() {
   }
 
   // Initialize flock assignments if not exists
-  if (!settings.flock) settings.flock = {};
-  if (!settings.flock.assignments) settings.flock.assignments = {};
+  if (!flockSettings.assignments) flockSettings.assignments = {};
 
   // Save assignment
-  settings.flock.assignments[botUsername] = {
+  flockSettings.assignments[botUsername] = {
     flockEnabled: true,
     flockName: flockName,
     flockRole: flockRole
@@ -17232,11 +17441,10 @@ function assignBotToFlock() {
 
   // Send to server
   send({ type: 'saveSettings', routine: 'flock', settings: {
-    flockGroups: settings.flock.flockGroups || [],
-    assignments: settings.flock.assignments
+    flockGroups: flockSettings.flockGroups || [],
+    assignments: flockSettings.assignments
   } });
 
-  // Refresh the assignments table
   document.getElementById('flock-assignments-tbody').innerHTML = buildFlockAssignmentsRows();
 
   // Clear the form
@@ -17272,10 +17480,9 @@ function saveFlockGroupingSettings() {
 
   send({ type: 'saveSettings', routine: 'flock', settings: {
     flockGroups: flockGroups,
-    assignments: settings.flock?.assignments || {}
+    assignments: flockSettings.assignments || {}
   } });
-  if (!settings.flock) settings.flock = {};
-  settings.flock.flockGroups = flockGroups;
+  flockSettings.flockGroups = flockGroups;
 }
 
 // ── Cargo Mover settings ────────────────────────────────────────
@@ -17858,6 +18065,209 @@ async function loadShipLoadoutToCargoMover() {
   } else {
     alert(`Loaded "${name}" but no items were added.`);
   }
+}
+
+// ── Fuel Transport Settings ──────────────────────────────────
+let ftFactionItems = [];
+
+function renderFuelTransportSettings(panel) {
+  const ft = settings.fuel_transport || {};
+  const stations = ft.stations || [];
+  const items = ft.items || [];
+  const refuelThreshold = ft.refuelThreshold ?? 35;
+  const repairThreshold = ft.repairThreshold ?? 40;
+
+  const general = settings.general || {};
+  const generalSystem = general.factionStorageSystem || '';
+  const generalStation = general.factionStorageStation || '';
+  let generalLabel = 'not set';
+  if (generalSystem && generalStation && mapData[generalSystem]) {
+    const gPoi = (mapData[generalSystem].pois || []).find(p => p.id === generalStation);
+    if (gPoi) generalLabel = (gPoi.base_name || gPoi.name || generalStation) + ' (' + (mapData[generalSystem].name || generalSystem) + ')';
+  }
+
+  let stationOpts = '<option value="">(not set)</option>';
+  for (const [sysId, sys] of Object.entries(mapData)) {
+    const sysName = sys.name || sysId;
+    for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
+      if (!(poi.has_base || poi.base_id)) continue;
+      const val = sysId + '|' + poi.id;
+      const label = poi.base_name || poi.name || poi.id;
+      stationOpts += `<option value="${esc(val)}">${esc(label)} (${esc(sysName)})</option>`;
+    }
+  }
+
+  let botOpts = '<option value="">(select bot at home)</option>';
+  for (const bot of [...bots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
+    botOpts += `<option value="${esc(bot.username)}">${esc(bot.username)}</option>`;
+  }
+
+  const stationsList = stations.length > 0
+    ? stations.map((s, idx) => {
+        const parts = s.includes('|') ? s.split('|') : [generalSystem, s];
+        const sysId = parts[0];
+        const poiId = parts[1];
+        const sysData = mapData[sysId];
+        const poiName = sysData ? ((sysData.pois || []).find(p => p.id === poiId)?.base_name || (sysData.pois || []).find(p => p.id === poiId)?.name || poiId) : poiId;
+        return `<div class="blacklist-item">
+          <span class="blacklist-name">${esc(sysData?.name || sysId)} / ${esc(poiName)} <span class="blacklist-id">(${esc(s)})</span></span>
+          <button class="sm danger" onclick="removeFuelTransportStation(${idx})">Remove</button>
+        </div>`;
+      }).join('')
+    : '<div class="blacklist-empty">No remote stations added. Add stations below using the dropdown.</div>';
+
+  const itemsList = items.length > 0
+    ? items.map((item, idx) => `
+        <div class="craft-limit-row">
+          <div class="craft-limit-info">
+            <div class="craft-limit-name">${esc(item.itemName || item.itemId)}</div>
+            <div class="craft-limit-detail">Target qty at each station: <b>${item.targetQuantity.toLocaleString()}</b></div>
+          </div>
+          <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeFuelTransportItem(${idx})">✕</button>
+        </div>
+      `).join('')
+    : '<div style="color:var(--dim);padding:8px">No items configured. Add items below or load from home faction storage.</div>';
+
+  const factionItemOpts = ftFactionItems.length > 0
+    ? ftFactionItems.filter(i => !items.some(ci => ci.itemId === i.itemId))
+        .sort((a, b) => (a.name || a.itemId).localeCompare(b.name || b.itemId))
+        .map(i => `<option value="${esc(i.itemId)}">${esc(i.name)} (${i.quantity.toLocaleString()} avail)</option>`).join('')
+    : '<option value="">Load faction storage first</option>';
+
+  panel.innerHTML = `
+    <h3>Fuel Transport Settings</h3>
+    <div class="settings-desc">Transfer items from home faction storage to remote stations to build and maintain fuel bunkers. Home base uses General > Faction Storage Station.</div>
+
+    <div style="padding:8px;border:1px solid var(--border);border-radius:4px;background:var(--card-bg);margin-bottom:12px">
+      <b>Home Base:</b> ${esc(generalLabel)}
+    </div>
+
+    <div style="margin-top:12px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🏁 Remote Stations</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">Bots will stock these stations with configured items.</div>
+      ${stationsList}
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+        <select id="ft-add-station" style="flex:1;min-width:0">${stationOpts}</select>
+        <button class="primary sm" onclick="addFuelTransportStation()">+ Add Station</button>
+      </div>
+    </div>
+
+    <div style="margin-top:16px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">📦 Items to Transport</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">Each item will be stocked up to the target quantity at every remote station.</div>
+      ${itemsList}
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <select id="ft-home-bot-select" style="flex:1;min-width:100px">${botOpts}</select>
+        <button class="sm" onclick="loadFuelTransportFactionStorage()">📥 Load Home Faction Storage</button>
+      </div>
+      <div style="font-size:10px;color:var(--dim);margin-top:4px">Select a bot docked at home, then load items from its faction storage.</div>
+      <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+        <select id="ft-item-select" style="flex:1;min-width:0">${factionItemOpts}</select>
+        <input type="number" id="ft-item-qty" min="1" value="5000" placeholder="Target qty" style="width:100px">
+        <button class="primary sm" onclick="addFuelTransportItem()">+ Add Item</button>
+      </div>
+    </div>
+
+    <div class="setting-row" style="margin-top:16px">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Refuel when fuel drops below this %.</div>
+      </div>
+      <input type="number" id="set-ft-refuelThreshold" min="10" max="80" value="${refuelThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold (%)</div>
+        <div class="setting-hint">Repair hull when HP drops below this %.</div>
+      </div>
+      <input type="number" id="set-ft-repairThreshold" min="10" max="80" value="${repairThreshold}">
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="sm" onclick="renderFuelTransportSettings(document.getElementById('settingsContent'))">Refresh</button>
+      <button class="primary" onclick="saveFuelTransportSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function addFuelTransportStation() {
+  const sel = document.getElementById('ft-add-station');
+  const val = sel?.value;
+  if (!val) return;
+  if (!settings.fuel_transport) settings.fuel_transport = {};
+  if (!settings.fuel_transport.stations) settings.fuel_transport.stations = [];
+  if (!settings.fuel_transport.stations.includes(val)) {
+    settings.fuel_transport.stations.push(val);
+  }
+  renderFuelTransportSettings(document.getElementById('settingsContent'));
+}
+
+function removeFuelTransportStation(idx) {
+  if (!settings.fuel_transport?.stations) return;
+  settings.fuel_transport.stations.splice(idx, 1);
+  renderFuelTransportSettings(document.getElementById('settingsContent'));
+}
+
+function addFuelTransportItem() {
+  const sel = document.getElementById('ft-item-select');
+  const qtyEl = document.getElementById('ft-item-qty');
+  const id = sel?.value;
+  const qty = parseInt(qtyEl?.value) || 5000;
+  if (!id) return;
+
+  const existingItem = ftFactionItems.find(i => i.itemId === id);
+  const itemName = existingItem?.name || id;
+
+  if (!settings.fuel_transport) settings.fuel_transport = {};
+  if (!settings.fuel_transport.items) settings.fuel_transport.items = [];
+  settings.fuel_transport.items.push({ itemId: id, itemName, targetQuantity: qty });
+  renderFuelTransportSettings(document.getElementById('settingsContent'));
+}
+
+function removeFuelTransportItem(idx) {
+  if (!settings.fuel_transport?.items) return;
+  settings.fuel_transport.items.splice(idx, 1);
+  renderFuelTransportSettings(document.getElementById('settingsContent'));
+}
+
+function loadFuelTransportFactionStorage() {
+  const botSel = document.getElementById('ft-home-bot-select');
+  const botName = botSel?.value;
+  if (!botName) {
+    alert('Please select a bot first');
+    return;
+  }
+  const bot = bots.find(b => b.username === botName);
+  if (!bot || !bot.docked) {
+    alert('Bot must be docked to query faction storage');
+    return;
+  }
+  sendExec(botName, 'view_faction_storage', undefined, (result) => {
+    if (result.ok && result.data) {
+      const d = result.data;
+      const items = Array.isArray(d.items) ? d.items : [];
+      ftFactionItems = items.map(i => ({
+        itemId: i.item_id || i.id || '',
+        name: i.name || i.item_id || '',
+        quantity: i.quantity || 0
+      })).filter(i => i.itemId && i.quantity > 0);
+      renderFuelTransportSettings(document.getElementById('settingsContent'));
+    } else {
+      alert('Failed to load faction storage: ' + (result.error || 'Unknown error'));
+    }
+  });
+}
+
+function saveFuelTransportSettings() {
+  const s = {
+    stations: settings.fuel_transport?.stations || [],
+    items: settings.fuel_transport?.items || [],
+    refuelThreshold: parseInt(document.getElementById('set-ft-refuelThreshold')?.value) || 35,
+    repairThreshold: parseInt(document.getElementById('set-ft-repairThreshold')?.value) || 40,
+  };
+  send({ type: 'saveSettings', routine: 'fuel_transport', settings: s });
+  settings.fuel_transport = s;
 }
 
 // ── Shipyard ────────────────────────────────────────────────
@@ -21131,3 +21541,5 @@ updateBandwidthDisplay(); // Initial update
 </script>
 </body>
 </html>
+
+

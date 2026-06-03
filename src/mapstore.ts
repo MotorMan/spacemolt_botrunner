@@ -33,6 +33,8 @@ export interface ResourceRecord {
   max_remaining: number;
   depletion_percent: number;
   last_scanned: string;
+  depleted?: boolean;
+  depleted_at?: string;
 }
 
 /** Depletion timeout in milliseconds - POIs can be re-checked after this long. */
@@ -1077,15 +1079,27 @@ class MapStore {
     return sys.pois.find((p) => p.has_base || !!p.base_id) ?? null;
   }
 
-  /** BFS to find the nearest known system that has a station (excluding pirate and blacklisted systems). Returns { systemId, poiId, poiName, hops } or null. */
-  findNearestStationSystem(fromSystemId: string, blacklist?: string[]): { systemId: string; poiId: string; poiName: string; hops: number } | null {
+  /** BFS to find the nearest known system that has a station (excluding pirate and blacklisted systems).
+   *  If approvedSet is provided, only stations whose poiId or "system|poiId" is in the set are considered.
+   *  Returns { systemId, poiId, poiName, hops } or null. */
+  findNearestStationSystem(fromSystemId: string, blacklist?: string[], approvedSet?: Set<string>): { systemId: string; poiId: string; poiName: string; hops: number } | null {
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
-    
+
+    const isApproved = (sysId: string, poiId: string): boolean => {
+      if (!approvedSet || approvedSet.size === 0) return true;
+      if (approvedSet.has(poiId)) return true;
+      if (approvedSet.has(`${sysId}|${poiId}`)) return true;
+      return false;
+    };
+
     // Check current system first (but skip if it's a pirate or blacklisted system)
     if (!this.isPirateSystem(fromSystemId) && !blacklistSet.has(fromSystemId.toLowerCase())) {
-      const localStation = this.findNearestStation(fromSystemId);
-      if (localStation) return { systemId: fromSystemId, poiId: localStation.id, poiName: localStation.name, hops: 0 };
+      const sys = this.data.systems[fromSystemId];
+      if (sys) {
+        const localStation = sys.pois.find((p) => (p.has_base || !!p.base_id) && isApproved(fromSystemId, p.id));
+        if (localStation) return { systemId: fromSystemId, poiId: localStation.id, poiName: localStation.name, hops: 0 };
+      }
     }
 
     const visited = new Set<string>([fromSystemId]);
@@ -1104,7 +1118,8 @@ class MapStore {
         if (blacklistSet.has(nextId.toLowerCase())) continue;
         visited.add(nextId);
 
-        const station = this.findNearestStation(nextId);
+        const nextSys = this.data.systems[nextId];
+        const station = nextSys?.pois.find((p) => (p.has_base || !!p.base_id) && isApproved(nextId, p.id));
         if (station) {
           return { systemId: nextId, poiId: station.id, poiName: station.name, hops: current.hops + 1 };
         }
@@ -1185,6 +1200,16 @@ findOreLocations(oreId: string): Array<{
       if (this.isPirateSystem(sysId)) continue;
       const hasStation = sys.pois.some((p) => p.has_base || !!p.base_id);
       for (const poi of sys.pois) {
+        // CRITICAL FIX: Only skip POIs where the SPECIFIC oreId being searched is exhausted.
+        // Previously this skipped any POI with ANY exhausted resource, so a POI containing
+        // iron_ore + copper_ore would be skipped when searching for iron_ore if copper was depleted.
+        const targetOre = poi.ores_found.find((o) => o.item_id === oreId);
+        const targetResource = poi.resources?.find((r) => r.resource_id === oreId);
+        const targetRemaining = targetResource?.remaining ?? 0;
+        const targetMaxRemaining = targetResource?.max_remaining ?? 0;
+        if (targetRemaining <= 0 && targetMaxRemaining > 0) continue;
+        if (targetOre?.depleted && !isDepletionExpired(targetOre.depleted_at)) continue;
+
         // Check both ores_found (mining history) AND resources (scan data)
         // Hidden POIs often only have data in resources (from get_poi scans)
         const ore = poi.ores_found.find((o) => o.item_id === oreId);
@@ -1289,10 +1314,11 @@ findOreLocations(oreId: string): Array<{
     const scored = locations
       .filter(loc => !blacklistSet.has(loc.systemId.toLowerCase()))
       .filter(loc => {
-        // Skip completely exhausted locations (0% available = empty)
-        if (loc.depletionPercent <= 0 && loc.remaining <= 0) return false;
-        // Skip nearly-depleted locations (<10% available) — not worth traveling to
-        if (loc.depletionPercent < 10) return false;
+        // Skip completely exhausted locations (0 remaining AND was scanned with maxRemaining > 0)
+        // Don't filter out unsurveyed locations (where maxRemaining is also 0)
+        if (loc.remaining <= 0 && loc.maxRemaining > 0) return false;
+        // Skip nearly-depleted locations (>90% depleted = <10% available)
+        if (loc.depletionPercent > 90) return false;
         return true;
       })
       .map(loc => {
@@ -1384,6 +1410,138 @@ findOreLocations(oreId: string): Array<{
     // Sort by score descending
     scored.sort((a, b) => b.score - a.score);
     return scored;
+  }
+
+  /** Return best scored, non-depleted location restricted to a single system, or [] if none. */
+  findBestMiningLocationInSystem(
+    oreId: string,
+    systemId: string,
+    fromSystem?: string,
+    blacklist?: string[],
+    shipSpeed?: number,
+    shipCargo?: number,
+    isMiningShip?: boolean,
+  ): Array<{
+    systemId: string;
+    systemName: string;
+    poiId: string;
+    poiName: string;
+    resourceId: string;
+    totalMined: number;
+    hasStation: boolean;
+    remaining: number;
+    maxRemaining: number;
+    depletionPercent: number;
+    minutesSinceScan: number;
+    jumpsAway: number;
+    isHidden: boolean;
+    richness: number;
+    score: number;
+  }> {
+    const allScored = this.findBestMiningLocation(oreId, fromSystem, blacklist, shipSpeed, shipCargo, isMiningShip);
+    return allScored.filter(loc => loc.systemId === systemId);
+  }
+
+  /** Simple selector for common ores: closest system first, then biggest remaining pool.
+   *  Skips POIs where the specific ore is fully exhausted or on depletion timer.
+   *  Used for strip-miner ores (iron, copper, carbon, lead, silicon, aluminum) which are plentiful. */
+  findClosestMiningLocations(
+    oreId: string,
+    fromSystem?: string,
+    blacklist?: string[],
+  ): Array<{
+    systemId: string;
+    systemName: string;
+    poiId: string;
+    poiName: string;
+    resourceId: string;
+    totalMined: number;
+    hasStation: boolean;
+    remaining: number;
+    maxRemaining: number;
+    depletionPercent: number;
+    minutesSinceScan: number;
+    jumpsAway: number;
+    isHidden: boolean;
+    richness: number;
+    score: number;
+  }> {
+    const locations = this.findOreLocations(oreId);
+    const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
+    const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+
+    const results: Array<{
+      systemId: string;
+      systemName: string;
+      poiId: string;
+      poiName: string;
+      resourceId: string;
+      totalMined: number;
+      hasStation: boolean;
+      remaining: number;
+      maxRemaining: number;
+      depletionPercent: number;
+      minutesSinceScan: number;
+      jumpsAway: number;
+      isHidden: boolean;
+      richness: number;
+      score: number;
+    }> = [];
+
+    for (const loc of locations) {
+      if (blacklistSet.has(loc.systemId.toLowerCase())) continue;
+      if (loc.remaining <= 0 && loc.maxRemaining > 0) continue;
+      const sys = this.data.systems[loc.systemId];
+      const poi = sys?.pois.find(p => p.id === loc.poiId);
+      const oreEntry = poi?.ores_found.find(o => o.item_id === oreId);
+      if (oreEntry?.depleted && !isDepletionExpired(oreEntry.depleted_at)) continue;
+
+      let jumpsAway = 0;
+      if (fromSystem && fromSystem !== loc.systemId) {
+        const route = this.findRoute(fromSystem, loc.systemId, blacklistArr);
+        jumpsAway = route ? route.length - 1 : 999;
+      }
+
+      results.push({
+        ...loc,
+        resourceId: oreId,
+        jumpsAway,
+        score: 0,
+      });
+    }
+
+    results.sort((a, b) => {
+      if (a.jumpsAway !== b.jumpsAway) return a.jumpsAway - b.jumpsAway;
+      return b.remaining - a.remaining;
+    });
+    return results;
+  }
+
+  /** Like findClosestMiningLocations but restricted to a single system. */
+  findClosestMiningLocationsInSystem(
+    oreId: string,
+    systemId: string,
+    fromSystem?: string,
+    blacklist?: string[],
+  ): Array<{
+    systemId: string;
+    systemName: string;
+    poiId: string;
+    poiName: string;
+    resourceId: string;
+    totalMined: number;
+    hasStation: boolean;
+    remaining: number;
+    maxRemaining: number;
+    depletionPercent: number;
+    minutesSinceScan: number;
+    jumpsAway: number;
+    isHidden: boolean;
+    richness: number;
+    score: number;
+  }> {
+    const all = this.findClosestMiningLocations(oreId, fromSystem, blacklist);
+    return all.filter(loc => loc.systemId === systemId);
   }
 
   /** BFS pathfinding between two systems using known connections. Returns system IDs in order, or null if no path. */

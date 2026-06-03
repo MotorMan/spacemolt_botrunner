@@ -19,7 +19,7 @@ export interface ApiResponse {
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
-const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-5-27-26-Statico-Rocks-Version";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-6-2-26-Cow-Version";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;
@@ -297,7 +297,7 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
 };
 
 // Commands that use payload.action for the action (like facility and battle)
-const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage']);
+const COMMANDS_WITH_PAYLOAD_ACTION = new Set(['facility', 'battle', 'storage', 'fleet']);
 
 // ── Response cache ────────────────────────────────────────────
 
@@ -772,13 +772,16 @@ export class SpaceMoltAPI {
     if (tool === 'spacemolt_catalog') {
       url = `${this.baseUrl}/${tool}`;
     } else if (COMMANDS_WITH_PAYLOAD_ACTION.has(command) && payload?.action) {
-      // Commands like facility and battle that use payload.action
       const action = payload.action as string;
       url = `${this.baseUrl}/${tool}/${action}`;
     } else {
-      // For most commands, use the command name (or mapped action) as the action
       const action = COMMAND_ACTION_MAP[command] || command;
       url = `${this.baseUrl}/${tool}/${action}`;
+    }
+
+    const outgoingBody = body ? JSON.stringify(body) : undefined;
+    if (command === 'reload') {
+      console.log('[RELOAD-DEBUG] tool=' + tool + ' url=' + url);
     }
 
     const headers: Record<string, string> = {

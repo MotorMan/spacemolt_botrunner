@@ -32,18 +32,27 @@ import {
   handleBattleNotifications,
   fleeFromBattle,
   parseWrecks,
+  fleetStatus,
+  fleetCreate,
+  fleetInvite,
+  fleetLeave,
+  fleetDecline,
+  getFleetMemberByUsername,
+  isFleetLeader,
+  type FleetStatusResponse,
 } from "./common.js";
 import { getSystemBlacklist } from "../web/server.js";
 import {
+  readFlockSettings,
   readFlockState,
   registerFlockMember,
   announceFlockTarget,
-  updateFlockPhase,
   claimFlockWreck,
   reportFlockWrecks,
   getAvailableFlockWrecks,
   setFlockTimeout,
   isFlockTimeoutExpired,
+  broadcastFlockHeartbeat,
   type FlockState,
   type FlockGroupConfig,
 } from "./flock.js";
@@ -96,11 +105,9 @@ function cleanupTemporaryBlacklist(): void {
   }
 }
 
-// ── Settings ─────────────────────────────────────────────────
-
 type DepositMode = "storage" | "faction" | "sell";
 
-function getSalvagerSettings(username?: string): {
+async function getSalvagerSettings(username?: string): Promise<{
   depositMode: DepositMode;
   cargoThreshold: number;
   refuelThreshold: number;
@@ -119,21 +126,26 @@ function getSalvagerSettings(username?: string): {
   depositAtSalvageYard: boolean;
   minimumFuelCells: number;
   ignoreBlacklist: boolean;
+  escortName: string;
 
   // Flock salvaging settings
   flockEnabled: boolean;
   flockName: string;
   flockRole: "leader" | "follower";
   allowIndependentTowing: boolean;
-} {
+}> {
+  console.log(`[escort] ===== getSalvagerSettings v2 CALLED for ${username} =====`);
   const all = readSettings();
   const m = all.salvager || {};
+  const flockCfg = await readFlockSettings();
   let botOverrides = username ? (all[username] || {}) : {};
 
-  // Include flock assignments
-  if (username && all.flock?.flockAssignments && typeof all.flock.flockAssignments === 'object' && (all.flock.flockAssignments as any)[username]) {
-    botOverrides = { ...botOverrides, ...(all.flock.flockAssignments as any)[username] };
+  if (username && flockCfg.assignments[username]) {
+    botOverrides = { ...botOverrides, ...flockCfg.assignments[username] };
   }
+  
+  console.log(`[escort] getSalvagerSettings: botOverrides =`, JSON.stringify(botOverrides));
+  console.log(`[escort] getSalvagerSettings: flockCfg =`, JSON.stringify(flockCfg));
 
   function parseDepositMode(val: unknown): DepositMode | null {
     if (val === "faction" || val === "sell" || val === "storage") return val;
@@ -145,6 +157,102 @@ function getSalvagerSettings(username?: string): {
     if (typeof val === "string") return val.split(",").map(s => s.trim()).filter(s => s.length > 0);
     return [];
   }
+
+// Flock salvaging settings - read from flockGroups
+  // Parse flock groups from flock settings
+  console.log(`[escort] Parsing flock groups: flockCfg =`, JSON.stringify(flockCfg));
+  const rawFlockGroups = flockCfg.flockGroups || [];
+  console.log(`[escort] Raw flock groups:`, JSON.stringify(rawFlockGroups));
+  const flockGroups: FlockGroupConfig[] = rawFlockGroups.map((g: Record<string, unknown>) => ({
+    name: (g.name as string) || "unnamed_flock",
+    targetOre: (g.targetOre as string) || (g.target_ore as string) || "",
+    targetGas: (g.targetGas as string) || (g.target_gas as string) || "",
+    targetIce: (g.targetIce as string) || (g.target_ice as string) || "",
+    miningType: (g.miningType as string) === "salvage" ? "salvage" : "auto",
+    rallySystem: (g.rallySystem as string) ?? (g.rally_system as string) ?? undefined,
+    systemOre: (g.systemOre as string) ?? (g.system_ore as string) ?? undefined,
+    systemGas: (g.systemGas as string) ?? (g.system_gas as string) ?? undefined,
+    systemIce: (g.systemIce as string) ?? (g.system_ice as string) ?? undefined,
+    systemSalvage: (g.systemSalvage as string) ?? (g.system_salvage as string) ?? undefined,
+    maxMembers: (g.maxMembers as number) ?? (g.max_members as number) ?? undefined,
+    leader: g.leader as string | undefined,
+    minerName: g.minerName as string | undefined,
+    salvagerName: g.salvagerName as string | undefined,
+    escortName: g.escortName as string | undefined,
+    follower: g.follower as string | undefined,
+    escort: g.escort as string | undefined,
+  }));
+  
+  // Find the flock group this bot is assigned to
+  let assignedFlockGroup: FlockGroupConfig | undefined;
+  console.log(`[escort] Looking for assigned flock group for ${username}`);
+  for (const group of flockGroups) {
+    console.log(`[escort] Checking group ${group.name}: leader=${group.leader}, minerName=${group.minerName}, salvagerName=${group.salvagerName}`);
+    // Check if this bot is the leader or follower in this group
+    if (group.leader === username || group.minerName === username || group.salvagerName === username) {
+      assignedFlockGroup = group;
+      break;
+    }
+  }
+  
+// Determine flock settings - use botOverrides (from flockAssignments) OR flock group assignment
+  console.log(`[escort] Determining flock settings: assignedFlockGroup=`, JSON.stringify(assignedFlockGroup));
+  console.log(`[escort] Determining flock settings: botOverrides.flockEnabled=`, botOverrides.flockEnabled);
+  const effectiveFlockEnabled = (botOverrides.flockEnabled as boolean) === true || (assignedFlockGroup !== undefined);
+  const effectiveFlockName = (botOverrides.flockName as string) || assignedFlockGroup?.name || "";
+  // Read role from botOverrides if set, otherwise default based on flock group assignment
+  const effectiveFlockRole = (botOverrides.flockRole as string) || (assignedFlockGroup ? (assignedFlockGroup.salvagerName === username ? "leader" : "follower") : "leader") as "leader" | "follower";
+  console.log(`[escort] Effective flock settings: enabled=${effectiveFlockEnabled}, name=${effectiveFlockName}, role=${effectiveFlockRole}`);
+  
+  // Auto-detect escort from flock group if not explicitly set
+  // The salvager is the leader, the escort is the follower in the same flock
+  // Find a bot assigned to the same flock with flockRole="follower"
+  let autoEscortName = "";
+  console.log(`[escort] Auto-detect: checking for escort for user ${username}`);
+  console.log(`[escort] Auto-detect: flockCfg.assignments=${Object.keys(flockCfg.assignments).length > 0 ? 'present' : 'missing'}`);
+  console.log(`[escort] Auto-detect: flockCfg.flockGroups=${flockCfg.flockGroups.length > 0 ? 'present' : 'missing'}`);
+  
+  // First try to get escort from flock group config
+  if (!autoEscortName && assignedFlockGroup) {
+    if (typeof assignedFlockGroup.escortName === "string" && assignedFlockGroup.escortName.length > 0) {
+      autoEscortName = assignedFlockGroup.escortName as string;
+      console.log(`[escort] Auto-detect: found escort ${autoEscortName} in flockGroups.escortName`);
+    } else if (typeof assignedFlockGroup.follower === "string") {
+      autoEscortName = assignedFlockGroup.follower as string;
+      console.log(`[escort] Auto-detect: found escort ${autoEscortName} in flockGroups.follower`);
+    } else if (typeof assignedFlockGroup.escort === "string") {
+      autoEscortName = assignedFlockGroup.escort as string;
+      console.log(`[escort] Auto-detect: found escort ${autoEscortName} in flockGroups.escort`);
+    }
+  }
+  
+  console.log(`[escort] Auto-detect: after flockGroups check, autoEscortName=${autoEscortName || 'not found'}`);
+  
+  // Then try from flockAssignments
+  if (!autoEscortName && username && flockCfg.assignments) {
+    const assignments = flockCfg.assignments;
+    const myFlockAssignment = assignments[username];
+    const myFlockName = myFlockAssignment?.flockName;
+    
+    console.log(`[escort] Auto-detect: ${username} - flockName=${myFlockName || 'none'}`);
+    console.log(`[escort] Auto-detect: all assignments:`, JSON.stringify(assignments, null, 2));
+    
+    if (myFlockName) {
+      // Find any other bot in the same flock with role "follower" - that's the escort
+      for (const [otherBot, otherAssignment] of Object.entries(assignments)) {
+        if (otherBot === username) continue;
+        const oa = otherAssignment as Record<string, unknown>;
+        if (oa.flockName === myFlockName && oa.flockRole === "follower") {
+          autoEscortName = otherBot;
+          console.log(`[escort] Auto-detect: found escort ${otherBot} in same flock "${myFlockName}"`);
+          break;
+        }
+      }
+    }
+  }
+  
+  console.log(`[escort] Final autoEscortName: ${autoEscortName || 'not found'}`);
+
 
   return {
     depositMode:
@@ -168,10 +276,13 @@ function getSalvagerSettings(username?: string): {
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
     ignoreBlacklist: (botOverrides.ignoreBlacklist as boolean) ?? (m.ignoreBlacklist as boolean) ?? false,
 
-    // Flock salvaging settings
-    flockEnabled: (botOverrides.flockEnabled as boolean) ?? false,
-    flockName: (botOverrides.flockName as string) || "",
-    flockRole: ((botOverrides.flockRole as string) === "leader" ? "leader" : "follower") as "leader" | "follower",
+    // Escort coordination - use auto-detected escort as fallback
+    escortName: (botOverrides.escortName as string) || autoEscortName || "",
+
+    // Flock salvaging settings - use effective values from flock group
+    flockEnabled: effectiveFlockEnabled,
+    flockName: effectiveFlockName,
+    flockRole: effectiveFlockRole as "leader" | "follower",
     allowIndependentTowing: (m.allowIndependentTowing as boolean) ?? false,
   };
 }
@@ -337,11 +448,9 @@ async function flockSalvageWrecks(
   return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
 }
 
-// ── Bot chat handler for escort queries ───────────────────────
+// ── Escort signaling ───────────────────────────────────────────
 
-// ── Escort signaling ──────────────────────────────────────────
-
-async function signalEscort(
+function sendEscortSignal(
   ctx: RoutineContext,
   action: "jump" | "travel" | "dock" | "undock",
   systemId?: string,
@@ -351,20 +460,23 @@ async function signalEscort(
   const message = `[ESCORT] ${action}${systemId ? ` ${systemId}` : ""}`;
 
   if (channel === "faction") {
-    await bot.exec("chat", { channel: "faction", content: message });
+    return bot.exec("chat", { channel: "faction", content: message }).then(() => {});
   } else if (channel === "local") {
     ctx.log("escort", `Signal: ${message}`);
+    return Promise.resolve();
   } else if (channel === "chat") {
-    // Use non-API chat channel for instant coordination
     ctx.sendBotChat?.(message, "escort");
+    return Promise.resolve();
   } else {
-    // File-based signaling for cross-bot coordination on same machine
-    const { writeFileSync, existsSync, mkdirSync } = await import("fs");
-    const { join } = await import("path");
-    const escortDir = join(process.cwd(), "data", "escort_signals");
-    if (!existsSync(escortDir)) mkdirSync(escortDir, { recursive: true });
-    const signalFile = join(escortDir, `${bot.username}.signal`);
-    writeFileSync(signalFile, JSON.stringify({ action, systemId, timestamp: Date.now() }));
+    return new Promise((resolve) => {
+      const { writeFileSync, existsSync, mkdirSync } = require("fs");
+      const { join } = require("path");
+      const escortDir = join(process.cwd(), "data", "escort_signals");
+      if (!existsSync(escortDir)) mkdirSync(escortDir, { recursive: true });
+      const signalFile = join(escortDir, `${bot.username}.signal`);
+      writeFileSync(signalFile, JSON.stringify({ action, systemId, timestamp: Date.now() }));
+      resolve();
+    });
   }
 }
 
@@ -438,6 +550,9 @@ function buildRoamList(currentSystem: string, maxRoamJumps: number, roamBaseSyst
 export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
+  // DEBUG: Log before anything else
+  ctx.log("escort", `[DEBUG] salvagerRoutine starting for bot ${bot.username}`);
+
   // Persistent battle state across cycles
   const battleRef = { state: null as BattleState | null };
   battleRef.state = {
@@ -449,25 +564,314 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     lastFleeTime: undefined,
   };
 
+  // Persistent flag for fleet invite handling (chat handler is sync)
+  let pendingFleetInvite: { sender: string; escortBot: string } | null = null;
+
+  // Track escort fuel level reported via bot chat (ESCORT_FUEL messages)
+  let escortReportedFuelPct: number | null = null;
+  let escortFuelQuerySent: number = 0; // timestamp of last fuel query to avoid spamming
+
+  ctx.log("escort", `[DEBUG] About to call getSalvagerSettings for ${bot.username}`);
+  
   await bot.refreshStatus();
   const startSystem = bot.system;
-  const settings0 = getSalvagerSettings(bot.username);
+  const settings0 = await getSalvagerSettings(bot.username);
   const homeSystem0 = settings0.homeSystem || startSystem;
+
+  console.log(`[escort] DEBUG: getSalvagerSettings returned escortName=${settings0.escortName}, flockEnabled=${settings0.flockEnabled}`);
+
+  // Check initial fleet status at startup
+  const initialFleetStatus = await fleetStatus(ctx);
+  ctx.log("escort", `Salvager ${bot.username} starting - Initial fleet status: in_fleet=${initialFleetStatus?.in_fleet}, is_leader=${initialFleetStatus?.is_leader}, leader=${initialFleetStatus?.leader || 'none'}`);
+  ctx.log("escort", `Auto-detected escortName: ${settings0.escortName || 'not set'}`);
+  ctx.log("escort", `Flock settings: flockEnabled=${settings0.flockEnabled}, flockName=${settings0.flockName || 'none'}, flockRole=${settings0.flockRole}`);
 
   // Register chat handler for escort queries
   const chatChannel = getBotChatChannel();
   const chatHandler = (message: BotChatMessage) => {
-    if (message.channel === "escort" && message.recipients.includes(bot.username) && message.content === "QUERY_LOCATION") {
-      chatChannel.send({ sender: bot.username, recipients: [message.sender], channel: "escort", content: `LOCATION: ${bot.system}` });
-      ctx.log("escort", `Responded to location query: ${bot.system}`);
+    ctx.log("escort", `chatHandler: received message from ${message.sender} in ${message.channel} to [${message.recipients.join(", ")}]: "${message.content}"`);
+    if (message.channel === "escort") {
+      if (message.recipients.includes(bot.username) && message.content === "LOCATION_QUERY") {
+        chatChannel.send({ sender: bot.username, recipients: [message.sender], channel: "escort", content: `LOCATION: ${bot.system}` });
+        ctx.log("escort", `Responded to location query: ${bot.system}`);
+      }
+      // Track escort fuel reports
+      if (message.content.startsWith("ESCORT_FUEL ")) {
+        const fuelPct = parseInt(message.content.substring(12).trim(), 10);
+        if (!isNaN(fuelPct)) {
+          escortReportedFuelPct = fuelPct;
+          ctx.log("escort", `Escort ${message.sender} reported fuel: ${fuelPct}%`);
+        }
+      }
+      if (message.content.startsWith("FLEET_INVITE ")) {
+        const escortBot = message.content.substring(12).trim();
+        // If the message is broadcast (empty recipients), the sender IS the escort
+        // If the message is direct, the escortBot field contains the escort's username
+        const actualEscortBot = message.recipients.length === 0 ? message.sender : escortBot;
+        pendingFleetInvite = { sender: message.sender, escortBot: actualEscortBot };
+        ctx.log("escort", `Received fleet invite request from ${message.sender} for escort: ${actualEscortBot}`);
+      }
     }
   };
   chatChannel.onMessage(bot.username, chatHandler);
+  ctx.log("escort", `Chat handler registered for ${bot.username}`);
+
+  const FLEET_INVITE_TIMEOUT = 60000;
+  const FLEET_INVITE_RETRY_DELAY = 10000;
+  const WAIT_FOR_INVITE_TIMEOUT = 120000;
+
+  async function waitForEscortAcceptance(escortBot: string, timeoutMs: number): Promise<boolean> {
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeoutMs) {
+      if (bot.state !== "running") return false;
+      const status = await fleetStatus(ctx);
+      const escortMember = getFleetMemberByUsername(status, escortBot);
+      if (escortMember) {
+        ctx.log("escort", `Escort ${escortBot} has joined the fleet`);
+        return true;
+      }
+      await ctx.sleep(1000);
+    }
+    return false;
+  }
+
+  async function waitForFleetInviteFromEscort(timeoutMs: number): Promise<{ sender: string; escortBot: string } | null> {
+    const startTime = Date.now();
+    ctx.log("escort", `Waiting for escort to send FLEET_INVITE message (timeout: ${timeoutMs}ms)...`);
+    while (Date.now() - startTime < timeoutMs) {
+      if (bot.state !== "running") return null;
+      if (pendingFleetInvite) {
+        ctx.log("escort", `Received FLEET_INVITE from ${pendingFleetInvite.sender} for escort: ${pendingFleetInvite.escortBot}`);
+        return pendingFleetInvite;
+      }
+      await ctx.sleep(1000);
+    }
+    ctx.log("escort", `Timeout waiting for FLEET_INVITE message`);
+    return null;
+  }
+
+  const ESCORT_FUEL_QUERY_TIMEOUT = 15000;
+
+  async function queryEscortFuel(escortName: string, timeoutMs: number = ESCORT_FUEL_QUERY_TIMEOUT): Promise<number | null> {
+    const chatChannel = getBotChatChannel();
+    escortReportedFuelPct = null;
+    chatChannel.send({ sender: bot.username, recipients: [escortName], channel: "escort", content: "ESCORT_FUEL_QUERY" });
+    ctx.log("escort", `Sent fuel query to ${escortName}`);
+    escortFuelQuerySent = Date.now();
+
+    const startTime = Date.now();
+    while (Date.now() - startTime < timeoutMs) {
+      if (bot.state !== "running") return null;
+      if (escortReportedFuelPct !== null) {
+        ctx.log("escort", `Received fuel report from ${escortName}: ${escortReportedFuelPct}%`);
+        return escortReportedFuelPct;
+      }
+      await ctx.sleep(500);
+    }
+    ctx.log("escort", `No fuel response from ${escortName} within timeout`);
+    return null;
+  }
+
+  async function processEscortFleetInvite(requiredEscortName?: string): Promise<boolean> {
+    ctx.log("escort", `processEscortFleetInvite called, pendingFleetInvite=${pendingFleetInvite ? JSON.stringify(pendingFleetInvite) : 'null'}, requiredEscortName=${requiredEscortName || 'not set'}`);
+    
+    // If no escort is required and we haven't received an invite, wait for one
+    if (!requiredEscortName) {
+      // Check if we're already in a fleet (no escort needed)
+      const existingStatus = await fleetStatus(ctx);
+      if (existingStatus?.in_fleet) {
+        ctx.log("escort", `Already in a fleet - no escort coordination needed`);
+        return true;
+      }
+      return true; // No escort required
+    }
+    
+    // First check if we're already in a fleet with the escort as a member
+    const existingStatus = await fleetStatus(ctx);
+    if (existingStatus?.in_fleet && getFleetMemberByUsername(existingStatus, requiredEscortName)) {
+      ctx.log("escort", `Already in fleet with required escort ${requiredEscortName} - fleet is ready`);
+      return true;
+    }
+    
+    // Determine who to invite
+    let escortBot = pendingFleetInvite?.escortBot || requiredEscortName;
+    
+    // Ensure we're in a fleet before trying to invite - this is the critical fix
+    // We need to create the fleet FIRST, then invite the escort
+    const currentStatus = await fleetStatus(ctx);
+    if (!currentStatus?.in_fleet) {
+      ctx.log("escort", `Creating fleet for escort ${escortBot}...`);
+      const createResult = await fleetCreate(ctx);
+      ctx.log("escort", `fleetCreate result: success=${createResult.success}, fleetId=${createResult.fleetId}, message=${createResult.message}`);
+      if (!createResult.success) {
+        ctx.log("error", `Failed to create fleet: ${createResult.message}`);
+        return false;
+      }
+      ctx.log("escort", `Created fleet: ${createResult.fleetId}`);
+    }
+    
+    // Check if escort is already in fleet
+    const checkStatus = await fleetStatus(ctx);
+    const escortMember = getFleetMemberByUsername(checkStatus, escortBot);
+    if (escortMember) {
+      ctx.log("escort", `Escort ${escortBot} already in fleet`);
+      pendingFleetInvite = null;
+      return true;
+    }
+    
+    // Invite loop - retries until escort joins or bot is stopped
+    while (true) {
+      if (bot.state !== "running") {
+        ctx.log("escort", `Stop requested — abandoning invite loop for ${escortBot}`);
+        return false;
+      }
+
+      // Re-check if escort already joined (e.g. accepted invite via fleetAccept)
+      const preCheck = await fleetStatus(ctx);
+      if (getFleetMemberByUsername(preCheck, escortBot)) {
+        ctx.log("escort", `Escort ${escortBot} is already in fleet`);
+        pendingFleetInvite = null;
+        return true;
+      }
+
+      ctx.log("escort", `Inviting ${escortBot} to fleet...`);
+      const inviteResult = await fleetInvite(ctx, escortBot!);
+      ctx.log("escort", `fleetInvite result: success=${inviteResult.success}, message=${inviteResult.message}`);
+      
+      if (inviteResult.success) {
+        ctx.log("escort", `Waiting up to ${FLEET_INVITE_TIMEOUT / 1000}s for ${escortBot} to accept...`);
+        const accepted = await waitForEscortAcceptance(escortBot!, FLEET_INVITE_TIMEOUT);
+        if (accepted) {
+          pendingFleetInvite = null;
+          return true;
+        }
+        ctx.log("escort", `Escort did not join within timeout - retrying invite...`);
+      } else if (inviteResult.message?.includes("already_invited") || inviteResult.message?.includes("target_in_fleet")) {
+        ctx.log("escort", `Escort ${escortBot} already invited or in a fleet - checking if they've joined this fleet...`);
+        const accepted = await waitForEscortAcceptance(escortBot!, FLEET_INVITE_TIMEOUT);
+        if (accepted) {
+          pendingFleetInvite = null;
+          return true;
+        }
+        ctx.log("escort", `Escort still not in fleet - will retry invite...`);
+      }
+      
+      ctx.log("escort", `Waiting ${FLEET_INVITE_RETRY_DELAY / 1000}s before retry...`);
+      await ctx.sleep(FLEET_INVITE_RETRY_DELAY);
+    }
+  }
+
+  // ── Escort fuel management ───────────────────────────────────────
+  // Before each navigation jump, check if escort has enough fuel.
+  // If escort is low, dock at a station here so escort can refuel too.
+  async function checkEscortFuelAndRefuel(escortName: string, fuelThresholdPct: number): Promise<boolean> {
+    if (!escortName) return true;
+
+    // Only query if we don't have a recent fuel reading (>60s old)
+    const fuelStale = escortFuelQuerySent === 0 || (Date.now() - escortFuelQuerySent) > 60000;
+    if (fuelStale) {
+      await queryEscortFuel(escortName);
+    }
+
+    if (escortReportedFuelPct !== null && escortReportedFuelPct < fuelThresholdPct) {
+      ctx.log("escort", `Escort fuel low (${escortReportedFuelPct}%) — docking at station for escort refuel...`);
+
+      // Dock at current station so escort can also dock and refuel
+      const docked = await ensureDocked(ctx);
+      if (docked) {
+        // Tell escort to dock and refuel
+        const chatChannel = getBotChatChannel();
+        chatChannel.send({ sender: bot.username, recipients: [escortName], channel: "escort", content: "ESCORT_DOCK_WAIT" });
+
+        // Refuel ourselves too (ensureFueled finds a station with fuel)
+        await ensureFueled(ctx, fuelThresholdPct);
+
+        // Wait a bit for escort to use cargo fuel cells / dock / refuel
+        ctx.log("escort", `Waiting 20s for escort to refuel...`);
+        await ctx.sleep(20000);
+
+        // Query escort fuel again to confirm they refueled
+        escortReportedFuelPct = null;
+        const newFuel = await queryEscortFuel(escortName);
+        if (newFuel !== null && newFuel < fuelThresholdPct) {
+          ctx.log("error", `Escort fuel still low after refuel stop: ${newFuel}% — continuing anyway`);
+        } else if (newFuel !== null) {
+          ctx.log("escort", `Escort refueled successfully: ${newFuel}%`);
+        }
+
+        await ensureUndocked(ctx);
+      } else {
+        ctx.log("error", "Could not dock for escort fuel stop — continuing anyway");
+      }
+    }
+
+    return true;
+  }
+
+  async function ensureEscortFleetReady(escortName: string): Promise<boolean> {
+    ctx.log("escort", `ensureEscortFleetReady: waiting for escort ${escortName} to initiate fleet coordination...`);
+    
+    // Wait for the escort to send FLEET_INVITE message
+    const inviteInfo = await waitForFleetInviteFromEscort(WAIT_FOR_INVITE_TIMEOUT);
+    if (!inviteInfo) {
+      ctx.log("escort", `Escort did not send FLEET_INVITE within timeout - proceeding with auto-detected escort: ${escortName}`);
+    }
+    
+    return await processEscortFleetInvite(escortName);
+  }
+
+  async function createFleetAndInviteEscort(escortName: string): Promise<boolean> {
+    // Create fleet if not in one
+    let currentStatus = await fleetStatus(ctx);
+    if (!currentStatus?.in_fleet) {
+      ctx.log("escort", `Creating fleet for escort ${escortName}...`);
+      const createResult = await fleetCreate(ctx);
+      if (!createResult.success) {
+        ctx.log("error", `Failed to create fleet: ${createResult.message}`);
+        return false;
+      }
+      ctx.log("escort", `Created fleet: ${createResult.fleetId}`);
+    }
+    
+    // Wait for escort to accept invite
+    return await processEscortFleetInvite(escortName);
+  }
 
   // Register lightweight salvage co-op handler (chat-based wreck claiming for independent salvagers)
   const salvageChatHandler = registerSalvageChatHandler(bot.username, (cat, msg) => ctx.log(cat as any, msg));
 
   // ── Startup: return home and dump non-fuel cargo to storage ──
+  // Process escort fleet invite BEFORE startup to ensure fleet is ready
+  // If escort is required, wait for them to join; otherwise proceed normally
+  console.log(`[escort] DEBUG: Final settings0.escortName=${settings0.escortName}, flockEnabled=${settings0.flockEnabled}, flockName=${settings0.flockName}`);
+  if (settings0.escortName) {
+    console.log(`[escort] DEBUG: Escort required, waiting for FLEET_INVITE...`);
+    ctx.log("escort", `Escort required: ${settings0.escortName}`);
+    ctx.log("escort", `Waiting for escort to send FLEET_INVITE message...`);
+    
+    // Wait for the escort to send FLEET_INVITE message
+    const inviteInfo = await waitForFleetInviteFromEscort(WAIT_FOR_INVITE_TIMEOUT);
+    if (inviteInfo) {
+      ctx.log("escort", `Received FLEET_INVITE from ${inviteInfo.sender} for escort: ${inviteInfo.escortBot}`);
+    }
+    
+    const fleetReady = await processEscortFleetInvite(settings0.escortName);
+    if (!fleetReady) {
+      ctx.log("error", `Escort coordination failed - required escort ${settings0.escortName} did not join fleet`);
+      ctx.log("system", `Waiting indefinitely at home system until escort joins...`);
+      let waitingForEscort = true;
+      while (waitingForEscort && bot.state === "running") {
+        await ctx.sleep(5000);
+        const rejoined = await processEscortFleetInvite(settings0.escortName);
+        if (rejoined) {
+          waitingForEscort = false;
+        }
+      }
+    }
+  } else {
+    console.log(`[escort] DEBUG: No escortName set - proceeding without escort coordination`);
+  }
+  
   await bot.refreshCargo();
   const nonFuelCargo = bot.inventory.filter(i => {
     const lower = i.itemId.toLowerCase();
@@ -598,7 +1002,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    const settings = getSalvagerSettings(bot.username);
+    const settings = await getSalvagerSettings(bot.username);
     const homeSystem = settings.homeSystem || startSystem;
     const cargoThresholdRatio = settings.cargoThreshold / 100;
     const safetyOpts = {
@@ -609,13 +1013,13 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     };
 
     // ── Flock salvaging integration ──
+    console.log(`[flock] Checking flock integration: settings.flockEnabled=${settings.flockEnabled}, flockName=${settings.flockName}, flockRole=${settings.flockRole}`);
     if (settings.flockEnabled && settings.flockName) {
-      // Find the flock group config for this bot
-      // Note: For now, we'll assume flock groups are defined in miner settings
-      // TODO: Add salvager-specific flock groups
-      const allSettings = readSettings();
-      const minerGroups = (allSettings.flock?.flockGroups as FlockGroupConfig[]) || [];
+      const flockCfg = await readFlockSettings();
+      const minerGroups = flockCfg.flockGroups || [];
+      console.log(`[flock] Available flock groups:`, JSON.stringify(minerGroups, null, 2));
       flockGroup = minerGroups.find(g => g.name === settings.flockName);
+      console.log(`[flock] Matched flock group:`, JSON.stringify(flockGroup, null, 2));
 
       if (settings.flockRole === "leader") {
         isFlockLeader = true;
@@ -667,11 +1071,33 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         flockTargetSystemId = flockState.targetSystemId;
         flockPhase = flockState.phase;
       }
-    } else {
-      // Not in flock mode
+    // Not in flock mode
       isFlockLeader = false;
       flockTargetSystemId = "";
       flockPhase = "gathering";
+    }
+    let flockState: FlockState | null = null;
+    let lastFlockHeartbeat = 0;
+
+    if (settings.flockEnabled && settings.flockName) {
+      flockState = await readFlockState(settings.flockName);
+      if (!flockState) {
+        ctx.log("flock", "Nothing here to hold on");
+      }
+    }
+
+    // ── Fleet coordination for escort ──
+    // The escort bot sends FLEET_INVITE messages - we respond by creating fleet and inviting them
+    // If escort is required and not in fleet, wait indefinitely before departure
+    if (settings.escortName) {
+      let escortReady = await processEscortFleetInvite(settings.escortName);
+      if (!escortReady) {
+        ctx.log("error", `Escort ${settings.escortName} not in fleet - waiting before departure`);
+        while (!escortReady && bot.state === "running") {
+          await ctx.sleep(5000);
+          escortReady = await processEscortFleetInvite(settings.escortName);
+        }
+      }
     }
 
     // ── Status + fuel/hull checks ──
@@ -711,8 +1137,13 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("escort", `Sent going to ${targetSystemId}`);
 
         ctx.log("escort", `Signaling escorts to travel to ${targetSystemId}...`);
-        await signalEscort(ctx, "travel", targetSystemId, "chat");
+        await sendEscortSignal(ctx, "travel", targetSystemId, "chat");
         await ctx.sleep(2000); // Brief pause to let escorts read the signal
+
+        // Check escort fuel before jumping
+        if (settings.escortName) {
+          await checkEscortFuelAndRefuel(settings.escortName, safetyOpts.fuelThresholdPct);
+        }
 
         yield "navigate_to_target";
         const travelOpts = {
@@ -861,10 +1292,16 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         // Flock coordination: Get wrecks and coordinate before salvaging
         let availableWrecks: Array<{ poiId: string; wreckId: string }> = [];
         if (settings.flockEnabled && settings.flockName && settings.enableFullSalvage) {
-          // Get wrecks at this POI for coordination
-          const wrecksResp = await bot.exec("get_wrecks");
-          const wrecks = parseWrecks(wrecksResp.result);
-          availableWrecks = wrecks.map((w: any) => ({ poiId: poi.id, wreckId: w.wreck_id }));
+      // Get wrecks at this POI for coordination
+      const wrecksResp = await bot.exec("get_wrecks");
+      const wrecks = parseWrecks(wrecksResp.result);
+      availableWrecks = wrecks.map((w: any) => ({ poiId: poi.id, wreckId: w.wreck_id }));
+
+      if (isFlockLeader && Date.now() - lastFlockHeartbeat > 30_000) {
+        await broadcastFlockHeartbeat(settings.flockName, bot.username);
+        lastFlockHeartbeat = Date.now();
+        ctx.log("flock", `Heartbeat: phase=${flockPhase}, wrecks at ${poi.name}=${wrecks.length}`);
+      }
 
           if (isFlockLeader) {
             // Leader reports found wrecks
@@ -971,12 +1408,18 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         const chatChannel = getBotChatChannel();
         chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Going to ${roamSystemId}` });
         ctx.log("escort", `Sent going to ${roamSystemId}`);
-        await signalEscort(ctx, "travel", roamSystemId, "chat");
+        await sendEscortSignal(ctx, "travel", roamSystemId, "chat");
         await ctx.sleep(1000); // Brief pause
 
         await ensureUndocked(ctx);
         const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
         if (!fueled) break;
+
+        // Check escort fuel before jumping to roam system
+        if (settings.escortName) {
+          await checkEscortFuelAndRefuel(settings.escortName, safetyOpts.fuelThresholdPct);
+        }
+
         const travelOpts = {
           ...safetyOpts,
           onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
@@ -1161,8 +1604,13 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         // Announce destination
         const chatChannel = getBotChatChannel();
         chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Going to ${targetSystem}` });
-        await signalEscort(ctx, "travel", targetSystem, "chat");
+        await sendEscortSignal(ctx, "travel", targetSystem, "chat");
         await ctx.sleep(1000);
+
+        // Check escort fuel before jumping to salvage yard
+        if (settings.escortName) {
+          await checkEscortFuelAndRefuel(settings.escortName, safetyOpts.fuelThresholdPct);
+        }
 
         yield "navigate_to_salvage_yard";
         ctx.log("travel", `Traveling to salvage yard system: ${targetSystem}...`);
@@ -1519,4 +1967,4 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
 
   // Unregister chat handler
   chatChannel.offMessage(bot.username, chatHandler);
-};
+}

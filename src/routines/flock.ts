@@ -1,6 +1,33 @@
 // flock.ts - Generic flock coordination system
 import type { RoutineContext } from "../bot.js";
 
+export interface FlockSettings {
+  flockGroups: FlockGroupConfig[];
+  assignments: Record<string, { flockEnabled: boolean; flockName: string; flockRole: string }>;
+}
+
+export async function readFlockSettings(): Promise<FlockSettings> {
+  const { readFileSync, existsSync } = await import("fs");
+  const { join } = await import("path");
+  const file = join(process.cwd(), "data", "flock.json");
+  if (existsSync(file)) {
+    try {
+      return JSON.parse(readFileSync(file, "utf-8")) as FlockSettings;
+    } catch {
+      // fall through
+    }
+  }
+  return { flockGroups: [], assignments: {} };
+}
+
+export async function writeFlockSettings(s: FlockSettings): Promise<void> {
+  const { writeFileSync, existsSync, mkdirSync } = await import("fs");
+  const { join } = await import("path");
+  const dir = join(process.cwd(), "data");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "flock.json"), JSON.stringify(s, null, 2) + "\n", "utf-8");
+}
+
 // ── Generic Flock State ─────────────────────────────────────────
 
 export interface FlockState {
@@ -58,7 +85,7 @@ export async function readFlockState(flockName: string): Promise<FlockState | nu
     const state = JSON.parse(raw) as FlockState;
 
     // Check if state is stale (older than 60 seconds)
-    if (Date.now() - state.lastUpdate > 60_000) {
+    if (Date.now() - state.lastUpdate > 120_000) {
       return null;
     }
 
@@ -323,4 +350,26 @@ export async function isFlockTimeoutExpired(flockName: string): Promise<boolean>
   if (!existingState || !existingState.timeoutEnd) return false;
 
   return Date.now() > existingState.timeoutEnd;
+}
+
+/**
+ * Leader broadcasts a heartbeat/status update to keep flock state fresh.
+ * Re-writes current state with an updated lastUpdate timestamp.
+ */
+export async function broadcastFlockHeartbeat(
+  flockName: string,
+  leader: string,
+  extra?: Partial<FlockState>,
+): Promise<void> {
+  const existingState = await readFlockState(flockName);
+
+  if (!existingState) {
+    return;
+  }
+
+  await writeFlockState(flockName, {
+    ...existingState,
+    leader,
+    ...extra,
+  });
 }

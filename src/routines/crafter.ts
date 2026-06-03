@@ -1,5 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { catalogStore } from "../catalogstore.js";
+import { updateFactionStorageCache } from "../factionStorageCache.js";
 import {
   ensureDocked,
   tryRefuel,
@@ -15,8 +16,9 @@ import {
 
 async function refreshFactionStorageDirectly(ctx: RoutineContext, bot: any): Promise<void> {
   const factionName = bot.faction;
+  const station = bot.poi;
   if (!factionName) {
-    // But let's still try to fetch faction storage to see if it works
+    return;
   }
 
   const resp = await bot.exec("view_storage", { target: "faction" });
@@ -26,25 +28,9 @@ async function refreshFactionStorageDirectly(ctx: RoutineContext, bot: any): Pro
     return;
   }
 
-  if (Array.isArray(resp.result)) {
-    // Process array directly
-  } else if (typeof resp.result === 'object') {
-    const r = resp.result as Record<string, unknown>;
-
-    // Check all possible array field names
-    const possibleArrays = ['items', 'cargo', 'storage', 'stored_items', 'faction_items', 'faction_storage', 'data', 'result'];
-    let foundArray = false;
-    for (const key of possibleArrays) {
-      if (Array.isArray(r[key])) {
-        foundArray = true;
-        break;
-      }
-    }
-  }
-
-  // Try to parse the items
   const items = parseFactionStorageItems(resp.result);
   bot.factionStorage = items;
+  updateFactionStorageCache(factionName, items, station);
 }
 
 function parseFactionStorageItems(result: unknown): Array<{itemId: string, name: string, quantity: number}> {
@@ -855,8 +841,7 @@ async function craftPrerequisites(
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
       // Don't deposit items we need as components for this prereq
       if (prereqRecipe.components.some(c => c.item_id === item.itemId)) continue;
-      // Use unified storage command: deposit from cargo to faction storage
-      const dResp = await bot.exec("faction_deposit_items", { faction_id: bot.faction, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+      const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
       if (dResp.error) {
         // Fallback: deposit to personal storage
         await bot.exec("deposit_items", { storage_unit_id: bot.poi, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
@@ -1018,7 +1003,7 @@ async function craftFromCategories(
       if (item.quantity <= 0) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-      const dResp = await bot.exec("faction_deposit_items", { faction_id: bot.faction, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+      const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
       if (dResp.error) {
         await bot.exec("deposit_items", { storage_unit_id: bot.poi, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
       }
@@ -1569,10 +1554,8 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         if (item.quantity <= 0) continue;
         const lower = item.itemId.toLowerCase();
         if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-        // In faction mode, try faction storage first; in personal mode, use personal storage directly
-      // In faction mode, try faction storage first; in personal mode, use personal storage directly
         if (!personalMode) {
-          const dResp = await bot.exec("faction_deposit_items", { faction_id: bot.faction, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+          const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
           if (dResp.error) {
             await bot.exec("deposit_items", { storage_unit_id: bot.poi, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
           }
@@ -1838,7 +1821,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
         
-        const dResp = await bot.exec("faction_deposit_items", { faction_id: bot.faction, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
+        const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
         if (!dResp.error) {
           depositedItems.push(`${item.quantity}x ${item.name} (crafted)`);
           logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (crafted)`);
@@ -1857,7 +1840,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
 
-        const transferResp = await bot.exec("faction_deposit_items", { faction_id: bot.faction, item_id: item.itemId, quantity: item.quantity, source: "storage" });
+        const transferResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "storage" });
         if (!transferResp.error) {
           depositedItems.push(`${item.quantity}x ${item.name} (from storage)`);
           logFactionActivity(ctx, "deposit", `Transferred ${item.quantity}x ${item.name} from personal storage to faction storage`);

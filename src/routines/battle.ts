@@ -286,7 +286,7 @@ export async function ensureAmmoLoaded(
     ctx.log("combat", `Found ${ammoItem.quantity}x ${ammoItem.itemId} (${weapon.ammoType}) — reloading "${weapon.name}"...`);
 
     for (let i = 0; i < maxAttempts; i++) {
-      const resp = await bot.exec("reload", { weapon_instance_id: weapon.instanceId, ammo_item_id: ammoItem.itemId, });
+      const resp = await bot.exec("reload", { weapon_instance_id: weapon.instanceId, ammo_item_id: ammoItem.itemId });
 
       if (resp.error) {
         const msg = resp.error.message.toLowerCase();

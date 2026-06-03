@@ -129,7 +129,14 @@ main {
 #page-commandall.active {
   display: flex;
 }
-#playersFrame, #shipsforsaleFrame, #commandallFrame {
+#page-fa {
+  padding: 0;
+  gap: 0;
+}
+#page-fa.active {
+  display: flex;
+}
+#playersFrame, #shipsforsaleFrame, #commandallFrame, #faFrame {
   flex: 1;
   width: 100%;
   border: none;
@@ -527,6 +534,31 @@ table.bot-table.compact-mode .row-actions button {
 .stats-toggle button:last-child { border-right: none; }
 .stats-toggle button:hover { color: var(--text); background: var(--bg-row-hover); }
 .stats-toggle button.active { color: var(--text-bright); background: var(--accent); }
+
+/* Stats taxes nav */
+.stats-taxes-nav {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 0 4px;
+}
+.stats-taxes-nav .stats-title {
+  margin-right: 4px;
+}
+.stats-taxes-nav button {
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+  background: var(--bg-card);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.stats-taxes-nav button:hover { color: var(--text); background: var(--bg-row-hover); }
+.stats-taxes-nav button.active { color: var(--text-bright); background: var(--accent); }
 
 .stats-page-header {
   display: flex;

@@ -64,6 +64,7 @@ const BLOCKED_EMPIRE_NPCS = [ //that is blocked from replying too, even though t
   "The Convergence", //needs verification
   "Solarian Confederacy", //gives message about rep increase. bot responded to it under "solarian"
   "Vex Nebulon", //Player that wanted to join guild, but i declined so i gave them ships! don't want AI responding to them. must do that in human mode.
+  "MeherCodexAI", //another player that i don't want the LLM talking to with the crazy personality.
 ];
 
 const EMPIRE_OFFICIAL_TAG = "[empire_official]";
@@ -1011,8 +1012,8 @@ export class AiChatService {
     isLastRound: boolean = false
   ): Promise<"sent" | "failed"> {
     // Check conversation limits (cooldown, consecutive responses)
-    // Use channel + human sender as key (not responder) so only one bot responds per conversation
-    const participants = [humanSender]; // Don't include responder - conversation is per channel+sender
+    // Use channel + human sender + responder as key so each bot tracks independently
+    const participants = [humanSender, responder.username];
     const limits = this.checkConversationLimits(msg.channel, participants);
     if (!limits.allowed) {
       this.logFn("ai_chat", `Skipping: ${limits.reason}`);
@@ -1739,6 +1740,7 @@ ${botContext}
       jumps?: number;
       fuelRefueled?: number;
       playerFuelPct?: number;
+      credits?: number;
     },
     personality?: string
   ): Promise<{ ok: boolean; message?: string; error?: string }> {
@@ -1764,16 +1766,18 @@ Context:
 IMPORTANT NOTES ABOUT FUEL:
 ${context.playerFuelPct !== undefined ? `- The STRANDED PILOT'S fuel level is ${context.playerFuelPct}% (this is THEIR fuel, NOT yours)` : `- Fuel levels are not specified - focus on the situation described`}
 ${context.fuelRefueled !== undefined ? `- You transferred ${context.fuelRefueled} fuel units to the stranded pilot` : ''}
+${context.credits !== undefined ? `- The rescue invoice totals ${context.credits} credits` : ''}
 - NEVER confuse the stranded pilot's fuel level with your own fuel level
 - When referring to fuel, always clarify whose fuel you're talking about
 
 Task:
 Generate a brief radio transmission message (max 2 sentences) to send via private chat to the stranded pilot.
+If an invoice was sent, ALWAYS mention the credit amount in your message.
 
 Style:
 - Keep it natural and in-character
 - Be concise (this is a radio transmission)
-- Include relevant details (ETA, jumps, etc.) if provided
+- Include relevant details (ETA, jumps, credits, etc.) if provided
 - Don't be overly verbose
 - Use 1st person ("I", "me", "my") when talking about yourself`;
 
@@ -1783,6 +1787,7 @@ Situation: ${context.situation}
 ${context.jumps ? `Jumps remaining: ${context.jumps}` : ""}
 ${context.fuelRefueled ? `Fuel transferred: ${context.fuelRefueled}` : ""}
 ${context.playerFuelPct ? `Their fuel before: ${context.playerFuelPct}%` : ""}
+${context.credits !== undefined ? `Invoice total: ${context.credits} credits` : ""}
 
 Message:`;
 

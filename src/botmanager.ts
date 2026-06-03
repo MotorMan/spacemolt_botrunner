@@ -21,6 +21,7 @@ import { fleetHunterCommanderRoutine } from "./routines/fleet_hunter_commander.j
 import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordinate.js";
 import { escortRoutine } from "./routines/escort.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
+import { fuelTransportRoutine } from "./routines/fuelTransfer.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
@@ -52,7 +53,7 @@ const sessionRestoreFailures: Map<string, number[]> = new Map();
 
 /** Get list of discovered bot usernames (for API use). */
 export function getDiscoveredBots(): string[] {
-  return [...bots.keys()];
+  return [...bots.keys()].sort((a, b) => a.localeCompare(b));
 }
 
 /** Get a bot by name (for API use). */
@@ -108,6 +109,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },
   trade_buyer: { name: "TradeBuyer", fn: tradeBuyerRoutine },
   fuel_cell_seller: { name: "FuelCellSeller", fn: fuelCellSellerRoutine },
+  fuel_transport: { name: "FuelTransport", fn: fuelTransportRoutine },
   cleanup: { name: "Cleanup", fn: cleanupRoutine },
   ai: { name: "AI", fn: aiRoutine },
   cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },
@@ -157,7 +159,9 @@ function setupBotLogging(bot: Bot): void {
 }
 
 function refreshStatusTable(): void {
-  const statuses = [...bots.values()].map((b) => b.status());
+  const statuses = [...bots.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([, b]) => b.status());
   server.updateBotStatus(statuses);
 }
 
@@ -208,6 +212,20 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
   const routine = (action as any).routine as string;
   const s = action.settings;
   if (!routine || !s) return { ok: false, error: "Routine and settings required" };
+
+  if (routine === "flock") {
+    const { writeFileSync, existsSync, mkdirSync } = await import("fs");
+    const { join } = await import("path");
+    const flockFile = join(process.cwd(), "data", "flock.json");
+    const dir = join(process.cwd(), "data");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const current = existsSync(flockFile) ? JSON.parse(require("fs").readFileSync(flockFile, "utf-8")) : { flockGroups: [], assignments: {} };
+    if (s.flockGroups !== undefined) current.flockGroups = s.flockGroups;
+    if (s.assignments !== undefined) current.assignments = s.assignments;
+    writeFileSync(flockFile, JSON.stringify(current, null, 2) + "\n", "utf-8");
+    server.logSystem(`Flock settings saved`);
+    return { ok: true, message: `flock settings saved` };
+  }
 
   server.saveRoutineSettings(routine, s);
   server.logSystem(`Settings saved for ${routine}`);
@@ -430,7 +448,7 @@ async function handleEmergencyReturn(): Promise<WebActionResult> {
       sendBotChat: (content: string, channel: string, recipients?: string[], metadata?: Record<string, unknown>) => {
         sendBotChatMessage(botName, content, channel as BotChatChannel, recipients, metadata);
       },
-      getAllBotNames: () => [...bots.keys()],
+    getAllBotNames: () => [...bots.keys()].sort((a, b) => a.localeCompare(b)),
       getBotAssignments: () => server.getBotAssignments(),
     };
 
@@ -748,7 +766,7 @@ async function main(): Promise<void> {
 
   if (bots.size > 0) {
     const assignments = server.getBotAssignments();
-    server.logSystem(`Found ${bots.size} saved bot(s): ${[...bots.keys()].join(", ")}`);
+    server.logSystem(`Found ${bots.size} saved bot(s): ${[...bots.keys()].sort((a, b) => a.localeCompare(b)).join(", ")}`);
     server.logSystem(`Bot assignments: ${JSON.stringify(assignments)}`);
     // Push initial bot list to UI immediately (shows as "idle" with default values)
     refreshStatusTable();
@@ -758,7 +776,7 @@ async function main(): Promise<void> {
     const FULL_LOGIN_DELAY_MS = 13000;
     let botIndex = 0;
 
-for (const [name, bot] of bots) {
+ for (const [name, bot] of [...bots.entries()].sort(([a], [b]) => a.localeCompare(b))) {
       const delay = botIndex * SESSION_RESUME_DELAY_MS;
       const loginIndex = botIndex;
       botIndex++;

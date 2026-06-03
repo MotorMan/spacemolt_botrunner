@@ -115,7 +115,8 @@ async function withdrawFromHomeFaction(
   ctx: RoutineContext,
   bot: Bot,
   itemId: string,
-  qty: number
+  qty: number,
+  homeStationId: string
 ): Promise<{ success: boolean; withdrawnQty: number }> {
   const freeSpace = Math.max(0, (bot.cargoMax || 825) - (bot.cargo || 0));
   const withdrawQty = Math.min(qty, maxItemsForCargo(freeSpace, itemId));
@@ -127,6 +128,7 @@ async function withdrawFromHomeFaction(
     target: "faction",
     item_id: itemId,
     quantity: withdrawQty,
+    station_id: homeStationId,
   });
   if (resp.error) {
     ctx.log("error", `Withdraw failed: ${resp.error.message}`);
@@ -374,13 +376,59 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
         if (withdrawQty <= 0) {
           ctx.log("fuel", `Already have ${alreadyHave}x ${item.itemName} in cargo — delivering`);
         } else {
+          if (bot.system !== homeSystem || bot.poi !== homeStation) {
+            yield "go_home_for_withdraw";
+            ctx.log("fuel", `Navigating to home base ${homeSystem}/${homeStation} for withdraw...`);
+
+            if (bot.system !== homeSystem) {
+              await ensureUndocked(ctx);
+              if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+              const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+              if (!fueled) { await ctx.sleep(30000); continue; }
+              const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+              if (!arrived || bot.state !== "running") {
+                if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+                await ctx.sleep(30000); continue;
+              }
+              ctx.log("fuel", `Arrived at home system ${homeSystem}`);
+            }
+
+            if (bot.poi !== homeStation) {
+              await ensureUndocked(ctx);
+              if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+              const tResp = await bot.exec("travel", { target_poi: homeStation });
+              if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+              if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
+                ctx.log("error", `Travel to home station failed: ${tResp.error.message}`);
+                await ctx.sleep(30000); continue;
+              }
+              await bot.refreshStatus();
+              if (bot.poi !== homeStation) {
+                ctx.log("error", `Travel to home station failed: not at target`);
+                await ctx.sleep(30000); continue;
+              }
+            }
+
+            if (!bot.docked) {
+              const dockResp = await bot.exec("dock");
+              if (dockResp.error && !dockResp.error.message.includes("already")) {
+                ctx.log("error", `Dock at home failed: ${dockResp.error.message}`);
+                await ctx.sleep(30000); continue;
+              }
+              bot.docked = true;
+            }
+
+            await tryRefuel(ctx);
+            await repairShip(ctx);
+          }
+
           yield `withdraw_${item.itemId}`;
           ctx.log("fuel", `Withdrawing ${withdrawQty}x ${item.itemName} from home faction storage...`);
 
           const { tripId } = startTrip(bot.username, item.itemId, item.itemName, remoteStationId, destSystem, withdrawQty, "faction");
           addTripEvent(bot.username, "withdraw", { qty: withdrawQty, station: homeStation, system: homeSystem });
 
-          const wr = await withdrawFromHomeFaction(ctx, bot, item.itemId, withdrawQty);
+          const wr = await withdrawFromHomeFaction(ctx, bot, item.itemId, withdrawQty, homeStation);
           if (!wr.success) {
             failCurrentTrip(bot.username, "withdraw failed");
             ctx.log("error", `Failed to withdraw ${withdrawQty}x ${item.itemName} from home`);

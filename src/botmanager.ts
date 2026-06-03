@@ -21,6 +21,7 @@ import { fleetHunterCommanderRoutine } from "./routines/fleet_hunter_commander.j
 import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordinate.js";
 import { escortRoutine } from "./routines/escort.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
+import { fuelTransportRoutine } from "./routines/fuelTransfer.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
@@ -108,6 +109,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   faction_trader: { name: "FactionTrader", fn: factionTraderRoutine },
   trade_buyer: { name: "TradeBuyer", fn: tradeBuyerRoutine },
   fuel_cell_seller: { name: "FuelCellSeller", fn: fuelCellSellerRoutine },
+  fuel_transport: { name: "FuelTransport", fn: fuelTransportRoutine },
   cleanup: { name: "Cleanup", fn: cleanupRoutine },
   ai: { name: "AI", fn: aiRoutine },
   cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },

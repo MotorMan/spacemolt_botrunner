@@ -1267,6 +1267,7 @@ export class WebServer {
                   faction: this.factionLog,
                 },
                 botLogs: botLogsObj,
+                flockSettings: loadFlockSettings(),
               }));
 
               // Send large data separately to avoid blocking with JSON serialization

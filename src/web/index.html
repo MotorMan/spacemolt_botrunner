@@ -16653,6 +16653,8 @@ function renderHunterSettings(panel) {
   const singleLoop = h.singleLoop ?? false;
   const hunterHomeSystem = h.homeSystem || '';
   const hunterHomeStation = h.homeStation || '';
+  const ammoReloadAbsoluteThreshold = h.ammoReloadAbsoluteThreshold ?? 1;
+  const ammoReloadPercentThreshold = h.ammoReloadPercentThreshold ?? 25;
 
   const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
   const tierOpts = tierOptions.map(t => `<option value="${t}"${t === maxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
@@ -16899,6 +16901,22 @@ function renderHunterSettings(panel) {
       </select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ammo Reload: Absolute Threshold</div>
+        <div class="setting-hint">For weapons with ≤50 ammo capacity, reload when ammo drops to this absolute number. Higher value = earlier reload.</div>
+      </div>
+      <input type="number" id="set-hunter-ammoReloadAbsoluteThreshold" min="1" max="50" value="${ammoReloadAbsoluteThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ammo Reload: Percent Threshold</div>
+        <div class="setting-hint">For weapons with >50 ammo capacity, reload when ammo drops below this percentage. 25% = reload when ammo is at 25% of max capacity.</div>
+      </div>
+      <input type="number" id="set-hunter-ammoReloadPercentThreshold" min="5" max="50" value="${ammoReloadPercentThreshold}">
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
     </div>
@@ -16923,6 +16941,8 @@ function saveHunterSettings() {
     disableWreckSalvaging: document.getElementById('set-hunter-disableWreckSalvaging').value === 'true',
     singleLoop: document.getElementById('set-hunter-singleLoop').value === 'true',
     homeStation: document.getElementById('set-hunter-homeStation').value.trim(),
+    ammoReloadAbsoluteThreshold: parseInt(document.getElementById('set-hunter-ammoReloadAbsoluteThreshold').value) || 1,
+    ammoReloadPercentThreshold: parseInt(document.getElementById('set-hunter-ammoReloadPercentThreshold').value) || 25,
     hunterPatrols: Array.isArray(settings.hunter?.hunterPatrols) ? settings.hunter.hunterPatrols : [],
     botHunterPatrolAssignments: settings.hunter?.botHunterPatrolAssignments || {},
   };
@@ -17296,6 +17316,8 @@ function renderFleetHunterSettings(panel) {
   const fleetSize = fh.fleetSize ?? 6;
   const autoCloak = fh.autoCloak ?? false;
   const ammoThreshold = fh.ammoThreshold ?? 5;
+  const ammoReloadAbsoluteThreshold = fh.ammoReloadAbsoluteThreshold ?? 1;
+  const ammoReloadPercentThreshold = fh.ammoReloadPercentThreshold ?? 25;
   const maxReloadAttempts = fh.maxReloadAttempts ?? 3;
   const huntingEnabled = fh.huntingEnabled ?? true;
   const manualMode = fh.manualMode ?? false;
@@ -17468,6 +17490,22 @@ function renderFleetHunterSettings(panel) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Ammo Reload: Absolute Threshold</div>
+        <div class="setting-hint">For weapons with ≤50 ammo capacity, reload when ammo drops to this absolute number.</div>
+      </div>
+      <input type="number" id="set-fleet-hunter-ammoReloadAbsoluteThreshold" min="1" max="50" value="${ammoReloadAbsoluteThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ammo Reload: Percent Threshold</div>
+        <div class="setting-hint">For weapons with >50 ammo capacity, reload when ammo drops below this percentage.</div>
+      </div>
+      <input type="number" id="set-fleet-hunter-ammoReloadPercentThreshold" min="5" max="50" value="${ammoReloadPercentThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Max Reload Attempts</div>
         <div class="setting-hint">Maximum attempts to reload before giving up and returning to station.</div>
       </div>
@@ -17495,6 +17533,8 @@ function saveFleetHunterSettings() {
     fleetSize: parseInt(document.getElementById('set-fleet-hunter-fleetSize').value) || 6,
     autoCloak: document.getElementById('set-fleet-hunter-autoCloak').value === 'true',
     ammoThreshold: parseInt(document.getElementById('set-fleet-hunter-ammoThreshold').value) || 5,
+    ammoReloadAbsoluteThreshold: parseInt(document.getElementById('set-fleet-hunter-ammoReloadAbsoluteThreshold').value) || 1,
+    ammoReloadPercentThreshold: parseInt(document.getElementById('set-fleet-hunter-ammoReloadPercentThreshold').value) || 25,
     maxReloadAttempts: parseInt(document.getElementById('set-fleet-hunter-maxReloadAttempts').value) || 3,
     huntingEnabled: document.getElementById('set-fleet-hunter-huntingEnabled').value === 'true',
     manualMode: document.getElementById('set-fleet-hunter-manualMode').value === 'true',
@@ -18290,6 +18330,20 @@ async function loadShipLoadoutToCargoMover() {
 
 // ── Fuel Transport Settings ──────────────────────────────────
 let ftFactionItems = [];
+let ftLoadouts = {};
+
+async function loadFuelTransferLoadouts() {
+  try {
+    const response = await fetch('/api/facility-transfer-loadouts');
+    if (response.ok) {
+      const data = await response.json();
+      ftLoadouts = data.loadouts || {};
+    }
+  } catch (e) {
+    console.warn('Failed to load facility transfer loadouts:', e);
+    ftLoadouts = {};
+  }
+}
 
 function renderFuelTransportSettings(panel) {
   const ft = settings.fuel_transport || {};
@@ -18297,6 +18351,8 @@ function renderFuelTransportSettings(panel) {
   const items = ft.items || [];
   const refuelThreshold = ft.refuelThreshold ?? 35;
   const repairThreshold = ft.repairThreshold ?? 40;
+  const useLoadouts = ft.useLoadouts ?? false;
+  const selectedLoadout = ft.selectedLoadout ?? "";
 
   const general = settings.general || {};
   const generalSystem = general.factionStorageSystem || '';
@@ -18322,6 +18378,11 @@ function renderFuelTransportSettings(panel) {
   for (const bot of [...bots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
     botOpts += `<option value="${esc(bot.username)}">${esc(bot.username)}</option>`;
   }
+
+  const loadoutOptions = Object.keys(ftLoadouts).sort().map(name => 
+    `<option value="${esc(name)}"${name === selectedLoadout ? ' selected' : ''}>${esc(name)}</option>`
+  ).join('');
+  const hasLoadouts = Object.keys(ftLoadouts).length > 0;
 
   const stationsList = stations.length > 0
     ? stations.map((s, idx) => {
@@ -18379,13 +18440,36 @@ function renderFuelTransportSettings(panel) {
       ${itemsList}
       <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <select id="ft-home-bot-select" style="flex:1;min-width:100px">${botOpts}</select>
-        <button class="sm" onclick="loadFuelTransportFactionStorage()">📥 Load Home Faction Storage</button>
+        <button class="sm" onclick="loadFuelTransferFactionStorage()">📥 Load Home Faction Storage</button>
       </div>
       <div style="font-size:10px;color:var(--dim);margin-top:4px">Select a bot docked at home, then load items from its faction storage.</div>
       <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
         <select id="ft-item-select" style="flex:1;min-width:0">${factionItemOpts}</select>
         <input type="number" id="ft-item-qty" min="1" value="5000" placeholder="Target qty" style="width:100px">
         <button class="primary sm" onclick="addFuelTransportItem()">+ Add Item</button>
+      </div>
+    </div>
+
+    <div style="margin-top:16px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🏗 Facility Transfer Loadouts (One-Time Transfers)</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
+        Save specific material sets for facility construction. Stations completed with a loadout won't be restocked with those materials.
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <select id="ft-loadout-select" style="flex:1;min-width:150px">
+          <option value="">-- Select Loadout --</option>
+          ${loadoutOptions}
+        </select>
+        <button class="sm primary" onclick="loadFuelTransferLoadout()">Load</button>
+        <button class="sm" onclick="saveFuelTransferLoadoutPrompt()">💾 Save</button>
+        <button class="sm danger" onclick="deleteFuelTransferLoadout()" ${!hasLoadouts ? 'disabled' : ''}>🗑 Delete</button>
+      </div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:12px;margin-bottom:8px">
+        <input type="checkbox" id="ft-use-loadouts" ${useLoadouts ? 'checked' : ''}>
+        Enable Loadout Mode (skip stations already completed with this loadout)
+      </label>
+      <div style="font-size:11px;color:var(--dim)">
+        ${hasLoadouts ? `${Object.keys(ftLoadouts).length} loadout(s) saved` : 'No loadouts saved yet. Configure items and click Save to create one.'}
       </div>
     </div>
 
@@ -18406,7 +18490,7 @@ function renderFuelTransportSettings(panel) {
     </div>
 
     <div class="settings-save-bar">
-      <button class="sm" onclick="renderFuelTransportSettings(document.getElementById('settingsContent'))">Refresh</button>
+      <button class="sm" onclick="loadFuelTransferLoadouts(); renderFuelTransportSettings(document.getElementById('settingsContent'))">Refresh</button>
       <button class="primary" onclick="saveFuelTransportSettings()">Save Settings</button>
     </div>
   `;
@@ -18486,9 +18570,103 @@ function saveFuelTransportSettings() {
     items: settings.fuel_transport?.items || [],
     refuelThreshold: parseInt(document.getElementById('set-ft-refuelThreshold')?.value) || 35,
     repairThreshold: parseInt(document.getElementById('set-ft-repairThreshold')?.value) || 40,
+    useLoadouts: document.getElementById('ft-use-loadouts')?.checked || false,
+    selectedLoadout: document.getElementById('ft-loadout-select')?.value || "",
   };
   send({ type: 'saveSettings', routine: 'fuel_transport', settings: s });
   settings.fuel_transport = s;
+}
+
+// ── Facility Transfer Loadout Functions ─────────────────────────
+
+function loadFuelTransferLoadout() {
+  const select = document.getElementById('ft-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to load.');
+    return;
+  }
+
+  const loadout = ftLoadouts[name];
+  if (!loadout) {
+    alert(`Loadout "${name}" not found!`);
+    return;
+  }
+
+  if (!settings.fuel_transport) settings.fuel_transport = {};
+  settings.fuel_transport.items = loadout.items.map(item => ({
+    itemId: item.itemId,
+    itemName: item.itemName || item.itemId,
+    targetQuantity: item.targetQuantity,
+  }));
+  renderFuelTransportSettings(document.getElementById('settingsContent'));
+}
+
+async function saveFuelTransferLoadoutPrompt() {
+  const name = prompt('Enter a name for this facility transfer loadout:');
+  if (!name || !name.trim()) return;
+  await saveFuelTransferLoadout(name.trim());
+}
+
+async function saveFuelTransferLoadout(name) {
+  const items = settings.fuel_transport?.items || [];
+  if (items.length === 0) {
+    alert('No items configured to save. Add some items first!');
+    return;
+  }
+
+  const loadoutItems = items.map(item => ({
+    itemId: item.itemId,
+    itemName: item.itemName || item.itemId,
+    targetQuantity: item.targetQuantity,
+  }));
+
+  try {
+    const response = await fetch('/api/facility-transfer-loadouts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, items: loadoutItems }),
+    });
+
+    if (response.ok) {
+      await loadFuelTransferLoadouts();
+      renderFuelTransportSettings(document.getElementById('settingsContent'));
+      alert(`Loadout "${name}" saved successfully!`);
+    } else {
+      const error = await response.json();
+      alert(`Failed to save loadout: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to save loadout: ${e.message}`);
+  }
+}
+
+async function deleteFuelTransferLoadout() {
+  const select = document.getElementById('ft-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to delete.');
+    return;
+  }
+
+  if (!confirm(`Are you sure you want to delete the loadout "${name}"?`)) return;
+
+  try {
+    const response = await fetch(`/api/facility-transfer-loadouts/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+
+    if (response.ok) {
+      await loadFuelTransferLoadouts();
+      renderFuelTransportSettings(document.getElementById('settingsContent'));
+      alert(`Loadout "${name}" deleted.`);
+    } else {
+      const error = await response.json();
+      alert(`Failed to delete loadout: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to delete loadout: ${e.message}`);
+  }
 }
 
 // ── Shipyard ────────────────────────────────────────────────

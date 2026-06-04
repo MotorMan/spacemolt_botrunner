@@ -40,7 +40,7 @@ export async function hasLeadLinedCargo(ctx: RoutineContext): Promise<boolean> {
     const modSpecial = (modObj?.special as string) || "";
 
     const checkStr = `${modId} ${modName} ${modType} ${modSpecial}`.toLowerCase();
-    if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo")) {
+    if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo") || checkStr.includes("hazmat_cargo")) {
       return true;
     }
   }
@@ -67,7 +67,7 @@ export async function hasRadHarvester(ctx: RoutineContext): Promise<boolean> {
     const modSpecial = (modObj?.special as string) || "";
 
     const checkStr = `${modId} ${modName} ${modType} ${modSpecial}`.toLowerCase();
-    if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester")) {
+    if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester") || checkStr.includes("rad_harvesting")) {
       return true;
     }
   }
@@ -158,8 +158,8 @@ export function getRadioactiveCapabilityCached(
     return `${obj.id || ""} ${obj.name || ""} ${obj.type || ""} ${obj.special || ""}`.toLowerCase();
   }).join(" ");
 
-  const hasLLCargo = moduleStr.includes("lead_lined_cargo") || moduleStr.includes("lead lined cargo");
-  const hasRadHarv = moduleStr.includes("rad_harvester") || moduleStr.includes("rad harvester");
+  const hasLLCargo = moduleStr.includes("lead_lined_cargo") || moduleStr.includes("lead lined cargo") || moduleStr.includes("hazmat_cargo");
+  const hasRadHarv = moduleStr.includes("rad_harvester") || moduleStr.includes("rad harvester") || moduleStr.includes("rad_harvesting");
   const hasDeepCoreExtractor = moduleStr.includes("deep_core_extractor_mki") ||
                                moduleStr.includes("deep_core_extractor_mkii") ||
                                moduleStr.includes("deep_core_extractor_ii") ||

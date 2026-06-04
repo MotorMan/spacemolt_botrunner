@@ -7,6 +7,7 @@ import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
+import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions } from "../routines/fuelTransferTracking.js";
 
 function getLocalIp(): string | null {
   const interfaces = os.networkInterfaces();
@@ -1043,6 +1044,44 @@ export class WebServer {
             delete loadouts[name];
             saveModuleLoadouts(loadouts);
             return Response.json({ ok: true, name });
+          }
+
+          // GET /api/facility-transfer-loadouts - Load all facility transfer loadouts
+          if (url.pathname === "/api/facility-transfer-loadouts" && req.method === "GET") {
+            const loadouts = getFacilityTransferLoadouts();
+            return Response.json({ loadouts });
+          }
+
+          // POST /api/facility-transfer-loadouts - Save a facility transfer loadout
+          if (url.pathname === "/api/facility-transfer-loadouts" && req.method === "POST") {
+            const body = await req.json() as { name: string; items: Array<{ itemId: string; itemName: string; targetQuantity: number }> };
+            if (!body?.name || !Array.isArray(body.items)) {
+              return Response.json({ error: "Missing name or items" }, { status: 400 });
+            }
+            const loadout: any = {
+              name: body.name,
+              items: body.items,
+              createdAt: new Date().toISOString(),
+            };
+            saveFacilityTransferLoadout(body.name, { items: body.items });
+            return Response.json({ ok: true, name: body.name });
+          }
+
+          // DELETE /api/facility-transfer-loadouts/:name - Delete a facility transfer loadout
+          if (url.pathname.startsWith("/api/facility-transfer-loadouts/") && req.method === "DELETE") {
+            const name = decodeURIComponent(url.pathname.slice("/api/facility-transfer-loadouts/".length));
+            const success = deleteFacilityTransferLoadout(name);
+            if (!success) {
+              return Response.json({ error: "Loadout not found" }, { status: 404 });
+            }
+            return Response.json({ ok: true, name });
+          }
+
+          // GET /api/facility-transfer-completions?station=X - Get completions for a station
+          if (url.pathname === "/api/facility-transfer-completions" && req.method === "GET") {
+            const station = url.searchParams.get("station") || "";
+            const completions = getStationCompletions(station);
+            return Response.json({ completions });
           }
 
           // Serve index.css

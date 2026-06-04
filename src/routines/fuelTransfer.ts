@@ -1,6 +1,5 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
-import { getSystemBlacklist } from "../web/server.js";
 import {
   ensureUndocked,
   ensureFueled,
@@ -28,6 +27,13 @@ import {
   loadFuelTransferData,
   saveFuelTransferData,
   type FuelTripRecord,
+  getFactionStorageQuantity,
+  getFactionStorageLastUpdated,
+  updateFactionStorageFromDeposit,
+  type FacilityTransferLoadout,
+  getFacilityTransferLoadouts,
+  isStationCompletedForLoadout,
+  saveStationCompletion,
 } from "./fuelTransferTracking.js";
 
 const FUEL_CELL_ITEM_ID_PREFIXES = ["fuel_cell", "premium_fuel_cell"];
@@ -35,6 +41,31 @@ const FUEL_CELL_ITEM_ID_PREFIXES = ["fuel_cell", "premium_fuel_cell"];
 function isFuelCellItem(itemId: string): boolean {
   const lower = itemId.toLowerCase();
   return FUEL_CELL_ITEM_ID_PREFIXES.some(p => lower.includes(p));
+}
+
+interface TransferStrategy {
+  skip: boolean;
+  reason: string;
+}
+
+function determineTransferStrategy(
+  cachedQty: number,
+  currentQty: number,
+  targetQty: number
+): TransferStrategy {
+  if (currentQty >= targetQty) {
+    return { skip: true, reason: "already at target" };
+  }
+
+  if (cachedQty >= targetQty) {
+    return { skip: true, reason: "cache shows at target" };
+  }
+
+  if (cachedQty > currentQty) {
+    return { skip: false, reason: "cache indicates need, proceeding" };
+  }
+
+  return { skip: false, reason: "proceeding with transfer" };
 }
 
 interface FuelTransportItem {
@@ -48,6 +79,14 @@ interface FuelTransportSettings {
   items: FuelTransportItem[];
   refuelThreshold: number;
   repairThreshold: number;
+  useLoadouts: boolean;
+  selectedLoadout: string;
+}
+
+interface FacilityTransferLoadoutItem {
+  itemId: string;
+  itemName: string;
+  targetQuantity: number;
 }
 
 function getFuelTransportSettings(username?: string): FuelTransportSettings {
@@ -71,6 +110,8 @@ function getFuelTransportSettings(username?: string): FuelTransportSettings {
     items,
     refuelThreshold: (t.refuelThreshold as number) || 35,
     repairThreshold: (t.repairThreshold as number) || 40,
+    useLoadouts: (t.useLoadouts as boolean) || false,
+    selectedLoadout: (t.selectedLoadout as string) || "",
   };
 }
 
@@ -153,6 +194,7 @@ async function depositToRemoteStation(
   ctx: RoutineContext,
   bot: Bot,
   itemId: string,
+  itemName: string,
   qty: number,
   remoteStationId: string
 ): Promise<{ success: boolean; depositedQty: number; mode: "faction" | "personal" | "failed" }> {
@@ -166,6 +208,7 @@ async function depositToRemoteStation(
       const deposited = Math.max(0, beforeQty - afterQty);
       if (deposited > 0) {
         logFactionActivity(ctx, "deposit", `Deposited ${deposited}x ${itemId} to ${remoteStationId} (fuel transport)`);
+        updateFactionStorageFromDeposit(remoteStationId, bot.faction || "", itemId, deposited, itemName);
         return { success: true, depositedQty: deposited, mode: "faction" };
       }
     }
@@ -344,14 +387,50 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
       stationsToService.push({ station, system: sys });
     }
 
+    const loadouts = getFacilityTransferLoadouts();
+    const useLoadouts = settings.useLoadouts && settings.selectedLoadout && loadouts[settings.selectedLoadout];
+    const loadoutItems: FacilityTransferLoadoutItem[] = useLoadouts 
+      ? loadouts[settings.selectedLoadout].items 
+      : [];
+
     for (const { station, system: destSystem } of stationsToService) {
       const remoteStationId = extractStationId(station);
 
-      for (const item of settings.items) {
-        const currentQty = await getRemoteFactionQty(bot, remoteStationId, item.itemId);
+      if (useLoadouts && isStationCompletedForLoadout(remoteStationId, settings.selectedLoadout)) {
+        ctx.log("fuel", `${remoteStationId}: Loadout "${settings.selectedLoadout}" already completed — skipping`);
+        continue;
+      }
+
+      const activeItems = useLoadouts ? loadoutItems : settings.items;
+      if (activeItems.length === 0) {
+        if (!useLoadouts) {
+          ctx.log("warn", "No items configured for station");
+        }
+        continue;
+      }
+
+      for (const item of activeItems) {
+        const cachedQty = getFactionStorageQuantity(remoteStationId, item.itemId);
+        const cachedLastUpdated = getFactionStorageLastUpdated(remoteStationId);
+        const hasCache = cachedLastUpdated > 0;
+
+        let currentQty: number;
+        if (hasCache) {
+          currentQty = cachedQty;
+          ctx.log("fuel", `Using faction storage cache for ${remoteStationId}: ${item.itemName} = ${currentQty}`);
+        } else {
+          currentQty = await getRemoteFactionQty(bot, remoteStationId, item.itemId);
+        }
 
         if (currentQty >= item.targetQuantity) {
           ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ✓`);
+          continue;
+        }
+
+        const strategy = determineTransferStrategy(cachedQty, currentQty, item.targetQuantity);
+        ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ${strategy.reason}`);
+
+        if (strategy.skip) {
           continue;
         }
 
@@ -502,7 +581,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
 
         yield `deposit_${item.itemId}`;
         ctx.log("fuel", `Depositing ${cargoForDelivery}x ${item.itemName} to ${remoteStationId}...`);
-        const depositResult = await depositToRemoteStation(ctx, bot, item.itemId, cargoForDelivery, remoteStationId);
+        const depositResult = await depositToRemoteStation(ctx, bot, item.itemId, item.itemName, cargoForDelivery, remoteStationId);
 
         if (depositResult.success) {
           addTripEvent(bot.username, depositResult.mode === "faction" ? "deposit_faction" : "deposit_personal", {
@@ -511,6 +590,12 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           });
           completeTrip(bot.username, depositResult.depositedQty);
           ctx.log("fuel", `✅ Deposited ${depositResult.depositedQty}x ${item.itemName} to ${remoteStationId} via ${depositResult.mode}`);
+
+          if (useLoadouts) {
+            saveStationCompletion(remoteStationId, settings.selectedLoadout, [
+              { itemId: item.itemId, quantity: depositResult.depositedQty },
+            ]);
+          }
         } else {
           addTripEvent(bot.username, "deposit_failed", { station: remoteStationId, error: "all deposit methods failed" });
           failCurrentTrip(bot.username, "deposit failed");

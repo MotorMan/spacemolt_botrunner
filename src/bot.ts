@@ -669,10 +669,15 @@ docked = false;
         }
 
         // Update faction storage cache whenever view_storage is called for faction
-        if (command === "view_storage" && payload?.target === "faction" && !resp.error && this.faction) {
+        if (command === "view_storage" && payload?.target === "faction" && !resp.error) {
           const entries = this.parseItemList(resp.result);
           const station = (payload.station_id as string) || this.poi;
-          updateFactionStorageCache(this.faction, entries, station);
+          const result = resp.result as Record<string, unknown> | undefined;
+          // Try to get faction name from response, then from existing cache, then fall back to this.faction
+          const factionName = (result?.faction_name as string) || (result?.faction_id as string) || (station ? getFactionStorageCacheByStationOnly(station)?.factionName : null) || this.faction || "";
+          if (factionName) {
+            updateFactionStorageCache(factionName, entries, station);
+          }
         }
 
         if (resp.error) {
@@ -1105,10 +1110,23 @@ docked = false;
     if (entries.length === 0) {
       this.log("warn", "Faction storage refresh returned 0 items");
     }
+    // Try to get faction name from response, then from existing cache, then fall back to this.faction
+    let respFactionName = (result.faction_name as string) || (result.faction_id as string);
+    if (!respFactionName && station) {
+      const cached = getFactionStorageCacheByStationOnly(station);
+      if (cached) {
+        respFactionName = cached.factionName;
+      }
+    }
+    if (!respFactionName) {
+      respFactionName = factionName;
+    }
     this.factionStorage = entries;
     this.factionFuelReserve = (result.faction_fuel_reserve as number) || 0;
     this.factionFuelCapacity = (result.faction_fuel_capacity as number) || 0;
-    updateFactionStorageCache(factionName, entries, station, this.factionFuelReserve, this.factionFuelCapacity);
+    if (respFactionName) {
+      updateFactionStorageCache(respFactionName, entries, station, this.factionFuelReserve, this.factionFuelCapacity);
+    }
   }
 
   /** Start running a routine. */

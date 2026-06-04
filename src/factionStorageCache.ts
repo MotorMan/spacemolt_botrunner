@@ -45,6 +45,26 @@ function checkExistingCacheFiles(): void {
   }
 }
 
+function loadAllCacheFiles(): void {
+  try {
+    if (!existsSync(CACHE_DIR)) return;
+    const files = readdirSync(CACHE_DIR);
+    for (const file of files) {
+      if (!file.endsWith(".json")) continue;
+      const cacheFile = join(CACHE_DIR, file);
+      const content = readFileSync(cacheFile, "utf-8");
+      const data = JSON.parse(content) as FactionStorageCache;
+      if (data.factionName && data.station) {
+        const key = getCacheKey(data.factionName, data.station);
+        cacheStore.set(key, { data, lastWritten: 0 });
+        stationToKeyMap.set(data.station, key);
+      }
+    }
+  } catch (e) {
+    console.log("Error loading cache files:", e);
+  }
+}
+
 function loadFromDisk(factionName: string, station: string): FactionStorageCache | null {
   try {
     const key = getCacheKey(factionName, station);
@@ -106,6 +126,7 @@ function migrateOldCache(): void {
 ensureCacheDir();
 migrateOldCache();
 checkExistingCacheFiles();
+loadAllCacheFiles();
 
 export function getFactionStorageCache(factionName: string, station: string = ""): FactionStorageCache | null {
   const key = getCacheKey(factionName, station);

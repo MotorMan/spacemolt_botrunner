@@ -492,10 +492,10 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
     if (checkStr.includes("ice_harvester") || checkStr.includes("ice harvester")) {
       hasIceHarvester = true;
     }
-    if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo")) {
+    if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo") || checkStr.includes("hazmat_cargo")) {
       hasLeadLinedCargo = true;
     }
-    if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester")) {
+    if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester") || checkStr.includes("rad_harvesting")) {
       hasRadHarvester = true;
     }
   }
@@ -590,12 +590,12 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
         if (checkStr.includes("ice_harvester") || checkStr.includes("ice harvester")) {
           hasIceHarvester = true;
         }
-        if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo")) {
-          hasLeadLinedCargo = true;
-        }
-        if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester")) {
-          hasRadHarvester = true;
-        }
+if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo") || checkStr.includes("hazmat_cargo")) {
+        hasLeadLinedCargo = true;
+      }
+      if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester") || checkStr.includes("rad_harvesting")) {
+        hasRadHarvester = true;
+      }
       }
 
       const freshHasRadioactiveEquipment = hasLeadLinedCargo && hasRadHarvester;

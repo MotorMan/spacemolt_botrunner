@@ -25,6 +25,8 @@
  *   desiredRepairKits    — how many repair kits (advanced + regular) the bot tries to keep stocked (default: 12)
  *   Auto-uses repair kits (advanced_repair_kit preferred, then repair_kit) from cargo after fights when hull deficit > 100
  *   onlyNPCs        — only attack NPC pirates, never players (default: true)
+ *   ammoReloadAbsoluteThreshold — ammo count to reload when weapon has ≤50 total ammo (default: 1)
+ *   ammoReloadPercentThreshold — % of max ammo to reload when weapon has >50 total ammo (default: 25)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -136,6 +138,8 @@ function getHunterSettings(username?: string): {
   onlyNPCs: boolean;
   autoCloak: boolean;
   ammoThreshold: number;
+  ammoReloadAbsoluteThreshold: number;
+  ammoReloadPercentThreshold: number;
   maxReloadAttempts: number;
   responseRange: number;
   maxAttackTier: PirateTier;
@@ -180,6 +184,8 @@ function getHunterSettings(username?: string): {
     onlyNPCs: (h.onlyNPCs as boolean) !== false,
     autoCloak: (h.autoCloak as boolean) ?? false,
     ammoThreshold: (h.ammoThreshold as number) || 5,
+    ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) || 1,
+    ammoReloadPercentThreshold: (h.ammoReloadPercentThreshold as number) || 25,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
     responseRange: (h.responseRange as number) ?? 3,
     maxAttackTier: ((h.maxAttackTier as PirateTier) || "large") as PirateTier,
@@ -516,7 +522,8 @@ interface WeaponModule {
  * Handles both traditional ammo weapons and missile launchers.
  */
 /**
- * Ensure the hunter has ammo loaded. Only reloads when ammo <= 25% of max capacity.
+ * Ensure the hunter has ammo loaded.
+ * Uses absolute threshold for low-capacity weapons (≤10 ammo), percent threshold for high-capacity weapons (>10 ammo).
  * Uses proper reload command with weapon_instance_id and ammo_item_id from cargo.
  * Returns false if out of ammo and needs to dock for resupply.
  * 
@@ -971,7 +978,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         }
 
         // Pre-fight ammo check - use ensureAmmoLoaded since bot.ammo may not reflect module-level ammo
-        const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+        const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
         if (!hasAmmo) {
           ctx.log("combat", "Out of ammo — aborting patrol to resupply");
           abortPatrol = true;
@@ -1028,7 +1035,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           await scavengeWrecks(ctx);
 
           // Post-kill reload
-          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           if (!hasAmmo) {
             ctx.log("combat", "No ammo after kill — aborting patrol to resupply");
             abortPatrol = true;
@@ -1100,7 +1107,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       await repairShip(ctx);
 
       yield "reload";
-      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
 
       yield "fit_mods";
       const modProfile = getModProfile("hunter");
@@ -1346,7 +1353,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         await useRepairKits(ctx); // use cargo kits if hull deficit >100 before engaging
 
         // Pre-fight ammo check
-        const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+        const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
         if (!hasAmmo) {
           ctx.log("combat", "Out of ammo — aborting patrol to resupply");
           abortPatrol = true;
@@ -1403,7 +1410,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           }
 
           // Post-kill reload
-          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           if (!hasAmmo) {
             ctx.log("combat", "No ammo after kill — aborting patrol to resupply");
             abortPatrol = true;
@@ -1475,7 +1482,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       await repairShip(ctx);
 
       yield "reload";
-      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
 
       yield "fit_mods";
       const modProfile = getModProfile("hunter");
@@ -1656,7 +1663,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       await useRepairKits(ctx); // use cargo kits if hull deficit >100 before engaging
 
       // Pre-fight ammo check
-      const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+      const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
       if (!hasAmmo) {
         ctx.log("combat", "Out of ammo — aborting to resupply");
         break;
@@ -1705,7 +1712,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           }
 
           // Post-kill reload
-          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           if (!hasAmmo) {
             ctx.log("combat", "No ammo after kill — aborting to resupply");
             break;
@@ -1807,7 +1814,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
-          await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
           if (won) {
             totalKills++;
@@ -2183,7 +2190,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
-          await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
           if (won) {
             totalKills++;

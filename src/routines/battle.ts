@@ -233,10 +233,21 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
   return weapons;
 }
 
+/**
+ * Ensure the hunter has ammo loaded.
+ * Uses absolute threshold for low-capacity weapons (≤50 ammo), percent threshold for high-capacity weapons (>50 ammo).
+ * Uses proper reload command with weapon_instance_id and ammo_item_id from cargo.
+ * Returns false if out of ammo and needs to dock for resupply.
+ * 
+ * Handles both traditional weapons (with reported ammo) and missile launchers
+ * (which may not report ammo state but still need cargo ammo).
+ */
 export async function ensureAmmoLoaded(
   ctx: RoutineContext,
   _threshold: number,
   maxAttempts: number,
+  absoluteThreshold: number = 1,
+  percentThreshold: number = 25,
 ): Promise<boolean> {
   const { bot } = ctx;
   const weapons = await getWeaponModules(ctx);
@@ -260,9 +271,13 @@ export async function ensureAmmoLoaded(
 
     let needsReload = false;
     if (weapon.maxAmmo > 0) {
-      needsReload = weapon.currentAmmo <= Math.floor(weapon.maxAmmo * 0.25);
+      const absThreshold = weapon.maxAmmo <= 50 ? absoluteThreshold : 0;
+      const pctThreshold = weapon.maxAmmo > 50 ? percentThreshold : 0;
+      const absCheck = absThreshold > 0 ? weapon.currentAmmo <= absThreshold : false;
+      const pctCheck = pctThreshold > 0 ? weapon.currentAmmo <= Math.floor(weapon.maxAmmo * pctThreshold / 100) : false;
+      needsReload = absCheck || pctCheck;
       if (needsReload) {
-        ctx.log("combat", `Weapon "${weapon.name}" ammo low: ${weapon.currentAmmo}/${weapon.maxAmmo} (<=25%, type: ${weapon.ammoType})`);
+        ctx.log("combat", `Weapon "${weapon.name}" ammo low: ${weapon.currentAmmo}/${weapon.maxAmmo} (abs:${absThreshold}, pct:${pctThreshold}%)`);
       }
     } else {
       const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, weapon.ammoType);

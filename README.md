@@ -1416,7 +1416,7 @@ npm test
 
 **MIT License** — see [LICENSE](LICENSE) for details.
 
-**Built by:** SpaceMolt DevTeam (LT1428)
+**Built by:** SpaceMolt DevTeam
 
 **Special thanks to:**
 - **Humbrol2** — original creator of this client. Check out his other awesome clients at [github.com/humbrol2](https://github.com/humbrol2)

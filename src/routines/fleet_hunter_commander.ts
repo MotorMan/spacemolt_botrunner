@@ -339,6 +339,8 @@ interface FleetHunterSettings {
   minPiratesToFlee: number;
   autoCloak: boolean;
   ammoThreshold: number;
+  ammoReloadAbsoluteThreshold: number;
+  ammoReloadPercentThreshold: number;
   maxReloadAttempts: number;
   huntingEnabled: boolean;
   manualMode: boolean;
@@ -361,6 +363,8 @@ export function getFleetHunterSettings(): FleetHunterSettings {
     minPiratesToFlee: (h.minPiratesToFlee as number) || 3,
     autoCloak: (h.autoCloak as boolean) ?? false,
     ammoThreshold: (h.ammoThreshold as number) || 5,
+    ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) || 1,
+    ammoReloadPercentThreshold: (h.ammoReloadPercentThreshold as number) || 25,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
     huntingEnabled: (h.huntingEnabled as boolean) ?? true,
     manualMode: (h.manualMode as boolean) ?? false,
@@ -1451,7 +1455,7 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
           await scavengeWrecks(ctx);
 
           // Post-kill reload
-          const hasAmmo = await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts);
+          const hasAmmo = await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts, currentSettings.ammoReloadAbsoluteThreshold, currentSettings.ammoReloadPercentThreshold);
           if (!hasAmmo) {
             ctx.log("combat", "No ammo after kill — aborting patrol to resupply");
             abortPatrol = true;
@@ -1514,7 +1518,7 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
           await repairShip(ctx);
 
           yield "reload";
-          await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts);
+          await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts, currentSettings.ammoReloadAbsoluteThreshold, currentSettings.ammoReloadPercentThreshold);
 
           yield "fit_mods";
           const modProfile = getModProfile("hunter");
@@ -1874,14 +1878,14 @@ export const fleetHunterCommanderRoutine: Routine = async function* (ctx: Routin
       await scavengeWrecks(ctx);
 
       // Post-kill reload
-      const hasAmmo = await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts);
+      const hasAmmo = await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts, currentSettings.ammoReloadAbsoluteThreshold, currentSettings.ammoReloadPercentThreshold);
       if (!hasAmmo) {
         ctx.log("combat", "Out of ammo — ordering fleet retreat to resupply");
         await orderFleetRegroup(ctx, bot.system, bot.poi);
         const docked = await navigateToSafeStation(ctx, safetyOpts);
         if (docked) {
           await tryRefuel(ctx);
-          await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts);
+          await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts, currentSettings.ammoReloadAbsoluteThreshold, currentSettings.ammoReloadPercentThreshold);
           await ensureUndocked(ctx);
           await orderFleetMove(ctx, bot.system, bot.poi);
         }

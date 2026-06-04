@@ -507,29 +507,6 @@ function findNextHuntSystem(fromSystemId: string): string | null {
 
 // ── Ammo management ──────────────────────────────────────────
 
-interface WeaponModule {
-  instanceId: string;
-  moduleId: string;
-  name: string;
-  currentAmmo: number;
-  maxAmmo: number;
-  ammoType?: string;
-}
-
-/**
- * Fetch weapon modules from get_ship and return those with ammo info.
- * Looks up ammo_type from catalog using the module_id.
- * Handles both traditional ammo weapons and missile launchers.
- */
-/**
- * Ensure the hunter has ammo loaded.
- * Uses absolute threshold for low-capacity weapons (≤10 ammo), percent threshold for high-capacity weapons (>10 ammo).
- * Uses proper reload command with weapon_instance_id and ammo_item_id from cargo.
- * Returns false if out of ammo and needs to dock for resupply.
- * 
- * Handles both traditional weapons (with reported ammo) and missile launchers
- * (which may not report ammo state but still need cargo ammo).
- */
 // ── Faction alert response ────────────────────────────────────
 
 /** Cooldown per system so we don't divert repeatedly (5 minutes). */

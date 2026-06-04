@@ -1650,21 +1650,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
           actualMiningType = detected;
         } else {
-          actualMiningType = groupMiningType as "ore" | "gas" | "ice";
+          actualMiningType = groupMiningType as "ore" | "gas" | "ice" | "radioactive";
         }
         
-        const groupTarget = actualMiningType === "ice"
-          ? (flockGroup?.targetIce || settings.targetIce)
-          : (actualMiningType === "ore"
-            ? (flockGroup?.targetOre || settings.targetOre)
-            : (flockGroup?.targetGas || settings.targetGas));
+        const groupTarget: string = (() => {
+          if (actualMiningType === "ice") return (flockGroup?.targetIce || settings.targetIce || "") as string;
+          if (actualMiningType === "ore") return (flockGroup?.targetOre || settings.targetOre || "") as string;
+          if (actualMiningType === "radioactive") return (flockGroup?.targetRadioactive || settings.targetRadioactive || "") as string;
+          return (flockGroup?.targetGas || settings.targetGas || "") as string;
+        })();
 
         // CRITICAL FIX: Use type-specific system from flock group config if available
-        const groupSystem = actualMiningType === "ice"
-          ? (flockGroup?.systemIce || settings.systemIce || settings.system)
-          : (actualMiningType === "ore"
-            ? (flockGroup?.systemOre || settings.systemOre || settings.system)
-            : (flockGroup?.systemGas || settings.systemGas || settings.system));
+        const groupSystem: string = (() => {
+          if (actualMiningType === "ice") return (flockGroup?.systemIce || settings.systemIce || settings.system || "") as string;
+          if (actualMiningType === "ore") return (flockGroup?.systemOre || settings.systemOre || settings.system || "") as string;
+          if (actualMiningType === "radioactive") return (flockGroup?.systemRadioactive || settings.systemRadioactive || settings.system || "") as string;
+          return (flockGroup?.systemGas || settings.systemGas || settings.system || "") as string;
+        })();
 
         flockTargetResource = groupTarget || "";
         flockMiningType = actualMiningType;
@@ -1675,6 +1677,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
         if (deepCoreCap.canMineVisibleDeepCore && flockTargetResource && !isDeepCoreOre(flockTargetResource)) {
           ctx.log("flock", `Deep core miner — ignoring regular ore target "${flockTargetResource}", will search for deep core ores`);
+          flockTargetResource = "";
+        }
+
+        // RADIOACTIVE MINER RESTRICTION: Radioactive miners must mine radioactive ores only
+        // They should NEVER fall back to regular ores or gas
+        if (actualMiningType === "radioactive" && flockTargetResource && !isRadioactiveOre(flockTargetResource)) {
+          ctx.log("flock", `Radioactive miner — ignoring non-radioactive target "${flockTargetResource}", will search for radioactive ores`);
           flockTargetResource = "";
         }
 
@@ -1713,6 +1722,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           // Continue with solo mining
         } else {
           ctx.log("flock", `Following leader to: ${flockTargetPoiName || flockTargetSystemId || "TBD"} (${flockTargetResource || "any"}, ${flockMiningType})`);
+        }
+
+        // RADIOACTIVE MINER RESTRICTION: Radioactive miners must mine radioactive ores only
+        // They should NEVER fall back to regular ores or gas
+        if (flockMiningType === "radioactive" && flockTargetResource && !isRadioactiveOre(flockTargetResource)) {
+          ctx.log("flock", `Radioactive miner — ignoring non-radioactive target "${flockTargetResource}", will mine radioactive ores instead`);
+          // Don't clear the target - let the solo mining logic handle finding a radioactive target
         }
       }
     }
@@ -1792,7 +1808,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Smart target selection: when mining type is auto-detected, only use the
     // matching target field (no cross-type fallback). A gas harvester should
     // never be forced to mine ore just because targetGas is empty.
-    // When mining type is manually forced, fall back to other targets as backup.
+// When mining type is manually forced, fall back to other targets as backup.
+    // CRITICAL: Radioactive miners should NEVER mine regular ores - they must stay in radioactive mode
+    // Gas/Ice miners can fall back to other types if their primary target is unavailable
     let targetResource = "";
     let resourceLabel = "";
     const isAutoDetected = settings.miningType === "auto";
@@ -1804,7 +1822,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       targetResource = isAutoDetected ? (useDeepCore ? settings.targetDeepCore : settings.targetOre) : ( (useDeepCore ? settings.targetDeepCore : settings.targetOre) || settings.targetGas || settings.targetIce);
       resourceLabel = (targetResource === settings.targetGas && targetResource !== "") ? "gas" : (targetResource === settings.targetIce && targetResource !== "" ? "ice" : (targetResource === settings.targetDeepCore && targetResource !== "" ? "deep core" : "ore"));
     } else if (miningType === "radioactive") {
-      targetResource = isAutoDetected ? settings.targetRadioactive : (settings.targetRadioactive || settings.targetOre || settings.targetGas);
+      // Radioactive miners MUST mine radioactive ores only - no fallback to regular ores!
+      targetResource = isAutoDetected ? settings.targetRadioactive : settings.targetRadioactive;
       resourceLabel = "radioactive";
     } else {
       // gas
@@ -2274,8 +2293,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           effectiveTarget = flockTargetResource;
           ctx.log("mining", `Flock deep core target validated: ${flockTargetResource}`);
         }
+      } else if (isRadioactiveOre(flockTargetResource)) {
+        // Radioactive validation for flock target
+        if (miningType !== "radioactive") {
+          ctx.log("error", `Flock target ${flockTargetResource} is a radioactive ore — skipping (not in radioactive mode)`);
+          // Don't override effectiveTarget — continue with solo mining instead
+        } else {
+          effectiveTarget = flockTargetResource;
+          ctx.log("mining", `Flock radioactive target validated: ${flockTargetResource}`);
+        }
       } else {
-        effectiveTarget = flockTargetResource;
+        // Regular ore target - validate for radioactive miners
+        if (miningType === "radioactive") {
+          ctx.log("error", `Flock target ${flockTargetResource} is NOT a radioactive ore — skipping (radioactive miner must mine radioactive ores)`);
+          // Don't override effectiveTarget — continue with solo mining instead
+        } else {
+          effectiveTarget = flockTargetResource;
+        }
       }
     }
 

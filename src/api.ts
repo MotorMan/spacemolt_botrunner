@@ -769,6 +769,36 @@ export class SpaceMoltAPI {
       }
     }
 
+    // Remove invalid parameters for find_route (server now only accepts target_system)
+    if (command === 'find_route') {
+      delete body.target_poi;
+      delete body.target;
+    }
+
+    // Translate target_system -> id for jump
+    if (command === 'jump' && body.target_system !== undefined) {
+      body.id = body.target_system;
+      delete body.target_system;
+    }
+
+    // Translate target -> id for jump (alias)
+    if (command === 'jump' && body.target !== undefined && body.id === undefined) {
+      body.id = body.target;
+      delete body.target;
+    }
+
+    // Translate target_poi -> id for jump (alias for wormhole jumps)
+    if (command === 'jump' && body.target_poi !== undefined && body.id === undefined) {
+      body.id = body.target_poi;
+      delete body.target_poi;
+    }
+
+    // Translate target_poi -> id for travel
+    if (command === 'travel' && body.target_poi !== undefined) {
+      body.id = body.target_poi;
+      delete body.target_poi;
+    }
+
     if (tool === 'spacemolt_catalog') {
       url = `${this.baseUrl}/${tool}`;
     } else if (COMMANDS_WITH_PAYLOAD_ACTION.has(command) && payload?.action) {

@@ -7,7 +7,7 @@ import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
-import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions } from "../routines/fuelTransferTracking.js";
+import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive } from "../routines/fuelTransferTracking.js";
 
 function getLocalIp(): string | null {
   const interfaces = os.networkInterfaces();
@@ -1075,6 +1075,14 @@ export class WebServer {
               return Response.json({ error: "Loadout not found" }, { status: 404 });
             }
             return Response.json({ ok: true, name });
+          }
+
+          // PATCH /api/facility-transfer-loadouts/:name/active - Set loadout active state
+          if (url.pathname.match(/^\/api\/facility-transfer-loadouts\/[^/]+\/active$/) && req.method === "PATCH") {
+            const name = decodeURIComponent(url.pathname.slice("/api/facility-transfer-loadouts/".length, -"/active".length));
+            const body = await req.json() as { active: boolean };
+            setLoadoutActive(name, body.active);
+            return Response.json({ ok: true, name, active: body.active });
           }
 
           // GET /api/facility-transfer-completions?station=X - Get completions for a station

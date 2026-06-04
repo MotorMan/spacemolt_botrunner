@@ -178,7 +178,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   let needsRefuel = fuelPct < refuelThreshold;
   try {
-    const routeResp = await bot.exec("find_route", { target_system: homeSystem, target_poi: homeStation || undefined });
+    const routeResp = await bot.exec("find_route", { target_system: homeSystem });
     if (!routeResp.error && routeResp.result && typeof routeResp.result === "object") {
       const r = routeResp.result as any;
       const est = r.estimated_fuel ?? 0;

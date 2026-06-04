@@ -1,6 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { catalogStore } from "../catalogstore.js";
-import { updateFactionStorageCache } from "../factionStorageCache.js";
+import { updateFactionStorageCache, getFactionStorageCache, getFactionStorageCacheByStationOnly } from "../factionStorageCache.js";
 import {
   ensureDocked,
   tryRefuel,
@@ -11,39 +11,24 @@ import {
   scavengeWrecks,
   logFactionActivity,
 } from "./common.js";
+import {
+  calculateCraftingPlan,
+  calculateMultiGoalPlan,
+  formatCraftingPlan,
+  isRecipeCraftable as isRecipeCraftableNew,
+} from "./craft-goals.js";
 
 // ── Custom faction storage refresh for debugging ──
-
-async function refreshFactionStorageDirectly(ctx: RoutineContext, bot: any): Promise<void> {
-  const factionName = bot.faction;
-  const station = bot.poi;
-  if (!factionName) {
-    return;
-  }
-
-  const resp = await bot.exec("view_storage", { target: "faction" });
-
-  if (resp.result === null || resp.result === undefined) {
-    bot.factionStorage = [];
-    return;
-  }
-
-  const items = parseFactionStorageItems(resp.result);
-  bot.factionStorage = items;
-  updateFactionStorageCache(factionName, items, station);
-}
 
 function parseFactionStorageItems(result: unknown): Array<{itemId: string, name: string, quantity: number}> {
   if (!result || typeof result !== "object") return [];
 
   const r = result as Record<string, unknown>;
 
-  // Try different possible array locations
   let items: Array<Record<string, unknown>> = [];
   if (Array.isArray(r)) {
     items = r;
   } else {
-    // Check various possible field names
     const possibleFields = ['items', 'cargo', 'storage', 'stored_items', 'faction_items', 'faction_storage', 'data', 'result'];
     for (const field of possibleFields) {
       if (Array.isArray(r[field])) {
@@ -55,9 +40,7 @@ function parseFactionStorageItems(result: unknown): Array<{itemId: string, name:
 
   if (items.length === 0) return [];
 
-  // Parse each item
   return items.map((item) => {
-    // Try various field name patterns
     const itemId = (item.item_id as string) ||
                    (item.resource_id as string) ||
                    (item.id as string) ||
@@ -80,12 +63,43 @@ function parseFactionStorageItems(result: unknown): Array<{itemId: string, name:
     return { itemId, name, quantity };
   }).filter(i => i.itemId && i.quantity > 0);
 }
-import {
-  calculateCraftingPlan,
-  calculateMultiGoalPlan,
-  formatCraftingPlan,
-  isRecipeCraftable as isRecipeCraftableNew,
-} from "./craft-goals.js";
+
+async function refreshFactionStorageDirectly(ctx: RoutineContext, bot: any): Promise<void> {
+  const station = bot.poi;
+  const resp = await bot.exec("view_storage", { target: "faction" });
+
+  if (resp.error) {
+    if (bot.faction) {
+      ctx.log("craft", `Could not refresh faction storage: ${resp.error.message}`);
+    }
+    return;
+  }
+
+  if (resp.result === null || resp.result === undefined) {
+    bot.factionStorage = [];
+    return;
+  }
+
+  const result = resp.result as Record<string, unknown>;
+  const items = parseFactionStorageItems(result);
+
+  let factionName = (result.faction_name as string) || (result.faction_id as string) || bot.faction;
+  if (!factionName && station) {
+    const cached = getFactionStorageCacheByStationOnly(station);
+    if (cached) {
+      factionName = cached.factionName;
+    }
+  }
+  if (!factionName) {
+    return;
+  }
+
+  bot.factionStorage = items;
+  if (bot.faction !== factionName) {
+    bot.faction = factionName;
+  }
+  updateFactionStorageCache(factionName, items, station);
+}
 
 // ── Settings ─────────────────────────────────────────────────
 

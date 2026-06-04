@@ -265,7 +265,7 @@ export async function ensureAmmoLoaded(
   let anyReloaded = false;
   for (const weapon of weapons) {
     if (!weapon.ammoType) {
-      ctx.log("warn", `Weapon "${weapon.name}" has no ammo type defined — skipping`);
+      ctx.log("combat", `Weapon "${weapon.name}" does not use ammo — skipping reload check`);
       continue;
     }
 
@@ -331,19 +331,28 @@ export async function ensureAmmoLoaded(
   const updatedWeapons = await getWeaponModules(ctx);
   let updatedTotalAmmo = 0;
   let updatedTotalMaxAmmo = 0;
+  let hasAmmoWeapons = false;
 
   for (const weapon of updatedWeapons) {
-    updatedTotalAmmo += weapon.currentAmmo;
-    updatedTotalMaxAmmo += weapon.maxAmmo;
+    if (weapon.ammoType) {
+      hasAmmoWeapons = true;
+      updatedTotalAmmo += weapon.currentAmmo;
+      updatedTotalMaxAmmo += weapon.maxAmmo;
+    }
   }
 
-  if (updatedTotalMaxAmmo > 0) {
+  if (hasAmmoWeapons && updatedTotalMaxAmmo > 0) {
     const updatedPct = (updatedTotalAmmo / updatedTotalMaxAmmo) * 100;
     ctx.log("combat", `Post-reload ammo: ${updatedTotalAmmo}/${updatedTotalMaxAmmo} (${updatedPct.toFixed(0)}%)`);
     return updatedTotalAmmo > 0 || anyReloaded;
   }
 
-  return updatedTotalAmmo > 0 || anyReloaded;
+  if (hasAmmoWeapons) {
+    ctx.log("combat", `Post-reload ammo: ${updatedTotalAmmo} rounds available`);
+    return updatedTotalAmmo > 0 || anyReloaded;
+  }
+
+  return true;
 }
 
 // ── Emergency Flee ────────────────────────────────────────────

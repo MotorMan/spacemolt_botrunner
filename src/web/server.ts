@@ -564,10 +564,6 @@ export class WebServer {
           });
         }
         if (url.pathname === "/api/faction-storage") {
-          // Return faction shared warehouse contents for a specific station
-          // Supports two modes:
-          // 1. ?station=X&faction=Y (legacy - faction is faction name)
-          // 2. ?station=X (find by station ID, faction name from cache)
           const station = url.searchParams.get("station") || "";
           const factionName = url.searchParams.get("faction") || "";
           
@@ -577,9 +573,8 @@ export class WebServer {
             return Response.json({ items: [], factionName: "", station: "" });
           }
           
-          // If faction name is provided, use it directly (legacy mode)
           if (factionName) {
-            const factionStoragePath = join(CACHE_DIR, `${factionName}::${station || "default"}.json`);
+            const factionStoragePath = join(CACHE_DIR, `${factionName}--${station || "default"}.json`);
             if (!existsSync(factionStoragePath)) {
               return Response.json({ items: [], factionName, station });
             }
@@ -599,19 +594,40 @@ export class WebServer {
             }
           }
           
-          // Otherwise, find the cache file that matches the station ID
           try {
             const files = readdirSync(CACHE_DIR);
             for (const file of files) {
               if (!file.endsWith(".json")) continue;
-              const match = file.match(/^(.+)::(.+)\.json$/);
+              const match1 = file.match(/^(.+)::(.+)\.json$/);
+              const match2 = file.match(/^(.+)--(.+)\.json$/);
+              const match = match1 || match2;
               if (!match) continue;
               const [, fn, st] = match;
-              if (st === station || st === "default") {
+              if (st === station || (station === "" && st === "default")) {
                 const factionStoragePath = join(CACHE_DIR, file);
                 const raw = readFileSync(factionStoragePath, "utf-8");
                 const data = JSON.parse(raw);
                 const items = data.entries || data.items || [];
+                return Response.json({
+                  items,
+                  factionFuelReserve: data.factionFuelReserve || 0,
+                  factionFuelCapacity: data.factionFuelCapacity || 0,
+                  factionName: data.factionName,
+                  station: data.station,
+                });
+              }
+            }
+            for (const file of files) {
+              if (!file.endsWith(".json")) continue;
+              const match1 = file.match(/^(.+)::(.+)\.json$/);
+              const match2 = file.match(/^(.+)--(.+)\.json$/);
+              const match = match1 || match2;
+              if (!match) continue;
+              const factionStoragePath = join(CACHE_DIR, file);
+              const raw = readFileSync(factionStoragePath, "utf-8");
+              const data = JSON.parse(raw);
+              const items = data.entries || data.items || [];
+              if (items && items.length > 0) {
                 return Response.json({
                   items,
                   factionFuelReserve: data.factionFuelReserve || 0,
@@ -638,7 +654,10 @@ export class WebServer {
             const caches = files
               .filter(f => f.endsWith(".json"))
               .map(f => {
-                const match = f.match(/^(.+)::(.+)\.json$/);
+                // Try both formats: with :: and with --
+                const match1 = f.match(/^(.+)::(.+)\.json$/);
+                const match2 = f.match(/^(.+)--(.+)\.json$/);
+                const match = match1 || match2;
                 if (!match) return null;
                 const [, factionName, station] = match;
                 return { factionName, station };

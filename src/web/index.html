@@ -6175,8 +6175,8 @@ function fetchMarket(username) {
     const items = Array.isArray(d) ? d : (d.items || d.market || d.listings || []);
     profileMarket = items
       .map(i => ({
-        item_id: i.item_id || i.id || '',
-        name: i.name || i.item_id || i.id || '?',
+        item_id: i.itemId || i.item_id || i.id || '',
+        name: i.name || i.itemId || '',
         buy_price: i.buy_price ?? i.price ?? null,
         sell_price: i.sell_price ?? null,
         stock: i.stock ?? i.quantity ?? null,
@@ -12898,7 +12898,7 @@ function fetchFactionStorageForWithdraw(username) {
     }
     
     const opts = items.map(i => {
-      const id = i.item_id || i.id || '';
+      const id = i.itemId || i.item_id || i.id || '';
       const name = i.name || i.item_name || id;
       const qty = i.quantity || i.count || 0;
       return `<option value="${esc(id)}" data-max="${qty}">${esc(name)} (${qty})</option>`;
@@ -18136,8 +18136,8 @@ function loadCargoMoverFactionStorage() {
       // Faction storage is in result.data.items
       const items = Array.isArray(result.data.items) ? result.data.items : [];
       cmFactionItems = items.map(i => ({
-        itemId: i.item_id || i.id || '',
-        name: i.name || i.item_id || '',
+        itemId: i.itemId || i.item_id || i.id || '',
+        name: i.name || i.itemId || '',
         quantity: i.quantity || 0,
         category: i.category || ''
       })).filter(i => i.itemId && i.quantity > 0);
@@ -18176,8 +18176,8 @@ function loadCargoMoverPersonalStorage() {
       // Personal storage is in result.data.storage, but handle fallback cases
       const items = Array.isArray(d) ? d : (Array.isArray(d.storage) ? d.storage : (Array.isArray(d.items) ? d.items : []));
       cmPersonalItems = items.map(i => ({
-        itemId: i.item_id || i.id || '',
-        name: i.name || i.item_id || '',
+        itemId: i.itemId || i.item_id || i.id || '',
+        name: i.name || i.itemId || '',
         quantity: i.quantity || 0,
         category: i.category || ''
       })).filter(i => i.itemId && i.quantity > 0);
@@ -18532,8 +18532,8 @@ async function renderFuelTransportSettings(panel) {
       ${itemsList}
       <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <select id="ft-home-bot-select" style="flex:1;min-width:100px">${botOpts}</select>
-        <button class="sm" onclick="loadFuelTransferFactionStorage()">📥 Load from Docked Bot</button>
-        <button class="sm primary" onclick="loadFuelTransferFactionStorageFromCache()">💾 Load from Cache</button>
+        <button class="sm" onclick="loadFuelTransportFactionStorage()">📥 Load from Docked Bot</button>
+        <button class="sm primary" onclick="loadFuelTransportFactionStorageFromCache()">💾 Load from Cache</button>
       </div>
       <div style="font-size:10px;color:var(--dim);margin-top:4px">Select a bot docked at home, or load from the cached faction storage.</div>
       <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
@@ -18632,15 +18632,15 @@ async function loadFuelTransportFactionStorage() {
   const botName = botSel?.value;
   const bot = botName ? bots.find(b => b.username === botName) : null;
 
-  // Try to load from docked bot first
+  // Try to load from docked bot if one is selected and docked
   if (bot && bot.docked) {
     sendExec(botName, 'view_storage', { target: 'faction' }, (result) => {
       if (result.ok && result.data) {
         const d = result.data;
         const items = Array.isArray(d.items) ? d.items : [];
         ftFactionItems = items.map(i => ({
-          itemId: i.item_id || i.id || '',
-          name: i.name || i.item_id || '',
+          itemId: i.itemId || i.item_id || i.id || '',
+          name: i.name || i.itemId || '',
           quantity: i.quantity || 0
         })).filter(i => i.itemId && i.quantity > 0);
         renderFuelTransportSettings(document.getElementById('settingsContent'));
@@ -18653,22 +18653,21 @@ async function loadFuelTransportFactionStorage() {
 
   // Fall back to loading from disk cache using General Settings
   const general = settings.general || {};
-  const homeSystem = general.factionStorageSystem || '';
   const homeStation = general.factionStorageStation || '';
 
-  if (!homeSystem || !homeStation) {
+  if (!homeStation) {
     alert('No home station configured. Set General > Faction Storage Station, or select a docked bot.');
     return;
   }
 
   try {
-    const response = await fetch(`/api/faction-storage?station=${encodeURIComponent(homeStation)}&faction=${encodeURIComponent(homeSystem)}`);
+    const response = await fetch(`/api/faction-storage?station=${encodeURIComponent(homeStation)}`);
     if (response.ok) {
       const data = await response.json();
       const items = data.items || [];
       ftFactionItems = items.map(i => ({
-        itemId: i.item_id || i.id || '',
-        name: i.name || i.item_id || '',
+        itemId: i.itemId || i.item_id || i.id || '',
+        name: i.name || i.itemId || '',
         quantity: i.quantity || 0
       })).filter(i => i.itemId && i.quantity > 0);
       renderFuelTransportSettings(document.getElementById('settingsContent'));
@@ -18691,34 +18690,63 @@ function saveFuelTransportSettings() {
   settings.fuel_transport = s;
 }
 
-async function loadFuelTransferFactionStorageFromCache() {
+async function loadFuelTransportFactionStorageFromCache() {
+  // First, try to get the configured home station from General Settings
   const general = settings.general || {};
-  const homeSystem = general.factionStorageSystem || '';
   const homeStation = general.factionStorageStation || '';
 
-  if (!homeSystem || !homeStation) {
-    alert('No home station configured. Set General > Faction Storage Station first.');
-    return;
+  // If configured, try that first
+  if (homeStation) {
+    try {
+      const response = await fetch(`/api/faction-storage?station=${encodeURIComponent(homeStation)}`);
+      if (response.ok) {
+        const data = await response.json();
+        if (data.items && data.items.length > 0) {
+          const items = data.items;
+          ftFactionItems = items.map(i => ({
+            itemId: i.itemId || i.item_id || i.id || '',
+            name: i.name || i.itemId || '',
+            quantity: i.quantity || 0
+          })).filter(i => i.itemId && i.quantity > 0);
+          renderFuelTransportSettings(document.getElementById('settingsContent'));
+          alert(`Loaded ${ftFactionItems.length} items from faction storage cache (${data.factionName || 'unknown'} at ${homeStation}).`);
+          return;
+        }
+      }
+    } catch (e) {
+      console.log('[FT] Failed to load from configured station:', e);
+    }
   }
 
+  // Fall back to listing available caches and picking the first one with items
   try {
-    const response = await fetch(`/api/faction-storage?station=${encodeURIComponent(homeStation)}`);
+    const response = await fetch(`/api/faction-storage/list`);
     if (response.ok) {
       const data = await response.json();
-      if (data.items && data.items.length > 0) {
-        const items = data.items;
-        ftFactionItems = items.map(i => ({
-          itemId: i.item_id || i.id || '',
-          name: i.name || i.item_id || '',
-          quantity: i.quantity || 0
-        })).filter(i => i.itemId && i.quantity > 0);
-        renderFuelTransportSettings(document.getElementById('settingsContent'));
-        alert(`Loaded ${ftFactionItems.length} items from faction storage cache (${data.factionName || 'unknown'} at ${homeStation}).`);
-      } else {
-        alert('No items found in faction storage cache for the configured home station.');
+      const caches = data.caches || [];
+      console.log('[FT] Available caches:', caches);
+      
+      // Try each cache in order until we find one with items
+      for (const cache of caches) {
+        const cacheResponse = await fetch(`/api/faction-storage?station=${encodeURIComponent(cache.station)}`);
+        if (cacheResponse.ok) {
+          const cacheData = await cacheResponse.json();
+          if (cacheData.items && cacheData.items.length > 0) {
+            const items = cacheData.items;
+            ftFactionItems = items.map(i => ({
+              itemId: i.itemId || i.item_id || i.id || '',
+              name: i.name || i.itemId || '',
+              quantity: i.quantity || 0
+            })).filter(i => i.itemId && i.quantity > 0);
+            renderFuelTransportSettings(document.getElementById('settingsContent'));
+            alert(`Loaded ${ftFactionItems.length} items from faction storage cache (${cacheData.factionName || 'unknown'} at ${cache.station}).`);
+            return;
+          }
+        }
       }
+      alert('No faction storage caches with items found.');
     } else {
-      alert('Failed to load faction storage from cache');
+      alert('Failed to list faction storage caches');
     }
   } catch (e) {
     alert('Failed to load faction storage: ' + e.message);

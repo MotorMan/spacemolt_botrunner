@@ -19455,6 +19455,10 @@ const activeShip = shipyardShipData?.ship || shipyardShipData || {};
       const unloadBtn = canUnloadFromCarrier
         ? `<button class="sm" style="color:var(--cyan)" onclick="shipWithdrawFromCarrier('${esc(username)}','${esc(id)}','${escJs(name)}')" title="Unload from carrier">📤 Unload</button>`
         : '';
+      
+      const nameBtn = isActive
+        ? `<button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}')">Name Ship</button>`
+        : '';
 
       const storedInCarrierDisplay = storedInCarrierName || '';
 
@@ -19469,7 +19473,7 @@ const activeShip = shipyardShipData?.ship || shipyardShipData || {};
           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" onclick="shipSwitch('${esc(username)}','${esc(id)}')">Switch</button>` : ''}
           ${loadBtn}${unloadBtn}
           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" style="color:var(--red)" onclick="shipSell('${esc(username)}','${esc(id)}','${escJs(name)}')">Sell</button>` : ''}
-          ${giftDropdown}
+          ${giftDropdown}${nameBtn}
         </div>
       </div>`;
     }

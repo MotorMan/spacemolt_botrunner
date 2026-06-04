@@ -22,6 +22,7 @@ import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordina
 import { escortRoutine } from "./routines/escort.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
 import { fuelTransportRoutine } from "./routines/fuelTransfer.js";
+import { pathfinderTestRoutine } from "./routines/pathfinder_test.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
@@ -116,6 +117,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   return_home: { name: "ReturnHome", fn: returnHomeRoutine },
   command_receiver: { name: "CommandReceiver", fn: commandReceiverRoutine },
   escort: { name: "Escort", fn: escortRoutine },
+  pathfinder_test: { name: "PathfinderTest", fn: pathfinderTestRoutine },
 };
 
 // ── Auto-discover existing sessions ─────────────────────────

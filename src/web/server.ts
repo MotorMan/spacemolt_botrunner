@@ -274,6 +274,17 @@ export class WebServer {
     this.broadcastLog = mainLogs.broadcast.slice(-MAX_LOG_BUFFER);
     this.systemLog = mainLogs.system.slice(-MAX_LOG_BUFFER);
     this.factionLog = mainLogs.faction.slice(-MAX_LOG_BUFFER);
+    this.applyInitialLogSettings();
+  }
+
+  applyInitialLogSettings(): void {
+    const { setDebugLog, setActivityLog } = require("../debug.js");
+    if ((this.settings.general as Record<string, unknown>)?.disableDebugLog === true) {
+      setDebugLog(false);
+    }
+    if ((this.settings.general as Record<string, unknown>)?.disableActivityLog === true) {
+      setActivityLog(false);
+    }
   }
 
   /** Schedule save of main logs to disk (debounced). */
@@ -301,6 +312,19 @@ export class WebServer {
   saveRoutineSettings(routine: string, s: Record<string, unknown>): void {
     this.settings[routine] = s;
     saveSettings(this.settings);
+    this.applySettingsChanges(routine, s);
+  }
+
+  applySettingsChanges(routine: string, s: Record<string, unknown>): void {
+    if (routine === "general") {
+      const { setDebugLog, setActivityLog } = require("../debug.js");
+      if (s.disableDebugLog !== undefined) {
+        setDebugLog(!s.disableDebugLog);
+      }
+      if (s.disableActivityLog !== undefined) {
+        setActivityLog(!s.disableActivityLog);
+      }
+    }
   }
 
   /** Reload settings from disk and broadcast to all connected clients.

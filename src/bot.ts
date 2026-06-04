@@ -10,7 +10,7 @@ import { playerNameStore } from "./playernamestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
-import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, type PathfinderTravelRecord } from "./pathfinder.js";
+import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
@@ -1286,7 +1286,133 @@ docked = false;
     return null;
   }
 
-  /** Get the current cached level for a skill. Returns 0 if unknown. Call checkSkills() first to populate. */
+  async awaitNextTick(pollIntervalMs = 1000): Promise<number> {
+    const startTick = await this.pollCurrentTick();
+    if (startTick === null) throw new Error("Could not determine current tick");
+    while (this.state === "running") {
+      await new Promise(r => setTimeout(r, pollIntervalMs));
+      const nextTick = await this.pollCurrentTick();
+      if (nextTick !== null && nextTick > startTick) return nextTick;
+    }
+    throw new Error("Bot stopped while waiting for next tick");
+  }
+
+  async waitForTick(tickNumber: number, pollIntervalMs = 1000): Promise<boolean> {
+    while (this.state === "running") {
+      const current = await this.pollCurrentTick();
+      if (current !== null && current >= tickNumber) return true;
+      await new Promise(r => setTimeout(r, pollIntervalMs));
+    }
+    return false;
+  }
+
+  async performPathfinderJump(
+    targetSystemId: string
+  ): Promise<{ success: boolean; arrivedTick?: number; landing?: { systemId: string; ticks: number } }> {
+    if (!this.hasPathfinderDrive) {
+      await this.refreshShipMods();
+    }
+    if (!this.hasPathfinderDrive) {
+      this.log("error", "Pathfinder jump attempted without Pathfinder Drive module.");
+      return { success: false };
+    }
+
+    await this.refreshStatus();
+    const calculatedBearing = mapStore.calculatePathfinderBearing(
+      this.system,
+      targetSystemId
+    );
+    if (typeof calculatedBearing !== "number") {
+      this.log("error", `Could not calculate bearing to ${targetSystemId} from ${this.system}`);
+      return { success: false };
+    }
+
+    const bearing = calculatedBearing;
+    const landing = mapStore.simulatePathfinderLanding(this.system, bearing);
+    if (!landing) {
+      this.log("error", `No landing predicted for bearing ${bearing}° — aborting pathfinder jump`);
+      return { success: false };
+    }
+
+    const originTick = await this.pollCurrentTick();
+    this.log("travel", `Pathfinder jump: ${this.system} -> ${targetSystemId}, bearing ${bearing.toFixed(4)}°, ETA ${landing.ticks} ticks (${(landing.ticks * 10)}s)`);
+    this.log("travel", `Predicted landing on ${landing.systemId} (perp ${landing.perp.toFixed(1)}, proj ${landing.proj.toFixed(1)})`);
+
+    const travelRecord: PathfinderTravelRecord = {
+      botName: this.username,
+      originSystem: this.system,
+      originTick: originTick ?? 0,
+      initialBearing: bearing,
+      corrections: [],
+      lastPolledTick: originTick ?? 0,
+      status: "in_transit",
+      destinationSystem: targetSystemId,
+    };
+    setPathfinderTravelState(this.username, travelRecord as any);
+
+    const jumpResp = await this.exec("jump", { target_system: bearing });
+    if (jumpResp.error) {
+      this.log("error", `Pathfinder jump failed: ${jumpResp.error.message}`);
+      clearPathfinderTravel(this.username);
+      return { success: false };
+    }
+
+    const jr = jumpResp.result as Record<string, unknown> | undefined;
+    const arrivalSystemId = (jr?.arrival_system_id as string) || (jr?.system_id as string) || (jr?.from_system as string) || "";
+    const arrivalSystemName = (jr?.arrival_system as string) || (jr?.system as string) || (jr?.from_system as string) || "";
+    const exitPoi = (jr?.poi as string) || (jr?.exit_poi as string) || "";
+    if (arrivalSystemId || exitPoi) {
+      this.log("travel", `Jump result from server: system=${arrivalSystemName || '?'} (${arrivalSystemId}), exit_poi=${exitPoi || 'n/a'}`);
+      this.log("travel", `Intended destination: ${landing.systemId} (${targetSystemId}) — match: ${arrivalSystemId.toLowerCase() === landing.systemId.toLowerCase()}`);
+    } else {
+      this.log("warn", `Jump result did not contain arrival_system_id/system_id field. Raw result keys: ${jr ? Object.keys(jr).slice(0, 12).join(',') : 'undefined'}`);
+    }
+
+    const travelTime = mapStore.getPathfinderTravelTime(landing.proj);
+    const expectedArrivalTick = (originTick ?? 0) + travelTime.ticks;
+    let arrived = false;
+
+    for (let poll = 0; poll < travelTime.ticks + 20; poll++) {
+      await new Promise(r => setTimeout(r, 1000));
+      await this.refreshStatus();
+      const tick = await this.pollCurrentTick();
+      if (tick !== null) updatePathfinderTravelTick(this.username, tick);
+
+      const tickDelta = tick !== null ? tick - (originTick ?? 0) : null;
+      const ticksLeft = tick !== null ? expectedArrivalTick - tick : null;
+      if (poll % 5 === 0 || poll === 0) {
+        this.log("travel", `Pathfinder in transit — server_tick=${tick ?? '?'}, tick_since_jump=${tickDelta ?? '?'}, ticks_left=${ticksLeft ?? '?'}, polls=${poll}`);
+      }
+
+      const lowerCurrent = this.system.toLowerCase();
+      const lowerTarget = landing.systemId.toLowerCase();
+      if (lowerCurrent === lowerTarget || lowerCurrent === targetSystemId.toLowerCase()) {
+        arrived = true;
+        this.log("travel", `Pathfinder jump complete: arrived at ${this.system} on tick ${tick}`);
+        break;
+      }
+      if (tick !== null && tick >= expectedArrivalTick) {
+        this.log("warn", `Expected arrival tick ${expectedArrivalTick} reached — refreshing status to confirm`);
+        await this.refreshStatus();
+        if (this.system.toLowerCase() === landing.systemId.toLowerCase() || this.system.toLowerCase() === targetSystemId.toLowerCase()) arrived = true;
+        if (!arrived) break;
+      }
+    }
+
+    const existingRecord = getActivePathfinderTravel(this.username);
+    if (existingRecord) {
+      setPathfinderTravelState(this.username, {
+        ...existingRecord,
+        status: arrived ? "arrived" : "unknown",
+      });
+    }
+
+    if (!arrived) {
+      this.log("warn", "Pathfinder jump finished but arrival not confirmed via location polling");
+    }
+
+    return { success: arrived, arrivedTick: (await this.pollCurrentTick()) ?? undefined, landing: { systemId: landing.systemId, ticks: landing.ticks } };
+  }
   getSkillLevel(skillId: string): number {
     return this.skillLevels.get(skillId) ?? 0;
   }

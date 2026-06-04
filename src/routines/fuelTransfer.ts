@@ -30,6 +30,7 @@ import {
   getFactionStorageQuantity,
   getFactionStorageLastUpdated,
   updateFactionStorageFromDeposit,
+  refreshFactionStorageCache,
   getFacilityTransferLoadouts,
   isStationCompletedForLoadout,
   saveStationCompletion,
@@ -283,19 +284,17 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
     return;
   }
 
-  if (settings.items.length === 0) {
-    ctx.log("warn", "Fuel Transport: No items configured");
-    yield "no_items";
-    await ctx.sleep(60000);
-    return;
-  }
-
-ctx.log("fuel", `Fuel Transport started: ${settings.stations.length} stations, ${settings.items.length} items`);
+  ctx.log("fuel", `Fuel Transport started: ${settings.stations.length} stations`);
 
   const activeLoadouts = getActiveLoadouts();
   const useLoadoutMode = activeLoadouts.length > 0;
   if (useLoadoutMode) {
     ctx.log("fuel", `Loadout mode enabled: ${activeLoadouts.length} active loadout(s)`);
+  } else if (settings.items.length === 0) {
+    ctx.log("warn", "Fuel Transport: No items configured");
+    yield "no_items";
+    await ctx.sleep(60000);
+    return;
   }
 
   while (bot.state === "running") {
@@ -391,10 +390,11 @@ ctx.log("fuel", `Fuel Transport started: ${settings.stations.length} stations, $
     for (const { station, system: destSystem } of stationsToService) {
       const remoteStationId = extractStationId(station);
 
-      if (useLoadoutMode) {
-        const loadoutItems: Map<string, number> = new Map();
-        const applicableLoadouts: string[] = [];
+      const loadoutItems: Map<string, number> = new Map();
+      const applicableLoadouts: string[] = [];
+      const loadoutItemMap: Map<string, Set<string>> = new Map();
 
+      if (useLoadoutMode) {
         for (const loadout of activeLoadouts) {
           if (isStationCompletedForLoadout(remoteStationId, loadout.name)) {
             ctx.log("fuel", `${remoteStationId}: Already completed for loadout "${loadout.name}" — skipping`);
@@ -402,49 +402,53 @@ ctx.log("fuel", `Fuel Transport started: ${settings.stations.length} stations, $
           }
 
           applicableLoadouts.push(loadout.name);
+          loadoutItemMap.set(loadout.name, new Set());
           for (const item of loadout.items) {
             const currentQty = await getRemoteFactionQty(bot, remoteStationId, item.itemId);
             if (currentQty < item.targetQuantity) {
+              loadoutItemMap.get(loadout.name)!.add(item.itemId);
               const existing = loadoutItems.get(item.itemId) || 0;
-              loadoutItems.set(item.itemId, Math.max(existing, item.targetQuantity));
+              loadoutItems.set(item.itemId, existing + item.targetQuantity);
             }
           }
         }
 
-        if (loadoutItems.size === 0) {
-          ctx.log("fuel", `${remoteStationId}: All active loadouts completed — skipping station`);
+        if (loadoutItems.size > 0) {
+          allAtTarget = false;
+          const deliveredItems: { itemId: string; quantity: number }[] = [];
+          
+          for (const [itemId, targetQty] of loadoutItems) {
+            const item = settings.items.find(i => i.itemId === itemId) || { itemId, itemName: itemId, targetQuantity: targetQty };
+            const result = await processItemTransfer(ctx, bot, item, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts, new Set());
+            if (result) deliveredItems.push({ itemId: result.itemId, quantity: result.qty });
+          }
+
+          if (deliveredItems.length > 0 && applicableLoadouts.length > 0) {
+            for (const loadoutName of applicableLoadouts) {
+              const loadoutItemIds = loadoutItemMap.get(loadoutName)!;
+              const loadoutDeliveredItems = deliveredItems.filter(i => loadoutItemIds.has(i.itemId));
+              saveStationCompletion(remoteStationId, loadoutName, loadoutDeliveredItems);
+            }
+          }
+        }
+      }
+
+      const processedItemIds = new Set(loadoutItems.keys());
+      for (const item of settings.items) {
+        if (processedItemIds.has(item.itemId)) continue;
+        
+        const { cachedQty, currentQty } = await getItemStatus(ctx, bot, remoteStationId, item.itemId);
+        if (currentQty >= item.targetQuantity) {
+          ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ✓`);
           continue;
         }
 
+        const strategy = determineTransferStrategy(cachedQty, currentQty, item.targetQuantity);
+        ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ${strategy.reason}`);
+        if (strategy.skip) continue;
+
         allAtTarget = false;
-        const deliveredItems: { itemId: string; quantity: number }[] = [];
-        
-        for (const [itemId, targetQty] of loadoutItems) {
-          const item = settings.items.find(i => i.itemId === itemId) || { itemId, itemName: itemId, targetQuantity: targetQty };
-          const result = await processItemTransfer(ctx, bot, item, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts, new Set());
-          if (result) deliveredItems.push({ itemId: result.itemId, quantity: result.qty });
-        }
-
-        if (deliveredItems.length > 0 && applicableLoadouts.length > 0) {
-          for (const loadoutName of applicableLoadouts) {
-            saveStationCompletion(remoteStationId, loadoutName, deliveredItems);
-          }
-        }
-      } else {
-        for (const item of settings.items) {
-          const { cachedQty, currentQty } = await getItemStatus(ctx, bot, remoteStationId, item.itemId);
-          if (currentQty >= item.targetQuantity) {
-            ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ✓`);
-            continue;
-          }
-
-          const strategy = determineTransferStrategy(cachedQty, currentQty, item.targetQuantity);
-          ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ${strategy.reason}`);
-          if (strategy.skip) continue;
-
-          allAtTarget = false;
-          await processItemTransfer(ctx, bot, item, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts, new Set());
-        }
+        await processItemTransfer(ctx, bot, item, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts, new Set());
       }
     }
 
@@ -621,14 +625,27 @@ async function getItemStatus(
 ): Promise<{ cachedQty: number; currentQty: number; hasCache: boolean }> {
   const cachedQty = getFactionStorageQuantity(remoteStationId, itemId);
   const cachedLastUpdated = getFactionStorageLastUpdated(remoteStationId);
+  const CACHE_MAX_AGE = 10 * 60 * 1000;
   const hasCache = cachedLastUpdated > 0;
+  const isCacheFresh = hasCache && (Date.now() - cachedLastUpdated) < CACHE_MAX_AGE;
 
   let currentQty: number;
-  if (hasCache) {
+  const isAtStation = bot.poi === remoteStationId && bot.system === resolveStationSystem(remoteStationId);
+  if (hasCache && isAtStation) {
+    currentQty = await getRemoteFactionQty(bot, remoteStationId, itemId);
+    if (currentQty !== cachedQty) {
+      ctx.log("fuel", `Faction storage cache for ${remoteStationId}: ${itemId} refreshed ${cachedQty} -> ${currentQty}`);
+    }
+  } else if (isCacheFresh && !isAtStation) {
     currentQty = cachedQty;
     ctx.log("fuel", `Using faction storage cache for ${remoteStationId}: ${itemId} = ${currentQty}`);
   } else {
     currentQty = await getRemoteFactionQty(bot, remoteStationId, itemId);
+    if (!hasCache) {
+      ctx.log("fuel", `No cache for ${remoteStationId}: ${itemId} = ${currentQty}`);
+    } else {
+      ctx.log("fuel", `Cache stale for ${remoteStationId}: ${itemId} ${cachedQty} -> ${currentQty}`);
+    }
   }
 
   return { cachedQty, currentQty, hasCache };

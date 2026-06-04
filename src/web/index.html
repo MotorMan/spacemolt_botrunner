@@ -2299,6 +2299,39 @@ function renderProfileTopbar() {
     }
   }
 
+  // Per-bot pathfinder_test settings (visible when pathfinder_test is selected or running)
+  const isPathfinderTest = (bot.state === 'running' && bot.routine === 'pathfinder_test')
+    || (bot.state !== 'running' && bot.state !== 'stopping' && getProfileSelectedRoutine() === 'pathfinder_test');
+  if (isPathfinderTest) {
+    const botSettings = settings[bot.username] || {};
+    const originSystem = botSettings.originSystem || 'sol';
+    const targetSystem = botSettings.targetSystem || 'alpha';
+    const refuelThreshold = botSettings.refuelThreshold ?? 50;
+    const sysOpts = [`<option value=""${!originSystem ? ' selected' : ''}>(current)</option>`];
+    for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+      const sel = sys.id === originSystem ? ' selected' : '';
+      sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+    }
+    if (originSystem && !knownSystems.find(s => s.id === originSystem)) {
+      sysOpts.push(`<option value="${esc(originSystem)}" selected>${esc(originSystem)}</option>`);
+    }
+    const targetOpts = [`<option value=""${!targetSystem ? ' selected' : ''}>(none)</option>`];
+    for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+      const sel = sys.id === targetSystem ? ' selected' : '';
+      targetOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+    }
+    if (targetSystem && !knownSystems.find(s => s.id === targetSystem)) {
+      targetOpts.push(`<option value="${esc(targetSystem)}" selected>${esc(targetSystem)}</option>`);
+    }
+    actions += `
+      <span class="profile-ore-label">Origin System:</span>
+      <select id="profile-pathfinderOrigin" onchange="saveProfilePathfinderOrigin()" style="width:auto;padding:2px 6px;font-size:11px">${sysOpts.join('')}</select>
+      <span class="profile-ore-label" style="margin-left:8px">Target System:</span>
+      <select id="profile-pathfinderTarget" onchange="saveProfilePathfinderTarget()" style="width:auto;padding:2px 6px;font-size:11px">${targetOpts.join('')}</select>
+      <span class="profile-ore-label" style="margin-left:8px">Refuel %:</span>
+      <input type="number" id="profile-pathfinderRefuel" value="${refuelThreshold}" min="10" max="90" style="width:60px" onchange="saveProfilePathfinderRefuel()">`;
+  }
+
   // Per-bot hunter mode selector (visible when hunter is selected or running)
   const isHunter = (bot.state === 'running' && bot.routine === 'hunter')
     || (bot.state !== 'running' && bot.state !== 'stopping' && getProfileSelectedRoutine() === 'hunter');
@@ -2650,6 +2683,42 @@ function saveProfileGroupUnknowns() {
   const groupUnknowns = sel.value === 'true';
   const existing = settings[bot.username] || {};
   const updated = Object.assign({}, existing, { groupUnknowns });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfilePathfinderOrigin() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const sel = document.getElementById('profile-pathfinderOrigin');
+  if (!sel) return;
+  const originSystem = sel.value;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { originSystem });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfilePathfinderTarget() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const sel = document.getElementById('profile-pathfinderTarget');
+  if (!sel) return;
+  const targetSystem = sel.value;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { targetSystem });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfilePathfinderRefuel() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const inp = document.getElementById('profile-pathfinderRefuel');
+  if (!inp) return;
+  const refuelThreshold = parseInt(inp.value, 10) || 50;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { refuelThreshold });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
 }
@@ -7530,12 +7599,8 @@ function renderSettingsPanel() {
     renderHunterSettings(panel);
   } else if (activeSettingsTab === 'escort') {
     renderEscortSettings(panel);
-  } else if (activeSettingsTab === 'fleet_hunter') {
-    renderFleetHunterSettings(panel);
-  } else if (activeSettingsTab === 'cargo_mover') {
-    renderCargoMoverSettings(panel);
-  } else if (activeSettingsTab === 'fuel_transport') {
-    renderFuelTransportSettings(panel);
+  } else if (activeSettingsTab === 'pathfinder_test') {
+    renderPathfinderTestSettings(panel);
   }
 }
 
@@ -7708,17 +7773,33 @@ function renderGeneralSettings(panel) {
        </div>
      </div>
 
-     <div class="setting-row">
-       <div>
-         <div class="setting-label">Jump Timeout Buffer</div>
-         <div class="setting-hint">Additional buffer time added to all jump timeouts (10s = 1 game tick default).</div>
+<div class="setting-row">
+        <div>
+          <div class="setting-label">Jump Timeout Buffer</div>
+          <div class="setting-hint">Additional buffer time added to all jump timeouts (10s = 1 game tick default).</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="number" id="set-general-jumpBuffer" min="0" max="60" step="5" value="${general.jumpBuffer ?? 10}" style="width:80px" />
+          <span style="color:var(--text-secondary);font-size:12px">s buffer</span>
+        </div>
        </div>
-       <div style="display:flex;align-items:center;gap:8px">
-         <input type="number" id="set-general-jumpBuffer" min="0" max="60" step="5" value="${general.jumpBuffer ?? 10}" style="width:80px" />
-         <span style="color:var(--text-secondary);font-size:12px">s buffer</span>
-       </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Disable Debug Log</div>
+          <div class="setting-hint">Disable writing to debug log files (data/logs/{botName}_debug.log). Activity logs remain unaffected.</div>
+        </div>
+        <input type="checkbox" id="set-general-disableDebugLog" ${general.disableDebugLog ? 'checked' : ''} />
       </div>
- 
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Disable Activity Log</div>
+          <div class="setting-hint">Disable writing to activity log files (data/logs/activity/{botName}_activity.log). Debug logs remain unaffected.</div>
+        </div>
+        <input type="checkbox" id="set-general-disableActivityLog" ${general.disableActivityLog ? 'checked' : ''} />
+      </div>
+  
       <div class="settings-save-bar">
         <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
       </div>
@@ -7754,6 +7835,8 @@ function saveGeneralSettings() {
     jumpSpeed6: parseInt(document.getElementById('set-general-jumpSpeed6').value) || 30,
     jumpBuffer: parseInt(document.getElementById('set-general-jumpBuffer').value) || 10,
     approvedFuelStations,
+    disableDebugLog: document.getElementById('set-general-disableDebugLog').checked,
+    disableActivityLog: document.getElementById('set-general-disableActivityLog').checked,
   };
   send({ type: 'saveSettings', routine: 'general', settings: s });
 }
@@ -17383,6 +17466,75 @@ function saveEscortSettings() {
   };
   send({ type: 'saveSettings', routine: 'escort', settings: s });
   settings.escort = s;
+}
+
+// ── Pathfinder Test settings ─────────────────────────────────────
+function renderPathfinderTestSettings(panel) {
+  const p = settings.pathfinder_test || {};
+  const originSystem = p.originSystem || 'sol';
+  const targetSystem = p.targetSystem || 'alpha';
+  const refuelThreshold = p.refuelThreshold ?? 50;
+
+  const sysOpts = ['<option value="">(current system)</option>'];
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+    const sel = sys.id === originSystem ? ' selected' : '';
+    sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+  }
+  if (originSystem && !knownSystems.find(s => s.id === originSystem)) {
+    sysOpts.push(`<option value="${esc(originSystem)}" selected>${esc(originSystem)} (custom)</option>`);
+  }
+
+  const targetOpts = ['<option value="">(none)</option>'];
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+    const sel = sys.id === targetSystem ? ' selected' : '';
+    targetOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+  }
+  if (targetSystem && !knownSystems.find(s => s.id === targetSystem)) {
+    targetOpts.push(`<option value="${esc(targetSystem)}" selected>${esc(targetSystem)} (custom)</option>`);
+  }
+
+  panel.innerHTML = `
+    <h3>Pathfinder Test Settings</h3>
+    <div class="settings-desc">Configure the pathfinder test routine: navigate to an origin system, then perform a single line-of-sight Pathfinder jump to a target.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Origin System</div>
+        <div class="setting-hint">System to navigate to before performing the Pathfinder jump. Leave as "(current system)" to skip the pre-jump travel phase.</div>
+      </div>
+      <select id="set-pathfinder_test-originSystem">${sysOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Target System</div>
+        <div class="setting-hint">Target system for the Pathfinder jump. Must be within line-of-sight from the origin.</div>
+      </div>
+      <select id="set-pathfinder_test-targetSystem">${targetOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Minimum fuel percentage before attempting jumps.</div>
+      </div>
+      <input type="number" id="set-pathfinder_test-refuelThreshold" min="10" max="90" value="${refuelThreshold}">
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="savePathfinderTestSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function savePathfinderTestSettings() {
+  const s = {
+    originSystem: document.getElementById('set-pathfinder_test-originSystem').value || 'sol',
+    targetSystem: document.getElementById('set-pathfinder_test-targetSystem').value || 'alpha',
+    refuelThreshold: parseInt(document.getElementById('set-pathfinder_test-refuelThreshold').value) || 50,
+  };
+  send({ type: 'saveSettings', routine: 'pathfinder_test', settings: s });
+  settings.pathfinder_test = s;
 }
 
 // ── Fleet Hunter settings ─────────────────────────────────────

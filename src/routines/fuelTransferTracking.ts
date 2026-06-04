@@ -169,6 +169,29 @@ export function updateFactionStorageFromDeposit(
   }
 }
 
+export function refreshFactionStorageCache(
+  station: string,
+  factionName: string,
+  items: { itemId: string; quantity: number; name?: string }[]
+): void {
+  try {
+    const sanitized = station.replace(/::/g, "--").replace(/[^a-zA-Z0-9\-_]/g, "_");
+    const now = Date.now();
+    
+    const record: FactionStorageRecord = {
+      factionName,
+      station,
+      lastUpdated: now,
+      entries: items.map(i => ({ itemId: i.itemId, quantity: i.quantity, name: i.name })),
+    };
+    
+    if (!existsSync(FACTION_STORAGE_DIR)) mkdirSync(FACTION_STORAGE_DIR, { recursive: true });
+    writeFileSync(join(FACTION_STORAGE_DIR, `${sanitized}.json`), JSON.stringify(record, null, 2), "utf-8");
+  } catch (err) {
+    console.warn(`Error refreshing faction storage cache for ${station}:`, err);
+  }
+}
+
 function ensureBot(botUsername: string): FuelTransferBotData {
   const data = loadFuelTransferData();
   if (!data.bots[botUsername]) {

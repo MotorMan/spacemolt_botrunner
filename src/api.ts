@@ -19,7 +19,7 @@ export interface ApiResponse {
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
-const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-6-2-26-Cow-Version";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-6-3-26-Cow-Version";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;

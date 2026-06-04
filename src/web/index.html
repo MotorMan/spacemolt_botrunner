@@ -397,7 +397,16 @@
             <option value="updated">Last Updated</option>
             <option value="name">Name</option>
             <option value="pois">Most POIs</option>
+            <option value="jumps">Most Jumps</option>
             <option value="security">Security Level</option>
+            <option value="" disabled style="font-weight:500;color:var(--text-dim)">— Ore Sorting —</option>
+            <option value="ore_richness">&nbsp; Highest Richness</option>
+            <option value="ore_amount">&nbsp; Most Available</option>
+            <option value="ore_newest">&nbsp; Recently Scanned</option>
+            <option value="ore_best_station">&nbsp; Best Station Price</option>
+            <option value="" disabled style="font-weight:500;color:var(--text-dim)">— Combo Sorting —</option>
+            <option value="ore_amount_jumps">&nbsp; Most Available + Fewest Jumps</option>
+            <option value="ore_price_jumps">&nbsp; Best Price + Fewest Jumps</option>
           </select>
           <div style="margin-top:12px;border-top:1px solid #21262d;padding-top:10px">
             <button class="sm" style="width:100%" onclick="switchTab('market')">Market Overview</button>
@@ -7050,6 +7059,123 @@ function poiIcon(type) {
   return '&#8226;'; // bullet
 }
 
+/** Get the best (highest) richness for a specific ore across all POIs in a system */
+function getBestOreRichness(sys, oreIds) {
+  if (!oreIds || oreIds.size === 0) return 0;
+  let bestRichness = 0;
+  for (const poi of (sys.pois || [])) {
+    for (const res of (poi.resources || [])) {
+      if (oreIds.has(res.resource_id) && (res.richness || 0) > bestRichness) {
+        bestRichness = res.richness;
+      }
+    }
+    for (const ore of (poi.ores_found || [])) {
+      if (oreIds.has(ore.item_id) && (ore.richness || 0) > bestRichness) {
+        bestRichness = ore.richness;
+      }
+    }
+  }
+  return bestRichness;
+}
+
+/** Get total amount available for a specific ore across all POIs in a system */
+function getOreTotalAmount(sys, oreIds) {
+  if (!oreIds || oreIds.size === 0) return 0;
+  let total = 0;
+  for (const poi of (sys.pois || [])) {
+    for (const res of (poi.resources || [])) {
+      if (oreIds.has(res.resource_id)) {
+        total += res.remaining || 0;
+      }
+    }
+    for (const ore of (poi.ores_found || [])) {
+      if (oreIds.has(ore.item_id)) {
+        total += ore.amount || 0;
+      }
+    }
+  }
+  return total;
+}
+
+/** Get most recent scan time for a specific ore (for "newest first" sorting) */
+function getBestOreScanTime(sys, oreIds) {
+  if (!oreIds || oreIds.size === 0) return 0;
+  let newestTime = 0;
+  for (const poi of (sys.pois || [])) {
+    for (const res of (poi.resources || [])) {
+      if (oreIds.has(res.resource_id) && res.last_scanned) {
+        const t = new Date(res.last_scanned).getTime();
+        if (t > newestTime) newestTime = t;
+      }
+    }
+    for (const ore of (poi.ores_found || [])) {
+      if (oreIds.has(ore.item_id) && ore.last_scanned) {
+        const t = new Date(ore.last_scanned).getTime();
+        if (t > newestTime) newestTime = t;
+      }
+    }
+  }
+  return newestTime;
+}
+
+/** Get best price for a specific ore (highest sell price to station) */
+function getBestOrePrice(sys, oreIds) {
+  if (!oreIds || oreIds.size === 0) return 0;
+  let bestPrice = 0;
+  for (const poi of (sys.pois || [])) {
+    // Check market data for sell prices (station buys from us)
+    if (poi.market) {
+      for (const m of poi.market) {
+        if (oreIds.has(m.item_id) && (m.best_buy || 0) > bestPrice) {
+          bestPrice = m.best_buy;
+        }
+      }
+    }
+  }
+  return bestPrice;
+}
+
+/** Build adjacency list for system jumps */
+function buildJumpGraph() {
+  const graph = new Map();
+  for (const [sysId, sys] of Object.entries(mapData)) {
+    if (!graph.has(sysId)) graph.set(sysId, []);
+    for (const conn of (sys.connections || [])) {
+      const targetId = conn.system_id;
+      if (targetId && !graph.get(sysId).includes(targetId)) {
+        graph.get(sysId).push(targetId);
+      }
+    }
+  }
+  return graph;
+}
+
+/** BFS to find shortest path length between systems */
+function bfsShortestPath(graph, startId, targetId) {
+  if (startId === targetId) return 0;
+  const visited = new Set([startId]);
+  const queue = [{ id: startId, dist: 0 }];
+  while (queue.length > 0) {
+    const { id, dist } = queue.shift();
+    for (const neighbor of (graph.get(id) || [])) {
+      if (neighbor === targetId) return dist + 1;
+      if (!visited.has(neighbor)) {
+        visited.add(neighbor);
+        queue.push({ id: neighbor, dist: dist + 1 });
+      }
+    }
+  }
+  return Infinity;
+}
+
+/** Get number of jumps from a system to the home base (faction storage station) */
+function getJumpsFromHome(sysId) {
+  const graph = buildJumpGraph();
+  const homeSystem = settings.general?.factionStorageSystem || '';
+  if (!homeSystem) return 0;
+  return bfsShortestPath(graph, sysId, homeSystem);
+}
+
 function renderMap() {
   const container = document.getElementById('mapContent');
   if (!container) return;
@@ -7108,7 +7234,55 @@ function renderMap() {
     if (sortBy === 'name') return (a.name || a.id || '').localeCompare(b.name || b.id || '');
     if (sortBy === 'updated') return (b.last_updated || '').localeCompare(a.last_updated || '');
     if (sortBy === 'pois') return (b.pois || []).length - (a.pois || []).length;
+    if (sortBy === 'jumps') return (b.connections || []).length - (a.connections || []).length;
     if (sortBy === 'security') return securityOrder(a.security_level) - securityOrder(b.security_level);
+    
+    // Ore-specific sorting (only meaningful when an ore is selected)
+    if (sortBy === 'ore_richness') {
+      const aRich = getBestOreRichness(a, activeOreFilters);
+      const bRich = getBestOreRichness(b, activeOreFilters);
+      return bRich - aRich;
+    }
+    if (sortBy === 'ore_amount') {
+      const aAmt = getOreTotalAmount(a, activeOreFilters);
+      const bAmt = getOreTotalAmount(b, activeOreFilters);
+      return bAmt - aAmt;
+    }
+    if (sortBy === 'ore_newest') {
+      const aTime = getBestOreScanTime(a, activeOreFilters);
+      const bTime = getBestOreScanTime(b, activeOreFilters);
+      return bTime - aTime;
+    }
+    if (sortBy === 'ore_best_station') {
+      const aPrice = getBestOrePrice(a, activeOreFilters);
+      const bPrice = getBestOrePrice(b, activeOreFilters);
+      return bPrice - aPrice;
+    }
+    
+    // Combo sorting: Most Available + Fewest Jumps from home base
+    if (sortBy === 'ore_amount_jumps') {
+      const aAmt = getOreTotalAmount(a, activeOreFilters);
+      const bAmt = getOreTotalAmount(b, activeOreFilters);
+      const aJumps = getJumpsFromHome(a.id);
+      const bJumps = getJumpsFromHome(b.id);
+      // Primary: most available (descending)
+      if (bAmt !== aAmt) return bAmt - aAmt;
+      // Secondary: fewest jumps (ascending)
+      return aJumps - bJumps;
+    }
+    
+    // Combo sorting: Best Price + Fewest Jumps from home base
+    if (sortBy === 'ore_price_jumps') {
+      const aPrice = getBestOrePrice(a, activeOreFilters);
+      const bPrice = getBestOrePrice(b, activeOreFilters);
+      const aJumps = getJumpsFromHome(a.id);
+      const bJumps = getJumpsFromHome(b.id);
+      // Primary: best price (descending)
+      if (bPrice !== aPrice) return bPrice - aPrice;
+      // Secondary: fewest jumps (ascending)
+      return aJumps - bJumps;
+    }
+    
     return 0;
   });
 
@@ -7140,6 +7314,39 @@ function renderMap() {
     const poiCount = pois.length;
     const connections = sys.connections || [];
     const updated = sys.last_updated ? new Date(sys.last_updated).toLocaleDateString() : 'Never';
+    
+    // Ore-specific summary when an ore is selected
+    let oreSummary = '';
+    if (filterOres && activeOreFilters.size > 0) {
+      const bestRichness = getBestOreRichness(sys, activeOreFilters);
+      const totalAmount = getOreTotalAmount(sys, activeOreFilters);
+      const newestScan = getBestOreScanTime(sys, activeOreFilters);
+      const bestPrice = getBestOrePrice(sys, activeOreFilters);
+      const homeJumps = getJumpsFromHome(sys.id);
+      
+      const richnessStr = bestRichness > 0 ? `${bestRichness}%` : '-';
+      const amountStr = totalAmount > 0 ? totalAmount.toLocaleString() : '-';
+      const priceStr = bestPrice > 0 ? `${bestPrice.toLocaleString()}cr` : '-';
+      
+      const newestStr = newestScan > 0 
+        ? Math.floor((Date.now() - newestScan) / 60000) + 'm ago' 
+        : '-';
+      
+      const homeJumpsStr = homeJumps === Infinity ? 'Unreachable' : `${homeJumps} jump${homeJumps !== 1 ? 's' : ''}`;
+      
+      oreSummary = `
+        <div class="sys-ore-summary" style="margin-top:8px;padding:8px;background:rgba(79,195,247,0.08);border-radius:4px;border:1px solid rgba(79,195,247,0.2)">
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px;font-weight:500">Ore Analysis (${[...activeOreFilters].map(id => catalog.items[id]?.name || catalogName(id) || id).join(', ')})</div>
+          <div style="display:flex;gap:12px;font-size:11px">
+            <span><span style="color:var(--text-dim)">Richness:</span> <span style="color:var(--text-bright)">${richnessStr}</span></span>
+            <span><span style="color:var(--text-dim)">Amount:</span> <span style="color:var(--text-bright)">${amountStr}</span></span>
+            <span><span style="color:var(--text-dim)">Best Price:</span> <span style="color:var(--text-bright)">${priceStr}</span></span>
+            <span><span style="color:var(--text-dim)">Latest:</span> <span style="color:var(--text-bright)">${newestStr}</span></span>
+            <span><span style="color:var(--text-dim)">From Home:</span> <span style="color:var(--text-bright)">${homeJumpsStr}</span></span>
+          </div>
+        </div>
+      `;
+    }
 
     html += `
       <div class="sys-card" data-sys="${esc(sys.id)}">
@@ -7156,6 +7363,7 @@ function renderMap() {
           </div>
         </div>
         <div class="sys-body">
+          ${oreSummary}
           <div class="sys-connections">
             <span class="conn-label">Connections:</span>
             ${connections.length > 0 ? connections.map(c => {
@@ -7240,13 +7448,26 @@ function renderMap() {
   }
 
   container.innerHTML = html;
+
+  // Restore expanded state for system cards
+  for (const sysId of expandedSystems) {
+    const card = document.querySelector(`.sys-card[data-sys="${sysId}"]`);
+    if (card) {
+      card.classList.add('expanded');
+    }
+  }
 }
 
 // System card interactions
 function toggleSystemCard(systemId) {
   const card = document.querySelector(`.sys-card[data-sys="${systemId}"]`);
   if (card) {
-    card.classList.toggle('expanded');
+    const isExpanded = card.classList.toggle('expanded');
+    if (isExpanded) {
+      expandedSystems.add(systemId);
+    } else {
+      expandedSystems.delete(systemId);
+    }
   }
 }
 

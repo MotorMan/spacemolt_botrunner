@@ -1372,6 +1372,18 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   cursor: default;
 }
 
+/* Ore summary in system body */
+.sys-ore-summary {
+  margin-bottom: 8px;
+}
+.sys-ore-summary .resource-label {
+  color: var(--text-dim);
+}
+.sys-ore-summary .resource-value {
+  color: var(--text-bright);
+  font-weight: 500;
+}
+
 /* POI inside system body */
 .poi-card {
   background: var(--bg);

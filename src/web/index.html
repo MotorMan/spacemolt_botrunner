@@ -693,8 +693,6 @@
   <div class="modal">
     <h2>Name Ship</h2>
     <div id="nameShipForm">
-      <label>Ship ID</label>
-      <input type="text" id="nameShipId" placeholder="Ship ID" disabled>
       <label>New Name</label>
       <input type="text" id="nameShipNewName" placeholder="Enter custom name">
     </div>
@@ -19218,7 +19216,7 @@ function renderShipOverview(data, username) {
     <div class="faction-section" style="display:flex;gap:6px;flex-wrap:wrap">
       <button class="sm" onclick="shipRepair('${esc(username)}')">Repair</button>
       <button class="sm" onclick="shipRefuel('${esc(username)}')">Refuel</button>
-      <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}','${shipIdVal}','${shipNameForModal}')">Name Ship</button>
+      <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}')">Name Ship</button>
     </div>
     <div class="faction-section"><div class="faction-section-title">Modules</div>${slotsHtml}</div>
     <details style="margin-top:12px">
@@ -19450,7 +19448,7 @@ const activeShip = shipyardShipData?.ship || shipyardShipData || {};
         </select>
         <input type="text" class="ship-gift-custom-input" id="gift-input-${id}" placeholder="Bot name..." style="display:none;width:120px;font-size:11px;padding:2px 6px;">
         <button class="sm" style="color:var(--cyan)" onclick="shipGift('${esc(username)}','${esc(id)}','${escJs(name)}')">Gift</button>
-        <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}','${esc(id)}','${escJs(name)}')">Name</button>
+        <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}')">Name</button>
       ` : '';
       
       const loadBtn = `<button class="sm" style="color:var(--green)" onclick="shipDepositIntoCarrier('${esc(username)}','${esc(id)}','${escJs(name)}')" title="Load onto carrier">📦 Load Ship</button>`;
@@ -20017,33 +20015,29 @@ function handleGiftBotSelect(username, shipId, selectEl) {
   }
 }
 
-function openNameShipModal(username, shipId, shipName) {
-  document.getElementById('nameShipId').value = shipId || '';
+function openNameShipModal(username) {
   document.getElementById('nameShipNewName').value = '';
   document.getElementById('nameShipModal').style.display = 'flex';
-  window._namingShipId = shipId;
   window._namingBot = username;
 }
 
 function closeNameShipModal() {
   document.getElementById('nameShipModal').style.display = 'none';
-  window._namingShipId = null;
   window._namingBot = null;
 }
 
 function submitNameShip() {
-  const shipId = document.getElementById('nameShipId').value;
   const newName = document.getElementById('nameShipNewName').value.trim();
   if (!newName) {
     appendLine('system', 'Please enter a name for the ship');
     return;
   }
   const bot = window._namingBot;
-  if (!bot || !shipId) {
-    appendLine('system', 'Could not determine bot or ship ID');
+  if (!bot) {
+    appendLine('system', 'Could not determine bot');
     return;
   }
-  sendExec(bot, 'rename_ship', { name: newName }, (result) => { //only 1 param, name=newName
+  sendExec(bot, 'rename_ship', { name: newName }, (result) => {
     if (result.ok) {
       appendLine('system', result.message || `Ship renamed to "${newName}"`);
       closeNameShipModal();

@@ -1008,7 +1008,10 @@ async function main(): Promise<void> {
     
     // If restarting due to mass session loss, clear all session files
     // This forces fresh logins on restart, avoiding the invalid session loop
-    if (restart && signal === "mass_session_loss") {
+    // But only if the setting allows it (default: true for backward compatibility)
+    const generalSettings = server.getSettings("general");
+    const clearSession = generalSettings.clearSessionOnRestart !== false;
+    if (restart && signal === "mass_session_loss" && clearSession) {
       server.logSystem(`Clearing session files for all bots...`);
       const sessionsDir = join(BASE_DIR, "sessions");
       if (existsSync(sessionsDir)) {

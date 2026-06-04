@@ -463,3 +463,31 @@ export function getStationCompletions(stationId: string): FacilityTransferStatio
   const completions = loadStationCompletions();
   return completions[stationId] || [];
 }
+
+export function clearLoadoutCompletions(loadoutName: string): void {
+  try {
+    const completions = loadStationCompletions();
+    for (const stationId of Object.keys(completions)) {
+      completions[stationId] = completions[stationId].filter(c => c.loadoutName !== loadoutName);
+      if (completions[stationId].length === 0) {
+        delete completions[stationId];
+      }
+    }
+    const file = getStationCompletionFilePath();
+    if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+    writeFileSync(file, JSON.stringify(completions, null, 2) + "\n", "utf-8");
+  } catch (err) {
+    console.error("Error clearing loadout completions:", err);
+  }
+}
+
+export function clearAllCompletions(): void {
+  try {
+    const file = getStationCompletionFilePath();
+    if (existsSync(file)) {
+      writeFileSync(file, JSON.stringify({}, null, 2) + "\n", "utf-8");
+    }
+  } catch (err) {
+    console.error("Error clearing all completions:", err);
+  }
+}

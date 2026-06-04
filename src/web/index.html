@@ -7799,7 +7799,15 @@ function renderGeneralSettings(panel) {
         </div>
         <input type="checkbox" id="set-general-disableActivityLog" ${general.disableActivityLog ? 'checked' : ''} />
       </div>
-  
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Clear Session on Restart</div>
+          <div class="setting-hint">Delete session.json files when server restarts due to mass session loss. Disable to preserve sessions across patches (HTTP API sessions now survive restarts).</div>
+        </div>
+        <input type="checkbox" id="set-general-clearSessionOnRestart" ${general.clearSessionOnRestart !== false ? 'checked' : ''} />
+      </div>
+ 
       <div class="settings-save-bar">
         <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
       </div>
@@ -7837,6 +7845,7 @@ function saveGeneralSettings() {
     approvedFuelStations,
     disableDebugLog: document.getElementById('set-general-disableDebugLog').checked,
     disableActivityLog: document.getElementById('set-general-disableActivityLog').checked,
+    clearSessionOnRestart: document.getElementById('set-general-clearSessionOnRestart').checked,
   };
   send({ type: 'saveSettings', routine: 'general', settings: s });
 }
@@ -18714,6 +18723,10 @@ async function renderFuelTransportSettings(panel) {
       <div style="font-size:11px;color:var(--dim)">
         ${loadoutOptions || '<div style="color:var(--dim);font-size:11px">No loadouts created yet. Create one, then enable it to use for facility construction.</div>'}
       </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button class="sm" onclick="resetFuelTransferLoadoutCompletions()">🔄 Reset Loadout Status</button>
+        <span class="setting-hint" style="color:var(--text-dim);font-size:11px">Clear completion tracking for selected loadout</span>
+      </div>
     </div>
 
     <div class="setting-row" style="margin-top:16px">
@@ -19124,6 +19137,34 @@ function createNewFuelTransferLoadout() {
   
   // Allow creating empty loadouts
   saveFuelTransferLoadout(trimmedName, loadoutItems);
+}
+
+async function resetFuelTransferLoadoutCompletions() {
+  const select = document.getElementById('ft-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to reset.');
+    return;
+  }
+
+  if (!confirm(`Reset completion status for loadout "${name}"? This will allow bots to re-check and re-deliver to all stations.`)) {
+    return;
+  }
+
+  try {
+    const response = await fetch(`/api/facility-transfer-completions/loadout/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+
+    if (response.ok) {
+      alert(`Reset completion status for "${name}"`);
+    } else {
+      const error = await response.json();
+      alert(`Failed to reset: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to reset: ${e.message}`);
+  }
 }
 
 // ── Shipyard ────────────────────────────────────────────────

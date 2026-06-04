@@ -7,7 +7,7 @@ import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
-import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive } from "../routines/fuelTransferTracking.js";
+import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
 
 function getLocalIp(): string | null {
   const interfaces = os.networkInterfaces();
@@ -1196,6 +1196,19 @@ export class WebServer {
             const station = url.searchParams.get("station") || "";
             const completions = getStationCompletions(station);
             return Response.json({ completions });
+          }
+
+          // DELETE /api/facility-transfer-completions/loadout/:name - Clear completions for a loadout
+          if (url.pathname.startsWith("/api/facility-transfer-completions/loadout/") && req.method === "DELETE") {
+            const name = decodeURIComponent(url.pathname.slice("/api/facility-transfer-completions/loadout/".length));
+            clearLoadoutCompletions(name);
+            return Response.json({ ok: true, cleared: name });
+          }
+
+          // DELETE /api/facility-transfer-completions - Clear all completions
+          if (url.pathname === "/api/facility-transfer-completions" && req.method === "DELETE") {
+            clearAllCompletions();
+            return Response.json({ ok: true, cleared: "all" });
           }
 
           // Serve index.css

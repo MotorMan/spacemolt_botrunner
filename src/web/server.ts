@@ -565,25 +565,88 @@ export class WebServer {
         }
         if (url.pathname === "/api/faction-storage") {
           // Return faction shared warehouse contents for a specific station
+          // Supports two modes:
+          // 1. ?station=X&faction=Y (legacy - faction is faction name)
+          // 2. ?station=X (find by station ID, faction name from cache)
           const station = url.searchParams.get("station") || "";
-          const faction = url.searchParams.get("faction") || "";
-          const factionStoragePath = join(process.cwd(), "data", "factionStorage", `${faction}::${station || "default"}.json`);
-          if (!existsSync(factionStoragePath)) {
-            return Response.json({ items: [] });
+          const factionName = url.searchParams.get("faction") || "";
+          
+          const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
+          
+          if (!existsSync(CACHE_DIR)) {
+            return Response.json({ items: [], factionName: "", station: "" });
           }
+          
+          // If faction name is provided, use it directly (legacy mode)
+          if (factionName) {
+            const factionStoragePath = join(CACHE_DIR, `${factionName}::${station || "default"}.json`);
+            if (!existsSync(factionStoragePath)) {
+              return Response.json({ items: [], factionName, station });
+            }
+            try {
+              const raw = readFileSync(factionStoragePath, "utf-8");
+              const data = JSON.parse(raw);
+              const items = data.entries || data.items || [];
+              return Response.json({
+                items,
+                factionFuelReserve: data.factionFuelReserve || 0,
+                factionFuelCapacity: data.factionFuelCapacity || 0,
+                factionName: data.factionName,
+                station: data.station,
+              });
+            } catch {
+              return Response.json({ items: [], factionName, station });
+            }
+          }
+          
+          // Otherwise, find the cache file that matches the station ID
           try {
-            const raw = readFileSync(factionStoragePath, "utf-8");
-            const data = JSON.parse(raw);
-            const items = data.entries || data.items || [];
-            return Response.json({
-              items,
-              factionFuelReserve: data.factionFuelReserve || 0,
-              factionFuelCapacity: data.factionFuelCapacity || 0,
-              factionName: data.factionName,
-              station: data.station,
-            });
+            const files = readdirSync(CACHE_DIR);
+            for (const file of files) {
+              if (!file.endsWith(".json")) continue;
+              const match = file.match(/^(.+)::(.+)\.json$/);
+              if (!match) continue;
+              const [, fn, st] = match;
+              if (st === station || st === "default") {
+                const factionStoragePath = join(CACHE_DIR, file);
+                const raw = readFileSync(factionStoragePath, "utf-8");
+                const data = JSON.parse(raw);
+                const items = data.entries || data.items || [];
+                return Response.json({
+                  items,
+                  factionFuelReserve: data.factionFuelReserve || 0,
+                  factionFuelCapacity: data.factionFuelCapacity || 0,
+                  factionName: data.factionName,
+                  station: data.station,
+                });
+              }
+            }
+            return Response.json({ items: [], factionName: "", station });
           } catch {
             return Response.json({ items: [] });
+          }
+        }
+        
+        if (url.pathname === "/api/faction-storage/list") {
+          // List all available faction storage caches
+          const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
+          if (!existsSync(CACHE_DIR)) {
+            return Response.json({ caches: [] });
+          }
+          try {
+            const files = readdirSync(CACHE_DIR);
+            const caches = files
+              .filter(f => f.endsWith(".json"))
+              .map(f => {
+                const match = f.match(/^(.+)::(.+)\.json$/);
+                if (!match) return null;
+                const [, factionName, station] = match;
+                return { factionName, station };
+              })
+              .filter((c): c is { factionName: string; station: string } => c !== null);
+            return Response.json({ caches });
+          } catch {
+            return Response.json({ caches: [] });
           }
         }
 

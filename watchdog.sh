@@ -15,6 +15,7 @@ echo ""
 echo "Configuration:"
 echo "  - Restart delay: $RESTART_DELAY seconds"
 echo "  - Working directory: $SCRIPT_DIR"
+echo "  - Git pull on start: enabled"
 echo ""
 echo "Exit codes:"
 echo "  - 0: Normal shutdown (no restart)"
@@ -31,6 +32,9 @@ while true; do
 
     set +e
     cd "$SCRIPT_DIR"
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Running git pull..."
+    timeout 30 git pull || echo "Warning: git pull failed, timed out, or not a git repository"
+    echo ""
     bun run src/botmanager.ts
     EXIT_CODE=$?
     set -e

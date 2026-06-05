@@ -554,10 +554,12 @@ docked = false;
         let targetId = "";
         if (command === "jump") {
           const t = (payload as Record<string, unknown>)?.target_system;
-          if (typeof t === "number") {
+          const id = (payload as Record<string, unknown>)?.id;
+          if (typeof t === "number" || typeof id === "number") {
             timeoutMs = 10000;
-            targetId = `bearing:${t.toFixed(4)}`;
-            this.log("travel", `Pathfinder jump to bearing ${t.toFixed(4)}° (immediate return, poll get_location for progress)`);
+            const bearingValue = typeof t === "number" ? t : (typeof id === "number" ? id : 0);
+            targetId = `bearing:${bearingValue.toFixed(4)}`;
+            this.log("travel", `Pathfinder jump to bearing ${bearingValue.toFixed(4)}° (immediate return, poll get_location for progress)`);
           } else {
             timeoutMs = this.calculateJumpTimeout();
             targetId = (typeof t === "string" ? t : "") || "";
@@ -1350,7 +1352,7 @@ docked = false;
     };
     setPathfinderTravelState(this.username, travelRecord as any);
 
-    const jumpResp = await this.exec("jump", { target_system: bearing });
+    const jumpResp = await this.exec("jump", { id: bearing });
     if (jumpResp.error) {
       this.log("error", `Pathfinder jump failed: ${jumpResp.error.message}`);
       clearPathfinderTravel(this.username);

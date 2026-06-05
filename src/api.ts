@@ -19,7 +19,7 @@ export interface ApiResponse {
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
-const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-6-3-26-Cow-Version";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-6-4-26-Pathfinder-Work-Version";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;
@@ -352,6 +352,7 @@ const COMMAND_TTL: Record<string, number> = {
   view_orders: 30_000,
   estimate_purchase: 30_000,
   get_wrecks: 10_000, //doesn't need to be 15.
+  get_notifications: 5_000, //throttled to once per tick (10s)
   catalog: 3600_000, //only really needs to be once per client restart, it NEVER changes while running.
 };
 
@@ -775,8 +776,9 @@ export class SpaceMoltAPI {
       delete body.target;
     }
 
-    // Translate target_system -> id for jump
-    if (command === 'jump' && body.target_system !== undefined) {
+    // Translate target_system -> id for jump (only for string system IDs, not numeric pathfinder bearings)
+    // The server expects target_system to be a number for pathfinder jumps
+    if (command === 'jump' && typeof body.target_system === 'string') {
       body.id = body.target_system;
       delete body.target_system;
     }

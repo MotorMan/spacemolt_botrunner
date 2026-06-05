@@ -332,7 +332,8 @@ export function getCorrectionBearingAtTick(
   for (let i = 0; i < jump.legs.length; i++) {
     const leg = jump.legs[i];
     if (leg.correction_tick_min !== undefined && leg.correction_tick_max !== undefined) {
-      if (elapsed >= leg.correction_tick_min && elapsed <= leg.correction_tick_max) {
+      const targetTick = leg.correction_tick_min + Math.floor((leg.correction_tick_max - leg.correction_tick_min) / 2);
+      if (elapsed >= targetTick && elapsed <= leg.correction_tick_max) {
         const nextLeg = jump.legs[i + 1];
         if (nextLeg) {
           return { bearing: nextLeg.bearing, legIndex: i + 1, ticksRemaining: jump.total_ticks - accumulated - (elapsed - (leg.correction_tick_min || 0)) };
@@ -364,11 +365,12 @@ export function getMccWindowInfo(
   for (let i = 0; i < jump.legs.length; i++) {
     const leg = jump.legs[i];
     if (leg.correction_tick_min !== undefined && leg.correction_tick_max !== undefined) {
-      if (elapsed < leg.correction_tick_min) {
+      const targetTick = leg.correction_tick_min + Math.floor((leg.correction_tick_max - leg.correction_tick_min) / 2);
+      if (elapsed < targetTick) {
         const nextLeg = jump.legs[i + 1];
         if (nextLeg) {
           return {
-            ticksUntilMcc: leg.correction_tick_min - elapsed,
+            ticksUntilMcc: targetTick - elapsed,
             correctionBearing: nextLeg.bearing,
             legIndex: i + 1
           };

@@ -1423,6 +1423,8 @@ docked = false;
     let poll = 0;
     let correctionIssued = false;
     let elapsedTicks = 0;
+    let nearMccWindow = false;
+    let lastLoggedTick: number | null = null;
 
     while (this.state === "running" && poll < maxPolls) {
       await new Promise(r => setTimeout(r, 5000));
@@ -1435,7 +1437,21 @@ docked = false;
         ticksRemaining = (poi2.ticks_remaining as number) ?? ticksRemaining;
         currentFrom = (poi2.from_system as string) ?? "";
         currentTo = (poi2.to_system as string) ?? "";
-        if (poll % 5 === 0 || poll === 1) {
+        if (correctionJump && !correctionIssued) {
+          const mccInfo = getMccWindowInfo(correctionJump, elapsedTicks);
+          const targetTick = mccInfo?.ticksUntilMcc !== undefined 
+            ? elapsedTicks + mccInfo.ticksUntilMcc 
+            : null;
+          nearMccWindow = targetTick !== null && Math.abs(elapsedTicks - targetTick) <= 2;
+        }
+      }
+
+      const tick = await this.pollCurrentTick();
+      if (tick !== null) {
+        updatePathfinderTravelTick(this.username, tick);
+        elapsedTicks = tick - travelRecord.originTick;
+        if (tick !== lastLoggedTick) {
+          lastLoggedTick = tick;
           let mccInfoStr = "";
           if (correctionJump && !correctionIssued) {
             const mccInfo = getMccWindowInfo(correctionJump, elapsedTicks);
@@ -1443,14 +1459,8 @@ docked = false;
               mccInfoStr = `, mcc_in=${mccInfo.ticksUntilMcc} ticks (bearing ${mccInfo.correctionBearing.toFixed(1)}°)`;
             }
           }
-          this.log("travel", `Pathfinder in transit — from=${currentFrom}, to=${currentTo}, ticks_remaining=${ticksRemaining}, polls=${poll}${mccInfoStr}`);
+          this.log("travel", `Pathfinder in transit — from=${currentFrom}, to=${currentTo}, ticks_remaining=${ticksRemaining}${mccInfoStr}`);
         }
-      }
-
-      const tick = await this.pollCurrentTick();
-      if (tick !== null) {
-        updatePathfinderTravelTick(this.username, tick);
-        elapsedTicks = tick - (originTick ?? 0);
       }
 
       if (!inTransit) {
@@ -1475,7 +1485,7 @@ docked = false;
         break;
       }
 
-      if (poll % 10 === 0 && poll > 1 && !correctionIssued) {
+      if ((poll % 10 === 0 || nearMccWindow) && poll > 1 && !correctionIssued) {
         const expectedFrom = travelRecord.originSystem;
         const expectedTo = landingSystemId;
         if (currentFrom && currentTo) {
@@ -1485,7 +1495,7 @@ docked = false;
             this.log("travel", `Pathfinder deviation detected: expected ${expectedFrom} -> ${expectedTo}, but transit shows ${currentFrom} -> ${currentTo}`);
             
             if (correctionJump && tick !== null) {
-              const correctionInfo = getCorrectionBearingAtTick(correctionJump, tick, originTick ?? 0);
+              const correctionInfo = getCorrectionBearingAtTick(correctionJump, tick, travelRecord.originTick);
               if (correctionInfo) {
                 this.log("travel", `Pathfinder correction jump to bearing ${correctionInfo.bearing.toFixed(4)}° (leg ${correctionInfo.legIndex + 1}/${correctionJump.legs.length})`);
                 recordPathfinderCorrection(this.username, tick + 1, correctionInfo.bearing);

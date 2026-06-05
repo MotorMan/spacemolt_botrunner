@@ -537,40 +537,40 @@ docked = false;
       }
     }
 
-     this._lastAction = command;
-     debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
+      this._lastAction = command;
+      debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
 
-     // Capture skill snapshot before command to measure gains later
-     this.captureSkillSnapshot();
+      // Capture skill snapshot before command to measure gains later
+      this.captureSkillSnapshot();
 
-       // Create AbortController for this command
-       const controller = new AbortController();
-       const key = command + (payload ? JSON.stringify(payload) : "");
-       this.pendingCommands.set(key, controller);
+      // Create AbortController for this command
+      const controller = new AbortController();
+      const key = command + (payload ? JSON.stringify(payload) : "");
+      this.pendingCommands.set(key, controller);
 
-         let resp: ApiResponse;
-         try {
-           let timeoutMs = 60000;
-           let targetId = "";
-           if (command === "jump") {
-             const t = (payload as Record<string, unknown>)?.target_system;
-             if (typeof t === "number") {
-               timeoutMs = 5000;
-               targetId = `bearing:${t.toFixed(4)}`;
-               this.log("travel", `Pathfinder jump to bearing ${t.toFixed(4)}° (immediate return, poll get_location for progress)`);
-             } else {
-               timeoutMs = this.calculateJumpTimeout();
-               targetId = (typeof t === "string" ? t : "") || "";
-               this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
-             }
-           } else if (command === "mine" || command === "jettison") {
-             timeoutMs = 15000;
-           } else if (command === "travel") {
-             timeoutMs = this.calculateTravelTimeout();
-             targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
-             this.log("travel", `Travel timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
-           }
-           resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
+      let resp: ApiResponse;
+      try {
+        let timeoutMs = 60000;
+        let targetId = "";
+        if (command === "jump") {
+          const t = (payload as Record<string, unknown>)?.target_system;
+          if (typeof t === "number") {
+            timeoutMs = 10000;
+            targetId = `bearing:${t.toFixed(4)}`;
+            this.log("travel", `Pathfinder jump to bearing ${t.toFixed(4)}° (immediate return, poll get_location for progress)`);
+          } else {
+            timeoutMs = this.calculateJumpTimeout();
+            targetId = (typeof t === "string" ? t : "") || "";
+            this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+          }
+        } else if (command === "mine" || command === "jettison") {
+          timeoutMs = 15000;
+        } else if (command === "travel") {
+          timeoutMs = this.calculateTravelTimeout();
+          targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
+          this.log("travel", `Travel timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+        }
+        resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
 
         // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
         // This prevents 502 errors from breaking routines mid-operation

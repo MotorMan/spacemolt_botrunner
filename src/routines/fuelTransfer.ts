@@ -306,6 +306,8 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
 
   while (bot.state === "running") {
     yield "cycle_start";
+    
+    if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
 
     if (await checkAndFleeFromBattle(ctx, "fuel_transport")) {
       yield "battle_flee";
@@ -395,6 +397,8 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
     }
 
     for (const { station, system: destSystem } of stationsToService) {
+      if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
+      
       const remoteStationId = extractStationId(station);
       
       const loadoutItems: Map<string, number> = new Map();
@@ -402,6 +406,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
       const loadoutItemMap: Map<string, Set<string>> = new Map();
       
       const stationQtyCache = await getRemoteFactionAllItems(bot, remoteStationId);
+      if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
       ctx.log("fuel", `Viewed faction storage at ${remoteStationId}: ${Object.keys(stationQtyCache).length} items found`);
 
       if (useLoadoutMode) {
@@ -440,6 +445,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           const deliveredItems: { itemId: string; quantity: number }[] = [];
           
           for (const [itemId, targetQty] of loadoutItems) {
+            if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
             const item = settings.items.find(i => i.itemId === itemId) || { itemId, itemName: itemId, targetQuantity: targetQty };
             const result = await processItemTransfer(ctx, bot, item, remoteStationId, destSystem, homeSystem, homeStation, safetyOpts, new Set());
             if (result) deliveredItems.push({ itemId: result.itemId, quantity: result.qty });
@@ -447,6 +453,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
 
           if (deliveredItems.length > 0 && applicableLoadouts.length > 0) {
             const freshQtyCache = await getRemoteFactionAllItems(bot, remoteStationId);
+            if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
             for (const loadoutName of applicableLoadouts) {
               const loadoutItemIds = loadoutItemMap.get(loadoutName)!;
               if (loadoutItemIds.size === 0) continue;
@@ -477,9 +484,11 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
 
       const processedItemIds = new Set(loadoutItems.keys());
       for (const item of settings.items) {
+        if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
         if (processedItemIds.has(item.itemId)) continue;
         
         const { cachedQty, currentQty } = await getItemStatus(ctx, bot, remoteStationId, item.itemId);
+        if (bot.state !== "running") { ctx.log("system", "Stopping"); return; }
         if (currentQty >= item.targetQuantity) {
           ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ✓`);
           continue;
@@ -517,7 +526,9 @@ async function processItemTransfer(
   safetyOpts: { fuelThresholdPct: number; hullThresholdPct: number },
   processedLoadouts: Set<string>
 ): Promise<{ deposited: boolean; itemId: string; qty: number } | null> {
+  if (bot.state !== "running") return null;
   const { cachedQty, currentQty, hasCache } = await getItemStatus(ctx, bot, remoteStationId, item.itemId);
+  if (bot.state !== "running") return null;
 
   if (currentQty >= item.targetQuantity) {
     ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ✓`);
@@ -670,6 +681,7 @@ async function getItemStatus(
   const hasCache = cachedLastUpdated > 0;
 
   const currentQty = await getRemoteFactionQty(bot, remoteStationId, itemId);
+  if (bot.state !== "running") return { cachedQty, currentQty, hasCache };
   ctx.log("fuel", `Remote faction storage for ${remoteStationId}: ${itemId} = ${currentQty}`);
 
   return { cachedQty, currentQty, hasCache };

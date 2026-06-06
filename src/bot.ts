@@ -12,6 +12,7 @@ import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFact
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord, getDirectPathfinderJump, getCorrectionPathfinderJump, getCorrectionBearingAtTick, isPathfinderLandingAtVoid, type CorrectionPathfinderJump, getMccWindowInfo, type MccWindowInfo } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
+import { chatBuffer } from "./chatbuffer.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -1889,10 +1890,20 @@ docked = false;
            this.lastChatMessage = content;
            this.lastChatMessageTime = now;
 
-           this.log("chat", `Received [${channel}] ${sender}: ${content}`);
+            this.log("chat", `Received [${channel}] ${sender}: ${content}`);
 
-          // Track player name from chat (but NOT from MAYDAY messages - those can be fake/pirate names)
-          // Also skip empire NPCs like customs agents and police
+            chatBuffer.addMessage({
+              botUsername: this.username,
+              channel,
+              sender,
+              content,
+              timestamp: Date.now(),
+              direction: "in",
+              ...(channel === "private" && data.target_id ? { targetId: data.target_id as string } : {}),
+            });
+
+           // Track player name from chat (but NOT from MAYDAY messages - those can be fake/pirate names)
+           // Also skip empire NPCs like customs agents and police
           if (sender && sender !== "Unknown" && sender !== this.username) {
             const contentLower = content.toLowerCase();
             const senderLower = sender.toLowerCase();

@@ -29,6 +29,8 @@ import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
 import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines } from "./web/server.js";
+import { ChatWebServer } from "./web/chatserver.js";
+import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
@@ -48,6 +50,7 @@ const SESSIONS_DIR = join(BASE_DIR, "sessions");
 
 const bots: Map<string, Bot> = new Map();
 let server: WebServer;
+let chatServer: ChatWebServer;
 let aiChatService: AiChatService | null = null;
 
 // Track failed session restore attempts per bot (timestamps in ms)
@@ -602,6 +605,29 @@ async function handleChat(action: WebAction): Promise<WebActionResult> {
   }
 
   server.logSystem(`[${channel || "system"}] ${bot.username}: ${message}`);
+
+  const targetId = (action as any).targetId as string | undefined;
+  if (targetId) {
+    chatBuffer.addMessage({
+      botUsername: botName,
+      channel: channel || "system",
+      sender: bot.username,
+      content: message,
+      timestamp: Date.now(),
+      direction: "out",
+      targetId,
+    });
+  } else {
+    chatBuffer.addMessage({
+      botUsername: botName,
+      channel: channel || "system",
+      sender: bot.username,
+      content: message,
+      timestamp: Date.now(),
+      direction: "out",
+    });
+  }
+
   return { ok: true, message: `Message sent as ${bot.username}` };
 }
 
@@ -709,6 +735,10 @@ async function main(): Promise<void> {
   server.onShutdown = async () => {
     (globalThis as any).shutdownServer("web-ui");
   };
+
+  const chatPort = parseInt(process.env.CHAT_PORT || String(Number(settings.general?.port || 3000) + 1000), 10);
+  chatServer = new ChatWebServer(chatPort);
+  chatServer.start();
 
   // Route global ui.log() calls through the web server
   setLogSink((category, message) => {
@@ -1048,6 +1078,7 @@ async function main(): Promise<void> {
       server.logSystem(`ERROR flushing miner activity data: ${err}`);
     });
     server.stop();
+    chatServer.stop();
     
     // If restarting due to mass session loss, clear all session files
     // This forces fresh logins on restart, avoiding the invalid session loop

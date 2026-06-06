@@ -41,14 +41,14 @@ function getCleanupSettings(username?: string): {
   homeStation: string;
   refuelThreshold: number;
   repairThreshold: number;
-  focusStationId: string;  // If set, only clean up this specific station
+  focusStationId: string;
+  depositAllStorage: boolean;
 } {
   const all = readSettings();
   const general = all.general || {};
   const t = all.cleanup || {};
   const botOverrides = username ? (all[username] || {}) : {};
   return {
-    // Per-bot override > cleanup-specific > general faction storage > "sol"
     homeSystem: (botOverrides.homeSystem as string)
       || (t.homeSystem as string) || (general.factionStorageSystem as string) || "sol",
     homeStation: (botOverrides.homeStation as string)
@@ -56,6 +56,7 @@ function getCleanupSettings(username?: string): {
     refuelThreshold: (t.refuelThreshold as number) || 50,
     repairThreshold: (t.repairThreshold as number) || 40,
     focusStationId: (botOverrides.focusStationId as string) || (t.focusStationId as string) || "",
+    depositAllStorage: (t.depositAllStorage as boolean) ?? true,
   };
 }
 
@@ -300,7 +301,7 @@ function getAllKnownStations(homeSystem: string, homeStation: string, focusStati
   return stations;
 }
 
-/** Navigate to home station and deposit all non-fuel cargo to faction storage. */
+/** Navigate to home station and deposit all non-fuel cargo/storage to faction storage. */
 async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof getCleanupSettings>): Promise<void> {
   const { bot } = ctx;
   const safetyOpts = {
@@ -308,7 +309,6 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     hullThresholdPct: settings.repairThreshold,
   };
 
-  // Navigate to home system
   if (bot.system !== settings.homeSystem) {
     await ensureUndocked(ctx);
     const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
@@ -324,28 +324,23 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     }
   }
 
-  // Travel to home station POI using fresh API data (like return_home.ts)
   await ensureUndocked(ctx);
   
-  // Get fresh system data from API
   const { pois } = await getSystemInfo(ctx);
   let targetStation = null;
   
-  // If we're already docked at a valid home station, just stay there
   const currentStation = bot.poi ? pois.find(p => p.id === bot.poi || p.base_id === bot.poi) : null;
   if (currentStation && isStationPoi(currentStation) && currentStation.id !== settings.focusStationId) {
     ctx.log("info", `Already at home station (${currentStation.base_id || currentStation.id})`);
     targetStation = currentStation;
   }
 
-  // Try to find by configured homeStation name/id (check multiple fields)
   if (settings.homeStation) {
     targetStation = pois.find(p => 
       isStationPoi(p) && 
       (p.id === settings.homeStation || p.base_id === settings.homeStation || p.name?.toLowerCase().replace(/ /g, '_') === settings.homeStation.toLowerCase())
     );
     if (!targetStation) {
-      // Also try matching by base_id (case-insensitive)
       targetStation = pois.find(p => 
         isStationPoi(p) && 
         p.base_id && 
@@ -353,7 +348,6 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
       );
     }
     if (!targetStation) {
-      // Try matching by name with normalized spaces (e.g., "Sol Central" -> "sol central")
       const normalizedHome = settings.homeStation.toLowerCase().replace(/_/g, ' ');
       targetStation = pois.find(p => 
         isStationPoi(p) && 
@@ -363,9 +357,6 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     }
   }
 
-  // If not found, search for any station with a base in the home system
-  // Skip the focus station (we're collecting FROM there, not depositing TO there)
-  // NOTE: Include bot.poi - if we're already docked at a valid station, use it
   if (!targetStation) {
     targetStation = pois.find(p =>
       isStationPoi(p) &&
@@ -377,16 +368,13 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     }
   }
 
-  // Final fallback: if still not found but we have a current station with base, use it
   if (!targetStation && currentStation && isStationPoi(currentStation)) {
     targetStation = currentStation;
     ctx.log("info", `Using current station as home: ${targetStation.base_id || targetStation.id}`);
   }
 
-  // If still not found, fall back to "sol" system (the default)
   if (!targetStation && settings.homeSystem !== "sol") {
     ctx.log("warn", `No valid home station in ${settings.homeSystem} — falling back to sol system`);
-    // Navigate to sol first
     const solSystem = "sol";
     if (bot.system !== solSystem) {
       const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
@@ -401,7 +389,6 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
         return;
       }
     }
-    // Get fresh system data for sol
     const { pois: solPois } = await getSystemInfo(ctx);
     targetStation = solPois.find(p =>
       isStationPoi(p) &&
@@ -418,14 +405,12 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     return;
   }
 
-  // For stations with bases, use base_id for travel (game API expects base_id for faction stations)
   const targetPoiId = targetStation.base_id || targetStation.id;
 
   if (bot.poi !== targetPoiId) {
     ctx.log("travel", `Traveling to home station...`);
     const tResp = await bot.exec("travel", { target_poi: targetPoiId });
 
-    // Check for battle after travel
     if (await checkBattleAfterCommand(ctx, tResp.notifications, "travel")) {
       ctx.log("combat", "Battle detected during travel to home station - fleeing!");
       await ctx.sleep(5000);
@@ -434,7 +419,6 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
 
     if (tResp.error) {
       const errMsg = tResp.error.message.toLowerCase();
-      // CRITICAL: Check for battle interrupt error
       if (tResp.error.code === "battle_interrupt" || errMsg.includes("interrupted by battle") || errMsg.includes("interrupted by combat")) {
         ctx.log("combat", `Travel to home station interrupted by battle! ${tResp.error.message} - fleeing!`);
         return;
@@ -447,20 +431,21 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
     bot.poi = targetPoiId;
   }
 
-  // Dock
   await ensureDocked(ctx);
 
-  // Check for battle after dock
   if (await checkAndFleeFromBattle(ctx, "dock")) {
     await ctx.sleep(5000);
     return;
   }
 
-  // Refresh storage to get accurate data
+  if (!bot.docked) {
+    ctx.log("error", `Could not dock at ${targetStation?.name || targetStation?.id} — skipping deposit`);
+    return;
+  }
+
   await bot.refreshStorage();
   await bot.refreshCargo();
 
-  // Check if we're at the home station (has faction storage)
   const botPoiId = bot.poi || "";
   const isAtHomeStation = targetStation && (
     targetStation.id === botPoiId || 
@@ -471,15 +456,13 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   const deposited: string[] = [];
   const skipped: string[] = [];
 
-  // If at home station with faction storage, try efficient direct deposit from storage
-  if (isAtHomeStation && bot.storage.length > 0) {
-    ctx.log("trade", `At home station — attempting direct storage deposit...`);
+  if (settings.depositAllStorage && isAtHomeStation && bot.storage.length > 0) {
+    ctx.log("trade", `At home station — depositing all station storage to faction...`);
     for (const item of [...bot.storage]) {
       if (item.quantity <= 0) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
 
-      // Direct deposit from station storage to faction storage
       const fResp = await bot.exec("faction_deposit_items", {
         faction_id: bot.faction,
         item_id: item.itemId,
@@ -488,27 +471,26 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
       });
 
       if (!fResp.error) {
-        deposited.push(`${item.quantity}x ${item.name} (direct)`);
-        logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (cleanup direct)`);
-        // Remove from local storage tracking
+        deposited.push(`${item.quantity}x ${item.name} (storage)`);
+        logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (cleanup storage)`);
         const idx = bot.storage.findIndex(s => s.itemId === item.itemId);
         if (idx >= 0) bot.storage.splice(idx, 1);
       } else if (fResp.error?.message?.includes("storage_cap_exceeded")) {
         skipped.push(`${item.quantity}x ${item.name} (faction full)`);
         ctx.log("warn", `Faction storage full for ${item.name} — skipping`);
+      } else {
+        ctx.log("error", `Faction deposit failed: ${fResp.error.message}`);
       }
     }
   }
 
-  // Also handle any items in cargo (if not already deposited via storage)
   if (bot.inventory.some(i => i.quantity > 0)) {
     for (const item of [...bot.inventory]) {
       if (item.quantity <= 0) continue;
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
 
-      // Skip if already deposited via storage action
-      if (deposited.some(d => d.includes(item.name))) continue;
+      if (settings.depositAllStorage && deposited.some(d => d.includes(item.name) && d.includes("storage"))) continue;
 
       const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
       if (!fResp.error) {
@@ -518,7 +500,6 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
         skipped.push(`${item.quantity}x ${item.name} (faction full)`);
         ctx.log("warn", `Faction storage full for ${item.name} — skipping`);
       } else {
-        // Fallback to station storage
         await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
         deposited.push(`${item.quantity}x ${item.name} (station)`);
       }

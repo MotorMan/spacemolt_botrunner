@@ -574,10 +574,10 @@ docked = false;
         }
         resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
 
-        // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
+        // Handle HTTP 502 Bad Gateway — server-side issue, retry infinitely with backoff
         // This prevents 502 errors from breaking routines mid-operation
         if (resp.error && resp.error.message && resp.error.message.includes("502")) {
-          const MAX_502_RETRIES = 3;
+          const MAX_502_RETRIES = Infinity;
           for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
             // CRITICAL: Check if we're in battle - if so, stop retrying immediately
             if (this.currentBattle.inBattle) {
@@ -585,21 +585,21 @@ docked = false;
               break;
             }
 
-            const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
-            this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1}/${MAX_502_RETRIES} after ${waitTime/1000}s...`);
+            const waitTime = Math.min(30000, 3000 * (retry + 1)); // capped at 30s
+            this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1} (infinite) after ${waitTime/1000}s...`);
             await sleep(waitTime);
             resp = await this.api.execute(command, payload);
             if (!resp.error || !resp.error.message?.includes("502")) break;
           }
           if (resp.error && resp.error.message?.includes("502")) {
-            this.log("error", `HTTP 502: Bad Gateway (after ${MAX_502_RETRIES} retries)`);
+            this.log("error", `HTTP 502: Bad Gateway (infinite retries exhausted due to battle or other error)`);
           }
         }
 
         // Handle HTTP 524 Timeout — server took too long to respond (common during battles)
-        // Retry with backoff since battle notifications may still be flowing via WebSocket
+        // Retry infinitely with backoff since battle notifications may still be flowing via WebSocket
         if (resp.error && resp.error.message && resp.error.message.includes("524")) {
-          const MAX_524_RETRIES = 3;
+          const MAX_524_RETRIES = Infinity;
           for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
             // CRITICAL: Check if we're in battle - if so, stop retrying immediately
             if (this.currentBattle.inBattle) {
@@ -607,14 +607,14 @@ docked = false;
               break;
             }
 
-            const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
-            this.log("warn", `HTTP 524 Timeout — retry ${retry + 1}/${MAX_524_RETRIES} after ${waitTime/1000}s...`);
+            const waitTime = Math.min(30000, 3000 * (retry + 1)); // capped at 30s
+            this.log("warn", `HTTP 524 Timeout — retry ${retry + 1} (infinite) after ${waitTime/1000}s...`);
             await sleep(waitTime);
             resp = await this.api.execute(command, payload);
             if (!resp.error || !resp.error.message?.includes("524")) break;
           }
           if (resp.error && resp.error.message?.includes("524")) {
-            this.log("error", `HTTP 524: Timeout (after ${MAX_524_RETRIES} retries)`);
+            this.log("error", `HTTP 524: Timeout (infinite retries exhausted due to battle or other error)`);
           }
         }
 

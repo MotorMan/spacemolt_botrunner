@@ -127,6 +127,14 @@ export interface HunterPatrolProfile {
   patrolSystems: string[];
 }
 
+function seededRandom(seed: number): () => number {
+  let state = seed;
+  return () => {
+    state = (state * 9301 + 49297) % 233280;
+    return state / 233280;
+  };
+}
+
 function getHunterSettings(username?: string): {
   mode: HunterMode;
   patrolCycleMode: PatrolCycleMode;
@@ -1860,7 +1868,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
     if (isProtected || item.quantity <= 0) continue;
 
-    const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+    const dResp = await bot.exec("spacemolt_storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity });
     if (dResp.error) {
       await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
     }
@@ -2078,7 +2086,6 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
   await bot.refreshStatus();
   let totalKills = 0;
-  let profileIndex = 0;
 
   const all = readSettings();
   const h = (all.hunter || {}) as any;
@@ -2091,8 +2098,13 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
     return;
   }
 
+  const botSeed = bot.username.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const random = seededRandom(botSeed);
+  const initialProfileIndex = Math.floor(random() * hunterPatrols.length);
+
   let nextShuffle: number[] | null = null;
   let shuffleIndex = 0;
+  let profileIndex = initialProfileIndex;
 
   while (bot.state === "running") {
     const cycleMode = settings.patrolCycleMode || "sequential";
@@ -2100,14 +2112,14 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
     if (cycleMode === "random") {
       if (!nextShuffle || shuffleIndex >= nextShuffle.length) {
-        nextShuffle = [...Array(hunterPatrols.length).keys()].sort(() => Math.random() - 0.5);
+        nextShuffle = [...Array(hunterPatrols.length).keys()].sort(() => random() - 0.5);
         shuffleIndex = 0;
       }
       targetIndex = nextShuffle[shuffleIndex];
       shuffleIndex++;
     } else {
-      targetIndex = profileIndex % hunterPatrols.length;
-      profileIndex++;
+      targetIndex = profileIndex;
+      profileIndex = (profileIndex + 1) % hunterPatrols.length;
     }
 
     const profile = hunterPatrols[targetIndex];

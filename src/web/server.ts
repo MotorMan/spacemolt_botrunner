@@ -70,6 +70,7 @@ interface CachedFacilities {
   lastUpdated: string;
   personal: { facility_type: string; name: string; description: string; category: string; level?: number }[];
   production: { facility_type: string; name: string; description: string; category: string; level?: number }[];
+  faction: { facility_type: string; name: string; description: string; category: string; level?: number }[];
   details: Record<string, unknown>;
 }
 
@@ -81,7 +82,7 @@ function loadFacilities(): CachedFacilities {
       console.warn(`Warning: corrupt facilities.json, starting fresh —`, err);
     }
   }
-  return { version: "", lastUpdated: "", personal: [], production: [], details: {} };
+  return { version: "", lastUpdated: "", personal: [], production: [], faction: [], details: {} };
 }
 
 function saveFacilities(data: CachedFacilities): void {
@@ -1046,6 +1047,7 @@ export class WebServer {
             lastUpdated: new Date().toISOString(),
             personal: body.personal || existing.personal,
             production: body.production || existing.production,
+            faction: body.faction || existing.faction,
             details: { ...existing.details, ...body.details },
           };
           saveFacilities(merged);

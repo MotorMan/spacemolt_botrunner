@@ -13357,10 +13357,26 @@ let factionFacilityCategory = 'faction';
 async function fetchFactionBuildableTypes(username) {
   const container = document.getElementById('factionBuildableTypes');
   if (!container) return;
+  
+  // Check if we have cached data first (check both factionFacilityTypes and personalFacilityTypes for production)
+  let cachedTypes;
+  if (factionFacilityCategory === 'production') {
+    cachedTypes = [...factionFacilityTypes.filter(t => t._category === 'production'),
+                   ...personalFacilityTypes.filter(t => t._category === 'production')];
+  } else {
+    cachedTypes = factionFacilityTypes.filter(t => t._category === factionFacilityCategory);
+  }
+  
+  if (cachedTypes.length > 0 && personalFacilityVersion) {
+    console.log('Using cached faction facility types:', cachedTypes.length);
+    renderFactionBuildableTypesList(username);
+    return;
+  }
+  
   container.innerHTML = '<div class="faction-no-data">Loading available types...</div>';
   const cat = factionFacilityCategory || 'faction';
   
-  factionFacilityTypes = [];
+  factionFacilityTypes = factionFacilityTypes.filter(t => t._category !== factionFacilityCategory);
   factionFacilityLoading = true;
   
   let page = 0;
@@ -13389,7 +13405,12 @@ async function fetchFactionBuildableTypes(username) {
       return;
     }
     
-    factionFacilityTypes.push(...types);
+    // Add category marker and deduplicate
+    const existingIds = new Set(factionFacilityTypes.filter(t => t._category === cat).map(t => t.facility_type || t.type || t.id));
+    const typedTypes = types
+      .filter(t => !existingIds.has(t.facility_type || t.type || t.id))
+      .map(t => ({ ...t, _category: cat }));
+    factionFacilityTypes.push(...typedTypes);
     
     hasMore = types.length >= factionFacilityPageSize && page < totalPages - 1;
     page++;
@@ -13400,6 +13421,11 @@ async function fetchFactionBuildableTypes(username) {
   }
   
   factionFacilityLoading = false;
+  
+  // Save to cache
+  if (personalFacilityVersion) {
+    saveFacilitiesCache();
+  }
   
   renderFactionBuildableTypesList(username);
 }
@@ -13416,8 +13442,10 @@ function renderFactionBuildableTypesList(username) {
   
   container.innerHTML = types.map(t => {
     const typeId = t.facility_type || t.type || t.id || '';
+    // Use cached details if available
+    const detail = personalFacilityDetails[typeId] || t;
     return `<div id="fac-type-${esc(typeId)}" class="faction-card" style="opacity:0.5">
-      <div class="fc-name">${esc(t.name || typeId)}</div>
+      <div class="fc-name">${esc(detail.name || typeId)}</div>
       <div class="fc-detail">Loading details...</div>
     </div>`;
   }).join('');
@@ -13425,6 +13453,17 @@ function renderFactionBuildableTypesList(username) {
   for (const t of types) {
     const typeId = t.facility_type || t.type || t.id || '';
     if (!typeId) continue;
+    
+    // Check if we have cached details
+    if (personalFacilityDetails[typeId]) {
+      const el = document.getElementById(`fac-type-${typeId}`);
+      if (el) {
+        el.style.opacity = '1';
+        el.innerHTML = renderFacilityTypeCard(personalFacilityDetails[typeId], username);
+      }
+      continue;
+    }
+    
     sendExec(username, 'facility', { action: 'types', facility_type: typeId }, (detailResult) => {
       const el = document.getElementById(`fac-type-${typeId}`);
       if (!el) return;
@@ -13435,6 +13474,13 @@ function renderFactionBuildableTypesList(username) {
       }
       const dd = detailResult.data;
       const detail = Array.isArray(dd) ? dd[0] : (dd.type || dd.facility || dd);
+      if (detail) {
+        personalFacilityDetails[typeId] = detail;
+        // Save to cache
+        if (personalFacilityVersion) {
+          saveFacilitiesCache();
+        }
+      }
       el.innerHTML = renderFacilityTypeCard(detail || t, username);
     });
   }
@@ -13504,7 +13550,9 @@ function renderFacilityTypeCard(t, username) {
 function renderFactionProductionFromCache(username) {
   const container = document.getElementById('factionBuildableTypes');
   if (!container) return;
-  const prodTypes = factionFacilityTypes.filter(t => t._category === 'production');
+  // Check both factionFacilityTypes and personalFacilityTypes for production facilities
+  const prodTypes = [...factionFacilityTypes.filter(t => t._category === 'production'),
+                      ...personalFacilityTypes.filter(t => t._category === 'production')];
   if (prodTypes.length === 0) {
     container.innerHTML = '<div class="faction-no-data">No cached production types</div>';
     return;
@@ -13524,6 +13572,13 @@ function renderFactionProductionFromCache(username) {
 function showFactionProductionDetail(username, facilityType) {
   const container = document.getElementById('factionBuildableTypes');
   if (!container) return;
+  
+  // Check cached details first
+  if (personalFacilityDetails[facilityType]) {
+    renderFactionProductionDetailCard(container, username, facilityType, personalFacilityDetails[facilityType]);
+    return;
+  }
+  
   container.innerHTML = `<div class="faction-card"><div style="font-size:14px">Loading details for ${esc(facilityType)}...</div></div>`;
   
   sendExec(username, 'facility', { action: 'types', facility_type: facilityType }, (detailResult) => {
@@ -13533,72 +13588,89 @@ function showFactionProductionDetail(username, facilityType) {
       detail = Array.isArray(dd) ? dd[0] : (dd.type || dd.facility || dd);
     }
     
-    const name = detail.name || detail.facility_type || facilityType;
-    const level = detail.level ?? detail.tier ?? '';
-    const levelStr = level ? ` Level ${level}` : '';
-    const category = detail.category || 'production';
-    const desc = detail.description || detail.desc || '';
-    const buildCost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? 0;
-    const buildCostStr = buildCost ? `${Number(buildCost).toLocaleString()}cr` : '';
-    const labor = detail.labor_cost ?? detail.labor ?? '';
-    const laborStr = labor ? `${labor} labor` : '';
-    const buildTime = detail.build_time ?? detail.time ?? '';
-    const buildTimeStr = buildTime ? `${buildTime}s` : '';
-    
-    const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || detail.resources || [];
-    let matsHtml = '';
-    if (Array.isArray(mats) && mats.length > 0) {
-      matsHtml = '<div style="margin-top:8px"><span style="color:var(--text-dim)">Materials required:</span> ' +
-        mats.map(m => {
-          const mName = m.name || m.item_name || m.item_id || '?';
-          const mQty = m.quantity || m.count || m.amount || 1;
-          return `${mQty}x ${esc(mName)}`;
-        }).join(', ') + '</div>';
+    if (detail) {
+      personalFacilityDetails[facilityType] = detail;
+      // Save to cache
+      if (personalFacilityVersion) {
+        saveFacilitiesCache();
+      }
     }
     
-    const rawRecipe = detail.recipe || null;
-    let recipeDisplay = '';
-    if (rawRecipe && typeof rawRecipe === 'object') {
-      const recipeName = rawRecipe.name || rawRecipe.id || detail.recipe_id || '';
-      const craftingTime = rawRecipe.crafting_time || rawRecipe.time || '';
-      const timeStr = craftingTime ? ` (${craftingTime}s)` : '';
-      const inputs = rawRecipe.inputs || rawRecipe.components || rawRecipe.ingredients || [];
-      const outputs = rawRecipe.outputs || rawRecipe.output || rawRecipe.result || rawRecipe.produces || [];
-      const inputsStr = inputs.length > 0 ? inputs.map(i => `${i.quantity || 1}x ${i.name || i.item_id || '?'}`).join(', ') : '-';
-      const outputsStr = outputs.length > 0 ? outputs.map(o => `${o.quantity || 1}x ${o.name || o.item_id || '?'}`).join(', ') : '-';
-      recipeDisplay = `<span style="font-weight:600">${esc(recipeName)}${timeStr}</span><br/>` +
-        `<span style="color:var(--text-dim)">Inputs:</span> ${esc(inputsStr)}<br/>` +
-        `<span style="color:var(--text-dim)">Outputs:</span> <span style="color:var(--green)">${esc(outputsStr)}</span>`;
-    } else if (typeof rawRecipe === 'string') {
-      recipeDisplay = esc(rawRecipe);
-    }
-    let recipeHtml = recipeDisplay ? `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">Recipe: ${recipeDisplay}</div>` : '';
-    
-    const detailHtml = `
-      <div class="faction-card" style="padding:12px">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
-          <div>
-            <div style="font-size:14px;font-weight:700;color:var(--text-bright)">${esc(name)}${esc(levelStr)}</div>
-            <div style="font-size:11px;color:var(--text-dim)">${esc(category)}</div>
-          </div>
-          <button class="sm" onclick="renderFactionProductionFromCache('${esc(username)}')">Back to List</button>
-        </div>
-        <div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>
-        ${buildCostStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Build Cost: ${esc(buildCostStr)}</div>` : ''}
-        ${laborStr ? `<div style="font-size:11px;color:var(--yellow);margin-top:2px">${esc(laborStr)}</div>` : ''}
-        ${buildTimeStr ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">Build Time: ${esc(buildTimeStr)}</div>` : ''}
-        ${matsHtml}
-        ${recipeHtml}
-        <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
-          <button class="primary sm" style="width:100%" onclick="factionBuildFacility('${esc(username)}','${esc(facilityType)}')">Build Facility</button>
-        </div>
-        <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
-          This will withdraw required materials from faction storage and build the facility using faction_build.
-        </div>
-      </div>
-    `;
-    container.innerHTML = detailHtml;
+    renderFactionProductionDetailCard(container, username, facilityType, detail);
   });
+}
+
+function renderFactionProductionDetailCard(container, username, facilityType, detail) {
+  if (!detail) {
+    container.innerHTML = '<div class="faction-no-data">No details available</div>';
+    return;
+  }
+  
+  const name = detail.name || detail.facility_type || facilityType;
+  const level = detail.level ?? detail.tier ?? '';
+  const levelStr = level ? ` Level ${level}` : '';
+  const category = detail.category || 'production';
+  const desc = detail.description || detail.desc || '';
+  const buildCost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? 0;
+  const buildCostStr = buildCost ? `${Number(buildCost).toLocaleString()}cr` : '';
+  const labor = detail.labor_cost ?? detail.labor ?? '';
+  const laborStr = labor ? `${labor} labor` : '';
+  const buildTime = detail.build_time ?? detail.time ?? '';
+  const buildTimeStr = buildTime ? `${buildTime}s` : '';
+  
+  const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || detail.resources || [];
+  let matsHtml = '';
+  if (Array.isArray(mats) && mats.length > 0) {
+    matsHtml = '<div style="margin-top:8px"><span style="color:var(--text-dim)">Materials required:</span> ' +
+      mats.map(m => {
+        const mName = m.name || m.item_name || m.item_id || '?';
+        const mQty = m.quantity || m.count || m.amount || 1;
+        return `${mQty}x ${esc(mName)}`;
+      }).join(', ') + '</div>';
+  }
+  
+  const rawRecipe = detail.recipe || null;
+  let recipeDisplay = '';
+  if (rawRecipe && typeof rawRecipe === 'object') {
+    const recipeName = rawRecipe.name || rawRecipe.id || detail.recipe_id || '';
+    const craftingTime = rawRecipe.crafting_time || rawRecipe.time || '';
+    const timeStr = craftingTime ? ` (${craftingTime}s)` : '';
+    const inputs = rawRecipe.inputs || rawRecipe.components || rawRecipe.ingredients || [];
+    const outputs = rawRecipe.outputs || rawRecipe.output || rawRecipe.result || rawRecipe.produces || [];
+    const inputsStr = inputs.length > 0 ? inputs.map(i => `${i.quantity || 1}x ${i.name || i.item_id || '?'}`).join(', ') : '-';
+    const outputsStr = outputs.length > 0 ? outputs.map(o => `${o.quantity || 1}x ${o.name || o.item_id || '?'}`).join(', ') : '-';
+    recipeDisplay = `<span style="font-weight:600">${esc(recipeName)}${timeStr}</span><br/>` +
+      `<span style="color:var(--text-dim)">Inputs:</span> ${esc(inputsStr)}<br/>` +
+      `<span style="color:var(--text-dim)">Outputs:</span> <span style="color:var(--green)">${esc(outputsStr)}</span>`;
+  } else if (typeof rawRecipe === 'string') {
+    recipeDisplay = esc(rawRecipe);
+  }
+  let recipeHtml = recipeDisplay ? `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">Recipe: ${recipeDisplay}</div>` : '';
+  
+  const detailHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+        <div>
+          <div style="font-size:14px;font-weight:700;color:var(--text-bright)">${esc(name)}${esc(levelStr)}</div>
+          <div style="font-size:11px;color:var(--text-dim)">${esc(category)}</div>
+        </div>
+        <button class="sm" onclick="renderFactionProductionFromCache('${esc(username)}')">Back to List</button>
+      </div>
+      <div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>
+      ${buildCostStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Build Cost: ${esc(buildCostStr)}</div>` : ''}
+      ${laborStr ? `<div style="font-size:11px;color:var(--yellow);margin-top:2px">${esc(laborStr)}</div>` : ''}
+      ${buildTimeStr ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">Build Time: ${esc(buildTimeStr)}</div>` : ''}
+      ${matsHtml}
+      ${recipeHtml}
+      <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+        <button class="primary sm" style="width:100%" onclick="factionBuildFacility('${esc(username)}','${esc(facilityType)}')">Build Facility</button>
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
+        This will withdraw required materials from faction storage and build the facility using faction_build.
+      </div>
+    </div>
+  `;
+  container.innerHTML = detailHtml;
 }
 
 async function factionBuildFacility(username, facilityType) {
@@ -13804,7 +13876,7 @@ async function loadFacilitiesCache() {
     const data = await res.json();
     console.log('Cache API response:', data);
     if (data.version) {
-      const hasData = (data.personal?.length > 0 || data.production?.length > 0);
+      const hasData = (data.personal?.length > 0 || data.production?.length > 0 || data.faction?.length > 0);
       const currentVersion = await fetchGameVersion();
       if (!hasData) {
         console.log('Cache is empty, fetching fresh data.');
@@ -13830,6 +13902,12 @@ async function loadFacilitiesCache() {
         const existingIds = new Set(personalFacilityTypes.map(t => t.facility_type || t.type || t.id));
         const newProduction = data.production.filter(t => !existingIds.has(t.facility_type || t.id)).map(t => ({ ...t, _category: 'production' }));
         personalFacilityTypes.push(...newProduction);
+      }
+      // Load faction types
+      if (data.faction && data.faction.length > 0) {
+        const existingIds = new Set(factionFacilityTypes.map(t => t.facility_type || t.type || t.id));
+        const newFaction = data.faction.filter(t => !existingIds.has(t.facility_type || t.id)).map(t => ({ ...t, _category: 'faction' }));
+        factionFacilityTypes.push(...newFaction);
       }
       // Load cached details
       if (data.details) {
@@ -13885,6 +13963,12 @@ async function saveFacilitiesCache() {
       description: t.description,
       category: t.category
     }));
+    const faction = factionFacilityTypes.filter(t => t._category === 'faction').map(t => ({
+      facility_type: t.facility_type || t.type || t.id,
+      name: t.name,
+      description: t.description,
+      category: t.category
+    }));
     await fetch('/api/facilities', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -13892,6 +13976,7 @@ async function saveFacilitiesCache() {
         version: personalFacilityVersion,
         personal,
         production,
+        faction,
         details: personalFacilityDetails
       })
     });
@@ -14048,7 +14133,10 @@ function switchFactionFacilityCategory(category, username) {
       productionBtn.style.color = '';
     }
   }
-  if (category === 'production' && factionFacilityTypes.some(t => t._category === 'production')) {
+  // Check both factionFacilityTypes (personal cache) and personalFacilityTypes (production cache)
+  const hasCached = factionFacilityTypes.some(t => t._category === 'production') || 
+                     personalFacilityTypes.some(t => t._category === 'production');
+  if (category === 'production' && hasCached) {
     renderFactionProductionFromCache(username);
   } else {
     fetchFactionBuildableTypes(username);

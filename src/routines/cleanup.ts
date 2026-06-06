@@ -5,6 +5,7 @@
  * then remotely inspects each via view_storage(station_id=...) before traveling.
  * Only physically visits stations that have items or credits to collect.
  * Deposits everything at the faction storage station set in general settings.
+ * Also cleans the home station's storage directly into faction storage at the start of each cycle.
  */
 import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
@@ -204,8 +205,40 @@ function isHomeStation(stationId: string, poiId: string, homeSystem: string, hom
   return false;
 }
 
+/** Get the home station's base_id and poi_id for storage operations. */
+function getHomeStationInfo(homeSystem: string, homeStation: string): { baseId: string; poiId: string } | null {
+  if (!homeStation) return null;
+  
+  const allSystems = mapStore.getAllSystems();
+  const lowerHome = homeStation.toLowerCase();
+  
+  // First check mobile capitol
+  const mcLocation = mapStore.getMobileCapitolLocation();
+  if (mcLocation && (lowerHome.includes("mobile") || lowerHome.includes("frontier"))) {
+    return { baseId: "frontier_station", poiId: mcLocation.poiId };
+  }
+  
+  // Check all systems
+  for (const [sysId, sys] of Object.entries(allSystems)) {
+    for (const poi of sys.pois) {
+      const travelId = poi.base_id || poi.id;
+      const normalizedHome = lowerHome.replace(/_/g, ' ');
+      
+      if (travelId.toLowerCase() === lowerHome || 
+          poi.id.toLowerCase() === lowerHome ||
+          (poi.base_name && poi.base_name.toLowerCase().includes(normalizedHome)) ||
+          (poi.name && poi.name.toLowerCase().includes(normalizedHome)) ||
+          (poi.id.toLowerCase().includes(lowerHome))) {
+        return { baseId: poi.base_id || poi.id, poiId: poi.id };
+      }
+    }
+  }
+  
+  return null;
+}
+
 /** Get all known stations with bases from mapStore (excluding pirate systems). */
-function getAllKnownStations(homeSystem: string, homeStation: string, focusStationId?: string): StationTarget[] {
+function getAllKnownStations(homeSystem: string, homeStation: string, focusStationId?: string, includeHomeStation?: boolean): StationTarget[] {
   const stations: StationTarget[] = [];
   const allSystems = mapStore.getAllSystems();
 
@@ -224,7 +257,7 @@ function getAllKnownStations(homeSystem: string, homeStation: string, focusStati
         hasCredits: false,
         hasOrders: false,
       };
-      if (!isHomeStation(mcStation.stationId, mcStation.poiId, homeSystem, homeStation)) {
+      if (includeHomeStation || !isHomeStation(mcStation.stationId, mcStation.poiId, homeSystem, homeStation)) {
         stations.push(mcStation);
       }
       return stations;
@@ -238,16 +271,17 @@ function getAllKnownStations(homeSystem: string, homeStation: string, focusStati
         if (!poi.base_id) continue;
         if (poi.base_id === focusStationId || poi.id === focusStationId) {
           const travelId = poi.base_id || poi.id;
-          if (isHomeStation(travelId, travelId, homeSystem, homeStation)) continue;
-          stations.push({
-            stationId: travelId,
-            systemId: sysId,
-            poiId: travelId,
-            poiName: poi.base_name || poi.name || poi.id,
-            hasItems: false,
-            hasCredits: false,
-            hasOrders: false,
-          });
+          if (includeHomeStation || !isHomeStation(travelId, travelId, homeSystem, homeStation)) {
+            stations.push({
+              stationId: travelId,
+              systemId: sysId,
+              poiId: travelId,
+              poiName: poi.base_name || poi.name || poi.id,
+              hasItems: false,
+              hasCredits: false,
+              hasOrders: false,
+            });
+          }
           return stations;
         }
       }
@@ -269,12 +303,12 @@ function getAllKnownStations(homeSystem: string, homeStation: string, focusStati
       hasCredits: false,
       hasOrders: false,
     };
-    if (!isHomeStation(mcStation.stationId, mcStation.poiId, homeSystem, homeStation)) {
+    if (includeHomeStation || !isHomeStation(mcStation.stationId, mcStation.poiId, homeSystem, homeStation)) {
       stations.push(mcStation);
     }
   }
 
-  // Default: return all stations (except home)
+  // Default: return all stations (optionally including home)
   for (const [sysId, sys] of Object.entries(allSystems)) {
     // Skip pirate systems
     if (isPirateSystem(sysId)) continue;
@@ -282,9 +316,8 @@ function getAllKnownStations(homeSystem: string, homeStation: string, focusStati
       // Use base_id as the primary indicator - it means the station has storage
       // has_base may be false in some cases even when base_id exists
       if (!poi.base_id) continue;
-      // Skip the home/faction storage station
       const travelId = poi.base_id || poi.id;
-      if (isHomeStation(travelId, travelId, homeSystem, homeStation)) continue;
+      if (!includeHomeStation && isHomeStation(travelId, travelId, homeSystem, homeStation)) continue;
       // For stations with bases, use base_id for travel; otherwise use poi.id
       stations.push({
         stationId: travelId,
@@ -522,6 +555,144 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
   }
 }
 
+/** Clean home station storage directly into faction storage. */
+async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType<typeof getCleanupSettings>): Promise<void> {
+  const { bot } = ctx;
+  
+  const homeInfo = getHomeStationInfo(settings.homeSystem, settings.homeStation);
+  if (!homeInfo) {
+    ctx.log("warn", "Could not determine home station info for cleaning");
+    return;
+  }
+  
+  ctx.log("info", `Cleaning home station storage at ${settings.homeStation}...`);
+  
+  // Navigate to home system if needed
+  if (bot.system !== settings.homeSystem) {
+    await ensureUndocked(ctx);
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    if (!fueled) {
+      ctx.log("error", "Cannot refuel to reach home system for home station cleanup");
+      return;
+    }
+    const arrived = await navigateToSystem(ctx, settings.homeSystem, {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+    });
+    if (!arrived) {
+      ctx.log("error", "Failed to reach home system for home station cleanup");
+      return;
+    }
+  }
+  
+  await ensureUndocked(ctx);
+  
+  // Check storage at home station using view_storage with station_id
+  const storageResp = await bot.viewStorage(homeInfo.baseId);
+  const storageError = storageResp.error as { message?: string } | undefined;
+  if (storageError) {
+    ctx.log("warn", `Could not view home station storage: ${storageError.message}`);
+    return;
+  }
+  
+  const storedCredits = (storageResp.credits as number) || (storageResp.stored_credits as number) || 0;
+  await bot.refreshStorage();
+  const hasItems = bot.storage.length > 0;
+  
+  if (storedCredits === 0 && !hasItems) {
+    ctx.log("info", "Home station storage is empty — nothing to clean");
+    return;
+  }
+  
+  // Travel to home station if not already there
+  if (bot.poi !== homeInfo.poiId) {
+    ctx.log("travel", `Traveling to home station ${homeInfo.poiId}...`);
+    const tResp = await bot.exec("travel", { target_poi: homeInfo.poiId });
+    if (tResp.error && !tResp.error.message.toLowerCase().includes("already")) {
+      ctx.log("error", `Failed to travel to home station: ${tResp.error.message}`);
+      return;
+    }
+    bot.poi = homeInfo.poiId;
+  }
+  
+  await ensureDocked(ctx);
+  if (!bot.docked) {
+    ctx.log("error", "Could not dock at home station for cleanup");
+    return;
+  }
+  
+  await bot.refreshStorage();
+  await bot.refreshCargo();
+  
+  let depositedCount = 0;
+  
+  // Deposit station storage (home station's storage) to faction
+  if (bot.storage.length > 0) {
+    ctx.log("trade", `Depositing home station storage to faction...`);
+    for (const item of [...bot.storage]) {
+      if (item.quantity <= 0) continue;
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+      
+      const fResp = await bot.exec("spacemolt_storage", {
+        action: "deposit",
+        target: "faction",
+        item_id: item.itemId,
+        quantity: item.quantity,
+        source: "storage"
+      });
+      
+      if (!fResp.error) {
+        depositedCount++;
+        ctx.log("trade", `Deposited ${item.quantity}x ${item.name} from home station storage`);
+        const idx = bot.storage.findIndex(s => s.itemId === item.itemId);
+        if (idx >= 0) bot.storage.splice(idx, 1);
+      } else {
+        ctx.log("error", `Failed to deposit ${item.name}: ${fResp.error.message}`);
+      }
+    }
+  }
+  
+  // Deposit cargo to faction
+  if (bot.inventory.some(i => i.quantity > 0)) {
+    ctx.log("trade", `Depositing cargo to faction...`);
+    for (const item of [...bot.inventory]) {
+      if (item.quantity <= 0) continue;
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+      
+      const fResp = await bot.exec("spacemolt_storage", {
+        action: "deposit",
+        target: "faction",
+        item_id: item.itemId,
+        quantity: item.quantity
+      });
+      
+      if (!fResp.error) {
+        depositedCount++;
+        ctx.log("trade", `Deposited ${item.quantity}x ${item.name} from home station cargo`);
+      } else {
+        await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
+        ctx.log("trade", `Deposited ${item.quantity}x ${item.name} to station`);
+      }
+    }
+  }
+  
+  // Withdraw credits
+  if (storedCredits > 0) {
+    const wResp = await bot.exec("withdraw_credits", { amount: storedCredits });
+    if (!wResp.error) {
+      ctx.log("trade", `Withdrew ${storedCredits}cr from home station`);
+    }
+  }
+  
+  if (depositedCount > 0) {
+    ctx.log("info", `Home station cleanup complete: ${depositedCount} item types processed`);
+    await bot.refreshStorage();
+    await bot.refreshCargo();
+  }
+}
+
 // ── Main routine ─────────────────────────────────────────────
 
 export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
@@ -602,6 +773,11 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       fuelThresholdPct: settings.refuelThreshold,
       hullThresholdPct: settings.repairThreshold,
     };
+
+    // ── Phase 0: Clean home station storage ──
+    yield "clean_home_station";
+    ctx.log("info", `Cleaning home station storage...`);
+    await cleanHomeStationStorage(ctx, settings);
 
     // ── Phase 1: Remote scan — discover which stations have our stuff ──
     yield "remote_scan";

@@ -1790,6 +1790,12 @@ export async function navigateToSystem(
         // Fall through to retry logic below
       }
 
+      // Check for undefined/null error message (session loss indicator)
+      if (!jumpResp.error.message || jumpResp.error.message === "undefined") {
+        ctx.log("error", `Jump response has undefined/null error message - treating as session loss`);
+        return false;
+      }
+
       const errorMsg = jumpResp.error.message.toLowerCase();
 
       // Check for in_battle error - for escorts, this means they got pulled into a battle

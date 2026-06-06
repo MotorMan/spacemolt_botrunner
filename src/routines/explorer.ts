@@ -1207,6 +1207,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
         const jumpResp = await bot.exec("jump", { target_system: random.id });
         if (jumpResp.error) {
+          if (!jumpResp.error.message) {
+            ctx.log("error", `Jump response has undefined/null error message`);
+            await ctx.sleep(10000);
+            continue;
+          }
           const msg = jumpResp.error.message.toLowerCase();
           // CRITICAL: Check for battle interrupt error
           if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
@@ -1290,6 +1295,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("travel", `Jumping to ${nextSystem.name || nextSystem.id}...`);
     const jumpResp = await bot.exec("jump", { target_system: nextSystem.id });
     if (jumpResp.error) {
+      if (!jumpResp.error.message) {
+        ctx.log("error", `Jump response has undefined/null error message`);
+        await ctx.sleep(10000);
+        continue;
+      }
       const msg = jumpResp.error.message.toLowerCase();
       // CRITICAL: Check for battle interrupt error
       if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {

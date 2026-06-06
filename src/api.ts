@@ -523,6 +523,52 @@ export class SpaceMoltAPI {
         return this.execute(command, payload);
       }
 
+      if (resp.error.message === "undefined" || resp.error.message === null) {
+        debugLogForBot(botName, "api:execute", `${botName} detected undefined/null error message for ${command}`);
+        massDisconnectDetector.trackSessionLoss(botName);
+
+        if (this._recoveryInProgress) {
+          debugLogForBot(botName, "api:execute", `${botName} recovery already in progress, waiting...`);
+          await sleep(5000);
+          return this.execute(command, payload);
+        }
+
+        this._recoveryInProgress = true;
+
+        try {
+          if (this._recoveryCount >= MAX_SESSION_RECOVERIES) {
+            log("system", `${botName} exceeded max session recoveries (${MAX_SESSION_RECOVERIES}), full login required`);
+            this._forceFullLogin = true;
+            this._recoveryCount = 0;
+            this.session = null;
+            return { error: { code: "full_login_required", message: "Session recovery failed too many times, full login required" } };
+          }
+
+          this._recoveryCount++;
+          this._lastRecoveryTime = Date.now();
+
+          debugLogForBot(botName, "api:execute", `${botName} clearing session due to undefined error message`);
+          const oldSessionId = this.session?.id;
+          this.session = null;
+
+          try {
+            debugLogForBot(botName, "api:recovery", `${botName} starting session recovery (old: ${oldSessionId?.slice(0, 8) || "none"})`);
+            await this.ensureSession();
+            const newId = (this.session as ApiSession | null)?.id?.slice(0, 8) || "none";
+            debugLogForBot(botName, "api:recovery", `${botName} session recovery complete (new: ${newId})`);
+            this._recoveryCount = 0;
+            return this.execute(command, payload);
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            log("error", `${botName} session renewal failed: ${msg}`);
+            return { error: { code: "session_renewal_failed", message: msg } };
+          }
+        } finally {
+          this._recoveryInProgress = false;
+          debugLogForBot(botName, "api:recovery", `${botName} recovery flag cleared`);
+        }
+      }
+
       if (code === "session_invalid" || code === "session_expired" || code === "not_authenticated") {
         massDisconnectDetector.trackSessionLoss(botName);
 
@@ -572,6 +618,54 @@ export class SpaceMoltAPI {
           this._recoveryInProgress = false;
           debugLogForBot(botName, "api:recovery", `${botName} recovery flag cleared`);
         }
+      }
+    }
+
+    const isMalformedResponse = resp.result === undefined && 
+      (!resp.error || !resp.error.message || resp.error.message === "undefined" || resp.error.message === null);
+    if (isMalformedResponse) {
+      debugLogForBot(botName, "api:execute", `${botName} detected malformed/undefined response for ${command}`, resp);
+      massDisconnectDetector.trackSessionLoss(botName);
+
+      if (this._recoveryInProgress) {
+        debugLogForBot(botName, "api:execute", `${botName} recovery already in progress, waiting...`);
+        await sleep(5000);
+        return this.execute(command, payload);
+      }
+
+      this._recoveryInProgress = true;
+
+      try {
+        if (this._recoveryCount >= MAX_SESSION_RECOVERIES) {
+          log("system", `${botName} exceeded max session recoveries (${MAX_SESSION_RECOVERIES}), full login required`);
+          this._forceFullLogin = true;
+          this._recoveryCount = 0;
+          this.session = null;
+          return { error: { code: "full_login_required", message: "Session recovery failed too many times, full login required" } };
+        }
+
+        this._recoveryCount++;
+        this._lastRecoveryTime = Date.now();
+
+        debugLogForBot(botName, "api:execute", `${botName} clearing session due to malformed response`);
+        const oldSessionId = this.session?.id;
+        this.session = null;
+
+        try {
+          debugLogForBot(botName, "api:recovery", `${botName} starting session recovery (old: ${oldSessionId?.slice(0, 8) || "none"})`);
+          await this.ensureSession();
+          const newId = (this.session as ApiSession | null)?.id?.slice(0, 8) || "none";
+          debugLogForBot(botName, "api:recovery", `${botName} session recovery complete (new: ${newId})`);
+          this._recoveryCount = 0;
+          return this.execute(command, payload);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          log("error", `${botName} session renewal failed: ${msg}`);
+          return { error: { code: "session_renewal_failed", message: msg } };
+        }
+      } finally {
+        this._recoveryInProgress = false;
+        debugLogForBot(botName, "api:recovery", `${botName} recovery flag cleared`);
       }
     }
 
@@ -846,6 +940,13 @@ export class SpaceMoltAPI {
     try {
       const text = await resp.text();
       this._totalBytesIn += Buffer.byteLength(text, 'utf8');
+      
+      if (text.trim() === "undefined" || text.trim() === "") {
+        return {
+          error: { code: "malformed_response", message: "Server returned empty/undefined response" },
+        };
+      }
+      
       const data = JSON.parse(text) as ApiResponse & { structuredContent?: unknown };
       if (data.structuredContent !== undefined) {
         data.result = data.structuredContent;

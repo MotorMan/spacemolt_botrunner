@@ -13607,27 +13607,12 @@ function renderFactionProductionDetailCard(container, username, facilityType, de
   }
   
   const name = detail.name || detail.facility_type || facilityType;
+  const desc = detail.description || detail.desc || '';
+  const category = detail.category || 'production';
   const level = detail.level ?? detail.tier ?? '';
   const levelStr = level ? ` Level ${level}` : '';
-  const category = detail.category || 'production';
-  const desc = detail.description || detail.desc || '';
-  const buildCost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? 0;
-  const buildCostStr = buildCost ? `${Number(buildCost).toLocaleString()}cr` : '';
-  const labor = detail.labor_cost ?? detail.labor ?? '';
-  const laborStr = labor ? `${labor} labor` : '';
-  const buildTime = detail.build_time ?? detail.time ?? '';
-  const buildTimeStr = buildTime ? `${buildTime}s` : '';
-  
-  const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || detail.resources || [];
-  let matsHtml = '';
-  if (Array.isArray(mats) && mats.length > 0) {
-    matsHtml = '<div style="margin-top:8px"><span style="color:var(--text-dim)">Materials required:</span> ' +
-      mats.map(m => {
-        const mName = m.name || m.item_name || m.item_id || '?';
-        const mQty = m.quantity || m.count || m.amount || 1;
-        return `${mQty}x ${esc(mName)}`;
-      }).join(', ') + '</div>';
-  }
+  const hint = detail.hint || '';
+  const buildable = detail.buildable !== false;
   
   const rawRecipe = detail.recipe || null;
   let recipeDisplay = '';
@@ -13635,17 +13620,63 @@ function renderFactionProductionDetailCard(container, username, facilityType, de
     const recipeName = rawRecipe.name || rawRecipe.id || detail.recipe_id || '';
     const craftingTime = rawRecipe.crafting_time || rawRecipe.time || '';
     const timeStr = craftingTime ? ` (${craftingTime}s)` : '';
+    
     const inputs = rawRecipe.inputs || rawRecipe.components || rawRecipe.ingredients || [];
     const outputs = rawRecipe.outputs || rawRecipe.output || rawRecipe.result || rawRecipe.produces || [];
-    const inputsStr = inputs.length > 0 ? inputs.map(i => `${i.quantity || 1}x ${i.name || i.item_id || '?'}`).join(', ') : '-';
-    const outputsStr = outputs.length > 0 ? outputs.map(o => `${o.quantity || 1}x ${o.name || o.item_id || '?'}`).join(', ') : '-';
+    
+    const inputsStr = inputs.length > 0 
+      ? inputs.map(i => `${i.quantity || 1}x ${i.name || i.item_id || '?'}`).join(', ')
+      : '-';
+    const outputsStr = outputs.length > 0
+      ? outputs.map(o => `${o.quantity || 1}x ${o.name || o.item_id || '?'}`).join(', ')
+      : '-';
+    
     recipeDisplay = `<span style="font-weight:600">${esc(recipeName)}${timeStr}</span><br/>` +
       `<span style="color:var(--text-dim)">Inputs:</span> ${esc(inputsStr)}<br/>` +
       `<span style="color:var(--text-dim)">Outputs:</span> <span style="color:var(--green)">${esc(outputsStr)}</span>`;
   } else if (typeof rawRecipe === 'string') {
     recipeDisplay = esc(rawRecipe);
   }
-  let recipeHtml = recipeDisplay ? `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">Recipe: ${recipeDisplay}</div>` : '';
+  
+  const buildCost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? 0;
+  const buildCostStr = buildCost ? `${Number(buildCost).toLocaleString()}cr` : '';
+  
+  const laborCost = detail.labor_cost ?? 0;
+  const laborCostStr = laborCost ? `${laborCost} labor` : '';
+  
+  const buildTime = detail.build_time ?? 0;
+  const buildTimeStr = buildTime ? `${buildTime}s` : '';
+  
+  const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || detail.resources || [];
+  let matsHtml = '';
+  if (Array.isArray(mats) && mats.length > 0) {
+    matsHtml = '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
+      mats.map(m => {
+        const mName = m.name || m.item_name || m.item_id || m.resource || '?';
+        const mQty = m.quantity || m.count || m.amount || 1;
+        return `<span style="color:var(--text)">${mQty}x ${esc(mName)}</span>`;
+      }).join(', ') + '</div>';
+  } else if (typeof mats === 'object' && !Array.isArray(mats) && Object.keys(mats).length > 0) {
+    matsHtml = '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
+      Object.entries(mats).map(([k, v]) => `<span style="color:var(--text)">${v}x ${esc(k)}</span>`).join(', ') + '</div>';
+  }
+  
+  const stats = [];
+  if (detail.capacity) stats.push(`Capacity: ${detail.capacity}`);
+  if (detail.storage_capacity) stats.push(`Storage: ${detail.storage_capacity}`);
+  if (detail.production_rate) stats.push(`Production: ${detail.production_rate}`);
+  let statsHtml = '';
+  if (stats.length > 0) {
+    statsHtml = `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">${stats.join(' | ')}</div>`;
+  }
+  
+  let recipeHtml = '';
+  if (recipeDisplay) {
+    recipeHtml = `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">Recipe: ${recipeDisplay}</div>`;
+  }
+  
+  const warningHtml = hint ? `<div style="margin-top:6px;font-size:11px;color:var(--orange)">${esc(hint)}</div>` : '';
+  const notBuildableHtml = !buildable ? `<div style="margin-top:6px;font-size:11px;color:var(--red)">Cannot build directly - ${esc(hint || 'must upgrade existing facility')}</div>` : '';
   
   const detailHtml = `
     <div class="faction-card" style="padding:12px">
@@ -13658,16 +13689,21 @@ function renderFactionProductionDetailCard(container, username, facilityType, de
       </div>
       <div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>
       ${buildCostStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Build Cost: ${esc(buildCostStr)}</div>` : ''}
-      ${laborStr ? `<div style="font-size:11px;color:var(--yellow);margin-top:2px">${esc(laborStr)}</div>` : ''}
+      ${laborCostStr ? `<div style="font-size:11px;color:var(--yellow);margin-top:2px">${esc(laborCostStr)}</div>` : ''}
       ${buildTimeStr ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">Build Time: ${esc(buildTimeStr)}</div>` : ''}
       ${matsHtml}
+      ${statsHtml}
       ${recipeHtml}
+      ${warningHtml}
+      ${notBuildableHtml}
+      ${buildable ? `
       <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
         <button class="primary sm" style="width:100%" onclick="factionBuildFacility('${esc(username)}','${esc(facilityType)}')">Build Facility</button>
       </div>
       <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
         This will withdraw required materials from faction storage and build the facility using faction_build.
       </div>
+      ` : ''}
     </div>
   `;
   container.innerHTML = detailHtml;

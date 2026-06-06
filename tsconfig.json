@@ -17,6 +17,7 @@
     "src/routines/fleet_hunter_subordinate.ts",
     "src/routines/fleet_hunter_subordinate_clean.ts",
     "src/routines/__tests__/battle_tick.test.ts",
-    "src/**/*_temp.ts"
+    "src/**/*_temp.ts",
+    "src/test_*.ts"
   ]
 }

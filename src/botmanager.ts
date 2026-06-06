@@ -807,7 +807,7 @@ async function main(): Promise<void> {
     refreshStatusTable();
 
     // Session resume is fast (5s delay to match renewal queue), full login requires rate limiting (25s delay)
-    const SESSION_RESUME_DELAY_MS = 5000;
+    const SESSION_RESUME_DELAY_MS = 7000;
     const FULL_LOGIN_DELAY_MS = 13000;
     let botIndex = 0;
 

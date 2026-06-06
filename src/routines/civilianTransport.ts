@@ -111,6 +111,10 @@ interface CivilianTransportSettings {
   repairThreshold: number;
   homeSystem: string;
   homeStation: string;
+  maxPassengers: number;
+  maxEconomy: number;
+  maxBusiness: number;
+  maxFirst: number;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -125,6 +129,10 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     repairThreshold: Number((t.repairThreshold as number) ?? 40),
     homeSystem: (botOverrides.homeSystem as string) || (t.homeSystem as string) || "",
     homeStation: (botOverrides.homeStation as string) || (t.homeStation as string) || "",
+    maxPassengers: Number((t.maxPassengers as number) ?? 0),
+    maxEconomy: Number((t.maxEconomy as number) ?? 0),
+    maxBusiness: Number((t.maxBusiness as number) ?? 0),
+    maxFirst: Number((t.maxFirst as number) ?? 0),
   };
 }
 
@@ -693,24 +701,49 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       let usedBusiness = 0;
       let usedFirst = 0;
 
+      const capAvailable = (used: number, max: number, free: number) => {
+        if (max > 0) return Math.min(free, max - used);
+        return free;
+      };
+
       const destinationsPriority = Array.from(byDest.entries())
         .sort((a, b) => b[1].length - a[1].length);
 
       for (const [destId, passengers] of destinationsPriority) {
         if (passengers.length === 0) continue;
-        // Check how many we can fit
+        // Check total passenger cap
+        const totalLoaded = usedEconomy + usedBusiness + usedFirst;
+        if (settings.maxPassengers > 0 && totalLoaded >= settings.maxPassengers) {
+          break;
+        }
+        // Check how many we can fit respecting configured maxes
         let canFit = 0;
         for (const p of passengers) {
           const cls = p.class.toLowerCase() as "economy" | "business" | "first";
           if (cls === "first") {
-            if (usedFirst < freeFirst) { canFit++; usedFirst++; }
+            if (usedFirst < capAvailable(usedFirst, settings.maxFirst, freeFirst)) {
+              canFit++;
+              usedFirst++;
+            }
           } else if (cls === "business") {
-            if (usedBusiness < freeBusiness) { canFit++; usedBusiness++; }
-            else if (usedEconomy < freeEconomy) { canFit++; usedEconomy++; }
+            if (usedBusiness < capAvailable(usedBusiness, settings.maxBusiness, freeBusiness)) {
+              canFit++;
+              usedBusiness++;
+            } else if (usedEconomy < capAvailable(usedEconomy, settings.maxEconomy, freeEconomy)) {
+              canFit++;
+              usedEconomy++;
+            }
           } else {
-            if (usedEconomy < freeEconomy) { canFit++; usedEconomy++; }
-            else if (usedBusiness < freeBusiness) { canFit++; usedBusiness++; }
-            else if (usedFirst < freeFirst) { canFit++; usedFirst++; }
+            if (usedEconomy < capAvailable(usedEconomy, settings.maxEconomy, freeEconomy)) {
+              canFit++;
+              usedEconomy++;
+            } else if (usedBusiness < capAvailable(usedBusiness, settings.maxBusiness, freeBusiness)) {
+              canFit++;
+              usedBusiness++;
+            } else if (usedFirst < capAvailable(usedFirst, settings.maxFirst, freeFirst)) {
+              canFit++;
+              usedFirst++;
+            }
           }
           if (canFit >= passengers.length) break;
         }

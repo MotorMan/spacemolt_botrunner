@@ -19320,6 +19320,38 @@ async function renderCivilianTransportSettings(panel) {
       <select id="set-civilian_transport-homeStation">${homeStationOpts}</select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max passengers per run</div>
+        <div class="setting-hint">Global passenger cap. Set to 0 for unlimited (only limited by berths).</div>
+      </div>
+      <input type="number" id="set-civilian_transport-maxPassengers" min="0" max="100" value="${esc(String(ct.maxPassengers ?? 0))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max economy passengers</div>
+        <div class="setting-hint">Class-specific cap for economy berths. Set to 0 to allow up to the ship's capacity.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-maxEconomy" min="0" max="50" value="${esc(String(ct.maxEconomy ?? 0))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max business passengers</div>
+        <div class="setting-hint">Class-specific cap for business berths. Set to 0 to allow up to the ship's capacity.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-maxBusiness" min="0" max="50" value="${esc(String(ct.maxBusiness ?? 0))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max first-class passengers</div>
+        <div class="setting-hint">Class-specific cap for first-class berths. Set to 0 to allow up to the ship's capacity.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-maxFirst" min="0" max="50" value="${esc(String(ct.maxFirst ?? 0))}">
+    </div>
+
     <div style="margin-top:18px">
       <button class="primary" onclick="saveCivilianTransportSettings()">Save Settings</button>
     </div>
@@ -19331,6 +19363,10 @@ function saveCivilianTransportSettings() {
   const refuelThreshold = Number(document.getElementById('set-civilian_transport-refuelThreshold')?.value || 50);
   const repairThreshold = Number(document.getElementById('set-civilian_transport-repairThreshold')?.value || 40);
   const homeStation = document.getElementById('set-civilian_transport-homeStation')?.value || '';
+  const maxPassengers = Number(document.getElementById('set-civilian_transport-maxPassengers')?.value || 0);
+  const maxEconomy = Number(document.getElementById('set-civilian_transport-maxEconomy')?.value || 0);
+  const maxBusiness = Number(document.getElementById('set-civilian_transport-maxBusiness')?.value || 0);
+  const maxFirst = Number(document.getElementById('set-civilian_transport-maxFirst')?.value || 0);
 
   const s = {};
   if (homeStation && homeStation.includes('|')) {
@@ -19342,6 +19378,10 @@ function saveCivilianTransportSettings() {
   s.maxJumps = maxJumps;
   s.refuelThreshold = refuelThreshold;
   s.repairThreshold = repairThreshold;
+  s.maxPassengers = maxPassengers;
+  s.maxEconomy = maxEconomy;
+  s.maxBusiness = maxBusiness;
+  s.maxFirst = maxFirst;
 
   send({ type: 'saveSettings', routine: 'civilian_transport', settings: s });
   alert('Civilian Transport settings saved');

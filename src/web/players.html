@@ -149,8 +149,6 @@
             shipTierMap[ship.id] = ship.tier;
           }
         }
-        // Re-render if view is already rendered
-        if (currentView) renderView();
       }).catch(e => console.error('Failed to load catalog:', e));
     }
 
@@ -225,6 +223,11 @@
     // ── Render Current View ──────────────────────────────
     function renderView() {
       const content = document.getElementById('viewContent');
+      const hasPlayers = Object.keys(playerData.players || {}).length > 0;
+      if (!hasPlayers) {
+        content.innerHTML = '<div class="empty-state">Loading player data...</div>';
+        return;
+      }
       if (filteredPlayers.length === 0 && currentView !== 'matrix') {
         filterPlayers();
         if (filteredPlayers.length === 0) {

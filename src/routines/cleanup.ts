@@ -496,9 +496,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
 
-      const fResp = await bot.exec("spacemolt_storage", {
-        action: "deposit",
-        target: "faction",
+      const fResp = await bot.exec("faction_deposit_items", {
         item_id: item.itemId,
         quantity: item.quantity,
         source: "storage"
@@ -526,12 +524,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
 
       if (settings.depositAllStorage && deposited.some(d => d.includes(item.name) && d.includes("storage"))) continue;
 
-      const fResp = await bot.exec("spacemolt_storage", {
-        action: "deposit",
-        target: "faction",
-        item_id: item.itemId,
-        quantity: item.quantity
-      });
+      const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
       if (!fResp.error) {
         deposited.push(`${item.quantity}x ${item.name}`);
         logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (cleanup)`);

@@ -1868,7 +1868,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 
     if (isProtected || item.quantity <= 0) continue;
 
-    const dResp = await bot.exec("spacemolt_storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity });
+    const dResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
     if (dResp.error) {
       await bot.exec("deposit_items", { item_id: item.itemId, quantity: item.quantity });
     }

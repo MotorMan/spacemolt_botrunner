@@ -44,24 +44,21 @@ interface CraftingPlan {
 
 const BLACKLISTED_RECIPES = new Set([
   "basic_silicon_refinement",
-]);
-
-const PENALTY_RECIPES: Record<string, number> = {
-  "synthesize_bio_polymer": -1000,
-};
-
-const WASTEFUL_WRAP_RECIPES = new Set([
   "wrap_processed_thorium",
   "wrap_thorium_fuel_rod",
   "wrap_reactor_fuel_assembly",
   "wrap_reactor_grade_plutonium",
   "wrap_enriched_uranium_rod",
   "wrap_weapons_grade_plutonium",
+  "wrap_highly_enriched_uranium",
+  "wrap_low_enriched_uranium",
+  "wrap_liquid_tritium",
+  "wrap_uranium_hexafluoride",
 ]);
 
-function isWrapRecipe(recipe: Recipe): boolean {
-  return WASTEFUL_WRAP_RECIPES.has(recipe.recipe_id);
-}
+const PENALTY_RECIPES: Record<string, number> = {
+  "synthesize_bio_polymer": -1000,
+};
 
 function isUnwrapRecipe(recipe: Recipe): boolean {
   return recipe.recipe_id.startsWith("unwrap_");
@@ -71,7 +68,7 @@ function hasDirectRecipe(recipeId: string, recipes: Recipe[]): boolean {
   const itemMatch = recipeId.match(/^unwrap_(.+)$/);
   if (!itemMatch) return false;
   const itemId = itemMatch[1];
-  return recipes.some(r => r.output_item_id === itemId && !isUnwrapRecipe(r) && !isWrapRecipe(r));
+  return recipes.some(r => r.output_item_id === itemId && !isUnwrapRecipe(r));
 }
 
 export function scoreRecipeAvailability(
@@ -100,10 +97,6 @@ export function scoreRecipeAvailability(
   
   if (recipe.recipe_id in PENALTY_RECIPES) {
     score += PENALTY_RECIPES[recipe.recipe_id];
-  }
-  
-  if (isWrapRecipe(recipe)) {
-    score -= 50;
   }
   
   return score;

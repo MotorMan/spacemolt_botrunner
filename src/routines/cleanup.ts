@@ -635,7 +635,7 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
       
-      const fResp = await bot.exec("spacemolt_storage", {
+      const fResp = await bot.exec("storage", {
         action: "deposit",
         target: "faction",
         item_id: item.itemId,
@@ -662,11 +662,12 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
       
-      const fResp = await bot.exec("spacemolt_storage", {
+      const fResp = await bot.exec("storage", {
         action: "deposit",
         target: "faction",
         item_id: item.itemId,
-        quantity: item.quantity
+        quantity: item.quantity,
+        source: "cargo"
       });
       
       if (!fResp.error) {

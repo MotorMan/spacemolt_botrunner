@@ -568,7 +568,7 @@ export async function collectFromStorage(ctx: RoutineContext, minBalance: number
     }
     
     if (amountToWithdraw > 0) {
-      const wResp = await bot.exec("spacemolt_storage", { action: "withdraw", item_id: "credits", quantity: amountToWithdraw, target: "self", source: "storage" });
+      const wResp = await bot.exec("storage", { action: "withdraw", item_id: "credits", quantity: amountToWithdraw, target: "self", source: "storage" });
       if (!wResp.error) {
         ctx.log("trade", `Collected ${amountToWithdraw} credits from storage`);
         await bot.refreshStatus();

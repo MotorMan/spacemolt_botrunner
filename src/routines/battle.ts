@@ -579,6 +579,7 @@ export async function engageTarget(
   sideId?: number, // Optional: if provided, skip analysis and directly join this side
   skipScan: boolean = false,
   repairThreshold: number = 0,   // if >0, enables in-combat emergency repair/recharge using repairThreshold as %
+  onlyNPCs: boolean = false,     // if true, flee when encountering players
 ): Promise<boolean> {
   const { bot } = ctx;
   if (!target.id) return false;
@@ -591,7 +592,7 @@ export async function engageTarget(
       ctx.log("error", `Failed to join battle side ${sideId}: ${engageResp.error.message}`);
       return false;
     }
-    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold);
+    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
   }
 
   const battleStatus = await getBattleStatus(ctx);
@@ -615,7 +616,7 @@ export async function engageTarget(
     }
 
     const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold);
+    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
   }
 
   ctx.log("combat", `🎯 Engaging ${target.name}...`);
@@ -661,7 +662,7 @@ export async function engageTarget(
         // Prefer a real participant from the battle we just detected.
         // This is the key fix for "boss jumped us while we were attacking something else".
         const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-        return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold);
+        return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
       }
     }
     return false;
@@ -816,6 +817,13 @@ export async function fightFreshBattle(
   }
 }
 
+const PLAYER_KEYWORDS = ["pirate", "drifter", "raider", "outlaw", "bandit", "corsair", "marauder", "hostile", "executioner", "sentinel", "prowler", "apex", "razor", "striker", "rampart", "stalwart", "bastion", "onslaught", "iron", "strike"];
+
+function isPlayerParticipant(participant: import("../types/game.js").BattleParticipant): boolean {
+  const name = (participant.username || "").toLowerCase();
+  return !PLAYER_KEYWORDS.some(kw => name.includes(kw));
+}
+
 /** Pick a real enemy participant from the current battle (opposite side of ourSideId).
  *  Prefers boss-like names when present. Returns null if no valid enemy is listed yet. */
 function pickRealBattleTarget(
@@ -862,6 +870,7 @@ export async function fightJoinedBattle(
   repairThreshold: number = 0,
   canFlee: boolean = true,
   shieldRechargePct: number = 80,
+  onlyNPCs: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
@@ -948,6 +957,12 @@ export async function fightJoinedBattle(
         targetParticipant = status.participants.find(
           p => p.player_id === better.id || p.username === better.name
         );
+        // Check if new target is a player and we should flee
+        if (onlyNPCs && targetParticipant && isPlayerParticipant(targetParticipant)) {
+          ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
+          await emergencyFleeSpam(ctx, `target switched to player`);
+          return false;
+        }
       }
     }
 
@@ -955,6 +970,12 @@ export async function fightJoinedBattle(
       ctx.log("combat", `⚠️ ${currentTarget.name} marked destroyed but battle still active — waiting...`);
       await ctx.sleep(2000);
       continue;
+    }
+
+    if (onlyNPCs && targetParticipant && isPlayerParticipant(targetParticipant)) {
+      ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
+      await emergencyFleeSpam(ctx, `target is a player`);
+      return false;
     }
 
     await bot.refreshStatus();

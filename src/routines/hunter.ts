@@ -78,7 +78,7 @@ import {
   getWeaponModules,
 } from "./battle.js";
 
-async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier, repairThreshold: number = 0): Promise<void> {
+async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier, repairThreshold: number = 0, onlyNPCs: boolean = false): Promise<void> {
   const battleStatus = await getBattleStatus(ctx);
   if (!battleStatus) return;
 
@@ -113,14 +113,14 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
   // Pick a real target from battle participants so we get the full combat loop
   const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
   const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
-  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, shieldRechargePct);
+  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, shieldRechargePct, hsettings.onlyNPCs);
 }
 
 async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
   // First check WebSocket state (works even when HTTP is hanging)
   if (ctx.bot.isInBattle()) {
     ctx.log("combat", `⚠️ Already in battle (ID: ${ctx.bot.currentBattle.battleId}) - engaging instead of navigating`);
-    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
     return true;
   }
   
@@ -129,7 +129,7 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
     const battleStatus = await getBattleStatus(ctx);
     if (battleStatus) {
       ctx.log("combat", `⚠️ Battle detected via API (ID: ${battleStatus.battle_id}) - engaging instead of navigating`);
-      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
       return true;
     }
   } catch (e) {
@@ -315,7 +315,7 @@ async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: Re
 
 const enemy = (battleStatus?.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed);
     const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
-    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100);
+    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs);
   }
 }
 

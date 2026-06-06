@@ -602,7 +602,7 @@ async function handleUnexpectedEscortBattle(
     : null;
   // shieldRechargePct is stored as percentage (80), convert to decimal for fightJoinedBattle
   const shieldRechargePctDecimal = shieldRechargePct / 100;
-  await fightJoinedBattle(ctx, fakeTarget as any, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, shieldRechargePctDecimal);
+  await fightJoinedBattle(ctx, fakeTarget as any, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, shieldRechargePctDecimal, false);
 }
 
 // ── Safe-system docking (reused from hunter) ─────────────────

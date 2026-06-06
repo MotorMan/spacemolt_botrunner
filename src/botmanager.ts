@@ -27,7 +27,7 @@ import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
-import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
+import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine } from "./web/server.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
@@ -333,6 +333,17 @@ async function handlePathfinderCalc(action: WebAction): Promise<WebActionResult>
   return { ok: false, error: "Provide from+to for bearing calc, or originSystem+bearing to simulate, or just bearing for reverse" };
 }
 
+async function handleAutoRestart(botName: string): Promise<void> {
+  const lastRoutine = getLastUsedRoutine(botName);
+  if (!lastRoutine || !ROUTINES[lastRoutine]) {
+    server.logSystem(`Bot ${botName} in ERROR state but no last-used routine found, defaulting to miner`);
+    await handleStart({ type: "start", bot: botName, routine: "miner" });
+    return;
+  }
+  server.logSystem(`Bot ${botName} in ERROR state, auto-restarting with last-used routine: ${lastRoutine}`);
+  await handleStart({ type: "start", bot: botName, routine: lastRoutine });
+}
+
 async function handleStart(action: WebAction): Promise<WebActionResult> {
   const botName = action.bot;
   if (!botName) return { ok: false, error: "No bot specified" };
@@ -340,11 +351,15 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   const bot = bots.get(botName);
   if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
   if (bot.state === "running") return { ok: false, error: `${botName} is already running` };
+  if (bot.state === "error") {
+    bot.clearError();
+  }
 
   const routineKey = action.routine || "miner";
   const routine = ROUTINES[routineKey];
   if (!routine) return { ok: false, error: `Unknown routine: ${routineKey}` };
 
+  saveLastUsedRoutine(botName, routineKey);
   server.logSystem(`Starting ${bot.username} with ${routine.name} routine...`);
 
   // Store routine parameters on bot object if provided (for manual_rescue etc.)
@@ -378,6 +393,8 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
     server.clearBotAssignment(botName);
     // Clear params after error
     (bot as unknown as Record<string, unknown>).routineParams = undefined;
+    // Auto-restart on ERROR state
+    handleAutoRestart(botName);
   });
 
   server.saveBotAssignment(botName, routineKey);
@@ -801,7 +818,7 @@ async function main(): Promise<void> {
                 server.logSystem(`Catalog fetch failed: ${err}`);
               }
             }
-            const routineKey = assignments[name];
+            const routineKey = assignments[name] || getLastUsedRoutine(name);
             if (routineKey && ROUTINES[routineKey]) {
               server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
               await handleStart({ type: "start", bot: name, routine: routineKey });
@@ -837,7 +854,7 @@ async function main(): Promise<void> {
                   server.logSystem(`Catalog fetch failed: ${err}`);
                 }
               }
-              const routineKey = assignments[name];
+              const routineKey = assignments[name] || getLastUsedRoutine(name);
               if (!routineKey || !ROUTINES[routineKey]) {
                 server.logSystem(`${name} logged in but no routine assigned`);
                 return;
@@ -872,7 +889,7 @@ async function main(): Promise<void> {
                     server.logSystem(`Catalog fetch failed: ${err}`);
                   }
                 }
-                const routineKey = assignments[name];
+                const routineKey = assignments[name] || getLastUsedRoutine(name);
                 if (!routineKey || !ROUTINES[routineKey]) {
                   server.logSystem(`${name} logged in but no routine assigned`);
                   return;
@@ -966,6 +983,16 @@ async function main(): Promise<void> {
       }
     }
   }, 24 * 60 * 60 * 1000));
+
+  // Periodic ERROR state check - auto-restart bots that crashed
+  intervals.push(setInterval(() => {
+    for (const [name, bot] of bots) {
+      if (bot.state === "error") {
+        server.logSystem(`Detected ${name} in ERROR state, attempting auto-restart...`);
+        handleAutoRestart(name);
+      }
+    }
+  }, 30000));
 
   // Start HTTP + WebSocket server
   server.start();

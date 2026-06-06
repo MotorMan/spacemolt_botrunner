@@ -712,7 +712,7 @@ let settings = {};
 let flockSettings = { flockGroups: [], assignments: {} };
 let knownSystems = [];
 let knownOres = [];
-let mobileCapitol = null;     // { systemId, systemName, poiId, discoveredAt }
+let mobileCapitol = null;
 let reconnectDelay = 1000;
 let mapData = {};
 let modalMode = 'add';
@@ -725,6 +725,7 @@ let catalog = { items: {}, ships: {}, skills: {}, recipes: {}, lastFetched: null
 let globalFactionStorage = [];
 let statsDaily = {};
 let profileReturnHomeIgnoreBlacklist = false;
+let lastUsedRoutines = {};
 
 // ── Resolve a system ID + optional POI ID to display names using mapData. ──
 
@@ -867,7 +868,7 @@ let wsInitTimer = null;
 /** Fetch initial data via REST API as fallback if WebSocket is slow */
 async function fetchInitialData() {
   try {
-    const [botsRes, discoveredRes, routinesRes, settingsRes, flockRes, mapRes, statsRes, catalogRes, mainLogsRes, factionStorageRes] = await Promise.all([
+    const [botsRes, discoveredRes, routinesRes, settingsRes, flockRes, mapRes, statsRes, catalogRes, mainLogsRes, factionStorageRes, lastUsedRoutinesRes] = await Promise.all([
       fetch('/api/bots').then(r => r.json()),
       fetch('/api/bots/discovered').then(r => r.json()),
       fetch('/api/routines').then(r => r.json()),
@@ -877,10 +878,12 @@ async function fetchInitialData() {
       fetch('/api/stats').then(r => r.json()),
       fetch('/api/catalog').then(r => r.json()),
       fetch('/api/logs/main').then(r => r.json()),
-      fetch('/api/faction-storage').then(r => r.json()).catch(() => ({ items: [] })), // Best effort
+      fetch('/api/faction-storage').then(r => r.json()).catch(() => ({ items: [] })),
+      fetch('/api/last-used-routines').then(r => r.json()).catch(() => ({}))
     ]);
     settings = settingsRes || {};
     flockSettings = flockRes || { flockGroups: [], assignments: {} };
+    lastUsedRoutines = lastUsedRoutinesRes || {};
 
     // Merge discovered bots with status data (discovered gives us usernames even if not logged in)
     const statusBots = botsRes || [];
@@ -1016,6 +1019,7 @@ async function fetchInitialData() {
         knownOres = msg.knownOres || [];
         mobileCapitol = msg.mobileCapitol || null;
         flockSettings = msg.flockSettings || { flockGroups: [], assignments: {} };
+        lastUsedRoutines = msg.lastUsedRoutines || {};
         renderBots();
         setTimeout(refreshFactionFunds, 2000);
         updateChatBotSelect();

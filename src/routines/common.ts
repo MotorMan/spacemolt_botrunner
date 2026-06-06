@@ -3559,8 +3559,19 @@ export function parseNearbyEntities(result: unknown): NearbyEntitiesResult {
  */
 export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus | null> {
   const { bot } = ctx;
+  
+  // First check WebSocket state (works even when HTTP is hanging)
+  if (bot.isInBattle()) {
+    return {
+      battle_id: bot.currentBattle.battleId || "",
+      participants: bot.currentBattle.participants as any,
+      is_participant: true,
+    } as any;
+  }
+  
   const resp = await bot.exec("get_battle_status");
   if (resp.error || !resp.result) {
+    // On 502/524 errors, return null but don't log - rely on WebSocket state
     return null;
   }
 

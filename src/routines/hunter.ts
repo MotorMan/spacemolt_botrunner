@@ -116,6 +116,30 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
   await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, shieldRechargePct);
 }
 
+async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
+  // First check WebSocket state (works even when HTTP is hanging)
+  if (ctx.bot.isInBattle()) {
+    ctx.log("combat", `⚠️ Already in battle (ID: ${ctx.bot.currentBattle.battleId}) - engaging instead of navigating`);
+    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+    return true;
+  }
+  
+  // Also check via API in case WebSocket state is stale/missing
+  try {
+    const battleStatus = await getBattleStatus(ctx);
+    if (battleStatus) {
+      ctx.log("combat", `⚠️ Battle detected via API (ID: ${battleStatus.battle_id}) - engaging instead of navigating`);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold);
+      return true;
+    }
+  } catch (e) {
+    // API check failed - rely on WebSocket state
+    ctx.log("combat", `API battle check failed, relying on WebSocket state`);
+  }
+  
+  return false;
+}
+
 // ── Settings ─────────────────────────────────────────────────
 
 export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols";
@@ -252,7 +276,20 @@ function isLowOnFieldConsumables(inventory: any[] | undefined, minRepairKits = 5
 }
 
 async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<void> {
-  const battleStatus = await getBattleStatus(ctx);
+  // First check WebSocket state (works even when HTTP is hanging)
+  let battleStatus: Awaited<ReturnType<typeof getBattleStatus>> = null;
+  
+  if (ctx.bot.isInBattle()) {
+    battleStatus = {
+      battle_id: ctx.bot.currentBattle.battleId || "",
+      participants: ctx.bot.currentBattle.participants as any,
+      is_participant: true,
+    } as any;
+  } else {
+    // Fall back to API check
+    battleStatus = await getBattleStatus(ctx);
+  }
+  
   if (!battleStatus) return;
 
   ctx.log("combat", `⚠️ Navigation interrupted by battle (ID: ${battleStatus.battle_id}) - hunter fights, not flees!`);
@@ -276,7 +313,7 @@ async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: Re
       }
     }
 
-    const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
+const enemy = (battleStatus?.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed);
     const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
     await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100);
   }
@@ -692,6 +729,10 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     yield "faction_alert_check";
     const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
     if (alertTarget) {
+      // CRITICAL: Check for existing battle before navigating
+      if (await checkAndHandleExistingBattle(ctx, settings)) {
+        continue;
+      }
       const sys = mapStore.getSystem(alertTarget);
       const blacklist = getSystemBlacklist();
       const route = mapStore.findRoute(bot.system, alertTarget, blacklist);
@@ -720,6 +761,11 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // ── Navigate to a huntable (low/unregulated) system ──
     yield "find_patrol_system";
+
+    // CRITICAL: Check for existing battle before navigating
+    if (await checkAndHandleExistingBattle(ctx, settings)) {
+      continue;
+    }
 
     if (patrolSystem && bot.system !== patrolSystem) {
       ctx.log("travel", `Navigating to configured patrol system ${patrolSystem}...`);
@@ -826,6 +872,12 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       }
       if (midFuel < settings.refuelThreshold) {
         ctx.log("system", `Fuel at ${midFuel}% — aborting patrol, heading to refuel`);
+        abortPatrol = true;
+        break;
+      }
+
+      // CRITICAL: Check for existing battle before traveling to POI
+      if (await checkAndHandleExistingBattle(ctx, settings)) {
         abortPatrol = true;
         break;
       }
@@ -1255,6 +1307,12 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       }
       if (midFuel < settings.refuelThreshold) {
         ctx.log("system", `Fuel at ${midFuel}% — aborting patrol, heading to refuel`);
+        abortPatrol = true;
+        break;
+      }
+
+      // CRITICAL: Check for existing battle before traveling to POI
+      if (await checkAndHandleExistingBattle(ctx, settings)) {
         abortPatrol = true;
         break;
       }

@@ -278,6 +278,12 @@ docked = false;
     return this._routine;
   }
 
+  clearError(): void {
+    this._state = "idle";
+    this._routine = null;
+    this._error = null;
+  }
+
   /** Get the bot's empire affiliation from session credentials. */
   getEmpire(): string {
     const creds = this.session.loadCredentials();
@@ -574,14 +580,23 @@ docked = false;
         }
         resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
 
-        // Handle HTTP 502 Bad Gateway — server-side issue, retry infinitely with backoff
-        // This prevents 502 errors from breaking routines mid-operation
+        // Handle HTTP 502 Bad Gateway — server-side issue, but could be battle interrupt
+        // The server may return 502 when a battle starts during the request
+        // Retry and check for battle state via WebSocket
         if (resp.error && resp.error.message && resp.error.message.includes("502")) {
+          let battleDetectedDuring502 = false;
           const MAX_502_RETRIES = Infinity;
           for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
             // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+            // Return a battle interrupt error instead of the misleading 502
             if (this.currentBattle.inBattle) {
-              this.log("combat", `HTTP 502 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              this.log("combat", `Battle detected during 502 retry - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              battleDetectedDuring502 = true;
+              resp = {
+                error: { code: "battle_interrupt", message: `Jump interrupted by battle ${this.currentBattle.battleId}` },
+                result: undefined,
+                notifications: [],
+              };
               break;
             }
 
@@ -591,19 +606,29 @@ docked = false;
             resp = await this.api.execute(command, payload);
             if (!resp.error || !resp.error.message?.includes("502")) break;
           }
-          if (resp.error && resp.error.message?.includes("502")) {
-            this.log("error", `HTTP 502: Bad Gateway (infinite retries exhausted due to battle or other error)`);
+          // Only log error if battle was NOT detected (battle detection means we're handling it)
+          if (resp.error && resp.error.message?.includes("502") && !battleDetectedDuring502) {
+            this.log("error", `HTTP 502: Bad Gateway (infinite retries exhausted due to other error)`);
           }
         }
 
         // Handle HTTP 524 Timeout — server took too long to respond (common during battles)
-        // Retry infinitely with backoff since battle notifications may still be flowing via WebSocket
+        // The server may return 524 when a battle starts during the request
+        // Retry and check for battle state via WebSocket
         if (resp.error && resp.error.message && resp.error.message.includes("524")) {
+          let battleDetectedDuring524 = false;
           const MAX_524_RETRIES = Infinity;
           for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
             // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+            // Return a battle interrupt error instead of the misleading 524
             if (this.currentBattle.inBattle) {
-              this.log("combat", `HTTP 524 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              this.log("combat", `Battle detected during 524 retry - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              battleDetectedDuring524 = true;
+              resp = {
+                error: { code: "battle_interrupt", message: `Travel interrupted by battle ${this.currentBattle.battleId}` },
+                result: undefined,
+                notifications: [],
+              };
               break;
             }
 
@@ -613,8 +638,9 @@ docked = false;
             resp = await this.api.execute(command, payload);
             if (!resp.error || !resp.error.message?.includes("524")) break;
           }
-          if (resp.error && resp.error.message?.includes("524")) {
-            this.log("error", `HTTP 524: Timeout (infinite retries exhausted due to battle or other error)`);
+          // Only log error if battle was NOT detected (battle detection means we're handling it)
+          if (resp.error && resp.error.message?.includes("524") && !battleDetectedDuring524) {
+            this.log("error", `HTTP 524: Timeout (infinite retries exhausted due to other error)`);
           }
         }
 
@@ -1776,11 +1802,12 @@ docked = false;
    * @returns true if in battle, false otherwise
    */
   isInBattle(): boolean {
-    // Check if we're in battle and the last update was recent (within 60 seconds)
+    // Check if we're in battle and the last update was recent (within 120 seconds)
     if (!this.currentBattle.inBattle) return false;
     
     const timeSinceUpdate = Date.now() - this.currentBattle.lastUpdate;
-    if (timeSinceUpdate > 60000) {
+    // Use 120 second timeout instead of 60 to be more lenient during HTTP errors
+    if (timeSinceUpdate > 120000) {
       // Battle state is stale - clear it
       this.currentBattle.inBattle = false;
       this.currentBattle.battleId = null;

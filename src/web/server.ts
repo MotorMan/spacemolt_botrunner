@@ -64,6 +64,7 @@ const MAIN_LOG_FILE = join(DATA_DIR, "main_logs.json");
 const FACILITIES_FILE = join(DATA_DIR, "facilities.json");
 const TAXES_FILE = join(DATA_DIR, "taxes.json");
 const FLOCK_FILE = join(DATA_DIR, "flock.json");
+const LAST_USED_ROUTINE_FILE = join(DATA_DIR, "lastUsedRoutine.json");
 
 interface CachedFacilities {
   version: string;
@@ -125,6 +126,39 @@ function loadSettings(): RoutineSettings {
 }
 
 export { loadSettings };
+
+export interface LastUsedRoutineData {
+  [botUsername: string]: string;
+}
+
+function loadLastUsedRoutines(): LastUsedRoutineData {
+  if (existsSync(LAST_USED_ROUTINE_FILE)) {
+    try {
+      return JSON.parse(readFileSync(LAST_USED_ROUTINE_FILE, "utf-8")) as LastUsedRoutineData;
+    } catch (err) {
+      console.warn(`Warning: corrupt lastUsedRoutine.json, starting fresh —`, err);
+    }
+  }
+  return {};
+}
+
+function saveLastUsedRoutine(botUsername: string, routine: string): void {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  const data = loadLastUsedRoutines();
+  data[botUsername] = routine;
+  writeFileSync(LAST_USED_ROUTINE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function getLastUsedRoutine(botUsername: string): string | null {
+  const data = loadLastUsedRoutines();
+  return data[botUsername] || null;
+}
+
+function getAllLastUsedRoutines(): LastUsedRoutineData {
+  return loadLastUsedRoutines();
+}
+
+export { loadLastUsedRoutines, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines };
 
 /** Get the global system blacklist from settings. */
 export function getSystemBlacklist(): string[] {
@@ -507,6 +541,19 @@ export class WebServer {
             if (updates.assignments !== undefined) current.assignments = updates.assignments as FlockSettingsData["assignments"];
             saveFlockSettings(current);
             return Response.json(current);
+          }
+        }
+        if (url.pathname === "/api/last-used-routines") {
+          if (req.method === "GET") {
+            return Response.json(getAllLastUsedRoutines());
+          }
+          if (req.method === "POST") {
+            const body = await req.json() as { bot: string; routine: string };
+            if (!body.bot || !body.routine) {
+              return Response.json({ error: "Missing bot or routine" }, { status: 400 });
+            }
+            saveLastUsedRoutine(body.bot, body.routine);
+            return Response.json({ ok: true });
           }
         }
         if (url.pathname === "/api/stats") {
@@ -1439,6 +1486,7 @@ export class WebServer {
                 },
                 botLogs: botLogsObj,
                 flockSettings: loadFlockSettings(),
+                lastUsedRoutines: getAllLastUsedRoutines(),
               }));
 
               // Send large data separately to avoid blocking with JSON serialization

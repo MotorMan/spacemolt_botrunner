@@ -22,6 +22,7 @@ import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordina
 import { escortRoutine } from "./routines/escort.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
 import { fuelTransportRoutine } from "./routines/fuelTransfer.js";
+import { civilianTransportRoutine } from "./routines/civilianTransport.js";
 import { pathfinderTestRoutine } from "./routines/pathfinder_test.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
@@ -118,6 +119,7 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   command_receiver: { name: "CommandReceiver", fn: commandReceiverRoutine },
   escort: { name: "Escort", fn: escortRoutine },
   pathfinder_test: { name: "PathfinderTest", fn: pathfinderTestRoutine },
+  civilian_transport: { name: "CivilianTransport", fn: civilianTransportRoutine },
 };
 
 // ── Auto-discover existing sessions ─────────────────────────

@@ -463,8 +463,9 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
 
-      const fResp = await bot.exec("faction_deposit_items", {
-        faction_id: bot.faction,
+      const fResp = await bot.exec("spacemolt_storage", {
+        action: "deposit",
+        target: "faction",
         item_id: item.itemId,
         quantity: item.quantity,
         source: "storage"
@@ -475,7 +476,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
         logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (cleanup storage)`);
         const idx = bot.storage.findIndex(s => s.itemId === item.itemId);
         if (idx >= 0) bot.storage.splice(idx, 1);
-      } else if (fResp.error?.message?.includes("storage_cap_exceeded")) {
+      } else if (fResp.error?.message?.includes("storage_cap_exceeded") || fResp.error?.message?.includes("cap reached")) {
         skipped.push(`${item.quantity}x ${item.name} (faction full)`);
         ctx.log("warn", `Faction storage full for ${item.name} — skipping`);
       } else {
@@ -492,11 +493,16 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
 
       if (settings.depositAllStorage && deposited.some(d => d.includes(item.name) && d.includes("storage"))) continue;
 
-      const fResp = await bot.exec("faction_deposit_items", { item_id: item.itemId, quantity: item.quantity });
+      const fResp = await bot.exec("spacemolt_storage", {
+        action: "deposit",
+        target: "faction",
+        item_id: item.itemId,
+        quantity: item.quantity
+      });
       if (!fResp.error) {
         deposited.push(`${item.quantity}x ${item.name}`);
         logFactionActivity(ctx, "deposit", `Deposited ${item.quantity}x ${item.name} (cleanup)`);
-      } else if (fResp.error?.message?.includes("storage_cap_exceeded")) {
+      } else if (fResp.error?.message?.includes("storage_cap_exceeded") || fResp.error?.message?.includes("cap reached")) {
         skipped.push(`${item.quantity}x ${item.name} (faction full)`);
         ctx.log("warn", `Faction storage full for ${item.name} — skipping`);
       } else {

@@ -8012,17 +8012,16 @@ function renderCleanupSettings(panel) {
   const cleanupSystem = cleanup.homeSystem || '';
   const cleanupStation = cleanup.homeStation || '';
   const focusStationId = cleanup.focusStationId || '';
+  const depositAllStorage = cleanup.depositAllStorage !== false;
   const generalSystem = general.factionStorageSystem || '';
   const generalStation = general.factionStorageStation || '';
 
-  // Resolve general station name for the fallback label
   let generalLabel = 'not set';
   if (generalSystem && generalStation && mapData[generalSystem]) {
     const gPoi = (mapData[generalSystem].pois || []).find(p => p.id === generalStation);
     if (gPoi) generalLabel = (gPoi.base_name || gPoi.name || generalStation) + ' (' + (mapData[generalSystem].name || generalSystem) + ')';
   }
 
-  // Build station options from mapData (same format as general settings: "systemId|poiId")
   let stationOpts = `<option value="">(use general: ${esc(generalLabel)})</option>`;
   let focusOpts = `<option value="">(clean all stations)</option>`;
   for (const [sysId, sys] of Object.entries(mapData)) {
@@ -8030,11 +8029,9 @@ function renderCleanupSettings(panel) {
     for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
       if (!(poi.has_base || poi.base_id)) continue;
       const val = sysId + '|' + poi.id;
-      // For deposit station
       const sel = (sysId === cleanupSystem && poi.id === cleanupStation) ? ' selected' : '';
       const label = poi.base_name || poi.name || poi.id;
       stationOpts += `<option value="${val}"${sel}>${label} (${sysName})</option>`;
-      // For focus station (use base_id if available)
       const focusVal = poi.base_id || poi.id;
       const focusSel = focusStationId === focusVal ? ' selected' : '';
       focusOpts += `<option value="${esc(focusVal)}"${focusSel}>${esc(label)} (${esc(sysName)})</option>`;
@@ -8061,6 +8058,17 @@ function renderCleanupSettings(panel) {
       <select id="set-cleanup-focusStation">${focusOpts}</select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Deposit All Storage</div>
+        <div class="setting-hint">When enabled, station storage items are deposited directly to faction storage (using source: storage). When disabled, only cargo is deposited and station storage is left in place.</div>
+      </div>
+      <select id="set-cleanup-depositAllStorage">
+        <option value="true" ${depositAllStorage ? 'selected' : ''}>Yes</option>
+        <option value="false" ${!depositAllStorage ? 'selected' : ''}>No</option>
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveCleanupSettings()">Save Settings</button>
     </div>
@@ -8071,7 +8079,8 @@ function saveCleanupSettings() {
   const stationVal = document.getElementById('set-cleanup-station').value;
   const [homeSystem, homeStation] = stationVal ? stationVal.split('|') : ['', ''];
   const focusStationId = document.getElementById('set-cleanup-focusStation').value;
-  const s = { homeSystem, homeStation, focusStationId };
+  const depositAllStorage = document.getElementById('set-cleanup-depositAllStorage').value === 'true';
+  const s = { homeSystem, homeStation, focusStationId, depositAllStorage };
   send({ type: 'saveSettings', routine: 'cleanup', settings: s });
   settings.cleanup = Object.assign(settings.cleanup || {}, s);
 }

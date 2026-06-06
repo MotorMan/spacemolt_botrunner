@@ -308,11 +308,17 @@ export function isMaydayDuplicate(
   const maydayKey = normalizeMaydayKey(player, system, poi);
   const now = Date.now();
   const oneHour = 60 * 60 * 1000; // 1 hour in milliseconds
+  const processingGracePeriod = 5000; // 5 seconds grace period for newly received MAYDAYs
 
   // Check if we recently received this MAYDAY (regardless of completion status)
   const receivedAt = recentMaydayReceived.get(maydayKey);
   if (receivedAt) {
     const timeSinceReceived = now - receivedAt;
+    
+    // If received within the last 5 seconds, it's still being processed - not a duplicate yet
+    if (timeSinceReceived < processingGracePeriod) {
+      return false;
+    }
     
     if (timeSinceReceived < oneHour) {
       // Still within the cooldown window - this is a duplicate

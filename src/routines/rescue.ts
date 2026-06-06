@@ -1786,13 +1786,17 @@ skipToReturnHome = true;
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
 
+          // ── ESTABLISH 1-HOUR COOLDOWN IMMEDIATELY ──
+          // Mark as received BEFORE any checks to establish the cooldown upfront
+          // This prevents the MAYDAY from re-triggering even if accepted or declined
+          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
+          ctx.log("mayday_debug", `📝 MAYDAY from ${mayday.sender} marked as received (1-hour cooldown active)`);
+
           // ── IMMEDIATE DUPLICATE CHECK: Prevent rapid-fire spam ──
-          // This MUST happen first, before any other processing, to prevent MASS SPAM
-          // when multiple MAYDAY messages arrive in quick succession
+          // This uses a 5-second grace period for newly received MAYDAYs
           if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (1-hour cooldown)`);
             markMaydayHandled(mayday);
-            markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
             continue;
           }
           
@@ -1801,13 +1805,8 @@ skipToReturnHome = true;
           if (isMaydayDeclined(mayday.sender, mayday.system, mayday.poi)) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - previously declined (1-hour cooldown)`);
             markMaydayHandled(mayday);
-            markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
             continue;
           }
-          
-          // Mark as received IMMEDIATELY to catch subsequent rapid duplicates
-          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
-          ctx.log("mayday_debug", `📝 MAYDAY from ${mayday.sender} marked as received (1-hour cooldown active)`);
 
           // Check if sender is a known player (from playerNames.json)
           const knownPlayer = isKnownPlayer(mayday.sender);
@@ -1815,6 +1814,7 @@ skipToReturnHome = true;
           if (!knownPlayer) {
             // Unknown sender - skip this MAYDAY (possible ambush)
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - not a known player (possible ambush)`);
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             markMaydayHandled(mayday);
             continue;
           }
@@ -1825,6 +1825,7 @@ skipToReturnHome = true;
           // Prevents wasting fuel on players who aren't actually in distress (potential ambushes)
           if (mayday.fuelPct > settings.maydayFuelThreshold) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - fuel too high (${mayday.fuelPct}% > ${settings.maydayFuelThreshold}% threshold)`);
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             markMaydayHandled(mayday);
             continue;
           }
@@ -1858,6 +1859,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
               }
             }
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             markMaydayHandled(mayday);
             continue;
           }
@@ -1867,6 +1869,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           const rescueDecision = shouldRescuePlayer(mayday.sender, ghostThresholdOverride);
           if (!rescueDecision.shouldRescue) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - ${rescueDecision.reason}`);
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             markMaydayHandled(mayday);
             continue;
           }
@@ -1880,6 +1883,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             // First check if this player is already locked out
             if (isMaydayPirateLocked(mayday.sender)) {
               ctx.log("mayday", `🔒 Ignoring MAYDAY from ${mayday.sender} - currently locked out (pirate base proximity)`);
+              markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
               markMaydayHandled(mayday);
               continue;
             }
@@ -4100,6 +4104,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     
     if (maxJumps > 0 && jumpsToTarget > maxJumps) {
       ctx.log("mayday", `⚠️ MAYDAY too far: ${jumpsToTarget} jumps (max: ${maxJumps}) - ignoring`);
+      markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
       markMaydayHandled(mayday);
       await ctx.sleep(5000);
       continue;

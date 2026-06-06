@@ -498,6 +498,7 @@ async function depositAtHome(ctx: RoutineContext, settings: ReturnType<typeof ge
 
       const fResp = await bot.exec("storage", {
         action: "deposit",
+        target: "faction",
         item_id: item.itemId,
         quantity: item.quantity,
         source: "storage"

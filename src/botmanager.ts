@@ -28,7 +28,7 @@ import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
-import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine } from "./web/server.js";
+import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines } from "./web/server.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
@@ -336,6 +336,9 @@ async function handlePathfinderCalc(action: WebAction): Promise<WebActionResult>
 }
 
 async function handleAutoRestart(botName: string): Promise<void> {
+  const bot = bots.get(botName);
+  if (!bot || bot.state !== "error") return;
+  
   const lastRoutine = getLastUsedRoutine(botName);
   if (!lastRoutine || !ROUTINES[lastRoutine]) {
     server.logSystem(`Bot ${botName} in ERROR state but no last-used routine found, defaulting to miner`);
@@ -400,6 +403,7 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   });
 
   server.saveBotAssignment(botName, routineKey);
+  saveLastUsedRoutine(botName, routineKey);
 
   return { ok: true, message: `Started ${botName} with ${routine.name}` };
 }
@@ -787,8 +791,18 @@ async function main(): Promise<void> {
 
   if (bots.size > 0) {
     const assignments = server.getBotAssignments();
+    const existingLastUsedRoutines = getAllLastUsedRoutines();
+    
+    // Migrate any missing last-used routines from assignments (one-time migration)
+    for (const [botName, routine] of Object.entries(assignments)) {
+      if (!existingLastUsedRoutines[botName] && routine && ROUTINES[routine]) {
+        saveLastUsedRoutine(botName, routine);
+      }
+    }
+    
     server.logSystem(`Found ${bots.size} saved bot(s): ${[...bots.keys()].sort((a, b) => a.localeCompare(b)).join(", ")}`);
     server.logSystem(`Bot assignments: ${JSON.stringify(assignments)}`);
+    server.logSystem(`Last-used routines: ${JSON.stringify(getAllLastUsedRoutines())}`);
     // Push initial bot list to UI immediately (shows as "idle" with default values)
     refreshStatusTable();
 
@@ -820,7 +834,7 @@ async function main(): Promise<void> {
                 server.logSystem(`Catalog fetch failed: ${err}`);
               }
             }
-            const routineKey = assignments[name] || getLastUsedRoutine(name);
+            const routineKey = getLastUsedRoutine(name) || assignments[name];
             if (routineKey && ROUTINES[routineKey]) {
               server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
               await handleStart({ type: "start", bot: name, routine: routineKey });
@@ -856,7 +870,7 @@ async function main(): Promise<void> {
                   server.logSystem(`Catalog fetch failed: ${err}`);
                 }
               }
-              const routineKey = assignments[name] || getLastUsedRoutine(name);
+              const routineKey = getLastUsedRoutine(name) || assignments[name];
               if (!routineKey || !ROUTINES[routineKey]) {
                 server.logSystem(`${name} logged in but no routine assigned`);
                 return;
@@ -891,7 +905,7 @@ async function main(): Promise<void> {
                     server.logSystem(`Catalog fetch failed: ${err}`);
                   }
                 }
-                const routineKey = assignments[name] || getLastUsedRoutine(name);
+                const routineKey = getLastUsedRoutine(name) || assignments[name];
                 if (!routineKey || !ROUTINES[routineKey]) {
                   server.logSystem(`${name} logged in but no routine assigned`);
                   return;

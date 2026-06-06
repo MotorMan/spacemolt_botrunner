@@ -363,7 +363,8 @@
         <div class="sidebar-item" onclick="switchSettingsTab('escort')">Escort</div>
         <div class="sidebar-item" onclick="switchSettingsTab('fleet_hunter')">Fleet Hunter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cargo_mover')">CargoMover</div>
-        <div class="sidebar-item" onclick="switchSettingsTab('fuel_transport')">Fuel Transport</div>
+         <div class="sidebar-item" onclick="switchSettingsTab('fuel_transport')">Fuel Transport</div>
+         <div class="sidebar-item" onclick="switchSettingsTab('civilian_transport')">Civilian Transport</div>
       </div>
       <div class="settings-panel" id="settingsContent">
         <!-- filled by JS -->
@@ -883,67 +884,10 @@ async function fetchInitialData() {
     ]);
     settings = settingsRes || {};
     flockSettings = flockRes || { flockGroups: [], assignments: {} };
-    lastUsedRoutines = lastUsedRoutinesRes || {};
-
-    // Merge discovered bots with status data (discovered gives us usernames even if not logged in)
-    const statusBots = botsRes || [];
-    const discoveredUsernames = discoveredRes?.usernames || [];
-    window.discoveredBots = discoveredUsernames;
-    const statusByUsername = new Map(statusBots.map(b => [b.username, b]));
-
-    // Build complete bot list: include discovered bots even if no status yet
-    const botSet = new Set([...discoveredUsernames, ...statusBots.map(b => b.username)]);
-    bots = [...botSet].map(username => {
-      const status = statusByUsername.get(username);
-      if (status) return status;
-      // Bot discovered but not logged in yet - show as idle
-      return {
-        username,
-        state: 'idle',
-        routine: null,
-        credits: 0,
-        fuel: 0,
-        maxFuel: 0,
-        cargo: 0,
-        cargoMax: 0,
-        location: 'unknown',
-        system: 'unknown',
-        poi: '',
-        docked: false,
-        lastAction: '',
-        error: null,
-         shipName: '-',
-         shipClass: '',
-         hull: 0,
-        maxHull: 0,
-        shield: 0,
-        maxShield: 0,
-        ammo: 0,
-        inventory: [],
-        storage: [],
-        stats: { totalMined: 0, totalCrafted: 0, totalTrades: 0, totalProfit: 0, totalSystems: 0 },
-      };
-    });
-
-    routines = routinesRes || [];
-    settings = settingsRes || {};
-    mapData = mapRes.systems || {};
-    knownSystems = Object.entries(mapData).map(([id, sys]) => ({ id, name: sys?.name || id }));
-    knownOres = [];
-    statsDaily = statsRes || {};
-    catalog = catalogRes || { items: {}, ships: {}, skills: {}, recipes: {}, lastFetched: null };
-    // Load faction storage (shared warehouse)
-    globalFactionStorage = (factionStorageRes?.items || factionStorageRes?.entries || []).map(e => ({
-      item_id: e.itemId || e.item_id,
-      name: e.name || '?',
-      quantity: e.quantity || 0,
-    }));
-    factionFuelReserve = factionStorageRes?.factionFuelReserve || 0;
-    factionFuelCapacity = factionStorageRes?.factionFuelCapacity || 0;
-    const fuelDisplayEl = document.getElementById('factionFuelDisplay');
-    if (fuelDisplayEl) {
-      const fuelK = (factionFuelReserve / 1000).toFixed(1);
-      fuelDisplayEl.textContent = `Fuel: ${fuelK}K`;
+lastUsedRoutines = lastUsedRoutinesRes || {};
+    // Fallback: migrate from settings.botAssignments if lastUsedRoutines is empty
+    if (Object.keys(lastUsedRoutines).length === 0 && settings.botAssignments) {
+      lastUsedRoutines = { ...settings.botAssignments };
     }
     renderBots();
     renderStats();
@@ -1020,6 +964,10 @@ async function fetchInitialData() {
         mobileCapitol = msg.mobileCapitol || null;
         flockSettings = msg.flockSettings || { flockGroups: [], assignments: {} };
         lastUsedRoutines = msg.lastUsedRoutines || {};
+        // Fallback: migrate from settings.botAssignments if lastUsedRoutines is empty
+        if (Object.keys(lastUsedRoutines).length === 0 && settings.botAssignments) {
+          lastUsedRoutines = { ...settings.botAssignments };
+        }
         renderBots();
         setTimeout(refreshFactionFunds, 2000);
         updateChatBotSelect();
@@ -1274,16 +1222,16 @@ function renderBots() {
     const fuelClass = isLowFuel ? 'low-fuel' : '';
     const fuelGradient = getFuelGradient(fuelPct);
     const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
-    const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+    const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : (bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state);
     const cargoPct = bot.cargoMax > 0 ? Math.round((bot.cargo / bot.cargoMax) * 100) : 0;
     const cargoDisplay = bot.cargoMax > 0 ? `${bot.cargo}/${bot.cargoMax}` : `${bot.cargo}`;
     const isCargoFull = bot.cargoMax > 0 && (bot.cargo / bot.cargoMax) > 0.9;
     const cargoClass = isCargoFull ? 'cargo-full' : '';
     const hullShd = (bot.maxHull > 0 || bot.maxShield > 0) ? `${bot.hull}/${bot.shield}` : '-';
-    let actions = '';
+let actions = '';
     if (bot.state !== 'running' && bot.state !== 'stopping') {
-      const prevSel = document.getElementById(`routine-${bot.username}`);
-      const prevRoutine = prevSel ? prevSel.value : (bot.routine || 'miner');
+      const prevSel = document.getElementById(`routine-${esc(bot.username)}`);
+      const prevRoutine = prevSel ? prevSel.value : (lastUsedRoutines[bot.username] || bot.routine || 'miner');
       actions = `
         <select id="routine-${esc(bot.username)}" onclick="event.stopPropagation()" onchange="toggleReturnHomeOptions('${esc(bot.username)}')">
           ${routines.map(r => `<option value="${esc(r)}"${r === prevRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
@@ -1328,7 +1276,7 @@ function updateBotTableBadges() {
     if (!row) return;
     const badge = row.querySelector(`.state-badge[data-bot="${bot.username}"]`);
     if (badge) {
-      const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+      const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : (bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state);
       badge.textContent = esc(stateLabel);
       badge.className = `state-badge state-${bot.state}`;
     }
@@ -1494,7 +1442,7 @@ function renderBotGridCard(bot) {
   const fuelGradient = getFuelGradient(fuelPct);
   const cargoGradient = getCargoGradient(cargoPct);
   const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
-  const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+  const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : (bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state);
 
   return `
     <div class="grid-bot-card" onclick="openProfile('${esc(bot.username)}')">
@@ -1539,7 +1487,8 @@ function renderRoutineGroups() {
 
   const filteredBots = bots.filter(bot => {
     const matchesSearch = !routineGroupsState.currentFilter.search || bot.username.toLowerCase().includes(routineGroupsState.currentFilter.search);
-    const matchesRoutine = !routineGroupsState.currentFilter.routine || bot.routine === routineGroupsState.currentFilter.routine;
+    const botRoutine = bot.state === 'error' ? (lastUsedRoutines[bot.username] || bot.routine) : bot.routine;
+    const matchesRoutine = !routineGroupsState.currentFilter.routine || botRoutine === routineGroupsState.currentFilter.routine;
     const matchesStatus = !routineGroupsState.currentFilter.status || bot.state === routineGroupsState.currentFilter.status;
     return matchesSearch && matchesRoutine && matchesStatus;
   });
@@ -1554,7 +1503,8 @@ function renderRoutineGroups() {
 
   const grouped = {};
   filteredBots.forEach(bot => {
-    const r = bot.routine || 'unknown';
+    const botRoutine = bot.state === 'error' ? (lastUsedRoutines[bot.username] || bot.routine) : bot.routine;
+    const r = botRoutine || 'unknown';
     if (!grouped[r]) grouped[r] = [];
     grouped[r].push(bot);
   });
@@ -1679,9 +1629,10 @@ function renderBotCard(bot) {
   const isLowFuel = fuelPct < 20;
   const fuelGradient = getFuelGradient(fuelPct);
   const cargoGradient = getCargoGradient(cargoPct);
+  const displayRoutine = bot.state === 'error' ? (lastUsedRoutines[bot.username] || bot.routine || 'unknown') : bot.routine;
 
   return `
-    <div class="bot-card routine-${bot.routine} ${isExpanded ? 'expanded' : ''}"
+    <div class="bot-card routine-${displayRoutine} ${isExpanded ? 'expanded' : ''}"
          data-bot="${esc(bot.username)}"
          onclick="handleBotCardClick(event, '${esc(bot.username)}')">
       <div class="bot-card-header">
@@ -1692,7 +1643,7 @@ function renderBotCard(bot) {
         </div>
         <div class="bot-card-status">
           <span class="status-dot ${bot.state}"></span>
-          <span class="status-label">${bot.state}</span>
+          <span class="status-label">${bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state}</span>
         </div>
       </div>
       <div class="bot-card-bars">
@@ -2198,7 +2149,7 @@ function renderProfileTopbar() {
   const bot = getProfileBot();
   if (!bot) return;
 
-  const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+  const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : (bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state);
   document.getElementById('profileName').textContent = bot.username;
   document.getElementById('profileShip').textContent = bot.shipName || 'No ship';
   document.getElementById('profileBadge').innerHTML = `<span class="state-badge state-${bot.state}">${esc(stateLabel)}</span>`;
@@ -2213,7 +2164,7 @@ function renderProfileTopbar() {
   let actions = '';
   if (bot.state !== 'running' && bot.state !== 'stopping') {
     const prevProfileSel = document.getElementById('profile-routine');
-    const prevProfileRoutine = prevProfileSel ? prevProfileSel.value : (bot.routine || 'miner');
+    const prevProfileRoutine = prevProfileSel ? prevProfileSel.value : ((lastUsedRoutines[bot.username] || bot.routine) || 'miner');
     actions = `
       <select id="profile-routine" onchange="renderProfileSidebar()">
         ${routines.map(r => `<option value="${esc(r)}"${r === prevProfileRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
@@ -3062,7 +3013,7 @@ function updateProfileSidebar() {
       // Still update badge/name since those are separate elements
       const bot = getProfileBot();
       if (bot) {
-        const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+        const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : (bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state);
         document.getElementById('profileName').textContent = bot.username;
         document.getElementById('profileShip').textContent = bot.shipName || 'No ship';
         document.getElementById('profileBadge').innerHTML = `<span class="state-badge state-${bot.state}">${esc(stateLabel)}</span>`;
@@ -7611,6 +7562,8 @@ function renderSettingsPanel() {
     renderCargoMoverSettings(panel);
   } else if (activeSettingsTab === 'fuel_transport') {
     renderFuelTransportSettings(panel);
+  } else if (activeSettingsTab === 'civilian_transport') {
+    renderCivilianTransportSettings(panel);
   }
 }
 
@@ -19290,9 +19243,119 @@ async function resetFuelTransferLoadoutCompletions() {
     return;
   }
 
-  if (!confirm(`Reset completion status for loadout "${name}"? This will allow bots to re-check and re-deliver to all stations.`)) {
+  if (!confirm(`Are you sure you want to delete the loadout completions for "${name}"? This will allow bots to re-check and re-deliver to all stations.`)) return;
+
+  try {
+    const response = await fetch(`/api/facility-transfer-completions/loadout/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+
+    if (response.ok) {
+      alert(`Reset completion status for "${name}"`);
+    } else {
+      const error = await response.json();
+      alert(`Failed to reset: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to reset: ${e.message}`);
+  }
+}
+
+// ── Civilian Transport ───────────────────────────────────────
+async function renderCivilianTransportSettings(panel) {
+  const ct = settings.civilian_transport || {};
+  const refuelThreshold = ct.refuelThreshold ?? 50;
+  const repairThreshold = ct.repairThreshold ?? 40;
+  const maxJumps = Number(ct.maxJumps ?? 5);
+
+  const general = settings.general || {};
+  const homeSystem = ct.homeSystem || general.homeSystem || '';
+  const homeStation = ct.homeStation || general.homeStation || '';
+
+  let homeStationOpts = '<option value="">(none)</option>';
+  for (const [sysId, sys] of Object.entries(mapData)) {
+    const sysName = sys.name || sysId;
+    for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
+      if (!(poi.has_base || poi.base_id)) continue;
+      const val = sysId + '|' + poi.id;
+      const label = poi.base_name || poi.name || poi.id;
+      const sel = val === homeStation ? ' selected' : '';
+      homeStationOpts += `<option value="${esc(val)}"${sel}>${label} (${esc(sysName)})</option>`;
+    }
+  }
+
+  panel.innerHTML = `
+    <h3>Civilian Transport Settings</h3>
+    <div class="settings-desc">Configure the civilian passenger transport routine. Values below are stored under <b>data/settings.json</b> → <b>civilian_transport</b> and are applied the next time a bot starts or restarts this routine.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max jumps from pickup</div>
+        <div class="setting-hint">Limit how far the bot will travel to pick up passengers. A lower value keeps runs short and fast.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-maxJumps" min="1" max="50" value="${esc(String(maxJumps))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Trigger a refuel when fuel drops below this percentage while running transport routes.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-refuelThreshold" min="10" max="90" value="${esc(String(refuelThreshold))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold (%)</div>
+        <div class="setting-hint">Dock for repairs when hull drops below this percentage.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-repairThreshold" min="10" max="90" value="${esc(String(repairThreshold))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home system / station</div>
+        <div class="setting-hint">Optional home base the transport routine will return to when idle or in an emergency.</div>
+      </div>
+      <select id="set-civilian_transport-homeStation">${homeStationOpts}</select>
+    </div>
+
+    <div style="margin-top:18px">
+      <button class="primary" onclick="saveCivilianTransportSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function saveCivilianTransportSettings() {
+  const maxJumps = Number(document.getElementById('set-civilian_transport-maxJumps')?.value || 5);
+  const refuelThreshold = Number(document.getElementById('set-civilian_transport-refuelThreshold')?.value || 50);
+  const repairThreshold = Number(document.getElementById('set-civilian_transport-repairThreshold')?.value || 40);
+  const homeStation = document.getElementById('set-civilian_transport-homeStation')?.value || '';
+
+  const s = {};
+  if (homeStation && homeStation.includes('|')) {
+    const [sys, poi] = homeStation.split('|');
+    s.homeSystem = sys;
+    s.homeStation = poi;
+  }
+
+  s.maxJumps = maxJumps;
+  s.refuelThreshold = refuelThreshold;
+  s.repairThreshold = repairThreshold;
+
+  send({ type: 'saveSettings', routine: 'civilian_transport', settings: s });
+  alert('Civilian Transport settings saved');
+}
+
+async function resetFuelTransferLoadoutCompletions() {
+  const select = document.getElementById('ft-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to reset.');
     return;
   }
+
+  if (!confirm(`Are you sure you want to delete the loadout completions for "${name}"? This will allow bots to re-check and re-deliver to all stations.`)) return;
 
   try {
     const response = await fetch(`/api/facility-transfer-completions/loadout/${encodeURIComponent(name)}`, {

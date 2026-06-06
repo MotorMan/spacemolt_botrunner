@@ -30,7 +30,6 @@ import {
   getFactionStorageQuantity,
   getFactionStorageLastUpdated,
   updateFactionStorageFromDeposit,
-  refreshFactionStorageCache,
   getFacilityTransferLoadouts,
   isStationCompletedForLoadout,
   saveStationCompletion,
@@ -50,20 +49,11 @@ interface TransferStrategy {
 }
 
 function determineTransferStrategy(
-  cachedQty: number,
   currentQty: number,
   targetQty: number
 ): TransferStrategy {
   if (currentQty >= targetQty) {
     return { skip: true, reason: "already at target" };
-  }
-
-  if (cachedQty >= targetQty) {
-    return { skip: true, reason: "cache shows at target" };
-  }
-
-  if (cachedQty > currentQty) {
-    return { skip: false, reason: "cache indicates need, proceeding" };
   }
 
   return { skip: false, reason: "proceeding with transfer" };
@@ -456,6 +446,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           }
 
           if (deliveredItems.length > 0 && applicableLoadouts.length > 0) {
+            const freshQtyCache = await getRemoteFactionAllItems(bot, remoteStationId);
             for (const loadoutName of applicableLoadouts) {
               const loadoutItemIds = loadoutItemMap.get(loadoutName)!;
               if (loadoutItemIds.size === 0) continue;
@@ -467,7 +458,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
               
               let allItemsAtTarget = true;
               for (const item of loadout.items) {
-                const currentQty = stationQtyCache[item.itemId] || 0;
+                const currentQty = freshQtyCache[item.itemId] || 0;
                 if (currentQty < item.targetQuantity) {
                   allItemsAtTarget = false;
                   ctx.log("fuel", `${item.itemId}: ${currentQty}/${item.targetQuantity} - not at target`);
@@ -494,7 +485,7 @@ export const fuelTransportRoutine: Routine = async function* (ctx: RoutineContex
           continue;
         }
 
-        const strategy = determineTransferStrategy(cachedQty, currentQty, item.targetQuantity);
+        const strategy = determineTransferStrategy(currentQty, item.targetQuantity);
         ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ${strategy.reason}`);
         if (strategy.skip) continue;
 
@@ -533,7 +524,7 @@ async function processItemTransfer(
     return null;
   }
 
-  const strategy = determineTransferStrategy(cachedQty, currentQty, item.targetQuantity);
+  const strategy = determineTransferStrategy(currentQty, item.targetQuantity);
   ctx.log("fuel", `${remoteStationId}: ${item.itemName} at ${currentQty}/${item.targetQuantity} — ${strategy.reason}`);
 
   if (strategy.skip) {
@@ -676,28 +667,10 @@ async function getItemStatus(
 ): Promise<{ cachedQty: number; currentQty: number; hasCache: boolean }> {
   const cachedQty = getFactionStorageQuantity(remoteStationId, itemId);
   const cachedLastUpdated = getFactionStorageLastUpdated(remoteStationId);
-  const CACHE_MAX_AGE = 10 * 60 * 1000;
   const hasCache = cachedLastUpdated > 0;
-  const isCacheFresh = hasCache && (Date.now() - cachedLastUpdated) < CACHE_MAX_AGE;
 
-  let currentQty: number;
-  const isAtStation = bot.poi === remoteStationId && bot.system === resolveStationSystem(remoteStationId);
-  if (hasCache && isAtStation) {
-    currentQty = await getRemoteFactionQty(bot, remoteStationId, itemId);
-    if (currentQty !== cachedQty) {
-      ctx.log("fuel", `Faction storage cache for ${remoteStationId}: ${itemId} refreshed ${cachedQty} -> ${currentQty}`);
-    }
-  } else if (isCacheFresh && !isAtStation) {
-    currentQty = cachedQty;
-    ctx.log("fuel", `Using faction storage cache for ${remoteStationId}: ${itemId} = ${currentQty}`);
-  } else {
-    currentQty = await getRemoteFactionQty(bot, remoteStationId, itemId);
-    if (!hasCache) {
-      ctx.log("fuel", `No cache for ${remoteStationId}: ${itemId} = ${currentQty}`);
-    } else {
-      ctx.log("fuel", `Cache stale for ${remoteStationId}: ${itemId} ${cachedQty} -> ${currentQty}`);
-    }
-  }
+  const currentQty = await getRemoteFactionQty(bot, remoteStationId, itemId);
+  ctx.log("fuel", `Remote faction storage for ${remoteStationId}: ${itemId} = ${currentQty}`);
 
   return { cachedQty, currentQty, hasCache };
 }

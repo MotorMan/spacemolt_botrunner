@@ -241,7 +241,7 @@ function saveFleetData(botUsername: string, ships: FleetShip[]): void {
   saveAllData(data);
 }
 
-async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
+async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings, atHomeBase: boolean): Promise<void> {
   const { bot } = ctx;
   await bot.refreshStatus();
 
@@ -255,37 +255,45 @@ async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransport
   const premSize = catalogStore.getItem("premium_fuel_cell")?.size as number || 2;
   const regSize = catalogStore.getItem("fuel_cell")?.size as number || 1;
 
-  const milCap = Math.floor(cargoFree / milSize);
-  const premCap = Math.floor(cargoFree / premSize);
-  const regCap = Math.floor(cargoFree / regSize);
+  let remainingSpace = cargoFree;
+  const milCap = Math.floor(remainingSpace / milSize);
+  remainingSpace -= milCap * milSize;
+
+  const premCap = Math.floor(remainingSpace / premSize);
+  remainingSpace -= premCap * premSize;
+
+  const regCap = Math.floor(remainingSpace / regSize);
 
   ctx.log("transport", `Fuel cell capacity: military=${milCap}, premium=${premCap}, regular=${regCap}`);
 
-  const fuelTypes = [
-    { id: "military_fuel_cell", cap: milCap },
-    { id: "premium_fuel_cell", cap: premCap },
-    { id: "fuel_cell", cap: regCap },
-  ];
-
-  for (const fuel of fuelTypes) {
-    if (fuel.cap <= 0) continue;
+  const tryAcquire = async (fuelId: string, qty: number) => {
+    if (qty <= 0) return true;
     const resp = await bot.exec("storage", {
       action: "withdraw",
       target: "faction",
-      item_id: fuel.id,
-      quantity: fuel.cap,
+      item_id: fuelId,
+      quantity: qty,
     });
     if (!resp.error) {
-      ctx.log("transport", `Withdrew ${fuel.cap} ${fuel.id} from faction storage`);
-    } else {
-      const buyResp = await bot.exec("buy", { item_id: fuel.id, quantity: fuel.cap });
-      if (!buyResp.error) {
-        ctx.log("transport", `Bought ${fuel.cap} ${fuel.id}`);
-      } else {
-        ctx.log("transport", `Could not acquire ${fuel.id}: ${buyResp.error.message}`);
-      }
+      ctx.log("transport", `Withdrew ${qty} ${fuelId} from faction storage`);
+      return true;
     }
-  }
+    if (atHomeBase) {
+      ctx.log("transport", `At home base - skipping purchase of ${fuelId}`);
+      return false;
+    }
+    const buyResp = await bot.exec("buy", { item_id: fuelId, quantity: qty });
+    if (!buyResp.error) {
+      ctx.log("transport", `Bought ${qty} ${fuelId}`);
+      return true;
+    }
+    ctx.log("transport", `Could not acquire ${fuelId}: ${buyResp.error.message}`);
+    return false;
+  };
+
+  await tryAcquire("military_fuel_cell", milCap);
+  await tryAcquire("premium_fuel_cell", premCap);
+  await tryAcquire("fuel_cell", regCap);
 }
 
 // ── Parsers ──────────────────────────────────────────────────
@@ -894,7 +902,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       // Collect fuel cells at home base
       if (pickup.poi === settings.homeStation || pickup.system === settings.homeSystem) {
         ctx.log("transport", "At home base - collecting fuel cells");
-        await collectFuelCells(ctx, settings);
+        await collectFuelCells(ctx, settings, true);
       }
 
       // Load passengers
@@ -1220,7 +1228,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         // Collect fuel cells at home base before returning
         if (settings.homeStation) {
           await ensureDocked(ctx);
-          await collectFuelCells(ctx, settings);
+          await collectFuelCells(ctx, settings, true);
         }
         
         state.status = "idle";

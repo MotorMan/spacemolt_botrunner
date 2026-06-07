@@ -17,12 +17,10 @@ import {
   type BattleState,
   isPirateSystem,
   getItemSize,
-  sleep,
 } from "./common.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
-import { callLlm, getAiChatSettings, type LlmMessage } from "../aichat_service.js";
 
 const fs = require("fs");
 const path = require("path");
@@ -83,47 +81,6 @@ function loadCatalog(): Record<string, CatalogShip> {
     // silent fail
   }
   return {};
-}
-
-async function generatePassengerBio(
-  bot: Bot,
-  name: string,
-  citizenId: string,
-  accommodationClass: string,
-  citizenship: string,
-): Promise<string> {
-  const settings = getAiChatSettings();
-  
-  if (!settings.enabled || !settings.baseUrl) {
-    return `A ${accommodationClass} class passenger from ${citizenship}.`;
-  }
-
-  const systemPrompt = `You are generating a brief bio for a passenger in the SpaceMolt game.
-Write a concise, interesting description (1-2 sentences) about this character.
-Be creative but factual based on the details provided.
-Do not mention the destination or any transport-related information.
-Keep it in character with the SpaceMolt universe.`;
-
-  const userMessage = `Generate a brief bio for:
-Name: ${name}
-Citizen ID: ${citizenId}
-Class: ${accommodationClass}
-Citizenship: ${citizenship}
-
-Bio:`;
-
-  try {
-    const response = await callLlm(
-      [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userMessage },
-      ],
-      settings
-    );
-    return response.trim();
-  } catch (err) {
-    return `A ${accommodationClass} class passenger from ${citizenship}.`;
-  }
 }
 
 // ── Types ────────────────────────────────────────────────────
@@ -1256,17 +1213,9 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       ctx.log("transport", `list_station_passengers returned ${waiting.length} waiting`);
 
       for (const p of waiting) {
-        let bio = p.bio || "";
-        if (!bio) {
-          ctx.log("transport", `Passenger ${p.name} (${p.citizen_id}) has no bio - generating...`);
-          bio = await generatePassengerBio(
-            bot,
-            p.name,
-            p.citizen_id,
-            p.class,
-            p.citizenship
-          );
-          ctx.log("transport", `Generated bio for ${p.name}: ${bio.substring(0, 50)}...`);
+        const bio = p.bio || "";
+        if (!p.bio) {
+          ctx.log("transport", `Passenger ${p.name} (${p.citizen_id}) has no bio`);
         }
         civilianStore.registerSeen({
           citizenId: p.citizen_id,

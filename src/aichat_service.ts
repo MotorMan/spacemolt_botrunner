@@ -27,7 +27,7 @@ interface AiChatMemory {
   }>;
 }
 
-export interface LlmMessage {
+interface LlmMessage {
   role: "system" | "user" | "assistant";
   content: string | null;
 }
@@ -170,7 +170,7 @@ function getBotPersonality(botName: string): string {
   return DEFAULT_PERSONALITY;
 }
 
-export function getAiChatSettings(): {
+function getAiChatSettings(): {
    enabled: boolean;
    model: string;
    baseUrl: string;
@@ -412,7 +412,7 @@ function isGeneralQuestion(message: string): boolean {
 
 // ── LLM client ───────────────────────────────────────────────
 
-export async function callLlm(
+async function callLlm(
   messages: LlmMessage[],
   settings: ReturnType<typeof getAiChatSettings>,
 ): Promise<string> {

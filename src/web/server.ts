@@ -459,13 +459,18 @@ export class WebServer {
           const discovered = getDiscoveredBots();
           return Response.json({ usernames: discovered });
         }
+        if (url.pathname === "/api/chat-bots") {
+          // Return bot list in format expected by chat UI
+          const discovered = getDiscoveredBots();
+          return Response.json({ bots: discovered });
+        }
         if (url.pathname === "/api/channels" && req.method === "GET") {
           const bot = url.searchParams.get("bot") || "";
           let channels = bot ? chatBuffer.getChannels(bot) : [];
           if (channels.length === 0) {
             channels = [{ name: "local", displayName: "Local" }, { name: "faction", displayName: "Faction" }, { name: "system", displayName: "System" }];
           }
-          return Response.json({ channels });
+          return Response.json({ channels }, { headers: { "Access-Control-Allow-Origin": "*" } });
         }
         if (url.pathname === "/api/messages" && req.method === "GET") {
           const bot = url.searchParams.get("bot") || "";
@@ -473,26 +478,27 @@ export class WebServer {
           const limit = parseInt(url.searchParams.get("limit") || "200", 10);
           const after = url.searchParams.get("after");
           const messages = chatBuffer.getMessages({ bot, channel, limit, after: after ? parseInt(after, 10) : undefined });
-          return Response.json({ messages, count: chatBuffer.getMessageCount({ bot, channel }) });
+          return Response.json({ messages, count: chatBuffer.getMessageCount({ bot, channel }) }, { headers: { "Access-Control-Allow-Origin": "*" } });
         }
         if (url.pathname === "/api/send" && req.method === "POST") {
           const body = (await req.json()) as { bot: string; channel: string; content: string; targetId?: string };
           const { bot, channel, content, targetId } = body;
+          const corsHeader = { "Access-Control-Allow-Origin": "*" };
 
           if (!bot || !channel || !content) {
-            return Response.json({ error: "Missing bot, channel, or content" }, { status: 400 });
+            return Response.json({ error: "Missing bot, channel, or content" }, { status: 400, headers: corsHeader });
           }
 
           const botInstance = getBot(bot);
           if (!botInstance) {
-            return Response.json({ error: `Bot ${bot} not found` }, { status: 404 });
+            return Response.json({ error: `Bot ${bot} not found` }, { status: 404, headers: corsHeader });
           }
 
           try {
             const chatBody: Record<string, unknown> = { channel, content };
             if (channel === "private") {
               if (!targetId) {
-                return Response.json({ error: "targetId is required for private messages" }, { status: 400 });
+                return Response.json({ error: "targetId is required for private messages" }, { status: 400, headers: corsHeader });
               }
               chatBody.target_id = targetId;
             }
@@ -500,7 +506,7 @@ export class WebServer {
             const result = await botInstance.exec("chat", chatBody);
 
             if (result.error) {
-              return Response.json({ error: result.error.message || "Chat failed" }, { status: 500 });
+              return Response.json({ error: result.error.message || "Chat failed" }, { status: 500, headers: corsHeader });
             }
 
             const sentMsg: ChatMessage = {
@@ -514,11 +520,11 @@ export class WebServer {
             };
             chatBuffer.addMessage(sentMsg);
 
-            return Response.json({ ok: true, message: "Message sent" });
+            return Response.json({ ok: true, message: "Message sent" }, { headers: corsHeader });
           } catch (err) {
             return Response.json(
               { error: err instanceof Error ? err.message : String(err) },
-              { status: 500 }
+              { status: 500, headers: corsHeader }
             );
           }
         }
@@ -1439,6 +1445,28 @@ export class WebServer {
           return new Response(readFileSync(commandallPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve chat.html for chat UI route
+        if (url.pathname === "/chat.html" || url.pathname === "/chat") {
+          const chatPath = join(import.meta.dir, "chat.html");
+          return new Response(readFileSync(chatPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve chat.css for chat UI
+        if (url.pathname === "/chat.css") {
+          const chatCssPath = join(import.meta.dir, "chat.css");
+          return new Response(readFileSync(chatCssPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/css; charset=utf-8",
               "Cache-Control": "no-store",
             },
           });

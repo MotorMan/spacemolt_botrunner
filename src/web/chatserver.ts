@@ -33,6 +33,17 @@ export class ChatWebServer {
       port: this.port,
       fetch: async (req) => {
         const url = new URL(req.url);
+        const origin = req.headers.get("origin") || "";
+
+        const corsHeaders = {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type",
+        };
+
+        if (req.method === "OPTIONS") {
+          return new Response(null, { headers: corsHeaders });
+        }
 
         if (url.pathname === "/ws") {
           const id = this.nextClientId++;
@@ -46,7 +57,7 @@ export class ChatWebServer {
         if (url.pathname === "/api/bots" && req.method === "GET") {
           const bots = getDiscoveredBots();
           console.log(`[ChatServer] /api/bots returning:`, bots);
-          return Response.json({ bots });
+          return Response.json({ bots }, { headers: corsHeaders });
         }
 
         if (url.pathname === "/api/channels" && req.method === "GET") {
@@ -55,7 +66,7 @@ export class ChatWebServer {
           if (channels.length === 0) {
             channels = [{ name: "local", displayName: "Local" }, { name: "faction", displayName: "Faction" }, { name: "system", displayName: "System" }];
           }
-          return Response.json({ channels });
+          return Response.json({ channels }, { headers: corsHeaders });
         }
 
         if (url.pathname === "/api/messages" && req.method === "GET") {
@@ -64,7 +75,7 @@ export class ChatWebServer {
           const limit = parseInt(url.searchParams.get("limit") || "200", 10);
           const after = url.searchParams.get("after");
           const messages = chatBuffer.getMessages({ bot, channel, limit, after: after ? parseInt(after, 10) : undefined });
-          return Response.json({ messages, count: chatBuffer.getMessageCount({ bot, channel }) });
+          return Response.json({ messages, count: chatBuffer.getMessageCount({ bot, channel }) }, { headers: corsHeaders });
         }
 
         if (url.pathname === "/api/send" && req.method === "POST") {
@@ -72,19 +83,19 @@ export class ChatWebServer {
           const { bot, channel, content, targetId } = body;
 
           if (!bot || !channel || !content) {
-            return Response.json({ error: "Missing bot, channel, or content" }, { status: 400 });
+            return Response.json({ error: "Missing bot, channel, or content" }, { status: 400, headers: corsHeaders });
           }
 
           const botInstance = getBot(bot);
           if (!botInstance) {
-            return Response.json({ error: `Bot ${bot} not found` }, { status: 404 });
+            return Response.json({ error: `Bot ${bot} not found` }, { status: 404, headers: corsHeaders });
           }
 
           try {
             const chatBody: Record<string, unknown> = { channel, content };
             if (channel === "private") {
               if (!targetId) {
-                return Response.json({ error: "targetId is required for private messages" }, { status: 400 });
+                return Response.json({ error: "targetId is required for private messages" }, { status: 400, headers: corsHeaders });
               }
               chatBody.target_id = targetId;
             }
@@ -92,7 +103,7 @@ export class ChatWebServer {
             const result = await botInstance.exec("chat", chatBody);
 
             if (result.error) {
-              return Response.json({ error: result.error.message || "Chat failed" }, { status: 500 });
+              return Response.json({ error: result.error.message || "Chat failed" }, { status: 500, headers: corsHeaders });
             }
 
             const sentMsg: ChatMessage = {
@@ -108,11 +119,11 @@ export class ChatWebServer {
 
             this.broadcast({ type: "new_message", message: sentMsg });
 
-            return Response.json({ ok: true, message: "Message sent" });
+            return Response.json({ ok: true, message: "Message sent" }, { headers: corsHeaders });
           } catch (err) {
             return Response.json(
               { error: err instanceof Error ? err.message : String(err) },
-              { status: 500 }
+              { status: 500, headers: corsHeaders }
             );
           }
         }
@@ -123,10 +134,11 @@ export class ChatWebServer {
               headers: {
                 "Content-Type": "text/css; charset=utf-8",
                 "Cache-Control": "no-store",
+                ...corsHeaders,
               },
             });
           }
-          return new Response("Not found", { status: 404 });
+          return new Response("Not found", { status: 404, headers: corsHeaders });
         }
 
         if (existsSync(indexPath)) {
@@ -134,11 +146,12 @@ export class ChatWebServer {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",
+              ...corsHeaders,
             },
           });
         }
 
-        return new Response("Chat UI not found", { status: 404 });
+        return new Response("Chat UI not found", { status: 404, headers: corsHeaders });
       },
       websocket: {
         open: (ws: ServerWebSocket<WSData>) => {

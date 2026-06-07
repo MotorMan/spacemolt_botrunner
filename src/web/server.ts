@@ -1315,17 +1315,6 @@ export class WebServer {
           }
         }
 
-        // Serve settings.html for settings route
-        if (url.pathname === "/settings.html") {
-          const settingsPath = join(import.meta.dir, "settings.html");
-          return new Response(readFileSync(settingsPath, "utf-8"), {
-            headers: {
-              "Content-Type": "text/html; charset=utf-8",
-              "Cache-Control": "no-store",
-            },
-          });
-        }
-
         // Serve players.html for players route
         if (url.pathname === "/players.html") {
           const playersPath = join(import.meta.dir, "players.html");
@@ -1440,17 +1429,6 @@ export class WebServer {
         if (url.pathname === "/stats.html") {
           const statsPath = join(import.meta.dir, "stats.html");
           return new Response(readFileSync(statsPath, "utf-8"), {
-            headers: {
-              "Content-Type": "text/html; charset=utf-8",
-              "Cache-Control": "no-store",
-            },
-          });
-        }
-
-        // Serve settings.html for settings route
-        if (url.pathname === "/settings.html") {
-          const settingsPath = join(import.meta.dir, "settings.html");
-          return new Response(readFileSync(settingsPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",

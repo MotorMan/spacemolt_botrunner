@@ -1,5 +1,3 @@
-import { getBot } from "./botmanager.js";
-
 export interface ChatMessage {
   botUsername: string;
   channel: string;
@@ -31,9 +29,9 @@ export class ChatBuffer {
     bot?: string;
     channel?: string;
     limit?: number;
-    offset?: number;
+    after?: number;
   } = {}): ChatMessage[] {
-    const { bot, channel, limit = 200, offset = 0 } = opts;
+    const { bot, channel, limit = 200, after } = opts;
 
     let filtered = this.messages;
     if (bot) {
@@ -42,10 +40,11 @@ export class ChatBuffer {
     if (channel) {
       filtered = filtered.filter(m => m.channel === channel);
     }
+    if (after !== undefined) {
+      filtered = filtered.filter(m => m.timestamp > after);
+    }
 
-    const total = filtered.length;
-    const slice = filtered.slice(Math.max(0, offset), offset + limit);
-    return slice;
+    return filtered.slice(0, limit);
   }
 
   getBots(): string[] {

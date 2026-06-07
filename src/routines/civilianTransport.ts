@@ -149,6 +149,10 @@ interface CivilianTransportSettings {
   maxBusiness: number;
   maxFirst: number;
   blockPirateStations: boolean;
+  passengerPriority: "first" | "business" | "economy" | "off";
+  allowFirstClass: boolean;
+  allowBusinessClass: boolean;
+  allowEconomyClass: boolean;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -168,6 +172,12 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     maxBusiness: Number((t.maxBusiness as number) ?? 0),
     maxFirst: Number((t.maxFirst as number) ?? 0),
     blockPirateStations: (t.blockPirateStations as boolean) ?? true,
+    passengerPriority: ((t.passengerPriority as string) === "first" || (t.passengerPriority as string) === "business" || (t.passengerPriority as string) === "economy")
+      ? (t.passengerPriority as "first" | "business" | "economy" | "off")
+      : "off",
+    allowFirstClass: (t.allowFirstClass as boolean) !== false,
+    allowBusinessClass: (t.allowBusinessClass as boolean) !== false,
+    allowEconomyClass: (t.allowEconomyClass as boolean) !== false,
   };
 }
 
@@ -899,6 +909,17 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           ctx.log("transport", `Skipping passenger ${p.name} going to pirate station ${p.destination_name}`);
           continue;
         }
+        // Skip disabled passenger classes
+        const cls = p.class.toLowerCase();
+        if (cls === "first" && !settings.allowFirstClass) {
+          continue;
+        }
+        if (cls === "business" && !settings.allowBusinessClass) {
+          continue;
+        }
+        if (cls === "economy" && !settings.allowEconomyClass) {
+          continue;
+        }
         const arr = byDest.get(p.destination) || [];
         arr.push(p);
         byDest.set(p.destination, arr);
@@ -927,9 +948,16 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         if (settings.maxPassengers > 0 && totalLoaded >= settings.maxPassengers) {
           break;
         }
+        // Sort passengers by priority if enabled
+        const priority = settings.passengerPriority;
+        const sortedPassengers = [...passengers].sort((a, b) => {
+          if (priority === "off") return 0;
+          const classOrder = { first: 0, business: 1, economy: 2 };
+          return classOrder[a.class.toLowerCase() as keyof typeof classOrder] - classOrder[b.class.toLowerCase() as keyof typeof classOrder];
+        });
         // Check how many we can fit respecting configured maxes
         let canFit = 0;
-        for (const p of passengers) {
+        for (const p of sortedPassengers) {
           const cls = p.class.toLowerCase() as "economy" | "business" | "first";
           if (cls === "first") {
             if (usedFirst < capAvailable(usedFirst, settings.maxFirst, freeFirst)) {
@@ -960,7 +988,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         }
         if (canFit <= 0) continue;
 
-        ctx.log("transport", `Loading up to ${canFit} passengers for ${passengers[0].destination_name} (${destId})...`);
+        ctx.log("transport", `Loading up to ${canFit} passengers for ${sortedPassengers[0].destination_name} (${destId})...`);
         const loadResp = await bot.exec("load_passenger", { destination: destId });
         if (loadResp.error) {
           ctx.log("error", `load_passenger failed for ${destId}: ${loadResp.error.message}`);

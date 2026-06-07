@@ -178,7 +178,7 @@
         url.searchParams.set("channel", currentChannel);
         url.searchParams.set("limit", "200");
         if (lastMessageTimestamp > 0) {
-          url.searchParams.set("offset", String(lastMessageTimestamp));
+          url.searchParams.set("after", String(lastMessageTimestamp));
         }
 
         const res = await fetch(url.toString());

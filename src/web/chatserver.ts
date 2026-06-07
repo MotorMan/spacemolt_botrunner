@@ -2,10 +2,8 @@ import { readFileSync, existsSync } from "fs";
 import { join as pathJoin } from "path";
 import os from "os";
 import type { ServerWebSocket } from "bun";
-import { getBot } from "../botmanager.js";
-import { chatBuffer, type ChatMessage, type ChannelInfo } from "../chatbuffer.js";
-
-const DATA_DIR = pathJoin(process.cwd(), "data");
+import { getBot, getDiscoveredBots } from "../botmanager.js";
+import { chatBuffer, type ChatMessage } from "../chatbuffer.js";
 
 export interface ChatSendRequest {
   bot: string;
@@ -46,12 +44,15 @@ export class ChatWebServer {
         }
 
         if (url.pathname === "/api/bots" && req.method === "GET") {
-          return Response.json({ bots: chatBuffer.getBots() });
+          return Response.json({ bots: getDiscoveredBots() });
         }
 
         if (url.pathname === "/api/channels" && req.method === "GET") {
           const bot = url.searchParams.get("bot") || "";
-          const channels = bot ? chatBuffer.getChannels(bot) : [];
+          let channels = bot ? chatBuffer.getChannels(bot) : [];
+          if (channels.length === 0) {
+            channels = [{ name: "local", displayName: "Local" }, { name: "faction", displayName: "Faction" }, { name: "system", displayName: "System" }];
+          }
           return Response.json({ channels });
         }
 
@@ -59,8 +60,8 @@ export class ChatWebServer {
           const bot = url.searchParams.get("bot") || "";
           const channel = url.searchParams.get("channel") || "";
           const limit = parseInt(url.searchParams.get("limit") || "200", 10);
-          const offset = parseInt(url.searchParams.get("offset") || "0", 10);
-          const messages = chatBuffer.getMessages({ bot, channel, limit, offset });
+          const after = url.searchParams.get("after");
+          const messages = chatBuffer.getMessages({ bot, channel, limit, after: after ? parseInt(after, 10) : undefined });
           return Response.json({ messages, count: chatBuffer.getMessageCount({ bot, channel }) });
         }
 

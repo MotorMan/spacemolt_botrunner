@@ -1,4 +1,4 @@
-import type { Bot, Routine, RoutineContext } from "../bot.js";
+import type { Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import {
@@ -6,7 +6,6 @@ import {
   ensureUndocked,
   tryRefuel,
   repairShip,
-  ensureFueled,
   navigateToSystem,
   getSystemInfo,
   detectAndRecoverFromDeath,
@@ -16,8 +15,6 @@ import {
   checkAndFleeFromBattle,
   type BattleState,
   getBattleStatus,
-  sleep,
-  ensureInsured,
 } from "./common.js";
 
 // ── Settings ─────────────────────────────────────────────────
@@ -49,8 +46,8 @@ function getModuleSellerSettings(username?: string): ModuleSellerSettings {
   const botOverrides = username ? (all[username] || {}) : {};
 
   let moduleItems: ModuleSellConfig[] = [];
-  if (Array.isArray(s.moduleItems)) {
-    moduleItems = s.moduleItems.map((item: any) => ({
+    if (Array.isArray(s.moduleItems)) {
+      moduleItems = s.moduleItems.map((item: { itemId?: string; maxQty?: number; doNotSell?: boolean }) => ({
       itemId: item.itemId || "",
       maxQty: typeof item.maxQty === "number" ? item.maxQty : 0,
       doNotSell: !!item.doNotSell,
@@ -137,7 +134,6 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
   const { bot } = ctx;
 
   await bot.refreshStatus();
-  const startSystem = bot.system;
 
   const battleState: BattleState = {
     inBattle: false,
@@ -244,7 +240,7 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
       sellQty: number;
       price: number;
       priceSource: string;
-      station: BestStation | null;
+      station: BestStation;
     }> = [];
 
     for (const storageItem of moduleStorage) {
@@ -260,21 +256,15 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
         continue;
       }
 
-      const station = settings.sellAtHome ? { systemId: settings.homeSystem, poiId: settings.homeStation, poiName: "Home" } : findBestSellStation(storageItem.itemId);
-
-      if (!station) {
-        ctx.log("warn", `ModuleSeller: no valid sell station for ${storageItem.itemId} — falling back to home`);
-        const homeStation = { systemId: settings.homeSystem, poiId: settings.homeStation, poiName: "Home" };
-        itemsToSell.push({
-          itemId: storageItem.itemId,
-          name: storageItem.name,
-          availableQty: storageItem.quantity,
-          sellQty: 0,
-          price,
-          priceSource,
-          station: homeStation,
-        });
-        continue;
+      let station: BestStation | null = null;
+      if (settings.sellAtHome) {
+        station = { systemId: settings.homeSystem, poiId: settings.homeStation, poiName: "Home" };
+      } else {
+        station = findBestSellStation(storageItem.itemId);
+        if (!station) {
+          ctx.log("warn", `ModuleSeller: no valid sell station for ${storageItem.itemId} — skipping`);
+          continue;
+        }
       }
 
       const config = settings.moduleItems.find(m => m.itemId === storageItem.itemId);
@@ -306,9 +296,6 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
       await ctx.sleep(60000);
       continue;
     }
-
-    const homeSys = mapStore.getSystem(settings.homeSystem);
-    const homePoi = homeSys?.pois.find(p => p.id === settings.homeStation);
 
     for (const sellItem of itemsToSell) {
       if (bot.state !== "running") break;

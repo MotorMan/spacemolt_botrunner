@@ -19282,7 +19282,7 @@ async function renderCivilianTransportSettings(panel) {
       if (!(poi.has_base || poi.base_id)) continue;
       const val = sysId + '|' + poi.id;
       const label = poi.base_name || poi.name || poi.id;
-      const sel = val === homeStation ? ' selected' : '';
+      const sel = (sysId === homeSystem && poi.id === homeStation) ? ' selected' : '';
       homeStationOpts += `<option value="${esc(val)}"${sel}>${label} (${esc(sysName)})</option>`;
     }
   }
@@ -19362,6 +19362,28 @@ async function renderCivilianTransportSettings(panel) {
       </label>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Passenger loading priority</div>
+        <div class="setting-hint">Prioritize loading higher-class passengers first. "off" loads passengers in API order.</div>
+      </div>
+      <select id="set-civilian_transport-passengerPriority">
+        <option value="off" ${ct.passengerPriority === 'off' || !ct.passengerPriority ? 'selected' : ''}>Off (API order)</option>
+        <option value="first" ${ct.passengerPriority === 'first' ? 'selected' : ''}>First class first</option>
+        <option value="business" ${ct.passengerPriority === 'business' ? 'selected' : ''}>Business first</option>
+        <option value="economy" ${ct.passengerPriority === 'economy' ? 'selected' : ''}>Economy first</option>
+      </select>
+    </div>
+
+    <div style="margin-top:12px">
+      <label style="display:block;margin-bottom:6px">Allow passenger classes:</label>
+      <div style="display:flex;gap:12px">
+        <label><input type="checkbox" id="set-civilian_transport-allowFirstClass" ${ct.allowFirstClass !== false ? 'checked' : ''}> First class</label>
+        <label><input type="checkbox" id="set-civilian_transport-allowBusinessClass" ${ct.allowBusinessClass !== false ? 'checked' : ''}> Business class</label>
+        <label><input type="checkbox" id="set-civilian_transport-allowEconomyClass" ${ct.allowEconomyClass !== false ? 'checked' : ''}> Economy class</label>
+      </div>
+    </div>
+
     <div style="margin-top:18px">
       <button class="primary" onclick="saveCivilianTransportSettings()">Save Settings</button>
     </div>
@@ -19378,6 +19400,10 @@ function saveCivilianTransportSettings() {
   const maxBusiness = Number(document.getElementById('set-civilian_transport-maxBusiness')?.value || 0);
   const maxFirst = Number(document.getElementById('set-civilian_transport-maxFirst')?.value || 0);
   const blockPirateStations = document.getElementById('set-civilian_transport-blockPirateStations')?.checked ?? true;
+  const passengerPriority = document.getElementById('set-civilian_transport-passengerPriority')?.value || 'off';
+  const allowFirstClass = document.getElementById('set-civilian_transport-allowFirstClass')?.checked ?? true;
+  const allowBusinessClass = document.getElementById('set-civilian_transport-allowBusinessClass')?.checked ?? true;
+  const allowEconomyClass = document.getElementById('set-civilian_transport-allowEconomyClass')?.checked ?? true;
 
   const s = {};
   if (homeStation && homeStation.includes('|')) {
@@ -19394,9 +19420,215 @@ function saveCivilianTransportSettings() {
   s.maxBusiness = maxBusiness;
   s.maxFirst = maxFirst;
   s.blockPirateStations = blockPirateStations;
+  s.passengerPriority = passengerPriority;
+  s.allowFirstClass = allowFirstClass;
+  s.allowBusinessClass = allowBusinessClass;
+  s.allowEconomyClass = allowEconomyClass;
 
   send({ type: 'saveSettings', routine: 'civilian_transport', settings: s });
   alert('Civilian Transport settings saved');
+}
+
+function renderModuleSellerSettings(panel) {
+  const ms = settings.module_seller || {};
+  const homeSystem = ms.homeSystem || settings.general?.factionStorageSystem || '';
+  const homeStation = ms.homeStation || settings.general?.factionStorageStation || '';
+  const fuelCostPerJump = ms.fuelCostPerJump ?? 50;
+  const refuelThreshold = ms.refuelThreshold ?? 50;
+  const repairThreshold = ms.repairThreshold ?? 40;
+  const priceMode = ms.priceMode || 'premium';
+  const premiumPct = ms.premiumPct ?? 5;
+  const undercutCr = ms.undercutCr ?? 100;
+  const sellAtHome = ms.sellAtHome !== false;
+  const maxQtyDefault = ms.maxQtyDefault ?? 10;
+  const moduleItems = Array.isArray(ms.moduleItems) ? ms.moduleItems : [];
+
+  let stationOpts = '<option value="">(use faction storage station)</option>';
+  for (const [sysId, sys] of Object.entries(mapData || {})) {
+    const sysName = sys.name || sysId;
+    for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
+      if (!(poi.has_base || poi.base_id)) continue;
+      const val = sysId + '|' + poi.id;
+      const sel = (sysId === homeSystem && poi.id === homeStation) ? ' selected' : '';
+      const label = poi.base_name || poi.name || poi.id;
+      stationOpts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
+    }
+  }
+
+  let moduleItemsHtml = '';
+  for (const item of moduleItems) {
+    moduleItemsHtml += `
+      <tr>
+        <td><input type="text" value="${esc(item.itemId || '')}" data-field="itemId" style="width:100%;font-family:monospace;font-size:11px"></td>
+        <td><input type="number" min="0" value="${item.maxQty ?? 0}" data-field="maxQty" style="width:60px"></td>
+        <td><input type="checkbox" data-field="doNotSell" ${item.doNotSell ? 'checked' : ''}></td>
+        <td><button class="sm danger" onclick="removeModuleItem(this)">Remove</button></td>
+      </tr>`;
+  }
+
+  panel.innerHTML = `
+    <h3>Module Seller Settings</h3>
+    <div class="settings-desc">Configure the module seller routine. Bots will buy ship modules from faction storage and sell them to the highest buyer at stations with markets.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home System</div>
+        <div class="setting-hint">System containing your faction storage station. Defaults to general faction storage system.</div>
+      </div>
+      <input type="text" id="set-module_seller-homeSystem" value="${esc(homeSystem)}" placeholder="e.g. sol, alpha_centauri" style="width:200px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home Station</div>
+        <div class="setting-hint">Station where the bot docks to check faction storage. Defaults to general faction storage station.</div>
+      </div>
+      <select id="set-module_seller-homeStation">${stationOpts}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Fuel Cost Per Jump</div>
+        <div class="setting-hint">Estimated fuel cost per jump. Used for pricing calculations.</div>
+      </div>
+      <input type="number" id="set-module_seller-fuelCostPerJump" min="0" value="${fuelCostPerJump}" style="width:80px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Refuel at station when fuel drops below this %.</div>
+      </div>
+      <input type="number" id="set-module_seller-refuelThreshold" min="10" max="90" value="${refuelThreshold}" style="width:80px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold (%)</div>
+        <div class="setting-hint">Repair hull at station when HP drops below this %.</div>
+      </div>
+      <input type="number" id="set-module_seller-repairThreshold" min="10" max="90" value="${repairThreshold}" style="width:80px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Price Mode</div>
+        <div class="setting-hint">How to calculate sell prices: Premium adds markup, Undercut subtracts from best buy.</div>
+      </div>
+      <select id="set-module_seller-priceMode">
+        <option value="premium"${priceMode === 'premium' ? ' selected' : ''}>Premium (+markup)</option>
+        <option value="undercut"${priceMode === 'undercut' ? ' selected' : ''}>Undercut (-cr)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Premium %</div>
+        <div class="setting-hint">Markup percentage over best buy price when using Premium mode.</div>
+      </div>
+      <input type="number" id="set-module_seller-premiumPct" min="0" max="100" value="${premiumPct}" style="width:80px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Undercut (cr)</div>
+        <div class="setting-hint">Amount to subtract from best buy price when using Undercut mode.</div>
+      </div>
+      <input type="number" id="set-module_seller-undercutCr" min="0" value="${undercutCr}" style="width:80px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Sell At Home</div>
+        <div class="setting-hint">Sell at the home station instead of traveling to the highest buyer.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-module_seller-sellAtHome"${sellAtHome ? ' checked' : ''}></label>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Default Max Quantity</div>
+        <div class="setting-hint">Default max quantity to sell per item when no specific config exists.</div>
+      </div>
+      <input type="number" id="set-module_seller-maxQtyDefault" min="0" value="${maxQtyDefault}" style="width:80px">
+    </div>
+
+    <div class="setting-section">
+      <div class="setting-label">Module Items (Per-Item Overrides)</div>
+      <div class="setting-hint">Configure specific items to sell. Leave empty to sell all ship modules. Item IDs are case-sensitive.</div>
+      <table class="settings-table" style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border)">
+            <th style="text-align:left;padding:4px">Item ID</th>
+            <th style="text-align:left;padding:4px">Max Qty</th>
+            <th style="text-align:left;padding:4px">Do Not Sell</th>
+            <th style="width:60px"></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${moduleItemsHtml}
+        </tbody>
+      </table>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <input type="text" id="new-module-item-id" placeholder="Item ID (e.g., weapon_module_id)" style="flex:1;font-family:monospace;font-size:11px">
+        <input type="number" id="new-module-item-qty" min="0" value="0" placeholder="Max Qty" style="width:80px">
+        <button class="sm primary" onclick="addModuleItem()">Add Item</button>
+      </div>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveModuleSellerSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function addModuleItem() {
+  const itemId = document.getElementById('new-module-item-id').value.trim();
+  const maxQty = parseInt(document.getElementById('new-module-item-qty').value) || 0;
+  if (!itemId) { alert('Please enter an Item ID'); return; }
+  const ms = settings.module_seller || {};
+  if (!Array.isArray(ms.moduleItems)) ms.moduleItems = [];
+  ms.moduleItems.push({ itemId, maxQty, doNotSell: false });
+  settings.module_seller = ms;
+  renderModuleSellerSettings(document.getElementById('settingsContent'));
+}
+
+function removeModuleItem(btn) {
+  const row = btn.closest('tr');
+  const itemId = row.querySelector('[data-field="itemId"]').value;
+  const ms = settings.module_seller || {};
+  if (!Array.isArray(ms.moduleItems)) ms.moduleItems = [];
+  ms.moduleItems = ms.moduleItems.filter(i => i.itemId !== itemId);
+  settings.module_seller = ms;
+  renderModuleSellerSettings(document.getElementById('settingsContent'));
+}
+
+function saveModuleSellerSettings() {
+  const ms = settings.module_seller || {};
+  ms.homeSystem = document.getElementById('set-module_seller-homeSystem').value;
+  ms.homeStation = document.getElementById('set-module_seller-homeStation').value;
+  ms.fuelCostPerJump = parseInt(document.getElementById('set-module_seller-fuelCostPerJump').value) || 50;
+  ms.refuelThreshold = parseInt(document.getElementById('set-module_seller-refuelThreshold').value) || 50;
+  ms.repairThreshold = parseInt(document.getElementById('set-module_seller-repairThreshold').value) || 40;
+  ms.priceMode = document.getElementById('set-module_seller-priceMode').value;
+  ms.premiumPct = parseInt(document.getElementById('set-module_seller-premiumPct').value) || 5;
+  ms.undercutCr = parseInt(document.getElementById('set-module_seller-undercutCr').value) || 100;
+  ms.sellAtHome = document.getElementById('set-module_seller-sellAtHome').checked;
+  ms.maxQtyDefault = parseInt(document.getElementById('set-module_seller-maxQtyDefault').value) || 10;
+
+  const items = [];
+  document.querySelectorAll('#settingsContent tr td:first-child input').forEach(input => {
+    const itemId = input.value.trim();
+    if (!itemId) return;
+    const row = input.closest('tr');
+    const maxQty = parseInt(row.querySelector('[data-field="maxQty"]')?.value) || 0;
+    const doNotSell = row.querySelector('[data-field="doNotSell"]')?.checked || false;
+    items.push({ itemId, maxQty, doNotSell });
+  });
+  ms.moduleItems = items;
+
+  send({ type: 'saveSettings', routine: 'module_seller', settings: ms });
+  settings.module_seller = ms;
 }
 
 async function resetFuelTransferLoadoutCompletions() {

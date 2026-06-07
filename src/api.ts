@@ -488,9 +488,11 @@ export class SpaceMoltAPI {
   private _totalBytesOut = 0;
   private _bandwidthStartTime = Date.now();
   private _rateLimiter = new SessionRateLimiter();
+  private _isGameServer: boolean;
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
+    this._isGameServer = this.baseUrl === DEFAULT_BASE_URL;
   }
 
   setBotName(name: string): void {
@@ -810,7 +812,10 @@ export class SpaceMoltAPI {
   }
 
   private async doRequest(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
-    return this._rateLimiter.enqueue(command, payload, abortSignal, (cmd, p, sig) => this.makeHttpRequest(cmd, p, sig));
+    if (this._isGameServer) {
+      return this._rateLimiter.enqueue(command, payload, abortSignal, (cmd, p, sig) => this.makeHttpRequest(cmd, p, sig));
+    }
+    return this.makeHttpRequest(command, payload, abortSignal);
   }
 
   private async makeHttpRequest(command: string, payload: Record<string, unknown> | undefined, abortSignal: AbortSignal | undefined): Promise<ApiResponse> {

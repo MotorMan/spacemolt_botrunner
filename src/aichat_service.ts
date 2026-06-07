@@ -2208,6 +2208,8 @@ They're warning you for not staying still. Respond defensively or apologetically
       return { ok: false, error: "AI Chat is disabled" };
     }
 
+    this.logFn("ai_chat_debug", `AI Chat enabled: ${settings.enabled}, sending transport announcement...`);
+
     const { shipName, route, totalPassengers, currentSystem, cycleType, onboardPassengers: providedPassengers } = context;
     
     const allPassengers = providedPassengers || this.loadOnboardPassengers();

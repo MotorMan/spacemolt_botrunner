@@ -1512,10 +1512,12 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       ctx.log("transport", `Loaded ${onboard.length} passenger(s). Route: ${planned.map(d => d.poiName).join(" → ")}`);
 
       const announceService = (globalThis as any).aiChatService;
+      const pickupIsHome = state.pickupStation === settings.homeStation || state.pickupSystem === settings.homeSystem;
+      ctx.log("transport", `Transport announcement check: service=${!!announceService}, sendTransportAnnouncement=${typeof announceService?.sendTransportAnnouncement === "function"}, pickupIsHome=${pickupIsHome}`);
       if (
         announceService &&
         typeof announceService.sendTransportAnnouncement === "function" &&
-        (state.pickupStation === settings.homeStation || state.pickupSystem === settings.homeSystem)
+        pickupIsHome
       ) {
         const routeNames = planned.map(d => d.poiName);
         const passengerInfos = onboard.map(p => ({
@@ -1530,7 +1532,13 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           currentSystem: bot.system || "",
           cycleType: "pickup",
           onboardPassengers: passengerInfos,
-        }).catch(() => {});
+        }).then((result: { ok: boolean; message?: string; error?: string }) => {
+          if (!result.ok) {
+            ctx.log("error", `Transport announcement failed: ${result.error}`);
+          }
+        }).catch((err: Error) => {
+          ctx.log("error", `Transport announcement error: ${err.message}`);
+        });
       }
 
       // Undock and continue to transit handling below
@@ -1693,10 +1701,12 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         saveTransportState(state);
         
         const announceService = (globalThis as any).aiChatService;
+        const isAtHomeSystem = bot.system === settings.homeSystem;
+        ctx.log("transport", `Transport cycle_complete announcement check: service=${!!announceService}, sendTransportAnnouncement=${typeof announceService?.sendTransportAnnouncement === "function"}, isAtHomeSystem=${isAtHomeSystem}`);
         if (
           announceService &&
           typeof announceService.sendTransportAnnouncement === "function" &&
-          bot.system === settings.homeSystem
+          isAtHomeSystem
         ) {
           const routeNames = completedPassengers.map(p => p.destinationName);
           const passengerInfos = completedPassengers.map(p => ({
@@ -1711,7 +1721,13 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
             currentSystem: bot.system || "",
             cycleType: "cycle_complete",
             onboardPassengers: passengerInfos,
-          }).catch(() => {});
+          }).then((result: { ok: boolean; message?: string; error?: string }) => {
+            if (!result.ok) {
+              ctx.log("error", `Transport cycle_complete announcement failed: ${result.error}`);
+            }
+          }).catch((err: Error) => {
+            ctx.log("error", `Transport cycle_complete announcement error: ${err.message}`);
+          });
         }
         
         await ctx.sleep(15000);

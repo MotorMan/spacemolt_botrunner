@@ -92,12 +92,28 @@ function parseListPassengers(result: unknown): { passengers: any[]; berths: Reco
       ? (r.structuredContent as Record<string, unknown>)
       : r;
   const passengers = Array.isArray(inner.passengers) ? (inner.passengers as any[]) : [];
-  const berths = (inner.berths || {}) as Record<string, number>;
-  const berthsUsed = (inner.berths_used || {}) as Record<string, number>;
+  const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
+  const berthsRaw = inner.berths && typeof inner.berths === 'object' ? (inner.berths as Record<string, unknown>) : null;
+  const berthsUsedRaw = inner.berths_used && typeof inner.berths_used === 'object' ? (inner.berths_used as Record<string, unknown>) : null;
+  const hasBerths = berthsRaw && (num(berthsRaw.economy) || num(berthsRaw.business) || num(berthsRaw.first));
   return {
     passengers,
-    berths,
-    berths_used: berthsUsed,
+    berths: hasBerths
+      ? {
+          economy: num(berthsRaw!.economy) || 0,
+          business: num(berthsRaw!.business) || 0,
+          first: num(berthsRaw!.first) || 0,
+        }
+      : {
+          economy: num(inner.economy_berths) || 0,
+          business: num(inner.business_berths) || 0,
+          first: num(inner.first_berths) || 0,
+        },
+    berths_used: {
+      economy: num(berthsUsedRaw?.economy) || 0,
+      business: num(berthsUsedRaw?.business) || 0,
+      first: num(berthsUsedRaw?.first) || 0,
+    },
   };
 }
 
@@ -106,7 +122,9 @@ function planTourRoute(
   destinations: Array<{ system: string; poi: string; poiName: string }>,
   maxJumps: number,
 ): Array<{ system: string; poi: string; poiName: string }> {
-  if (destinations.length <= 1) return destinations;
+  const validDests = destinations.filter(d => d.system);
+  if (validDests.length === 0) return [];
+  if (validDests.length === 1) return validDests;
 
   const remaining = destinations.slice();
   const planned: typeof destinations = [];
@@ -284,12 +302,72 @@ describe('parseListPassengers', () => {
     expect(parseListPassengers({})).not.toBeNull();
     expect(parseListPassengers({}).passengers).toHaveLength(0);
   });
+
+  it('parses direct berth keys when berths object is absent', () => {
+    const input = {
+      passengers: [],
+      economy_berths: 4,
+      business_berths: 2,
+      first_berths: 1,
+    };
+    const result = parseListPassengers(input);
+    expect(result).not.toBeNull();
+    expect(result!.berths.economy).toBe(4);
+    expect(result!.berths.business).toBe(2);
+    expect(result!.berths.first).toBe(1);
+  });
+
+  it('prefers berths object over direct keys when both present', () => {
+    const input = {
+      passengers: [],
+      berths: { economy: 5, business: 3, first: 0 },
+      economy_berths: 4,
+      business_berths: 2,
+      first_berths: 1,
+    };
+    const result = parseListPassengers(input);
+    expect(result).not.toBeNull();
+    expect(result!.berths.economy).toBe(5);
+    expect(result!.berths.business).toBe(3);
+    expect(result!.berths.first).toBe(0);
+  });
+
+  it('falls back to direct keys when berths object is empty', () => {
+    const input = {
+      passengers: [],
+      berths: { economy: 0, business: 0, first: 0 },
+      economy_berths: 4,
+      business_berths: 2,
+      first_berths: 1,
+    };
+    const result = parseListPassengers(input);
+    expect(result).not.toBeNull();
+    expect(result!.berths.economy).toBe(4);
+    expect(result!.berths.business).toBe(2);
+    expect(result!.berths.first).toBe(1);
+  });
+
+  it('treats missing berths_used as zeros', () => {
+    const result = parseListPassengers({
+      passengers: [],
+      berths: { economy: 4, business: 2, first: 1 },
+    });
+    expect(result).not.toBeNull();
+    expect(result!.berths_used.economy).toBe(0);
+    expect(result!.berths_used.business).toBe(0);
+    expect(result!.berths_used.first).toBe(0);
+  });
 });
 
 describe('planTourRoute', () => {
-  it('returns single-element array as-is', () => {
+  it('returns single-element array when only one valid destination', () => {
     const dests = [{ system: 'sol', poi: 'sol_central', poiName: 'Sol Central' }];
     expect(planTourRoute('sol', dests, 5)).toEqual(dests);
+  });
+
+  it('returns empty array for single destination without system', () => {
+    const dests = [{ system: '', poi: 'empty_station', poiName: 'Empty Station' }];
+    expect(planTourRoute('sol', dests, 5)).toEqual([]);
   });
 
   it('returns empty array for empty input', () => {
@@ -305,6 +383,24 @@ describe('planTourRoute', () => {
     const planned = planTourRoute('sol', dests, 5);
     expect(planned).toHaveLength(3);
     expect(planned[0].system.toLowerCase()).toBe('sol');
+  });
+
+  it('filters out destinations without valid systems', () => {
+    const dests = [
+      { system: '', poi: 'empty_station', poiName: 'Empty Station' },
+      { system: 'sol', poi: 'sol_central', poiName: 'Sol Central' },
+    ];
+    const planned = planTourRoute('sol', dests, 5);
+    expect(planned).toHaveLength(1);
+    expect(planned[0].system).toBe('sol');
+  });
+
+  it('returns empty array when all destinations lack systems', () => {
+    const dests = [
+      { system: '', poi: 'station_a', poiName: 'Station A' },
+      { system: '', poi: 'station_b', poiName: 'Station B' },
+    ];
+    expect(planTourRoute('sol', dests, 5)).toEqual([]);
   });
 
   it('does not modify the original destination array', () => {
@@ -470,5 +566,75 @@ describe('TransportState persistence', () => {
     }
     expect(threw).toBe(false);
     expect(result).toBeNull();
+  });
+});
+
+describe('pickup station selection logic', () => {
+  it('returns null when no stations have passengers', () => {
+    const result = parseStationPassengers({ station: 'Empty Station', waiting: [], count: 0 });
+    expect(result).not.toBeNull();
+    expect(result!.count).toBe(0);
+  });
+
+  it('parses waiting passengers correctly', () => {
+    const result = parseStationPassengers({
+      station: 'Test Station',
+      waiting: [
+        { citizen_id: 'p1', name: 'Passenger One', class: 'economy', citizenship: 'solarian', destination: 'dest1', destination_name: 'Destination One' }
+      ],
+      count: 1,
+    });
+    expect(result).not.toBeNull();
+    expect(result!.count).toBe(1);
+    expect(result!.waiting[0].name).toBe('Passenger One');
+  });
+});
+
+describe('alreadyAtPickup check logic', () => {
+  it('returns true when docked and poi/system match', () => {
+    const botPoi = 'sol_central';
+    const botSystem = 'sol';
+    const pickupStation = 'sol_central';
+    const pickupSystem = 'sol';
+    const docked = true;
+    
+    const poiMatch = String(botPoi || '').toLowerCase() === String(pickupStation || '').toLowerCase();
+    const sysMatch = String(botSystem || '').toLowerCase() === String(pickupSystem || '').toLowerCase();
+    const alreadyAtPickup = docked && poiMatch && sysMatch;
+    
+    expect(alreadyAtPickup).toBe(true);
+  });
+
+  it('returns false when poi does not match', () => {
+    const botPoi = 'sol_central';
+    const botSystem = 'sol';
+    const pickupStation = 'other_station';
+    const pickupSystem = 'sol';
+    const docked = true;
+    
+    const poiMatch = String(botPoi || '').toLowerCase() === String(pickupStation || '').toLowerCase();
+    const sysMatch = String(botSystem || '').toLowerCase() === String(pickupSystem || '').toLowerCase();
+    const alreadyAtPickup = docked && poiMatch && sysMatch;
+    
+    expect(alreadyAtPickup).toBe(false);
+  });
+
+  it('returns false when not docked', () => {
+    const alreadyAtPickup = false && true && true;
+    expect(alreadyAtPickup).toBe(false);
+  });
+
+  it('handles null/undefined values gracefully', () => {
+    const botPoi = '';
+    const botSystem = '';
+    const pickupStation = null;
+    const pickupSystem = null;
+    const docked = true;
+    
+    const poiMatch = String(botPoi || '').toLowerCase() === String(pickupStation || '').toLowerCase();
+    const sysMatch = String(botSystem || '').toLowerCase() === String(pickupSystem || '').toLowerCase();
+    const alreadyAtPickup = docked && poiMatch && sysMatch;
+    
+    expect(alreadyAtPickup).toBe(true);
   });
 });

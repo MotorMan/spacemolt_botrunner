@@ -1526,8 +1526,9 @@ export class AiChatService {
             lines.push(`  * ${poi.name} (${poi.type})${poi.has_base ? " [Station]" : ""}`);
           }
           if (system.pois.length > 10) {
-            lines.push(`  ... and ${system.pois.length - 10} more`);
+          lines.push(`  ... and ${system.pois.length - 10} more`);
           }
+          lines.push("");
         }
         
         if (system.connections && Array.isArray(system.connections)) {
@@ -2129,6 +2130,161 @@ They're warning you for not staying still. Respond defensively or apologetically
       }
     } catch (llmErr) {
       this.logFn("error", `Customs LLM error: ${llmErr instanceof Error ? llmErr.message : String(llmErr)}`);
+    }
+  }
+
+  /**
+   * Load onboard passengers from the civilianTransport.json file.
+   */
+  private loadOnboardPassengers(): Array<{
+    citizenId: string;
+    name: string;
+    bio: string;
+    destinationName: string;
+  }> {
+    try {
+      const TRANSPORT_DATA_FILE = join(process.cwd(), "data", "civilianTransport.json");
+      
+      if (!existsSync(TRANSPORT_DATA_FILE)) {
+        return [];
+      }
+      
+      const raw = readFileSync(TRANSPORT_DATA_FILE, "utf-8");
+      const data = JSON.parse(raw);
+      
+      const allPassengers: Array<{
+        citizenId: string;
+        name: string;
+        bio: string;
+        destinationName: string;
+      }> = [];
+      
+      for (const botName of Object.keys(data.runs || {})) {
+        const run = data.runs[botName];
+        if (run.onboardPassengers && Array.isArray(run.onboardPassengers)) {
+          for (const p of run.onboardPassengers) {
+            allPassengers.push({
+              citizenId: p.citizenId || p.name,
+              name: p.name,
+              bio: p.bio || "",
+              destinationName: p.destinationName || "",
+            });
+          }
+        }
+      }
+      
+      return allPassengers;
+    } catch (err) {
+      this.logFn("ai_chat_debug", `Failed to load onboard passengers: ${err instanceof Error ? err.message : String(err)}`);
+      return [];
+    }
+  }
+
+  /**
+   * Send a transport announcement to faction chat.
+   * Announces who the bot is transporting and highlights interesting passengers.
+   * Uses LLM with bot personality for natural, character-appropriate messages.
+   */
+  async sendTransportAnnouncement(
+    bot: Bot,
+    context: {
+      shipName: string;
+      route: string[];
+      totalPassengers: number;
+      currentSystem: string;
+      cycleType: "pickup" | "cycle_complete";
+      onboardPassengers?: Array<{
+        name: string;
+        bio: string;
+        destinationName: string;
+      }>;
+    },
+    personality?: string
+  ): Promise<{ ok: boolean; message?: string; error?: string }> {
+    const settings = getAiChatSettings();
+
+    if (!settings.enabled) {
+      this.logFn("ai_chat_debug", "Transport announcement skipped: AI Chat is disabled");
+      return { ok: false, error: "AI Chat is disabled" };
+    }
+
+    const { shipName, route, totalPassengers, currentSystem, cycleType, onboardPassengers: providedPassengers } = context;
+    
+    const allPassengers = providedPassengers || this.loadOnboardPassengers();
+    
+    const passengersWithBios = allPassengers.filter(p => p.bio && p.bio.trim().length > 0);
+
+    const routeStr = route.length > 0 ? route.join(" → ") : "various destinations";
+    
+    const situation = cycleType === "pickup"
+      ? `You have picked up ${totalPassengers} passengers aboard the ${shipName}. Route: ${routeStr}.`
+      : `You have completed a transport cycle. Delivered ${totalPassengers} passengers to ${routeStr}. Back at base.`;
+    
+    const styleGuide = cycleType === "pickup"
+      ? "Be professional and matter-of-fact. Mention your ship name and destination. Keep it brief (1-2 sentences)."
+      : "Be satisfied with a job well done. Mention completion and readiness for new pickups. Keep it brief (1-2 sentences).";
+
+    const systemPrompt = `${personality || getBotPersonality(bot.username)}
+
+Context:
+- You are: ${bot.username} in SpaceMolt
+- You are currently in: ${currentSystem}
+- Ship: ${shipName}
+- ${situation}
+
+Task:
+Generate a brief faction chat announcement about your transport duties.
+From the list of passengers below, select 1-2 who are most interesting and mention them briefly in your announcement.
+
+Style:
+- Keep it natural and in-character
+- Be concise (1-2 sentences max)
+- ${styleGuide}
+- Use 1st person ("I", "me", "my") when talking about yourself
+- If mentioning notable passengers, briefly describe them based on their bio (not the full bio, just enough to make them interesting)`;
+
+    const userMessage = `Generate a faction chat announcement:
+
+Message type: ${cycleType}
+Ship: ${shipName}
+Route: ${routeStr}
+Total passengers: ${totalPassengers}
+${passengersWithBios.length > 0 ? `All passengers:\n${passengersWithBios.map(ip => `- ${ip.name}: ${ip.bio}`).join('\n')}` : 'No passengers with bios available.'}
+
+Select 1-2 most interesting passengers and mention them in your announcement.
+Announcement:`;
+
+    const llmMessages: LlmMessage[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage },
+    ];
+
+    try {
+      const response = await callLlm(llmMessages, settings);
+      const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+      
+      if (!cleanResponse) {
+        this.logFn("ai_chat_debug", "Empty response from LLM, skipping transport announcement");
+        return { ok: false, error: "Empty response from AI" };
+      }
+
+      const chatResp = await bot.exec("chat", {
+        channel: "faction",
+        content: cleanResponse,
+      });
+
+      if (!chatResp.error) {
+        this.logFn("ai_chat", `→ Transport announcement: ${cleanResponse}`);
+        bot.log("chat", `📤 Faction: ${cleanResponse}`);
+        return { ok: true, message: cleanResponse };
+      } else {
+        this.logFn("error", `Transport announcement failed: ${chatResp.error.message}`);
+        return { ok: false, error: chatResp.error.message };
+      }
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      this.logFn("error", `Transport announcement error: ${errMsg}`);
+      return { ok: false, error: errMsg };
     }
   }
 

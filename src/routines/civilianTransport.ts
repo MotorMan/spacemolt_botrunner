@@ -25,6 +25,38 @@ import { catalogStore } from "../catalogstore.js";
 const fs = require("fs");
 const path = require("path");
 
+interface RouteResult {
+  system: string;
+  poi: string;
+  poiName: string;
+}
+
+async function resolveDestination(bot: Bot, destinationId: string, destinationName: string): Promise<RouteResult | null> {
+  const allSystems = mapStore.getAllSystems();
+  for (const [, sysData] of Object.entries(allSystems)) {
+    const found = sysData.pois.find(
+      pp => pp.id === destinationId || pp.name.toLowerCase() === destinationName.toLowerCase(),
+    );
+    if (found) {
+      return { system: sysData.id, poi: found.id, poiName: found.name };
+    }
+  }
+
+  const routeResp = await bot.exec("find_route", { target: destinationId });
+  if (routeResp.error || !routeResp.result) {
+    return null;
+  }
+  const result = routeResp.result as Record<string, unknown>;
+  if (!result.found) {
+    return null;
+  }
+  return {
+    system: (result.target_system as string) || "",
+    poi: (result.target_poi as string) || destinationId,
+    poiName: (result.target_poi_name as string) || destinationName,
+  };
+}
+
 interface CatalogShip {
   id: string;
   name: string;
@@ -75,6 +107,7 @@ interface TransportState {
   shipName: string;
   tier: number | null;
   berths: { economy: number; business: number; first: number };
+  berths_used: { economy: number; business: number; first: number };
   onboardPassengers: TransportPassenger[];
   pickupStation: string | null;
   pickupSystem: string | null;
@@ -213,8 +246,25 @@ function saveAllData(data: { runs: Record<string, TransportState>; fleet: FleetD
 }
 
 function loadTransportState(botUsername: string): TransportState | null {
-  const data = loadAllData();
-  return data.runs[botUsername] || null;
+  try {
+    const data = loadAllData();
+    const raw = data.runs[botUsername];
+    if (!raw || typeof raw !== "object") return null;
+    return raw as TransportState;
+  } catch {
+    return null;
+  }
+}
+
+function isValidTransportState(state: unknown): state is TransportState {
+  if (!state || typeof state !== "object") return false;
+  const s = state as Record<string, unknown>;
+  if (typeof s.shipId !== "string" || s.shipId.length === 0) return false;
+  const berths = s.berths as Record<string, number> | undefined;
+  if (!berths || (berths.economy + berths.business + berths.first) <= 0) return false;
+  const validStatuses = new Set(["idle", "loading", "unloading", "in_transit", "traveling_to_ship", "docked_at_pickup"]);
+  if (typeof s.status !== "string" || !validStatuses.has(s.status)) return false;
+  return true;
 }
 
 function saveTransportState(state: TransportState): void {
@@ -320,19 +370,27 @@ function parseListPassengers(result: unknown): ListPassengersResponse | null {
     ? r.structuredContent as Record<string, unknown>
     : r;
   const passengers = Array.isArray(inner.passengers) ? inner.passengers as AboardPassenger[] : [];
-  const berths = (inner.berths || {}) as Record<string, number>;
-  const berthsUsed = (inner.berths_used || {}) as Record<string, number>;
+  const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+  const berthsRaw = inner.berths && typeof inner.berths === "object" ? (inner.berths as Record<string, unknown>) : null;
+  const berthsUsedRaw = inner.berths_used && typeof inner.berths_used === "object" ? (inner.berths_used as Record<string, unknown>) : null;
+  const hasBerths = berthsRaw && (num(berthsRaw.economy) || num(berthsRaw.business) || num(berthsRaw.first));
   return {
     passengers,
-    berths: {
-      economy: berths.economy || 0,
-      business: berths.business || 0,
-      first: berths.first || 0,
-    },
+    berths: hasBerths
+      ? {
+          economy: num(berthsRaw!.economy) ?? 0,
+          business: num(berthsRaw!.business) ?? 0,
+          first: num(berthsRaw!.first) ?? 0,
+        }
+      : {
+          economy: num(inner.economy_berths) ?? 0,
+          business: num(inner.business_berths) ?? 0,
+          first: num(inner.first_berths) ?? 0,
+        },
     berths_used: {
-      economy: berthsUsed.economy || 0,
-      business: berthsUsed.business || 0,
-      first: berthsUsed.first || 0,
+      economy: num(berthsUsedRaw?.economy) ?? 0,
+      business: num(berthsUsedRaw?.business) ?? 0,
+      first: num(berthsUsedRaw?.first) ?? 0,
     },
   };
 }
@@ -376,7 +434,7 @@ function parseListShips(result: unknown): FleetShip[] {
   const catalog = loadCatalog();
   
   return ships.map((s: Record<string, unknown>) => {
-    let berths: { economy: number; business: number; first: number };
+    let berths: { economy: number; business: number; first: number } = { economy: 0, business: 0, first: 0 };
     
     const directBerths = (s.passenger_berths || s.berths || {}) as Record<string, number>;
     if (directBerths.economy || directBerths.business || directBerths.first) {
@@ -392,8 +450,8 @@ function parseListShips(result: unknown): FleetShip[] {
       const fromCaps = extractBerthsFromCapabilities(caps);
       if (fromCaps) {
         berths = fromCaps;
-      } else {
-        berths = { economy: 0, business: 0, first: 0 };
+      } else if (s.modules) {
+        berths = countPassengerModules(s.modules);
       }
     }
     
@@ -642,7 +700,9 @@ function planTourRoute(
   destinations: Array<{ system: string; poi: string; poiName: string }>,
   maxJumps: number,
 ): Array<{ system: string; poi: string; poiName: string }> {
-  if (destinations.length <= 1) return destinations;
+  const validDests = destinations.filter(d => d.system);
+  if (validDests.length === 0) return [];
+  if (validDests.length === 1) return validDests;
 
   const remaining = [...destinations];
   const planned: typeof destinations = [];
@@ -683,6 +743,7 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, tier: number |
     shipName,
     tier,
     berths,
+    berths_used: { economy: 0, business: 0, first: 0 },
     onboardPassengers: [],
     pickupStation: null,
     pickupSystem: null,
@@ -710,8 +771,9 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
     ctx.log("transport", "Initial fleet refresh failed — using cached data");
   }
 
-  // Initialize state if none
-  if (!state) {
+  // Initialize state if none or invalid
+  if (!state || !isValidTransportState(state)) {
+    clearTransportState(bot.username);
     const best = pickBestShip(ctx, fleet);
     if (!best) {
       ctx.log("error", "No passenger-capable ship found in fleet. Routine cannot run.");
@@ -719,9 +781,165 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
     }
     state = makeNewState(bot, best.shipId, best.shipName, best.tier, best.berths);
     saveTransportState(state);
+  } else {
+    const currentShip = fleet.find(s => s.shipId === state!.shipId);
+    if (currentShip && totalBerths(currentShip.berths) > 0) {
+      state!.shipId = currentShip.shipId;
+      state!.shipName = currentShip.shipName;
+      state!.tier = currentShip.tier;
+      state!.berths = currentShip.berths;
+      state!.berths_used = { economy: 0, business: 0, first: 0 };
+      saveTransportState(state!);
+      ctx.log("transport", `Synced berths from fleet cache: ${state!.shipName} = ${state!.berths.economy}e/${state!.berths.business}b/${state!.berths.first}f`);
+    }
   }
 
   ctx.log("transport", `Civilian transport started. Active ship: ${state.shipName} (${state.shipId}). Status: ${state.status}`);
+
+  if (state && state.status !== "idle") {
+    ctx.log("transport", `Verifying loaded passengers for non-idle state (${state.status})...`);
+    const verifyResp = await bot.exec("list_passengers");
+    if (verifyResp.error || !verifyResp.result) {
+      ctx.log("transport", `list_passengers failed during verification: ${verifyResp.error?.message || "no result"} — resetting to idle.`);
+      state.status = "idle";
+      state.onboardPassengers = [];
+      state.route = [];
+      state.currentRouteIndex = 0;
+      state.currentDestination = null;
+      state.berths_used = { economy: 0, business: 0, first: 0 };
+      saveTransportState(state);
+    } else {
+      const vParsed = parseListPassengers(verifyResp.result);
+      const verifiedCount = vParsed ? vParsed.passengers.length : 0;
+      if (verifiedCount === 0) {
+        ctx.log("transport", "Stale state detected: no passengers aboard despite non-idle status. Resetting to idle.");
+        state.status = "idle";
+        state.onboardPassengers = [];
+        state.route = [];
+        state.currentRouteIndex = 0;
+        state.currentDestination = null;
+        state.berths_used = { economy: 0, business: 0, first: 0 };
+        saveTransportState(state);
+      } else {
+        ctx.log("transport", `Verified ${verifiedCount} passengers aboard — rebuilding route from actual destinations.`);
+        const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
+        const mcLocation = mapStore.getMobileCapitolLocation();
+        for (const p of vParsed!.passengers) {
+          const existing = destMap.get(p.destination);
+          if (existing) {
+            existing.count++;
+            continue;
+          }
+          const resolved = await resolveDestination(bot, p.destination, p.destination_name);
+          let sys = resolved?.system || "";
+          let poi = resolved?.poi || p.destination;
+          if (!sys && mcLocation && (p.destination.toLowerCase() === "frontier_station" || p.destination_name.toLowerCase() === "frontier station")) {
+            sys = mcLocation.systemId;
+            poi = mcLocation.poiId;
+          }
+          destMap.set(p.destination, { system: sys, poi, poiName: p.destination_name, count: 1 });
+        }
+        const routeDests = Array.from(destMap.values()).filter(d => d.system);
+        const planned = planTourRoute(bot.system || "", routeDests, 6);
+        state.onboardPassengers = vParsed!.passengers.map(p => ({
+          citizenId: p.citizen_id || p.name,
+          name: p.name,
+          accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
+          citizenship: p.citizenship,
+          destination: p.destination,
+          destinationName: p.destination_name,
+          fare: p.fare,
+          bio: p.bio,
+          routeData: p.route_data || null,
+          loadedAt: new Date().toISOString(),
+          status: "boarded",
+          ticksRemaining: p.ticks_remaining,
+        }));
+        state.route = planned;
+        state.currentRouteIndex = 0;
+        state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
+        if (planned.length === 0 && vParsed!.passengers.length > 0) {
+          ctx.log("transport", `Warning: ${vParsed!.passengers.length} passengers aboard but no valid route — staying in_transit to attempt recovery.`);
+        } else {
+          state.status = "in_transit";
+        }
+        const recoveredBerths = vParsed!.berths;
+        const recoveredBerthsUsed = vParsed!.berths_used;
+        const hasRecoveredBerths = (recoveredBerths.economy + recoveredBerths.business + recoveredBerths.first) > 0;
+        if (hasRecoveredBerths) {
+          state.berths = recoveredBerths;
+          state.berths_used = recoveredBerthsUsed;
+        }
+        saveTransportState(state);
+        ctx.log("transport", `Rebuilt route from ${verifiedCount} passengers: ${planned.map(d => d.poiName).join(" → ")}`);
+      }
+    }
+  }
+
+  if (!state || state.status === "idle") {
+    ctx.log("transport", "State is missing or idle — checking for already-loaded passengers to recover route.");
+    const listResp = await bot.exec("list_passengers");
+    if (listResp.error || !listResp.result) {
+      ctx.log("transport", `list_passengers failed during recovery: ${listResp.error?.message || "no result"}`);
+    } else {
+      const parsed = parseListPassengers(listResp.result);
+      if (parsed && parsed.passengers.length > 0) {
+        const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
+        const mcLocation = mapStore.getMobileCapitolLocation();
+        for (const p of parsed.passengers) {
+          const existing = destMap.get(p.destination);
+          if (existing) {
+            existing.count++;
+            continue;
+          }
+          const resolved = await resolveDestination(bot, p.destination, p.destination_name);
+          let sys = resolved?.system || "";
+          let poi = resolved?.poi || p.destination;
+          if (!sys && mcLocation && (p.destination.toLowerCase() === "frontier_station" || p.destination_name.toLowerCase() === "frontier station")) {
+            sys = mcLocation.systemId;
+            poi = mcLocation.poiId;
+          }
+          destMap.set(p.destination, { system: sys, poi, poiName: p.destination_name, count: 1 });
+        }
+        const routeDests = Array.from(destMap.values()).filter(d => d.system);
+        const planned = planTourRoute(bot.system || "", routeDests, 6);
+        state.onboardPassengers = parsed.passengers.map(p => ({
+          citizenId: p.citizen_id || p.name,
+          name: p.name,
+          accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
+          citizenship: p.citizenship,
+          destination: p.destination,
+          destinationName: p.destination_name,
+          fare: p.fare,
+          bio: p.bio,
+          routeData: p.route_data || null,
+          loadedAt: new Date().toISOString(),
+          status: "boarded",
+          ticksRemaining: p.ticks_remaining,
+        }));
+        state.route = planned;
+        state.currentRouteIndex = 0;
+        state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
+        if (planned.length === 0 && parsed.passengers.length > 0) {
+          ctx.log("transport", `Warning: ${parsed.passengers.length} passengers aboard but no valid route — staying in_transit to attempt recovery.`);
+        } else {
+          state.status = "in_transit";
+        }
+        const stateParsed = parsed;
+        const recoveredBerths = stateParsed.berths;
+        const recoveredBerthsUsed = stateParsed.berths_used;
+        const hasRecoveredBerths = (recoveredBerths.economy + recoveredBerths.business + recoveredBerths.first) > 0;
+        if (hasRecoveredBerths) {
+          state.berths = recoveredBerths;
+          state.berths_used = recoveredBerthsUsed;
+        }
+        saveTransportState(state);
+        ctx.log("transport", `Recovered ${parsed.passengers.length} passengers. Route: ${planned.map(d => d.poiName).join(" → ")}`);
+      } else {
+        ctx.log("transport", "No passengers aboard — staying idle.");
+      }
+    }
+  }
 
   // Battle state tracking
   const battleState: BattleState = {
@@ -800,7 +1018,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       }
     }
 
-    // ── State machine ────────────────────────────────────────
+    // --- State machine ---
     if (state.status === "idle") {
       // Need to find passengers and load up
       // If already docked at a station, check for passengers to loaf
@@ -810,18 +1028,18 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           const data = parseStationPassengers(resp.result);
           if (data && data.count > 0) {
             // Passengers available at current station - proceed with loading
-            ctx.log("transport", `Found ${data.count} passengers at current station ${bot.poi}`);
+            ctx.log("transport", "Found " + data.count + " passengers at current station " + bot.poi);
             // Set pickup to current station so we can proceed
             state.pickupStation = bot.poi;
             state.pickupSystem = bot.system;
           } else {
             // No passengers at current station - loaf here and wait
-            ctx.log("transport", `No passengers at current station ${bot.poi} — loafing and waiting`);
+            ctx.log("transport", "No passengers at current station " + bot.poi + " -- loafing and waiting");
             await ctx.sleep(60000);
             continue;
           }
         } else {
-          ctx.log("transport", "Could not list station passengers — sleeping 60s");
+          ctx.log("transport", "Could not list station passengers -- sleeping 60s");
           await ctx.sleep(60000);
           continue;
         }
@@ -836,102 +1054,112 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         state.pickupSystem = pickup.system;
       }
 
-      state.status = "loading";
-      saveTransportState(state);
+      // Check if already at pickup station before any travel
+      const poiMatch = String(bot.poi || "").toLowerCase() === String(state.pickupStation || "").toLowerCase();
+      const sysMatch = String(bot.system || "").toLowerCase() === String(state.pickupSystem || "").toLowerCase();
+      const alreadyAtPickup = bot.docked && poiMatch && sysMatch;
+      ctx.log("transport", "Check pickup: docked=" + bot.docked + ", poi=" + bot.poi + ", pickupStation=" + state.pickupStation + ", system=" + bot.system + ", pickupSystem=" + state.pickupSystem + ", alreadyAtPickup=" + alreadyAtPickup);
+      
+      if (!alreadyAtPickup) {
+        ctx.log("transport", "NOT already at pickup -- will travel");
+        // Check if we need to switch to the best passenger ship first
+        const bestNow = pickBestShip(ctx, fleet);
+        const targetShipId = bestNow ? bestNow.shipId : state.shipId;
 
-      // Check if we need to switch to the best passenger ship first
-      const bestNow = pickBestShip(ctx, fleet);
-      const targetShipId = bestNow ? bestNow.shipId : state.shipId;
+        if (targetShipId !== state.shipId) {
+          const targetShip = fleet.find(s => s.shipId === targetShipId);
+          if (!targetShip) {
+            ctx.log("transport", "Target ship not found in fleet -- staying on current ship.");
+          } else {
+            if (targetShip.storedAtSystemId !== bot.system || targetShip.storedAtStationId !== bot.poi) {
+              // Travel to where the ship is stored
+              const shipSystem = targetShip.storedAtSystemId || targetShip.storedAtStationId;
+              if (shipSystem && shipSystem !== bot.system) {
+                ctx.log("transport", "Traveling to " + shipSystem + " to switch to " + targetShip.shipName + "...");
+                state.status = "traveling_to_ship";
+                saveTransportState(state);
+                const ok = await navigateToSystem(ctx, shipSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
+                if (!ok) {
+                  ctx.log("error", "Failed to reach ship location. Will retry.");
+                  state.status = "idle";
+                  saveTransportState(state);
+                  await ctx.sleep(30000);
+                  continue;
+                }
+              }
+              // Dock at the ship's station
+              const docked = await ensureDocked(ctx);
+              if (!docked) {
+                ctx.log("error", "Failed to dock at ship's station. Will retry.");
+                state.status = "idle";
+                saveTransportState(state);
+                await ctx.sleep(30000);
+                continue;
+              }
+            }
 
-      if (targetShipId !== state.shipId) {
-        const targetShip = fleet.find(s => s.shipId === targetShipId);
-        if (!targetShip) {
-          ctx.log("transport", "Target ship not found in fleet — staying on current ship.");
-        } else if (targetShip.storedAtSystemId !== bot.system || targetShip.storedAtStationId !== bot.poi) {
-          // Travel to where the ship is stored
-          const shipSystem = targetShip.storedAtSystemId || targetShip.storedAtStationId;
-          if (shipSystem && shipSystem !== bot.system) {
-            ctx.log("transport", `Traveling to ${shipSystem} to switch to ${targetShip.shipName}...`);
-            state.status = "traveling_to_ship";
-            saveTransportState(state);
-            const ok = await navigateToSystem(ctx, shipSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
-            if (!ok) {
-              ctx.log("error", "Failed to reach ship location. Will retry.");
-              state.status = "idle";
+            // Attempt switch_ship
+            ctx.log("transport", "Switching from " + state.shipName + " to " + targetShip.shipName + "...");
+            const switchResp = await bot.exec("switch_ship", { ship_id: targetShipId });
+            if (switchResp.error) {
+              ctx.log("error", "switch_ship failed: " + switchResp.error.message + " -- staying on " + state.shipName);
+            } else {
+              ctx.log("transport", "Switched to " + targetShip.shipName);
+              state.shipId = targetShipId;
+              state.shipName = targetShip.shipName;
+              state.tier = targetShip.tier;
+              state.berths = targetShip.berths;
               saveTransportState(state);
-              await ctx.sleep(30000);
-              continue;
             }
           }
-          // Dock at the ship's station
-          const docked = await ensureDocked(ctx);
-          if (!docked) {
-            ctx.log("error", "Failed to dock at ship's station. Will retry.");
+        }
+
+        // Travel to pickup station and dock
+        if (!state.pickupStation || !state.pickupSystem) {
+          ctx.log("error", "Pickup station not set -- cannot proceed");
+          state.status = "idle";
+          saveTransportState(state);
+          await ctx.sleep(30000);
+          continue;
+        }
+        ctx.log("transport", "Traveling to pickup station: " + state.pickupStation + " (" + state.pickupSystem + ")...");
+        state.status = "traveling_to_ship";
+        saveTransportState(state);
+        if (state.pickupSystem !== bot.system) {
+          const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
+          if (!ok) {
+            ctx.log("error", "Failed to reach pickup system. Will retry.");
             state.status = "idle";
             saveTransportState(state);
             await ctx.sleep(30000);
             continue;
           }
         }
-
-        // Attempt switch_ship
-        ctx.log("transport", `Switching from ${state.shipName} to ${targetShip!.shipName}...`);
-        const switchResp = await bot.exec("switch_ship", { ship_id: targetShipId });
-        if (switchResp.error) {
-          ctx.log("error", `switch_ship failed: ${switchResp.error.message} — staying on ${state.shipName}`);
-        } else {
-          ctx.log("transport", `Switched to ${targetShip!.shipName}`);
-          state.shipId = targetShipId;
-          state.shipName = targetShip!.shipName;
-          state.tier = targetShip!.tier;
-          state.berths = targetShip!.berths;
-          saveTransportState(state);
+        if (bot.poi !== state.pickupStation) {
+          ctx.log("transport", "Traveling to " + state.pickupStation + "...");
+          const tr = await bot.exec("travel", { target_poi: state.pickupStation });
+          if (tr.error) {
+            ctx.log("error", "Travel to pickup failed: " + tr.error.message);
+            state.status = "idle";
+            saveTransportState(state);
+            await ctx.sleep(30000);
+            continue;
+          }
         }
-      }
-
-      // Travel to pickup station and dock
-      if (!state.pickupStation || !state.pickupSystem) {
-        ctx.log("error", "Pickup station not set — cannot proceed");
-        state.status = "idle";
-        saveTransportState(state);
-        await ctx.sleep(30000);
-        continue;
-      }
-      ctx.log("transport", `Traveling to pickup station: ${state.pickupStation} (${state.pickupSystem})...`);
-      state.status = "traveling_to_ship";
-      saveTransportState(state);
-      if (state.pickupSystem !== bot.system) {
-        const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
-        if (!ok) {
-          ctx.log("error", "Failed to reach pickup system. Will retry.");
+        const dOk = await ensureDocked(ctx);
+        if (!dOk) {
+          ctx.log("error", "Failed to dock at pickup station.");
           state.status = "idle";
           saveTransportState(state);
           await ctx.sleep(30000);
           continue;
         }
-      }
-      if (bot.poi !== state.pickupStation) {
-        ctx.log("transport", `Traveling to ${state.pickupStation}...`);
-        const tr = await bot.exec("travel", { target_poi: state.pickupStation });
-        if (tr.error) {
-          ctx.log("error", `Travel to pickup failed: ${tr.error.message}`);
-          state.status = "idle";
-          saveTransportState(state);
-          await ctx.sleep(30000);
-          continue;
-        }
-      }
-      const dOk = await ensureDocked(ctx);
-      if (!dOk) {
-        ctx.log("error", "Failed to dock at pickup station.");
-        state.status = "idle";
-        saveTransportState(state);
-        await ctx.sleep(30000);
-        continue;
+      } else {
+        ctx.log("transport", "Already at pickup station " + state.pickupStation);
       }
 
       // Collect fuel cells at home base
-      if (state.pickupStation === settings.homeStation || state.pickupSystem === settings.homeSystem) {
+      if ((state.pickupStation === settings.homeStation || state.pickupSystem === settings.homeSystem) && bot.system === settings.homeSystem && bot.poi === settings.homeStation) {
         ctx.log("transport", "At home base - collecting fuel cells");
         await collectFuelCells(ctx, settings, true);
       }
@@ -939,6 +1167,40 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       // Load passengers
       state.status = "loading";
       saveTransportState(state);
+      if (bot.state !== "running") {
+        ctx.log("transport", "Stop requested before loading — aborting.");
+        state.status = "idle";
+        saveTransportState(state);
+        await ctx.sleep(10000);
+        continue;
+      }
+
+      // Count berth availability BEFORE issuing any load commands
+      const preListResp = await bot.exec("list_passengers");
+      let preListParsed: ListPassengersResponse | null = null;
+      if (!preListResp.error && preListResp.result) {
+        preListParsed = parseListPassengers(preListResp.result);
+        ctx.log("transport", `Raw list_passengers result keys: ${Object.keys(preListResp.result).join(", ")} berths=${JSON.stringify((preListResp.result as any).berths)} berths_used=${JSON.stringify((preListResp.result as any).berths_used)}`);
+      } else if (preListResp.error) {
+        ctx.log("transport", `Pre-load list_passengers error: ${preListResp.error?.message}`);
+      }
+      state.berths = preListParsed && (preListParsed.berths.economy + preListParsed.berths.business + preListParsed.berths.first) > 0
+        ? preListParsed.berths
+        : state.berths;
+      state.berths_used = preListParsed
+        ? preListParsed.berths_used
+        : { economy: 0, business: 0, first: 0 };
+      const freeEconomy = state.berths.economy - state.berths_used.economy;
+      const freeBusiness = state.berths.business - state.berths_used.business;
+      const freeFirst = state.berths.first - state.berths_used.first;
+      ctx.log("transport", `Pre-load berths: total=${state.berths.economy}e/${state.berths.business}b/${state.berths.first}f used=${state.berths_used.economy}e/${state.berths_used.business}b/${state.berths_used.first}f free=${freeEconomy}e/${freeBusiness}b/${freeFirst}f`);
+      if (freeEconomy <= 0 && freeBusiness <= 0 && freeFirst <= 0) {
+        ctx.log("transport", "No free berths available — skipping load, returning to idle.");
+        state.status = "idle";
+        saveTransportState(state);
+        await ctx.sleep(10000);
+        continue;
+      }
 
       // Determine destination groups
       const stationResp = await bot.exec("list_station_passengers");
@@ -947,29 +1209,38 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         const parsed = parseStationPassengers(stationResp.result);
         if (parsed) waiting = parsed.waiting;
       }
+      ctx.log("transport", `list_station_passengers returned ${waiting.length} waiting`);
 
-      // Count berth availability
-      const freeEconomy = state.berths.economy;
-      const freeBusiness = state.berths.business;
-      const freeFirst = state.berths.first;
+      for (const p of waiting) {
+        civilianStore.registerSeen({
+          citizenId: p.citizen_id,
+          name: p.name,
+          accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
+          destination: p.destination,
+          destinationName: p.destination_name,
+          fare: 0,
+          bio: "",
+        });
+      }
 
       // Group passengers by destination
       const byDest = new Map<string, StationPassenger[]>();
       for (const p of waiting) {
-        // Skip passengers going to pirate stations
+        const cls = p.class.toLowerCase();
         if (settings.blockPirateStations && isPirateSystem(p.destination)) {
-          ctx.log("transport", `Skipping passenger ${p.name} going to pirate station ${p.destination_name}`);
+          ctx.log("transport", `Skipping ${p.name}: pirate route -> ${p.destination_name}`);
           continue;
         }
-        // Skip disabled passenger classes
-        const cls = p.class.toLowerCase();
         if (cls === "first" && !settings.allowFirstClass) {
+          ctx.log("transport", `Skipping ${p.name}: first disabled`);
           continue;
         }
         if (cls === "business" && !settings.allowBusinessClass) {
+          ctx.log("transport", `Skipping ${p.name}: business disabled`);
           continue;
         }
         if (cls === "economy" && !settings.allowEconomyClass) {
+          ctx.log("transport", `Skipping ${p.name}: economy disabled`);
           continue;
         }
         const arr = byDest.get(p.destination) || [];
@@ -977,9 +1248,25 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         byDest.set(p.destination, arr);
       }
 
-      // For multi-destination tours: we can load passengers for multiple stops.
-      // Call load_passenger once per destination to fill berths.
-      // Economy berths can take any class; business can take business/first; first is exclusive.
+      // For multi-destination tours, plan the route FIRST so loading order follows it.
+      // This prevents stranding nearby passengers when distant destinations fill berths first.
+      const mcLocation = mapStore.getMobileCapitolLocation();
+      const destDrafts: Array<{ system: string; poi: string; poiName: string; count: number }> = [];
+      for (const [destId, ps] of byDest.entries()) {
+        const resolved = await resolveDestination(bot, destId, ps[0]?.destination_name || destId);
+        let sys = resolved?.system || "";
+        let poi = resolved?.poi || destId;
+        if (!sys && mcLocation && (destId.toLowerCase() === "frontier_station" || (ps[0]?.destination_name || "").toLowerCase() === "frontier station")) {
+          sys = mcLocation.systemId;
+          poi = mcLocation.poiId;
+        }
+        destDrafts.push({ system: sys, poi, poiName: ps[0]?.destination_name || destId, count: ps.length });
+      }
+
+      const plannedRoute = planTourRoute(bot.system || "", destDrafts.filter(d => d.system), settings.maxJumps);
+      ctx.log("transport", `Planned route BEFORE loading: ${plannedRoute.map(d => d.poiName).join(" → ") || "(none)"}`);
+
+      // Now load in route order, one destination per loop, berth tally.
       const loadedNames = new Set<string>();
       let usedEconomy = 0;
       let usedBusiness = 0;
@@ -990,66 +1277,113 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         return free;
       };
 
-      const destinationsPriority = Array.from(byDest.entries())
-        .sort((a, b) => b[1].length - a[1].length);
-
-      for (const [destId, passengers] of destinationsPriority) {
-        if (passengers.length === 0) continue;
-        // Check total passenger cap
-        const totalLoaded = usedEconomy + usedBusiness + usedFirst;
-        if (settings.maxPassengers > 0 && totalLoaded >= settings.maxPassengers) {
+      for (const leg of plannedRoute) {
+        if (bot.state !== "running") {
+          ctx.log("transport", "Stop requested during loading — aborting passenger load loop.");
+          state.status = "idle";
+          saveTransportState(state);
           break;
         }
-        // Sort passengers by priority if enabled
+        const passengers = byDest.get(leg.poi) || [];
+        if (passengers.length === 0) continue;
+
+        const totalLoaded = usedEconomy + usedBusiness + usedFirst;
+        if (settings.maxPassengers > 0 && totalLoaded >= settings.maxPassengers) {
+          ctx.log("transport", "Max passenger cap reached — stopping load loop.");
+          break;
+        }
+
         const priority = settings.passengerPriority;
         const sortedPassengers = [...passengers].sort((a, b) => {
           if (priority === "off") return 0;
           const classOrder = { first: 0, business: 1, economy: 2 };
           return classOrder[a.class.toLowerCase() as keyof typeof classOrder] - classOrder[b.class.toLowerCase() as keyof typeof classOrder];
         });
-        // Check how many we can fit respecting configured maxes
+
         let canFit = 0;
         for (const p of sortedPassengers) {
+          if (loadedNames.has(p.citizen_id)) continue;
           const cls = p.class.toLowerCase() as "economy" | "business" | "first";
+          const capFirst = capAvailable(usedFirst, settings.maxFirst, freeFirst);
+          const capBusiness = capAvailable(usedBusiness, settings.maxBusiness, freeBusiness);
+          const capEconomy = capAvailable(usedEconomy, settings.maxEconomy, freeEconomy);
           if (cls === "first") {
-            if (usedFirst < capAvailable(usedFirst, settings.maxFirst, freeFirst)) {
+            if (usedFirst < capFirst) {
+              ctx.log("transport", `→ canFit ${p.name} (first): capAvail=${capFirst}, usedFirst=${usedFirst} → fit`);
               canFit++;
               usedFirst++;
+              loadedNames.add(p.citizen_id);
+            } else {
+              ctx.log("transport", `→ NOFIT ${p.name} (first): capAvail=${capFirst}, usedFirst=${usedFirst}`);
             }
           } else if (cls === "business") {
-            if (usedBusiness < capAvailable(usedBusiness, settings.maxBusiness, freeBusiness)) {
+            if (usedBusiness < capBusiness) {
+              ctx.log("transport", `→ canFit ${p.name} (business): capAvail=${capBusiness}, usedBusiness=${usedBusiness} → fit`);
               canFit++;
               usedBusiness++;
-            } else if (usedEconomy < capAvailable(usedEconomy, settings.maxEconomy, freeEconomy)) {
+              loadedNames.add(p.citizen_id);
+            } else if (usedEconomy < capEconomy) {
+              ctx.log("transport", `→ canFit ${p.name} (business->economy): capAvail=${capEconomy}, usedEconomy=${usedEconomy} → fit`);
               canFit++;
               usedEconomy++;
+              loadedNames.add(p.citizen_id);
+            } else {
+              ctx.log("transport", `→ NOFIT ${p.name} (business): capAvail bus=${capBusiness} eco=${capEconomy}`);
             }
           } else {
-            if (usedEconomy < capAvailable(usedEconomy, settings.maxEconomy, freeEconomy)) {
+            if (usedEconomy < capEconomy) {
+              ctx.log("transport", `→ canFit ${p.name} (economy): capAvail=${capEconomy}, usedEconomy=${usedEconomy} → fit`);
               canFit++;
               usedEconomy++;
-            } else if (usedBusiness < capAvailable(usedBusiness, settings.maxBusiness, freeBusiness)) {
+              loadedNames.add(p.citizen_id);
+            } else if (usedBusiness < capBusiness) {
+              ctx.log("transport", `→ canFit ${p.name} (economy->business): capAvail=${capBusiness}, usedBusiness=${usedBusiness} → fit`);
               canFit++;
               usedBusiness++;
-            } else if (usedFirst < capAvailable(usedFirst, settings.maxFirst, freeFirst)) {
+              loadedNames.add(p.citizen_id);
+            } else if (usedFirst < capFirst) {
+              ctx.log("transport", `→ canFit ${p.name} (economy->first): capAvail=${capFirst}, usedFirst=${usedFirst} → fit`);
               canFit++;
               usedFirst++;
+              loadedNames.add(p.citizen_id);
+            } else {
+              ctx.log("transport", `→ NOFIT ${p.name} (economy): capAvail eco=${capEconomy} bus=${capBusiness} first=${capFirst}`);
             }
           }
-          if (canFit >= passengers.length) break;
         }
+
         if (canFit <= 0) continue;
 
-        ctx.log("transport", `Loading up to ${canFit} passengers for ${sortedPassengers[0].destination_name} (${destId})...`);
-        const loadResp = await bot.exec("load_passenger", { destination: destId });
+        ctx.log("transport", `Loading up to ${canFit} passengers for ${leg.poiName} (${leg.poi})...`);
+        if (bot.state !== "running") {
+          ctx.log("transport", "Stop requested before issuing load_passenger — aborting.");
+          state.status = "idle";
+          saveTransportState(state);
+          break;
+        }
+        const loadResp = await bot.exec("load_passenger", { destination: leg.poi });
         if (loadResp.error) {
-          ctx.log("error", `load_passenger failed for ${destId}: ${loadResp.error.message}`);
+          ctx.log("error", `load_passenger failed for ${leg.poi}: ${loadResp.error.message}`);
           continue;
         }
-        // Brief pause for mutation cooldown
         await ctx.sleep(11000);
-        // Refresh fleet and state after load
+        if (bot.state !== "running") {
+          ctx.log("transport", "Stop requested after load sleep — aborting passenger load loop.");
+          state.status = "idle";
+          saveTransportState(state);
+          break;
+        }
         bot.refreshStatus().catch(() => {});
+      }
+
+      if (bot.state !== "running") {
+        ctx.log("transport", "Stop requested after loading — remaining docked, returning to idle.");
+        state.onboardPassengers = [];
+        state.route = [];
+        state.status = "idle";
+        saveTransportState(state);
+        await ctx.sleep(10000);
+        continue;
       }
 
       // Read full passenger info
@@ -1072,37 +1406,65 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       // Build route from aboard passengers
       const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
       for (const p of aboard) {
-        // Destination may be a station id; we already have destination_name
         const existing = destMap.get(p.destination);
         if (existing) {
           existing.count++;
         } else {
-          // Try to resolve destination station to system
-          let sys = "";
-          let poi = p.destination;
-          // Look up in mapStore by station id or name
-          const allSystems = mapStore.getAllSystems();
-          for (const [, sysData] of Object.entries(allSystems)) {
-            const found = sysData.pois.find(
-              pp => pp.id === p.destination || pp.name.toLowerCase() === p.destination_name.toLowerCase(),
-            );
-            if (found) {
-              sys = sysData.id;
-              poi = found.id;
-              break;
-            }
+          const resolved = await resolveDestination(bot, p.destination, p.destination_name);
+          if (resolved) {
+            destMap.set(p.destination, { ...resolved, count: 1 });
+          } else {
+            ctx.log("transport", `Could not resolve destination for ${p.name}: ${p.destination_name}`);
+            destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destination_name, count: 1 });
           }
-          destMap.set(p.destination, {
-            system: sys,
-            poi,
-            poiName: p.destination_name,
-            count: 1,
-          });
         }
       }
 
-      const routeDests = Array.from(destMap.values());
-      const planned = planTourRoute(bot.system || "", routeDests, settings.maxJumps);
+      const routeDests = Array.from(destMap.values()).filter(d => d.system);
+      const planned = plannedRoute;
+
+      const aboardIds = new Set(aboard.map(p => p.citizen_id || p.name));
+      const beforeCount = state.onboardPassengers.length;
+      state.onboardPassengers = state.onboardPassengers.filter(op => aboardIds.has(op.citizenId));
+      const removedCount = beforeCount - state.onboardPassengers.length;
+      if (removedCount > 0) {
+        ctx.log("transport", `Removed ${removedCount} passenger(s) from onboard manifest — no longer aboard per list_passengers.`);
+      }
+
+      if (planned.length === 0) {
+        const stranded = state.onboardPassengers.filter(p => !routeDests.some(d => d.poi === p.destination));
+        if (stranded.length > 0) {
+          ctx.log("transport", `Stranded ${stranded.length} passenger(s) with unresolvable destinations: ${stranded.map(p => p.destinationName).join(", ")}`);
+          state.onboardPassengers = state.onboardPassengers.filter(p => routeDests.some(d => d.poi === p.destination));
+        }
+        if (state.onboardPassengers.length === 0) {
+          ctx.log("transport", "No passengers with resolvable destinations — returning to idle.");
+          state.route = [];
+          state.currentRouteIndex = 0;
+          state.currentDestination = null;
+          state.status = "idle";
+          saveTransportState(state);
+          await ctx.sleep(10000);
+          continue;
+        }
+      }
+
+      for (const p of aboard) {
+        civilianStore.addOrUpdate({
+          citizenId: p.citizen_id || p.name,
+          name: p.name,
+          accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
+          citizenship: p.citizenship,
+          destination: p.destination,
+          destinationName: p.destination_name,
+          fare: p.fare,
+          bio: p.bio,
+          loadedAt: new Date().toISOString(),
+          status: "boarded",
+          ticksRemaining: p.ticks_remaining,
+        });
+      }
+      ctx.log("transport", `civilianStore updated for ${aboard.length} boarded passenger(s)`);
 
       // Build onboard passenger records
       const onboard: TransportPassenger[] = aboard.map(p => ({
@@ -1125,8 +1487,9 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       state.currentRouteIndex = 0;
       state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
       state.status = onboard.length > 0 ? "in_transit" : "idle";
-      state.berths = listResp.result
-        ? parseListPassengers(listResp.result)!.berths
+      const listParsed = listResp.result ? parseListPassengers(listResp.result) : null;
+      state.berths = listParsed && (listParsed.berths.economy + listParsed.berths.business + listParsed.berths.first) > 0
+        ? listParsed.berths
         : state.berths;
       saveTransportState(state);
 
@@ -1136,7 +1499,39 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         continue;
       }
 
+      if (bot.state !== "running") {
+        ctx.log("transport", "Stop requested after loading — remaining docked, returning to idle.");
+        state.onboardPassengers = [];
+        state.route = [];
+        state.status = "idle";
+        saveTransportState(state);
+        await ctx.sleep(10000);
+        continue;
+      }
+
       ctx.log("transport", `Loaded ${onboard.length} passenger(s). Route: ${planned.map(d => d.poiName).join(" → ")}`);
+
+      const announceService = (globalThis as any).aiChatService;
+      if (
+        announceService &&
+        typeof announceService.sendTransportAnnouncement === "function" &&
+        (state.pickupStation === settings.homeStation || state.pickupSystem === settings.homeSystem)
+      ) {
+        const routeNames = planned.map(d => d.poiName);
+        const passengerInfos = onboard.map(p => ({
+          name: p.name,
+          bio: p.bio || "",
+          destinationName: p.destinationName,
+        }));
+        announceService.sendTransportAnnouncement(bot, {
+          shipName: state.shipName,
+          route: routeNames,
+          totalPassengers: onboard.length,
+          currentSystem: bot.system || "",
+          cycleType: "pickup",
+          onboardPassengers: passengerInfos,
+        }).catch(() => {});
+      }
 
       // Undock and continue to transit handling below
       await ensureUndocked(ctx);
@@ -1146,6 +1541,33 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
 
     if (state.status === "in_transit" || state.status === "traveling_to_ship") {
       if (state.route.length === 0 || state.currentRouteIndex >= state.route.length) {
+        if (state.onboardPassengers.length > 0) {
+          ctx.log("transport", `Route exhausted but ${state.onboardPassengers.length} passenger(s) remain — checking for new route...`);
+          const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
+          for (const p of state.onboardPassengers) {
+            const resolved = await resolveDestination(bot, p.destination, p.destinationName);
+            if (resolved) {
+              destMap.set(p.destination, { ...resolved, count: 1 });
+            } else {
+              destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destinationName, count: 1 });
+            }
+          }
+          const validDests = Array.from(destMap.values()).filter(d => d.system);
+          if (validDests.length > 0) {
+            const newRoute = planTourRoute(bot.system || "", validDests, 6);
+            if (newRoute.length > 0) {
+              state.route = newRoute;
+              state.currentRouteIndex = 0;
+              state.currentDestination = newRoute[0].poiName;
+              state.status = "in_transit";
+              ctx.log("transport", `Rebuilt route with ${validDests.length} destination(s): ${newRoute.map(d => d.poiName).join(" → ")}`);
+              saveTransportState(state);
+              continue;
+            }
+          }
+          ctx.log("transport", "Cannot find route for remaining passengers — marking as stranded and returning to idle.");
+          state.onboardPassengers = state.onboardPassengers.map(p => ({ ...p, status: "stranded" }));
+        }
         state.status = "idle";
         saveTransportState(state);
         continue;
@@ -1254,9 +1676,9 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       saveTransportState(state);
 
       if (state.status === "completed") {
+        const completedPassengers = [...state.onboardPassengers];
         clearTransportState(bot.username);
         
-        // Collect fuel cells at home base before returning
         if (settings.homeStation) {
           await ensureDocked(ctx);
           await collectFuelCells(ctx, settings, true);
@@ -1269,6 +1691,29 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         state.currentRouteIndex = 0;
         state.currentDestination = null;
         saveTransportState(state);
+        
+        const announceService = (globalThis as any).aiChatService;
+        if (
+          announceService &&
+          typeof announceService.sendTransportAnnouncement === "function" &&
+          bot.system === settings.homeSystem
+        ) {
+          const routeNames = completedPassengers.map(p => p.destinationName);
+          const passengerInfos = completedPassengers.map(p => ({
+            name: p.name,
+            bio: p.bio || "",
+            destinationName: p.destinationName,
+          }));
+          announceService.sendTransportAnnouncement(bot, {
+            shipName: state.shipName,
+            route: routeNames,
+            totalPassengers: completedPassengers.length,
+            currentSystem: bot.system || "",
+            cycleType: "cycle_complete",
+            onboardPassengers: passengerInfos,
+          }).catch(() => {});
+        }
+        
         await ctx.sleep(15000);
         continue;
       }

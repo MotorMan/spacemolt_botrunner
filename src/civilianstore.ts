@@ -110,6 +110,51 @@ export class CivilianStore {
     return id.trim().toLowerCase();
   }
 
+  registerSeen(passenger: {
+    citizenId: string;
+    name: string;
+    accommodationClass: "economy" | "business" | "first";
+    destination: string;
+    destinationName: string;
+    fare: number;
+    bio?: string;
+  }): void {
+    this.ensureLoaded();
+    const now = new Date().toISOString();
+    const normalizedId = this.normalizeId(passenger.citizenId);
+    const existing = this.civilians.get(normalizedId);
+
+    if (existing) {
+      existing.lastSeen = now;
+      if (passenger.bio) {
+        existing.bio = passenger.bio;
+      }
+      const stationId = passenger.destination;
+      existing.timesSeenAtStation[stationId] = (existing.timesSeenAtStation[stationId] || 0) + 1;
+      existing.lastSeenAtStation = stationId;
+      return;
+    }
+
+    const record: CivilianRecord = {
+      citizenId: passenger.citizenId,
+      name: passenger.name,
+      accommodationClass: passenger.accommodationClass,
+      citizenship: "",
+      destination: passenger.destination,
+      destinationName: passenger.destinationName,
+      fare: passenger.fare,
+      bio: passenger.bio || "",
+      firstSeen: now,
+      lastSeen: now,
+      timesTransported: 0,
+      totalFare: 0,
+      timesSeenAtStation: { [passenger.destination]: 1 },
+      lastSeenAtStation: passenger.destination,
+      transportHistory: [],
+    };
+    this.civilians.set(normalizedId, record);
+  }
+
   addOrUpdate(passenger: CivilianPassenger): void {
     this.ensureLoaded();
     const now = new Date().toISOString();
@@ -129,7 +174,9 @@ export class CivilianStore {
           status: "delivered",
         });
       }
-      // Track station visits
+      if (passenger.bio) {
+        existing.bio = passenger.bio;
+      }
       const stationId = passenger.destination;
       existing.timesSeenAtStation[stationId] = (existing.timesSeenAtStation[stationId] || 0) + 1;
       existing.lastSeenAtStation = stationId;

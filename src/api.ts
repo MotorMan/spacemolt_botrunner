@@ -867,9 +867,14 @@ export class SpaceMoltAPI {
     }
 
     // Remove invalid parameters for find_route (server now only accepts target_system)
+    // But also accept target as alias for station IDs
     if (command === 'find_route') {
       delete body.target_poi;
-      delete body.target;
+      // Translate target -> target_system for find_route
+      if (body.target !== undefined && body.target_system === undefined) {
+        body.target_system = body.target;
+        delete body.target;
+      }
     }
 
     // Translate target_system -> id for jump (only for string system IDs, not numeric pathfinder bearings)

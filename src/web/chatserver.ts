@@ -1,5 +1,5 @@
 import { readFileSync, existsSync } from "fs";
-import { join as pathJoin } from "path";
+import { join } from "path";
 import os from "os";
 import type { ServerWebSocket } from "bun";
 import { getBot, getDiscoveredBots } from "../botmanager.js";
@@ -25,8 +25,8 @@ export class ChatWebServer {
   }
 
   start(): void {
-    const indexPath = pathJoin(import.meta.dir, "chat.html");
-    const cssPath = pathJoin(import.meta.dir, "chat.css");
+    const indexPath = join(import.meta.dir, "chat.html");
+    const cssPath = join(import.meta.dir, "chat.css");
 
     this.server = Bun.serve<WSData>({
       hostname: "0.0.0.0",
@@ -44,7 +44,9 @@ export class ChatWebServer {
         }
 
         if (url.pathname === "/api/bots" && req.method === "GET") {
-          return Response.json({ bots: getDiscoveredBots() });
+          const bots = getDiscoveredBots();
+          console.log(`[ChatServer] /api/bots returning:`, bots);
+          return Response.json({ bots });
         }
 
         if (url.pathname === "/api/channels" && req.method === "GET") {

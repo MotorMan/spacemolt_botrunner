@@ -4,6 +4,78 @@ import { debugLogForBot } from "./debug.js";
 import { SessionManager } from "./session.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
 
+interface QueuedRequest {
+  command: string;
+  payload: Record<string, unknown> | undefined;
+  abortSignal: AbortSignal | undefined;
+  resolve: (value: ApiResponse) => void;
+  reject: (reason: Error) => void;
+}
+
+class SessionRateLimiter {
+  private requestTimestamps: number[] = [];
+  private queue: QueuedRequest[] = [];
+  private processing = false;
+  private readonly maxRequestsPerSecond = 5;
+  private readonly windowMs = 1000;
+
+  canMakeRequest(): boolean {
+    const now = Date.now();
+    this.requestTimestamps = this.requestTimestamps.filter(t => now - t < this.windowMs);
+    return this.requestTimestamps.length < this.maxRequestsPerSecond;
+  }
+
+  recordRequest(): void {
+    this.requestTimestamps.push(Date.now());
+  }
+
+  async enqueue(
+    command: string,
+    payload: Record<string, unknown> | undefined,
+    abortSignal: AbortSignal | undefined,
+    makeRequest: (cmd: string, p: Record<string, unknown> | undefined, sig: AbortSignal | undefined) => Promise<ApiResponse>
+  ): Promise<ApiResponse> {
+    return new Promise((resolve, reject) => {
+      const request: QueuedRequest = { command, payload, abortSignal, resolve, reject };
+      this.queue.push(request);
+      this.processQueue(makeRequest);
+    });
+  }
+
+  private async processQueue(
+    makeRequest: (cmd: string, p: Record<string, unknown> | undefined, sig: AbortSignal | undefined) => Promise<ApiResponse>
+  ): Promise<void> {
+    if (this.processing) return;
+    this.processing = true;
+
+    while (this.queue.length > 0) {
+      while (!this.canMakeRequest() && this.queue.length > 0) {
+        const waitTime = this.windowMs - (Date.now() - (this.requestTimestamps[0] || 0));
+        if (waitTime > 0) {
+          await sleep(Math.min(waitTime, 100));
+        }
+      }
+
+      const request = this.queue.shift();
+      if (!request) break;
+
+      try {
+        this.recordRequest();
+        const result = await makeRequest(request.command, request.payload, request.abortSignal);
+        request.resolve(result);
+      } catch (err) {
+        request.reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    this.processing = false;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export interface ApiSession {
   id: string;
   playerId?: string;
@@ -19,7 +91,7 @@ export interface ApiResponse {
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
-const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-6-5-26-Pathfinder-Work-Version";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-6-5-26-flood-protected-Version";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;
@@ -415,6 +487,7 @@ export class SpaceMoltAPI {
   private _totalBytesIn = 0;
   private _totalBytesOut = 0;
   private _bandwidthStartTime = Date.now();
+  private _rateLimiter = new SessionRateLimiter();
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
@@ -737,6 +810,10 @@ export class SpaceMoltAPI {
   }
 
   private async doRequest(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
+    return this._rateLimiter.enqueue(command, payload, abortSignal, (cmd, p, sig) => this.makeHttpRequest(cmd, p, sig));
+  }
+
+  private async makeHttpRequest(command: string, payload: Record<string, unknown> | undefined, abortSignal: AbortSignal | undefined): Promise<ApiResponse> {
     const tool = COMMAND_TOOL_MAP[command] || 'spacemolt';
     let url: string;
     let body: Record<string, unknown> = payload ? { ...payload } : {};
@@ -892,8 +969,4 @@ export class SpaceMoltAPI {
       };
     }
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

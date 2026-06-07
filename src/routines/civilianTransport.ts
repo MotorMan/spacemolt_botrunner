@@ -557,45 +557,58 @@ async function selectPickupStation(
     }
   }
 
-// Query each candidate system's station(s) concurrently
-   const stationPromises: Promise<void>[] = [];
-   candidates.forEach((info) => {
-     if (info.hops > maxJumps) return;
-     if (blockPirateStations && isPirateSystem(info.systemId)) return;
-     stationPromises.push(
-       (async () => {
-         try {
-           const sysResp = await bot.exec("get_system", { system_id: info.systemId });
-           if (sysResp.error || !sysResp.result) return;
-           const sysResult = sysResp.result as Record<string, unknown>;
-           const sysObj = sysResult.system as Record<string, unknown> || sysResult;
-           const pois = (sysObj.pois || []) as Array<Record<string, unknown>>;
-           for (const p of pois) {
-             const hasBase = p.has_base || p.base_id || p.base;
-             if (!hasBase) continue;
-             const poiId = (p.id || p.poi_id || p.name || "") as string;
-             if (!poiId) continue;
-             if (blockPirateStations && isPirateSystem(info.systemId)) continue;
-             const pResp = await bot.exec("list_station_passengers", { station: poiId });
-             if (pResp.error || !pResp.result) continue;
-             const pData = parseStationPassengers(pResp.result);
-             if (pData && pData.count > 0) {
-               stations.push({
-                 system: info.systemId,
-                 poi: poiId,
-                 poiName: pData.station,
-                 count: pData.count,
-                 hops: info.hops,
-               });
-             }
-           }
-         } catch {
-           // skip system query errors
+// Query candidate systems sequentially with rate limiting to avoid flooding the API
+  const SYSTEM_DELAY_MS = 1000;
+  const MAX_SYSTEMS_TO_CHECK = 10;
+   
+   const validCandidates = Array.from(candidates.values()).filter(
+     (info) => info.hops <= maxJumps && !(blockPirateStations && isPirateSystem(info.systemId))
+   );
+   
+   // Sort by hops to prioritize closer systems
+   validCandidates.sort((a, b) => a.hops - b.hops);
+   
+   // Limit total systems checked to prevent excessive requests
+   const candidatesToCheck = validCandidates.slice(0, MAX_SYSTEMS_TO_CHECK);
+   
+   for (let i = 0; i < candidatesToCheck.length; i++) {
+     const info = candidatesToCheck[i];
+     
+     try {
+       const sysResp = await bot.exec("get_system", { system_id: info.systemId });
+       if (sysResp.error || !sysResp.result) {
+         if (i < candidatesToCheck.length - 1) await ctx.sleep(SYSTEM_DELAY_MS);
+         continue;
+       }
+       const sysResult = sysResp.result as Record<string, unknown>;
+       const sysObj = sysResult.system as Record<string, unknown> || sysResult;
+       const pois = (sysObj.pois || []) as Array<Record<string, unknown>>;
+       for (const p of pois) {
+         const hasBase = p.has_base || p.base_id || p.base;
+         if (!hasBase) continue;
+         const poiId = (p.id || p.poi_id || p.name || "") as string;
+         if (!poiId) continue;
+         if (blockPirateStations && isPirateSystem(info.systemId)) continue;
+         const pResp = await bot.exec("list_station_passengers", { station: poiId });
+         if (pResp.error || !pResp.result) continue;
+         const pData = parseStationPassengers(pResp.result);
+         if (pData && pData.count > 0) {
+           stations.push({
+             system: info.systemId,
+             poi: poiId,
+             poiName: pData.station,
+             count: pData.count,
+             hops: info.hops,
+           });
          }
-       })()
-     );
-   });
-   await Promise.allSettled(stationPromises);
+       }
+     } catch {
+       // skip system query errors
+     }
+     
+     // Delay between system queries to avoid rate limiting
+     if (i < candidatesToCheck.length - 1) await ctx.sleep(SYSTEM_DELAY_MS);
+   }
 
    if (stations.length === 0) return null;
 

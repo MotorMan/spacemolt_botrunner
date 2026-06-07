@@ -237,22 +237,70 @@ function parseListPassengers(result: unknown): ListPassengersResponse | null {
   };
 }
 
+function extractBerthsFromCapabilities(capabilities: unknown): { economy: number; business: number; first: number } | null {
+  if (!Array.isArray(capabilities)) return null;
+  let economy = 0, business = 0, first = 0;
+  for (const cap of capabilities) {
+    if (!cap || typeof cap !== "object") continue;
+    const c = cap as Record<string, unknown>;
+    const type = (c.type as string) || "";
+    const value = (c.value as number) || 0;
+    if (type === "passenger_economy_berths") economy = value;
+    else if (type === "passenger_business_berths") business = value;
+    else if (type === "passenger_first_berths") first = value;
+  }
+  if (economy === 0 && business === 0 && first === 0) return null;
+  return { economy, business, first };
+}
+
+function countPassengerModules(modules: unknown): { economy: number; business: number; first: number } {
+  if (!Array.isArray(modules)) return { economy: 0, business: 0, first: 0 };
+  let economy = 0, business = 0, first = 0;
+  for (const m of modules) {
+    if (!m || typeof m !== "object") continue;
+    const mod = m as Record<string, unknown>;
+    const typeId = ((mod.type_id as string) || (mod.type as string) || "") as string;
+    if (typeId.includes("passenger")) {
+      if (typeId.includes("first")) first += 1;
+      else if (typeId.includes("business")) business += 1;
+      else if (typeId.includes("economy")) economy += 1;
+    }
+  }
+  return { economy, business, first };
+}
+
 function parseListShips(result: unknown): FleetShip[] {
   if (!result || typeof result !== "object") return [];
   const r = result as Record<string, unknown>;
   const ships = Array.isArray(r.ships) ? r.ships : Array.isArray(r.fleet) ? r.fleet : [];
   return ships.map((s: Record<string, unknown>) => {
-    const berths = (s.passenger_berths || s.berths || {}) as Record<string, number>;
+    let berths: { economy: number; business: number; first: number };
+    
+    const directBerths = (s.passenger_berths || s.berths || {}) as Record<string, number>;
+    if (directBerths.economy || directBerths.business || directBerths.first) {
+      berths = {
+        economy: directBerths.economy || 0,
+        business: directBerths.business || 0,
+        first: directBerths.first || 0,
+      };
+    } else {
+      const caps = s.inherent_capabilities || (s.class && (s.class as Record<string, unknown>).inherent_capabilities);
+      const fromCaps = extractBerthsFromCapabilities(caps);
+      if (fromCaps) {
+        berths = fromCaps;
+      } else {
+        const mods = s.modules;
+        const fromMods = countPassengerModules(mods);
+        berths = fromMods;
+      }
+    }
+    
     return {
       shipId: (s.ship_id || s.id || "") as string,
       shipName: (s.name || s.ship_name || "") as string,
       type: (s.type || s.ship_type || "") as string,
       tier: (s.tier as number) ?? null,
-      berths: {
-        economy: berths.economy || 0,
-        business: berths.business || 0,
-        first: berths.first || 0,
-      },
+      berths,
       storedAtStationId: (s.stored_at_station_id || s.station_id || s.current_station || "") as string,
       storedAtSystemId: (s.stored_at_system_id || s.system_id || s.system || "") as string,
       hasShipyard: (s.has_shipyard as boolean) || false,
@@ -298,7 +346,35 @@ async function refreshFleetCache(ctx: RoutineContext): Promise<FleetShip[]> {
     ctx.log("transport", "list_ships failed — using cached fleet data");
     return loadFleetData(bot.username);
   }
-  const ships = parseListShips(resp.result);
+  let ships = parseListShips(resp.result);
+  
+  const shipsNeedingDetails = ships.filter(s => totalBerths(s.berths) === 0);
+  if (shipsNeedingDetails.length > 0) {
+    ctx.log("transport", `Fetching details for ${shipsNeedingDetails.length} ship(s) without berth info...`);
+    for (const ship of shipsNeedingDetails) {
+      const detailResp = await bot.exec("get_ship", { ship_id: ship.shipId });
+      if (!detailResp.error && detailResp.result) {
+        const detail = detailResp.result as Record<string, unknown> & { class?: Record<string, unknown> };
+        const caps = detail.class?.inherent_capabilities || detail.inherent_capabilities;
+        const fromCaps = extractBerthsFromCapabilities(caps);
+        if (fromCaps) {
+          ship.berths = fromCaps;
+        } else if (detail.modules) {
+          const fromMods = countPassengerModules(detail.modules);
+          if (totalBerths(fromMods) > 0) {
+            ship.berths = fromMods;
+          }
+        }
+        if (totalBerths(ship.berths) === 0 && detail.class) {
+          const shipClass = detail.class as Record<string, unknown>;
+          if ((shipClass.special as string) === "passenger_liner") {
+            ship.berths = { economy: 1, business: 0, first: 0 };
+          }
+        }
+      }
+    }
+  }
+  
   saveFleetData(bot.username, ships);
   ctx.log("transport", `Fleet updated: ${ships.length} ship(s) cached`);
   return ships;

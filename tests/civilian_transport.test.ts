@@ -321,6 +321,78 @@ describe('makeNewState', () => {
   });
 });
 
+function extractBerthsFromCapabilities(capabilities: unknown): { economy: number; business: number; first: number } | null {
+  if (!Array.isArray(capabilities)) return null;
+  let economy = 0, business = 0, first = 0;
+  for (const cap of capabilities) {
+    if (!cap || typeof cap !== 'object') continue;
+    const c = cap as Record<string, unknown>;
+    const type = (c.type as string) || '';
+    const value = (c.value as number) || 0;
+    if (type === 'passenger_economy_berths') economy = value;
+    else if (type === 'passenger_business_berths') business = value;
+    else if (type === 'passenger_first_berths') first = value;
+  }
+  if (economy === 0 && business === 0 && first === 0) return null;
+  return { economy, business, first };
+}
+
+function countPassengerModules(modules: unknown): { economy: number; business: number; first: number } {
+  if (!Array.isArray(modules)) return { economy: 0, business: 0, first: 0 };
+  let economy = 0, business = 0, first = 0;
+  for (const m of modules) {
+    if (!m || typeof m !== 'object') continue;
+    const mod = m as Record<string, unknown>;
+    const typeId = ((mod.type_id as string) || (mod.type as string) || '') as string;
+    if (typeId.includes('passenger')) {
+      if (typeId.includes('first')) first += 1;
+      else if (typeId.includes('business')) business += 1;
+      else if (typeId.includes('economy')) economy += 1;
+    }
+  }
+  return { economy, business, first };
+}
+
+describe('extractBerthsFromCapabilities', () => {
+  it('extracts berths from capabilities array', () => {
+    const caps = [
+      { type: 'passenger_economy_berths', value: 12 },
+      { type: 'passenger_business_berths', value: 6 },
+      { type: 'passenger_first_berths', value: 1 },
+    ];
+    const result = extractBerthsFromCapabilities(caps);
+    expect(result).toEqual({ economy: 12, business: 6, first: 1 });
+  });
+
+  it('returns null for non-array input', () => {
+    expect(extractBerthsFromCapabilities(null)).toBeNull();
+    expect(extractBerthsFromCapabilities(undefined)).toBeNull();
+    expect(extractBerthsFromCapabilities({})).toBeNull();
+  });
+
+  it('returns null when no passenger capabilities present', () => {
+    const caps = [{ type: 'ore_yield_bonus', value: 10 }];
+    expect(extractBerthsFromCapabilities(caps)).toBeNull();
+  });
+});
+
+describe('countPassengerModules', () => {
+  it('counts passenger modules', () => {
+    const mods = [
+      { type_id: 'economy_passenger_cabin' },
+      { type_id: 'economy_passenger_cabin' },
+      { type_id: 'business_passenger_cabin' },
+    ];
+    const result = countPassengerModules(mods);
+    expect(result).toEqual({ economy: 2, business: 1, first: 0 });
+  });
+
+  it('returns zeros for non-array input', () => {
+    expect(countPassengerModules(null)).toEqual({ economy: 0, business: 0, first: 0 });
+    expect(countPassengerModules(undefined)).toEqual({ economy: 0, business: 0, first: 0 });
+  });
+});
+
 describe('TransportState persistence', () => {
   beforeEach(() => {
     try { mkdirSync(join(REPO_ROOT, 'spacemolt_botrunner/data'), { recursive: true }); } catch {}

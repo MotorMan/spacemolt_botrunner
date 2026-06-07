@@ -303,6 +303,22 @@ export class WebServer {
     this.port = port;
     this.settings = loadSettings();
     delete (this.settings as Record<string, unknown>).flock;
+    if (!this.settings.module_seller) {
+      this.settings.module_seller = {
+        homeSystem: "",
+        homeStation: "",
+        fuelCostPerJump: 50,
+        refuelThreshold: 50,
+        repairThreshold: 40,
+        priceMode: "premium",
+        premiumPct: 5,
+        undercutCr: 100,
+        sellAtHome: true,
+        maxQtyDefault: 10,
+        moduleItems: [],
+      };
+      saveSettings(this.settings);
+    }
     this.statsData = loadStats();
     const mainLogs = loadMainLogs();
     this.activityLog = mainLogs.activity.slice(-MAX_LOG_BUFFER);

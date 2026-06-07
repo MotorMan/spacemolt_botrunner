@@ -1939,7 +1939,11 @@ export async function navigateToSystem(
     }
 
     ctx.log("travel", `Arrived in ${bot.system}`);
-    if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
+    if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) {
+      await sleep(1000);
+      await bot.refreshStatus();
+      return true;
+    }
     if (bot.state !== "running") return false;
   }
 

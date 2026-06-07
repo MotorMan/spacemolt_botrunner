@@ -15,8 +15,41 @@ import {
   fleeFromBattle,
   getShipTier,
   type BattleState,
+  isPirateSystem,
+  getItemSize,
 } from "./common.js";
 import { getSystemBlacklist } from "../web/server.js";
+import { civilianStore, CivilianPassenger } from "../civilianstore.js";
+import { catalogStore } from "../catalogstore.js";
+
+const fs = require("fs");
+const path = require("path");
+
+interface CatalogShip {
+  id: string;
+  name: string;
+  special?: string;
+  inherent_capabilities?: Array<{ type: string; value: number }>;
+}
+
+let catalogCache: Record<string, CatalogShip> | null = null;
+
+function loadCatalog(): Record<string, CatalogShip> {
+  if (catalogCache) return catalogCache;
+  try {
+    const catalogPath = path.join(process.cwd(), "data/catalog.json");
+    if (fs.existsSync(catalogPath)) {
+      const raw = fs.readFileSync(catalogPath, "utf-8");
+      const data = JSON.parse(raw) as Record<string, unknown>;
+      const ships = (data.ships as Record<string, CatalogShip>) || {};
+      catalogCache = ships;
+      return ships;
+    }
+  } catch {
+    // silent fail
+  }
+  return {};
+}
 
 // ── Types ────────────────────────────────────────────────────
 
@@ -115,6 +148,7 @@ interface CivilianTransportSettings {
   maxEconomy: number;
   maxBusiness: number;
   maxFirst: number;
+  blockPirateStations: boolean;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -133,6 +167,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     maxEconomy: Number((t.maxEconomy as number) ?? 0),
     maxBusiness: Number((t.maxBusiness as number) ?? 0),
     maxFirst: Number((t.maxFirst as number) ?? 0),
+    blockPirateStations: (t.blockPirateStations as boolean) ?? true,
   };
 }
 
@@ -194,6 +229,53 @@ function saveFleetData(botUsername: string, ships: FleetShip[]): void {
   const data = loadAllData();
   data.fleet.bots[botUsername] = { ships, lastUpdated: new Date().toISOString() };
   saveAllData(data);
+}
+
+async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
+  const { bot } = ctx;
+  await bot.refreshStatus();
+
+  const cargoFree = (bot.cargoMax || 0) - (bot.cargo || 0);
+  if (cargoFree <= 0) {
+    ctx.log("transport", "No cargo space for fuel cells");
+    return;
+  }
+
+  const milSize = catalogStore.getItem("military_fuel_cell")?.size as number || 3;
+  const premSize = catalogStore.getItem("premium_fuel_cell")?.size as number || 2;
+  const regSize = catalogStore.getItem("fuel_cell")?.size as number || 1;
+
+  const milCap = Math.floor(cargoFree / milSize);
+  const premCap = Math.floor(cargoFree / premSize);
+  const regCap = Math.floor(cargoFree / regSize);
+
+  ctx.log("transport", `Fuel cell capacity: military=${milCap}, premium=${premCap}, regular=${regCap}`);
+
+  const fuelTypes = [
+    { id: "military_fuel_cell", cap: milCap },
+    { id: "premium_fuel_cell", cap: premCap },
+    { id: "fuel_cell", cap: regCap },
+  ];
+
+  for (const fuel of fuelTypes) {
+    if (fuel.cap <= 0) continue;
+    const resp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: fuel.id,
+      quantity: fuel.cap,
+    });
+    if (!resp.error) {
+      ctx.log("transport", `Withdrew ${fuel.cap} ${fuel.id} from faction storage`);
+    } else {
+      const buyResp = await bot.exec("buy", { item_id: fuel.id, quantity: fuel.cap });
+      if (!buyResp.error) {
+        ctx.log("transport", `Bought ${fuel.cap} ${fuel.id}`);
+      } else {
+        ctx.log("transport", `Could not acquire ${fuel.id}: ${buyResp.error.message}`);
+      }
+    }
+  }
 }
 
 // ── Parsers ──────────────────────────────────────────────────
@@ -273,6 +355,8 @@ function parseListShips(result: unknown): FleetShip[] {
   if (!result || typeof result !== "object") return [];
   const r = result as Record<string, unknown>;
   const ships = Array.isArray(r.ships) ? r.ships : Array.isArray(r.fleet) ? r.fleet : [];
+  const catalog = loadCatalog();
+  
   return ships.map((s: Record<string, unknown>) => {
     let berths: { economy: number; business: number; first: number };
     
@@ -284,24 +368,24 @@ function parseListShips(result: unknown): FleetShip[] {
         first: directBerths.first || 0,
       };
     } else {
-      const caps = s.inherent_capabilities || (s.class && (s.class as Record<string, unknown>).inherent_capabilities);
+      const classId = ((s.class_id || (s.class as Record<string, unknown>)?.id || s.type || "") as string);
+      const classData = catalog[classId];
+      const caps = classData?.inherent_capabilities;
       const fromCaps = extractBerthsFromCapabilities(caps);
       if (fromCaps) {
         berths = fromCaps;
       } else {
-        const mods = s.modules;
-        const fromMods = countPassengerModules(mods);
-        berths = fromMods;
+        berths = { economy: 0, business: 0, first: 0 };
       }
     }
     
     return {
       shipId: (s.ship_id || s.id || "") as string,
-      shipName: (s.name || s.ship_name || "") as string,
-      type: (s.type || s.ship_type || "") as string,
+      shipName: (s.name || s.ship_name || s.class_name || "") as string,
+      type: (s.type || s.ship_type || s.class_id || "") as string,
       tier: (s.tier as number) ?? null,
       berths,
-      storedAtStationId: (s.stored_at_station_id || s.station_id || s.current_station || "") as string,
+      storedAtStationId: (s.stored_at_station_id || s.station_id || s.current_station || s.location_base_id || "") as string,
       storedAtSystemId: (s.stored_at_system_id || s.system_id || s.system || "") as string,
       hasShipyard: (s.has_shipyard as boolean) || false,
       cargoCapacity: (s.cargo_capacity || s.max_cargo || 0) as number,
@@ -351,25 +435,52 @@ async function refreshFleetCache(ctx: RoutineContext): Promise<FleetShip[]> {
   const shipsNeedingDetails = ships.filter(s => totalBerths(s.berths) === 0);
   if (shipsNeedingDetails.length > 0) {
     ctx.log("transport", `Fetching details for ${shipsNeedingDetails.length} ship(s) without berth info...`);
+    const catalog = loadCatalog();
     for (const ship of shipsNeedingDetails) {
-      const detailResp = await bot.exec("get_ship", { ship_id: ship.shipId });
-      if (!detailResp.error && detailResp.result) {
-        const detail = detailResp.result as Record<string, unknown> & { class?: Record<string, unknown> };
-        const caps = detail.class?.inherent_capabilities || detail.inherent_capabilities;
+      const classData = catalog[ship.type];
+      if (classData) {
+        const caps = classData.inherent_capabilities;
         const fromCaps = extractBerthsFromCapabilities(caps);
         if (fromCaps) {
           ship.berths = fromCaps;
-        } else if (detail.modules) {
-          const fromMods = countPassengerModules(detail.modules);
+        }
+        if (totalBerths(ship.berths) === 0 && classData.special === "passenger_liner") {
+          ship.berths = { economy: 1, business: 0, first: 0 };
+        }
+      }
+      
+      if (totalBerths(ship.berths) === 0) {
+        const detailResp = await bot.exec("get_ship", { ship_id: ship.shipId });
+        if (detailResp.error) {
+          ctx.log("transport", `get_ship failed for ${ship.shipId}: ${detailResp.error.message}`);
+          continue;
+        }
+        if (!detailResp.result) {
+          ctx.log("transport", `get_ship returned no result for ${ship.shipId}`);
+          continue;
+        }
+        const detail = detailResp.result as Record<string, unknown> & { ship?: Record<string, unknown>; class?: { special?: string; inherent_capabilities?: unknown } };
+        const shipData = detail.ship || detail;
+        ship.shipId = (shipData.id || ship.shipId) as string;
+        ship.shipName = (detail.name || shipData.name || ship.shipName) as string;
+        ship.type = (shipData.ship_type || shipData.type || ship.type) as string;
+        ship.tier = (shipData.tier as number) ?? ship.tier;
+        ship.cargoCapacity = (shipData.cargo_capacity || shipData.max_cargo || ship.cargoCapacity) as number;
+        ship.cargoUsed = (shipData.cargo_used || ship.cargoUsed) as number;
+        ship.hasShipyard = (shipData.has_shipyard as boolean) ?? ship.hasShipyard;
+        
+        const caps = ((detail.class as Record<string, unknown>)?.inherent_capabilities as unknown) || ((shipData.class as Record<string, unknown>)?.inherent_capabilities as unknown);
+        const fromCaps = extractBerthsFromCapabilities(caps);
+        if (fromCaps) {
+          ship.berths = fromCaps;
+        } else if (detail.modules || shipData.modules) {
+          const fromMods = countPassengerModules(detail.modules || shipData.modules);
           if (totalBerths(fromMods) > 0) {
             ship.berths = fromMods;
           }
         }
-        if (totalBerths(ship.berths) === 0 && detail.class) {
-          const shipClass = detail.class as Record<string, unknown>;
-          if ((shipClass.special as string) === "passenger_liner") {
-            ship.berths = { economy: 1, business: 0, first: 0 };
-          }
+        if (totalBerths(ship.berths) === 0 && detail.class?.special === "passenger_liner") {
+          ship.berths = { economy: 1, business: 0, first: 0 };
         }
       }
     }
@@ -384,22 +495,26 @@ async function selectPickupStation(
   ctx: RoutineContext,
   berths: { economy: number; business: number; first: number },
   maxJumps: number,
+  blockPirateStations: boolean,
 ): Promise<{ system: string; poi: string; poiName: string; count: number } | null> {
   const { bot } = ctx;
-  const stations: Array<{ system: string; poi: string; poiName: string; count: number }> = [];
+  const stations: Array<{ system: string; poi: string; poiName: string; count: number; hops: number }> = [];
 
   // Check current station first if docked
   if (bot.docked && bot.poi && bot.system) {
-    const resp = await bot.exec("list_station_passengers");
-    if (!resp.error && resp.result) {
-      const data = parseStationPassengers(resp.result);
-      if (data && data.count > 0) {
-        stations.push({
-          system: bot.system,
-          poi: bot.poi,
-          poiName: data.station,
-          count: data.count,
-        });
+    if (!blockPirateStations || !isPirateSystem(bot.system)) {
+      const resp = await bot.exec("list_station_passengers");
+      if (!resp.error && resp.result) {
+        const data = parseStationPassengers(resp.result);
+        if (data && data.count > 0) {
+          stations.push({
+            system: bot.system,
+            poi: bot.poi,
+            poiName: data.station,
+            count: data.count,
+            hops: 0,
+          });
+        }
       }
     }
   }
@@ -432,49 +547,55 @@ async function selectPickupStation(
     }
   }
 
-  // Query each candidate system's station(s) concurrently
-  const stationPromises: Promise<void>[] = [];
-  candidates.forEach((info) => {
-    if (info.hops > maxJumps) return;
-    stationPromises.push(
-      (async () => {
-        try {
-          const sysResp = await bot.exec("get_system", { system_id: info.systemId });
-          if (sysResp.error || !sysResp.result) return;
-          const sysResult = sysResp.result as Record<string, unknown>;
-          const sysObj = sysResult.system as Record<string, unknown> || sysResult;
-          const pois = (sysObj.pois || []) as Array<Record<string, unknown>>;
-          for (const p of pois) {
-            const hasBase = p.has_base || p.base_id || p.base;
-            if (!hasBase) continue;
-            const poiId = (p.id || p.poi_id || p.name || "") as string;
-            if (!poiId) continue;
-            const pResp = await bot.exec("list_station_passengers", { station: poiId });
-            if (pResp.error || !pResp.result) continue;
-            const pData = parseStationPassengers(pResp.result);
-            if (pData && pData.count > 0) {
-              stations.push({
-                system: info.systemId,
-                poi: poiId,
-                poiName: pData.station,
-                count: pData.count,
-              });
-            }
-          }
-        } catch {
-          // skip system query errors
-        }
-      })()
-    );
-  });
-  await Promise.allSettled(stationPromises);
+// Query each candidate system's station(s) concurrently
+   const stationPromises: Promise<void>[] = [];
+   candidates.forEach((info) => {
+     if (info.hops > maxJumps) return;
+     if (blockPirateStations && isPirateSystem(info.systemId)) return;
+     stationPromises.push(
+       (async () => {
+         try {
+           const sysResp = await bot.exec("get_system", { system_id: info.systemId });
+           if (sysResp.error || !sysResp.result) return;
+           const sysResult = sysResp.result as Record<string, unknown>;
+           const sysObj = sysResult.system as Record<string, unknown> || sysResult;
+           const pois = (sysObj.pois || []) as Array<Record<string, unknown>>;
+           for (const p of pois) {
+             const hasBase = p.has_base || p.base_id || p.base;
+             if (!hasBase) continue;
+             const poiId = (p.id || p.poi_id || p.name || "") as string;
+             if (!poiId) continue;
+             if (blockPirateStations && isPirateSystem(info.systemId)) continue;
+             const pResp = await bot.exec("list_station_passengers", { station: poiId });
+             if (pResp.error || !pResp.result) continue;
+             const pData = parseStationPassengers(pResp.result);
+             if (pData && pData.count > 0) {
+               stations.push({
+                 system: info.systemId,
+                 poi: poiId,
+                 poiName: pData.station,
+                 count: pData.count,
+                 hops: info.hops,
+               });
+             }
+           }
+         } catch {
+           // skip system query errors
+         }
+       })()
+     );
+   });
+   await Promise.allSettled(stationPromises);
 
-  if (stations.length === 0) return null;
+   if (stations.length === 0) return null;
 
-  // Pick station with most waiting passengers
-  stations.sort((a, b) => b.count - a.count);
-  return stations[0];
-}
+   // Filter to stations within maxJumps, then sort by count (descending)
+   const validStations = stations.filter(s => s.hops <= maxJumps);
+   if (validStations.length === 0) return null;
+   
+   validStations.sort((a, b) => b.count - a.count || a.hops - b.hops);
+   return { system: validStations[0].system, poi: validStations[0].poi, poiName: validStations[0].poiName, count: validStations[0].count };
+ }
 
 // ── Route planning ───────────────────────────────────────────
 
@@ -495,9 +616,9 @@ function planTourRoute(
   const remaining = [...destinations];
   const planned: typeof destinations = [];
   let cur = currentSystem;
+  let totalJumps = 0;
 
   while (remaining.length > 0) {
-    // Find nearest reachable within maxJumps from current position
     let bestIndex = -1;
     let bestHops = maxJumps + 1;
     for (let i = 0; i < remaining.length; i++) {
@@ -509,11 +630,14 @@ function planTourRoute(
     }
 
     if (bestIndex === -1) {
-      // No more reachable destinations within maxJumps — stop here
       break;
     }
 
     const next = remaining.splice(bestIndex, 1)[0]!;
+    if (totalJumps + bestHops > maxJumps) {
+      break;
+    }
+    totalJumps += bestHops;
     planned.push(next);
     cur = next.system;
   }
@@ -648,7 +772,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
     // ── State machine ────────────────────────────────────────
     if (state.status === "idle") {
       // Need to find passengers and load up
-      const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps);
+      const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
       if (!pickup) {
         ctx.log("transport", "No stations with waiting passengers found nearby. Sleeping 60s.");
         await ctx.sleep(60000);
@@ -744,6 +868,12 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         continue;
       }
 
+      // Collect fuel cells at home base
+      if (pickup.poi === settings.homeStation || pickup.system === settings.homeSystem) {
+        ctx.log("transport", "At home base - collecting fuel cells");
+        await collectFuelCells(ctx, settings);
+      }
+
       // Load passengers
       state.status = "loading";
       saveTransportState(state);
@@ -764,6 +894,11 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       // Group passengers by destination
       const byDest = new Map<string, StationPassenger[]>();
       for (const p of waiting) {
+        // Skip passengers going to pirate stations
+        if (settings.blockPirateStations && isPirateSystem(p.destination)) {
+          ctx.log("transport", `Skipping passenger ${p.name} going to pirate station ${p.destination_name}`);
+          continue;
+        }
         const arr = byDest.get(p.destination) || [];
         arr.push(p);
         byDest.set(p.destination, arr);
@@ -842,7 +977,16 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       let aboard: AboardPassenger[] = [];
       if (!listResp.error && listResp.result) {
         const parsed = parseListPassengers(listResp.result);
-        if (parsed) aboard = parsed.passengers;
+        if (parsed) {
+          aboard = parsed.passengers;
+          ctx.log("transport", `list_passengers returned ${aboard.length} passengers`);
+          if (aboard.length > 0) {
+            ctx.log("transport", `Sample passenger fields: ${Object.keys(aboard[0]).join(", ")}`);
+            ctx.log("transport", `Sample passenger citizen_id: ${aboard[0].citizen_id}`);
+          }
+        }
+      } else {
+        ctx.log("transport", `WARNING: list_passengers failed: ${listResp.error?.message}`);
       }
 
       // Build route from aboard passengers
@@ -882,7 +1026,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
 
       // Build onboard passenger records
       const onboard: TransportPassenger[] = aboard.map(p => ({
-        citizenId: p.citizen_id,
+        citizenId: p.citizen_id || p.name,
         name: p.name,
         accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
         citizenship: p.citizenship,
@@ -931,62 +1075,85 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       ctx.log("transport", `Navigating to waypoint ${state.currentRouteIndex + 1}/${state.route.length}: ${waypoint.poiName} (${waypoint.system})`);
 
       if (waypoint.system !== bot.system) {
+        ctx.log("transport", `Navigating from ${bot.system} to ${waypoint.system}...`);
         const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
+        await bot.refreshStatus();
+        ctx.log("transport", `navigateToSystem result: ${ok}, bot.system: ${bot.system}, bot.poi: ${bot.poi}`);
         if (!ok) {
           ctx.log("error", "Navigation failed — will retry.");
           await ctx.sleep(30000);
           continue;
         }
+      } else {
+        ctx.log("transport", `Already in system ${bot.system}`);
       }
       if (bot.poi !== waypoint.poi) {
-        ctx.log("transport", `Traveling to ${waypoint.poiName}...`);
+        ctx.log("transport", `Traveling to ${waypoint.poiName}... (current poi: ${bot.poi})`);
         const tr = await bot.exec("travel", { target_poi: waypoint.poi });
         if (tr.error) {
           ctx.log("error", `Travel failed: ${tr.error.message}`);
           await ctx.sleep(30000);
           continue;
         }
+        await bot.refreshStatus();
+        ctx.log("transport", `After travel, bot.poi: ${bot.poi}`);
+      } else {
+        ctx.log("transport", `Already at ${waypoint.poi}`);
       }
 
-      const dockOk = await ensureDocked(ctx);
-      if (!dockOk) {
-        ctx.log("error", "Dock failed at destination.");
-        await ctx.sleep(30000);
-        continue;
+      const alreadyDocked = bot.docked && bot.poi === waypoint.poi;
+      ctx.log("transport", `Docking at ${waypoint.poiName}... (alreadyDocked=${alreadyDocked}, poi=${bot.poi}, docked=${bot.docked})`);
+      
+      const creditsBefore = bot.credits || 0;
+      ctx.log("transport", `Credits before docking: ${creditsBefore}`);
+      
+      if (!alreadyDocked) {
+        const dockResp = await bot.exec("dock");
+        if (dockResp.error && !dockResp.error.message.includes("already")) {
+          ctx.log("error", `Dock failed: ${dockResp.error.message}`);
+          await ctx.sleep(30000);
+          continue;
+        }
       }
+
+      await bot.refreshStatus();
+      const creditsAfter = bot.credits || 0;
+      const fareEarned = creditsAfter - creditsBefore;
+      ctx.log("transport", `Credits after docking: ${creditsAfter}, fare earned: ${fareEarned}`);
 
       // Unload passengers for this station
       state.status = "unloading";
       saveTransportState(state);
 
-      // Refresh list_passengers to verify current onboard
-      const checkResp = await bot.exec("list_passengers");
-      let currentAboard: AboardPassenger[] = [];
-      if (!checkResp.error && checkResp.result) {
-        const parsed = parseListPassengers(checkResp.result);
-        if (parsed) currentAboard = parsed.passengers;
-      }
-
-      const boundHere = currentAboard.filter(
-        p => p.destination.toLowerCase() === waypoint.poi.toLowerCase() || p.destination_name.toLowerCase() === waypoint.poiName.toLowerCase(),
+      const boundHere = state.onboardPassengers.filter(
+        p => p.status === "boarded" && (p.destination.toLowerCase() === waypoint.poi.toLowerCase() || p.destinationName.toLowerCase() === waypoint.poiName.toLowerCase()),
       );
 
+      ctx.log("transport", `Found ${boundHere.length} passengers to deliver at ${waypoint.poiName}`);
+
+      // Calculate fare per passenger (distribute evenly if multiple passengers)
+      const farePerPassenger = boundHere.length > 0 ? Math.round(fareEarned / boundHere.length) : 0;
+
       for (const p of boundHere) {
-        const unloadResp = await bot.exec("unload_passenger", { name: p.citizen_id || p.name });
-        if (unloadResp.error) {
-          ctx.log("error", `unload_passenger ${p.name} failed: ${unloadResp.error.message}`);
-          state.onboardPassengers = state.onboardPassengers.map(op =>
-            op.citizenId === p.citizen_id ? { ...op, status: "stranded" as const } : op,
-          );
-        } else {
-          ctx.log("transport", `Delivered ${p.name} to ${waypoint.poiName}. Fare: ${p.fare}cr`);
-          state.revenue += p.fare;
-          state.totalFaresEarned += p.fare;
-          state.onboardPassengers = state.onboardPassengers.map(op =>
-            op.citizenId === p.citizen_id ? { ...op, status: "delivered" as const } : op,
-          );
-        }
-        await ctx.sleep(11000); // mutation cooldown
+        const citizenId = p.citizenId || p.name;
+        ctx.log("transport", `Delivered ${p.name} to ${waypoint.poiName}. Fare: ${farePerPassenger}cr`);
+        state.revenue += farePerPassenger;
+        state.totalFaresEarned += farePerPassenger;
+        state.onboardPassengers = state.onboardPassengers.map(op =>
+          op.citizenId === citizenId ? { ...op, status: "delivered" as const } : op,
+        );
+        civilianStore.addOrUpdate({
+          citizenId,
+          name: p.name,
+          accommodationClass: p.accommodationClass,
+          citizenship: p.citizenship,
+          destination: p.destination,
+          destinationName: p.destinationName,
+          fare: farePerPassenger,
+          bio: p.bio,
+          loadedAt: p.loadedAt,
+          status: "delivered",
+        });
       }
 
       state.currentRouteIndex += 1;
@@ -1008,6 +1175,13 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
 
       if (state.status === "completed") {
         clearTransportState(bot.username);
+        
+        // Collect fuel cells at home base before returning
+        if (settings.homeStation) {
+          await ensureDocked(ctx);
+          await collectFuelCells(ctx, settings);
+        }
+        
         state.status = "idle";
         state.onboardPassengers = [];
         state.route = [];

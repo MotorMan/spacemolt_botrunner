@@ -104,19 +104,31 @@ function parseListPassengers(result: unknown): { passengers: any[]; berths: Reco
 function planTourRoute(
   current: string,
   destinations: Array<{ system: string; poi: string; poiName: string }>,
+  maxJumps: number,
 ): Array<{ system: string; poi: string; poiName: string }> {
   if (destinations.length <= 1) return destinations;
+
   const remaining = destinations.slice();
   const planned: typeof destinations = [];
   let cur = current;
+  let totalJumps = 0;
+
   while (remaining.length > 0) {
-    remaining.sort((a, b) => {
-      // Mock hops: same system = 0, different = 1
-      const ha = a.system.toLowerCase() === cur.toLowerCase() ? 0 : 1;
-      const hb = b.system.toLowerCase() === cur.toLowerCase() ? 0 : 1;
-      return ha - hb;
-    });
-    const next = remaining.shift()!;
+    let bestIndex = -1;
+    let bestHops = maxJumps + 1;
+    for (let i = 0; i < remaining.length; i++) {
+      const ha = remaining[i].system.toLowerCase() === cur.toLowerCase() ? 0 : 1;
+      if (ha <= maxJumps && ha < bestHops) {
+        bestHops = ha;
+        bestIndex = i;
+      }
+    }
+
+    if (bestIndex === -1) break;
+
+    const next = remaining.splice(bestIndex, 1)[0]!;
+    if (totalJumps + bestHops > maxJumps) break;
+    totalJumps += bestHops;
     planned.push(next);
     cur = next.system;
   }
@@ -277,11 +289,11 @@ describe('parseListPassengers', () => {
 describe('planTourRoute', () => {
   it('returns single-element array as-is', () => {
     const dests = [{ system: 'sol', poi: 'sol_central', poiName: 'Sol Central' }];
-    expect(planTourRoute('sol', dests)).toEqual(dests);
+    expect(planTourRoute('sol', dests, 5)).toEqual(dests);
   });
 
   it('returns empty array for empty input', () => {
-    expect(planTourRoute('sol', [])).toEqual([]);
+    expect(planTourRoute('sol', [], 5)).toEqual([]);
   });
 
   it('plans a nearest-first tour by closest system', () => {
@@ -290,8 +302,7 @@ describe('planTourRoute', () => {
       { system: 'procyon', poi: 'procyon_station', poiName: 'Procyon Station' },
       { system: 'sol', poi: 'sol_central', poiName: 'Sol Central' },
     ];
-    // With mocked same-system priority, from 'sol' the nearest is 'sol' first, then the rest
-    const planned = planTourRoute('sol', dests);
+    const planned = planTourRoute('sol', dests, 5);
     expect(planned).toHaveLength(3);
     expect(planned[0].system.toLowerCase()).toBe('sol');
   });
@@ -302,8 +313,17 @@ describe('planTourRoute', () => {
       { system: 'procyon', poi: 'procyon_station', poiName: 'Procyon Station' },
     ];
     const original = JSON.stringify(dests);
-    planTourRoute('sol', dests);
+    planTourRoute('sol', dests, 5);
     expect(JSON.stringify(dests)).toBe(original);
+  });
+
+  it('respects maxJumps limit for total route', () => {
+    const dests = [
+      { system: 'alpha_centauri', poi: 'alpha_station', poiName: 'Alpha Station' },
+      { system: 'procyon', poi: 'procyon_station', poiName: 'Procyon Station' },
+    ];
+    const planned = planTourRoute('sol', dests, 1);
+    expect(planned).toHaveLength(1);
   });
 });
 

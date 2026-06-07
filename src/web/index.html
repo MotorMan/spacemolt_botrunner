@@ -364,7 +364,8 @@
         <div class="sidebar-item" onclick="switchSettingsTab('fleet_hunter')">Fleet Hunter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cargo_mover')">CargoMover</div>
          <div class="sidebar-item" onclick="switchSettingsTab('fuel_transport')">Fuel Transport</div>
-         <div class="sidebar-item" onclick="switchSettingsTab('civilian_transport')">Civilian Transport</div>
+          <div class="sidebar-item" onclick="switchSettingsTab('civilian_transport')">Civilian Transport</div>
+         <div class="sidebar-item" onclick="switchSettingsTab('module_seller')">Module Seller</div>
       </div>
       <div class="settings-panel" id="settingsContent">
         <!-- filled by JS -->
@@ -7564,6 +7565,8 @@ function renderSettingsPanel() {
     renderFuelTransportSettings(panel);
   } else if (activeSettingsTab === 'civilian_transport') {
     renderCivilianTransportSettings(panel);
+  } else if (activeSettingsTab === 'module_seller') {
+    renderModuleSellerSettings(panel);
   }
 }
 
@@ -19353,6 +19356,13 @@ async function renderCivilianTransportSettings(panel) {
     </div>
 
     <div style="margin-top:18px">
+      <label>
+        <input type="checkbox" id="set-civilian_transport-blockPirateStations" ${ct.blockPirateStations !== false ? 'checked' : ''}>
+        Block pirate stations (recommended)
+      </label>
+    </div>
+
+    <div style="margin-top:18px">
       <button class="primary" onclick="saveCivilianTransportSettings()">Save Settings</button>
     </div>
   `;
@@ -19367,6 +19377,7 @@ function saveCivilianTransportSettings() {
   const maxEconomy = Number(document.getElementById('set-civilian_transport-maxEconomy')?.value || 0);
   const maxBusiness = Number(document.getElementById('set-civilian_transport-maxBusiness')?.value || 0);
   const maxFirst = Number(document.getElementById('set-civilian_transport-maxFirst')?.value || 0);
+  const blockPirateStations = document.getElementById('set-civilian_transport-blockPirateStations')?.checked ?? true;
 
   const s = {};
   if (homeStation && homeStation.includes('|')) {
@@ -19382,6 +19393,7 @@ function saveCivilianTransportSettings() {
   s.maxEconomy = maxEconomy;
   s.maxBusiness = maxBusiness;
   s.maxFirst = maxFirst;
+  s.blockPirateStations = blockPirateStations;
 
   send({ type: 'saveSettings', routine: 'civilian_transport', settings: s });
   alert('Civilian Transport settings saved');

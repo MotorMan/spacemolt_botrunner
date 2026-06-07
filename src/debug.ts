@@ -8,7 +8,7 @@ const GLOBAL_LOG_FILE = join(LOGS_DIR, "debug.log");
 const OLD_LOGS_DIR = join(process.cwd(), "old-logs");
 const OLD_ACTIVITY_LOGS_DIR = join(OLD_LOGS_DIR, "activity");
 
-const LOG_ROTATION_SIZE = 200 * 1024 * 1024;
+const LOG_ROTATION_SIZE = 50 * 1024 * 1024;  //changed to 50kb, since 200kb seems still too big and slows startup.
 
 // Ensure directories exist once at module load
 if (!existsSync(DATA_DIR)) {

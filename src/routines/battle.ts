@@ -709,6 +709,11 @@ export async function fightFreshBattle(
     ctx.log("combat", `Advancing to zone ${zone + 1}/3...`);
     const advResp = await bot.exec("battle", { action: "advance" });
     if (advResp.error) {
+      const errMsg = advResp.error.message.toLowerCase();
+      if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+        ctx.log("combat", `✅ Battle ended during advance - victory!`);
+        return true;
+      }
       ctx.log("error", `Advance failed: ${advResp.error.message}`);
       break;
     }
@@ -1049,10 +1054,26 @@ export async function fightJoinedBattle(
     // Advance to engaged if enemy is in inner/mid and we're not there yet
     if (enemyZoneNum >= 1 && ourZoneNum < 3) {
       ctx.log("combat", `⚔️ Advancing to engaged (enemy in ${enemyZone})`);
-      await bot.exec("battle", { action: "advance" });
+      const advResp = await bot.exec("battle", { action: "advance" });
+      if (advResp.error) {
+        const errMsg = advResp.error.message.toLowerCase();
+        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+          ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+          return true;
+        }
+        ctx.log("error", `Advance failed: ${advResp.error.message}`);
+      }
       await ctx.sleep(10000);
     } else {
-      await bot.exec("battle", { action: "stance", stance: "fire" });
+      const stanceResp = await bot.exec("battle", { action: "stance", stance: "fire" });
+      if (stanceResp.error) {
+        const errMsg = stanceResp.error.message.toLowerCase();
+        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+          ctx.log("combat", `✅ Battle ended (stance failed: not in battle) - victory!`);
+          return true;
+        }
+        ctx.log("error", `Stance failed: ${stanceResp.error.message}`);
+      }
       await ctx.sleep(10000);
     }
   }

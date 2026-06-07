@@ -803,16 +803,40 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
     // ── State machine ────────────────────────────────────────
     if (state.status === "idle") {
       // Need to find passengers and load up
-      const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
-      if (!pickup) {
-        ctx.log("transport", "No stations with waiting passengers found nearby. Sleeping 60s.");
-        await ctx.sleep(60000);
-        continue;
+      // If already docked at a station, check for passengers to loaf
+      if (bot.docked && bot.poi && bot.system) {
+        const resp = await bot.exec("list_station_passengers");
+        if (!resp.error && resp.result) {
+          const data = parseStationPassengers(resp.result);
+          if (data && data.count > 0) {
+            // Passengers available at current station - proceed with loading
+            ctx.log("transport", `Found ${data.count} passengers at current station ${bot.poi}`);
+            // Set pickup to current station so we can proceed
+            state.pickupStation = bot.poi;
+            state.pickupSystem = bot.system;
+          } else {
+            // No passengers at current station - loaf here and wait
+            ctx.log("transport", `No passengers at current station ${bot.poi} — loafing and waiting`);
+            await ctx.sleep(60000);
+            continue;
+          }
+        } else {
+          ctx.log("transport", "Could not list station passengers — sleeping 60s");
+          await ctx.sleep(60000);
+          continue;
+        }
+      } else {
+        const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
+        if (!pickup) {
+          ctx.log("transport", "No stations with waiting passengers found nearby. Sleeping 60s.");
+          await ctx.sleep(60000);
+          continue;
+        }
+        state.pickupStation = pickup.poi;
+        state.pickupSystem = pickup.system;
       }
 
-      state.pickupStation = pickup.poi;
-      state.pickupSystem = pickup.system;
-      state.status = "traveling_to_ship";
+      state.status = "loading";
       saveTransportState(state);
 
       // Check if we need to switch to the best passenger ship first
@@ -866,11 +890,18 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       }
 
       // Travel to pickup station and dock
-      ctx.log("transport", `Traveling to pickup station: ${pickup.poiName} (${pickup.system})...`);
+      if (!state.pickupStation || !state.pickupSystem) {
+        ctx.log("error", "Pickup station not set — cannot proceed");
+        state.status = "idle";
+        saveTransportState(state);
+        await ctx.sleep(30000);
+        continue;
+      }
+      ctx.log("transport", `Traveling to pickup station: ${state.pickupStation} (${state.pickupSystem})...`);
       state.status = "traveling_to_ship";
       saveTransportState(state);
-      if (pickup.system !== bot.system) {
-        const ok = await navigateToSystem(ctx, pickup.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
+      if (state.pickupSystem !== bot.system) {
+        const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
         if (!ok) {
           ctx.log("error", "Failed to reach pickup system. Will retry.");
           state.status = "idle";
@@ -879,9 +910,9 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           continue;
         }
       }
-      if (bot.poi !== pickup.poi) {
-        ctx.log("transport", `Traveling to ${pickup.poiName}...`);
-        const tr = await bot.exec("travel", { target_poi: pickup.poi });
+      if (bot.poi !== state.pickupStation) {
+        ctx.log("transport", `Traveling to ${state.pickupStation}...`);
+        const tr = await bot.exec("travel", { target_poi: state.pickupStation });
         if (tr.error) {
           ctx.log("error", `Travel to pickup failed: ${tr.error.message}`);
           state.status = "idle";
@@ -900,7 +931,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       }
 
       // Collect fuel cells at home base
-      if (pickup.poi === settings.homeStation || pickup.system === settings.homeSystem) {
+      if (state.pickupStation === settings.homeStation || state.pickupSystem === settings.homeSystem) {
         ctx.log("transport", "At home base - collecting fuel cells");
         await collectFuelCells(ctx, settings, true);
       }

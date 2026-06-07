@@ -768,6 +768,9 @@ export async function fightFreshBattle(
         target = better;
         await bot.exec("battle", { action: "target", target_id: better.id });
         await ctx.sleep(300);
+      } else if (!better) {
+        ctx.log("combat", `✅ No valid targets remaining — battle complete (${tickCount} ticks, victory!)`);
+        return true;
       }
     }
 
@@ -963,6 +966,9 @@ export async function fightJoinedBattle(
           await emergencyFleeSpam(ctx, `target switched to player`);
           return false;
         }
+      } else if (!better) {
+        ctx.log("combat", `✅ No valid targets remaining — battle complete (${tickCount} ticks)!`);
+        return true;
       }
     }
 

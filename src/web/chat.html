@@ -106,13 +106,13 @@
 
     async function loadBots() {
       try {
-        const res = await fetch(`${API_BASE}/api/bots`);
+        const res = await fetch(`${API_BASE}/api/chat-bots`);
         if (!res.ok) {
-          console.error(`[Chat] /api/bots failed: ${res.status} ${res.statusText}`);
+          console.error(`[Chat] /api/chat-bots failed: ${res.status} ${res.statusText}`);
           throw new Error(`HTTP ${res.status}`);
         }
         const data = await res.json();
-        console.log(`[Chat] /api/bots response:`, data);
+        console.log(`[Chat] /api/chat-bots response:`, data);
         botSelect.innerHTML = "";
 
         if (!data.bots || data.bots.length === 0) {

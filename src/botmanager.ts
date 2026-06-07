@@ -738,6 +738,10 @@ async function main(): Promise<void> {
     (globalThis as any).shutdownServer("web-ui");
   };
 
+  server.logSystem("SpaceMolt Bot Manager v0.2");
+  server.logSystem("Loading saved sessions...");
+  discoverBots();
+
   const chatPort = parseInt(process.env.CHAT_PORT || String(Number(settings.general?.port || 3000) + 1000), 10);
   chatServer = new ChatWebServer(chatPort);
   chatServer.start();
@@ -803,11 +807,6 @@ async function main(): Promise<void> {
     (globalThis as any).shutdownServer("mass_session_loss", true);
   });
   server.logSystem("Mass disconnect detector initialized");
-
-  server.logSystem("SpaceMolt Bot Manager v0.2");
-  server.logSystem("Loading saved sessions...");
-
-  discoverBots();
 
   // Seed galaxy map from public API so pathfinding works from first run
   server.logSystem("Seeding galaxy map from /api/map...");

@@ -19,7 +19,8 @@ import { returnHomeRoutine } from "./routines/return_home.js";
 import { commandReceiverRoutine } from "./routines/command_receiver.js";
 import { fleetHunterCommanderRoutine } from "./routines/fleet_hunter_commander.js";
 import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordinate.js";
-import { escortRoutine } from "./routines/escort.js";
+import { escortRoutine } from "./routines/escort-fleet.js";
+import { escortFlockRoutine } from "./routines/escort-flock.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
 import { fuelTransportRoutine } from "./routines/fuelTransfer.js";
 import { civilianTransportRoutine } from "./routines/civilianTransport.js";
@@ -121,7 +122,8 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },
   return_home: { name: "ReturnHome", fn: returnHomeRoutine },
   command_receiver: { name: "CommandReceiver", fn: commandReceiverRoutine },
-  escort: { name: "Escort", fn: escortRoutine },
+  escort: { name: "Escort (Fleet)", fn: escortRoutine },
+  escort_flock: { name: "Escort (Flock)", fn: escortFlockRoutine },
   pathfinder_test: { name: "PathfinderTest", fn: pathfinderTestRoutine },
   civilian_transport: { name: "CivilianTransport", fn: civilianTransportRoutine },
   module_seller: { name: "ModuleSeller", fn: moduleSellerRoutine },

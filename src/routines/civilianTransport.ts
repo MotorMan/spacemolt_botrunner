@@ -33,9 +33,34 @@ interface RouteResult {
 }
 
 async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: string, destinationName: string, destinationSystem?: string): Promise<RouteResult | null> {
+  const tryResolve = async (targetId: string, systemHint?: string): Promise<RouteResult | null> => {
+    const params: Record<string, unknown> = { target: targetId };
+    if (systemHint) {
+      params.target_system = systemHint;
+    }
+    const routeResp = await bot.exec("find_route", params);
+    if (routeResp.error || !routeResp.result) {
+      return null;
+    }
+    const result = routeResp.result as Record<string, unknown>;
+    if (!result.found) {
+      return null;
+    }
+    return {
+      system: (result.target_system as string) || "",
+      poi: (result.target_poi as string) || targetId,
+      poiName: (result.target_poi_name as string) || destinationName,
+      origDest: targetId,
+    };
+  };
+
   if (destinationSystem) {
     const allSystems = mapStore.getAllSystems();
-    const sysData = allSystems[destinationSystem];
+    let sysData = allSystems[destinationSystem];
+    if (!sysData) {
+      const lowerKey = Object.keys(allSystems).find(k => k.toLowerCase() === destinationSystem.toLowerCase());
+      if (lowerKey) sysData = allSystems[lowerKey];
+    }
     if (sysData) {
       const found = sysData.pois.find(
         pp => pp.id === destinationId || pp.name.toLowerCase() === destinationName.toLowerCase(),
@@ -44,6 +69,8 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
         return { system: sysData.id, poi: found.id, poiName: found.name, origDest: destinationId };
       }
     }
+    const resolved = await tryResolve(destinationId, destinationSystem);
+    if (resolved) return resolved;
   }
 
   const allSystems = mapStore.getAllSystems();
@@ -56,20 +83,13 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
     }
   }
 
-  const routeResp = await bot.exec("find_route", { target: destinationId });
-  if (routeResp.error || !routeResp.result) {
-    return null;
-  }
-  const result = routeResp.result as Record<string, unknown>;
-  if (!result.found) {
-    return null;
-  }
-  return {
-    system: (result.target_system as string) || "",
-    poi: (result.target_poi as string) || destinationId,
-    poiName: (result.target_poi_name as string) || destinationName,
-    origDest: destinationId,
-  };
+  let resolved = await tryResolve(destinationId);
+  if (resolved) return resolved;
+
+  resolved = await tryResolve(destinationName);
+  if (resolved) return resolved;
+
+  return null;
 }
 
 interface CatalogShip {
@@ -134,6 +154,7 @@ interface TransportState {
   totalFaresEarned: number;
   currentDestination: string | null;
   lastUpdated: string;
+  routeRebuildAttempts: number;
 }
 
 interface FleetShip {
@@ -838,6 +859,7 @@ function makeNewState(bot: Bot, shipId: string, shipName: string, customName: st
     totalFaresEarned: 0,
     currentDestination: null,
     lastUpdated: new Date().toISOString(),
+    routeRebuildAttempts: 0,
   };
 }
 
@@ -927,7 +949,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           }
           destMap.set(p.destination, { system: sys, poi, poiName: p.destination_name, count: 1 });
         }
-        const routeDests = Array.from(destMap.values()).filter(d => d.system);
+const routeDests = Array.from(destMap.values()).filter(d => d.system);
         const planned = planTourRoute(bot.system || "", routeDests, 6);
         state.onboardPassengers = vParsed!.passengers.map(p => ({
           citizenId: p.citizen_id || p.name,
@@ -949,9 +971,8 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
         if (planned.length === 0 && vParsed!.passengers.length > 0) {
           ctx.log("transport", `Warning: ${vParsed!.passengers.length} passengers aboard but no valid route — staying in_transit to attempt recovery.`);
-        } else {
-          state.status = "in_transit";
         }
+        state.status = "in_transit";
         const recoveredBerths = vParsed!.berths;
         const recoveredBerthsUsed = vParsed!.berths_used;
         const hasRecoveredBerths = (recoveredBerths.economy + recoveredBerths.business + recoveredBerths.first) > 0;
@@ -961,72 +982,6 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         }
         saveTransportState(state);
         ctx.log("transport", `Rebuilt route from ${verifiedCount} passengers: ${planned.map(d => d.poiName).join(" → ")}`);
-      }
-    }
-  }
-
-  if (!state || state.status === "idle") {
-    ctx.log("transport", "State is missing or idle — checking for already-loaded passengers to recover route.");
-    const listResp = await bot.exec("list_passengers");
-    if (listResp.error || !listResp.result) {
-      ctx.log("transport", `list_passengers failed during recovery: ${listResp.error?.message || "no result"}`);
-    } else {
-      const parsed = parseListPassengers(listResp.result);
-      if (parsed && parsed.passengers.length > 0) {
-        const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
-        const mcLocation = mapStore.getMobileCapitolLocation();
-        for (const p of parsed.passengers) {
-          const existing = destMap.get(p.destination);
-          if (existing) {
-            existing.count++;
-            continue;
-          }
-          const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
-          let sys = resolved?.system || "";
-          let poi = resolved?.poi || p.destination;
-          if (!sys && mcLocation && (p.destination.toLowerCase() === "frontier_station" || p.destination_name.toLowerCase() === "frontier station")) {
-            sys = mcLocation.systemId;
-            poi = mcLocation.poiId;
-          }
-          destMap.set(p.destination, { system: sys, poi, poiName: p.destination_name, count: 1 });
-        }
-        const routeDests = Array.from(destMap.values()).filter(d => d.system);
-        const planned = planTourRoute(bot.system || "", routeDests, 6);
-        state.onboardPassengers = parsed.passengers.map(p => ({
-          citizenId: p.citizen_id || p.name,
-          name: p.name,
-          accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
-          citizenship: p.citizenship,
-          destination: p.destination,
-          destinationName: p.destination_name,
-          destinationSystem: p.destination_system,
-          fare: p.fare,
-          bio: p.bio,
-          routeData: p.route_data || null,
-          loadedAt: new Date().toISOString(),
-          status: "boarded",
-          ticksRemaining: p.ticks_remaining,
-        }));
-        state.route = planned;
-        state.currentRouteIndex = 0;
-        state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
-        if (planned.length === 0 && parsed.passengers.length > 0) {
-          ctx.log("transport", `Warning: ${parsed.passengers.length} passengers aboard but no valid route — staying in_transit to attempt recovery.`);
-        } else {
-          state.status = "in_transit";
-        }
-        const stateParsed = parsed;
-        const recoveredBerths = stateParsed.berths;
-        const recoveredBerthsUsed = stateParsed.berths_used;
-        const hasRecoveredBerths = (recoveredBerths.economy + recoveredBerths.business + recoveredBerths.first) > 0;
-        if (hasRecoveredBerths) {
-          state.berths = recoveredBerths;
-          state.berths_used = recoveredBerthsUsed;
-        }
-        saveTransportState(state);
-        ctx.log("transport", `Recovered ${parsed.passengers.length} passengers. Route: ${planned.map(d => d.poiName).join(" → ")}`);
-      } else {
-        ctx.log("transport", "No passengers aboard — staying idle.");
       }
     }
   }
@@ -1627,6 +1582,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       state.currentRouteIndex = 0;
       state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
       state.status = onboard.length > 0 ? "in_transit" : "idle";
+      state.routeRebuildAttempts = 0;
       const listParsed = listResp.result ? parseListPassengers(listResp.result) : null;
       state.berths = listParsed && (listParsed.berths.economy + listParsed.berths.business + listParsed.berths.first) > 0
         ? listParsed.berths
@@ -1690,7 +1646,18 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
     if (state.status === "in_transit" || state.status === "traveling_to_ship") {
       if (state.route.length === 0 || state.currentRouteIndex >= state.route.length) {
         if (state.onboardPassengers.length > 0) {
-          ctx.log("transport", `Route exhausted but ${state.onboardPassengers.length} passenger(s) remain — checking for new route...`);
+          const retryCount = (state.routeRebuildAttempts || 0) + 1;
+          if (retryCount > 3) {
+            ctx.log("transport", `Route rebuild failed ${retryCount} times — marking passengers as stranded and returning to idle.`);
+            state.onboardPassengers = state.onboardPassengers.map(p => ({ ...p, status: "stranded" }));
+            state.status = "idle";
+            state.routeRebuildAttempts = 0;
+            saveTransportState(state);
+            await ctx.sleep(60000);
+            continue;
+          }
+          state.routeRebuildAttempts = retryCount;
+          ctx.log("transport", `Route exhausted but ${state.onboardPassengers.length} passenger(s) remain — checking for new route... (attempt ${retryCount}/3)`);
           const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
           for (const p of state.onboardPassengers) {
             const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
@@ -1708,15 +1675,19 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
               state.currentRouteIndex = 0;
               state.currentDestination = newRoute[0].poiName;
               state.status = "in_transit";
+              state.routeRebuildAttempts = 0;
               ctx.log("transport", `Rebuilt route with ${validDests.length} destination(s): ${newRoute.map(d => d.poiName).join(" → ")}`);
               saveTransportState(state);
               continue;
             }
           }
-          ctx.log("transport", "Cannot find route for remaining passengers — marking as stranded and returning to idle.");
-          state.onboardPassengers = state.onboardPassengers.map(p => ({ ...p, status: "stranded" }));
+          ctx.log("transport", "Cannot find route for remaining passengers — will retry...");
+          saveTransportState(state);
+          await ctx.sleep(30000);
+          continue;
         }
         state.status = "idle";
+        state.routeRebuildAttempts = 0;
         saveTransportState(state);
         continue;
       }

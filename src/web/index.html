@@ -2466,9 +2466,9 @@ function renderProfileTopbar() {
       </label>`;
   }
 
-  // Per-bot miner to follow (for escort routine)
-  const isEscort = (bot.state === 'running' && bot.routine === 'escort')
-    || (bot.state !== 'running' && bot.state !== 'stopping' && getProfileSelectedRoutine() === 'escort');
+  // Per-bot miner to follow (for escort and escort_flock routines)
+  const isEscort = (bot.state === 'running' && (bot.routine === 'escort' || bot.routine === 'escort_flock'))
+    || (bot.state !== 'running' && bot.state !== 'stopping' && (getProfileSelectedRoutine() === 'escort' || getProfileSelectedRoutine() === 'escort_flock'));
   if (isEscort) {
     const botSettings = settings[bot.username] || {};
     const globalMiner = (settings.escort || {}).minerName || '';

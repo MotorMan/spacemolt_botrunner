@@ -370,24 +370,45 @@ function parseListPassengers(result: unknown): ListPassengersResponse | null {
   let inner = r.structuredContent && typeof r.structuredContent === "object"
     ? r.structuredContent as Record<string, unknown>
     : r;
-  const passengers = Array.isArray(inner.passengers) ? inner.passengers as AboardPassenger[] : [];
-  const num = (v: unknown): number | undefined => (typeof v === "number" ? v : undefined);
+  
+  let passengers: AboardPassenger[] = [];
+  const passengerSources = [inner.passengers, r.passengers, inner.passenger_list, r.passenger_list];
+  for (const source of passengerSources) {
+    if (Array.isArray(source)) {
+      passengers = source as AboardPassenger[];
+      break;
+    }
+  }
+  
+  if (passengers.length === 0 && typeof inner.passengers === "object" && inner.passengers !== null) {
+    const p = inner.passengers as Record<string, unknown>;
+    if (Array.isArray(p.data)) passengers = p.data as AboardPassenger[];
+    else if (Array.isArray(p.items)) passengers = p.items as AboardPassenger[];
+  }
+  
+  const num = (v: unknown): number | undefined => {
+    if (typeof v === "number") return v;
+    if (typeof v === "string") {
+      const match = v.match(/(\d+)/);
+      return match ? parseInt(match[1], 10) : undefined;
+    }
+    return undefined;
+  };
   const berthsRaw = inner.berths && typeof inner.berths === "object" ? (inner.berths as Record<string, unknown>) : null;
   const berthsUsedRaw = inner.berths_used && typeof inner.berths_used === "object" ? (inner.berths_used as Record<string, unknown>) : null;
   const hasBerths = berthsRaw && (num(berthsRaw.economy) || num(berthsRaw.business) || num(berthsRaw.first));
+  const economy = hasBerths
+    ? num(berthsRaw!.economy) ?? 0
+    : (num(inner.economy_berths) ?? num(inner.economyBerths) ?? num(inner.economy) ?? 0);
+  const business = hasBerths
+    ? num(berthsRaw!.business) ?? 0
+    : (num(inner.business_berths) ?? num(inner.businessBerths) ?? num(inner.business) ?? 0);
+  const first = hasBerths
+    ? num(berthsRaw!.first) ?? 0
+    : (num(inner.first_berths) ?? num(inner.firstBerths) ?? num(inner.first) ?? 0);
   return {
     passengers,
-    berths: hasBerths
-      ? {
-          economy: num(berthsRaw!.economy) ?? 0,
-          business: num(berthsRaw!.business) ?? 0,
-          first: num(berthsRaw!.first) ?? 0,
-        }
-      : {
-          economy: num(inner.economy_berths) ?? 0,
-          business: num(inner.business_berths) ?? 0,
-          first: num(inner.first_berths) ?? 0,
-        },
+    berths: { economy, business, first },
     berths_used: {
       economy: num(berthsUsedRaw?.economy) ?? 0,
       business: num(berthsUsedRaw?.business) ?? 0,
@@ -445,21 +466,20 @@ function parseListShips(result: unknown): FleetShip[] {
         first: directBerths.first || 0,
       };
     } else {
-      const classId = ((s.class_id || (s.class as Record<string, unknown>)?.id || s.type || "") as string);
+      const classId = ((s.class_id || (s.class as Record<string, unknown>)?.id || s.ship_type || s.type || "") as string);
       const classData = catalog[classId];
       const caps = classData?.inherent_capabilities;
       const fromCaps = extractBerthsFromCapabilities(caps);
       if (fromCaps) {
         berths = fromCaps;
-      } else if (s.modules) {
-        berths = countPassengerModules(s.modules);
       }
     }
     
+    const typeId = (s.class_id || (s.class as Record<string, unknown>)?.id || s.ship_type || s.type || "") as string;
     return {
       shipId: (s.ship_id || s.id || "") as string,
       shipName: (s.name || s.ship_name || s.class_name || "") as string,
-      type: (s.type || s.ship_type || s.class_id || "") as string,
+      type: typeId,
       tier: (s.tier as number) ?? null,
       berths,
       storedAtStationId: (s.stored_at_station_id || s.station_id || s.current_station || s.location_base_id || "") as string,
@@ -507,23 +527,32 @@ async function refreshFleetCache(ctx: RoutineContext): Promise<FleetShip[]> {
     ctx.log("transport", "list_ships failed — using cached fleet data");
     return loadFleetData(bot.username);
   }
+  ctx.log("transport", `list_ships response keys: ${Object.keys(resp.result).join(", ")}`);
   let ships = parseListShips(resp.result);
+  ctx.log("transport", `parseListShips: ${ships.length} ships parsed`);
   
   const shipsNeedingDetails = ships.filter(s => totalBerths(s.berths) === 0);
   if (shipsNeedingDetails.length > 0) {
     ctx.log("transport", `Fetching details for ${shipsNeedingDetails.length} ship(s) without berth info...`);
     const catalog = loadCatalog();
+    ctx.log("transport", `Catalog has ${Object.keys(catalog).length} ship entries`);
     for (const ship of shipsNeedingDetails) {
-      const classData = catalog[ship.type];
+      const classId = ship.type;
+      ctx.log("transport", `  Ship ${ship.shipId}: type=${classId}, berths=${ship.berths.economy}e/${ship.berths.business}b/${ship.berths.first}f`);
+      const classData = catalog[classId];
       if (classData) {
+        ctx.log("transport", `    Found in catalog: ${classData.name || classId}`);
         const caps = classData.inherent_capabilities;
         const fromCaps = extractBerthsFromCapabilities(caps);
         if (fromCaps) {
           ship.berths = fromCaps;
+          ctx.log("transport", `    Berths from capabilities: ${fromCaps.economy}e/${fromCaps.business}b/${fromCaps.first}f`);
         }
         if (totalBerths(ship.berths) === 0 && classData.special === "passenger_liner") {
           ship.berths = { economy: 1, business: 0, first: 0 };
         }
+      } else {
+        ctx.log("transport", `    NOT in catalog`);
       }
       
       if (totalBerths(ship.berths) === 0) {
@@ -536,29 +565,37 @@ async function refreshFleetCache(ctx: RoutineContext): Promise<FleetShip[]> {
           ctx.log("transport", `get_ship returned no result for ${ship.shipId}`);
           continue;
         }
-        const detail = detailResp.result as Record<string, unknown> & { ship?: Record<string, unknown>; class?: { special?: string; inherent_capabilities?: unknown } };
-        const shipData = detail.ship || detail;
+        const detail = detailResp.result as Record<string, unknown>;
+        ctx.log("transport", `get_ship keys for ${ship.shipId}: ${Object.keys(detail).join(", ")}`);
+        const shipData = (detail.ship as Record<string, unknown>) || detail;
+        const cls = (detail.class as Record<string, unknown>) || (shipData.class as Record<string, unknown>);
+        
         ship.shipId = (shipData.id || ship.shipId) as string;
-        ship.shipName = (detail.name || shipData.name || ship.shipName) as string;
-        ship.type = (shipData.ship_type || shipData.type || ship.type) as string;
+        ship.shipName = (shipData.name || ship.shipName) as string;
+        ship.type = (shipData.class_id || shipData.type || ship.type) as string;
         ship.tier = (shipData.tier as number) ?? ship.tier;
         ship.cargoCapacity = (shipData.cargo_capacity || shipData.max_cargo || ship.cargoCapacity) as number;
         ship.cargoUsed = (shipData.cargo_used || ship.cargoUsed) as number;
         ship.hasShipyard = (shipData.has_shipyard as boolean) ?? ship.hasShipyard;
         
-        const caps = ((detail.class as Record<string, unknown>)?.inherent_capabilities as unknown) || ((shipData.class as Record<string, unknown>)?.inherent_capabilities as unknown);
+        const caps = (cls?.inherent_capabilities as unknown);
         const fromCaps = extractBerthsFromCapabilities(caps);
         if (fromCaps) {
           ship.berths = fromCaps;
-        } else if (detail.modules || shipData.modules) {
-          const fromMods = countPassengerModules(detail.modules || shipData.modules);
+        }
+        
+        const modules = (detail.modules as unknown[]) || [];
+        ctx.log("transport", `modules for ${ship.shipId}: ${modules.length} items`);
+        if (totalBerths(ship.berths) === 0 && Array.isArray(modules) && modules.length > 0) {
+          const fromMods = countPassengerModules(modules);
           if (totalBerths(fromMods) > 0) {
             ship.berths = fromMods;
           }
         }
-        if (totalBerths(ship.berths) === 0 && detail.class?.special === "passenger_liner") {
+        if (totalBerths(ship.berths) === 0 && (cls?.special as string) === "passenger_liner") {
           ship.berths = { economy: 1, business: 0, first: 0 };
         }
+        ctx.log("transport", `get_ship for ${ship.shipId}: type=${ship.type}, berths=${ship.berths.economy}e/${ship.berths.business}b/${ship.berths.first}f`);
       }
     }
   }
@@ -1180,8 +1217,11 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       const preListResp = await bot.exec("list_passengers");
       let preListParsed: ListPassengersResponse | null = null;
       if (!preListResp.error && preListResp.result) {
+        ctx.log("transport", `list_passengers raw: ${JSON.stringify(preListResp.result).slice(0, 500)}`);
         preListParsed = parseListPassengers(preListResp.result);
-        ctx.log("transport", `Raw list_passengers result keys: ${Object.keys(preListResp.result).join(", ")} berths=${JSON.stringify((preListResp.result as any).berths)} berths_used=${JSON.stringify((preListResp.result as any).berths_used)}`);
+        if (preListParsed) {
+          ctx.log("transport", `list_passengers parsed: berths=${preListParsed.berths.economy}e/${preListParsed.berths.business}b/${preListParsed.berths.first}f, passengers=${preListParsed.passengers.length}`);
+        }
       } else if (preListResp.error) {
         ctx.log("transport", `Pre-load list_passengers error: ${preListResp.error?.message}`);
       }
@@ -1207,6 +1247,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       const stationResp = await bot.exec("list_station_passengers");
       let waiting: StationPassenger[] = [];
       if (!stationResp.error && stationResp.result) {
+        ctx.log("transport", `list_station_passengers response keys: ${Object.keys(stationResp.result).join(", ")}`);
         const parsed = parseStationPassengers(stationResp.result);
         if (parsed) waiting = parsed.waiting;
       }
@@ -1732,6 +1773,14 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           }).catch((err: Error) => {
             ctx.log("error", `Transport cycle_complete announcement error: ${err.message}`);
           });
+        }
+        
+        if (bot.shouldStopAfterCycle()) {
+          ctx.log("transport", "Stop after cycle flag set — completing current cycle and stopping");
+          bot.clearStopAfterCycle();
+          bot.initiateStop();
+          await ctx.sleep(5000);
+          return;
         }
         
         await ctx.sleep(15000);

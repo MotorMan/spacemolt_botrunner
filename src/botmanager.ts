@@ -182,6 +182,8 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleStart(action);
     case "stop":
       return handleStop(action);
+    case "stop_after_cycle":
+      return handleStopAfterCycle(action);
     case "add":
       return handleAdd(action);
     case "register":
@@ -425,6 +427,19 @@ async function handleStop(action: WebAction): Promise<WebActionResult> {
   server.clearBotAssignment(botName);
   server.logSystem(`Stop signal sent to ${bot.username}`);
   return { ok: true, message: `Stop signal sent to ${botName}` };
+}
+
+async function handleStopAfterCycle(action: WebAction): Promise<WebActionResult> {
+  const botName = action.bot;
+  if (!botName) return { ok: false, error: "No bot specified" };
+
+  const bot = bots.get(botName);
+  if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
+  if (bot.state !== "running") return { ok: false, error: `${botName} is not running` };
+
+  bot.stopAfterCycle();
+  server.logSystem(`Stop after cycle requested for ${bot.username}`);
+  return { ok: true, message: `Stop after cycle requested for ${botName} — will stop after current transport cycle` };
 }
 
 async function handleEmergencyReturn(): Promise<WebActionResult> {

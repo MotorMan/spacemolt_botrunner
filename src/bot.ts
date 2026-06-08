@@ -57,6 +57,7 @@ export interface BotStatus {
   inventory: CargoItem[];
   storage: CargoItem[];
   stats: BotStats;
+  stopAfterCycle: boolean;
 }
 
 export interface RoutineContext {
@@ -241,6 +242,9 @@ docked = false;
 
   /** Track ongoing login to prevent duplicate concurrent logins */
   private _loginPromise: Promise<boolean> | null = null;
+
+  /** Flag to request stop after current cycle completes (for civilian transport). */
+  private _stopAfterCycle = false;
 
   constructor(username: string, baseDir: string) {
     this.username = username;
@@ -2798,6 +2802,33 @@ docked = false;
     this.log("system", "Stop requested — canceling all pending operations immediately");
   }
 
+  /** Signal the bot to stop after completing the current cycle. */
+  stopAfterCycle(): void {
+    if (this._state !== "running") return;
+    this._stopAfterCycle = true;
+    this.log("system", "Stop after cycle requested — will stop after current transport cycle completes");
+  }
+
+  /** Check if stop-after-cycle is pending. */
+  shouldStopAfterCycle(): boolean {
+    return this._stopAfterCycle;
+  }
+
+  /** Clear the stop-after-cycle flag (called when stopping is processed). */
+  clearStopAfterCycle(): void {
+    this._stopAfterCycle = false;
+  }
+
+  /** Initiate the stop process (used internally after stop-after-cycle is processed). */
+  initiateStop(): void {
+    this._state = "stopping";
+    this._abortController?.abort();
+    for (const controller of this.pendingCommands.values()) {
+      controller.abort();
+    }
+    this.pendingCommands.clear();
+  }
+
   /** Get a summary of the bot's current state. */
   status(): BotStatus {
     return {
@@ -2826,6 +2857,7 @@ docked = false;
       inventory: this.inventory,
       storage: this.storage,
       stats: { ...this.stats },
+      stopAfterCycle: this._stopAfterCycle,
     };
   }
 }

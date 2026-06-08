@@ -1244,7 +1244,9 @@ let actions = '';
         <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>
         <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕</button>`;
     } else if (bot.state === 'running') {
-      actions = `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
+      actions = bot.routine === 'civilian_transport'
+        ? `<button class="warning sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+        : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
     }
     return `<tr data-bot="${esc(bot.username)}">
       <td class="bot-name-cell" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}</td>
@@ -1474,7 +1476,9 @@ function renderBotGridCard(bot) {
           <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>
           <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" style="padding:2px 6px">✕</button>
         ` : bot.state === 'running' ? `
-          <button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>
+          ${bot.routine === 'civilian_transport' 
+            ? `<button class="warning sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+            : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`}
         ` : ''}
       </div>
     </div>
@@ -1684,7 +1688,9 @@ function renderBotCard(bot) {
       <div class="bot-card-actions">
         ${bot.state !== 'running'
           ? `<button class="sm primary" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>`
-          : `<button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+          : bot.routine === 'civilian_transport'
+            ? `<button class="sm warning" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+            : `<button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
         }
         <button class="sm" onclick="event.stopPropagation();openProfile('${esc(bot.username)}')">Details</button>
       </div>
@@ -2173,7 +2179,10 @@ function renderProfileTopbar() {
       <button class="primary sm" onclick="startBotFromProfile()">Start</button>
       <button class="danger sm" onclick="removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕ Remove</button>`;
   } else if (bot.state === 'running') {
-    actions = `<button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop</button>`;
+    const isCivilianTransport = bot.routine === 'civilian_transport';
+    actions = isCivilianTransport
+      ? `<button class="warning sm" onclick="stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop Now</button>`
+      : `<button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop</button>`;
   }
 
   // Per-bot target ore selector (visible when miner is selected or running)
@@ -11467,6 +11476,10 @@ function toggleReturnHomeOptions(username) {
 
 function stopBot(username) {
   send({ type: 'stop', bot: username });
+}
+
+function stopBotAfterCycle(username) {
+  send({ type: 'stop_after_cycle', bot: username });
 }
 
 function removeBot(username) {

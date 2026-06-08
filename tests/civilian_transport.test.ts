@@ -92,7 +92,14 @@ function parseListPassengers(result: unknown): { passengers: any[]; berths: Reco
       ? (r.structuredContent as Record<string, unknown>)
       : r;
   const passengers = Array.isArray(inner.passengers) ? (inner.passengers as any[]) : [];
-  const num = (v: unknown): number | undefined => (typeof v === 'number' ? v : undefined);
+  const num = (v: unknown): number | undefined => {
+    if (typeof v === 'number') return v;
+    if (typeof v === 'string') {
+      const match = v.match(/(\d+)/);
+      return match ? parseInt(match[1], 10) : undefined;
+    }
+    return undefined;
+  };
   const berthsRaw = inner.berths && typeof inner.berths === 'object' ? (inner.berths as Record<string, unknown>) : null;
   const berthsUsedRaw = inner.berths_used && typeof inner.berths_used === 'object' ? (inner.berths_used as Record<string, unknown>) : null;
   const hasBerths = berthsRaw && (num(berthsRaw.economy) || num(berthsRaw.business) || num(berthsRaw.first));
@@ -100,19 +107,19 @@ function parseListPassengers(result: unknown): { passengers: any[]; berths: Reco
     passengers,
     berths: hasBerths
       ? {
-          economy: num(berthsRaw!.economy) || 0,
-          business: num(berthsRaw!.business) || 0,
-          first: num(berthsRaw!.first) || 0,
+          economy: num(berthsRaw!.economy) ?? 0,
+          business: num(berthsRaw!.business) ?? 0,
+          first: num(berthsRaw!.first) ?? 0,
         }
       : {
-          economy: num(inner.economy_berths) || 0,
-          business: num(inner.business_berths) || 0,
-          first: num(inner.first_berths) || 0,
+          economy: num(inner.economy_berths) ?? 0,
+          business: num(inner.business_berths) ?? 0,
+          first: num(inner.first_berths) ?? 0,
         },
     berths_used: {
-      economy: num(berthsUsedRaw?.economy) || 0,
-      business: num(berthsUsedRaw?.business) || 0,
-      first: num(berthsUsedRaw?.first) || 0,
+      economy: num(berthsUsedRaw?.economy) ?? 0,
+      business: num(berthsUsedRaw?.business) ?? 0,
+      first: num(berthsUsedRaw?.first) ?? 0,
     },
   };
 }
@@ -356,6 +363,20 @@ describe('parseListPassengers', () => {
     expect(result!.berths_used.economy).toBe(0);
     expect(result!.berths_used.business).toBe(0);
     expect(result!.berths_used.first).toBe(0);
+  });
+
+  it('parses string berth values like "8 total"', () => {
+    const input = {
+      passengers: [],
+      economy_berths: '0 total',
+      business_berths: '8 total',
+      first_berths: '8 total',
+    };
+    const result = parseListPassengers(input);
+    expect(result).not.toBeNull();
+    expect(result!.berths.economy).toBe(0);
+    expect(result!.berths.business).toBe(8);
+    expect(result!.berths.first).toBe(8);
   });
 });
 

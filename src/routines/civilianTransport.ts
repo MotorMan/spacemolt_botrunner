@@ -1,5 +1,6 @@
 import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
+import type { StationRef } from "../stationRef.js";
 import {
   ensureDocked,
   ensureUndocked,
@@ -22,6 +23,31 @@ import { getSystemBlacklist } from "../web/server.js";
 import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
 
+let stationRefCache: StationRef | null = null;
+
+function loadStationRef(): StationRef {
+  if (stationRefCache) return stationRefCache;
+  try {
+    const fs = require("fs");
+    const path = require("path");
+    const stationRefPath = path.join(process.cwd(), "data/stationRef.json");
+    if (fs.existsSync(stationRefPath)) {
+      const raw = fs.readFileSync(stationRefPath, "utf-8");
+      stationRefCache = JSON.parse(raw) as StationRef;
+      return stationRefCache;
+    }
+  } catch (err) {
+    console.error("Failed to load stationRef.json:", err);
+  }
+  return { stations: [], passenger_destinations: [], by_station_id: {}, by_system_id: {}, by_underline_name: {}, pirate_stations: [] };
+}
+
+function isPirateStation(stationId: string): boolean {
+  const stationRef = loadStationRef();
+  const info = stationRef.by_station_id[stationId.toLowerCase()];
+  return info?.is_pirate ?? false;
+}
+
 const fs = require("fs");
 const path = require("path");
 
@@ -33,44 +59,49 @@ interface RouteResult {
 }
 
 async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: string, destinationName: string, destinationSystem?: string): Promise<RouteResult | null> {
-  const tryResolve = async (targetId: string, systemHint?: string): Promise<RouteResult | null> => {
-    const params: Record<string, unknown> = { target: targetId };
-    if (systemHint) {
-      params.target_system = systemHint;
+  ctx.log("transport", `resolveDestination: id=${destinationId}, name=${destinationName}, system=${destinationSystem || "none"}`);
+  
+  const stationRef = loadStationRef();
+  
+  const byUnderline = stationRef.by_underline_name[destinationId.toLowerCase()];
+  if (byUnderline) {
+    ctx.log("transport", `  Found in stationRef by station_id: ${byUnderline.station_id} -> ${byUnderline.system_id}`);
+    return { system: byUnderline.system_id, poi: byUnderline.station_id, poiName: byUnderline.regular_station_name, origDest: destinationId };
+  }
+  
+  for (const pd of stationRef.passenger_destinations) {
+    if (pd.destination === destinationId || pd.station_id === destinationId ||
+        pd.destination_name === destinationName || pd.destination.toLowerCase() === destinationId.toLowerCase()) {
+      ctx.log("transport", `  Found in passenger_destinations: ${pd.station_id} -> ${pd.system_id} (pirate=${pd.is_pirate})`);
+      return { system: pd.system_id, poi: pd.station_id, poiName: pd.destination_name, origDest: destinationId };
     }
-    const routeResp = await bot.exec("find_route", params);
-    if (routeResp.error || !routeResp.result) {
-      return null;
-    }
-    const result = routeResp.result as Record<string, unknown>;
-    if (!result.found) {
-      return null;
-    }
-    return {
-      system: (result.target_system as string) || "",
-      poi: (result.target_poi as string) || targetId,
-      poiName: (result.target_poi_name as string) || destinationName,
-      origDest: targetId,
-    };
-  };
-
+  }
+  
   if (destinationSystem) {
     const allSystems = mapStore.getAllSystems();
-    let sysData = allSystems[destinationSystem];
-    if (!sysData) {
-      const lowerKey = Object.keys(allSystems).find(k => k.toLowerCase() === destinationSystem.toLowerCase());
-      if (lowerKey) sysData = allSystems[lowerKey];
+    let sysData: { id: string; name: string; pois: { id: string; name: string }[] } | undefined;
+    
+    const directKey = Object.keys(allSystems).find(k => k === destinationSystem || k.toLowerCase() === destinationSystem.toLowerCase());
+    if (directKey) {
+      sysData = allSystems[directKey];
+    } else {
+      sysData = Object.entries(allSystems).find(([, s]) => {
+        const sysName = s.name || s.id || "";
+        return sysName.toLowerCase() === destinationSystem.toLowerCase();
+      })?.[1];
     }
+    
     if (sysData) {
+      ctx.log("transport", `  Found system in mapStore: ${sysData.id}`);
       const found = sysData.pois.find(
         pp => pp.id === destinationId || pp.name.toLowerCase() === destinationName.toLowerCase(),
       );
       if (found) {
         return { system: sysData.id, poi: found.id, poiName: found.name, origDest: destinationId };
       }
+    } else {
+      ctx.log("transport", `  System ${destinationSystem} not found in mapStore`);
     }
-    const resolved = await tryResolve(destinationId, destinationSystem);
-    if (resolved) return resolved;
   }
 
   const allSystems = mapStore.getAllSystems();
@@ -83,13 +114,24 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
     }
   }
 
-  let resolved = await tryResolve(destinationId);
-  if (resolved) return resolved;
-
-  resolved = await tryResolve(destinationName);
-  if (resolved) return resolved;
-
-  return null;
+  ctx.log("transport", `  Trying find_route with target=${destinationId}`);
+  const routeResp = await bot.exec("find_route", { target: destinationId });
+  if (routeResp.error || !routeResp.result) {
+    ctx.log("transport", `  find_route error: ${routeResp.error?.message || "no result"}`);
+    return null;
+  }
+  const result = routeResp.result as Record<string, unknown>;
+  ctx.log("transport", `  find_route result: found=${result.found}, target_system=${result.target_system}, target_poi=${result.target_poi}`);
+  if (!result.found) {
+    ctx.log("transport", `  find_route: not found`);
+    return null;
+  }
+  return {
+    system: (result.target_system as string) || "",
+    poi: (result.target_poi as string) || destinationId,
+    poiName: (result.target_poi_name as string) || destinationName,
+    origDest: destinationId,
+  };
 }
 
 interface CatalogShip {
@@ -447,6 +489,15 @@ function parseListPassengers(result: unknown): ListPassengersResponse | null {
   const first = hasBerths
     ? num(berthsRaw!.first) ?? 0
     : (num(inner.first_berths) ?? num(inner.firstBerths) ?? num(inner.first) ?? 0);
+  for (let i = 0; i < passengers.length; i++) {
+    const p = passengers[i];
+    if (typeof p === "object" && p !== null) {
+      const po = p as unknown as Record<string, unknown>;
+      if (po.destination_system === undefined && po.destinationSystem !== undefined) {
+        po.destination_system = po.destinationSystem;
+      }
+    }
+  }
   return {
     passengers,
     berths: { economy, business, first },
@@ -683,7 +734,7 @@ async function selectPickupStation(
 
   // Check current station first if docked
   if (bot.docked && bot.poi && bot.system) {
-    if (!blockPirateStations || !isPirateSystem(bot.system)) {
+    if (!blockPirateStations || !isPirateStation(bot.poi)) {
       const resp = await bot.exec("list_station_passengers");
       if (!resp.error && resp.result) {
         const data = parseStationPassengers(resp.result);
@@ -754,13 +805,13 @@ async function selectPickupStation(
        const sysResult = sysResp.result as Record<string, unknown>;
        const sysObj = sysResult.system as Record<string, unknown> || sysResult;
        const pois = (sysObj.pois || []) as Array<Record<string, unknown>>;
-       for (const p of pois) {
-         const hasBase = p.has_base || p.base_id || p.base;
-         if (!hasBase) continue;
-         const poiId = (p.id || p.poi_id || p.name || "") as string;
-         if (!poiId) continue;
-         if (blockPirateStations && isPirateSystem(info.systemId)) continue;
-         const pResp = await bot.exec("list_station_passengers", { station: poiId });
+for (const p of pois) {
+          const hasBase = p.has_base || p.base_id || p.base;
+          if (!hasBase) continue;
+          const poiId = (p.id || p.poi_id || p.name || "") as string;
+          if (!poiId) continue;
+          if (blockPirateStations && isPirateStation(poiId)) continue;
+          const pResp = await bot.exec("list_station_passengers", { station: poiId });
          if (pResp.error || !pResp.result) continue;
          const pData = parseStationPassengers(pResp.result);
          if (pData && pData.count > 0) {
@@ -904,7 +955,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
     }
   }
 
-  ctx.log("transport", `Civilian transport started. Active ship: ${state.shipName} (${state.shipId}). Status: ${state.status}`);
+ctx.log("transport", `Civilian transport started. Active ship: ${state.shipName} (${state.shipId}). Status: ${state.status}`);
 
   if (state && state.status !== "idle") {
     ctx.log("transport", `Verifying loaded passengers for non-idle state (${state.status})...`);
@@ -949,7 +1000,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           }
           destMap.set(p.destination, { system: sys, poi, poiName: p.destination_name, count: 1 });
         }
-const routeDests = Array.from(destMap.values()).filter(d => d.system);
+        const routeDests = Array.from(destMap.values()).filter(d => d.system);
         const planned = planTourRoute(bot.system || "", routeDests, 6);
         state.onboardPassengers = vParsed!.passengers.map(p => ({
           citizenId: p.citizen_id || p.name,
@@ -958,7 +1009,7 @@ const routeDests = Array.from(destMap.values()).filter(d => d.system);
           citizenship: p.citizenship,
           destination: p.destination,
           destinationName: p.destination_name,
-          destinationSystem: p.destination_system,
+          destinationSystem: (p as any).destinationSystem || p.destination_system,
           fare: p.fare,
           bio: p.bio,
           routeData: p.route_data || null,
@@ -982,6 +1033,55 @@ const routeDests = Array.from(destMap.values()).filter(d => d.system);
         }
         saveTransportState(state);
         ctx.log("transport", `Rebuilt route from ${verifiedCount} passengers: ${planned.map(d => d.poiName).join(" → ")}`);
+      }
+    }
+  } else if (state && state.status === "idle") {
+    const verifyResp = await bot.exec("list_passengers");
+    if (!verifyResp.error && verifyResp.result) {
+      const vParsed = parseListPassengers(verifyResp.result);
+      const verifiedCount = vParsed ? vParsed.passengers.length : 0;
+      if (verifiedCount > 0) {
+        ctx.log("transport", `Found ${verifiedCount} passengers already aboard while idle — transitioning to in_transit.`);
+        const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
+        const mcLocation = mapStore.getMobileCapitolLocation();
+        for (const p of vParsed!.passengers) {
+          const existing = destMap.get(p.destination);
+          if (existing) {
+            existing.count++;
+            continue;
+          }
+          const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
+          let sys = resolved?.system || "";
+          let poi = resolved?.poi || p.destination;
+          if (!sys && mcLocation && (p.destination.toLowerCase() === "frontier_station" || p.destination_name.toLowerCase() === "frontier station")) {
+            sys = mcLocation.systemId;
+            poi = mcLocation.poiId;
+          }
+          destMap.set(p.destination, { system: sys, poi, poiName: p.destination_name, count: 1 });
+        }
+        const routeDests = Array.from(destMap.values()).filter(d => d.system);
+        const planned = planTourRoute(bot.system || "", routeDests, 6);
+        state.onboardPassengers = vParsed!.passengers.map(p => ({
+          citizenId: p.citizen_id || p.name,
+          name: p.name,
+          accommodationClass: (p.class || "economy").toLowerCase() as "economy" | "business" | "first",
+          citizenship: p.citizenship,
+          destination: p.destination,
+          destinationName: p.destination_name,
+          destinationSystem: (p as any).destinationSystem || p.destination_system,
+          fare: p.fare,
+          bio: p.bio,
+          routeData: p.route_data || null,
+          loadedAt: new Date().toISOString(),
+          status: "boarded",
+          ticksRemaining: p.ticks_remaining,
+        }));
+        state.route = planned;
+        state.currentRouteIndex = 0;
+        state.currentDestination = planned.length > 0 ? planned[0].poiName : null;
+        state.status = "in_transit";
+        saveTransportState(state);
+        ctx.log("transport", `Recovered ${verifiedCount} passengers with route: ${planned.map(d => d.poiName).join(" → ")}`);
       }
     }
   }
@@ -1272,7 +1372,7 @@ const routeDests = Array.from(destMap.values()).filter(d => d.system);
           accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
           destination: p.destination,
           destinationName: p.destination_name,
-          destinationSystem: p.destination_system,
+          destinationSystem: (p as any).destinationSystem || p.destination_system,
           fare: 0,
           bio,
         });
@@ -1282,7 +1382,7 @@ const routeDests = Array.from(destMap.values()).filter(d => d.system);
       const byDest = new Map<string, StationPassenger[]>();
       for (const p of waiting) {
         const cls = p.class.toLowerCase();
-        if (settings.blockPirateStations && isPirateSystem(p.destination)) {
+        if (settings.blockPirateStations && isPirateStation(p.destination)) {
           ctx.log("transport", `Skipping ${p.name}: pirate route -> ${p.destination_name}`);
           continue;
         }
@@ -1438,7 +1538,7 @@ const routeDests = Array.from(destMap.values()).filter(d => d.system);
                   citizenship: p.citizenship,
                   destination: p.destination,
                   destinationName: p.destination_name,
-                  destinationSystem: p.destination_system,
+                  destinationSystem: (p as any).destinationSystem || p.destination_system,
                   fare: p.fare,
                   bio: p.bio || "",
                   routeData: p.route_data || null,
@@ -1503,9 +1603,11 @@ const routeDests = Array.from(destMap.values()).filter(d => d.system);
         if (existing) {
           existing.count++;
         } else {
+          ctx.log("transport", `Resolving destination: ${p.destination_name} (system: ${p.destination_system || "unknown"})`);
           const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
           if (resolved) {
             destMap.set(p.destination, { ...resolved, count: 1 });
+            ctx.log("transport", `  -> resolved to ${resolved.system}/${resolved.poi}`);
           } else {
             ctx.log("transport", `Could not resolve destination for ${p.name}: ${p.destination_name}`);
             destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destination_name, count: 1 });
@@ -1550,7 +1652,7 @@ const routeDests = Array.from(destMap.values()).filter(d => d.system);
           citizenship: p.citizenship,
           destination: p.destination,
           destinationName: p.destination_name,
-          destinationSystem: p.destination_system,
+          destinationSystem: (p as any).destinationSystem || p.destination_system,
           fare: p.fare,
           bio: p.bio,
           loadedAt: new Date().toISOString(),
@@ -1568,7 +1670,7 @@ const routeDests = Array.from(destMap.values()).filter(d => d.system);
         citizenship: p.citizenship,
         destination: p.destination,
         destinationName: p.destination_name,
-        destinationSystem: p.destination_system,
+        destinationSystem: (p as any).destinationSystem || p.destination_system,
         fare: p.fare,
         bio: p.bio,
         routeData: p.route_data || null,
@@ -1660,6 +1762,7 @@ const routeDests = Array.from(destMap.values()).filter(d => d.system);
           ctx.log("transport", `Route exhausted but ${state.onboardPassengers.length} passenger(s) remain — checking for new route... (attempt ${retryCount}/3)`);
           const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
           for (const p of state.onboardPassengers) {
+            ctx.log("transport", `Rebuilding route for ${p.name}: dest=${p.destination}, system=${p.destinationSystem || "none"}, destName=${p.destinationName}`);
             const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
             if (resolved) {
               destMap.set(p.destination, { ...resolved, count: 1 });

@@ -159,6 +159,34 @@ function isPrimaryCreditTopOffBot(botUsername: string): boolean {
 }
 
 /**
+ * Check if this bot should ONLY run credit top-off (no rescue operations).
+ * Returns true if:
+ * - This bot is the primary credit top-off bot, AND
+ * - Fleet rescue bot is empty/none/different, AND
+ * - MAYDAY rescue bot is empty/none/different
+ * This allows a bot to be dedicated to credit top-off without doing actual rescues.
+ */
+function shouldOnlyCreditTopOff(botUsername: string): boolean {
+  const settings = getRescueSettings();
+  
+  // Must be the primary credit top-off bot
+  if (!settings.creditTopOffBot || botUsername !== settings.creditTopOffBot) {
+    return false;
+  }
+  
+  // If no fleet rescue bot is assigned (or it's a different bot), we're not doing fleet rescues
+  const fleetBotEmpty: boolean = !settings.fleetRescueBot || settings.fleetRescueBot === 'none' || settings.fleetRescueBot === '';
+  const fleetBotDifferent: boolean = !!(settings.fleetRescueBot && settings.fleetRescueBot !== botUsername);
+  
+  // If no mayday rescue bot is assigned (or it's a different bot), we're not doing mayday rescues
+  const maydayBotEmpty: boolean = !settings.maydayRescueBot || settings.maydayRescueBot === 'none' || settings.maydayRescueBot === '';
+  const maydayBotDifferent: boolean = !!(settings.maydayRescueBot && settings.maydayRescueBot !== botUsername);
+  
+  // We should only do credit top-off if we're NOT the fleet or mayday rescue bot
+  return (fleetBotEmpty || fleetBotDifferent) && (maydayBotEmpty || maydayBotDifferent);
+}
+
+/**
  * Check if this bot is the primary assigned for fleet rescue operations.
  * Returns true if this bot is the primary fleet rescue bot, or if no assignment exists (legacy behavior).
  */
@@ -1513,6 +1541,22 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
   const homeSystem = settings.homeSystem || bot.system;
 
   ctx.log("system", "FuelTransfer bot online — ready to refuel stranded ships...");
+
+  // Check if this bot should ONLY do credit top-off (no rescue operations)
+  if (shouldOnlyCreditTopOff(bot.username)) {
+    ctx.log("rescue", "💰 CREDIT TOP-OFF ONLY MODE: Fleet and MAYDAY bots are not assigned to this bot");
+    ctx.log("rescue", "💰 Will ONLY perform credit top-off operations, skipping all rescue missions");
+    
+    // Start the credit top-off background loop and idle
+    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+    
+    while (bot.state === "running") {
+      await ctx.sleep(30000);
+    }
+    
+    stopCreditTopOffBackground();
+    return;
+  }
 
   if (settings.homeSystem) {
     ctx.log("system", `Home base configured: ${homeSystem}`);
@@ -4608,6 +4652,22 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
+
+  // Check if this bot should ONLY do credit top-off (no rescue operations)
+  if (shouldOnlyCreditTopOff(bot.username)) {
+    ctx.log("rescue", "💰 CREDIT TOP-OFF ONLY MODE: Fleet and MAYDAY bots are not assigned to this bot");
+    ctx.log("rescue", "💰 Will ONLY perform credit top-off operations, skipping all rescue missions");
+    
+    // Start the credit top-off background loop and idle
+    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+    
+    while (bot.state === "running") {
+      await ctx.sleep(30000);
+    }
+    
+    stopCreditTopOffBackground();
+    return;
+  }
 
   // ── Register cooperation handler for Bot Chat Channel coordination ──
   if (isCooperationEnabled()) {

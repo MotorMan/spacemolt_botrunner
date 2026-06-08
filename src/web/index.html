@@ -7766,14 +7766,22 @@ function renderGeneralSettings(panel) {
         <input type="checkbox" id="set-general-disableActivityLog" ${general.disableActivityLog ? 'checked' : ''} />
       </div>
 
-      <div class="setting-row">
+<div class="setting-row">
         <div>
           <div class="setting-label">Clear Session on Restart</div>
           <div class="setting-hint">Delete session.json files when server restarts due to mass session loss. Disable to preserve sessions across patches (HTTP API sessions now survive restarts).</div>
         </div>
         <input type="checkbox" id="set-general-clearSessionOnRestart" ${general.clearSessionOnRestart !== false ? 'checked' : ''} />
       </div>
- 
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Disable Rate Limiting</div>
+          <div class="setting-hint">Disable the 5 requests/second rate limiter for the game API. Use only if experiencing connection issues that may be rate-limiting related.</div>
+        </div>
+        <input type="checkbox" id="set-general-disableRateLimiting" ${general.disableRateLimiting ? 'checked' : ''} />
+      </div>
+  
       <div class="settings-save-bar">
         <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
       </div>
@@ -7812,6 +7820,7 @@ function saveGeneralSettings() {
     disableDebugLog: document.getElementById('set-general-disableDebugLog').checked,
     disableActivityLog: document.getElementById('set-general-disableActivityLog').checked,
     clearSessionOnRestart: document.getElementById('set-general-clearSessionOnRestart').checked,
+    disableRateLimiting: document.getElementById('set-general-disableRateLimiting').checked,
   };
   send({ type: 'saveSettings', routine: 'general', settings: s });
 }

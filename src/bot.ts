@@ -13,6 +13,7 @@ import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord, getDirectPathfinderJump, getCorrectionPathfinderJump, getCorrectionBearingAtTick, isPathfinderLandingAtVoid, type CorrectionPathfinderJump, getMccWindowInfo, type MccWindowInfo } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
 import { chatBuffer } from "./chatbuffer.js";
+import { loadSettings } from "./web/server.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -1177,6 +1178,13 @@ docked = false;
     this._routine = routineName;
     this._error = null;
     this._abortController = new AbortController();
+
+    const settings = loadSettings();
+    const generalSettings = (settings.general as Record<string, unknown>) || {};
+    if (generalSettings.disableRateLimiting === true) {
+      this.api.setRateLimitingDisabled(true);
+      this.log("system", "Rate limiting disabled via settings");
+    }
 
     const creds = this.session.loadCredentials();
     if (!creds) {

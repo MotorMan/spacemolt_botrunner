@@ -489,6 +489,7 @@ export class SpaceMoltAPI {
   private _bandwidthStartTime = Date.now();
   private _rateLimiter = new SessionRateLimiter();
   private _isGameServer: boolean;
+  private _rateLimitingDisabled = false;
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
@@ -505,6 +506,10 @@ export class SpaceMoltAPI {
 
   setSessionManager(sessionManager: SessionManager): void {
     this._sessionManager = sessionManager;
+  }
+
+  setRateLimitingDisabled(disabled: boolean): void {
+    this._rateLimitingDisabled = disabled;
   }
 
   restoreSessionToken(): boolean {
@@ -812,7 +817,7 @@ export class SpaceMoltAPI {
   }
 
   private async doRequest(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
-    if (this._isGameServer) {
+    if (this._isGameServer && !this._rateLimitingDisabled) {
       return this._rateLimiter.enqueue(command, payload, abortSignal, (cmd, p, sig) => this.makeHttpRequest(cmd, p, sig));
     }
     return this.makeHttpRequest(command, payload, abortSignal);

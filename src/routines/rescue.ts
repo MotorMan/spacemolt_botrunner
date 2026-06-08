@@ -1792,18 +1792,19 @@ skipToReturnHome = true;
           markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
           ctx.log("mayday_debug", `📝 MAYDAY from ${mayday.sender} marked as received (1-hour cooldown active)`);
 
-          // ── IMMEDIATE DUPLICATE CHECK: Prevent rapid-fire spam ──
-          // This uses a 5-second grace period for newly received MAYDAYs
-          if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
-            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (1-hour cooldown)`);
+          // ── DECLINED MAYDAY CHECK: Prevent spam for already-declined rescues ──
+          // This prevents the bot from sending multiple decline messages for the same MAYDAY
+          // Check this FIRST, before the duplicate check, to catch declined MAYDAYS immediately
+          if (isMaydayDeclined(mayday.sender, mayday.system, mayday.poi)) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - previously declined (1-hour cooldown)`);
             markMaydayHandled(mayday);
             continue;
           }
           
-          // ── DECLINED MAYDAY CHECK: Prevent spam for already-declined rescues ──
-          // This prevents the bot from sending multiple decline messages for the same MAYDAY
-          if (isMaydayDeclined(mayday.sender, mayday.system, mayday.poi)) {
-            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - previously declined (1-hour cooldown)`);
+          // ── IMMEDIATE DUPLICATE CHECK: Prevent rapid-fire spam ──
+          // This uses a 5-second grace period for newly received MAYDAYs
+          if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (1-hour cooldown)`);
             markMaydayHandled(mayday);
             continue;
           }

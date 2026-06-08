@@ -1941,10 +1941,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   }
 
   // Count what we already have in cargo for protected resupply items (so we only top off)
-  const currentAmmo = bot.inventory
-    .filter(i => i.itemId.toLowerCase().includes("ammo") || i.itemId.toLowerCase().includes("cell_pack") || i.itemId.toLowerCase().includes("plasma"))
-    .reduce((sum, i) => sum + (i.quantity || 0), 0);
-
+  // Note: currentAmmo is total across all types; we calculate per-type below
   const currentRepair = bot.inventory
     .filter(i => i.itemId.toLowerCase().includes("repair_kit"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
@@ -1957,12 +1954,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     .filter(i => i.itemId.toLowerCase().includes("shield_charge"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
 
-  // Check if we already have ammo in cargo (user may have placed it manually)
-  const existingAmmo = bot.inventory.find(i =>
-    i.itemId.includes("ammo") || i.itemId.includes("_ammo")
-  );
-
-  // 1. Ammo resupply
+  // 1. Ammo resupply - handle ALL ammo types needed by all weapons
   const weapons = await getWeaponModules(ctx);
   ctx.log("debug", `Hunter resupply: detected ${weapons.length} weapons`);
 
@@ -1970,90 +1962,84 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     ctx.log("debug", `  Weapon: ${w.name} | ammoType: ${w.ammoType || 'none'} | maxAmmo: ${w.maxAmmo}`);
   }
 
-  let ammoToGet = Math.max(0, 30 - currentAmmo);
-
-  if (weapons.length > 0) {
-    const maxAmmo = Math.max(...weapons.map(w => w.maxAmmo || 0));
-    if (maxAmmo > 50) {
-      ammoToGet = Math.max(0, 20 - currentAmmo);
-    } else if (maxAmmo > 0) {
-      ammoToGet = Math.max(0, 40 - currentAmmo);
+  // Collect all unique ammo types needed by weapons
+  const weaponAmmoTypes = new Set<string>();
+  for (const w of weapons) {
+    if (w.ammoType && w.ammoType !== "none") {
+      weaponAmmoTypes.add(w.ammoType);
     }
   }
 
-  let chosenAmmoId: string | null = null;
-
-  if (existingAmmo) {
-    chosenAmmoId = existingAmmo.itemId;
-    ctx.log("trade", `Using existing ammo type from cargo: ${chosenAmmoId}`);
-  } else if (weapons.length > 0) {
-    // Find the first weapon that actually uses ammo
-    const ammoWeapon = weapons.find(w => w.ammoType && w.ammoType !== "none");
-    
-    if (ammoWeapon) {
-      const ammoIndex = catalogStore.getAmmoTypeIndex();
-      const ammoType = ammoWeapon.ammoType!;
-
-      // Prefer the ammo that is currently loaded in the weapon, if available
-      let possibleAmmo = ammoIndex[ammoType] || [];
-
-      if (ammoWeapon.loadedAmmoId && possibleAmmo.includes(ammoWeapon.loadedAmmoId)) {
-        // Move the currently loaded ammo to the front so we prefer it
-        possibleAmmo = [
-          ammoWeapon.loadedAmmoId,
-          ...possibleAmmo.filter(id => id !== ammoWeapon.loadedAmmoId)
-        ];
-        ctx.log("debug", `Preferring currently loaded ammo: ${ammoWeapon.loadedAmmoId}`);
-      }
-
-      ctx.log("debug", `Catalog ammo options for ${ammoType}: ${possibleAmmo.join(", ") || "none"}`);
-
-      if (possibleAmmo.length > 0) {
-        chosenAmmoId = possibleAmmo[0];
-      }
-    } else {
-      ctx.log("debug", "No weapons with ammoType found");
-    }
-  }
-
-  if (chosenAmmoId) {
-    // Try the selected ammo, then fall back through other catalog options if it fails
-    const ammoOptions = [chosenAmmoId];
+  let gotAnyAmmo = false;
+  for (const ammoType of weaponAmmoTypes) {
     const ammoIndex = catalogStore.getAmmoTypeIndex();
-    const ammoWeapon = weapons.find(w => w.ammoType && w.ammoType !== "none");
-    if (ammoWeapon) {
-      const ammoType = ammoWeapon.ammoType!;
-      const extra = ammoIndex[ammoType] || [];
-      for (const opt of extra) {
-        if (!ammoOptions.includes(opt)) ammoOptions.push(opt);
-      }
+    const possibleAmmo = ammoIndex[ammoType] || [];
+    ctx.log("debug", `Catalog ammo options for ${ammoType}: ${possibleAmmo.join(", ") || "none"}`);
+
+    if (possibleAmmo.length === 0) {
+      ctx.log("trade", `No catalog options for ${ammoType} — skipping`);
+      continue;
     }
 
-    let gotAmmo = false;
-    for (const ammoId of ammoOptions) {
-      const ammoSize = getItemSize(ammoId);
-      const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
-      if (actualQty <= 0) continue;
+    // Calculate current ammo count for this specific type
+    const currentAmmoForType = bot.inventory
+      .filter(i => possibleAmmo.includes(i.itemId))
+      .reduce((sum, i) => sum + (i.quantity || 0), 0);
 
-      const wResp = await bot.exec("storage", {
-        action: "withdraw",
-        target: "faction",
-        item_id: ammoId,
-        quantity: actualQty
-      });
-      if (!wResp.error) {
-        ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
-        freeSpace -= actualQty * ammoSize;
-        gotAmmo = true;
-        break;
-      }
+    // Calculate ammo needed for this type
+    const weaponsUsingThisAmmo = weapons.filter(w => w.ammoType === ammoType);
+    const maxAmmoForType = weaponsUsingThisAmmo.length > 0
+      ? Math.max(...weaponsUsingThisAmmo.map(w => w.maxAmmo || 0))
+      : 0;
+    let ammoToGet: number;
+    if (maxAmmoForType > 50) {
+      ammoToGet = Math.max(0, 20 - currentAmmoForType);
+    } else if (maxAmmoForType > 0) {
+      ammoToGet = Math.max(0, 40 - currentAmmoForType);
+    } else {
+      ammoToGet = Math.max(0, 30 - currentAmmoForType);
     }
 
-    if (!gotAmmo) {
-      ctx.log("trade", `Ammo resupply: relying on faction storage (tried ${ammoOptions.length} options)`);
+    // Prefer currently loaded ammo if available
+    let chosenAmmoId: string | null = null;
+    const loadedAmmo = weaponsUsingThisAmmo.find(w => w.loadedAmmoId && possibleAmmo.includes(w.loadedAmmoId));
+    if (loadedAmmo && loadedAmmo.loadedAmmoId) {
+      chosenAmmoId = loadedAmmo.loadedAmmoId;
+      ctx.log("debug", `Preferring currently loaded ammo: ${chosenAmmoId}`);
+    } else {
+      chosenAmmoId = possibleAmmo[0];
     }
-  } else {
-    ctx.log("trade", "No suitable ammo found for equipped weapons — skipping ammo resupply");
+
+    if (!chosenAmmoId) {
+      ctx.log("trade", `No suitable ammo found for ${ammoType} — skipping`);
+      continue;
+    }
+
+    // Try to withdraw the chosen ammo
+    const ammoSize = getItemSize(chosenAmmoId);
+    const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
+    if (actualQty <= 0) {
+      ctx.log("trade", `Not enough cargo space for ${ammoType} ammo — skipping`);
+      continue;
+    }
+
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: chosenAmmoId,
+      quantity: actualQty
+    });
+    if (!wResp.error) {
+      ctx.log("trade", `Withdrew ${actualQty} ${chosenAmmoId} from faction storage`);
+      freeSpace -= actualQty * ammoSize;
+      gotAnyAmmo = true;
+    } else {
+      ctx.log("trade", `Failed to withdraw ${chosenAmmoId} for ${ammoType}: ${wResp.error.message}`);
+    }
+  }
+
+  if (!gotAnyAmmo) {
+    ctx.log("trade", "No ammo withdrawn — skipping ammo resupply");
   }
 
   const hs = getHunterSettings(bot.username);

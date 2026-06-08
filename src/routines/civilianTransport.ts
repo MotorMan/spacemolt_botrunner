@@ -1521,8 +1521,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       ctx.log("transport", `Transport announcement check: service=${!!announceService}, sendTransportAnnouncement=${typeof announceService?.sendTransportAnnouncement === "function"}, pickupIsHome=${pickupIsHome}`);
       if (
         announceService &&
-        typeof announceService.sendTransportAnnouncement === "function" &&
-        pickupIsHome
+        typeof announceService.sendTransportAnnouncement === "function"
       ) {
         const routeNames = planned.map(d => d.poiName);
         const passengerInfos = onboard.map(p => ({

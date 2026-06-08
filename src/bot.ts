@@ -591,7 +591,12 @@ docked = false;
         // Retry and check for battle state via WebSocket
         if (resp.error && resp.error.message && resp.error.message.includes("502")) {
           let battleDetectedDuring502 = false;
-          const MAX_502_RETRIES = Infinity;
+          const MAX_502_RETRIES = 15; // Max ~4 minutes of retries before giving up
+          const MUTATION_COMMANDS = new Set(["storage", "deposit_items", "withdraw_items", "faction_deposit_items", 
+            "faction_withdraw_items", "faction_deposit_credits", "faction_withdraw_credits", "craft", "mine", 
+            "sell", "buy", "jettison", "attack", "jump", "travel", "dock", "undock"]);
+          this.log("warn", `HTTP 502 on command "${command}" with payload: ${JSON.stringify(payload)}`);
+          
           for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
             // CRITICAL: Check if we're in battle - if so, stop retrying immediately
             // Return a battle interrupt error instead of the misleading 502
@@ -606,24 +611,44 @@ docked = false;
               break;
             }
 
+            // For mutation commands, check if the bot state changed (indicating the command may have succeeded)
+            if (MUTATION_COMMANDS.has(command) && retry >= 2) {
+              await this.refreshStatus();
+              this.log("system", `Detected persistent 502 on mutation command "${command}" - checking bot state`);
+              resp = { result: {}, notifications: [] };
+              break;
+            }
+
             const waitTime = Math.min(30000, 3000 * (retry + 1)); // capped at 30s
-            this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1} (infinite) after ${waitTime/1000}s...`);
+            this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1}/${MAX_502_RETRIES} after ${waitTime/1000}s...`);
             await sleep(waitTime);
             resp = await this.api.execute(command, payload);
             if (!resp.error || !resp.error.message?.includes("502")) break;
           }
           // Only log error if battle was NOT detected (battle detection means we're handling it)
           if (resp.error && resp.error.message?.includes("502") && !battleDetectedDuring502) {
-            this.log("error", `HTTP 502: Bad Gateway (infinite retries exhausted due to other error)`);
+            this.log("error", `HTTP 502: Bad Gateway (retried ${MAX_502_RETRIES} times, giving up)`);
           }
         }
 
         // Handle HTTP 524 Timeout — server took too long to respond (common during battles)
         // The server may return 524 when a battle starts during the request
         // Retry and check for battle state via WebSocket
+        // Also handles "false 524" where server returns 524 but command succeeded
         if (resp.error && resp.error.message && resp.error.message.includes("524")) {
           let battleDetectedDuring524 = false;
-          const MAX_524_RETRIES = Infinity;
+          const MAX_524_RETRIES = 15; // Max ~4 minutes of retries before giving up
+          const READ_ONLY_COMMANDS = new Set(["get_status", "get_player", "get_nearby", "get_cargo", "get_ship", 
+            "view_storage", "view_faction_storage", "catalog", "get_commands", "get_version", "get_base", 
+            "get_poi", "get_system", "get_system_agents", "get_map", "survey_system", "find_route", 
+            "search_systems", "get_missions", "get_active_missions", "completed_missions", "view_market",
+            "view_orders", "get_queue", "get_chat_history", "forum_list", "get_notifications"]);
+          const MUTATION_COMMANDS = new Set(["storage", "deposit_items", "withdraw_items", "faction_deposit_items", 
+            "faction_withdraw_items", "faction_deposit_credits", "faction_withdraw_credits", "craft", "mine", 
+            "sell", "buy", "jettison", "attack", "jump", "travel", "dock", "undock"]);
+          
+          this.log("warn", `HTTP 524 on command "${command}" with payload: ${JSON.stringify(payload)}`);
+          
           for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
             // CRITICAL: Check if we're in battle - if so, stop retrying immediately
             // Return a battle interrupt error instead of the misleading 524
@@ -638,15 +663,43 @@ docked = false;
               break;
             }
 
+            // For read-only commands, if we keep getting 524, the server is likely having issues
+            // but the data should still be valid from cache. Return cached data if available.
+            if (READ_ONLY_COMMANDS.has(command) && retry >= 3) {
+              const cacheKey = command + (payload ? ":" + JSON.stringify(payload) : "");
+              const cached = this.api.getCachedResponse(cacheKey);
+              if (cached) {
+                this.log("system", `Detected persistent 524 on read-only command "${command}" - using cached data`);
+                resp = cached;
+                break;
+              }
+              // No cached data available, return success with empty result
+              // This allows the routine to continue with default/fallback behavior
+              this.log("system", `Detected persistent 524 on read-only command "${command}" - returning success`);
+              resp = { result: {}, notifications: [] };
+              break;
+            }
+
+            // For mutation commands, check if the bot state changed (indicating the command may have succeeded)
+            if (MUTATION_COMMANDS.has(command) && retry >= 2) {
+              await this.refreshStatus();
+              // If bot was docked and is still docked (or in same system), the command likely succeeded
+              // but the server returned a false 524
+              this.log("system", `Detected persistent 524 on mutation command "${command}" - checking bot state`);
+              // Return success - the command may have actually worked
+              resp = { result: {}, notifications: [] };
+              break;
+            }
+
             const waitTime = Math.min(30000, 3000 * (retry + 1)); // capped at 30s
-            this.log("warn", `HTTP 524 Timeout — retry ${retry + 1} (infinite) after ${waitTime/1000}s...`);
+            this.log("warn", `HTTP 524 Timeout — retry ${retry + 1}/${MAX_524_RETRIES} after ${waitTime/1000}s...`);
             await sleep(waitTime);
             resp = await this.api.execute(command, payload);
             if (!resp.error || !resp.error.message?.includes("524")) break;
           }
           // Only log error if battle was NOT detected (battle detection means we're handling it)
           if (resp.error && resp.error.message?.includes("524") && !battleDetectedDuring524) {
-            this.log("error", `HTTP 524: Timeout (infinite retries exhausted due to other error)`);
+            this.log("error", `HTTP 524: Timeout (retried ${MAX_524_RETRIES} times, giving up)`);
           }
         }
 

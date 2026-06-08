@@ -558,6 +558,10 @@ export class SpaceMoltAPI {
     return { inKBps, outKBps };
   }
 
+  getCachedResponse(cacheKey: string): ApiResponse | null {
+    return this._cache.get(cacheKey);
+  }
+
   async execute(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
     debugLogForBot(botName, "api:execute", `${botName} > ${command}`, payload);

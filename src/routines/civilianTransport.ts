@@ -460,10 +460,13 @@ function countPassengerModules(modules: unknown): { economy: number; business: n
     if (!m || typeof m !== "object") continue;
     const mod = m as Record<string, unknown>;
     const typeId = ((mod.type_id as string) || (mod.type as string) || "") as string;
-    if (typeId.includes("passenger")) {
-      if (typeId.includes("first")) first += 1;
-      else if (typeId.includes("business")) business += 1;
-      else if (typeId.includes("economy")) economy += 1;
+    const typeName = ((mod.name as string) || (mod.type_name as string) || "") as string;
+    const allText = (typeId + " " + typeName).toLowerCase();
+    
+    if (allText.includes("passenger") || allText.includes("berth") || allText.includes("cabin")) {
+      if (allText.includes("first")) first += 1;
+      else if (allText.includes("business")) business += 1;
+      else if (allText.includes("economy")) economy += 1;
     }
   }
   return { economy, business, first };
@@ -578,12 +581,22 @@ async function refreshFleetCache(ctx: RoutineContext): Promise<FleetShip[]> {
       }
       
       if (totalBerths(ship.berths) === 0) {
-        const detailResp = await bot.exec("get_ship", { ship_id: ship.shipId });
-        if (detailResp.error) {
-          ctx.log("transport", `get_ship failed for ${ship.shipId}: ${detailResp.error.message}`);
+        let detailResp: Record<string, unknown> | null = null;
+        try {
+          const result = await Promise.race([
+            bot.exec("get_ship", { ship_id: ship.shipId }),
+            new Promise<null>((_, reject) => setTimeout(() => reject(new Error("get_ship timeout")), 30000)),
+          ]);
+          if (result && typeof result === "object") {
+            detailResp = result as Record<string, unknown>;
+          }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          ctx.log("transport", `get_ship failed for ${ship.shipId}: ${msg}`);
           continue;
         }
-        if (!detailResp.result) {
+        
+        if (!detailResp || !detailResp.result) {
           ctx.log("transport", `get_ship returned no result for ${ship.shipId}`);
           continue;
         }
@@ -610,6 +623,16 @@ async function refreshFleetCache(ctx: RoutineContext): Promise<FleetShip[]> {
         const modules = (detail.modules as unknown[]) || (shipData.modules as unknown[]) || [];
         ctx.log("transport", `modules for ${ship.shipId}: ${modules.length} items`);
         if (totalBerths(ship.berths) === 0 && Array.isArray(modules) && modules.length > 0) {
+          const moduleTypes: string[] = [];
+          for (const m of modules) {
+            if (m && typeof m === "object") {
+              const mod = m as Record<string, unknown>;
+              const typeId = ((mod.type_id as string) || (mod.type as string) || "") as string;
+              const typeName = ((mod.name as string) || (mod.type_name as string) || "") as string;
+              moduleTypes.push(typeId || typeName || "unknown");
+            }
+          }
+          ctx.log("transport", `module types: ${moduleTypes.slice(0, 10).join(", ")}${moduleTypes.length > 10 ? "..." : ""}`);
           const fromMods = countPassengerModules(modules);
           if (totalBerths(fromMods) > 0) {
             ship.berths = fromMods;
@@ -1484,7 +1507,6 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
             state.currentRouteIndex = 0;
             state.currentDestination = state.route.length > 0 ? state.route[0].poiName : null;
             ctx.log("transport", `Route recalculated from ${currentCount} passengers: ${state.route.map(d => d.poiName).join(" → ")}`);
-            }
             if (verifyParsed) {
               usedEconomy = verifyParsed.berths_used.economy;
               usedBusiness = verifyParsed.berths_used.business;
@@ -1495,7 +1517,6 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         bot.refreshStatus().catch(() => {});
       }
 
-      if (bot.state !== "running") {
       const listResp = await bot.exec("list_passengers");
       let aboard: AboardPassenger[] = [];
       if (!listResp.error && listResp.result) {

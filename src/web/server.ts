@@ -590,6 +590,26 @@ export class WebServer {
           }
           return Response.json({ ok: false, error: "Missing system_data" }, { status: 400 });
         }
+        if (url.pathname === "/api/map/reset-poi" && req.method === "POST") {
+          const body = await req.json() as { system_id: string; poi_id: string };
+          if (body?.system_id && body?.poi_id) {
+            mapStore.resetPoi(body.system_id, body.poi_id);
+            return Response.json({ ok: true });
+          }
+          return Response.json({ ok: false, error: "Missing system_id or poi_id" }, { status: 400 });
+        }
+        if (url.pathname === "/api/map/reset-corrupted" && req.method === "POST") {
+          const result = mapStore.resetCorruptedPois();
+          return Response.json(result);
+        }
+        if (url.pathname === "/api/map/clear-poi-resources" && req.method === "POST") {
+          const body = await req.json() as { system_id: string; poi_id: string };
+          if (body?.system_id && body?.poi_id) {
+            mapStore.clearPoiResources(body.system_id, body.poi_id);
+            return Response.json({ ok: true });
+          }
+          return Response.json({ ok: false, error: "Missing system_id or poi_id" }, { status: 400 });
+        }
         if (url.pathname === "/api/routines") {
           return Response.json(this.routines);
         }

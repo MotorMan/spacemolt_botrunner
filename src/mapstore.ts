@@ -762,17 +762,20 @@ class MapStore {
     const poi = sys.pois.find((p) => p.id === poiId);
     if (!poi) return;
 
-    poi.resources = resources.map((r) => ({
-      resource_id: r.resource_id,
-      name: r.name,
-      richness: r.richness,
-      remaining: r.remaining,
-      max_remaining: r.max_remaining,
-      depletion_percent: r.depletion_percent,
-      last_scanned: now(),
-    }));
+    const timestamp = now();
+    poi.resources = resources
+      .filter((r) => r.remaining <= r.max_remaining)
+      .map((r) => ({
+        resource_id: r.resource_id,
+        name: r.name,
+        richness: r.richness,
+        remaining: r.remaining,
+        max_remaining: r.max_remaining,
+        depletion_percent: r.depletion_percent,
+        last_scanned: timestamp,
+      }));
 
-    poi.last_updated = now();
+    poi.last_updated = timestamp;
     this.scheduleSave();
   }
 
@@ -843,15 +846,17 @@ class MapStore {
 
     // Update resources if provided
     if (poiData.resources && poiData.resources.length > 0) {
-      poi.resources = poiData.resources.map((r) => ({
-        resource_id: r.resource_id,
-        name: r.name,
-        richness: r.richness,
-        remaining: r.remaining,
-        max_remaining: r.max_remaining,
-        depletion_percent: r.depletion_percent,
-        last_scanned: now(),
-      }));
+      poi.resources = poiData.resources
+        .filter((r) => r.remaining <= r.max_remaining)
+        .map((r) => ({
+          resource_id: r.resource_id,
+          name: r.name,
+          richness: r.richness,
+          remaining: r.remaining,
+          max_remaining: r.max_remaining,
+          depletion_percent: r.depletion_percent,
+          last_scanned: now(),
+        }));
     }
 
     this.scheduleSave();
@@ -871,6 +876,72 @@ class MapStore {
       existing.depleted_at = now();
       this.scheduleSave();
     }
+  }
+
+  /** Clear all resource data from a POI. Use when POI data is known to be corrupted or outdated. */
+  clearPoiResources(systemId: string, poiId: string): void {
+    const sys = this.data.systems[systemId];
+    if (!sys) return;
+
+    const poi = sys.pois.find((p) => p.id === poiId);
+    if (!poi) return;
+
+    poi.resources = [];
+    poi.ores_found = [];
+    poi.last_updated = now();
+    this.scheduleSave();
+  }
+
+  /** Reset a POI to its initial state, clearing all discovered data. */
+  resetPoi(systemId: string, poiId: string): void {
+    const sys = this.data.systems[systemId];
+    if (!sys) return;
+
+    const poi = sys.pois.find((p) => p.id === poiId);
+    if (!poi) return;
+
+    poi.ores_found = [];
+    poi.resources = [];
+    poi.market = [];
+    poi.orders = [];
+    poi.missions = [];
+    poi.last_explored = null;
+    poi.last_updated = now();
+    this.scheduleSave();
+  }
+
+  /** Check if a resource record has corrupted data (remaining > max_remaining). */
+  private isResourceCorrupted(resource: ResourceRecord): boolean {
+    return resource.remaining > resource.max_remaining;
+  }
+
+  /** Check if a POI has any corrupted resource data. */
+  hasCorruptedResources(systemId: string, poiId: string): boolean {
+    const sys = this.data.systems[systemId];
+    if (!sys) return false;
+
+    const poi = sys.pois.find((p) => p.id === poiId);
+    if (!poi || !poi.resources) return false;
+
+    return poi.resources.some((r) => this.isResourceCorrupted(r));
+  }
+
+  /** Reset all POIs with corrupted resource data across the entire map. */
+  resetCorruptedPois(): { reset: number; total: number } {
+    let resetCount = 0;
+    let totalCount = 0;
+
+    for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      for (const poi of sys.pois) {
+        if (poi.resources && poi.resources.some((r) => this.isResourceCorrupted(r))) {
+          totalCount++;
+          this.clearPoiResources(sysId, poi.id);
+          resetCount++;
+        }
+      }
+    }
+
+    return { reset: resetCount, total: totalCount };
   }
 
   /** Record a pirate sighting in a system. */
@@ -1200,6 +1271,9 @@ findOreLocations(oreId: string): Array<{
       if (this.isPirateSystem(sysId)) continue;
       const hasStation = sys.pois.some((p) => p.has_base || !!p.base_id);
       for (const poi of sys.pois) {
+        // Skip POIs with corrupted resource data
+        if (poi.resources && poi.resources.some((r) => r.remaining > r.max_remaining)) continue;
+
         // CRITICAL FIX: Only skip POIs where the SPECIFIC oreId being searched is exhausted.
         // Previously this skipped any POI with ANY exhausted resource, so a POI containing
         // iron_ore + copper_ore would be skipped when searching for iron_ore if copper was depleted.

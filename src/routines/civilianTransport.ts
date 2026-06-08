@@ -29,6 +29,7 @@ interface RouteResult {
   system: string;
   poi: string;
   poiName: string;
+  origDest?: string;
 }
 
 async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: string, destinationName: string, destinationSystem?: string): Promise<RouteResult | null> {
@@ -40,7 +41,7 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
         pp => pp.id === destinationId || pp.name.toLowerCase() === destinationName.toLowerCase(),
       );
       if (found) {
-        return { system: sysData.id, poi: found.id, poiName: found.name };
+        return { system: sysData.id, poi: found.id, poiName: found.name, origDest: destinationId };
       }
     }
   }
@@ -51,7 +52,7 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
       pp => pp.id === destinationId || pp.name.toLowerCase() === destinationName.toLowerCase(),
     );
     if (found) {
-      return { system: sysData.id, poi: found.id, poiName: found.name };
+      return { system: sysData.id, poi: found.id, poiName: found.name, origDest: destinationId };
     }
   }
 
@@ -67,6 +68,7 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
     system: (result.target_system as string) || "",
     poi: (result.target_poi as string) || destinationId,
     poiName: (result.target_poi_name as string) || destinationName,
+    origDest: destinationId,
   };
 }
 
@@ -119,13 +121,14 @@ interface TransportState {
   status: "idle" | "traveling_to_ship" | "loading" | "in_transit" | "unloading" | "completed";
   shipId: string;
   shipName: string;
+  customName?: string;
   tier: number | null;
   berths: { economy: number; business: number; first: number };
   berths_used: { economy: number; business: number; first: number };
   onboardPassengers: TransportPassenger[];
   pickupStation: string | null;
   pickupSystem: string | null;
-  route: Array<{ system: string; poi: string; poiName: string }>;
+  route: Array<{ system: string; poi: string; poiName: string; origDest?: string }>;
   currentRouteIndex: number;
   revenue: number;
   totalFaresEarned: number;
@@ -136,6 +139,7 @@ interface TransportState {
 interface FleetShip {
   shipId: string;
   shipName: string;
+  customName?: string;
   type: string;
   tier: number | null;
   berths: { economy: number; business: number; first: number };
@@ -492,9 +496,11 @@ function parseListShips(result: unknown): FleetShip[] {
     }
     
     const typeId = (s.type || s.class_id || (s.class as Record<string, unknown>)?.id || s.ship_type || "") as string;
+    const customName = (s.custom_name || s.customName || "") as string;
     return {
       shipId: (s.ship_id || s.id || "") as string,
       shipName: (s.name || s.ship_name || s.class_name || "") as string,
+      customName: customName || undefined,
       type: typeId,
       tier: (s.tier as number) ?? null,
       berths,
@@ -588,6 +594,7 @@ async function refreshFleetCache(ctx: RoutineContext): Promise<FleetShip[]> {
         
         ship.shipId = (shipData.id || ship.shipId) as string;
         ship.shipName = (shipData.name || ship.shipName) as string;
+        ship.customName = ((shipData.custom_name || shipData.customName || ship.customName) as string) || undefined;
         ship.type = (shipData.type || shipData.class_id || ship.type) as string;
         ship.tier = (shipData.tier as number) ?? ship.tier;
         ship.cargoCapacity = (shipData.cargo_capacity || shipData.max_cargo || ship.cargoCapacity) as number;
@@ -751,9 +758,9 @@ function hopsBetween(a: string, b: string): number {
 
 function planTourRoute(
   currentSystem: string,
-  destinations: Array<{ system: string; poi: string; poiName: string }>,
+  destinations: Array<{ system: string; poi: string; poiName: string; origDest?: string }>,
   maxJumps: number,
-): Array<{ system: string; poi: string; poiName: string }> {
+): Array<{ system: string; poi: string; poiName: string; origDest?: string }> {
   const validDests = destinations.filter(d => d.system);
   if (validDests.length === 0) return [];
   if (validDests.length === 1) return validDests;
@@ -789,12 +796,13 @@ function planTourRoute(
   return planned;
 }
 
-function makeNewState(bot: Bot, shipId: string, shipName: string, tier: number | null, berths: { economy: number; business: number; first: number }): TransportState {
+function makeNewState(bot: Bot, shipId: string, shipName: string, customName: string | undefined, tier: number | null, berths: { economy: number; business: number; first: number }): TransportState {
   return {
     botUsername: bot.username,
     status: "idle",
     shipId,
     shipName,
+    customName,
     tier,
     berths,
     berths_used: { economy: 0, business: 0, first: 0 },
@@ -833,13 +841,14 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       ctx.log("error", "No passenger-capable ship found in fleet. Routine cannot run.");
       return;
     }
-    state = makeNewState(bot, best.shipId, best.shipName, best.tier, best.berths);
+    state = makeNewState(bot, best.shipId, best.shipName, best.customName, best.tier, best.berths);
     saveTransportState(state);
   } else {
     const currentShip = fleet.find(s => s.shipId === state!.shipId);
     if (currentShip) {
       state!.shipId = currentShip.shipId;
       state!.shipName = currentShip.shipName;
+      state!.customName = currentShip.customName;
       state!.tier = currentShip.tier;
       if (totalBerths(currentShip.berths) > 0) {
         state!.berths = currentShip.berths;
@@ -1165,6 +1174,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
               ctx.log("transport", "Switched to " + targetShip.shipName);
               state.shipId = targetShipId;
               state.shipName = targetShip.shipName;
+              state.customName = targetShip.customName;
               state.tier = targetShip.tier;
               state.berths = targetShip.berths;
               saveTransportState(state);
@@ -1319,7 +1329,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       // This prevents stranding nearby passengers when distant destinations fill berths first.
       const mcLocation = mapStore.getMobileCapitolLocation();
       ctx.log("transport", `Mobile capitol location: ${mcLocation ? `${mcLocation.systemId}/${mcLocation.poiId}` : 'not found'}`);
-      const destDrafts: Array<{ system: string; poi: string; poiName: string; count: number }> = [];
+      const destDrafts: Array<{ system: string; poi: string; poiName: string; count: number; origDest: string }> = [];
       for (const [destId, ps] of byDest.entries()) {
         const resolved = await resolveDestination(ctx, bot, destId, ps[0]?.destination_name || destId, ps[0]?.destination_system);
         let sys = resolved?.system || "";
@@ -1329,7 +1339,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           sys = mcLocation.systemId;
           poi = mcLocation.poiId;
         }
-        destDrafts.push({ system: sys, poi, poiName: ps[0]?.destination_name || destId, count: ps.length });
+        destDrafts.push({ system: sys, poi, poiName: ps[0]?.destination_name || destId, count: ps.length, origDest: destId });
       }
 
       const plannedRoute = planTourRoute(bot.system || "", destDrafts.filter(d => d.system), settings.maxJumps);
@@ -1359,7 +1369,9 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           break;
         }
         const passengers = byDest.get(leg.poi) || [];
-        if (passengers.length === 0) continue;
+        const passengersByOrigDest = leg.origDest ? byDest.get(leg.origDest) || [] : passengers;
+        const passengersFinal = passengersByOrigDest.length > 0 ? passengersByOrigDest : passengers;
+        if (passengersFinal.length === 0) continue;
 
         const totalLoaded = usedEconomy + usedBusiness + usedFirst;
         if (settings.maxPassengers > 0 && totalLoaded >= settings.maxPassengers) {
@@ -1368,81 +1380,64 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         }
 
         const priority = settings.passengerPriority;
-        const sortedPassengers = [...passengers].sort((a, b) => {
+        const classOrder: Record<string, number> = { first: 0, business: 0, economy: 0 };
+        if (priority === "first") {
+          classOrder.first = 0;
+          classOrder.business = 1;
+          classOrder.economy = 2;
+        } else if (priority === "business") {
+          classOrder.business = 0;
+          classOrder.first = 1;
+          classOrder.economy = 2;
+        } else if (priority === "economy") {
+          classOrder.economy = 0;
+          classOrder.first = 1;
+          classOrder.business = 2;
+        }
+        const sortedPassengers = [...passengersFinal].sort((a, b) => {
           if (priority === "off") return 0;
-          const classOrder = { first: 0, business: 1, economy: 2 };
-          return classOrder[a.class.toLowerCase() as keyof typeof classOrder] - classOrder[b.class.toLowerCase() as keyof typeof classOrder];
+          return classOrder[a.class.toLowerCase()] - classOrder[b.class.toLowerCase()];
         });
 
-        let canFit = 0;
+        let loadedThisLeg = 0;
         for (const p of sortedPassengers) {
+          if (bot.state !== "running") {
+            ctx.log("transport", "Stop requested during load_passenger — aborting.");
+            break;
+          }
           if (loadedNames.has(p.citizen_id)) continue;
           const cls = p.class.toLowerCase() as "economy" | "business" | "first";
           const capFirst = capAvailable(usedFirst, settings.maxFirst, freeFirst);
           const capBusiness = capAvailable(usedBusiness, settings.maxBusiness, freeBusiness);
           const capEconomy = capAvailable(usedEconomy, settings.maxEconomy, freeEconomy);
-          if (cls === "first") {
-            if (usedFirst < capFirst) {
-              ctx.log("transport", `→ canFit ${p.name} (first): capAvail=${capFirst}, usedFirst=${usedFirst} → fit`);
-              canFit++;
-              usedFirst++;
-              loadedNames.add(p.citizen_id);
-            } else {
-              ctx.log("transport", `→ NOFIT ${p.name} (first): capAvail=${capFirst}, usedFirst=${usedFirst}`);
-            }
-          } else if (cls === "business") {
-            if (usedBusiness < capBusiness) {
-              ctx.log("transport", `→ canFit ${p.name} (business): capAvail=${capBusiness}, usedBusiness=${usedBusiness} → fit`);
-              canFit++;
-              usedBusiness++;
-              loadedNames.add(p.citizen_id);
-            } else if (usedEconomy < capEconomy) {
-              ctx.log("transport", `→ canFit ${p.name} (business->economy): capAvail=${capEconomy}, usedEconomy=${usedEconomy} → fit`);
-              canFit++;
-              usedEconomy++;
-              loadedNames.add(p.citizen_id);
-            } else {
-              ctx.log("transport", `→ NOFIT ${p.name} (business): capAvail bus=${capBusiness} eco=${capEconomy}`);
-            }
-          } else {
-            if (usedEconomy < capEconomy) {
-              ctx.log("transport", `→ canFit ${p.name} (economy): capAvail=${capEconomy}, usedEconomy=${usedEconomy} → fit`);
-              canFit++;
-              usedEconomy++;
-              loadedNames.add(p.citizen_id);
-            } else if (usedBusiness < capBusiness) {
-              ctx.log("transport", `→ canFit ${p.name} (economy->business): capAvail=${capBusiness}, usedBusiness=${usedBusiness} → fit`);
-              canFit++;
-              usedBusiness++;
-              loadedNames.add(p.citizen_id);
-            } else if (usedFirst < capFirst) {
-              ctx.log("transport", `→ canFit ${p.name} (economy->first): capAvail=${capFirst}, usedFirst=${usedFirst} → fit`);
-              canFit++;
-              usedFirst++;
-              loadedNames.add(p.citizen_id);
-            } else {
-              ctx.log("transport", `→ NOFIT ${p.name} (economy): capAvail eco=${capEconomy} bus=${capBusiness} first=${capFirst}`);
-            }
+          
+          let canLoad = false;
+          if (cls === "first" && usedFirst < capFirst) {
+            canLoad = true;
+            usedFirst++;
+          } else if (cls === "business" && usedBusiness < capBusiness) {
+            canLoad = true;
+            usedBusiness++;
+          } else if (cls === "economy" && usedEconomy < capEconomy) {
+            canLoad = true;
+            usedEconomy++;
           }
+          
+          if (!canLoad) continue;
+          
+          loadedNames.add(p.citizen_id);
+          loadedThisLeg++;
+          
+          ctx.log("transport", `→ Loading ${p.name} (${p.citizen_id}) via load_passenger destination=${leg.origDest || leg.poi}`);
+          const loadResp = await bot.exec("load_passenger", { destination: leg.origDest || leg.poi });
+          if (loadResp.error) {
+            ctx.log("error", `load_passenger failed: ${loadResp.error.message}`);
+          }
+          await ctx.sleep(11000);
         }
 
-        if (canFit <= 0) continue;
-
-        ctx.log("transport", `Loading up to ${canFit} passengers...`);
         if (bot.state !== "running") {
-          ctx.log("transport", "Stop requested before issuing load_passenger — aborting.");
-          state.status = "idle";
-          saveTransportState(state);
-          break;
-        }
-        const loadResp = await bot.exec("load_passenger", { destination: leg.poi });
-        if (loadResp.error) {
-          ctx.log("error", `load_passenger failed: ${loadResp.error.message}`);
-          continue;
-        }
-        await ctx.sleep(11000);
-        if (bot.state !== "running") {
-          ctx.log("transport", "Stop requested after load sleep — aborting passenger load loop.");
+          ctx.log("transport", "Stop requested after loading — aborting passenger load loop.");
           state.status = "idle";
           saveTransportState(state);
           break;
@@ -1452,21 +1447,55 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           const verifyParsed = parseListPassengers(verifyResp.result);
           const currentCount = verifyParsed?.passengers.length || 0;
           ctx.log("transport", `After loading: ${currentCount} passengers aboard`);
+          if (verifyParsed && currentCount > 0) {
+            const aboardIds = new Set(verifyParsed.passengers.map(p => p.citizen_id || p.name));
+            state.onboardPassengers = state.onboardPassengers.filter(op => aboardIds.has(op.citizenId));
+            for (const p of verifyParsed.passengers) {
+              const existing = state.onboardPassengers.find(op => op.citizenId === (p.citizen_id || p.name));
+              if (!existing) {
+                state.onboardPassengers.push({
+                  citizenId: p.citizen_id || p.name,
+                  name: p.name,
+                  accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
+                  citizenship: p.citizenship,
+                  destination: p.destination,
+                  destinationName: p.destination_name,
+                  destinationSystem: p.destination_system,
+                  fare: p.fare,
+                  bio: p.bio || "",
+                  routeData: p.route_data || null,
+                  loadedAt: new Date().toISOString(),
+                  status: "boarded",
+                  ticksRemaining: p.ticks_remaining,
+                });
+              }
+            }
+            const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
+            for (const p of verifyParsed.passengers) {
+              const existing = destMap.get(p.destination);
+              if (existing) { existing.count++; continue; }
+              const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
+              if (resolved) {
+                destMap.set(p.destination, { ...resolved, count: 1 });
+              }
+            }
+            const routeDests = Array.from(destMap.values()).filter(d => d.system);
+            state.route = planTourRoute(bot.system || "", routeDests, 6);
+            state.currentRouteIndex = 0;
+            state.currentDestination = state.route.length > 0 ? state.route[0].poiName : null;
+            ctx.log("transport", `Route recalculated from ${currentCount} passengers: ${state.route.map(d => d.poiName).join(" → ")}`);
+            }
+            if (verifyParsed) {
+              usedEconomy = verifyParsed.berths_used.economy;
+              usedBusiness = verifyParsed.berths_used.business;
+              usedFirst = verifyParsed.berths_used.first;
+            }
+          }
         }
         bot.refreshStatus().catch(() => {});
       }
 
       if (bot.state !== "running") {
-        ctx.log("transport", "Stop requested after loading — remaining docked, returning to idle.");
-        state.onboardPassengers = [];
-        state.route = [];
-        state.status = "idle";
-        saveTransportState(state);
-        await ctx.sleep(10000);
-        continue;
-      }
-
-      // Read full passenger info
       const listResp = await bot.exec("list_passengers");
       let aboard: AboardPassenger[] = [];
       if (!listResp.error && listResp.result) {
@@ -1509,7 +1538,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       }
 
       const routeDests = Array.from(destMap.values()).filter(d => d.system);
-      const planned = plannedRoute;
+      const planned = planTourRoute(bot.system || "", routeDests, 6);
 
       const aboardIds = new Set(aboard.map(p => p.citizen_id || p.name));
       const beforeCount = state.onboardPassengers.length;
@@ -1614,8 +1643,9 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           bio: p.bio || "",
           destinationName: p.destinationName,
         }));
+        const shipDisplayName = state.customName || state.shipName;
         announceService.sendTransportAnnouncement(bot, {
-          shipName: bot.shipName || state.shipName,
+          shipName: bot.shipName || shipDisplayName,
           route: routeNames,
           totalPassengers: onboard.length,
           currentSystem: bot.system || "",
@@ -1804,8 +1834,9 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
             bio: p.bio || "",
             destinationName: p.destinationName,
           }));
+          const shipDisplayName = state.customName || state.shipName;
           announceService.sendTransportAnnouncement(bot, {
-            shipName: bot.shipName || state.shipName,
+            shipName: bot.shipName || shipDisplayName,
             route: routeNames,
             totalPassengers: completedPassengers.length,
             currentSystem: bot.system || "",

@@ -1478,6 +1478,7 @@ ctx.log("transport", `Civilian transport started. Active ship: ${state.shipName}
         });
 
         let loadedThisLeg = 0;
+        let loadAttempted = false;
         for (const p of sortedPassengers) {
           if (bot.state !== "running") {
             ctx.log("transport", "Stop requested during load_passenger — aborting.");
@@ -1505,8 +1506,11 @@ ctx.log("transport", `Civilian transport started. Active ship: ${state.shipName}
           
           loadedNames.add(p.citizen_id);
           loadedThisLeg++;
-          
-          ctx.log("transport", `→ Loading ${p.name} (${p.citizen_id}) via load_passenger destination=${leg.origDest || leg.poi}`);
+        }
+        
+        if (loadedThisLeg > 0 && !loadAttempted) {
+          loadAttempted = true;
+          ctx.log("transport", `Loading all ${loadedThisLeg} passenger(s) destined for ${leg.poiName} via load_passenger`);
           const loadResp = await bot.exec("load_passenger", { destination: leg.origDest || leg.poi });
           if (loadResp.error) {
             ctx.log("error", `load_passenger failed: ${loadResp.error.message}`);

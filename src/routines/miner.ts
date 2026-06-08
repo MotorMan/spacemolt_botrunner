@@ -1478,6 +1478,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
    // when the server is still processing (e.g. after a jump timeout).
    let cachedModules: unknown[] | null = await cacheShipModules(ctx);
 
+   // ── Flock heartbeat tracking (persists across cycles) ──
+   let lastFlockHeartbeat = 0;
+
    // ── CRITICAL FIX: Refresh faction storage at startup for accurate quota checks ──
    ctx.log("miner", "Refreshing faction storage at startup...");
    await bot.refreshFactionStorage();
@@ -1622,7 +1625,6 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let flockMiningType: FlockState["miningType"] = "ore";
     let flockPhase: FlockState["phase"] = "gathering";
     let flockGroup: FlockGroupConfig | undefined;
-    let lastFlockHeartbeat = 0;
 
     if (settings.flockEnabled && settings.flockName) {
       flockGroup = settings.flockGroups.find(g => g.name === settings.flockName);
@@ -1733,13 +1735,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // ── Leader: broadcast immediate heartbeat to let followers know we're alive ──
-    if (isFlockLeader && settings.flockEnabled && settings.flockName) {
+    // ── Leader: broadcast heartbeat to keep flock state fresh ──
+    if (isFlockLeader && settings.flockEnabled && settings.flockName && (Date.now() - lastFlockHeartbeat) > 30_000) {
       await broadcastFlockHeartbeat(settings.flockName, bot.username);
       lastFlockHeartbeat = Date.now();
     }
 
-     // ── Re-evaluate mining type and target from settings each cycle ──
+    // ── Re-evaluate mining type and target from settings each cycle ──
       let miningType: "ore" | "gas" | "ice" | "radioactive" = "ore";
       if (settings.miningType === "auto") {
         const detected = await detectMiningType(ctx, cachedModules || undefined);
@@ -5598,11 +5600,6 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     await bot.refreshStatus();
     const endFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Cycle done — ${bot.credits} credits, ${endFuel}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
-
-    if (isFlockLeader && settings.flockEnabled && settings.flockName) {
-      await broadcastFlockHeartbeat(settings.flockName, bot.username);
-      lastFlockHeartbeat = Date.now();
-    }
   }
 
   // Unregister chat handler

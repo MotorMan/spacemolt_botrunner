@@ -927,6 +927,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
   let flockTargetSystemId = "";
   let flockPhase: FlockState["phase"] = "gathering";
   let flockGroup: FlockGroupConfig | undefined;
+  let lastFlockHeartbeat = 0;
 
   while (bot.state === "running") {
     // Clean up expired temporary blacklists
@@ -1078,8 +1079,14 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       flockTargetSystemId = "";
       flockPhase = "gathering";
     }
+
+    // ── Leader: broadcast heartbeat to keep flock state fresh ──
+    if (isFlockLeader && settings.flockEnabled && settings.flockName && (Date.now() - lastFlockHeartbeat) > 30_000) {
+      await broadcastFlockHeartbeat(settings.flockName, bot.username);
+      lastFlockHeartbeat = Date.now();
+    }
+
     let flockState: FlockState | null = null;
-    let lastFlockHeartbeat = 0;
 
     if (settings.flockEnabled && settings.flockName) {
       flockState = await readFlockState(settings.flockName);
@@ -1298,12 +1305,6 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       const wrecksResp = await bot.exec("get_wrecks");
       const wrecks = parseWrecks(wrecksResp.result);
       availableWrecks = wrecks.map((w: any) => ({ poiId: poi.id, wreckId: w.wreck_id }));
-
-      if (isFlockLeader && Date.now() - lastFlockHeartbeat > 30_000) {
-        await broadcastFlockHeartbeat(settings.flockName, bot.username);
-        lastFlockHeartbeat = Date.now();
-        ctx.log("flock", `Heartbeat: phase=${flockPhase}, wrecks at ${poi.name}=${wrecks.length}`);
-      }
 
           if (isFlockLeader) {
             // Leader reports found wrecks

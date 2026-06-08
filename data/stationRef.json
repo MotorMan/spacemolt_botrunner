@@ -174,7 +174,7 @@
       "regular_station_name": "Iron Reach Mining Colony",
       "underline_system_name": "iron_reach",
       "underline_station_name": "iron_reach_mining_colony",
-      "is_pirate": true
+      "is_pirate": false
     },
     {
       "station_id": "node_alpha_processing_station",
@@ -470,7 +470,7 @@
       "destination_system": "Iron Reach",
       "station_id": "iron_reach_mining_colony",
       "system_id": "iron_reach",
-      "is_pirate": true
+      "is_pirate": false
     },
     {
       "destination": "confederacy_central_command",
@@ -521,7 +521,7 @@
     "the_crucible_garrison": {"station_id": "the_crucible_garrison", "system_id": "the_crucible", "official_name": "The Crucible Garrison", "is_pirate": false},
     "sirius_observatory_station": {"station_id": "sirius_observatory_station", "system_id": "sirius", "official_name": "Sirius Observatory Station", "is_pirate": false},
     "mobile_capital": {"station_id": "mobile_capital", "system_id": "the_telescope", "official_name": "Frontier Station", "is_pirate": false},
-    "iron_reach_mining_colony": {"station_id": "iron_reach_mining_colony", "system_id": "iron_reach", "official_name": "Iron Reach Mining Colony", "is_pirate": true},
+    "iron_reach_mining_colony": {"station_id": "iron_reach_mining_colony", "system_id": "iron_reach", "official_name": "Iron Reach Mining Colony", "is_pirate": false},
     "node_alpha_processing_station": {"station_id": "node_alpha_processing_station", "system_id": "node_alpha", "official_name": "Node Alpha Processing Station", "is_pirate": false},
     "first_step_memorial_station": {"station_id": "first_step_memorial_station", "system_id": "first_step", "official_name": "First Step Memorial Station", "is_pirate": false},
     "the_rampart_checkpoint": {"station_id": "the_rampart_checkpoint", "system_id": "the_rampart", "official_name": "The Rampart Checkpoint", "is_pirate": false},
@@ -565,7 +565,7 @@
     "the_crucible": {"station_id": "the_crucible_garrison", "system_id": "the_crucible", "official_name": "The Crucible Garrison", "is_pirate": false},
     "sirius": {"station_id": "sirius_observatory_station", "system_id": "sirius", "official_name": "Sirius Observatory Station", "is_pirate": false},
     "the_telescope": {"station_id": "mobile_capital", "system_id": "the_telescope", "official_name": "Frontier Station", "is_pirate": false},
-    "iron_reach": {"station_id": "iron_reach_mining_colony", "system_id": "iron_reach", "official_name": "Iron Reach Mining Colony", "is_pirate": true},
+    "iron_reach": {"station_id": "iron_reach_mining_colony", "system_id": "iron_reach", "official_name": "Iron Reach Mining Colony", "is_pirate": false},
     "node_alpha": {"station_id": "node_alpha_processing_station", "system_id": "node_alpha", "official_name": "Node Alpha Processing Station", "is_pirate": false},
     "first_step": {"station_id": "first_step_memorial_station", "system_id": "first_step", "official_name": "First Step Memorial Station", "is_pirate": false},
     "the_rampart": {"station_id": "the_rampart_checkpoint", "system_id": "the_rampart", "official_name": "The Rampart Checkpoint", "is_pirate": false},
@@ -609,7 +609,7 @@
     "the_crucible_garrison": {"station_id": "the_crucible_garrison", "system_id": "the_crucible", "official_name": "The Crucible Garrison", "is_pirate": false},
     "sirius_observatory_station": {"station_id": "sirius_observatory_station", "system_id": "sirius", "official_name": "Sirius Observatory Station", "is_pirate": false},
     "mobile_capital": {"station_id": "mobile_capital", "system_id": "the_telescope", "official_name": "Frontier Station", "is_pirate": false},
-    "iron_reach_mining_colony": {"station_id": "iron_reach_mining_colony", "system_id": "iron_reach", "official_name": "Iron Reach Mining Colony", "is_pirate": true},
+    "iron_reach_mining_colony": {"station_id": "iron_reach_mining_colony", "system_id": "iron_reach", "official_name": "Iron Reach Mining Colony", "is_pirate": false},
     "node_alpha_processing_station": {"station_id": "node_alpha_processing_station", "system_id": "node_alpha", "official_name": "Node Alpha Processing Station", "is_pirate": false},
     "first_step_memorial_station": {"station_id": "first_step_memorial_station", "system_id": "first_step", "official_name": "First Step Memorial Station", "is_pirate": false},
     "the_rampart_checkpoint": {"station_id": "the_rampart_checkpoint", "system_id": "the_rampart", "official_name": "The Rampart Checkpoint", "is_pirate": false},
@@ -643,7 +643,7 @@
       "system_id": "iron_reach",
       "official_name": "Iron Reach Mining Colony",
       "system_security": "Lawless",
-      "is_pirate": true
+      "is_pirate": false
     },
     {
       "station_id": "dross_citadel",
@@ -688,7 +688,7 @@
       "destination_system": "Iron Reach",
       "station_id": "iron_reach_mining_colony",
       "system_id": "iron_reach",
-      "is_pirate": true
+      "is_pirate": false
     },
     {
       "destination": "confederacy_central_command",

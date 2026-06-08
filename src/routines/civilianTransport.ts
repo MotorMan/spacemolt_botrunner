@@ -31,7 +31,20 @@ interface RouteResult {
   poiName: string;
 }
 
-async function resolveDestination(bot: Bot, destinationId: string, destinationName: string): Promise<RouteResult | null> {
+async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: string, destinationName: string, destinationSystem?: string): Promise<RouteResult | null> {
+  if (destinationSystem) {
+    const allSystems = mapStore.getAllSystems();
+    const sysData = allSystems[destinationSystem];
+    if (sysData) {
+      const found = sysData.pois.find(
+        pp => pp.id === destinationId || pp.name.toLowerCase() === destinationName.toLowerCase(),
+      );
+      if (found) {
+        return { system: sysData.id, poi: found.id, poiName: found.name };
+      }
+    }
+  }
+
   const allSystems = mapStore.getAllSystems();
   for (const [, sysData] of Object.entries(allSystems)) {
     const found = sysData.pois.find(
@@ -92,6 +105,7 @@ interface TransportPassenger {
   citizenship: string;
   destination: string;
   destinationName: string;
+  destinationSystem?: string;
   fare: number;
   bio: string;
   routeData: unknown;
@@ -144,6 +158,7 @@ interface StationPassenger {
   citizenship: string;
   destination: string;
   destination_name: string;
+  destination_system?: string;
   bio?: string;
 }
 
@@ -160,6 +175,7 @@ interface AboardPassenger {
   citizenship: string;
   destination: string;
   destination_name: string;
+  destination_system?: string;
   fare: number;
   bio: string;
   ticks_remaining: number;
@@ -466,7 +482,7 @@ function parseListShips(result: unknown): FleetShip[] {
         first: directBerths.first || 0,
       };
     } else {
-      const classId = ((s.class_id || (s.class as Record<string, unknown>)?.id || s.ship_type || s.type || "") as string);
+      const classId = ((s.type || s.class_id || (s.class as Record<string, unknown>)?.id || s.ship_type || "") as string);
       const classData = catalog[classId];
       const caps = classData?.inherent_capabilities;
       const fromCaps = extractBerthsFromCapabilities(caps);
@@ -475,7 +491,7 @@ function parseListShips(result: unknown): FleetShip[] {
       }
     }
     
-    const typeId = (s.class_id || (s.class as Record<string, unknown>)?.id || s.ship_type || s.type || "") as string;
+    const typeId = (s.type || s.class_id || (s.class as Record<string, unknown>)?.id || s.ship_type || "") as string;
     return {
       shipId: (s.ship_id || s.id || "") as string,
       shipName: (s.name || s.ship_name || s.class_name || "") as string,
@@ -572,7 +588,7 @@ async function refreshFleetCache(ctx: RoutineContext): Promise<FleetShip[]> {
         
         ship.shipId = (shipData.id || ship.shipId) as string;
         ship.shipName = (shipData.name || ship.shipName) as string;
-        ship.type = (shipData.class_id || shipData.type || ship.type) as string;
+        ship.type = (shipData.type || shipData.class_id || ship.type) as string;
         ship.tier = (shipData.tier as number) ?? ship.tier;
         ship.cargoCapacity = (shipData.cargo_capacity || shipData.max_cargo || ship.cargoCapacity) as number;
         ship.cargoUsed = (shipData.cargo_used || ship.cargoUsed) as number;
@@ -584,7 +600,7 @@ async function refreshFleetCache(ctx: RoutineContext): Promise<FleetShip[]> {
           ship.berths = fromCaps;
         }
         
-        const modules = (detail.modules as unknown[]) || [];
+        const modules = (detail.modules as unknown[]) || (shipData.modules as unknown[]) || [];
         ctx.log("transport", `modules for ${ship.shipId}: ${modules.length} items`);
         if (totalBerths(ship.berths) === 0 && Array.isArray(modules) && modules.length > 0) {
           const fromMods = countPassengerModules(modules);
@@ -821,12 +837,14 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
     saveTransportState(state);
   } else {
     const currentShip = fleet.find(s => s.shipId === state!.shipId);
-    if (currentShip && totalBerths(currentShip.berths) > 0) {
+    if (currentShip) {
       state!.shipId = currentShip.shipId;
       state!.shipName = currentShip.shipName;
       state!.tier = currentShip.tier;
-      state!.berths = currentShip.berths;
-      state!.berths_used = { economy: 0, business: 0, first: 0 };
+      if (totalBerths(currentShip.berths) > 0) {
+        state!.berths = currentShip.berths;
+        state!.berths_used = { economy: 0, business: 0, first: 0 };
+      }
       saveTransportState(state!);
       ctx.log("transport", `Synced berths from fleet cache: ${state!.shipName} = ${state!.berths.economy}e/${state!.berths.business}b/${state!.berths.first}f`);
     }
@@ -868,7 +886,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
             existing.count++;
             continue;
           }
-          const resolved = await resolveDestination(bot, p.destination, p.destination_name);
+          const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
           let sys = resolved?.system || "";
           let poi = resolved?.poi || p.destination;
           if (!sys && mcLocation && (p.destination.toLowerCase() === "frontier_station" || p.destination_name.toLowerCase() === "frontier station")) {
@@ -886,6 +904,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           citizenship: p.citizenship,
           destination: p.destination,
           destinationName: p.destination_name,
+          destinationSystem: p.destination_system,
           fare: p.fare,
           bio: p.bio,
           routeData: p.route_data || null,
@@ -930,7 +949,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
             existing.count++;
             continue;
           }
-          const resolved = await resolveDestination(bot, p.destination, p.destination_name);
+          const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
           let sys = resolved?.system || "";
           let poi = resolved?.poi || p.destination;
           if (!sys && mcLocation && (p.destination.toLowerCase() === "frontier_station" || p.destination_name.toLowerCase() === "frontier station")) {
@@ -948,6 +967,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           citizenship: p.citizenship,
           destination: p.destination,
           destinationName: p.destination_name,
+          destinationSystem: p.destination_system,
           fare: p.fare,
           bio: p.bio,
           routeData: p.route_data || null,
@@ -1264,6 +1284,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           accommodationClass: p.class.toLowerCase() as "economy" | "business" | "first",
           destination: p.destination,
           destinationName: p.destination_name,
+          destinationSystem: p.destination_system,
           fare: 0,
           bio,
         });
@@ -1297,11 +1318,13 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       // For multi-destination tours, plan the route FIRST so loading order follows it.
       // This prevents stranding nearby passengers when distant destinations fill berths first.
       const mcLocation = mapStore.getMobileCapitolLocation();
+      ctx.log("transport", `Mobile capitol location: ${mcLocation ? `${mcLocation.systemId}/${mcLocation.poiId}` : 'not found'}`);
       const destDrafts: Array<{ system: string; poi: string; poiName: string; count: number }> = [];
       for (const [destId, ps] of byDest.entries()) {
-        const resolved = await resolveDestination(bot, destId, ps[0]?.destination_name || destId);
+        const resolved = await resolveDestination(ctx, bot, destId, ps[0]?.destination_name || destId, ps[0]?.destination_system);
         let sys = resolved?.system || "";
         let poi = resolved?.poi || destId;
+        ctx.log("transport", `Destination ${destId}: resolved=${sys ? `${sys}/${poi}` : 'NOT FOUND'}`);
         if (!sys && mcLocation && (destId.toLowerCase() === "frontier_station" || (ps[0]?.destination_name || "").toLowerCase() === "frontier station")) {
           sys = mcLocation.systemId;
           poi = mcLocation.poiId;
@@ -1310,6 +1333,11 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
       }
 
       const plannedRoute = planTourRoute(bot.system || "", destDrafts.filter(d => d.system), settings.maxJumps);
+      const filteredDests = destDrafts.filter(d => d.system);
+      const outsideJumpLimit = destDrafts.filter(d => !d.system);
+      if (outsideJumpLimit.length > 0) {
+        ctx.log("transport", `Passengers outside ${settings.maxJumps}-jump limit: ${outsideJumpLimit.map(d => d.poiName).join(", ")}`);
+      }
       ctx.log("transport", `Planned route BEFORE loading: ${plannedRoute.map(d => d.poiName).join(" → ") || "(none)"}`);
 
       // Now load in route order, one destination per loop, berth tally.
@@ -1400,7 +1428,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
 
         if (canFit <= 0) continue;
 
-        ctx.log("transport", `Loading up to ${canFit} passengers for ${leg.poiName} (${leg.poi})...`);
+        ctx.log("transport", `Loading up to ${canFit} passengers...`);
         if (bot.state !== "running") {
           ctx.log("transport", "Stop requested before issuing load_passenger — aborting.");
           state.status = "idle";
@@ -1409,7 +1437,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         }
         const loadResp = await bot.exec("load_passenger", { destination: leg.poi });
         if (loadResp.error) {
-          ctx.log("error", `load_passenger failed for ${leg.poi}: ${loadResp.error.message}`);
+          ctx.log("error", `load_passenger failed: ${loadResp.error.message}`);
           continue;
         }
         await ctx.sleep(11000);
@@ -1418,6 +1446,12 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           state.status = "idle";
           saveTransportState(state);
           break;
+        }
+        const verifyResp = await bot.exec("list_passengers");
+        if (!verifyResp.error && verifyResp.result) {
+          const verifyParsed = parseListPassengers(verifyResp.result);
+          const currentCount = verifyParsed?.passengers.length || 0;
+          ctx.log("transport", `After loading: ${currentCount} passengers aboard`);
         }
         bot.refreshStatus().catch(() => {});
       }
@@ -1449,6 +1483,14 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         ctx.log("transport", `WARNING: list_passengers failed: ${listResp.error?.message}`);
       }
 
+      if (aboard.length === 0) {
+        ctx.log("transport", "WARNING: No passengers were loaded despite planned route. Returning to idle.");
+        state.status = "idle";
+        saveTransportState(state);
+        await ctx.sleep(10000);
+        continue;
+      }
+
       // Build route from aboard passengers
       const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
       for (const p of aboard) {
@@ -1456,7 +1498,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         if (existing) {
           existing.count++;
         } else {
-          const resolved = await resolveDestination(bot, p.destination, p.destination_name);
+          const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
           if (resolved) {
             destMap.set(p.destination, { ...resolved, count: 1 });
           } else {
@@ -1503,6 +1545,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           citizenship: p.citizenship,
           destination: p.destination,
           destinationName: p.destination_name,
+          destinationSystem: p.destination_system,
           fare: p.fare,
           bio: p.bio,
           loadedAt: new Date().toISOString(),
@@ -1520,6 +1563,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
         citizenship: p.citizenship,
         destination: p.destination,
         destinationName: p.destination_name,
+        destinationSystem: p.destination_system,
         fare: p.fare,
         bio: p.bio,
         routeData: p.route_data || null,
@@ -1571,7 +1615,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           destinationName: p.destinationName,
         }));
         announceService.sendTransportAnnouncement(bot, {
-          shipName: state.shipName,
+          shipName: bot.shipName || state.shipName,
           route: routeNames,
           totalPassengers: onboard.length,
           currentSystem: bot.system || "",
@@ -1598,7 +1642,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           ctx.log("transport", `Route exhausted but ${state.onboardPassengers.length} passenger(s) remain — checking for new route...`);
           const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
           for (const p of state.onboardPassengers) {
-            const resolved = await resolveDestination(bot, p.destination, p.destinationName);
+            const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
             if (resolved) {
               destMap.set(p.destination, { ...resolved, count: 1 });
             } else {
@@ -1704,6 +1748,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
           citizenship: p.citizenship,
           destination: p.destination,
           destinationName: p.destinationName,
+          destinationSystem: p.destinationSystem,
           fare: farePerPassenger,
           bio: p.bio,
           loadedAt: p.loadedAt,
@@ -1760,7 +1805,7 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
             destinationName: p.destinationName,
           }));
           announceService.sendTransportAnnouncement(bot, {
-            shipName: state.shipName,
+            shipName: bot.shipName || state.shipName,
             route: routeNames,
             totalPassengers: completedPassengers.length,
             currentSystem: bot.system || "",

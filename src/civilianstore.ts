@@ -10,6 +10,7 @@ export interface CivilianPassenger {
   citizenship: string;
   destination: string;
   destinationName: string;
+  destinationSystem?: string;
   fare: number;
   bio: string;
   loadedAt: string;
@@ -24,6 +25,7 @@ export interface CivilianRecord {
   citizenship: string;
   destination: string;
   destinationName: string;
+  destinationSystem?: string;
   fare: number;
   bio: string;
   firstSeen: string;
@@ -35,6 +37,7 @@ export interface CivilianRecord {
   transportHistory: Array<{
     destination: string;
     destinationName: string;
+    destinationSystem?: string;
     fare: number;
     transportedAt: string;
     status: "delivered" | "stranded";
@@ -116,6 +119,7 @@ export class CivilianStore {
     accommodationClass: "economy" | "business" | "first";
     destination: string;
     destinationName: string;
+    destinationSystem?: string;
     fare: number;
     bio?: string;
   }): void {
@@ -142,6 +146,7 @@ export class CivilianStore {
       citizenship: "",
       destination: passenger.destination,
       destinationName: passenger.destinationName,
+      destinationSystem: passenger.destinationSystem,
       fare: passenger.fare,
       bio: passenger.bio || "",
       firstSeen: now,
@@ -169,6 +174,7 @@ export class CivilianStore {
         existing.transportHistory.push({
           destination: passenger.destination,
           destinationName: passenger.destinationName,
+          destinationSystem: passenger.destinationSystem,
           fare: passenger.fare,
           transportedAt: now,
           status: "delivered",
@@ -188,6 +194,7 @@ export class CivilianStore {
         citizenship: passenger.citizenship,
         destination: passenger.destination,
         destinationName: passenger.destinationName,
+        destinationSystem: passenger.destinationSystem,
         fare: passenger.fare,
         bio: passenger.bio,
         firstSeen: now,
@@ -200,6 +207,7 @@ export class CivilianStore {
           ? [{
               destination: passenger.destination,
               destinationName: passenger.destinationName,
+              destinationSystem: passenger.destinationSystem,
               fare: passenger.fare,
               transportedAt: now,
               status: "delivered",

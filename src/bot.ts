@@ -13,7 +13,7 @@ import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord, getDirectPathfinderJump, getCorrectionPathfinderJump, getCorrectionBearingAtTick, isPathfinderLandingAtVoid, type CorrectionPathfinderJump, getMccWindowInfo, type MccWindowInfo } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
 import { chatBuffer } from "./chatbuffer.js";
-import { loadSettings } from "./web/server.js";
+import { loadSettings, saveStoppedState } from "./web/server.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -508,6 +508,9 @@ docked = false;
             `\x1b[93m[system]${RESET} ⛔ Routine stopped — please install a new stabilizer before resuming.`
         );
       }
+
+      // Mark bot as stopped-by-emergency so it won't auto-restart on mass disconnect
+      saveStoppedState(this.username, "emergency");
 
       // Stop the routine immediately
       if (this._state === "running") {

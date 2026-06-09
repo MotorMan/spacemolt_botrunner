@@ -30,7 +30,7 @@ import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
-import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines } from "./web/server.js";
+import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState } from "./web/server.js";
 import { ChatWebServer } from "./web/chatserver.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
@@ -345,6 +345,12 @@ async function handlePathfinderCalc(action: WebAction): Promise<WebActionResult>
 }
 
 async function handleAutoRestart(botName: string): Promise<void> {
+  const stoppedState = getStoppedState(botName);
+  if (stoppedState) {
+    server.logSystem(`Bot ${botName} was stopped intentionally (${stoppedState}), skipping auto-restart`);
+    return;
+  }
+
   const bot = bots.get(botName);
   if (!bot || bot.state !== "error") return;
   
@@ -368,6 +374,9 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   if (bot.state === "error") {
     bot.clearError();
   }
+
+  // Clear any stopped state when manually starting the bot
+  clearStoppedState(botName);
 
   const routineKey = action.routine || "miner";
   const routine = ROUTINES[routineKey];
@@ -399,6 +408,7 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   bot.start(routineKey, routine.fn, chatStartOpts).then(() => {
     server.logSystem(`Bot ${bot.username} routine finished.`);
     server.clearBotAssignment(botName);
+    clearStoppedState(botName);
     // Clear params after routine completes
     (bot as unknown as Record<string, unknown>).routineParams = undefined;
   }).catch((err: unknown) => {
@@ -427,6 +437,7 @@ async function handleStop(action: WebAction): Promise<WebActionResult> {
 
   bot.stop();
   server.clearBotAssignment(botName);
+  saveStoppedState(botName, "user");
   server.logSystem(`Stop signal sent to ${bot.username}`);
   return { ok: true, message: `Stop signal sent to ${botName}` };
 }
@@ -440,6 +451,7 @@ async function handleStopAfterCycle(action: WebAction): Promise<WebActionResult>
   if (bot.state !== "running") return { ok: false, error: `${botName} is not running` };
 
   bot.stopAfterCycle();
+  saveStoppedState(botName, "user");
   server.logSystem(`Stop after cycle requested for ${bot.username}`);
   return { ok: true, message: `Stop after cycle requested for ${botName} — will stop after current transport cycle` };
 }
@@ -457,6 +469,7 @@ async function handleEmergencyReturn(): Promise<WebActionResult> {
   for (const bot of runningBots) {
     bot.stop();
     server.clearBotAssignment(bot.username);
+    saveStoppedState(bot.username, "emergency");
     server.logSystem(`Stop requested for ${bot.username}`);
   }
 
@@ -531,6 +544,7 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
   bots.delete(botName);
   server.clearBotAssignment(botName);
   server.removePerBotSettings(botName);
+  clearStoppedState(botName);
 
   // Delete session directory
   const sessionDir = join(SESSIONS_DIR, botName);
@@ -884,8 +898,13 @@ async function main(): Promise<void> {
             }
             const routineKey = getLastUsedRoutine(name) || assignments[name];
             if (routineKey && ROUTINES[routineKey]) {
-              server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-              await handleStart({ type: "start", bot: name, routine: routineKey });
+              const stoppedState = getStoppedState(name);
+              if (stoppedState) {
+                server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
+              } else {
+                server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+                await handleStart({ type: "start", bot: name, routine: routineKey });
+              }
             }
             return;
           }
@@ -923,8 +942,13 @@ async function main(): Promise<void> {
                 server.logSystem(`${name} logged in but no routine assigned`);
                 return;
               }
-              server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-              await handleStart({ type: "start", bot: name, routine: routineKey });
+              const stoppedState = getStoppedState(name);
+              if (stoppedState) {
+                server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
+              } else {
+                server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+                await handleStart({ type: "start", bot: name, routine: routineKey });
+              }
             }).catch((err) => {
               server.logSystem(`Forced login failed for ${name}: ${err}`);
               refreshStatusTable();
@@ -958,8 +982,13 @@ async function main(): Promise<void> {
                   server.logSystem(`${name} logged in but no routine assigned`);
                   return;
                 }
-                server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-                await handleStart({ type: "start", bot: name, routine: routineKey });
+                const stoppedState = getStoppedState(name);
+                if (stoppedState) {
+                  server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
+                } else {
+                  server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+                  await handleStart({ type: "start", bot: name, routine: routineKey });
+                }
               }).catch((err) => {
                 server.logSystem(`Login failed for ${name}: ${err}`);
                 refreshStatusTable();

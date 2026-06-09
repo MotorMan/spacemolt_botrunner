@@ -161,6 +161,43 @@ function getAllLastUsedRoutines(): LastUsedRoutineData {
 
 export { loadLastUsedRoutines, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines };
 
+const STOPPED_STATE_FILE = join(DATA_DIR, "stoppedState.json");
+
+export interface StoppedStateData {
+  [botUsername: string]: "user" | "emergency" | true;
+}
+
+function loadStoppedState(): StoppedStateData {
+  if (existsSync(STOPPED_STATE_FILE)) {
+    try {
+      return JSON.parse(readFileSync(STOPPED_STATE_FILE, "utf-8")) as StoppedStateData;
+    } catch (err) {
+      console.warn(`Warning: corrupt stoppedState.json, starting fresh —`, err);
+    }
+  }
+  return {};
+}
+
+export function saveStoppedState(botUsername: string, reason: "user" | "emergency" | true): void {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  const data = loadStoppedState();
+  data[botUsername] = reason;
+  writeFileSync(STOPPED_STATE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+export function getStoppedState(botUsername: string): "user" | "emergency" | true | null {
+  const data = loadStoppedState();
+  return data[botUsername] || null;
+}
+
+export function clearStoppedState(botUsername: string): void {
+  const data = loadStoppedState();
+  if (data[botUsername] !== undefined) {
+    delete data[botUsername];
+    writeFileSync(STOPPED_STATE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  }
+}
+
 /** Get the global system blacklist from settings. */
 export function getSystemBlacklist(): string[] {
   const settings = loadSettings();

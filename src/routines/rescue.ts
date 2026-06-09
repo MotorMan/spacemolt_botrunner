@@ -1341,20 +1341,20 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     // Verify actual credits via debug log
     ctx.log("rescue", `💰 ${member.username} has 5 consecutive 0 credit readings, verifying via debug log...`);
     const actualCredits = await getActualCreditsFromLog(member.username, ctx);
+    
     if (actualCredits === null) {
-      ctx.log("rescue", `💰 Failed to verify credits for ${member.username} from log, skipping`);
-      continue;
-    }
-
-    if (actualCredits >= minThreshold) {
+      ctx.log("rescue", `💰 Failed to verify credits for ${member.username} from log, but has ${consecutiveCount} consecutive 0 readings - proceeding with top-off as fallback`);
+    } else if (actualCredits >= minThreshold) {
       ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr (>= ${minThreshold}), false 0 reading. Resetting count.`);
       consecutiveZeroCredits.delete(member.username);
       continue;
+    } else {
+      ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr, needs top-off`);
     }
 
-    // Proceed with top-off using verified credits
-    const needed = targetAmount - actualCredits;
-    ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+    const verifiedCredits = actualCredits ?? 0;
+    const needed = targetAmount - verifiedCredits;
+    ctx.log("rescue", `💰 ${member.username} verified credits: ${verifiedCredits}, needs ${needed}cr to reach ${targetAmount}cr`);
 
     const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction, not source=faction
     if (withdrawResp.error) {

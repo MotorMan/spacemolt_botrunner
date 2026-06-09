@@ -567,117 +567,70 @@ function parseListShips(result: unknown): FleetShip[] {
   });
 }
 
-// ── Fleet / ship selection ───────────────────────────────────
+// ── Ship info ─────────────────────────────────────────────────
 
 function totalBerths(b: { economy: number; business: number; first: number }): number {
   return b.economy + b.business + b.first;
 }
 
-function pickBestShip(ctx: RoutineContext, fleet: FleetShip[]): FleetShip | null {
+async function getCurrentShipInfo(ctx: RoutineContext, shipId: string): Promise<{ shipId: string; shipName: string; customName: string | undefined; tier: number | null; berths: { economy: number; business: number; first: number } } | null> {
   const { bot } = ctx;
-  const currentId = bot.shipName || "";
-
-  // Filter ships that have any passenger berths
-  const withBerths = fleet.filter(s => totalBerths(s.berths) > 0);
-  if (withBerths.length === 0) return null;
-
-  // Sort by total berths descending; prefer higher tier as tiebreaker
-  withBerths.sort((a, b) => {
-    const tbA = totalBerths(a.berths);
-    const tbB = totalBerths(b.berths);
-    if (tbB !== tbA) return tbB - tbA;
-    const tA = a.tier || 0;
-    const tB = b.tier || 0;
-    return tB - tA;
-  });
-
-  return withBerths[0];
-}
-
-// ── Passenger / station selection ────────────────────────────
-
-async function refreshFleetCache(ctx: RoutineContext): Promise<FleetShip[]> {
-  const { bot } = ctx;
-  const resp = await bot.exec("list_ships");
+  const resp = await bot.exec("get_ship", { ship_id: shipId });
   if (resp.error || !resp.result) {
-    ctx.log("transport", "list_ships failed — using cached fleet data");
-    return loadFleetData(bot.username);
+    return null;
   }
-  let ships = parseListShips(resp.result);
+  const result = resp.result as Record<string, unknown>;
+  const shipData = (result.ship as Record<string, unknown>) || result;
+  const cls = (result.class as Record<string, unknown>) || (shipData.class as Record<string, unknown>);
   
-  const shipsNeedingDetails = ships.filter(s => totalBerths(s.berths) === 0);
-  if (shipsNeedingDetails.length > 0) {
+  const customName = (shipData.custom_name || shipData.customName) as string | undefined;
+  const classId = (shipData.class_id || cls?.id || "") as string;
+  const name = (shipData.name || shipData.ship_name || shipData.class_name || classId || "Unknown") as string;
+  const typeId = (shipData.type || shipData.class_id || cls?.id || "") as string;
+  const tier = (shipData.tier as number) ?? null;
+  const cargoCapacity = (shipData.cargo_capacity || shipData.max_cargo || 0) as number;
+  
+  let berths = { economy: 0, business: 0, first: 0 };
+  const directBerths = (shipData.passenger_berths || shipData.berths || {}) as Record<string, number>;
+  if (directBerths.economy || directBerths.business || directBerths.first) {
+    berths = {
+      economy: directBerths.economy || 0,
+      business: directBerths.business || 0,
+      first: directBerths.first || 0,
+    };
+  } else {
     const catalog = loadCatalog();
-    for (const ship of shipsNeedingDetails) {
-      const classId = ship.type;
-      const classData = catalog[classId];
-      if (classData) {
-        const caps = classData.inherent_capabilities;
-        const fromCaps = extractBerthsFromCapabilities(caps);
-        if (fromCaps) {
-          ship.berths = fromCaps;
-        }
-        if (totalBerths(ship.berths) === 0 && classData.special === "passenger_liner") {
-          ship.berths = { economy: 1, business: 0, first: 0 };
-        }
+    const classData = catalog[typeId];
+    if (classData) {
+      const caps = classData.inherent_capabilities;
+      const fromCaps = extractBerthsFromCapabilities(caps);
+      if (fromCaps) {
+        berths = fromCaps;
       }
-      
-      if (totalBerths(ship.berths) === 0) {
-        let detailResp: Record<string, unknown> | null = null;
-        try {
-          const result = await Promise.race([
-            bot.exec("get_ship", { ship_id: ship.shipId }),
-            new Promise<null>((_, reject) => setTimeout(() => reject(new Error("get_ship timeout")), 30000)),
-          ]);
-          if (result && typeof result === "object") {
-            detailResp = result as Record<string, unknown>;
-          }
-        } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          ctx.log("transport", `get_ship failed for ${ship.shipId}: ${msg}`);
-          continue;
-        }
-        
-        if (!detailResp || !detailResp.result) {
-          continue;
-        }
-        const detail = detailResp.result as Record<string, unknown>;
-        const shipData = (detail.ship as Record<string, unknown>) || detail;
-        const cls = (detail.class as Record<string, unknown>) || (shipData.class as Record<string, unknown>);
-        
-        ship.shipId = (shipData.id || ship.shipId) as string;
-        ship.shipName = (shipData.name || ship.shipName) as string;
-        ship.customName = ((shipData.custom_name || shipData.customName || ship.customName) as string) || undefined;
-        ship.type = (shipData.type || shipData.class_id || ship.type) as string;
-        ship.tier = (shipData.tier as number) ?? ship.tier;
-        ship.cargoCapacity = (shipData.cargo_capacity || shipData.max_cargo || ship.cargoCapacity) as number;
-        ship.cargoUsed = (shipData.cargo_used || ship.cargoUsed) as number;
-        ship.hasShipyard = (shipData.has_shipyard as boolean) ?? ship.hasShipyard;
-        
-        const caps = (cls?.inherent_capabilities as unknown);
-        const fromCaps = extractBerthsFromCapabilities(caps);
-        if (fromCaps) {
-          ship.berths = fromCaps;
-        }
-        
-        const modules = (detail.modules as unknown[]) || (shipData.modules as unknown[]) || [];
-        if (totalBerths(ship.berths) === 0 && Array.isArray(modules) && modules.length > 0) {
-          const fromMods = countPassengerModules(modules);
-          if (totalBerths(fromMods) > 0) {
-            ship.berths = fromMods;
-          }
-        }
-        if (totalBerths(ship.berths) === 0 && (cls?.special as string) === "passenger_liner") {
-          ship.berths = { economy: 1, business: 0, first: 0 };
-        }
+      if (totalBerths(berths) === 0 && classData.special === "passenger_liner") {
+        berths = { economy: 1, business: 0, first: 0 };
       }
     }
   }
   
-  saveFleetData(bot.username, ships);
-  ctx.log("transport", `Fleet cached: ${ships.length} ship(s)`);
-  return ships;
+  const modules = (shipData.modules as unknown[]) || [];
+  if (totalBerths(berths) === 0 && Array.isArray(modules) && modules.length > 0) {
+    const fromMods = countPassengerModules(modules);
+    if (totalBerths(fromMods) > 0) {
+      berths = fromMods;
+    }
+  }
+  
+  return {
+    shipId: (shipData.id || shipId) as string,
+    shipName: name,
+    customName: customName || undefined,
+    tier,
+    berths,
+  };
 }
+
+// ── Passenger / station selection ────────────────────────────
 
 async function selectPickupStation(
   ctx: RoutineContext,
@@ -876,41 +829,32 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
   const { bot } = ctx;
   const settings = getCivilianTransportSettings(bot.username);
   let state = loadTransportState(bot.username);
-  let fleet: FleetShip[] = loadFleetData(bot.username);
 
-  // Initial fleet refresh
-  try {
-    fleet = await refreshFleetCache(ctx);
-  } catch {
-    ctx.log("transport", "Initial fleet refresh failed — using cached data");
+  // Get current ship info via get_ship
+  const currentShipId = bot.shipId || "";
+  const currentShipInfo = currentShipId ? await getCurrentShipInfo(ctx, currentShipId) : null;
+  
+  if (!currentShipInfo || currentShipInfo.berths.economy + currentShipInfo.berths.business + currentShipInfo.berths.first === 0) {
+    ctx.log("error", "Current ship has no passenger berths or cannot be verified. Routine cannot run.");
+    return;
   }
-
+  
   // Initialize state if none or invalid
   if (!state || !isValidTransportState(state)) {
     clearTransportState(bot.username);
-    const best = pickBestShip(ctx, fleet);
-    if (!best) {
-      ctx.log("error", "No passenger-capable ship found in fleet. Routine cannot run.");
-      return;
-    }
-    state = makeNewState(bot, best.shipId, best.shipName, best.customName, best.tier, best.berths);
+    state = makeNewState(bot, currentShipInfo.shipId, currentShipInfo.shipName, currentShipInfo.customName, currentShipInfo.tier, currentShipInfo.berths);
     saveTransportState(state);
   } else {
-    const currentShip = fleet.find(s => s.shipId === state!.shipId);
-    if (currentShip) {
-      state!.shipId = currentShip.shipId;
-      state!.shipName = currentShip.shipName;
-      state!.customName = currentShip.customName;
-      state!.tier = currentShip.tier;
-      if (totalBerths(currentShip.berths) > 0) {
-        state!.berths = currentShip.berths;
-        state!.berths_used = { economy: 0, business: 0, first: 0 };
-      }
-      saveTransportState(state!);
-    }
+    // Verify state against current ship
+    state.shipId = currentShipInfo.shipId;
+    state.shipName = currentShipInfo.shipName;
+    state.customName = currentShipInfo.customName;
+    state.tier = currentShipInfo.tier;
+    state.berths = currentShipInfo.berths;
+    saveTransportState(state);
   }
 
-ctx.log("transport", `Civilian transport started. Ship: ${state.shipName}. Status: ${state.status}`);
+ctx.log("transport", `Civilian transport started. Ship: ${state.customName || state.shipName}. Status: ${state.status}`);
 
   if (state && state.status !== "idle") {
     const verifyResp = await bot.exec("list_passengers");
@@ -1095,15 +1039,6 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.shipName}. Statu
       }
     }
 
-    // ── Refresh shuttle fleet periodically ──
-    if (Math.random() < 0.1) {
-      try {
-        fleet = await refreshFleetCache(ctx);
-      } catch {
-        // silent refresh failure
-      }
-    }
-
     // --- State machine ---
     if (state.status === "idle") {
       // Need to find passengers and load up
@@ -1139,47 +1074,6 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.shipName}. Statu
       const alreadyAtPickup = bot.docked && poiMatch && sysMatch;
       
       if (!alreadyAtPickup) {
-        // Check if we need to switch to the best passenger ship first
-        const bestNow = pickBestShip(ctx, fleet);
-        const targetShipId = bestNow ? bestNow.shipId : state.shipId;
-
-        if (targetShipId !== state.shipId) {
-          const targetShip = fleet.find(s => s.shipId === targetShipId);
-          if (targetShip) {
-            if (targetShip.storedAtSystemId !== bot.system || targetShip.storedAtStationId !== bot.poi) {
-              const shipSystem = targetShip.storedAtSystemId || targetShip.storedAtStationId;
-              if (shipSystem && shipSystem !== bot.system) {
-                state.status = "traveling_to_ship";
-                saveTransportState(state);
-                const ok = await navigateToSystem(ctx, shipSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
-                if (!ok) {
-                  state.status = "idle";
-                  saveTransportState(state);
-                  await ctx.sleep(30000);
-                  continue;
-                }
-              }
-              const docked = await ensureDocked(ctx);
-              if (!docked) {
-                state.status = "idle";
-                saveTransportState(state);
-                await ctx.sleep(30000);
-                continue;
-              }
-            }
-
-            const switchResp = await bot.exec("switch_ship", { ship_id: targetShipId });
-            if (!switchResp.error) {
-              state.shipId = targetShipId;
-              state.shipName = targetShip.shipName;
-              state.customName = targetShip.customName;
-              state.tier = targetShip.tier;
-              state.berths = targetShip.berths;
-              saveTransportState(state);
-            }
-          }
-        }
-
         // Travel to pickup station and dock
         if (!state.pickupStation || !state.pickupSystem) {
           state.status = "idle";

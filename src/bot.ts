@@ -124,6 +124,7 @@ export class Bot {
   poi = "";
 docked = false;
   shipName = "";
+  shipId = "";
   shipClass = "";
   tier: number | null = null;
   hull = 0;
@@ -967,6 +968,9 @@ docked = false;
         this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
         // Cache ship speed (1-6, where 1=slowest at 120s/jump, 6=fastest at 30s/jump)
         this.shipSpeed = (ship.speed as number) || 1;
+        
+        // Ship ID
+        this.shipId = (ship.id as string) || "";
         
         // Ammo is stored per-weapon-module, not at ship level.
         // get_status may return modules as full objects or just IDs.

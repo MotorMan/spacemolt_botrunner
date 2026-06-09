@@ -130,6 +130,9 @@ const SHIP_PASSIVE_RECIPE_IDS = new Set([
 const BLACKLISTED_RECIPES = new Set([
   "basic_silicon_refinement", // Noob trap - severe waste of basic materials
   "Fabricate Circuit Boards", // Force base materials only - never use expensive alternate paths
+  "Synthesize Energy Crystal", // Extremely wasteful - raw materials are easier to obtain
+  "Synthesize Xenon Power Cell", // Extremely wasteful - raw materials are easier to obtain
+  "Chlorine Circuit Etching", // Extremely wasteful - raw materials are easier to obtain
 ]);
 
 /** Recipes that should be heavily penalized - only use as absolute last resort */

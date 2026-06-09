@@ -8496,6 +8496,22 @@ async function renderCrafterSettings(panel) {
       <input type="number" id="set-crafter-repairThreshold" min="20" max="80" value="${repairThreshold}">
     </div>
 
+    <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
+        <div class="setting-label">Blacklisted Recipes</div>
+        <div class="setting-hint">Recipes that will NEVER be used for crafting (extremely wasteful). Add recipe IDs to prevent their use.</div>
+      </div>
+      <div style="flex:1">
+        <div id="blacklisted-recipes-list" style="max-height:100px;overflow-y:auto;margin-bottom:6px;font-size:11px">
+          ${renderBlacklistedRecipesList()}
+        </div>
+        <div style="display:flex;gap:6px">
+          <input type="text" id="blacklisted-recipe-input" placeholder="recipe_id (e.g., synthesize_energy_crystal)" style="flex:1;font-size:11px;padding:4px">
+          <button class="sm primary" onclick="addBlacklistedRecipe()">Add</button>
+        </div>
+      </div>
+    </div>
+
     <div class="settings-save-bar">
       <button class="sm" onclick="cachedSettingsRecipes=null;renderCrafterSettings(document.getElementById('settingsContent'))">Refresh Recipes</button>
       <button class="primary" onclick="saveCrafterSettings()">Save Settings</button>
@@ -8726,6 +8742,7 @@ function saveCrafterSettings() {
       excludeCategories: autoBuyExcludeCategories,
     },
     requestItems,
+    blacklistedRecipes: settings.crafter.blacklistedRecipes || [],
   };
   send({ type: 'saveSettings', routine: 'crafter', settings: s });
 
@@ -8965,6 +8982,48 @@ function deleteCrafterProfile() {
     window._currentCrafterProfile = "Default Crafter";
   }
 
+  saveCrafterSettings();
+}
+
+// ── Ship Loadouts ───────────────────────────────────────
+
+// ── Blacklisted Recipes Management ───────────────────────
+
+function renderBlacklistedRecipesList() {
+  const blacklisted = settings.crafter?.blacklistedRecipes || [];
+  if (blacklisted.length === 0) {
+    return '<span style="color:var(--dim);">No recipes blacklisted (only defaults apply)</span>';
+  }
+  return blacklisted.map(id => `
+    <div style="display:flex;align-items:center;gap:4px;margin-bottom:2px">
+      <span>${esc(id)}</span>
+      <button style="margin-left:auto;font-size:10px;padding:2px 6px;background:#d32f2f;color:#fff;border:none;border-radius:3px;cursor:pointer" onclick="removeBlacklistedRecipe('${esc(id)}')">✕ Remove</button>
+    </div>
+  `).join('');
+}
+
+function addBlacklistedRecipe() {
+  const input = document.getElementById('blacklisted-recipe-input');
+  const recipeId = input?.value.trim();
+  if (!recipeId) return;
+  
+  if (!settings.crafter) settings.crafter = {};
+  if (!settings.crafter.blacklistedRecipes) settings.crafter.blacklistedRecipes = [];
+  
+  const blacklisted = settings.crafter.blacklistedRecipes;
+  if (!blacklisted.includes(recipeId)) {
+    blacklisted.push(recipeId);
+    input.value = '';
+    saveCrafterSettings();
+  } else {
+    alert(`Recipe "${recipeId}" is already blacklisted.`);
+  }
+}
+
+function removeBlacklistedRecipe(recipeId) {
+  if (!settings.crafter?.blacklistedRecipes) return;
+  
+  settings.crafter.blacklistedRecipes = settings.crafter.blacklistedRecipes.filter(id => id !== recipeId);
   saveCrafterSettings();
 }
 

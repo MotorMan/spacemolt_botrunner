@@ -127,13 +127,21 @@ const SHIP_PASSIVE_RECIPE_IDS = new Set([
 ]);
 
 /** Recipes that should NEVER be used - they are inefficient/wasteful */
-const BLACKLISTED_RECIPES = new Set([
+const DEFAULT_BLACKLISTED_RECIPES = new Set([
   "basic_silicon_refinement", // Noob trap - severe waste of basic materials
-  "Fabricate Circuit Boards", // Force base materials only - never use expensive alternate paths
-  "Synthesize Energy Crystal", // Extremely wasteful - raw materials are easier to obtain
-  "Synthesize Xenon Power Cell", // Extremely wasteful - raw materials are easier to obtain
-  "Chlorine Circuit Etching", // Extremely wasteful - raw materials are easier to obtain
+  "fabricate_circuit_boards", // Force base materials only - never use expensive alternate paths
+  "synthesize_energy_crystal", // Extremely wasteful - raw materials are easier to obtain
+  "synthesize_xenon_power_cell", // Extremely wasteful - raw materials are easier to obtain
+  "chlorine_circuit_etching", // Extremely wasteful - raw materials are easier to obtain
 ]);
+
+/** Get the current set of blacklisted recipes (combines defaults with user-configured). */
+export function getBlacklistedRecipes(): Set<string> {
+  const all = readSettings();
+  const c = all.crafter || {};
+  const userBlacklisted = (c.blacklistedRecipes as string[]) || [];
+  return new Set([...DEFAULT_BLACKLISTED_RECIPES, ...userBlacklisted]);
+}
 
 /** Recipes that should be heavily penalized - only use as absolute last resort */
 const PENALTY_RECIPES: Record<string, number> = {
@@ -153,9 +161,18 @@ export function getCrafterSettings(): {
   botQuotaOverrides: Record<string, Record<string, number>>;
   goalProcessingMode: GoalProcessingMode;
   autoBuy: AutoBuySettings;
+  blacklistedRecipes: string[];
 } {
   const all = readSettings();
   const c = all.crafter || {};
+
+  const blacklistedRecipes: string[] = (c.blacklistedRecipes as string[]) || [
+    "basic_silicon_refinement",
+    "fabricate_circuit_boards",
+    "synthesize_energy_crystal",
+    "synthesize_xenon_power_cell",
+    "chlorine_circuit_etching",
+  ];
 
 
 
@@ -261,6 +278,7 @@ export function getCrafterSettings(): {
     botQuotaOverrides,
     goalProcessingMode,
     autoBuy,
+    blacklistedRecipes,
   };
 }
 
@@ -796,9 +814,10 @@ async function craftPrerequisites(
     // Score each recipe by material availability
     let bestRecipe: Recipe | null = null;
     let bestScore = -Infinity;
+    const blacklistedRecipes = getBlacklistedRecipes();
     for (const r of allRecipesForComp) {
       // Skip blacklisted recipes
-      if (BLACKLISTED_RECIPES.has(r.recipe_id)) continue;
+      if (blacklistedRecipes.has(r.recipe_id)) continue;
 
       let score = 0;
       let totalNeeded = 0;
@@ -977,7 +996,8 @@ async function craftFromCategories(
     if (!enabledCategories.includes(recipeCategory)) continue;
 
     // Skip blacklisted recipes
-    if (BLACKLISTED_RECIPES.has(recipe.recipe_id)) continue;
+    const blacklistedRecipes = getBlacklistedRecipes();
+    if (blacklistedRecipes.has(recipe.recipe_id)) continue;
 
     // Skip recipes with no ingredients
     if (recipe.components.length === 0) continue;

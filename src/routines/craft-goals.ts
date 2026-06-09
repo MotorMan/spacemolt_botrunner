@@ -8,6 +8,8 @@
  * 4. Returns a flat crafting order (prerequisites first)
  */
 
+import { readSettings } from "./common.js";
+
 interface Recipe {
   recipe_id: string;
   name: string;
@@ -42,7 +44,7 @@ interface CraftingPlan {
   totalSteps: number;
 }
 
-const BLACKLISTED_RECIPES = new Set([
+const DEFAULT_BLACKLISTED_RECIPES = new Set([
   "basic_silicon_refinement",
   "wrap_processed_thorium",
   "wrap_thorium_fuel_rod",
@@ -54,7 +56,17 @@ const BLACKLISTED_RECIPES = new Set([
   "wrap_low_enriched_uranium",
   "wrap_liquid_tritium",
   "wrap_uranium_hexafluoride",
+  "synthesize_energy_crystal",
+  "synthesize_xenon_power_cell",
+  "chlorine_circuit_etching",
 ]);
+
+export function getBlacklistedRecipes(): Set<string> {
+  const all = readSettings();
+  const c = all.crafter || {};
+  const userBlacklisted = (c.blacklistedRecipes as string[]) || [];
+  return new Set([...DEFAULT_BLACKLISTED_RECIPES, ...userBlacklisted]);
+}
 
 const PENALTY_RECIPES: Record<string, number> = {
   "synthesize_bio_polymer": -1000,
@@ -75,7 +87,8 @@ export function scoreRecipeAvailability(
   recipe: Recipe,
   countItemFn: (itemId: string) => number,
 ): number {
-  if (BLACKLISTED_RECIPES.has(recipe.recipe_id)) {
+  const blacklistedRecipes = getBlacklistedRecipes();
+  if (blacklistedRecipes.has(recipe.recipe_id)) {
     return -Infinity;
   }
 
@@ -122,7 +135,8 @@ export function findRecipeForItem(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
 ): Recipe | null {
-  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok);
+  const blacklistedRecipes = getBlacklistedRecipes();
+  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok && !blacklistedRecipes.has(r.recipe_id));
 
   if (candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
@@ -330,7 +344,8 @@ export function findAllRecipesForItem(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
 ): Recipe[] {
-  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok);
+  const blacklistedRecipes = getBlacklistedRecipes();
+  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok && !blacklistedRecipes.has(r.recipe_id));
   if (candidates.length === 0) return [];
 
   const unwrapCandidates = candidates.filter(isUnwrapRecipe);

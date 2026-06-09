@@ -1484,9 +1484,17 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           } else if (cls === "business" && usedBusiness < capBusiness) {
             canLoad = true;
             usedBusiness++;
-          } else if (cls === "economy" && usedEconomy < capEconomy) {
-            canLoad = true;
-            usedEconomy++;
+          } else if (cls === "economy") {
+            if (usedEconomy < capEconomy) {
+              canLoad = true;
+              usedEconomy++;
+            } else if (usedBusiness < capBusiness) {
+              canLoad = true;
+              usedBusiness++;
+            } else if (usedFirst < capFirst) {
+              canLoad = true;
+              usedFirst++;
+            }
           }
           
           if (!canLoad) continue;

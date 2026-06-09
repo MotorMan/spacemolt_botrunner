@@ -19293,6 +19293,7 @@ async function renderCivilianTransportSettings(panel) {
   const refuelThreshold = ct.refuelThreshold ?? 50;
   const repairThreshold = ct.repairThreshold ?? 40;
   const maxJumps = Number(ct.maxJumps ?? 5);
+  const roundsBeforeMoving = Number(ct.roundsBeforeMoving ?? 5);
 
   const general = settings.general || {};
   const homeSystem = ct.homeSystem || general.homeSystem || '';
@@ -19320,6 +19321,14 @@ async function renderCivilianTransportSettings(panel) {
         <div class="setting-hint">Limit how far the bot will travel to pick up passengers. A lower value keeps runs short and fast.</div>
       </div>
       <input type="number" id="set-civilian_transport-maxJumps" min="1" max="50" value="${esc(String(maxJumps))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Rounds before moving</div>
+        <div class="setting-hint">Number of rounds with no passengers before the bot moves to the next closest station.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-roundsBeforeMoving" min="1" max="50" value="${esc(String(roundsBeforeMoving))}">
     </div>
 
     <div class="setting-row">
@@ -19415,6 +19424,7 @@ async function renderCivilianTransportSettings(panel) {
 
 function saveCivilianTransportSettings() {
   const maxJumps = Number(document.getElementById('set-civilian_transport-maxJumps')?.value || 5);
+  const roundsBeforeMoving = Number(document.getElementById('set-civilian_transport-roundsBeforeMoving')?.value || 5);
   const refuelThreshold = Number(document.getElementById('set-civilian_transport-refuelThreshold')?.value || 50);
   const repairThreshold = Number(document.getElementById('set-civilian_transport-repairThreshold')?.value || 40);
   const homeStation = document.getElementById('set-civilian_transport-homeStation')?.value || '';
@@ -19436,6 +19446,7 @@ function saveCivilianTransportSettings() {
   }
 
   s.maxJumps = maxJumps;
+  s.roundsBeforeMoving = roundsBeforeMoving;
   s.refuelThreshold = refuelThreshold;
   s.repairThreshold = repairThreshold;
   s.maxPassengers = maxPassengers;

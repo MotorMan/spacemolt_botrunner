@@ -25,5 +25,5 @@ export interface StationRef {
   by_station_id: Record<string, StationInfo>;
   by_system_id: Record<string, StationInfo>;
   by_underline_name: Record<string, StationInfo>;
-  pirate_stations: Array<Omit<StationInfo, keyof PassengerDestination>>;
+  pirate_stations: StationInfo[];
 }

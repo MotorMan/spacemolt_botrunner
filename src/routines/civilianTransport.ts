@@ -73,7 +73,8 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
     const routeResp = await bot.exec("find_route", { target: destinationId });
     if (!routeResp.error && routeResp.result) {
       const result = routeResp.result as Record<string, unknown>;
-      if (result.found) {
+      const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
+      if (isFound) {
         return {
           system: (result.target_system as string) || "",
           poi: (result.target_poi as string) || destinationId,
@@ -92,22 +93,26 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
   
   const byUnderline = stationRef.by_underline_name[destinationId.toLowerCase()];
   if (byUnderline) {
-    ctx.log("transport", `resolveDestination: found in by_underline_name: system=${byUnderline.system_id}`);
+    ctx.log("transport", `resolveDestination: found in by_underline_name: system=${byUnderline.system_id}, station=${byUnderline.station_id}, name=${byUnderline.regular_station_name || byUnderline.station_id}`);
     if (isPirateDestination(byUnderline.station_id, byUnderline.system_id)) {
-      ctx.log("transport", `resolveDestination: rejecting pirate destination ${byUnderline.station_id}`);
+      ctx.log("transport", `resolveDestination: REJECTING pirate destination ${byUnderline.station_id}`);
       return null;
     }
-    return { system: byUnderline.system_id, poi: byUnderline.station_id, poiName: byUnderline.regular_station_name || byUnderline.station_id, origDest: destinationId };
+    const result = { system: byUnderline.system_id, poi: byUnderline.station_id, poiName: byUnderline.regular_station_name || byUnderline.station_id, origDest: destinationId };
+    ctx.log("transport", `resolveDestination: SUCCESS returning system=${result.system}, poi=${result.poi}`);
+    return result;
   }
 
   const byStationId = stationRef.by_station_id[destinationId.toLowerCase()];
   if (byStationId) {
-    ctx.log("transport", `resolveDestination: found in by_station_id: system=${byStationId.system_id}`);
+    ctx.log("transport", `resolveDestination: found in by_station_id: system=${byStationId.system_id}, station=${byStationId.station_id}`);
     if (isPirateDestination(byStationId.station_id, byStationId.system_id)) {
-      ctx.log("transport", `resolveDestination: rejecting pirate destination ${byStationId.station_id}`);
+      ctx.log("transport", `resolveDestination: REJECTING pirate destination ${byStationId.station_id}`);
       return null;
     }
-    return { system: byStationId.system_id, poi: byStationId.station_id, poiName: byStationId.official_name || byStationId.station_id, origDest: destinationId };
+    const result = { system: byStationId.system_id, poi: byStationId.station_id, poiName: byStationId.official_name || byStationId.station_id, origDest: destinationId };
+    ctx.log("transport", `resolveDestination: SUCCESS returning system=${result.system}, poi=${result.poi}`);
+    return result;
   }
 
   for (const st of stationRef.stations) {
@@ -125,53 +130,29 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
       regularNameLower.includes(destLower) || destLower.includes(regularNameLower);
     
     if (stationIdMatch || underlineMatch || regularNameMatch || nameMatch || partialMatch) {
-      ctx.log("transport", `resolveDestination: found in stations: system=${st.system_id}`);
+      ctx.log("transport", `resolveDestination: found in stations: system=${st.system_id}, station=${st.station_id}`);
       if (isPirateDestination(st.station_id, st.system_id)) {
-        ctx.log("transport", `resolveDestination: rejecting pirate destination ${st.station_id}`);
+        ctx.log("transport", `resolveDestination: REJECTING pirate destination ${st.station_id}`);
         return null;
       }
-      return { system: st.system_id, poi: st.station_id, poiName: st.regular_station_name || st.station_id, origDest: destinationId };
+      const result = { system: st.system_id, poi: st.station_id, poiName: st.regular_station_name || st.station_id, origDest: destinationId };
+      ctx.log("transport", `resolveDestination: SUCCESS returning system=${result.system}, poi=${result.poi}`);
+      return result;
     }
   }
   
-  if (destinationSystem) {
-    let sysData: { id: string; name: string; pois: { id: string; name: string }[] } | undefined;
-    
-    const directKey = Object.keys(allSystems).find(k => k === destinationSystem || k.toLowerCase() === destinationSystem.toLowerCase());
-    if (directKey) {
-      sysData = allSystems[directKey];
-    } else {
-      const entry = Object.entries(allSystems).find(([, s]) => {
-        const sysName = s.name || s.id || "";
-        return sysName.toLowerCase() === destinationSystem.toLowerCase();
-      });
-      sysData = entry?.[1];
-    }
-    
-    if (sysData) {
-      const found = sysData.pois.find(
-        (pp: { id: string; name: string }) => pp.id === destinationId || pp.name.toLowerCase() === destinationName.toLowerCase(),
-      );
-      if (found) {
-        if (isPirateDestination(found.id, sysData.id)) {
-          ctx.log("transport", `resolveDestination: rejecting pirate destination ${found.id} in system ${sysData.id}`);
-          return null;
-        }
-        return { system: sysData.id, poi: found.id, poiName: found.name || found.id, origDest: destinationId };
-      }
-    }
-  }
-
   for (const [, sysData] of Object.entries(allSystems)) {
     const found = sysData.pois.find(
       (pp: { id: string; name: string }) => pp.id === destinationId || pp.name.toLowerCase() === destinationName.toLowerCase(),
     );
     if (found) {
       if (isPirateDestination(found.id, sysData.id)) {
-        ctx.log("transport", `resolveDestination: rejecting pirate destination ${found.id} in system ${sysData.id}`);
+        ctx.log("transport", `resolveDestination: REJECTING pirate destination ${found.id} in system ${sysData.id}`);
         return null;
       }
-      return { system: sysData.id, poi: found.id, poiName: found.name || found.id, origDest: destinationId };
+      const result = { system: sysData.id, poi: found.id, poiName: found.name || found.id, origDest: destinationId };
+      ctx.log("transport", `resolveDestination: SUCCESS (allSystems scan) system=${result.system}, poi=${result.poi}`);
+      return result;
     }
   }
 
@@ -199,62 +180,74 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
   }
 
   if (bestStationMatch && bestMatchScore >= 5) {
-    ctx.log("transport", `resolveDestination: fallback to find_route for ${destinationId} via system ${bestStationMatch.system_id}`);
+    ctx.log("transport", `resolveDestination: fallback bestMatchScore=${bestMatchScore}, station=${bestStationMatch.station_id}, system=${bestStationMatch.system_id}`);
     const routeResp = await bot.exec("find_route", { target_system: bestStationMatch.system_id });
     if (!routeResp.error && routeResp.result) {
       const result = routeResp.result as Record<string, unknown>;
-      if (result.found) {
+      const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
+      if (isFound) {
         const targetSystem = (result.target_system as string) || "";
         const targetPoi = (result.target_poi as string) || bestStationMatch.station_id;
         if (!isPirateDestination(targetPoi, targetSystem)) {
-          return {
+          const ret = {
             system: targetSystem,
             poi: targetPoi,
             poiName: ((result.target_poi_name as string) || bestStationMatch.regular_station_name || bestStationMatch.station_id) as string,
             origDest: destinationId,
           };
+          ctx.log("transport", `resolveDestination: SUCCESS (find_route fallback) system=${ret.system}, poi=${ret.poi}`);
+          return ret;
         }
+        ctx.log("transport", `resolveDestination: REJECTING pirate destination from find_route fallback: ${targetPoi}`);
       }
     }
   }
-
+  
   let targetSystemId: string | null = null;
   
   if (destinationSystem) {
+    ctx.log("transport", `resolveDestination: trying destinationSystem=${destinationSystem}`);
     const directKey = Object.keys(allSystems).find(k => k === destinationSystem || k.toLowerCase() === destinationSystem.toLowerCase());
     if (directKey) {
       targetSystemId = directKey;
+      ctx.log("transport", `resolveDestination: matched system by direct key: ${targetSystemId}`);
     } else {
-      const sysMatch = Object.entries(allSystems).find(([, s]) => {
+      const entry = Object.entries(allSystems).find(([, s]) => {
         const sysName = s.name || s.id || "";
         return sysName.toLowerCase() === destinationSystem.toLowerCase();
       });
-      if (sysMatch) {
-        targetSystemId = sysMatch[0];
+      if (entry) {
+        targetSystemId = entry[0];
+        ctx.log("transport", `resolveDestination: matched system by name: ${targetSystemId}`);
       }
     }
   }
 
-  if (!targetSystemId) {
+if (!targetSystemId) {
     ctx.log("transport", `resolveDestination: could not resolve system ID for ${destinationSystem}`);
     if (destinationSystem) {
       const routeResp = await bot.exec("find_route", { target_system: destinationSystem });
       if (!routeResp.error && routeResp.result) {
         const result = routeResp.result as Record<string, unknown>;
-        if (result.found) {
+        const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
+        if (isFound) {
           const targetSystem = (result.target_system as string) || "";
           const targetPoi = (result.target_poi as string) || destinationId;
           if (!isPirateDestination(targetPoi, targetSystem)) {
-            return {
+            const ret = {
               system: targetSystem,
               poi: targetPoi,
               poiName: ((result.target_poi_name as string) || destinationName || targetPoi) as string,
               origDest: destinationId,
             };
+            ctx.log("transport", `resolveDestination: SUCCESS (destinationSystem fallback) system=${ret.system}, poi=${ret.poi}`);
+            return ret;
           }
+          ctx.log("transport", `resolveDestination: REJECTING pirate destination from destinationSystem fallback: ${targetPoi}`);
         }
       }
     }
+    ctx.log("transport", `resolveDestination: FAILED - could not resolve destination ${destinationId}`);
     return null;
   }
   
@@ -265,22 +258,26 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
     return null;
   }
   const result = routeResp.result as Record<string, unknown>;
-  if (!result.found) {
+  const isFound = result.found || result.target_system || (result.route && (result.route as Array<{system_id: string}>).length > 0);
+  if (!isFound) {
     ctx.log("transport", `resolveDestination: find_route not found for ${destinationId}`);
+    ctx.log("transport", `resolveDestination: FAILED - no route found`);
     return null;
   }
   const targetSystem = (result.target_system as string) || "";
   const targetPoi = (result.target_poi as string) || destinationId;
   if (isPirateDestination(targetPoi, targetSystem)) {
-    ctx.log("transport", `resolveDestination: rejecting pirate destination ${targetPoi} in system ${targetSystem}`);
+    ctx.log("transport", `resolveDestination: REJECTING pirate destination ${targetPoi} in system ${targetSystem}`);
     return null;
   }
-  return {
+  const ret = {
     system: targetSystem,
     poi: targetPoi,
     poiName: ((result.target_poi_name as string) || destinationName || targetPoi) as string,
     origDest: destinationId,
   };
+  ctx.log("transport", `resolveDestination: SUCCESS (find_route) system=${ret.system}, poi=${ret.poi}`);
+  return ret;
 }
 
 interface CatalogShip {
@@ -993,7 +990,11 @@ async function selectNextPickupStation(
   if (availableStations.length === 0) {
     ctx.log("transport", `All empire stations already checked, starting fresh with ${empireStations[0].poiName}`);
     const randomStation = getRandomEmpireStation(empireLower);
-    if (!randomStation) return null;
+    if (!randomStation) {
+      ctx.log("transport", `No random station found for empire ${empireLower}`);
+      return null;
+    }
+    ctx.log("transport", `Selected random station: ${randomStation.poiName} (${randomStation.systemId})`);
     return { system: randomStation.systemId, poi: randomStation.poiId, poiName: randomStation.poiName };
   }
 
@@ -1006,10 +1007,12 @@ async function selectNextPickupStation(
   const blacklist = getSystemBlacklist();
   const knownSystems = mapStore.getAllSystems();
   
-  const stationsWithHops = availableStations.map(s => {
+const stationsWithHops = availableStations.map(s => {
     const hops = hopsBetweenSync(currentSystem, s.systemId);
     return { ...s, hops };
   }).filter(s => s.hops <= settings.maxJumps && !blacklist.includes(s.systemId));
+  
+  ctx.log("transport", `Found ${stationsWithHops.length} reachable stations out of ${availableStations.length}`);
   
   if (stationsWithHops.length === 0) {
     let nearest: EmpireStation & { dist: number } = { ...availableStations[0], dist: 9999 };
@@ -1019,6 +1022,7 @@ async function selectNextPickupStation(
         nearest = { ...s, dist };
       }
     }
+    ctx.log("transport", `No stations within ${settings.maxJumps} hops, falling back to nearest: ${nearest.poiName}`);
     return { system: nearest.systemId, poi: nearest.poiId, poiName: nearest.poiName };
   }
   
@@ -1038,10 +1042,21 @@ async function hopsBetween(a: string, b: string, bot: Bot): Promise<number> {
   const routeResp = await bot.exec("find_route", { target_system: b });
   if (!routeResp.error && routeResp.result) {
     const result = routeResp.result as Record<string, unknown>;
-    if (result.found) {
-      return 1;
+    // Check for valid route in multiple formats
+    if (result.found || result.target_system) {
+      const jumps = (result.total_jumps as number) || (result.route && (result.route as Array<{system_id: string}>).length - 1) || 1;
+      return Math.max(0, typeof jumps === 'number' ? jumps : 1);
     }
+    // Also check if route array exists (server may not set 'found' but still return valid route)
+    const serverRoute = result.route as Array<{ system_id: string }> | undefined;
+    if (serverRoute && serverRoute.length > 0) {
+      const jumps = serverRoute.length - 1;
+      return Math.max(0, jumps);
+    }
+  } else if (routeResp.error) {
+    // Error already handled
   }
+  console.log(`hopsBetween: no route found from ${a} to ${b}`);
   return 9999;
 }
 
@@ -1052,8 +1067,14 @@ async function planTourRoute(
   bot: Bot,
 ): Promise<Array<{ system: string; poi: string; poiName: string; origDest?: string }>> {
   const validDests = destinations.filter(d => d.system);
-  if (validDests.length === 0) return [];
-  if (!currentSystem) return validDests;
+  if (validDests.length === 0) {
+    console.log(`planTourRoute: no valid destinations (total=${destinations.length})`);
+    return [];
+  }
+  if (!currentSystem) {
+    console.log(`planTourRoute: no current system, returning ${validDests.length} destinations`);
+    return validDests;
+  }
   if (validDests.length === 1) return validDests;
 
   const remaining = [...validDests];
@@ -1073,7 +1094,10 @@ async function planTourRoute(
     }
 
     if (bestIndex === -1) {
-      break;
+      console.log(`planTourRoute: no reachable destination from ${cur}, remaining=${remaining.length}`);
+      // Fallback: return all remaining destinations anyway
+      console.log(`planTourRoute: fallback - returning all ${remaining.length} remaining destinations`);
+      return [...planned, ...remaining];
     }
 
     const next = remaining.splice(bestIndex, 1)[0]!;
@@ -1289,6 +1313,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
 
   while (bot.state === "running") {
     yield state.status;
+    ctx.log("transport", `Main loop: status=${state.status}, route.length=${state.route.length}, currentRouteIndex=${state.currentRouteIndex}, onboard=${state.onboardPassengers.length}`);
 
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
@@ -1494,13 +1519,24 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
 
       // For multi-destination tours, plan the route FIRST so loading order follows it.
       // This prevents stranding nearby passengers when distant destinations fill berths first.
+      ctx.log("transport", `Determining destinations for ${waiting.length} waiting passengers`);
       const destDrafts: Array<{ system: string; poi: string; poiName: string; count: number; origDest: string }> = [];
       for (const [destId, ps] of byDest.entries()) {
+        ctx.log("transport", `resolveDestination for waiting passenger: ${destId} (name: ${ps[0]?.destination_name || destId}, system: ${ps[0]?.destination_system || 'none'})`);
         const resolved = await resolveDestination(ctx, bot, destId, ps[0]?.destination_name || destId, ps[0]?.destination_system);
+        if (resolved) {
+          ctx.log("transport", `Resolved waiting ${destId} -> system=${resolved.system}, poi=${resolved.poi}`);
+        } else {
+          ctx.log("transport", `FAILED to resolve waiting passenger ${destId}`);
+        }
         destDrafts.push({ system: resolved?.system || "", poi: resolved?.poi || destId, poiName: ps[0]?.destination_name || destId, count: ps.length, origDest: destId });
       }
 
       const plannedRoute = await planTourRoute(bot.system || "", destDrafts.filter(d => d.system), settings.maxJumps, bot);
+      ctx.log("transport", `Planned route: ${plannedRoute.length} waypoints, ${destDrafts.filter(d => !d.system).length} could not resolve`);
+      for (const d of destDrafts.filter(d => !d.system)) {
+        ctx.log("transport", `  Unresolved destination: ${d.poiName} (origDest: ${d.origDest})`);
+      }
       const outsideJumpLimit = destDrafts.filter(d => !d.system);
 
       // Now load in route order, one destination per loop, berth tally.
@@ -1665,24 +1701,31 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         const existing = destMap.get(p.destination);
         if (existing) {
           existing.count++;
+          continue;
+        }
+        ctx.log("transport", `resolveDestination for aboard passenger: ${p.destination} (name: ${p.destination_name}, system: ${p.destination_system || 'none'})`);
+        const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
+        if (resolved) {
+          destMap.set(p.destination, { ...resolved, count: 1 });
+          ctx.log("transport", `Resolved aboard ${p.destination} -> system=${resolved.system}, poi=${resolved.poi}`);
         } else {
-          const resolved = await resolveDestination(ctx, bot, p.destination, p.destination_name, p.destination_system);
-          if (resolved) {
-            destMap.set(p.destination, { ...resolved, count: 1 });
-          } else {
-            destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destination_name || p.destination, count: 1 });
-          }
+          destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destination_name || p.destination, count: 1 });
+          ctx.log("transport", `FAILED to resolve aboard passenger ${p.destination}`);
         }
       }
 
       const routeDests = Array.from(destMap.values()).filter(d => d.system);
+      ctx.log("transport", `Route destinations: ${routeDests.length} valid out of ${destMap.size}`);
       const planned = await planTourRoute(bot.system || "", routeDests, 6, bot);
+      ctx.log("transport", `planTourRoute result: ${planned.length} waypoints, currentSystem=${bot.system || 'none'}`);
 
       const aboardIds = new Set(aboard.map(p => p.citizen_id || p.name));
       state.onboardPassengers = state.onboardPassengers.filter(op => aboardIds.has(op.citizenId));
 
       if (planned.length === 0) {
+        ctx.log("transport", `planned.length === 0 but ${state.onboardPassengers.length} passengers remain`);
         const stranded = state.onboardPassengers.filter(p => !routeDests.some(d => d.poi === p.destination));
+        ctx.log("transport", `${stranded.length} passengers stranded`);
         if (stranded.length > 0) {
           state.onboardPassengers = state.onboardPassengers.filter(p => routeDests.some(d => d.poi === p.destination));
         }
@@ -1759,6 +1802,12 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       }
 
       ctx.log("transport", `${onboard.length} passengers. Route: ${planned.map(d => d.poiName).join(" → ")}`);
+      if (planned.length === 0 && onboard.length > 0) {
+        ctx.log("transport", `WARNING: ${onboard.length} passengers but empty route!`);
+        for (const p of onboard) {
+          ctx.log("transport", `  - Passenger ${p.name} -> ${p.destination} (system: ${p.destinationSystem || 'none'})`);
+        }
+      }
 
       const announceService = (globalThis as any).aiChatService;
       const pickupIsHome = state.pickupStation === settings.homeStation || state.pickupSystem === settings.homeSystem;
@@ -1798,8 +1847,10 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
     if (state.status === "in_transit" || state.status === "traveling_to_ship") {
       if (state.route.length === 0 || state.currentRouteIndex >= state.route.length) {
         if (state.onboardPassengers.length > 0) {
+          ctx.log("transport", `Route empty but ${state.onboardPassengers.length} passengers onboard, rebuilding route`);
           const retryCount = (state.routeRebuildAttempts || 0) + 1;
           if (retryCount > 3) {
+            ctx.log("transport", `Route rebuild failed ${retryCount} times, stranding passengers`);
             state.onboardPassengers = state.onboardPassengers.map(p => ({ ...p, status: "stranded" }));
             state.status = "idle";
             state.routeRebuildAttempts = 0;
@@ -1810,16 +1861,21 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           state.routeRebuildAttempts = retryCount;
           const destMap = new Map<string, { system: string; poi: string; poiName: string; count: number }>();
           for (const p of state.onboardPassengers) {
+            ctx.log("transport", `resolveDestination for onboard passenger: ${p.destination} (system: ${p.destinationSystem || 'none'})`);
             const resolved = await resolveDestination(ctx, bot, p.destination, p.destinationName, p.destinationSystem);
             if (resolved) {
               destMap.set(p.destination, { ...resolved, count: 1 });
+              ctx.log("transport", `Resolved ${p.destination} -> system=${resolved.system}, poi=${resolved.poi}`);
             } else {
               destMap.set(p.destination, { system: "", poi: p.destination, poiName: p.destinationName, count: 1 });
+              ctx.log("transport", `FAILED to resolve ${p.destination}`);
             }
           }
           const validDests = Array.from(destMap.values()).filter(d => d.system);
+          ctx.log("transport", `Route rebuild: ${validDests.length} valid destinations out of ${destMap.size}`);
           if (validDests.length > 0) {
             const newRoute = await planTourRoute(bot.system || "", validDests, 6, bot);
+            ctx.log("transport", `Route rebuild result: ${newRoute.length} waypoints, route: ${newRoute.map(d => d.poiName).join(' -> ')}`);
             if (newRoute.length > 0) {
               state.route = newRoute;
               state.currentRouteIndex = 0;
@@ -1830,6 +1886,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
               continue;
             }
           }
+          ctx.log("transport", `Route rebuild failed: validDests=${validDests.length}, would strand passengers`);
           saveTransportState(state);
           await ctx.sleep(30000);
           continue;
@@ -1841,18 +1898,24 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       }
 
       const waypoint = state.route[state.currentRouteIndex];
+      ctx.log("transport", `Processing waypoint ${state.currentRouteIndex + 1}/${state.route.length}: system=${waypoint.system}, poi=${waypoint.poi}`);
 
       if (waypoint.system !== bot.system) {
+        ctx.log("transport", `Navigating to system ${waypoint.system}`);
         const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
         await bot.refreshStatus();
         if (!ok) {
+          ctx.log("transport", `FAILED to navigate to system ${waypoint.system}`);
           await ctx.sleep(30000);
           continue;
         }
+        ctx.log("transport", `Arrived at system ${waypoint.system}`);
       }
       if (bot.poi !== waypoint.poi) {
+        ctx.log("transport", `Traveling to poi ${waypoint.poi}`);
         const tr = await bot.exec("travel", { target_poi: waypoint.poi });
         if (tr.error) {
+          ctx.log("transport", `Travel to ${waypoint.poi} failed: ${tr.error.message}`);
           await ctx.sleep(30000);
           continue;
         }
@@ -1990,6 +2053,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
     // Safety / upkeep
     await tryRefuel(ctx);
     await repairShip(ctx);
+    ctx.log("transport", `Loop iteration complete, sleeping 5s`);
     await ctx.sleep(5000);
   }
 };

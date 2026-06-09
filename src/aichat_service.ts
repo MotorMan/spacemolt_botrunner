@@ -2294,6 +2294,46 @@ Announcement:`;
    * Send a rescue en-route notification to a stranded player.
    * This is a simple, non-AI message to let them know help is coming.
    */
+  async translateToKlingon(
+    message: string,
+    context: "battle" | "praise" | "general",
+    playerName?: string
+  ): Promise<{ ok: boolean; message?: string; error?: string }> {
+    const settings = getAiChatSettings();
+
+    if (!settings.enabled) {
+      return { ok: false, error: "AI Chat is disabled" };
+    }
+
+    const systemPrompt = `Translate the following message into Klingon. The context is: ${context}.
+If playerName is provided, incorporate it naturally into the translation (e.g., "well done, {playerName}").
+Keep the translation authentic and appropriate for the context.
+Return ONLY the translated text, no additional formatting or explanation.
+
+Message to translate: "${message}"
+${playerName ? `Player name to include: ${playerName}` : ""}`;
+
+    const userMessage = `Translate to Klingon: "${message}"${playerName ? ` (mention ${playerName})` : ""}`;
+
+    const llmMessages: LlmMessage[] = [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userMessage },
+    ];
+
+    try {
+      const response = await callLlm(llmMessages, settings);
+      const cleanResponse = response.trim().replace(/^["']|["']$/g, "");
+      
+      if (!cleanResponse) {
+        return { ok: false, error: "Empty translation from AI" };
+      }
+
+      return { ok: true, message: cleanResponse };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
   async sendRescueEnRouteNotification(
     bot: Bot,
     targetPlayer: string,

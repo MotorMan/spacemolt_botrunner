@@ -747,12 +747,14 @@ export async function fightFreshBattle(
 
     if (tickCount > MAX_BATTLE_TICKS) {
       ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
+      await checkAndPraiseMorgThar(ctx, true);
       return true;
     }
 
     const status = await getBattleStatus(ctx);
     if (!status) {
       ctx.log("combat", `✅ ${target.name} eliminated — battle complete (${tickCount} ticks, victory!)`);
+      await checkAndPraiseMorgThar(ctx, true);
       return true;
     }
 
@@ -775,6 +777,7 @@ export async function fightFreshBattle(
         await ctx.sleep(300);
       } else if (!better) {
         ctx.log("combat", `✅ No valid targets remaining — battle complete (${tickCount} ticks, victory!)`);
+        await checkAndPraiseMorgThar(ctx, true);
         return true;
       }
     }
@@ -869,6 +872,66 @@ function pickRealBattleTarget(
   } as NearbyEntity;
 }
 
+const MORG_THAR_NAME = "Morg'Thar";
+
+/**
+ * Check if we just battled alongside Morg'Thar and send a Klingon praise message.
+ * This is called after a battle ends successfully.
+ */
+export async function checkAndPraiseMorgThar(
+  ctx: RoutineContext,
+  battleJustEnded: boolean,
+): Promise<void> {
+  if (!battleJustEnded) return;
+
+  const { bot } = ctx;
+  const aiChatService = (globalThis as any).aiChatService;
+  if (!aiChatService || typeof aiChatService.translateToKlingon !== "function") {
+    ctx.log("combat", "AI Chat service not available for Morg'Thar praise");
+    return;
+  }
+
+  const battleStatus = await getBattleStatus(ctx);
+  if (!battleStatus) return;
+
+  const wasWithMorgThar = battleStatus.participants.some(p => 
+    p.username?.toLowerCase() === MORG_THAR_NAME.toLowerCase() ||
+    p.player_id?.toLowerCase() === MORG_THAR_NAME.toLowerCase()
+  );
+
+  if (!wasWithMorgThar) {
+    ctx.log("combat", "Did not fight alongside Morg'Thar this battle");
+    return;
+  }
+
+  const ourPlayerName = bot.username;
+  const praiseMessage = `${ourPlayerName} and I have defeated our enemies together. A victory worthy of the Empire!`;
+
+  ctx.log("combat", `Translating praise for Morg'Thar to Klingon...`);
+  const translation = await aiChatService.translateToKlingon(
+    praiseMessage,
+    "battle",
+    ourPlayerName
+  );
+
+  if (!translation.ok) {
+    ctx.log("combat", `Klingon translation failed: ${translation.error}`);
+    return;
+  }
+
+  const klingonMessage = translation.message || praiseMessage;
+  ctx.log("combat", `Sending Klingon praise to system chat: ${klingonMessage}`);
+
+  const chatResp = await bot.exec("chat", {
+    channel: "system",
+    content: klingonMessage,
+  });
+
+  if (chatResp.error) {
+    ctx.log("error", `Failed to send Klingon praise: ${chatResp.error.message}`);
+  }
+}
+
 export async function fightJoinedBattle(
   ctx: RoutineContext,
   target: NearbyEntity | null,
@@ -938,12 +1001,14 @@ export async function fightJoinedBattle(
 
     if (tickCount > MAX_BATTLE_TICKS) {
       ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
+      await checkAndPraiseMorgThar(ctx, true);
       return true;
     }
 
     const status = await getBattleStatus(ctx);
     if (!status) {
       ctx.log("combat", `✅ Battle complete — victory! (${tickCount} ticks)`);
+      await checkAndPraiseMorgThar(ctx, true);
       return true;
     }
 
@@ -1059,6 +1124,7 @@ export async function fightJoinedBattle(
         const errMsg = advResp.error.message.toLowerCase();
         if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
           ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+          await checkAndPraiseMorgThar(ctx, true);
           return true;
         }
         ctx.log("error", `Advance failed: ${advResp.error.message}`);
@@ -1070,6 +1136,7 @@ export async function fightJoinedBattle(
         const errMsg = stanceResp.error.message.toLowerCase();
         if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
           ctx.log("combat", `✅ Battle ended (stance failed: not in battle) - victory!`);
+          await checkAndPraiseMorgThar(ctx, true);
           return true;
         }
         ctx.log("error", `Stance failed: ${stanceResp.error.message}`);

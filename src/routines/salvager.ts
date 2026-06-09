@@ -593,7 +593,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
   const chatHandler = (message: BotChatMessage) => {
     ctx.log("escort", `chatHandler: received message from ${message.sender} in ${message.channel} to [${message.recipients.join(", ")}]: "${message.content}"`);
     if (message.channel === "escort") {
-      if (message.recipients.includes(bot.username) && message.content === "LOCATION_QUERY") {
+      if (message.recipients.includes(bot.username) && message.content === "QUERY_LOCATION") {
         chatChannel.send({ sender: bot.username, recipients: [message.sender], channel: "escort", content: `LOCATION: ${bot.system}` });
         ctx.log("escort", `Responded to location query: ${bot.system}`);
       }

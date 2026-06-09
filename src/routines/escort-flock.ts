@@ -379,6 +379,41 @@ function getMinerLocation(minerName: string): string | null {
 
 // ── Escort routine (flock mode - chat-based) ───────────────────────────────
 
+const POSITION_VERIFY_TIMEOUT = 30000;
+
+async function checkPositionAndCoordinate(
+  ctx: RoutineContext,
+  minerName: string,
+): Promise<string | null> {
+  const { bot } = ctx;
+  const chatChannel = getBotChatChannel();
+  
+  chatChannel.send({
+    sender: bot.username,
+    recipients: [minerName],
+    channel: "escort",
+    content: "QUERY_LOCATION"
+  });
+  
+  ctx.log("escort", `Sent location query to ${minerName}...`);
+  
+  const startTime = Date.now();
+  while (Date.now() - startTime < POSITION_VERIFY_TIMEOUT) {
+    const messages = chatChannel.getHistory("escort", 20);
+    for (const msg of messages) {
+      if (msg.sender?.toLowerCase() === minerName.toLowerCase() && msg.content.startsWith("LOCATION: ")) {
+        const minerSystem = msg.content.substring(9).trim();
+        ctx.log("escort", `${minerName} responded: system=${minerSystem}`);
+        return minerSystem;
+      }
+    }
+    await ctx.sleep(500);
+  }
+  
+  ctx.log("escort", `No location response from ${minerName} within timeout`);
+  return null;
+}
+
 export const escortFlockRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
@@ -449,6 +484,12 @@ export const escortFlockRoutine: Routine = async function* (ctx: RoutineContext)
     for (let i = recentMessages.length - 1; i >= 0; i--) {
       const msg = recentMessages[i];
       if (msg.sender?.toLowerCase() === minerName.toLowerCase()) {
+        if (msg.content.startsWith("LOCATION: ")) {
+          minerSystem = msg.content.substring(9).trim();
+          setMinerLocation(minerName, minerSystem);
+          ctx.log("escort", `Miner ${minerName} at ${minerSystem} (broadcast)`);
+          break;
+        }
         const jumpMatch = msg.content.match(/Jumping to ([a-z0-9_]+)/i);
         const travelMatch = msg.content.match(/Going to ([a-z0-9_]+)/i);
         const match = jumpMatch || travelMatch;
@@ -463,11 +504,16 @@ export const escortFlockRoutine: Routine = async function* (ctx: RoutineContext)
 
     if (!minerSystem) {
       minerSystem = getMinerLocation(minerName);
-      if (!minerSystem) {
-        ctx.log("escort", `No location for ${minerName} — waiting for signal...`);
-        await ctx.sleep(5000);
-        continue;
-      }
+    }
+    
+    if (!minerSystem) {
+      minerSystem = await checkPositionAndCoordinate(ctx, minerName);
+    }
+    
+    if (!minerSystem) {
+      ctx.log("escort", `No location for ${minerName} — waiting for signal...`);
+      await ctx.sleep(5000);
+      continue;
     }
 
     yield "fuel_check";

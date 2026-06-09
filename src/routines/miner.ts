@@ -1478,8 +1478,11 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
    // when the server is still processing (e.g. after a jump timeout).
    let cachedModules: unknown[] | null = await cacheShipModules(ctx);
 
-   // ── Flock heartbeat tracking (persists across cycles) ──
-   let lastFlockHeartbeat = 0;
+// ── Flock heartbeat tracking (persists across cycles) ──
+    let lastFlockHeartbeat = 0;
+
+    // ── Escort location broadcast tracking ──
+    let lastEscortLocationBroadcast = 0;
 
    // ── CRITICAL FIX: Refresh faction storage at startup for accurate quota checks ──
    ctx.log("miner", "Refreshing faction storage at startup...");
@@ -1745,6 +1748,19 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       });
       lastFlockHeartbeat = Date.now();
       ctx.log("flock", `Leader broadcast: target=${flockTargetResource || flockTargetSystemId}, phase=${flockPhase}`);
+    }
+
+    // ── Broadcast location to escorts every 30 seconds for tracking ──
+    if ((Date.now() - lastEscortLocationBroadcast) > 30_000) {
+      const chatChannel = getBotChatChannel();
+      chatChannel.send({
+        sender: bot.username,
+        recipients: [],
+        channel: "escort",
+        content: `LOCATION: ${bot.system}`
+      });
+      lastEscortLocationBroadcast = Date.now();
+      ctx.log("escort", `Broadcast location: ${bot.system}`);
     }
 
     // ── Re-evaluate mining type and target from settings each cycle ──

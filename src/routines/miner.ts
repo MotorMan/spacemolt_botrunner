@@ -1735,41 +1735,47 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    // ── Leader: broadcast heartbeat to keep flock state fresh ──
+// ── Leader: broadcast heartbeat AND target updates every 30 seconds ──
     if (isFlockLeader && settings.flockEnabled && settings.flockName && (Date.now() - lastFlockHeartbeat) > 30_000) {
-      await broadcastFlockHeartbeat(settings.flockName, bot.username);
+      await broadcastFlockHeartbeat(settings.flockName, bot.username, {
+        targetSystemId: flockTargetSystemId,
+        targetResourceId: flockTargetResource,
+        miningType: flockMiningType,
+        phase: flockPhase,
+      });
       lastFlockHeartbeat = Date.now();
+      ctx.log("flock", `Leader broadcast: target=${flockTargetResource || flockTargetSystemId}, phase=${flockPhase}`);
     }
 
     // ── Re-evaluate mining type and target from settings each cycle ──
-      let miningType: "ore" | "gas" | "ice" | "radioactive" = "ore";
-      if (settings.miningType === "auto") {
-        const detected = await detectMiningType(ctx, cachedModules || undefined);
-        if (!detected) {
-          // CRITICAL FIX: Refresh cached modules and try again
-          ctx.log("warn", "Mining type detection failed — refreshing cached modules and retrying");
-          cachedModules = await cacheShipModules(ctx);
-          const retryDetected = await detectMiningType(ctx, cachedModules || undefined);
-          if (!retryDetected) {
-            ctx.log("error", "Cannot determine mining type even after refreshing modules — please check ship equipment");
-            await ctx.sleep(30000);
-            continue;
-          }
-          miningType = retryDetected;
-        } else {
-          miningType = detected;
+    let miningType: "ore" | "gas" | "ice" | "radioactive" = "ore";
+    if (settings.miningType === "auto") {
+      const detected = await detectMiningType(ctx, cachedModules || undefined);
+      if (!detected) {
+        // CRITICAL FIX: Refresh cached modules and try again
+        ctx.log("warn", "Mining type detection failed — refreshing cached modules and retrying");
+        cachedModules = await cacheShipModules(ctx);
+        const retryDetected = await detectMiningType(ctx, cachedModules || undefined);
+        if (!retryDetected) {
+          ctx.log("error", "Cannot determine mining type even after refreshing modules — please check ship equipment");
+          await ctx.sleep(30000);
+          continue;
         }
-       } else {
-         miningType = settings.miningType;
-       }
-
-      // CRITICAL FIX: Validate miningType against actual ship equipment after resolution.
-      // Prevents the miner from looping forever in an impossible mode (e.g. forced "gas" with no gas harvester).
-      const detectedFromModules = await detectMiningType(ctx, cachedModules || undefined);
-      if (detectedFromModules && detectedFromModules !== miningType) {
-        ctx.log("warn", `Resolved miningType="${miningType}" does not match ship equipment (detected: ${detectedFromModules}) — overriding miningType for this cycle`);
-        miningType = detectedFromModules;
+        miningType = retryDetected;
+      } else {
+        miningType = detected;
       }
+   } else {
+      miningType = settings.miningType;
+    }
+
+    // CRITICAL FIX: Validate miningType against actual ship equipment after resolution.
+    // Prevents the miner from looping forever in an impossible mode (e.g. forced "gas" with no gas harvester).
+    const detectedFromModules = await detectMiningType(ctx, cachedModules || undefined);
+    if (detectedFromModules && detectedFromModules !== miningType) {
+      ctx.log("warn", `Resolved miningType="${miningType}" does not match ship equipment (detected: ${detectedFromModules}) — overriding miningType for this cycle`);
+      miningType = detectedFromModules;
+    }
 
     // Deep core capability check - needed for target selection
     const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
@@ -3712,9 +3718,28 @@ if (effectiveTarget) {
 
     while (bot.state === "running") {
       const harvestNow = Date.now();
+
+      // ── Update follower state from flock ──
+      if (!isFlockLeader && settings.flockEnabled && settings.flockName) {
+        const updatedState = await readFlockState(settings.flockName);
+        if (updatedState) {
+          flockTargetSystemId = updatedState.targetSystemId;
+          flockTargetResource = updatedState.targetResourceId;
+          flockMiningType = updatedState.miningType;
+          flockPhase = updatedState.phase;
+          ctx.log("flock", `Follower updating: target=${flockTargetResource || flockTargetSystemId}, phase=${flockPhase}`);
+        }
+      }
+      
       if (isFlockLeader && settings.flockEnabled && settings.flockName && (harvestNow - lastFlockHeartbeat) > 30_000) {
-        await broadcastFlockHeartbeat(settings.flockName, bot.username);
+        await broadcastFlockHeartbeat(settings.flockName, bot.username, {
+          targetSystemId: flockTargetSystemId,
+          targetResourceId: flockTargetResource,
+          miningType: flockMiningType,
+          phase: flockPhase,
+        });
         lastFlockHeartbeat = harvestNow;
+        ctx.log("flock", `Leader broadcast: target=${flockTargetResource || flockTargetSystemId}, phase=${flockPhase}`);
       }
 
       await bot.refreshStatus();

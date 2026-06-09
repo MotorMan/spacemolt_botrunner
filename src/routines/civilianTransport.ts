@@ -34,26 +34,21 @@ function loadStationRef(): StationRef {
     if (fs.existsSync(stationRefPath)) {
       const raw = fs.readFileSync(stationRefPath, "utf-8");
       stationRefCache = JSON.parse(raw) as StationRef;
-      console.log(`Loaded stationRef.json: ${Object.keys(stationRefCache.by_underline_name).length} stations, ${stationRefCache.passenger_destinations.length} passenger destinations`);
+      console.log(`Loaded stationRef.json: ${Object.keys(stationRefCache.by_underline_name).length} stations`);
       return stationRefCache;
     }
     console.error("stationRef.json not found at:", stationRefPath);
   } catch (err) {
     console.error("Failed to load stationRef.json:", err);
   }
-  return { stations: [], passenger_destinations: [], by_station_id: {}, by_system_id: {}, by_underline_name: {}, pirate_stations: [] };
+  return { stations: [], by_station_id: {}, by_system_id: {}, by_underline_name: {} };
 }
 
 function isPirateStation(stationId: string): boolean {
   const stationRef = loadStationRef();
   const lowerId = stationId.toLowerCase();
   const info = stationRef.by_station_id[lowerId];
-  if (info?.is_pirate) return true;
-  const pirateStation = stationRef.pirate_stations?.find(
-    (s) => s.station_id.toLowerCase() === lowerId || s.system_id.toLowerCase() === lowerId
-  );
-  if (pirateStation) return true;
-  return false;
+  return info?.is_pirate === true;
 }
 
 function isPirateDestination(stationId: string, systemId: string | undefined): boolean {
@@ -73,16 +68,16 @@ interface RouteResult {
 }
 
 async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: string, destinationName: string, destinationSystem?: string): Promise<RouteResult | null> {
-  if (destinationId.toLowerCase() === "frontier_station") {
-    ctx.log("transport", `resolveDestination: frontier_station is mobile, using find_route directly`);
-    const routeResp = await bot.exec("find_route", { target: "frontier_station" });
+  if (destinationId.toLowerCase() === "frontier_station" || destinationId.toLowerCase() === "mobile_capitol") {
+    ctx.log("transport", `resolveDestination: ${destinationId} is mobile, using find_route directly`);
+    const routeResp = await bot.exec("find_route", { target: destinationId });
     if (!routeResp.error && routeResp.result) {
       const result = routeResp.result as Record<string, unknown>;
       if (result.found) {
         return {
           system: (result.target_system as string) || "",
-          poi: (result.target_poi as string) || "frontier_station",
-          poiName: (result.target_poi_name as string) || "Frontier Station",
+          poi: (result.target_poi as string) || destinationId,
+          poiName: (result.target_poi_name as string) || destinationName || destinationId,
           origDest: destinationId,
         };
       }
@@ -104,18 +99,38 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
     }
     return { system: byUnderline.system_id, poi: byUnderline.station_id, poiName: byUnderline.regular_station_name || byUnderline.station_id, origDest: destinationId };
   }
-  
-  ctx.log("transport", `resolveDestination: not in by_underline_name, checking passenger_destinations`);
-  
-  for (const pd of stationRef.passenger_destinations) {
-    if (pd.destination === destinationId || pd.station_id === destinationId ||
-        pd.destination_name === destinationName || pd.destination.toLowerCase() === destinationId.toLowerCase()) {
-      ctx.log("transport", `resolveDestination: found in passenger_destinations: system=${pd.system_id}`);
-      if (isPirateDestination(pd.station_id, pd.system_id)) {
-        ctx.log("transport", `resolveDestination: rejecting pirate destination ${pd.station_id}`);
+
+  const byStationId = stationRef.by_station_id[destinationId.toLowerCase()];
+  if (byStationId) {
+    ctx.log("transport", `resolveDestination: found in by_station_id: system=${byStationId.system_id}`);
+    if (isPirateDestination(byStationId.station_id, byStationId.system_id)) {
+      ctx.log("transport", `resolveDestination: rejecting pirate destination ${byStationId.station_id}`);
+      return null;
+    }
+    return { system: byStationId.system_id, poi: byStationId.station_id, poiName: byStationId.official_name || byStationId.station_id, origDest: destinationId };
+  }
+
+  for (const st of stationRef.stations) {
+    const destLower = destinationId.toLowerCase();
+    const stIdLower = st.station_id.toLowerCase();
+    const underlineLower = st.underline_station_name.toLowerCase();
+    const regularNameLower = st.regular_station_name?.toLowerCase() || "";
+    
+    const stationIdMatch = stIdLower === destLower;
+    const underlineMatch = underlineLower === destLower;
+    const regularNameMatch = regularNameLower === destLower;
+    const nameMatch = destinationName && regularNameLower === destinationName.toLowerCase();
+    const partialMatch = stIdLower.includes(destLower) || destLower.includes(stIdLower) ||
+      underlineLower.includes(destLower) || destLower.includes(underlineLower) ||
+      regularNameLower.includes(destLower) || destLower.includes(regularNameLower);
+    
+    if (stationIdMatch || underlineMatch || regularNameMatch || nameMatch || partialMatch) {
+      ctx.log("transport", `resolveDestination: found in stations: system=${st.system_id}`);
+      if (isPirateDestination(st.station_id, st.system_id)) {
+        ctx.log("transport", `resolveDestination: rejecting pirate destination ${st.station_id}`);
         return null;
       }
-      return { system: pd.system_id, poi: pd.station_id, poiName: pd.destination_name || pd.station_id, origDest: destinationId };
+      return { system: st.system_id, poi: st.station_id, poiName: st.regular_station_name || st.station_id, origDest: destinationId };
     }
   }
   
@@ -160,6 +175,49 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
     }
   }
 
+  let bestStationMatch: { station_id: string; system_id: string; regular_station_name: string } | null = null;
+  let bestMatchScore = 0;
+  
+  for (const st of stationRef.stations) {
+    const destLower = destinationId.toLowerCase();
+    const stIdLower = st.station_id.toLowerCase();
+    const underlineLower = st.underline_station_name.toLowerCase();
+    const regularNameLower = st.regular_station_name?.toLowerCase() || "";
+    
+    let score = 0;
+    if (stIdLower === destLower) score = 10;
+    else if (underlineLower === destLower) score = 10;
+    else if (regularNameLower === destLower) score = 10;
+    else if (stIdLower.includes(destLower) || destLower.includes(stIdLower)) score = 5;
+    else if (underlineLower.includes(destLower) || destLower.includes(underlineLower)) score = 5;
+    else if (regularNameLower.includes(destLower) || destLower.includes(regularNameLower)) score = 5;
+    
+    if (score > bestMatchScore) {
+      bestMatchScore = score;
+      bestStationMatch = st;
+    }
+  }
+
+  if (bestStationMatch && bestMatchScore >= 5) {
+    ctx.log("transport", `resolveDestination: fallback to find_route for ${destinationId} via system ${bestStationMatch.system_id}`);
+    const routeResp = await bot.exec("find_route", { target_system: bestStationMatch.system_id });
+    if (!routeResp.error && routeResp.result) {
+      const result = routeResp.result as Record<string, unknown>;
+      if (result.found) {
+        const targetSystem = (result.target_system as string) || "";
+        const targetPoi = (result.target_poi as string) || bestStationMatch.station_id;
+        if (!isPirateDestination(targetPoi, targetSystem)) {
+          return {
+            system: targetSystem,
+            poi: targetPoi,
+            poiName: ((result.target_poi_name as string) || bestStationMatch.regular_station_name || bestStationMatch.station_id) as string,
+            origDest: destinationId,
+          };
+        }
+      }
+    }
+  }
+
   let targetSystemId: string | null = null;
   
   if (destinationSystem) {
@@ -176,12 +234,31 @@ async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: 
       }
     }
   }
-  
+
   if (!targetSystemId) {
     ctx.log("transport", `resolveDestination: could not resolve system ID for ${destinationSystem}`);
+    if (destinationSystem) {
+      const routeResp = await bot.exec("find_route", { target_system: destinationSystem });
+      if (!routeResp.error && routeResp.result) {
+        const result = routeResp.result as Record<string, unknown>;
+        if (result.found) {
+          const targetSystem = (result.target_system as string) || "";
+          const targetPoi = (result.target_poi as string) || destinationId;
+          if (!isPirateDestination(targetPoi, targetSystem)) {
+            return {
+              system: targetSystem,
+              poi: targetPoi,
+              poiName: ((result.target_poi_name as string) || destinationName || targetPoi) as string,
+              origDest: destinationId,
+            };
+          }
+        }
+      }
+    }
     return null;
   }
   
+  ctx.log("transport", `resolveDestination: using find_route for ${destinationId} in system ${targetSystemId}`);
   const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
   if (routeResp.error || !routeResp.result) {
     ctx.log("transport", `resolveDestination: find_route error for ${destinationId}: ${routeResp.error?.message || "no result"}`);

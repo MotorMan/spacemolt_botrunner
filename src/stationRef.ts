@@ -10,20 +10,9 @@ export interface StationInfo {
   is_pirate: boolean;
 }
 
-export interface PassengerDestination {
-  destination: string;
-  destination_name: string;
-  destination_system: string;
-  station_id: string;
-  system_id: string;
-  is_pirate: boolean;
-}
-
 export interface StationRef {
   stations: StationInfo[];
-  passenger_destinations: PassengerDestination[];
   by_station_id: Record<string, StationInfo>;
   by_system_id: Record<string, StationInfo>;
   by_underline_name: Record<string, StationInfo>;
-  pirate_stations: StationInfo[];
 }

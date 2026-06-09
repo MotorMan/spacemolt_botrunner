@@ -1080,10 +1080,14 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       flockPhase = "gathering";
     }
 
-    // ── Leader: broadcast heartbeat to keep flock state fresh ──
+    // ── Leader: broadcast heartbeat AND target updates every 30 seconds ──
     if (isFlockLeader && settings.flockEnabled && settings.flockName && (Date.now() - lastFlockHeartbeat) > 30_000) {
-      await broadcastFlockHeartbeat(settings.flockName, bot.username);
+      await broadcastFlockHeartbeat(settings.flockName, bot.username, {
+        targetSystemId: flockTargetSystemId,
+        phase: flockPhase,
+      });
       lastFlockHeartbeat = Date.now();
+      ctx.log("flock", `Leader broadcast: target=${flockTargetSystemId}, phase=${flockPhase}`);
     }
 
     let flockState: FlockState | null = null;
@@ -1092,9 +1096,12 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       flockState = await readFlockState(settings.flockName);
       if (!flockState) {
         ctx.log("flock", "Nothing here to hold on");
+      } else if (!isFlockLeader) {
+        flockTargetSystemId = flockState.targetSystemId;
+        flockPhase = flockState.phase;
+        ctx.log("flock", `Follower updating: target=${flockTargetSystemId}, phase=${flockPhase}`);
       }
     }
-
     // ── Fleet coordination for escort ──
     // The escort bot sends FLEET_INVITE messages - we respond by creating fleet and inviting them
     // If escort is required and not in fleet, wait indefinitely before departure

@@ -463,48 +463,6 @@
       "is_pirate": false
     }
   ],
-  "passenger_destinations": [
-    {
-      "destination": "iron_reach_mining_colony",
-      "destination_name": "Iron Reach Mining Colony",
-      "destination_system": "Iron Reach",
-      "station_id": "iron_reach_mining_colony",
-      "system_id": "iron_reach",
-      "is_pirate": false
-    },
-    {
-      "destination": "confederacy_central_command",
-      "destination_name": "Confederacy Central Command",
-      "destination_system": "Sol",
-      "station_id": "sol_central",
-      "system_id": "sol",
-      "is_pirate": false
-    },
-    {
-      "destination": "crimson_war_citadel",
-      "destination_name": "Crimson War Citadel",
-      "destination_system": "Krynn",
-      "station_id": "war_citadel",
-      "system_id": "krynn",
-      "is_pirate": false
-    },
-    {
-      "destination": "procyon_colonial_station",
-      "destination_name": "Procyon Colonial Station",
-      "destination_system": "Procyon",
-      "station_id": "procyon_colonial_station",
-      "system_id": "procyon",
-      "is_pirate": false
-    },
-    {
-      "destination": "frontier_station",
-      "destination_name": "Frontier Station",
-      "destination_system": "The Telescope",
-      "station_id": "mobile_capital",
-      "system_id": "the_telescope",
-      "is_pirate": false
-    }
-  ],
   "by_station_id": {
     "synchrony_hub": {"station_id": "synchrony_hub", "system_id": "synchrony", "official_name": "Synchrony Hub", "is_pirate": false},
     "market_prime_exchange": {"station_id": "market_prime_exchange", "system_id": "market_prime", "official_name": "Market Prime Exchange", "is_pirate": false},
@@ -513,6 +471,7 @@
     "node_beta_industrial_station": {"station_id": "node_beta_industrial_station", "system_id": "node_beta", "official_name": "Node Beta Industrial Station", "is_pirate": false},
     "gold_run_extraction_hub": {"station_id": "gold_run_extraction_hub", "system_id": "gold_run", "official_name": "Gold Run Extraction Hub", "is_pirate": false},
     "the_core": {"station_id": "the_core", "system_id": "nexus_prime", "official_name": "Central Nexus", "is_pirate": false},
+    "central_nexus": {"station_id": "the_core", "system_id": "nexus_prime", "official_name": "Central Nexus", "is_pirate": false},
     "treasure_cache_trading_post": {"station_id": "treasure_cache_trading_post", "system_id": "treasure_cache", "official_name": "Treasure Cache Trading Post", "is_pirate": false},
     "voss_redoubt": {"station_id": "voss_redoubt", "system_id": "alhena", "official_name": "Voss Redoubt Station", "is_pirate": true},
     "factory_belt_manufacturing_hub": {"station_id": "factory_belt_manufacturing_hub", "system_id": "factory_belt", "official_name": "Factory Belt Manufacturing Hub", "is_pirate": false},
@@ -547,51 +506,21 @@
     "blood_forge_smelting_works": {"station_id": "blood_forge_smelting_works", "system_id": "blood_forge", "official_name": "Blood Forge Smelting Works", "is_pirate": false},
     "sol_central": {"station_id": "sol_central", "system_id": "sol", "official_name": "Confederacy Central Command", "is_pirate": false},
     "traders_rest_resort_station": {"station_id": "traders_rest_resort_station", "system_id": "traders_rest", "official_name": "Trader's Rest Resort Station", "is_pirate": false},
-    "the_experiment_research_station": {"station_id": "the_experiment_research_station", "system_id": "the_experiment", "official_name": "The Experiment Research Station", "is_pirate": false}
-  },
-  "by_system_id": {
-    "synchrony": {"station_id": "synchrony_hub", "system_id": "synchrony", "official_name": "Synchrony Hub", "is_pirate": false},
-    "market_prime": {"station_id": "market_prime_exchange", "system_id": "market_prime", "official_name": "Market Prime Exchange", "is_pirate": false},
-    "algol": {"station_id": "dross_citadel", "system_id": "algol", "official_name": "Dross Citadel Station", "is_pirate": true},
-    "krynn": {"station_id": "war_citadel", "system_id": "krynn", "official_name": "Crimson War Citadel", "is_pirate": false},
-    "node_beta": {"station_id": "node_beta_industrial_station", "system_id": "node_beta", "official_name": "Node Beta Industrial Station", "is_pirate": false},
-    "gold_run": {"station_id": "gold_run_extraction_hub", "system_id": "gold_run", "official_name": "Gold Run Extraction Hub", "is_pirate": false},
-    "nexus_prime": {"station_id": "the_core", "system_id": "nexus_prime", "official_name": "Central Nexus", "is_pirate": false},
-    "treasure_cache": {"station_id": "treasure_cache_trading_post", "system_id": "treasure_cache", "official_name": "Treasure Cache Trading Post", "is_pirate": false},
-    "alhena": {"station_id": "voss_redoubt", "system_id": "alhena", "official_name": "Voss Redoubt Station", "is_pirate": true},
-    "factory_belt": {"station_id": "factory_belt_manufacturing_hub", "system_id": "factory_belt", "official_name": "Factory Belt Manufacturing Hub", "is_pirate": false},
-    "cargo_lanes": {"station_id": "cargo_lanes_freight_depot", "system_id": "cargo_lanes", "official_name": "Cargo Lanes Freight Depot", "is_pirate": false},
-    "procyon": {"station_id": "procyon_colonial_station", "system_id": "procyon", "official_name": "Procyon Colonial Station", "is_pirate": false},
-    "the_crucible": {"station_id": "the_crucible_garrison", "system_id": "the_crucible", "official_name": "The Crucible Garrison", "is_pirate": false},
-    "sirius": {"station_id": "sirius_observatory_station", "system_id": "sirius", "official_name": "Sirius Observatory Station", "is_pirate": false},
-    "the_telescope": {"station_id": "mobile_capital", "system_id": "the_telescope", "official_name": "Frontier Station", "is_pirate": false},
-    "iron_reach": {"station_id": "iron_reach_mining_colony", "system_id": "iron_reach", "official_name": "Iron Reach Mining Colony", "is_pirate": false},
-    "node_alpha": {"station_id": "node_alpha_processing_station", "system_id": "node_alpha", "official_name": "Node Alpha Processing Station", "is_pirate": false},
-    "first_step": {"station_id": "first_step_memorial_station", "system_id": "first_step", "official_name": "First Step Memorial Station", "is_pirate": false},
-    "the_rampart": {"station_id": "the_rampart_checkpoint", "system_id": "the_rampart", "official_name": "The Rampart Checkpoint", "is_pirate": false},
-    "starfall": {"station_id": "starfall_salvage_station", "system_id": "starfall", "official_name": "Starfall Salvage Station", "is_pirate": false},
-    "gsc_0008": {"station_id": "nyx_nexus", "system_id": "gsc_0008", "official_name": "Nyx Nexus Station", "is_pirate": true},
-    "the_levy": {"station_id": "the_levy_customs_station", "system_id": "the_levy", "official_name": "The Levy Customs Station", "is_pirate": false},
-    "last_light": {"station_id": "ramens_rest", "system_id": "last_light", "official_name": "Ramen's Rest", "is_pirate": false},
-    "zaniah": {"station_id": "mera_sanctum", "system_id": "zaniah", "official_name": "Mera Sanctum Station", "is_pirate": true},
-    "node_gamma": {"station_id": "node_gamma_relay_station", "system_id": "node_gamma", "official_name": "Node Gamma Relay Station", "is_pirate": false},
-    "haven": {"station_id": "grand_exchange", "system_id": "haven", "official_name": "Grand Exchange Station", "is_pirate": false},
-    "alpha_centauri": {"station_id": "alpha_centauri_colonial_station", "system_id": "alpha_centauri", "official_name": "Alpha Centauri Colonial Station", "is_pirate": false},
-    "xamidimura": {"station_id": "kael_arsenal", "system_id": "xamidimura", "official_name": "Kael Arsenal Station", "is_pirate": true},
-    "nova_terra": {"station_id": "nova_terra_central", "system_id": "nova_terra", "official_name": "Nova Terra Central", "is_pirate": false},
-    "ironhearth": {"station_id": "ironhearth_station", "system_id": "ironhearth", "official_name": "Ironhearth Station", "is_pirate": false},
-    "deep_range": {"station_id": "deep_range_outpost", "system_id": "deep_range", "official_name": "Deep Range Outpost", "is_pirate": false},
-    "bellatrix": {"station_id": "crix_stronghold", "system_id": "bellatrix", "official_name": "Crix Stronghold Station", "is_pirate": true},
-    "the_anvil": {"station_id": "the_anvil_arsenal", "system_id": "the_anvil", "official_name": "The Anvil Arsenal", "is_pirate": false},
-    "unknown_edge": {"station_id": "unknown_edge_waystation", "system_id": "unknown_edge", "official_name": "Unknown Edge Waystation", "is_pirate": false},
-    "gliese_581": {"station_id": "korr_fortress", "system_id": "gliese_581", "official_name": "Korr Fortress Station", "is_pirate": true},
-    "sheratan": {"station_id": "thane_keep", "system_id": "sheratan", "official_name": "Thane Keep Station", "is_pirate": true},
-    "barnard_44": {"station_id": "sable_port", "system_id": "barnard_44", "official_name": "Sable Port Station", "is_pirate": true},
-    "void_gate": {"station_id": "void_gate_outpost", "system_id": "void_gate", "official_name": "Void Gate Outpost", "is_pirate": false},
-    "blood_forge": {"station_id": "blood_forge_smelting_works", "system_id": "blood_forge", "official_name": "Blood Forge Smelting Works", "is_pirate": false},
-    "sol": {"station_id": "sol_central", "system_id": "sol", "official_name": "Confederacy Central Command", "is_pirate": false},
-    "traders_rest": {"station_id": "traders_rest_resort_station", "system_id": "traders_rest", "official_name": "Trader's Rest Resort Station", "is_pirate": false},
-    "the_experiment": {"station_id": "the_experiment_research_station", "system_id": "the_experiment", "official_name": "The Experiment Research Station", "is_pirate": false}
+    "the_experiment_research_station": {"station_id": "the_experiment_research_station", "system_id": "the_experiment", "official_name": "The Experiment Research Station", "is_pirate": false},
+    "dross_citadel_station": {"station_id": "dross_citadel", "system_id": "algol", "official_name": "Dross Citadel Station", "is_pirate": true},
+    "crimson_war_citadel": {"station_id": "war_citadel", "system_id": "krynn", "official_name": "Crimson War Citadel", "is_pirate": false},
+    "voss_redoubt_station": {"station_id": "voss_redoubt", "system_id": "alhena", "official_name": "Voss Redoubt Station", "is_pirate": true},
+    "nyx_nexus_station": {"station_id": "nyx_nexus", "system_id": "gsc_0008", "official_name": "Nyx Nexus Station", "is_pirate": true},
+    "grand_exchange_station": {"station_id": "grand_exchange", "system_id": "haven", "official_name": "Grand Exchange Station", "is_pirate": false},
+    "mera_sanctum_station": {"station_id": "mera_sanctum", "system_id": "zaniah", "official_name": "Mera Sanctum Station", "is_pirate": true},
+    "kael_arsenal_station": {"station_id": "kael_arsenal", "system_id": "xamidimura", "official_name": "Kael Arsenal Station", "is_pirate": true},
+    "crix_stronghold_station": {"station_id": "crix_stronghold", "system_id": "bellatrix", "official_name": "Crix Stronghold Station", "is_pirate": true},
+    "korr_fortress_station": {"station_id": "korr_fortress", "system_id": "gliese_581", "official_name": "Korr Fortress Station", "is_pirate": true},
+    "thane_keep_station": {"station_id": "thane_keep", "system_id": "sheratan", "official_name": "Thane Keep Station", "is_pirate": true},
+    "sable_port_station": {"station_id": "sable_port", "system_id": "barnard_44", "official_name": "Sable Port Station", "is_pirate": true},
+    "confederacy_central_command": {"station_id": "sol_central", "system_id": "sol", "official_name": "Confederacy Central Command", "is_pirate": false},
+    "frontier_station": {"station_id": "mobile_capital", "system_id": "the_telescope", "official_name": "Frontier Station", "is_pirate": false},
+    "mobile_capitol": {"station_id": "mobile_capital", "system_id": "the_telescope", "official_name": "Frontier Station", "is_pirate": false}
   },
   "by_underline_name": {
     "synchrony_hub": {"station_id": "synchrony_hub", "system_id": "synchrony", "official_name": "Synchrony Hub", "is_pirate": false},
@@ -601,6 +530,7 @@
     "node_beta_industrial_station": {"station_id": "node_beta_industrial_station", "system_id": "node_beta", "official_name": "Node Beta Industrial Station", "is_pirate": false},
     "gold_run_extraction_hub": {"station_id": "gold_run_extraction_hub", "system_id": "gold_run", "official_name": "Gold Run Extraction Hub", "is_pirate": false},
     "the_core": {"station_id": "the_core", "system_id": "nexus_prime", "official_name": "Central Nexus", "is_pirate": false},
+    "central_nexus": {"station_id": "the_core", "system_id": "nexus_prime", "official_name": "Central Nexus", "is_pirate": false},
     "treasure_cache_trading_post": {"station_id": "treasure_cache_trading_post", "system_id": "treasure_cache", "official_name": "Treasure Cache Trading Post", "is_pirate": false},
     "voss_redoubt": {"station_id": "voss_redoubt", "system_id": "alhena", "official_name": "Voss Redoubt Station", "is_pirate": true},
     "factory_belt_manufacturing_hub": {"station_id": "factory_belt_manufacturing_hub", "system_id": "factory_belt", "official_name": "Factory Belt Manufacturing Hub", "is_pirate": false},
@@ -635,92 +565,21 @@
     "blood_forge_smelting_works": {"station_id": "blood_forge_smelting_works", "system_id": "blood_forge", "official_name": "Blood Forge Smelting Works", "is_pirate": false},
     "sol_central": {"station_id": "sol_central", "system_id": "sol", "official_name": "Confederacy Central Command", "is_pirate": false},
     "traders_rest_resort_station": {"station_id": "traders_rest_resort_station", "system_id": "traders_rest", "official_name": "Trader's Rest Resort Station", "is_pirate": false},
-    "the_experiment_research_station": {"station_id": "the_experiment_research_station", "system_id": "the_experiment", "official_name": "The Experiment Research Station", "is_pirate": false}
+    "the_experiment_research_station": {"station_id": "the_experiment_research_station", "system_id": "the_experiment", "official_name": "The Experiment Research Station", "is_pirate": false},
+    "dross_citadel_station": {"station_id": "dross_citadel", "system_id": "algol", "official_name": "Dross Citadel Station", "is_pirate": true},
+    "crimson_war_citadel": {"station_id": "war_citadel", "system_id": "krynn", "official_name": "Crimson War Citadel", "is_pirate": false},
+    "voss_redoubt_station": {"station_id": "voss_redoubt", "system_id": "alhena", "official_name": "Voss Redoubt Station", "is_pirate": true},
+    "nyx_nexus_station": {"station_id": "nyx_nexus", "system_id": "gsc_0008", "official_name": "Nyx Nexus Station", "is_pirate": true},
+    "grand_exchange_station": {"station_id": "grand_exchange", "system_id": "haven", "official_name": "Grand Exchange Station", "is_pirate": false},
+    "mera_sanctum_station": {"station_id": "mera_sanctum", "system_id": "zaniah", "official_name": "Mera Sanctum Station", "is_pirate": true},
+    "kael_arsenal_station": {"station_id": "kael_arsenal", "system_id": "xamidimura", "official_name": "Kael Arsenal Station", "is_pirate": true},
+    "crix_stronghold_station": {"station_id": "crix_stronghold", "system_id": "bellatrix", "official_name": "Crix Stronghold Station", "is_pirate": true},
+    "korr_fortress_station": {"station_id": "korr_fortress", "system_id": "gliese_581", "official_name": "Korr Fortress Station", "is_pirate": true},
+    "thane_keep_station": {"station_id": "thane_keep", "system_id": "sheratan", "official_name": "Thane Keep Station", "is_pirate": true},
+    "sable_port_station": {"station_id": "sable_port", "system_id": "barnard_44", "official_name": "Sable Port Station", "is_pirate": true},
+    "confederacy_central_command": {"station_id": "sol_central", "system_id": "sol", "official_name": "Confederacy Central Command", "is_pirate": false},
+    "frontier_station": {"station_id": "mobile_capital", "system_id": "the_telescope", "official_name": "Frontier Station", "is_pirate": false},
+    "mobile_capitol": {"station_id": "mobile_capital", "system_id": "the_telescope", "official_name": "Frontier Station", "is_pirate": false}
   },
-  "pirate_stations": [
-    {
-      "station_id": "iron_reach_mining_colony",
-      "system_id": "iron_reach",
-      "official_name": "Iron Reach Mining Colony",
-      "system_security": "Lawless",
-      "is_pirate": false
-    },
-    {
-      "station_id": "dross_citadel",
-      "system_id": "algol",
-      "official_name": "Dross Citadel Station",
-      "system_security": "Lawless",
-      "is_pirate": true
-    },
-    {
-      "station_id": "voss_redoubt",
-      "system_id": "alhena",
-      "official_name": "Voss Redoubt Station",
-      "system_security": "Lawless",
-      "is_pirate": true
-    },
-    {
-      "station_id": "kael_arsenal",
-      "system_id": "xamidimura",
-      "official_name": "Kael Arsenal Station",
-      "system_security": "Lawless",
-      "is_pirate": true
-    },
-    {
-      "station_id": "crix_stronghold",
-      "system_id": "bellatrix",
-      "official_name": "Crix Stronghold Station",
-      "system_security": "Lawless",
-      "is_pirate": true
-    },
-    {
-      "station_id": "korr_fortress",
-      "system_id": "gliese_581",
-      "official_name": "Korr Fortress Station",
-      "system_security": "Lawless",
-      "is_pirate": true
-    }
-  ],
-  "passenger_destinations": [
-    {
-      "destination": "iron_reach_mining_colony",
-      "destination_name": "Iron Reach Mining Colony",
-      "destination_system": "Iron Reach",
-      "station_id": "iron_reach_mining_colony",
-      "system_id": "iron_reach",
-      "is_pirate": false
-    },
-    {
-      "destination": "confederacy_central_command",
-      "destination_name": "Confederacy Central Command",
-      "destination_system": "Sol",
-      "station_id": "sol_central",
-      "system_id": "sol",
-      "is_pirate": false
-    },
-    {
-      "destination": "crimson_war_citadel",
-      "destination_name": "Crimson War Citadel",
-      "destination_system": "Krynn",
-      "station_id": "war_citadel",
-      "system_id": "krynn",
-      "is_pirate": false
-    },
-    {
-      "destination": "procyon_colonial_station",
-      "destination_name": "Procyon Colonial Station",
-      "destination_system": "Procyon",
-      "station_id": "procyon_colonial_station",
-      "system_id": "procyon",
-      "is_pirate": false
-    },
-    {
-      "destination": "frontier_station",
-      "destination_name": "Frontier Station",
-      "destination_system": "The Telescope",
-      "station_id": "mobile_capital",
-      "system_id": "the_telescope",
-      "is_pirate": false
-    }
-  ]
+  "by_system_id": {}
 }

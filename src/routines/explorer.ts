@@ -1712,9 +1712,12 @@ async function* scanStation(
       const shipsData = loadShipsForSale();
       let updated = 0;
 
+      const currentListingIds = new Set<string>();
+
       for (const listing of listings) {
         const listing_id = (listing.listing_id as string) || "";
         if (!listing_id) continue;
+        currentListingIds.add(listing_id);
 
         const shipListing: ShipListing = {
           systemId: systemId,
@@ -1742,9 +1745,20 @@ async function* scanStation(
         updated++;
       }
 
-      if (updated > 0) {
+      let removed = 0;
+      for (const listingId of Object.keys(shipsData.listings)) {
+        if (!currentListingIds.has(listingId)) {
+          delete shipsData.listings[listingId];
+          removed++;
+        }
+      }
+
+      if (updated > 0 || removed > 0) {
         saveShipsForSale(shipsData);
-        ctx.log("info", `Saved ${updated} ship listings to shipsForSale.json`);
+        const msgs: string[] = [];
+        if (updated > 0) msgs.push(`${updated} added/updated`);
+        if (removed > 0) msgs.push(`${removed} sold/removed`);
+        ctx.log("info", `Saved ship listings to shipsForSale.json (${msgs.join(", ")})`);
       }
     }
   }
@@ -2527,9 +2541,12 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
                 const shipsData = loadShipsForSale();
                 let updated = 0;
 
+                const currentListingIds = new Set<string>();
+
                 for (const listing of listings) {
                   const listing_id = (listing.listing_id as string) || "";
                   if (!listing_id) continue;
+                  currentListingIds.add(listing_id);
 
                   const shipListing: ShipListing = {
                     systemId: target.systemId,
@@ -2557,9 +2574,20 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
                   updated++;
                 }
 
-                if (updated > 0) {
+                let removed = 0;
+                for (const listingId of Object.keys(shipsData.listings)) {
+                  if (!currentListingIds.has(listingId)) {
+                    delete shipsData.listings[listingId];
+                    removed++;
+                  }
+                }
+
+                if (updated > 0 || removed > 0) {
                   saveShipsForSale(shipsData);
-                  ctx.log("info", `Saved ${updated} ship listings to shipsForSale.json`);
+                  const msgs: string[] = [];
+                  if (updated > 0) msgs.push(`${updated} added/updated`);
+                  if (removed > 0) msgs.push(`${removed} sold/removed`);
+                  ctx.log("info", `Saved ship listings to shipsForSale.json (${msgs.join(", ")})`);
                 }
               }
             }

@@ -4255,12 +4255,79 @@ export async function checkCustomsInspection(
  */
 export { getBotCustomsStats };
 
-const MOBILE_CAPITAL_NOT_FOUND_REGEX = /It's called a Mobile Capital for a reason[^.]*\.?\s*Jump to (\w+) to find it/i;
+export const MOBILE_CAPITAL_NOT_FOUND_REGEX = /It's called a Mobile Capital for a reason[^.]*\.?\s*Jump to (\w+) to find it/i;
 
 export function parseTravelHint(errorMessage: string): string | null {
   if (!errorMessage) return null;
   const match = MOBILE_CAPITAL_NOT_FOUND_REGEX.exec(errorMessage);
   return match ? match[1] : null;
+}
+
+export async function smartTravel(
+  ctx: RoutineContext,
+  stationId: string,
+  opts?: {
+    target_system?: string;
+    fuelThresholdPct?: number;
+    hullThresholdPct?: number;
+    noJettison?: boolean;
+    autoCloak?: boolean;
+  },
+): Promise<{ success: boolean; usedHint: boolean; hintSystem?: string }> {
+  const { bot } = ctx;
+  const maxRetries = 3;
+  let currentTargetSystemId = opts?.target_system ?? getMobileCapitolSystem();
+  let hintSystem: string | null = null;
+  let usedHint = false;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    ctx.log("travel", `Traveling to ${stationId}${currentTargetSystemId ? ` in ${currentTargetSystemId}` : ""}... (attempt ${attempt + 1}/${maxRetries})`);
+    const travelResp = await bot.exec("travel", { target_poi: stationId, target_system: currentTargetSystemId });
+
+    if (!travelResp.error) {
+      ctx.log("travel", `Arrived at ${stationId}`);
+      return { success: true, usedHint, hintSystem: hintSystem || undefined };
+    }
+
+    const errorMsg = travelResp.error?.message || "";
+    ctx.log("error", `Travel failed: ${errorMsg}`);
+
+    if (!hintSystem) {
+      const parsedHint = parseTravelHint(errorMsg);
+      if (parsedHint) {
+        ctx.log("travel", `[error] travel: It's called a Mobile Capital for a reason — it's not here right now. Jump to ${parsedHint} to find it.`);
+        hintSystem = parsedHint;
+        usedHint = true;
+      }
+    }
+
+    if (hintSystem && attempt < maxRetries - 1) {
+      ctx.log("travel", `Rerouting to hint system ${hintSystem}...`);
+      const navResult = await navigateToSystem(ctx, hintSystem, {
+        fuelThresholdPct: opts?.fuelThresholdPct ?? 40,
+        hullThresholdPct: opts?.hullThresholdPct ?? 30,
+        noJettison: opts?.noJettison,
+        autoCloak: opts?.autoCloak,
+      });
+
+      if (!navResult) {
+        ctx.log("error", `Failed to navigate to hint system ${hintSystem}`);
+        return { success: false, usedHint, hintSystem };
+      }
+
+      const jumpResp = await bot.exec("jump", { target_system: hintSystem });
+      if (jumpResp.error && !jumpResp.error.message.includes("already")) {
+        ctx.log("error", `Jump to ${hintSystem} failed: ${jumpResp.error.message}`);
+        return { success: false, usedHint, hintSystem };
+      }
+
+      ctx.log("travel", `Jumped to ${hintSystem}, retrying travel to ${stationId}...`);
+      currentTargetSystemId = hintSystem;
+      hintSystem = null;
+    }
+  }
+
+  return { success: false, usedHint, hintSystem: hintSystem || undefined };
 }
 
 export async function travelToStationWithHint(

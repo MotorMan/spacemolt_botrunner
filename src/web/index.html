@@ -8499,7 +8499,7 @@ async function renderCrafterSettings(panel) {
     <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
       <div>
         <div class="setting-label">Blacklisted Recipes</div>
-        <div class="setting-hint">Recipes that will NEVER be used for crafting (extremely wasteful). Add recipe IDs to prevent their use.</div>
+        <div class="setting-hint">Recipes that will NEVER be used for crafting (extremely wasteful). Defaults are shown below. Add custom recipe IDs to blacklist additional recipes.</div>
       </div>
       <div style="flex:1">
         <div id="blacklisted-recipes-list" style="max-height:100px;overflow-y:auto;margin-bottom:6px;font-size:11px">
@@ -8989,17 +8989,34 @@ function deleteCrafterProfile() {
 
 // ── Blacklisted Recipes Management ───────────────────────
 
+const DEFAULT_BLACKLISTED_RECIPES = [
+  "basic_silicon_refinement",
+  "fabricate_circuit_boards",
+  "synthesize_energy_crystal",
+  "synthesize_xenon_power_cell",
+  "chlorine_circuit_etching",
+];
+
 function renderBlacklistedRecipesList() {
-  const blacklisted = settings.crafter?.blacklistedRecipes || [];
-  if (blacklisted.length === 0) {
-    return '<span style="color:var(--dim);">No recipes blacklisted (only defaults apply)</span>';
+  const userBlacklisted = settings.crafter?.blacklistedRecipes || [];
+  const allBlacklisted = new Set([...DEFAULT_BLACKLISTED_RECIPES, ...userBlacklisted]);
+  
+  if (allBlacklisted.size === 0) {
+    return '<span style="color:var(--dim);">No recipes blacklisted</span>';
   }
-  return blacklisted.map(id => `
-    <div style="display:flex;align-items:center;gap:4px;margin-bottom:2px">
-      <span>${esc(id)}</span>
-      <button style="margin-left:auto;font-size:10px;padding:2px 6px;background:#d32f2f;color:#fff;border:none;border-radius:3px;cursor:pointer" onclick="removeBlacklistedRecipe('${esc(id)}')">✕ Remove</button>
-    </div>
-  `).join('');
+  
+  const sorted = [...allBlacklisted].sort();
+  return sorted.map(id => {
+    const isUserAdded = userBlacklisted.includes(id);
+    const isDefault = DEFAULT_BLACKLISTED_RECIPES.includes(id);
+    return `
+      <div style="display:flex;align-items:center;gap:4px;margin-bottom:2px;padding:4px;background:${isUserAdded ? 'rgba(211,47,47,0.1)' : 'rgba(88,166,255,0.05)'};border-radius:3px">
+        <span>${esc(id)}</span>
+        <span style="font-size:10px;color:var(--dim)">${isDefault && !isUserAdded ? '(default)' : isUserAdded ? '(custom)' : ''}</span>
+        ${isUserAdded ? `<button style="margin-left:auto;font-size:10px;padding:2px 6px;background:#d32f2f;color:#fff;border:none;border-radius:3px;cursor:pointer" onclick="removeBlacklistedRecipe('${esc(id)}')">✕ Remove</button>` : ''}
+      </div>
+    `;
+  }).join('');
 }
 
 function addBlacklistedRecipe() {

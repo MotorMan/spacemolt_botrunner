@@ -568,7 +568,7 @@ function saveFleetData(botUsername: string, ships: FleetShip[]): void {
   saveAllData(data);
 }
 
-async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings, atHomeBase: boolean): Promise<void> {
+async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
   const { bot } = ctx;
   await bot.refreshStatus();
 
@@ -600,9 +600,6 @@ async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransport
     });
     if (!resp.error) {
       return true;
-    }
-    if (atHomeBase) {
-      return false;
     }
     const buyResp = await bot.exec("buy", { item_id: fuelId, quantity: qty });
     return !buyResp.error;
@@ -1196,6 +1193,15 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
 
 ctx.log("transport", `Civilian transport started. Ship: ${state.customName || state.shipName}. Status: ${state.status}`);
 
+  // Collect fuel cells at home base on startup
+  if (settings.homeStation && bot.docked && bot.poi && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()) {
+    ctx.log("transport", "At home station - collecting fuel cells");
+    await collectFuelCells(ctx, settings);
+    await bot.refreshStatus();
+    const fuelPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 0;
+    ctx.log("transport", `Fuel after collection: ${Math.round(fuelPct)}%`);
+  }
+
   if (state && state.status !== "idle") {
     const verifyResp = await bot.exec("list_passengers");
     if (verifyResp.error || !verifyResp.result) {
@@ -1371,6 +1377,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       // Need to find passengers and load up
       // If already docked at a station, check for passengers to loaf
       if (bot.docked && bot.poi && bot.system) {
+        // Collect fuel cells at any station when idle
+        await collectFuelCells(ctx, settings);
         const resp = await bot.exec("list_station_passengers");
         if (!resp.error && resp.result) {
           const data = parseStationPassengers(resp.result);
@@ -1451,8 +1459,10 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           await ctx.sleep(30000);
           continue;
         }
+        await collectFuelCells(ctx, settings);
       } else {
         ctx.log("transport", `Ready at ${state.pickupStation}`);
+        await collectFuelCells(ctx, settings);
       }
       state.status = "loading";
       saveTransportState(state);
@@ -1935,6 +1945,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         }
       }
 
+      await collectFuelCells(ctx, settings);
+
       await bot.refreshStatus();
       const creditsAfter = bot.credits || 0;
       const fareEarned = creditsAfter - creditsBefore;
@@ -1995,7 +2007,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         
         if (settings.homeStation) {
           await ensureDocked(ctx);
-          await collectFuelCells(ctx, settings, true);
+          await collectFuelCells(ctx, settings);
         }
         
         state.status = "idle";

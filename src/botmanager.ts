@@ -41,6 +41,7 @@ import { massDisconnectDetector } from "./massdisconnect.js";
 import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_chat_channel.js";
 import { flushMinerActivity } from "./routines/minerActivity.js";
+import { type SyncSettings } from "./client_sync_types.js";
 
 interface BotState {
   wasRunning: boolean;

@@ -3,6 +3,7 @@ import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
 import { log } from "./ui.js";
 import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
+import { onPoiUpdate } from "./client_sync_hooks.js";
 
 // ── Data model ──────────────────────────────────────────────
 
@@ -477,6 +478,7 @@ class MapStore {
 
     this.data.systems[id] = sys;
     this.scheduleSave();
+    void onPoiUpdate(id, systemData as Record<string, unknown>);
   }
 
   /** Update market prices for a station POI from view_market response. */
@@ -860,6 +862,7 @@ class MapStore {
     }
 
     this.scheduleSave();
+    void onPoiUpdate(systemId, poiData as Record<string, unknown>);
   }
 
   /** Mark an ore as depleted at a POI. */

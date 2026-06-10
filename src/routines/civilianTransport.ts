@@ -22,6 +22,7 @@ import {
 import { getSystemBlacklist } from "../web/server.js";
 import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
+import { onCivilianTransportUpdate } from "../client_sync_hooks.js";
 
 let stationRefCache: StationRef | null = null;
 
@@ -517,6 +518,7 @@ function saveAllData(data: { runs: Record<string, TransportState>; fleet: FleetD
     const dir = path.dirname(full);
     if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
     fs.writeFileSync(full, JSON.stringify(data, null, 2) + "\n", "utf-8");
+    void onCivilianTransportUpdate({ manifest: data });
   } catch (err) {
     console.error("Failed to save civilianTransport state:", err);
   }

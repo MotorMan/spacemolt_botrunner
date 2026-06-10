@@ -9,6 +9,9 @@ import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
 import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
+import { playerNameStore } from "../playernamestore.js";
+import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse } from "../client_sync_master.js";
+import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate } from "../client_sync_hooks.js";
 
 function getLocalIp(): string | null {
   const interfaces = os.networkInterfaces();
@@ -337,6 +340,9 @@ export class WebServer {
   // Available routines — set by botmanager
   routines: string[] = [];
 
+  // Client sync state
+  private syncMaster: ClientSyncMaster | null = null;
+
   constructor(port: number = 3000) {
     this.port = port;
     this.settings = loadSettings();
@@ -354,6 +360,30 @@ export class WebServer {
         sellAtHome: true,
         maxQtyDefault: 10,
         moduleItems: [],
+      };
+      saveSettings(this.settings);
+    }
+    if (!this.settings.clientSync) {
+      this.settings.clientSync = {
+        enabled: false,
+        mode: "slave",
+        masterUrl: "http://192.168.1.100:3000",
+        apiKey: "",
+        password: "",
+        label: "",
+        pollIntervalSec: 15,
+        syncMap: true,
+        syncMarket: true,
+        syncCatalog: true,
+        syncStats: true,
+        syncBotChat: true,
+        syncPlayerNames: true,
+        syncCoordination: true,
+        syncCivilianTransport: true,
+        syncRescue: true,
+        allowRemoteBotsInDropdowns: true,
+        remoteBotNameStyle: "prefix",
+        pushLocalDiscoveries: true,
       };
       saveSettings(this.settings);
     }
@@ -922,6 +952,101 @@ export class WebServer {
           } catch (e) {
             return new Response("Invalid flock state", { status: 500 });
           }
+        }
+
+        // Client sync routes
+        if (url.pathname.startsWith("/api/client-sync/")) {
+          if (!this.syncMaster) this.syncMaster = new ClientSyncMaster(this.settings as Record<string, unknown>);
+          const cors = { "Access-Control-Allow-Origin": "*" } as Record<string, string>;
+
+          if (url.pathname === "/api/client-sync/hello" && req.method === "GET") {
+            const clientId = req.headers.get("x-client-id") || "unknown";
+            const master = this.syncMaster;
+            master?.touch(clientId);
+            return Response.json(master?.hello(clientId), { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/map" && req.method === "GET") {
+            return Response.json(mapStore.getAllSystems(), { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/catalog" && req.method === "GET") {
+            return Response.json(catalogStore.getAll(), { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/stats" && req.method === "GET") {
+            return Response.json(this.statsData.daily, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/chat-history" && req.method === "GET") {
+            const history = botChatChannel.getHistory(undefined, 100);
+            return Response.json(history, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/bots" && req.method === "GET") {
+            return Response.json(this.latestStatuses, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/clients" && req.method === "GET") {
+            return Response.json(this.syncMaster?.getClients() ?? [], { headers: cors });
+          }
+          if (url.pathname.startsWith("/api/client-sync/coordination") && req.method === "GET") {
+            const file = url.searchParams.get("file") || "";
+            const path = join(process.cwd(), "data", file);
+            if (!existsSync(path)) return new Response("not found", { status: 404, headers: cors });
+            try {
+              const raw = readFileSync(path, "utf-8");
+              const data = JSON.parse(raw);
+              return Response.json(data, { headers: cors });
+            } catch {
+              return new Response("invalid json", { status: 500, headers: cors });
+            }
+          }
+          if (url.pathname === "/api/client-sync/player-names" && req.method === "GET") {
+            return Response.json({ names: playerNameStore.getAll() }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/register" && req.method === "POST") {
+            const body = await req.json() as { apiKey: string; label: string; password?: string };
+            const result = this.syncMaster?.register(body);
+            return Response.json(result ?? { ok: false, error: "not enabled" }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/chat-relay" && req.method === "POST") {
+            const body = await req.json() as { channel: string; content: string; sender?: string };
+            const clientId = req.headers.get("x-client-id") || "";
+            const result = this.syncMaster?.chatRelay(body);
+            return Response.json(result ?? { ok: false }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/bot-status" && req.method === "POST") {
+            const body = await req.json() as { clientId?: string; statuses: BotStatusPush[] };
+            const cid = body.clientId || req.headers.get("x-client-id") || "";
+            const ok = this.syncMaster?.botStatusPush(cid, body.statuses);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/poi-update" && req.method === "POST") {
+            const body = await req.json() as PoiPayload;
+            const ok = this.syncMaster?.poiUpdate(body);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/market-update" && req.method === "POST") {
+            const body = await req.json() as MarketPayload;
+            const ok = this.syncMaster?.marketUpdate(body);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/coordination-sync" && req.method === "POST") {
+            const body = await req.json() as CoordinationPayload;
+            const ok = this.syncMaster?.coordinationSync(body);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/player-names-update" && req.method === "POST") {
+            const body = await req.json() as PlayerNamePayload;
+            const ok = this.syncMaster?.playerNamesUpdate(body);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/civilian-transport-update" && req.method === "POST") {
+            const body = await req.json() as PassengerPayload;
+            const ok = this.syncMaster?.civilianTransportUpdate(body);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname.startsWith("/api/client-sync/clients/") && req.method === "DELETE") {
+            const id = decodeURIComponent(url.pathname.slice("/api/client-sync/clients/".length));
+            const ok = this.syncMaster?.disconnect(id);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          return new Response("not found", { status: 404, headers: cors });
         }
 
         // POST actions (fallback for non-WS clients)

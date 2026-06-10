@@ -3,6 +3,7 @@ import type { BotChatMessage } from "../bot_chat_channel.js";
 import { mapStore, isDepletionExpired } from "../mapstore.js";
 import { getBotChatChannel } from "../botmanager.js";
 import { getSystemBlacklist } from "../web/server.js";
+import { onCoordinationUpdate } from "../client_sync_hooks.js";
 import {
   isOreBeltPoi,
   isGasCloudPoi,
@@ -1267,6 +1268,7 @@ async function signalEscort(
     if (!existsSync(escortDir)) mkdirSync(escortDir, { recursive: true });
     const signalFile = join(escortDir, `${bot.username}.signal`);
     writeFileSync(signalFile, JSON.stringify({ action, systemId, timestamp: Date.now() }));
+    void onCoordinationUpdate("escort", { action, systemId, timestamp: Date.now() });
   }
 }
 

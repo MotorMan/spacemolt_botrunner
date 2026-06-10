@@ -3630,3 +3630,20 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   color: var(--cyan);
   font-weight: 500;
 }
+
+/* ── Client Sync Status ─────────────────────────────── */
+.sync-status-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+.sync-status-dot.connected { background: var(--green); }
+.sync-status-dot.disconnected { background: var(--red); }
+.sync-status-dot.reconnecting { background: var(--yellow); animation: pulse 1s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+.sync-settings-row { margin-bottom: 12px; }
+.sync-settings-row label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
+.sync-settings-row input, .sync-settings-row select { width: 100%; background: var(--bg-input); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 6px; font-size: 13px; }

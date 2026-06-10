@@ -247,27 +247,26 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
   
   // Update client sync slave settings if changed
   if (routine === "clientSync") {
-    const cs = s as Record<string, unknown>;
     const newSettings: SyncSettings = {
-      enabled: cs.enabled as boolean ?? false,
-      mode: (cs.mode as string) || "slave",
-      masterUrl: (cs.masterUrl as string) || "",
-      apiKey: (cs.apiKey as string) || "",
-      password: (cs.password as string) || "",
-      label: (cs.label as string) || "",
-      pollIntervalSec: (cs.pollIntervalSec as number) || 15,
-      syncMap: (cs.syncMap as boolean) ?? true,
-      syncMarket: (cs.syncMarket as boolean) ?? true,
-      syncCatalog: (cs.syncCatalog as boolean) ?? true,
-      syncStats: (cs.syncStats as boolean) ?? true,
-      syncBotChat: (cs.syncBotChat as boolean) ?? true,
-      syncPlayerNames: (cs.syncPlayerNames as boolean) ?? true,
-      syncCoordination: (cs.syncCoordination as boolean) ?? true,
-      syncCivilianTransport: (cs.syncCivilianTransport as boolean) ?? true,
-      syncRescue: (cs.syncRescue as boolean) ?? true,
-      allowRemoteBotsInDropdowns: (cs.allowRemoteBotsInDropdowns as boolean) ?? true,
-      remoteBotNameStyle: (cs.remoteBotNameStyle as "prefix" | "suffix") || "prefix",
-      pushLocalDiscoveries: (cs.pushLocalDiscoveries as boolean) ?? true,
+      enabled: (s.enabled as boolean) ?? false,
+      mode: ((s.mode as string) || "slave"),
+      masterUrl: ((s.masterUrl as string) || ""),
+      apiKey: ((s.apiKey as string) || ""),
+      password: ((s.password as string) || ""),
+      label: ((s.label as string) || ""),
+      pollIntervalSec: ((s.pollIntervalSec as number) || 15),
+      syncMap: ((s.syncMap as boolean) ?? true),
+      syncMarket: ((s.syncMarket as boolean) ?? true),
+      syncCatalog: ((s.syncCatalog as boolean) ?? true),
+      syncStats: ((s.syncStats as boolean) ?? true),
+      syncBotChat: ((s.syncBotChat as boolean) ?? true),
+      syncPlayerNames: ((s.syncPlayerNames as boolean) ?? true),
+      syncCoordination: ((s.syncCoordination as boolean) ?? true),
+      syncCivilianTransport: ((s.syncCivilianTransport as boolean) ?? true),
+      syncRescue: ((s.syncRescue as boolean) ?? true),
+      allowRemoteBotsInDropdowns: ((s.allowRemoteBotsInDropdowns as boolean) ?? true),
+      remoteBotNameStyle: ((s.remoteBotNameStyle as "prefix" | "suffix") || "prefix"),
+      pushLocalDiscoveries: ((s.pushLocalDiscoveries as boolean) ?? true),
     };
     const syncSlave = (globalThis as any).syncSlave as ClientSyncSlave | undefined;
     if (newSettings.enabled && newSettings.mode === "slave" && newSettings.masterUrl) {

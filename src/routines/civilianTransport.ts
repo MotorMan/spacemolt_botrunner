@@ -419,6 +419,7 @@ interface CivilianTransportSettings {
   allowFirstClass: boolean;
   allowBusinessClass: boolean;
   allowEconomyClass: boolean;
+  announceDestination: boolean;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -445,6 +446,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     allowFirstClass: (t.allowFirstClass as boolean) !== false,
     allowBusinessClass: (t.allowBusinessClass as boolean) !== false,
     allowEconomyClass: (t.allowEconomyClass as boolean) !== false,
+    announceDestination: (t.announceDestination as boolean) !== false,
   };
 }
 
@@ -1827,7 +1829,9 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         announceService &&
         typeof announceService.sendTransportAnnouncement === "function"
       ) {
-        const routeNames = planned.map(d => d.poiName).filter(name => name && name.trim().length > 0);
+        const routeNames = settings.announceDestination
+          ? planned.map(d => d.poiName).filter(name => name && name.trim().length > 0)
+          : [];
         const passengerInfos = onboard.map(p => ({
           name: p.name,
           bio: p.bio || "",
@@ -2025,7 +2029,9 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           announceService &&
           typeof announceService.sendTransportAnnouncement === "function"
         ) {
-          const routeNames = completedPassengers.map(p => p.destinationName).filter(name => name && name.trim().length > 0);
+          const routeNames = settings.announceDestination
+            ? completedPassengers.map(p => p.destinationName).filter(name => name && name.trim().length > 0)
+            : [];
           const passengerInfos = completedPassengers.map(p => ({
             name: p.name,
             bio: p.bio || "",

@@ -10255,6 +10255,17 @@ function renderTraderSettings(panel) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Debug Logging</div>
+        <div class="setting-hint">Enable verbose logging for trade route discovery (shows profit calculations, skipped routes, etc).</div>
+      </div>
+      <select id="set-trader-debugLogging">
+        <option value="false" ${t.debugLogging === true ? '' : 'selected'}>Disabled</option>
+        <option value="true" ${t.debugLogging === true ? 'selected' : ''}>Enabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Min Profit Per Unit (credits)</div>
         <div class="setting-hint">Only run trade routes where per-item profit exceeds this amount after fuel costs.</div>
       </div>
@@ -10325,6 +10336,7 @@ function saveTraderSettings() {
     repairThreshold: parseInt(document.getElementById('set-trader-repairThreshold').value) || 40,
     homeSystem: document.getElementById('set-trader-homeSystem').value.trim(),
     enableMissions: document.getElementById('set-trader-enableMissions').value === 'true',
+    debugLogging: document.getElementById('set-trader-debugLogging').value === 'true',
   };
   send({ type: 'saveSettings', routine: 'trader', settings: s });
   settings.trader = s;

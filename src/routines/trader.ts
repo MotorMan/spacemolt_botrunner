@@ -242,6 +242,7 @@ function getTraderSettings(username?: string): {
   autoCloak: boolean;
   maxFactionCreditsToUse: number;
   enableMissions: boolean;
+  debugLogging: boolean;
 } {
   const all = readSettings();
   const t = all.trader || {};
@@ -259,6 +260,7 @@ function getTraderSettings(username?: string): {
     autoCloak: (t.autoCloak as boolean) ?? false,
     maxFactionCreditsToUse: (t.maxFactionCreditsToUse as number) ?? 0, // 0 = unlimited
     enableMissions: (t.enableMissions as boolean) !== false,
+    debugLogging: (t.debugLogging as boolean) ?? false,
   };
 }
 
@@ -565,7 +567,7 @@ function processMarketInsights(
 ): TradeRoute[] {
   const routes: TradeRoute[] = [];
 
-  debugLog?.(`processMarketInsights: ${insights.length} insights, priority threshold ${settings.minProfitPerUnit}`);
+  debugLog?.(`processMarketInsights: ${insights.length} insights, priority threshold 100000`);
 
   for (const insight of insights) {
     const category = insight.category as string;
@@ -973,20 +975,20 @@ function findCargoSellRoutes(
     return !lower.includes("fuel") && !lower.includes("energy_cell");
   });
   if (cargoItems.length === 0) {
-    ctx.log("trade", "  findCargoSellRoutes: no cargo items found");
+    if (settings.debugLogging) ctx.log("trade", "  findCargoSellRoutes: no cargo items found");
     return routes;
   }
-  ctx.log("trade", `  findCargoSellRoutes: checking ${cargoItems.length} cargo items`);
+  if (settings.debugLogging) ctx.log("trade", `  findCargoSellRoutes: checking ${cargoItems.length} cargo items`);
 
   const allBuys = mapStore.getAllBuyDemand();
-  ctx.log("trade", `  findCargoSellRoutes: ${allBuys.length} buy demands available`);
+  if (settings.debugLogging) ctx.log("trade", `  findCargoSellRoutes: ${allBuys.length} buy demands available`);
   if (allBuys.length === 0) {
-    ctx.log("trade", "  findCargoSellRoutes: no buy demand data");
+    if (settings.debugLogging) ctx.log("trade", "  findCargoSellRoutes: no buy demand data");
     return routes;
   }
 
   for (const item of cargoItems) {
-    ctx.log("trade", `  findCargoSellRoutes: checking ${item.name} (${item.quantity}x)`);
+    if (settings.debugLogging) ctx.log("trade", `  findCargoSellRoutes: checking ${item.name} (${item.quantity}x)`);
     // Find best buyer at a dockable station (not at current station — we already tried selling here)
     const buyers = allBuys
       .filter(b => b.itemId === item.itemId && b.price > 0)
@@ -999,18 +1001,18 @@ function findCargoSellRoutes(
       })
       .sort((a, b) => b.price - a.price);
 
-    ctx.log("trade", `    found ${buyers.length} potential buyers for ${item.name}`);
+    if (settings.debugLogging) ctx.log("trade", `    found ${buyers.length} potential buyers for ${item.name}`);
 
     for (const buy of buyers) {
       const { jumps, cost: fuelCost } = estimateFuelCost(currentSystem, buy.systemId, settings.fuelCostPerJump);
       if (jumps >= 999) {
-        ctx.log("trade", `    skipping ${buy.poiName}: no route found`);
+        if (settings.debugLogging) ctx.log("trade", `    skipping ${buy.poiName}: no route found`);
         continue;
       }
 
       const sellQty = Math.min(item.quantity, buy.quantity);
       if (sellQty <= 0) {
-        ctx.log("trade", `    skipping ${buy.poiName}: no quantity available`);
+        if (settings.debugLogging) ctx.log("trade", `    skipping ${buy.poiName}: no quantity available`);
         continue;
       }
 
@@ -1018,11 +1020,11 @@ function findCargoSellRoutes(
       const costBasis = acquisitionCostPerUnit ?? 0;
       const profitPerUnit = buy.price - costBasis - (jumps > 0 ? fuelCost / sellQty : 0);
       if (profitPerUnit <= 0) {
-        ctx.log("trade", `    skipping ${buy.poiName}: profit ${Math.round(profitPerUnit)}cr/unit <= 0`);
+        if (settings.debugLogging) ctx.log("trade", `    skipping ${buy.poiName}: profit ${Math.round(profitPerUnit)}cr/unit <= 0`);
         continue;
       }
 
-      ctx.log("trade", `    route found: ${item.name} → ${buy.poiName} (${Math.round(profitPerUnit)}cr profit)`);
+      if (settings.debugLogging) ctx.log("trade", `    route found: ${item.name} → ${buy.poiName} (${Math.round(profitPerUnit)}cr profit)`);
       routes.push({
         itemId: item.itemId,
         itemName: item.name,
@@ -1698,11 +1700,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
       const cargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
+      const spreadCount = mapStore.findPriceSpreads().length;
       cargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
       marketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, cargoCapacity, marketInsights, 
-        (msg) => ctx.log("trade", msg));
+        settings.debugLogging ? (msg) => ctx.log("trade", msg) : undefined);
       ctx.log("trade", `findCargoSellRoutes found ${cargoRoutes.length} routes`);
-      ctx.log("trade", `findTradeOpportunities found ${marketRoutes.length} routes from ${mapStore.findPriceSpreads().length} spreads`);
+      ctx.log("trade", `findTradeOpportunities found ${marketRoutes.length} routes from ${spreadCount} spreads`);
       // Filter out routes that sell items we just sold at the current station (demand already filled)
       const currentPoi = bot.poi;
       let allRoutes = [...cargoRoutes, ...marketRoutes].filter(r => {
@@ -1736,9 +1739,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("trade", `Found ${routeCounts} routes (${cargoRoutes.length} cargo + ${marketRoutes.length} market)`);
 
       // Debug: log each market route's profit check
-      for (const r of marketRoutes) {
-        const profitCheck = r.profitPerUnit >= settings.minProfitPerUnit ? "PASS" : "FAIL";
-        ctx.log("trade", `  Market route: ${r.itemName} - profit ${Math.round(r.profitPerUnit)}cr/unit (min: ${settings.minProfitPerUnit}) [${profitCheck}]`);
+      if (settings.debugLogging) {
+        for (const r of marketRoutes) {
+          const profitCheck = r.profitPerUnit >= settings.minProfitPerUnit ? "PASS" : "FAIL";
+          ctx.log("trade", `  Market route: ${r.itemName} - profit ${Math.round(r.profitPerUnit)}cr/unit (min: ${settings.minProfitPerUnit}) [${profitCheck}]`);
+        }
       }
 
       // Station priority: put routes whose destination is the home station first
@@ -1776,15 +1781,17 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     if (routes.length === 0 && !recoveredSessionHandled) {
       // No routes found and no recovered session to handle
-      ctx.log("trade", `ROUTE ANALYSIS: ${allRoutesCount} total routes found, ${affordableRoutesCount} affordable`);
+      if (settings.debugLogging) {
+        ctx.log("trade", `ROUTE ANALYSIS: ${allRoutesCount} total routes found, ${affordableRoutesCount} affordable`);
+        ctx.log("trade", `  cargoRoutes: ${cargoRoutes.length}, marketRoutes: ${marketRoutes.length}`);
+        ctx.log("trade", `  minProfitPerUnit setting: ${settings.minProfitPerUnit}`);
+      }
       if (allRoutesCount > 0 && affordableRoutesCount === 0) {
         ctx.log("trade", `No affordable routes found (budget: ${bot.credits}cr) — waiting 60s for more market data or consider earning credits via missions`);
       } else if (allRoutesCount > 0 && affordableRoutesCount > 0) {
         ctx.log("trade", `No routes after coordination filtering (${affordableRoutesCount} affordable) — waiting 60s before re-scanning`);
       } else {
         ctx.log("trade", "No profitable trade routes found — waiting 60s before re-scanning");
-        ctx.log("trade", `  cargoRoutes: ${cargoRoutes.length}, marketRoutes: ${marketRoutes.length}`);
-        ctx.log("trade", `  minProfitPerUnit setting: ${settings.minProfitPerUnit}`);
       }
       await ctx.sleep(60000);
       continue;

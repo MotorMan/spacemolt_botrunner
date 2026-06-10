@@ -426,6 +426,7 @@ const COMMAND_TTL: Record<string, number> = {
   get_wrecks: 10_000, //doesn't need to be 15.
   get_notifications: 5_000, //throttled to once per tick (10s)
   catalog: 3600_000, //only really needs to be once per client restart, it NEVER changes while running.
+  get_map: 3600_000, //cached once per session, invalidated on server version change or client restart.
 };
 
 const INV_STATUS   = ["get_status", "get_player", "get_queue", "get_skills"];
@@ -470,6 +471,7 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   attack: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
   battle: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
   catalog: [],
+  get_map: [],
 };
 
 export class SpaceMoltAPI {
@@ -490,6 +492,7 @@ export class SpaceMoltAPI {
   private _rateLimiter = new SessionRateLimiter();
   private _isGameServer: boolean;
   private _rateLimitingDisabled = false;
+  private _serverVersion: string | null = null;
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
@@ -562,12 +565,36 @@ export class SpaceMoltAPI {
     return this._cache.get(cacheKey);
   }
 
+  private async getServerVersion(): Promise<string> {
+    if (this._serverVersion) return this._serverVersion;
+    try {
+      const resp = await this.doRequest("get_version");
+      if (!resp.error && resp.result) {
+        this._serverVersion = String(resp.result);
+        return this._serverVersion;
+      }
+    } catch {}
+    return "unknown";
+  }
+
+  private async invalidateVersionCaches(): Promise<void> {
+    const version = await this.getServerVersion();
+    if (version !== this._serverVersion) {
+      this._serverVersion = version;
+      this._cache.invalidate(["catalog:", "get_map:"]);
+    }
+  }
+
   async execute(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
     debugLogForBot(botName, "api:execute", `${botName} > ${command}`, payload);
 
     const cacheTtl = COMMAND_TTL[command];
-    const cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
+    let cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
+    if (command === "catalog" || command === "get_map") {
+      const version = this._serverVersion || await this.getServerVersion();
+      cacheKey = `${command}:${version}:${JSON.stringify(payload ?? {})}`;
+    }
     if (cacheTtl !== undefined) {
       const cached = this._cache.get(cacheKey);
       if (cached) return cached;
@@ -691,6 +718,13 @@ export class SpaceMoltAPI {
       }
       const toInvalidate = MUTATION_INVALIDATIONS[command];
       if (toInvalidate) this._cache.invalidate(toInvalidate);
+      if (command === "get_version" && resp.result) {
+        const newVersion = String(resp.result);
+        if (newVersion !== this._serverVersion) {
+          this._serverVersion = newVersion;
+          this._cache.invalidate(["catalog:", "get_map:"]);
+        }
+      }
     }
 
     return resp;

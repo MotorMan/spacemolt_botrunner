@@ -451,7 +451,7 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   let shipData: Record<string, unknown>;
   let usingCachedModules = false;
 
-  if (cachedModules) {
+  if (cachedModules && cachedModules.length > 0) {
     shipData = { modules: cachedModules };
     usingCachedModules = true;
   } else {
@@ -650,7 +650,7 @@ export async function hasEquipmentForMiningType(ctx: RoutineContext, miningType:
   const { bot } = ctx;
   let modules: unknown[];
 
-  if (cachedModules) {
+  if (cachedModules && cachedModules.length > 0) {
     modules = cachedModules;
   } else {
     const shipResp = await bot.exec("get_ship");
@@ -1480,6 +1480,24 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
    // when the server is still processing (e.g. after a jump timeout).
    let cachedModules: unknown[] | null = await cacheShipModules(ctx);
 
+   // CRITICAL FIX: If modules are empty at startup, wait and retry a few times
+   // This handles the case where get_ship returns empty data due to server lag
+   if (!cachedModules || cachedModules.length === 0) {
+     ctx.log("warn", "Ship modules empty at startup — waiting for server to process...");
+     let retryCount = 0;
+     const maxRetries = 5;
+     while ((!cachedModules || cachedModules.length === 0) && retryCount < maxRetries) {
+       await ctx.sleep(2000);
+       cachedModules = await cacheShipModules(ctx);
+       retryCount++;
+     }
+     if (!cachedModules || cachedModules.length === 0) {
+       ctx.log("error", `Failed to get ship modules after ${maxRetries} retries — cannot determine mining type`);
+       yield "error";
+       return;
+     }
+   }
+
 // ── Flock heartbeat tracking (persists across cycles) ──
     let lastFlockHeartbeat = 0;
     let lastFlockStateUpdate = 0;
@@ -1512,6 +1530,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (!hasEquipment) {
           ctx.log("error", `Session invalid: no equipment for ${sessionMiningType} mining (${activeSession.targetResourceName}) — abandoning`);
           await failMiningSession(bot.username, "No equipment for resource type");
+          recoveredSession = null;
         } else {
           // Check if bot is at the expected location for the session
           if (bot.system !== activeSession.targetSystemId || bot.poi !== activeSession.targetPoiId) {
@@ -1556,6 +1575,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Refresh cached ship modules after death recovery ──
     // (modules could change if ship was destroyed and replaced)
     cachedModules = await cacheShipModules(ctx);
+    
+    // CRITICAL FIX: If modules are empty after death recovery, wait and retry
+    if (!cachedModules || cachedModules.length === 0) {
+      ctx.log("warn", "Ship modules empty after death recovery — waiting for server...");
+      let retryCount = 0;
+      while ((!cachedModules || cachedModules.length === 0) && retryCount < 3) {
+        await ctx.sleep(2000);
+        cachedModules = await cacheShipModules(ctx);
+        retryCount++;
+      }
+      if (!cachedModules || cachedModules.length === 0) {
+        ctx.log("error", "Failed to get ship modules after death recovery — skipping cycle");
+        await ctx.sleep(30000);
+        continue;
+      }
+    }
 
     // ── Battle state tracking (per-cycle initialization) ──
     const battleState: BattleState = {
@@ -4433,9 +4468,21 @@ if (effectiveTarget) {
 
       // Verify mining equipment before attempting to mine
       if (!await hasEquipmentForMiningType(ctx, miningType)) {
-        ctx.log("warn", "Mining equipment error: No mining equipment installed");
-        await ctx.sleep(5000);
-        continue;
+        ctx.log("warn", "Mining equipment error: No mining equipment installed — refreshing modules and re-detecting");
+        cachedModules = await cacheShipModules(ctx);
+        const retryDetected = await detectMiningType(ctx, cachedModules || undefined);
+        if (!retryDetected) {
+          ctx.log("error", "Still no mining equipment detected after refresh — clearing target and returning home to retry next cycle");
+          effectiveTarget = "";
+          targetResource = "";
+          if (recoveredSession) {
+            await failMiningSession(bot.username, "Equipment lost after refresh");
+            recoveredSession = null;
+          }
+          break;
+        }
+        miningType = retryDetected;
+        ctx.log("mining", `Re-detected mining type: ${miningType} after equipment refresh`);
       }
 
       const mineResp = await bot.exec("mine");

@@ -1007,6 +1007,13 @@ export class WebServer {
             this.syncMaster?.saveSettings();
             return Response.json({ ok: true }, { headers: cors });
           }
+          if (url.pathname === "/api/client-sync/slave-state" && req.method === "GET") {
+            const syncSlave = (globalThis as any).syncSlave;
+            if (syncSlave) {
+              return Response.json(syncSlave.getState(), { headers: cors });
+            }
+            return Response.json({ connected: false, lastError: "Slave not running" }, { headers: cors });
+          }
           if (url.pathname.startsWith("/api/client-sync/coordination") && req.method === "GET") {
             const file = url.searchParams.get("file") || "";
             const path = join(process.cwd(), "data", file);

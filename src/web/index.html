@@ -21878,9 +21878,13 @@ function renderClientSyncSettings(panel) {
         <div class="setting-row">
           <div>
             <div class="setting-label">Connection Status</div>
-            <div class="setting-hint">Current sync status.</div>
+            <div class="setting-hint">Current sync status. Auto-refreshes every 5s.</div>
           </div>
-          <span id="clientSyncStatus" style="font-size:12px;color:var(--text-dim)">Not connected</span>
+          <span id="clientSyncStatus" style="font-size:12px;color:var(--text-dim)">Checking...</span>
+        </div>
+        <div style="margin-top:8px;display:flex;gap:8px">
+          <button class="sm" onclick="refreshClientSyncStatus()">Refresh Status</button>
+          <button class="sm primary" onclick="testClientSyncConnection()">Test Connection</button>
         </div>
       </div>
 
@@ -21984,10 +21988,79 @@ function refreshClientSyncConnectedClients() {
     .catch(() => {});
 }
 
+function refreshClientSyncStatus() {
+  const mode = document.getElementById('set-client_sync-mode').value;
+  const masterUrl = document.getElementById('set-client_sync-masterUrl').value;
+  const statusEl = document.getElementById('clientSyncStatus');
+  if (mode !== 'slave') {
+    if (statusEl) statusEl.textContent = 'Not applicable';
+    return;
+  }
+  
+  // Fetch slave state from server
+  fetch('/api/client-sync/slave-state')
+    .then(r => r.json())
+    .then(state => {
+      const statusEl = document.getElementById('clientSyncStatus');
+      if (!statusEl) return;
+      
+      if (state.connected) {
+        statusEl.textContent = 'Connected';
+        statusEl.style.color = 'var(--green, #00ff00)';
+      } else {
+        statusEl.textContent = `Disconnected: ${state.lastError || 'Unknown error'}`;
+        statusEl.style.color = 'var(--red, #ff4444)';
+      }
+    })
+    .catch(err => {
+      if (statusEl) {
+        statusEl.textContent = `Not connected (${err.message})`;
+        statusEl.style.color = 'var(--red, #ff4444)';
+      }
+    });
+}
+
+function testClientSyncConnection() {
+  const masterUrl = document.getElementById('set-client_sync-masterUrl').value;
+  const apiKey = document.getElementById('set-client_sync-apiKey').value;
+  const password = document.getElementById('set-client_sync-password').value;
+  const label = document.getElementById('set-client_sync-label').value;
+  const statusEl = document.getElementById('clientSyncStatus');
+  
+  if (!masterUrl) {
+    statusEl.textContent = 'Enter master URL first';
+    return;
+  }
+  
+  statusEl.textContent = 'Testing...';
+  statusEl.style.color = 'var(--text-bright)';
+  
+  fetch(`${masterUrl}/api/client-sync/register`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ apiKey, label: label || 'test', password })
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.ok) {
+      statusEl.textContent = `Success: ${data.clientId}`;
+      statusEl.style.color = 'var(--green, #00ff00)';
+    } else {
+      statusEl.textContent = `Failed: ${data.error || 'Unknown error'}`;
+      statusEl.style.color = 'var(--red, #ff4444)';
+    }
+  })
+  .catch(err => {
+    statusEl.textContent = `Failed: ${err.message}`;
+    statusEl.style.color = 'var(--red, #ff4444)';
+  });
+}
+
 setInterval(() => {
   if (document.getElementById('page-settings')?.classList.contains('active')) {
     const mode = document.getElementById('set-client_sync-mode')?.value;
     if (mode === 'master') refreshClientSyncConnectedClients();
+    if (mode === 'slave') refreshClientSyncStatus();
   }
 }, 5000);
 

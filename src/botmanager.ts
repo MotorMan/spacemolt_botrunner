@@ -42,6 +42,7 @@ import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_chat_channel.js";
 import { flushMinerActivity } from "./routines/minerActivity.js";
 import { type SyncSettings } from "./client_sync_types.js";
+import { ClientSyncSlave } from "./client_sync_slave.js";
 
 interface BotState {
   wasRunning: boolean;
@@ -243,6 +244,44 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
 
   server.saveRoutineSettings(routine, s);
   server.logSystem(`Settings saved for ${routine}`);
+  
+  // Update client sync slave settings if changed
+  if (routine === "clientSync") {
+    const cs = s as Record<string, unknown>;
+    if (cs.enabled && cs.mode === "slave" && cs.masterUrl) {
+      const syncSlave = (globalThis as any).syncSlave as ClientSyncSlave | undefined;
+      const newSettings: SyncSettings = {
+        enabled: cs.enabled as boolean,
+        mode: (cs.mode as string) || "slave",
+        masterUrl: (cs.masterUrl as string) || "",
+        apiKey: (cs.apiKey as string) || "",
+        password: (cs.password as string) || "",
+        label: (cs.label as string) || "",
+        pollIntervalSec: (cs.pollIntervalSec as number) || 15,
+        syncMap: (cs.syncMap as boolean) ?? true,
+        syncMarket: (cs.syncMarket as boolean) ?? true,
+        syncCatalog: (cs.syncCatalog as boolean) ?? true,
+        syncStats: (cs.syncStats as boolean) ?? true,
+        syncBotChat: (cs.syncBotChat as boolean) ?? true,
+        syncPlayerNames: (cs.syncPlayerNames as boolean) ?? true,
+        syncCoordination: (cs.syncCoordination as boolean) ?? true,
+        syncCivilianTransport: (cs.syncCivilianTransport as boolean) ?? true,
+        syncRescue: (cs.syncRescue as boolean) ?? true,
+        allowRemoteBotsInDropdowns: (cs.allowRemoteBotsInDropdowns as boolean) ?? true,
+        remoteBotNameStyle: (cs.remoteBotNameStyle as "prefix" | "suffix") || "prefix",
+        pushLocalDiscoveries: (cs.pushLocalDiscoveries as boolean) ?? true,
+      };
+      if (syncSlave) {
+        syncSlave.updateSettings(newSettings);
+      } else {
+        const newSlave = new ClientSyncSlave(newSettings);
+        newSlave.start();
+        (globalThis as any).syncSlave = newSlave;
+        server.logSystem(`Client sync slave started`);
+      }
+    }
+  }
+  
   return { ok: true, message: `${routine} settings saved`, settings: server.settings };
 }
 
@@ -777,6 +816,38 @@ async function main(): Promise<void> {
   const chatPort = parseInt(process.env.CHAT_PORT || String(Number(settings.general?.port || 3000) + 1000), 10);
   chatServer = new ChatWebServer(chatPort);
   chatServer.start();
+
+  // Initialize client sync slave if configured
+  const csSettings = settings.clientSync as Record<string, unknown> | undefined;
+  if (csSettings) {
+    const clientSyncSettings: SyncSettings = {
+      enabled: csSettings.enabled as boolean ?? false,
+      mode: (csSettings.mode as string) || "slave",
+      masterUrl: (csSettings.masterUrl as string) || "",
+      apiKey: (csSettings.apiKey as string) || "",
+      password: (csSettings.password as string) || "",
+      label: (csSettings.label as string) || "",
+      pollIntervalSec: (csSettings.pollIntervalSec as number) || 15,
+      syncMap: (csSettings.syncMap as boolean) ?? true,
+      syncMarket: (csSettings.syncMarket as boolean) ?? true,
+      syncCatalog: (csSettings.syncCatalog as boolean) ?? true,
+      syncStats: (csSettings.syncStats as boolean) ?? true,
+      syncBotChat: (csSettings.syncBotChat as boolean) ?? true,
+      syncPlayerNames: (csSettings.syncPlayerNames as boolean) ?? true,
+      syncCoordination: (csSettings.syncCoordination as boolean) ?? true,
+      syncCivilianTransport: (csSettings.syncCivilianTransport as boolean) ?? true,
+      syncRescue: (csSettings.syncRescue as boolean) ?? true,
+      allowRemoteBotsInDropdowns: (csSettings.allowRemoteBotsInDropdowns as boolean) ?? true,
+      remoteBotNameStyle: (csSettings.remoteBotNameStyle as "prefix" | "suffix") || "prefix",
+      pushLocalDiscoveries: (csSettings.pushLocalDiscoveries as boolean) ?? true,
+    };
+    if (clientSyncSettings.enabled && clientSyncSettings.mode === "slave" && clientSyncSettings.masterUrl) {
+      const syncSlave = new ClientSyncSlave(clientSyncSettings);
+      syncSlave.start();
+      (globalThis as any).syncSlave = syncSlave;
+      server.logSystem(`Client sync slave enabled, connecting to ${clientSyncSettings.masterUrl}`);
+    }
+  }
 
   // Route global ui.log() calls through the web server
   setLogSink((category, message) => {

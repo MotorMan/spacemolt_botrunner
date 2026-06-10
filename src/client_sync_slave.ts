@@ -11,6 +11,8 @@ export class ClientSyncSlave {
   private timer: ReturnType<typeof setInterval> | null = null;
   private lastSync = 0;
   private lastError: string | null = null;
+  private connectionState: 'disconnected' | 'connecting' | 'connected' = 'disconnected';
+  private lastConnectAttempt = 0;
 
   constructor(settings: SyncSettings) {
     this.settings = settings;
@@ -19,6 +21,7 @@ export class ClientSyncSlave {
   public start(): void {
     if (this.running) return;
     this.running = true;
+    console.log(`[ClientSync] Starting slave mode`);
     const intervalMs = Math.max(5, this.settings.pollIntervalSec * 1000);
     this.timer = setInterval(() => this.pollCycle(), intervalMs);
     this.pollCycle();
@@ -31,14 +34,23 @@ export class ClientSyncSlave {
       this.timer = null;
     }
     this.clientId = null;
+    this.connectionState = 'disconnected';
   }
 
-  public getState(): { connected: boolean; lastSync: number; lastError: string | null } {
-    return { connected: !!this.clientId, lastSync: this.lastSync, lastError: this.lastError };
+  public getState(): { connected: boolean; lastSync: number; lastError: string | null; connectionState: string; lastConnectAttempt: number } {
+    return { connected: !!this.clientId, lastSync: this.lastSync, lastError: this.lastError, connectionState: this.connectionState, lastConnectAttempt: this.lastConnectAttempt };
   }
 
   public updateSettings(s: SyncSettings): void {
     this.settings = s;
+  }
+
+  private log(msg: string): void {
+    console.log(`[ClientSync] ${msg}`);
+  }
+
+  private logError(msg: string): void {
+    console.error(`[ClientSync] ${msg}`);
   }
 
   private async request<T>(path: string, init?: RequestInit, body?: unknown): Promise<T> {
@@ -51,9 +63,25 @@ export class ClientSyncSlave {
     if (this.clientId) headers["X-Client-Id"] = this.clientId;
 
     const url = `${this.settings.masterUrl}${path}`;
-    const res = await fetch(url, { ...init, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
-    const text = await res.text();
-    try { return JSON.parse(text) as T; } catch { return text as T; }
+    this.log(`Requesting: ${url}`);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
+    
+    try {
+      const res = await fetch(url, { ...init, headers, body: body !== undefined ? JSON.stringify(body) : undefined, signal: controller.signal });
+      clearTimeout(timeoutId);
+      const text = await res.text();
+      this.log(`Response from ${url}: ${res.status} ${text.substring(0, 200)}`);
+      try { return JSON.parse(text) as T; } catch { return text as T; }
+    } catch (err) {
+      clearTimeout(timeoutId);
+      if (err instanceof Error && err.name === 'AbortError') {
+        this.logError(`Timeout connecting to ${url}`);
+        throw new Error(`Connection timeout to ${this.settings.masterUrl}`);
+      }
+      this.logError(`Fetch error to ${url}: ${err instanceof Error ? err.message : String(err)}`);
+      throw err;
+    }
   }
 
   private async pushLocal(endpoint: string, payload: Record<string, unknown>): Promise<void> {
@@ -62,14 +90,34 @@ export class ClientSyncSlave {
 
   private async register(): Promise<{ ok: boolean; error?: string }> {
     const url = new URL("/api/client-sync/register", this.settings.masterUrl).toString();
+    this.log(`Registering with master at ${url}`);
     const headers: Record<string, string> = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
     if (this.settings.apiKey) headers["X-API-Key"] = this.settings.apiKey;
     if (this.settings.password) headers["X-Password"] = this.settings.password;
-    const res = await fetch(url, { method: "POST", headers, body: JSON.stringify({ apiKey: this.settings.apiKey, label: this.settings.label || "slave", password: this.settings.password }) });
-    let payload: { ok: boolean; clientId?: string; error?: string };
-    try { payload = await res.json(); } catch { payload = { ok: false, error: "invalid response" }; }
-    if (payload.ok && payload.clientId) this.clientId = payload.clientId;
-    return payload;
+    
+    this.connectionState = 'connecting';
+    this.lastConnectAttempt = Date.now();
+    
+    try {
+      const res = await fetch(url, { method: "POST", headers, body: JSON.stringify({ apiKey: this.settings.apiKey, label: this.settings.label || "slave", password: this.settings.password }) });
+      this.log(`Register response: ${res.status}`);
+      let payload: { ok: boolean; clientId?: string; error?: string };
+      try { payload = await res.json(); } catch { payload = { ok: false, error: "invalid response" }; }
+      if (payload.ok && payload.clientId) {
+        this.clientId = payload.clientId;
+        this.connectionState = 'connected';
+        this.log(`Registered as ${payload.clientId}`);
+      } else {
+        this.connectionState = 'disconnected';
+        this.logError(`Registration failed: ${payload.error}`);
+      }
+      return payload;
+    } catch (err) {
+      this.connectionState = 'disconnected';
+      const msg = err instanceof Error ? err.message : String(err);
+      this.logError(`Registration error: ${msg}`);
+      return { ok: false, error: msg };
+    }
   }
 
   private async pullMap(): Promise<void> {
@@ -120,8 +168,10 @@ export class ClientSyncSlave {
 
   private async pollCycle(): Promise<void> {
     if (!this.running) return;
+    this.log(`Poll cycle starting, clientId: ${this.clientId || 'none'}`);
     try {
       if (!this.clientId) {
+        this.log('Attempting registration...');
         const reg = await this.register();
         if (!reg.ok) throw new Error(reg.error || "register failed");
       }
@@ -136,9 +186,12 @@ export class ClientSyncSlave {
       }
       this.lastSync = Date.now();
       this.lastError = null;
+      this.log(`Poll cycle completed successfully`);
     } catch (err) {
       this.lastError = err instanceof Error ? err.message : String(err);
       this.clientId = null;
+      this.connectionState = 'disconnected';
+      this.logError(`Poll cycle failed: ${this.lastError}`);
     }
   }
 }

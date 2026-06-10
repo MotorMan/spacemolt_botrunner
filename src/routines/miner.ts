@@ -1701,8 +1701,32 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         
         if (!flockState) {
           ctx.log("flock", `Flock mode: FOLLOWER of "${settings.flockName}" — waiting for leader...`);
-          // Wait for leader to announce target
+          // Check if leader has been inactive for too long (60 seconds stale)
+          // If so, return home and wait for fresh leader data
+          const statePath = await (await import("path")).join(process.cwd(), "data", "flock_signals", `${settings.flockName}.json`);
+          const { existsSync } = await import("fs");
+          if (existsSync(statePath)) {
+            const { statSync } = await import("fs");
+            const fileStat = statSync(statePath);
+            const ageMs = Date.now() - fileStat.mtimeMs;
+            if (ageMs > 60_000) {
+              ctx.log("flock", `Leader state stale (${Math.round(ageMs/1000)}s old) — returning home to wait for fresh coordination`);
+              yield "return_home";
+              await ensureDocked(ctx);
+              await ctx.sleep(10000);
+              continue;
+            }
+          }
           await ctx.sleep(5000);
+          continue;
+        }
+        
+        // Check if leader state is too stale (older than 60 seconds)
+        if (Date.now() - flockState.lastUpdate > 60_000) {
+          ctx.log("flock", `Leader state stale (${Math.round((Date.now() - flockState.lastUpdate)/1000)}s) — returning home to wait for fresh coordination`);
+          yield "return_home";
+          await ensureDocked(ctx);
+          await ctx.sleep(10000);
           continue;
         }
         
@@ -1741,30 +1765,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
 // ── Leader: broadcast heartbeat AND target updates every 30 seconds ──
-    if (isFlockLeader && settings.flockEnabled && settings.flockName && (Date.now() - lastFlockHeartbeat) > 30_000) {
-      await broadcastFlockHeartbeat(settings.flockName, bot.username, {
-        targetSystemId: flockTargetSystemId,
-        targetResourceId: flockTargetResource,
-        miningType: flockMiningType,
-        phase: flockPhase,
-      });
-      lastFlockHeartbeat = Date.now();
-      ctx.log("flock", `Leader broadcast: target=${flockTargetResource || flockTargetSystemId}, phase=${flockPhase}`);
-    }
-
-    // ── Broadcast location to escorts every 30 seconds for tracking ──
-    if ((Date.now() - lastEscortLocationBroadcast) > 30_000) {
-      const chatChannel = getBotChatChannel();
-      chatChannel.send({
-        sender: bot.username,
-        recipients: [],
-        channel: "escort",
-        content: `LOCATION: ${bot.system}`
-      });
-      lastEscortLocationBroadcast = Date.now();
-      ctx.log("escort", `Broadcast location: ${bot.system}`);
-    }
-
+    // Always broadcast current state to keep followers updated
+    // NOTE: This must be AFTER the target variables are declared (below)
+    
     // ── Re-evaluate mining type and target from settings each cycle ──
     let miningType: "ore" | "gas" | "ice" | "radioactive" = "ore";
     if (settings.miningType === "auto") {
@@ -2771,7 +2774,8 @@ if (effectiveTarget) {
               rallySystem,
             );
             ctx.log("flock", `Announced target to flock: ${targetPoiName} @ ${targetSystemId} (${miningType})`);
-            await updateFlockPhase(settings.flockName, "traveling");
+            flockPhase = "traveling";
+            await updateFlockPhase(settings.flockName, "traveling", isFlockLeader);
           }
         }
       }
@@ -2845,6 +2849,11 @@ if (effectiveTarget) {
       yield "navigate_to_target";
       if (recoveredSession) {
         await updateMiningSession(bot.username, { state: "traveling_to_ore" });
+      }
+      
+      // Update flock phase to traveling for leader
+      if (isFlockLeader && settings.flockEnabled && settings.flockName) {
+        flockPhase = "traveling";
       }
 
       // Flock followers wait for leader to arrive first (optional synchronization)
@@ -3018,7 +3027,7 @@ if (effectiveTarget) {
         
         if (settings.flockEnabled && settings.flockName) {
           // Update flock phase after successful arrival
-          await updateFlockPhase(settings.flockName, "traveling");
+          await updateFlockPhase(settings.flockName, "traveling", isFlockLeader);
         }
       }
     }
@@ -3642,7 +3651,8 @@ if (effectiveTarget) {
 
     // Update flock phase to mining
     if (settings.flockEnabled && settings.flockName && miningPoi) {
-      await updateFlockPhase(settings.flockName, "mining");
+      flockPhase = "mining";
+      await updateFlockPhase(settings.flockName, "mining", isFlockLeader);
       ctx.log("flock", "Flock phase updated: mining");
     }
 
@@ -3741,23 +3751,47 @@ if (effectiveTarget) {
       if (!isFlockLeader && settings.flockEnabled && settings.flockName) {
         const updatedState = await readFlockState(settings.flockName);
         if (updatedState) {
+          // Check if leader state is too stale (older than 60 seconds)
+          if (Date.now() - updatedState.lastUpdate > 60_000) {
+            ctx.log("flock", `Leader state stale (${Math.round((Date.now() - updatedState.lastUpdate)/1000)}s) — returning home to wait for fresh coordination`);
+            yield "return_home";
+            await ensureDocked(ctx);
+            await ctx.sleep(10000);
+            continue;
+          }
           flockTargetSystemId = updatedState.targetSystemId;
           flockTargetResource = updatedState.targetResourceId;
           flockMiningType = updatedState.miningType;
           flockPhase = updatedState.phase;
           ctx.log("flock", `Follower updating: target=${flockTargetResource || flockTargetSystemId}, phase=${flockPhase}`);
+        } else {
+          // No state - check if file is stale
+          const { existsSync, statSync } = await import("fs");
+          const { join } = await import("path");
+          const statePath = join(process.cwd(), "data", "flock_signals", `${settings.flockName}.json`);
+          if (existsSync(statePath)) {
+            const fileStat = statSync(statePath);
+            const ageMs = Date.now() - fileStat.mtimeMs;
+            if (ageMs > 60_000) {
+              ctx.log("flock", `Leader state stale (${Math.round(ageMs/1000)}s) — returning home to wait for fresh coordination`);
+              yield "return_home";
+              await ensureDocked(ctx);
+              await ctx.sleep(10000);
+              continue;
+            }
+          }
         }
       }
       
       if (isFlockLeader && settings.flockEnabled && settings.flockName && (harvestNow - lastFlockHeartbeat) > 30_000) {
         await broadcastFlockHeartbeat(settings.flockName, bot.username, {
-          targetSystemId: flockTargetSystemId,
-          targetResourceId: flockTargetResource,
-          miningType: flockMiningType,
+          targetSystemId: targetSystemId || "",
+          targetResourceId: effectiveTarget || "",
+          miningType: miningType,
           phase: flockPhase,
         });
         lastFlockHeartbeat = harvestNow;
-        ctx.log("flock", `Leader broadcast: target=${flockTargetResource || flockTargetSystemId}, phase=${flockPhase}`);
+        ctx.log("flock", `Leader broadcast: target=${effectiveTarget || "none"}, phase=${flockPhase}`);
       }
 
       await bot.refreshStatus();
@@ -5476,7 +5510,8 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     // Signal flock that we're docking
     if (settings.flockEnabled && settings.flockName) {
       ctx.log("flock", "Signaling flock: miner docking...");
-      await updateFlockPhase(settings.flockName, "docked");
+      flockPhase = "docked";
+      await updateFlockPhase(settings.flockName, "docked", isFlockLeader);
     }
 
     const dockResp = await bot.exec("dock");

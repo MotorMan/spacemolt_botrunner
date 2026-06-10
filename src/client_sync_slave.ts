@@ -88,7 +88,7 @@ export class ClientSyncSlave {
     await this.request<{ ok: boolean }>(`/api/client-sync/${endpoint}`, { method: "POST" }, payload);
   }
 
-  private async register(): Promise<{ ok: boolean; error?: string }> {
+private async register(): Promise<{ ok: boolean; error?: string }> {
     const url = new URL("/api/client-sync/register", this.settings.masterUrl).toString();
     this.log(`Registering with master at ${url}`);
     const headers: Record<string, string> = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
@@ -102,14 +102,20 @@ export class ClientSyncSlave {
       const res = await fetch(url, { method: "POST", headers, body: JSON.stringify({ apiKey: this.settings.apiKey, label: this.settings.label || "slave", password: this.settings.password }) });
       this.log(`Register response: ${res.status}`);
       let payload: { ok: boolean; clientId?: string; error?: string };
-      try { payload = await res.json(); } catch { payload = { ok: false, error: "invalid response" }; }
+      try { 
+        const text = await res.text();
+        payload = JSON.parse(text) as { ok: boolean; clientId?: string; error?: string }; 
+      } catch { 
+        payload = { ok: false, error: "invalid response" }; 
+      }
       if (payload.ok && payload.clientId) {
         this.clientId = payload.clientId;
         this.connectionState = 'connected';
         this.log(`Registered as ${payload.clientId}`);
       } else {
         this.connectionState = 'disconnected';
-        this.logError(`Registration failed: ${payload.error}`);
+        const errMsg = payload.error || `HTTP ${res.status}`;
+        this.logError(`Registration failed: ${errMsg}`);
       }
       return payload;
     } catch (err) {

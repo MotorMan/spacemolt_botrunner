@@ -30,11 +30,22 @@ export class ClientSyncMaster {
   private readonly version = "1.0.0";
   private apiKey: string;
   private password: string;
+  private mode: string;
 
   constructor(settings: Record<string, unknown>) {
     this.settings = settings;
-    this.apiKey = (settings.apiKey as string) || generateApiKey();
+    this.mode = (settings.mode as string) || "slave";
+    const storedApiKey = settings.apiKey as string | undefined;
+    this.apiKey = storedApiKey || "";
     this.password = (settings.password as string) || "";
+    if (!this.apiKey) {
+      this.apiKey = generateApiKey();
+      this.settings.apiKey = this.apiKey;
+    }
+  }
+
+  public getMode(): string {
+    return this.mode;
   }
 
   public getApiKey(): string {
@@ -74,12 +85,15 @@ export class ClientSyncMaster {
     return { ok: true, version: this.version, clientId, connectedClients: clients };
   }
 
-  public async register(payload: { label: string; apiKey: string; password?: string }): Promise<{ clientId: string; ok?: boolean; error?: string }> {
+  public register(payload: { label: string; apiKey: string; password?: string }): Promise<{ clientId: string; ok?: boolean; error?: string }> {
+    if (this.mode !== "master") {
+      return Promise.resolve({ clientId: "", ok: false, error: "Master not in master mode" });
+    }
     if (payload.apiKey !== this.apiKey) {
-      return { clientId: "", ok: false, error: "Invalid API key" };
+      return Promise.resolve({ clientId: "", ok: false, error: "Invalid API key" });
     }
     if (this.password && payload.password !== this.password) {
-      return { clientId: "", ok: false, error: "Invalid password" };
+      return Promise.resolve({ clientId: "", ok: false, error: "Invalid password" });
     }
     const id = `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     const now = Date.now();
@@ -91,7 +105,7 @@ export class ClientSyncMaster {
       connectedAt: now,
       lastSeen: now,
     });
-    return { clientId: id, ok: true };
+    return Promise.resolve({ clientId: id, ok: true });
   }
 
   public disconnect(clientId: string): boolean {

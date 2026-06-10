@@ -989,18 +989,34 @@ async function selectNextPickupStation(
   );
   
   if (availableStations.length === 0) {
-    ctx.log("transport", `All empire stations already checked, starting fresh with ${empireStations[0].poiName}`);
-    const randomStation = getRandomEmpireStation(empireLower);
-    if (!randomStation) {
-      ctx.log("transport", `No random station found for empire ${empireLower}`);
+    ctx.log("transport", `All empire stations already checked, finding nearest from ${empireStations.length} total`);
+    let nearest: EmpireStation & { dist: number } = { ...empireStations[0], dist: 9999 };
+    for (const s of empireStations) {
+      if (s.poiId === currentPoi && s.systemId === currentSystem) continue;
+      const dist = hopsBetweenSync(currentSystem, s.systemId);
+      if (dist < nearest.dist) {
+        nearest = { ...s, dist };
+      }
+    }
+    if (nearest.dist === 9999) {
+      ctx.log("transport", `No other empire stations available`);
       return null;
     }
-    ctx.log("transport", `Selected random station: ${randomStation.poiName} (${randomStation.systemId})`);
-    return { system: randomStation.systemId, poi: randomStation.poiId, poiName: randomStation.poiName };
+    if (nearest.dist > settings.maxJumps) {
+      ctx.log("transport", `No stations within ${settings.maxJumps} hops, using nearest: ${nearest.poiName}`);
+    }
+    return { system: nearest.systemId, poi: nearest.poiId, poiName: nearest.poiName };
   }
 
   if (empireLower === "solarian") {
     const randomStation = availableStations[Math.floor(Math.random() * availableStations.length)];
+    if (randomStation.poiId === currentPoi && randomStation.systemId === currentSystem) {
+      ctx.log("transport", `Randomly selected same station, using next available`);
+      const otherStations = availableStations.filter(s => !(s.poiId === currentPoi && s.systemId === currentSystem));
+      if (otherStations.length > 0) {
+        return { system: otherStations[0].systemId, poi: otherStations[0].poiId, poiName: otherStations[0].poiName };
+      }
+    }
     ctx.log("transport", `Solarian Empire: randomly selecting ${randomStation.poiName}`);
     return { system: randomStation.systemId, poi: randomStation.poiId, poiName: randomStation.poiName };
   }
@@ -1018,10 +1034,15 @@ const stationsWithHops = availableStations.map(s => {
   if (stationsWithHops.length === 0) {
     let nearest: EmpireStation & { dist: number } = { ...availableStations[0], dist: 9999 };
     for (const s of availableStations) {
+      if (s.poiId === currentPoi && s.systemId === currentSystem) continue;
       const dist = hopsBetweenSync(currentSystem, s.systemId);
       if (dist < nearest.dist) {
         nearest = { ...s, dist };
       }
+    }
+    if (nearest.dist === 9999) {
+      ctx.log("transport", `No other stations within ${settings.maxJumps} hops`);
+      return null;
     }
     ctx.log("transport", `No stations within ${settings.maxJumps} hops, falling back to nearest: ${nearest.poiName}`);
     return { system: nearest.systemId, poi: nearest.poiId, poiName: nearest.poiName };
@@ -1395,12 +1416,19 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
             ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
             if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
               ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-              state.roundsWithoutPassengers = 0;
               const nextPickup = await selectNextPickupStation(ctx, state, settings);
               if (!nextPickup) {
                 await ctx.sleep(60000);
                 continue;
               }
+              const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+              if (isSameStation) {
+                ctx.log("transport", `Next pickup is same station, incrementing counter and continuing`);
+                state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+                await ctx.sleep(60000);
+                continue;
+              }
+              state.roundsWithoutPassengers = 0;
               state.pickupStation = nextPickup.poi;
               state.pickupSystem = nextPickup.system;
             } else {
@@ -1703,6 +1731,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       }
 
       if (aboard.length === 0) {
+        state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+        ctx.log("transport", `No passengers loaded, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
         state.status = "idle";
         saveTransportState(state);
         await ctx.sleep(10000);

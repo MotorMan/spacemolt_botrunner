@@ -962,7 +962,8 @@ export class WebServer {
         // Client sync routes
         if (url.pathname.startsWith("/api/client-sync/")) {
           if (!this.syncMaster) {
-            this.syncMaster = new ClientSyncMaster(this.settings.clientSync || {});
+            const csSettings = this.settings.clientSync || {};
+            this.syncMaster = new ClientSyncMaster(csSettings);
             this.syncMaster.saveSettings();
           }
           const cors = { "Access-Control-Allow-Origin": "*" } as Record<string, string>;
@@ -1031,8 +1032,11 @@ export class WebServer {
           }
           if (url.pathname === "/api/client-sync/register" && req.method === "POST") {
             const body = await req.json() as { apiKey: string; label: string; password?: string };
-            const result = this.syncMaster?.register(body);
-            return Response.json(result ?? { ok: false, error: "not enabled" }, { headers: cors });
+            if (!this.syncMaster) {
+              return Response.json({ ok: false, error: "syncMaster not initialized" }, { headers: cors });
+            }
+            const result = await this.syncMaster.register(body);
+            return Response.json(result, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/chat-relay" && req.method === "POST") {
             const body = await req.json() as { channel: string; content: string; sender?: string };

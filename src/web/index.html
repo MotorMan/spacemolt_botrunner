@@ -2234,6 +2234,7 @@ function renderProfileTopbar() {
         <option value="explore"${explorerMode === 'explore' ? ' selected' : ''}>Explore new systems</option>
         <option value="trade_update"${explorerMode === 'trade_update' ? ' selected' : ''}>Update trade data</option>
         <option value="deep_core_scan"${explorerMode === 'deep_core_scan' ? ' selected' : ''}>Scan hidden POIs</option>
+        <option value="visit_all"${explorerMode === 'visit_all' ? ' selected' : ''}>Visit all systems</option>
       </select>
       <span class="profile-ore-label" style="margin-left:8px">Direct to Unknown:</span>
       <select id="profile-directToUnknown" onchange="saveProfileDirectToUnknown()" style="width:auto;padding:2px 6px;font-size:11px">

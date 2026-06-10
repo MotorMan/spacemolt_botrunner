@@ -206,6 +206,10 @@ export interface StoredSystem {
   pirate_sightings: PirateSighting[];
   wrecks: WreckRecord[];
   last_updated: string;
+  /** Server-verified visited status from get_map */
+  visited?: boolean;
+  /** ISO timestamp of first visit from get_map */
+  visited_at?: string | null;
 }
 
 export interface MapData {
@@ -392,6 +396,14 @@ class MapStore {
     }
 
     sys.last_updated = now();
+
+    // Merge visited status from get_map
+    if (systemData.visited !== undefined) {
+      sys.visited = Boolean(systemData.visited);
+    }
+    if (systemData.visited_at !== undefined) {
+      sys.visited_at = (systemData.visited_at as string) || null;
+    }
 
     // Merge connections
     const conns = systemData.connections as Array<Record<string, unknown>> | undefined;
@@ -666,6 +678,17 @@ class MapStore {
 
     poi.last_explored = now();
     poi.last_updated = now();
+    this.scheduleSave();
+  }
+
+  /** Mark a system as visited (sets visited=true and visited_at timestamp). */
+  markSystemVisited(systemId: string): void {
+    const sys = this.data.systems[systemId];
+    if (!sys) return;
+
+    sys.visited = true;
+    sys.visited_at = now();
+    sys.last_updated = now();
     this.scheduleSave();
   }
 
@@ -2149,6 +2172,17 @@ findOreLocations(oreId: string): Array<{
       }));
   }
 
+  /** Get all system positions as a record keyed by system ID. */
+  getAllSystemPositionsRecord(): Record<string, { x: number; y: number }> {
+    const result: Record<string, { x: number; y: number }> = {};
+    for (const [id, sys] of Object.entries(this.data.systems)) {
+      if (sys.position && typeof sys.position.x === "number" && typeof sys.position.y === "number") {
+        result[id] = { x: sys.position.x, y: sys.position.y };
+      }
+    }
+    return result;
+  }
+
   calculatePathfinderBearing(fromSystemId: string, toSystemId: string): number | null {
     const from = this.data.systems[fromSystemId.toLowerCase()];
     const to = this.data.systems[toSystemId.toLowerCase()];
@@ -2197,6 +2231,36 @@ findOreLocations(oreId: string): Array<{
 
   getPathfinderTravelTime(proj: number): { ticks: number; seconds: number } {
     return getPathfinderTravelTime(proj);
+  }
+
+  /** Get systems that have not been visited according to the server's visited flag. */
+  getUnvisitedSystems(): Array<{ systemId: string; systemName: string; visited: boolean; visited_at: string | null }> {
+    const unvisited: Array<{ systemId: string; systemName: string; visited: boolean; visited_at: string | null }> = [];
+    for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      if (!sys.visited) {
+        unvisited.push({
+          systemId: sysId,
+          systemName: sys.name || sysId,
+          visited: sys.visited ?? false,
+          visited_at: sys.visited_at ?? null,
+        });
+      }
+    }
+    return unvisited;
+  }
+
+  /** Get count of visited vs unvisited systems. */
+  getVisitStats(): { total: number; visited: number; unvisited: number } {
+    let visitedCount = 0;
+    for (const sys of Object.values(this.data.systems)) {
+      if (sys.visited) visitedCount++;
+    }
+    const total = Object.keys(this.data.systems).length;
+    return {
+      total,
+      visited: visitedCount,
+      unvisited: total - visitedCount,
+    };
   }
 }
 

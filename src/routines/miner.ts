@@ -1482,6 +1482,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
 // ── Flock heartbeat tracking (persists across cycles) ──
     let lastFlockHeartbeat = 0;
+    let lastFlockStateUpdate = 0;
 
     // ── Escort location broadcast tracking ──
     let lastEscortLocationBroadcast = 0;
@@ -1572,6 +1573,31 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       hullThresholdPct: settings.repairThreshold,
     };
     const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
+
+    // ── Flock state heartbeat for leader ──
+    // Update flock state file immediately at cycle start if we're the leader
+    // This ensures followers always see fresh data, even if the leader is stuck
+    if (settings.flockEnabled && settings.flockName && settings.flockRole === "leader") {
+      const flockGroup = settings.flockGroups.find(g => g.name === settings.flockName);
+      if (flockGroup) {
+        const { writeFileSync, existsSync } = await import("fs");
+        const { join } = await import("path");
+        const flockDir = join(process.cwd(), "data", "flock_signals");
+        const flockPath = join(flockDir, `${settings.flockName}.json`);
+        
+        if (existsSync(flockPath)) {
+          try {
+            const { readFileSync } = await import("fs");
+            const raw = readFileSync(flockPath, "utf-8");
+            const existingState = JSON.parse(raw) as FlockState;
+            existingState.lastUpdate = Date.now();
+            writeFileSync(flockPath, JSON.stringify(existingState, null, 2));
+          } catch {
+            // Ignore errors - the regular flock logic will handle updates
+          }
+        }
+      }
+    }
 
     // ── CRITICAL FIX: Always refresh faction storage at cycle start ──
     // This ensures quota decisions are based on fresh data, not stale cached state
@@ -1709,7 +1735,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             const { statSync } = await import("fs");
             const fileStat = statSync(statePath);
             const ageMs = Date.now() - fileStat.mtimeMs;
-            if (ageMs > 60_000) {
+            if (ageMs > 120_000) {
               ctx.log("flock", `Leader state stale (${Math.round(ageMs/1000)}s old) — returning home to wait for fresh coordination`);
               yield "return_home";
               await ensureDocked(ctx);
@@ -1721,8 +1747,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           continue;
         }
         
-        // Check if leader state is too stale (older than 60 seconds)
-        if (Date.now() - flockState.lastUpdate > 60_000) {
+        // Check if leader state is too stale (older than 120 seconds - must match readFlockState threshold)
+        if (Date.now() - flockState.lastUpdate > 120_000) {
           ctx.log("flock", `Leader state stale (${Math.round((Date.now() - flockState.lastUpdate)/1000)}s) — returning home to wait for fresh coordination`);
           yield "return_home";
           await ensureDocked(ctx);
@@ -1764,7 +1790,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-// ── Leader: broadcast heartbeat AND target updates every 30 seconds ──
+    // ── Leader: broadcast heartbeat AND target updates every 30 seconds ──
     // Always broadcast current state to keep followers updated
     // NOTE: This must be AFTER the target variables are declared (below)
     
@@ -2854,6 +2880,7 @@ if (effectiveTarget) {
       // Update flock phase to traveling for leader
       if (isFlockLeader && settings.flockEnabled && settings.flockName) {
         flockPhase = "traveling";
+        await updateFlockPhase(settings.flockName, "traveling", isFlockLeader);
       }
 
       // Flock followers wait for leader to arrive first (optional synchronization)
@@ -3751,8 +3778,8 @@ if (effectiveTarget) {
       if (!isFlockLeader && settings.flockEnabled && settings.flockName) {
         const updatedState = await readFlockState(settings.flockName);
         if (updatedState) {
-          // Check if leader state is too stale (older than 60 seconds)
-          if (Date.now() - updatedState.lastUpdate > 60_000) {
+          // Check if leader state is too stale (older than 120 seconds - must match readFlockState threshold)
+          if (Date.now() - updatedState.lastUpdate > 120_000) {
             ctx.log("flock", `Leader state stale (${Math.round((Date.now() - updatedState.lastUpdate)/1000)}s) — returning home to wait for fresh coordination`);
             yield "return_home";
             await ensureDocked(ctx);
@@ -3772,7 +3799,7 @@ if (effectiveTarget) {
           if (existsSync(statePath)) {
             const fileStat = statSync(statePath);
             const ageMs = Date.now() - fileStat.mtimeMs;
-            if (ageMs > 60_000) {
+            if (ageMs > 120_000) {
               ctx.log("flock", `Leader state stale (${Math.round(ageMs/1000)}s) — returning home to wait for fresh coordination`);
               yield "return_home";
               await ensureDocked(ctx);
@@ -3783,7 +3810,7 @@ if (effectiveTarget) {
         }
       }
       
-      if (isFlockLeader && settings.flockEnabled && settings.flockName && (harvestNow - lastFlockHeartbeat) > 30_000) {
+      if (isFlockLeader && settings.flockEnabled && settings.flockName && (harvestNow - lastFlockHeartbeat) > 10_000) {
         await broadcastFlockHeartbeat(settings.flockName, bot.username, {
           targetSystemId: targetSystemId || "",
           targetResourceId: effectiveTarget || "",
@@ -3791,7 +3818,8 @@ if (effectiveTarget) {
           phase: flockPhase,
         });
         lastFlockHeartbeat = harvestNow;
-        ctx.log("flock", `Leader broadcast: target=${effectiveTarget || "none"}, phase=${flockPhase}`);
+        lastFlockStateUpdate = harvestNow;
+        ctx.log("flock", `Leader heartbeat: target=${effectiveTarget || "none"}, phase=${flockPhase}`);
       }
 
       await bot.refreshStatus();

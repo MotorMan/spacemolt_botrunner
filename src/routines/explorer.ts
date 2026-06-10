@@ -280,7 +280,7 @@ const RESOURCE_REFRESH_MINS = 120;
 
 // ── Per-bot settings ─────────────────────────────────────────
 
-export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan";
+export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all";
 
 function getExplorerSettings(username?: string): {
   mode: ExplorerMode;
@@ -361,7 +361,7 @@ function getExplorerSettings(username?: string): {
       : false;
 
   return {
-    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : "explore") as ExplorerMode,
+    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : "explore") as ExplorerMode,
     acceptMissions,
     focusAreaSystem,
     maxJumps,
@@ -387,6 +387,13 @@ export function setExplorerMode(username: string, mode: ExplorerMode): void {
 export function setExplorerDeepCoreScan(username: string, enabled: boolean): void {
   writeSettings({
     [username]: { explorerMode: enabled ? "deep_core_scan" : "explore" },
+  });
+}
+
+/** Persist visit_all mode setting for a specific bot. */
+export function setExplorerVisitAll(username: string, enabled: boolean): void {
+  writeSettings({
+    [username]: { explorerMode: enabled ? "visit_all" : "explore" },
   });
 }
 
@@ -465,6 +472,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
   if (initialSettings.mode === "deep_core_scan") {
     yield* deepCoreScanRoutine(ctx);
+    return;
+  }
+  if (initialSettings.mode === "visit_all") {
+    yield* visitAllRoutine(ctx);
     return;
   }
 
@@ -640,6 +651,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       yield* deepCoreScanRoutine(ctx);
       return;
     }
+    if (modeCheck.mode === "visit_all") {
+      ctx.log("system", "Mode changed to visit_all — switching routines...");
+      yield* visitAllRoutine(ctx);
+      return;
+    }
 
     // ── Get current system data ──
     yield "scan_system";
@@ -655,6 +671,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
     visitedSystems.add(systemId);
     visitedSystemTimes.set(systemId, Date.now());
+    mapStore.markSystemVisited(systemId);
     if (path.length === 0) {
       path.push(systemId); // Initialize path with starting system
     }
@@ -2675,6 +2692,151 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
   }
 }
 
+// ── Visit All Systems Routine ───────────────────────────────────
+
+/**
+ * Visit all systems mode — systematically visits every system in the galaxy
+ * to update the server's visited flag and achieve 100% exploration.
+ */
+async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  ctx.log("system", "Visit All mode — systematically visiting all systems to update visited flags...");
+
+  const visitedSystems = new Set<string>();
+  const fledFromSystems = new Set<string>();
+  const path: string[] = [];
+  let lastSystem: string | null = null;
+
+  // Get initial system info
+  yield "startup";
+  await bot.refreshStatus();
+  let { systemId } = await getSystemInfo(ctx);
+  if (!systemId) {
+    ctx.log("error", "Could not determine current system — waiting 30s");
+    await ctx.sleep(30000);
+    return;
+  }
+
+  const blacklist = getSystemBlacklist();
+
+  while (bot.state === "running") {
+    // Check for battle
+    if (await checkAndFleeFromBattle(ctx, "visit_all")) {
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // Refresh settings
+    const settings = getExplorerSettings(bot.username);
+
+    await bot.refreshStatus();
+    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("info", `Visit All ${bot.system} — ${bot.credits} cr, ${fuelPct}% fuel`);
+
+    let { pois, connections, systemId } = await getSystemInfo(ctx);
+    if (!systemId) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    // Mark this system as visited (both locally and via mapStore)
+    visitedSystems.add(systemId);
+    mapStore.markSystemVisited(systemId);
+
+    // Get visit stats
+    const stats = mapStore.getVisitStats();
+    ctx.log("exploration", `Progress: ${stats.visited}/${stats.total} systems visited (${Math.round(stats.visited/stats.total*100)}%)`);
+
+    // Check if we're done
+    if (stats.unvisited === 0) {
+      ctx.log("info", "All systems visited! Explore mode complete.");
+      return;
+    }
+
+    // Find unvisited systems reachable from current position
+    const unvisited = findUnvisitedSystemsByServerFlag(ctx, systemId, blacklist, fledFromSystems);
+
+    if (unvisited.length === 0) {
+      ctx.log("info", "No unvisited systems in connected region — picking nearest unvisited from map...");
+      
+      // Get all unvisited systems and find nearest
+      const allUnvisited = mapStore.getUnvisitedSystems();
+      if (allUnvisited.length === 0) {
+        ctx.log("info", "All systems visited! Explore mode complete.");
+        return;
+      }
+
+      // Find nearest unvisited system
+      const allPos = mapStore.getAllSystemPositionsRecord();
+      const currentPos = allPos[systemId];
+      if (!currentPos) {
+        ctx.log("error", "Could not get current position — waiting 30s");
+        await ctx.sleep(30000);
+        continue;
+      }
+
+      // Sort by distance
+      allUnvisited.sort((a, b) => {
+        const aPos = allPos[a.systemId];
+        const bPos = allPos[b.systemId];
+        if (!aPos || !bPos) return 0;
+        const aDist = Math.sqrt(Math.pow(aPos.x - currentPos.x, 2) + Math.pow(aPos.y - currentPos.y, 2));
+        const bDist = Math.sqrt(Math.pow(bPos.x - currentPos.x, 2) + Math.pow(bPos.y - currentPos.y, 2));
+        return aDist - bDist;
+      });
+
+      const target = allUnvisited[0];
+      if (!target) {
+        ctx.log("info", "All systems visited! Explore mode complete.");
+        return;
+      }
+
+      ctx.log("travel", `Navigating to ${target.systemName} (${target.systemId})...`);
+      const arrived = await navigateToSystem(ctx, target.systemId, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 });
+      if (!arrived) {
+        await ctx.sleep(10000);
+        continue;
+      }
+      bot.stats.totalSystems++;
+      path.push(target.systemId);
+      lastSystem = systemId;
+      continue;
+    }
+
+    // Jump to nearest unvisited system
+    const target = unvisited[0];
+    ctx.log("travel", `Jumping to ${target.name} (${target.id}) - ${target.distance} jumps away`);
+
+    // Ensure fueled
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    if (!fueled) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    await ensureUndocked(ctx);
+    const jumpResp = await bot.exec("jump", { target_system: target.id });
+
+    if (jumpResp.error) {
+      const msg = jumpResp.error.message.toLowerCase();
+      if (msg.includes("battle") || msg.includes("in battle")) {
+        const fled = await fleeFromBattle(ctx);
+        if (!fled) await ctx.sleep(5000);
+        continue;
+      }
+      ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+      await ctx.sleep(10000);
+      continue;
+    }
+
+    ctx.log("travel", `Jumped to ${target.name}`);
+    bot.stats.totalSystems++;
+    path.push(target.id);
+    lastSystem = systemId;
+  }
+}
+
 // ── Helpers ──────────────────────────────────────────────────
 
 /** Threshold in days for considering POI data stale. */
@@ -2862,6 +3024,70 @@ function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps:
   }
 
   return nearby;
+}
+
+/**
+ * Find all systems that have not been visited according to the server's visited flag.
+ * Returns systems sorted by distance from current system.
+ */
+function findUnvisitedSystemsByServerFlag(ctx: RoutineContext, currentSystem: string, blacklist: string[], fledFromSystems: Set<string>): Array<{
+  id: string;
+  name: string;
+  distance: number;
+  route: string[];
+}> {
+  const unvisited: Array<{
+    id: string;
+    name: string;
+    distance: number;
+    route: string[];
+  }> = [];
+
+  // BFS to find all reachable systems and their distances
+  const visited = new Set<string>();
+  const queue: Array<{ systemId: string; distance: number; route: string[] }> = [
+    { systemId: currentSystem, distance: 0, route: [currentSystem] }
+  ];
+  visited.add(currentSystem);
+
+  while (queue.length > 0) {
+    const { systemId, distance, route } = queue.shift()!;
+    const sys = mapStore.getSystem(systemId);
+    if (!sys) continue;
+
+    for (const conn of sys.connections) {
+      const connId = conn.system_id;
+      if (!connId) continue;
+      if (visited.has(connId)) continue;
+      // Skip blacklisted systems, temporarily blacklisted systems, and systems we've fled from
+      if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(connId)) continue;
+      if (fledFromSystems.has(connId)) continue;
+
+      visited.add(connId);
+      const newRoute = [...route, connId];
+      const newDistance = distance + 1;
+
+      const targetSys = mapStore.getSystem(connId);
+      if (targetSys) {
+        // Check server's visited flag
+        if (!targetSys.visited) {
+          unvisited.push({
+            id: connId,
+            name: conn.system_name || connId,
+            distance: newDistance,
+            route: newRoute,
+          });
+        }
+        // Continue BFS to find more unvisited systems
+        queue.push({ systemId: connId, distance: newDistance, route: newRoute });
+      }
+    }
+  }
+
+  // Sort by distance (nearest first)
+  unvisited.sort((a, b) => a.distance - b.distance);
+  return unvisited;
 }
 
 /**
@@ -3468,7 +3694,6 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
   // Priority 1: Systems not in map.json at all (completely unexplored)
   const unmapped = candidates.filter(c => !mapStore.getSystem(c.id));
 
-
   if (unmapped.length > 0) {
     // If multiple unmapped, prefer non-pirate
     const unmappedNonPirate = unmapped.filter(c => !isPirateSystem(c.id));
@@ -3478,7 +3703,7 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
     return unmapped[Math.floor(Math.random() * unmapped.length)];
   }
 
-  // Priority 2: Systems in map.json but not visited this session
+  // Priority 2: Systems in map.json but not visited (per server flag or session)
   // Apply penalty to systems visited in the last hour to avoid loops
   const unvisited = candidates.filter(c => {
     if (visited.has(c.id)) {
@@ -3486,6 +3711,11 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
       if (lastVisit && (now - lastVisit) < ONE_HOUR_MS) {
         return false; // Skip systems visited in the last hour
       }
+    }
+    // Also check server's visited flag
+    const sys = mapStore.getSystem(c.id);
+    if (sys?.visited === true) {
+      return false;
     }
     return true;
   });
@@ -3577,6 +3807,7 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     const isExploredThisSession = conn.id ? visited.has(conn.id) : false;
     const lastVisit = conn.id ? visitedTimes.get(conn.id) : null;
     const visitedRecently = lastVisit && (now - lastVisit) < ONE_HOUR_MS;
+    const isVisitedServer = sys?.visited === true;
 
     // Higher score = better
     let score = 0;
@@ -3584,6 +3815,11 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     // Big bonus for systems not in map.json (completely unexplored)
     if (!isInMap) {
       score += 1000;
+    }
+
+    // Bonus for unvisited systems according to server flag
+    if (isInMap && !isVisitedServer) {
+      score += 500;
     }
 
     // Reduce selection of systems that are directly in the recent path to avoid 3-system loops

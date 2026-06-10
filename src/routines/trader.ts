@@ -432,7 +432,8 @@ function findTradeOpportunities(
   currentSystem: string,
   currentPoi: string,
   cargoCapacity: number = 999,
-  marketInsights: Array<Record<string, unknown>> = []
+  marketInsights: Array<Record<string, unknown>> = [],
+  debugLog?: (msg: string) => void,
 ): TradeRoute[] {
   // Extract oversupply items to filter out bad sell destinations
   const oversupplyItems = new Set<string>();
@@ -449,12 +450,19 @@ function findTradeOpportunities(
   const routes: TradeRoute[] = [];
 
   // Process market insights first (higher priority)
-  const insightRoutes = processMarketInsights(marketInsights, currentSystem, currentPoi, settings, cargoCapacity);
+  const insightRoutes = processMarketInsights(marketInsights, currentSystem, currentPoi, settings, cargoCapacity, debugLog);
+  debugLog?.(`processMarketInsights returned ${insightRoutes.length} routes`);
   routes.push(...insightRoutes);
+
+  let skippedProfit = 0;
+  let skippedItems = 0;
+  let skippedStupidity = 0;
+  let skippedValueCap = 0;
 
   for (const sp of spreads) {
     // Skip routes that would sell oversupplied items at current station
     if (oversupplyItems.has(sp.itemId) && sp.destSystem === currentSystem && sp.destPoi === currentPoi) {
+      debugLog?.(`  Skipping ${sp.itemName}: oversupply at current station`);
       continue;
     }
     // Filter by allowed items
@@ -463,7 +471,10 @@ function findTradeOpportunities(
         sp.itemId.toLowerCase().includes(t.toLowerCase()) ||
         sp.itemName.toLowerCase().includes(t.toLowerCase())
       );
-      if (!match) continue;
+      if (!match) {
+        skippedItems++;
+        continue;
+      }
     }
 
     // Calculate route: current → source → dest
@@ -473,17 +484,28 @@ function findTradeOpportunities(
     const totalFuelCost = toSource.cost + sourceToDest.cost;
 
     const profitPerUnit = sp.spread - (totalJumps > 0 ? totalFuelCost / Math.min(sp.buyQty, sp.sellQty) : 0);
-    if (profitPerUnit < settings.minProfitPerUnit) continue;
+    if (profitPerUnit < settings.minProfitPerUnit) {
+      skippedProfit++;
+      debugLog?.(`  Skipping ${sp.itemName}: profit ${Math.round(profitPerUnit)}cr/unit < min ${settings.minProfitPerUnit}`);
+      continue;
+    }
 
     // Stupidity check: if item normally sells for >50k, but buy price <100, it's likely a buy/sell order mixup
     const marketCost = getItemMarketCost(sp.itemId);
-    if (marketCost > 50000 && sp.buyAt < 100) continue;
+    if (marketCost > 50000 && sp.buyAt < 100) {
+      skippedStupidity++;
+      debugLog?.(`  Skipping ${sp.itemName}: likely buy/sell mixup (marketCost ${marketCost}cr, buyAt ${sp.buyAt})`);
+      continue;
+    }
 
     const tradeQty = Math.min(sp.buyQty, sp.sellQty, maxItemsForCargo(cargoCapacity, sp.itemId));
     const totalProfit = profitPerUnit * tradeQty;
 
     // Cap by max cargo value
-    if (settings.maxCargoValue > 0 && sp.buyAt * tradeQty > settings.maxCargoValue) continue;
+    if (settings.maxCargoValue > 0 && sp.buyAt * tradeQty > settings.maxCargoValue) {
+      skippedValueCap++;
+      continue;
+    }
 
     routes.push({
       itemId: sp.itemId,
@@ -503,6 +525,8 @@ function findTradeOpportunities(
       totalProfit,
     });
   }
+
+  debugLog?.(`findTradeOpportunities: ${routes.length} routes found, skipped: ${skippedItems} items, ${skippedProfit} low profit, ${skippedStupidity} stupidity, ${skippedValueCap} value cap`);
 
   // Sort by total profit descending
   routes.sort((a, b) => b.totalProfit - a.totalProfit);
@@ -536,9 +560,12 @@ function processMarketInsights(
   currentSystem: string,
   currentPoi: string,
   settings: ReturnType<typeof getTraderSettings>,
-  cargoCapacity: number = 999
+  cargoCapacity: number = 999,
+  debugLog?: (msg: string) => void,
 ): TradeRoute[] {
   const routes: TradeRoute[] = [];
+
+  debugLog?.(`processMarketInsights: ${insights.length} insights, priority threshold ${settings.minProfitPerUnit}`);
 
   for (const insight of insights) {
     const category = insight.category as string;
@@ -553,11 +580,17 @@ function processMarketInsights(
         itemId.toLowerCase().includes(t.toLowerCase()) ||
         itemName.toLowerCase().includes(t.toLowerCase())
       );
-      if (!match) continue;
+      if (!match) {
+        debugLog?.(`  skipping ${itemName}: not in tradeItems filter`);
+        continue;
+      }
     }
 
     // Only process high-priority insights (above 100,000 for significant opportunities)
-    if (priority < 100000) continue;
+    if (priority < 100000) {
+      debugLog?.(`  skipping ${itemName}: priority ${priority} < 100000`);
+      continue;
+    }
 
     if (category === "arbitrage") {
       // Parse arbitrage messages like: "Dark Matter Cell trades for ~96150cr in Nebula Trade Federation space but ~5000cr in Outer Rim Explorers space — 1823% spread."
@@ -939,12 +972,21 @@ function findCargoSellRoutes(
     const lower = i.itemId.toLowerCase();
     return !lower.includes("fuel") && !lower.includes("energy_cell");
   });
-  if (cargoItems.length === 0) return routes;
+  if (cargoItems.length === 0) {
+    ctx.log("trade", "  findCargoSellRoutes: no cargo items found");
+    return routes;
+  }
+  ctx.log("trade", `  findCargoSellRoutes: checking ${cargoItems.length} cargo items`);
 
   const allBuys = mapStore.getAllBuyDemand();
-  if (allBuys.length === 0) return routes;
+  ctx.log("trade", `  findCargoSellRoutes: ${allBuys.length} buy demands available`);
+  if (allBuys.length === 0) {
+    ctx.log("trade", "  findCargoSellRoutes: no buy demand data");
+    return routes;
+  }
 
   for (const item of cargoItems) {
+    ctx.log("trade", `  findCargoSellRoutes: checking ${item.name} (${item.quantity}x)`);
     // Find best buyer at a dockable station (not at current station — we already tried selling here)
     const buyers = allBuys
       .filter(b => b.itemId === item.itemId && b.price > 0)
@@ -957,18 +999,30 @@ function findCargoSellRoutes(
       })
       .sort((a, b) => b.price - a.price);
 
+    ctx.log("trade", `    found ${buyers.length} potential buyers for ${item.name}`);
+
     for (const buy of buyers) {
       const { jumps, cost: fuelCost } = estimateFuelCost(currentSystem, buy.systemId, settings.fuelCostPerJump);
-      if (jumps >= 999) continue;
+      if (jumps >= 999) {
+        ctx.log("trade", `    skipping ${buy.poiName}: no route found`);
+        continue;
+      }
 
       const sellQty = Math.min(item.quantity, buy.quantity);
-      if (sellQty <= 0) continue;
+      if (sellQty <= 0) {
+        ctx.log("trade", `    skipping ${buy.poiName}: no quantity available`);
+        continue;
+      }
 
       // Calculate profit: if acquisition cost is known, include it in the calculation
       const costBasis = acquisitionCostPerUnit ?? 0;
       const profitPerUnit = buy.price - costBasis - (jumps > 0 ? fuelCost / sellQty : 0);
-      if (profitPerUnit <= 0) continue;
+      if (profitPerUnit <= 0) {
+        ctx.log("trade", `    skipping ${buy.poiName}: profit ${Math.round(profitPerUnit)}cr/unit <= 0`);
+        continue;
+      }
 
+      ctx.log("trade", `    route found: ${item.name} → ${buy.poiName} (${Math.round(profitPerUnit)}cr profit)`);
       routes.push({
         itemId: item.itemId,
         itemName: item.name,
@@ -1629,6 +1683,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     let routes: TradeRoute[] = [];
     let allRoutesCount = 0;
     let affordableRoutesCount = 0;
+    let cargoRoutes: TradeRoute[] = [];
+    let marketRoutes: TradeRoute[] = [];
 
     if (!recoveredSessionHandled) {
       await bot.refreshStatus();
@@ -1642,8 +1698,11 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
       const cargoCapacity = Math.max(0, (bot.cargoMax > 0 ? bot.cargoMax : 50) - fuelCellWeight);
-      const cargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
-      const marketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, cargoCapacity, marketInsights);
+      cargoRoutes = findCargoSellRoutes(ctx, settings, bot.system);
+      marketRoutes = findTradeOpportunities(settings, bot.system, bot.poi, cargoCapacity, marketInsights, 
+        (msg) => ctx.log("trade", msg));
+      ctx.log("trade", `findCargoSellRoutes found ${cargoRoutes.length} routes`);
+      ctx.log("trade", `findTradeOpportunities found ${marketRoutes.length} routes from ${mapStore.findPriceSpreads().length} spreads`);
       // Filter out routes that sell items we just sold at the current station (demand already filled)
       const currentPoi = bot.poi;
       let allRoutes = [...cargoRoutes, ...marketRoutes].filter(r => {
@@ -1674,8 +1733,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         cargoRoutes.length > 0 ? `${cargoRoutes.length} cargo` : "",
         `${marketRoutes.length} market`,
       ].filter(Boolean).join(" + ");
-      if (cargoRoutes.length > 0) {
-        ctx.log("trade", `Found ${routeCounts} routes`);
+      ctx.log("trade", `Found ${routeCounts} routes (${cargoRoutes.length} cargo + ${marketRoutes.length} market)`);
+
+      // Debug: log each market route's profit check
+      for (const r of marketRoutes) {
+        const profitCheck = r.profitPerUnit >= settings.minProfitPerUnit ? "PASS" : "FAIL";
+        ctx.log("trade", `  Market route: ${r.itemName} - profit ${Math.round(r.profitPerUnit)}cr/unit (min: ${settings.minProfitPerUnit}) [${profitCheck}]`);
       }
 
       // Station priority: put routes whose destination is the home station first
@@ -1706,16 +1769,22 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         routes = [selectedRoute, ...routes.filter(r => r !== selectedRoute)];
       } else {
         // No routes available due to locks - clear routes array
+        ctx.log("trade", `Route coordination: no unlocked routes (all ${routes.length} routes locked)`);
         routes = [];
       }
     }
 
     if (routes.length === 0 && !recoveredSessionHandled) {
       // No routes found and no recovered session to handle
+      ctx.log("trade", `ROUTE ANALYSIS: ${allRoutesCount} total routes found, ${affordableRoutesCount} affordable`);
       if (allRoutesCount > 0 && affordableRoutesCount === 0) {
         ctx.log("trade", `No affordable routes found (budget: ${bot.credits}cr) — waiting 60s for more market data or consider earning credits via missions`);
+      } else if (allRoutesCount > 0 && affordableRoutesCount > 0) {
+        ctx.log("trade", `No routes after coordination filtering (${affordableRoutesCount} affordable) — waiting 60s before re-scanning`);
       } else {
         ctx.log("trade", "No profitable trade routes found — waiting 60s before re-scanning");
+        ctx.log("trade", `  cargoRoutes: ${cargoRoutes.length}, marketRoutes: ${marketRoutes.length}`);
+        ctx.log("trade", `  minProfitPerUnit setting: ${settings.minProfitPerUnit}`);
       }
       await ctx.sleep(60000);
       continue;

@@ -387,6 +387,11 @@ export class WebServer {
       };
       saveSettings(this.settings);
     }
+    if (this.settings.clientSync.mode === "master" && !this.settings.clientSync.apiKey) {
+      const generatedKey = `master_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+      this.settings.clientSync.apiKey = generatedKey;
+      saveSettings(this.settings);
+    }
     this.statsData = loadStats();
     const mainLogs = loadMainLogs();
     this.activityLog = mainLogs.activity.slice(-MAX_LOG_BUFFER);
@@ -956,7 +961,10 @@ export class WebServer {
 
         // Client sync routes
         if (url.pathname.startsWith("/api/client-sync/")) {
-          if (!this.syncMaster) this.syncMaster = new ClientSyncMaster(this.settings as Record<string, unknown>);
+          if (!this.syncMaster) {
+            this.syncMaster = new ClientSyncMaster(this.settings.clientSync || {});
+            this.syncMaster.saveSettings();
+          }
           const cors = { "Access-Control-Allow-Origin": "*" } as Record<string, string>;
 
           if (url.pathname === "/api/client-sync/hello" && req.method === "GET") {
@@ -983,6 +991,21 @@ export class WebServer {
           }
           if (url.pathname === "/api/client-sync/clients" && req.method === "GET") {
             return Response.json(this.syncMaster?.getClients() ?? [], { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/api-key" && req.method === "GET") {
+            return Response.json({ apiKey: this.syncMaster?.getApiKey() ?? "" }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/set-password" && req.method === "POST") {
+            const body = await req.json() as { password: string };
+            this.syncMaster?.setPassword(body.password);
+            this.syncMaster?.saveSettings();
+            return Response.json({ ok: true }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/set-api-key" && req.method === "POST") {
+            const body = await req.json() as { apiKey: string };
+            this.syncMaster?.setApiKey(body.apiKey);
+            this.syncMaster?.saveSettings();
+            return Response.json({ ok: true }, { headers: cors });
           }
           if (url.pathname.startsWith("/api/client-sync/coordination") && req.method === "GET") {
             const file = url.searchParams.get("file") || "";

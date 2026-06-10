@@ -21750,8 +21750,8 @@ function renderClientSyncSettings(panel) {
   const enabled = cs.enabled !== false;
   const mode = cs.mode || 'slave';
   const masterUrl = cs.masterUrl || '';
-  const apiKey = cs.apiKey || '';
-  const password = cs.password || '';
+  let apiKey = cs.apiKey || '';
+  let password = cs.password || '';
   const label = cs.label || '';
   const pollIntervalSec = cs.pollIntervalSec || 15;
   const syncMap = cs.syncMap !== false;
@@ -21765,6 +21765,19 @@ function renderClientSyncSettings(panel) {
   const syncRescue = cs.syncRescue !== false;
   const allowRemoteBots = cs.allowRemoteBotsInDropdowns !== false;
   const pushLocalDiscoveries = cs.pushLocalDiscoveries !== false;
+
+  if (mode === 'master' && !apiKey) {
+    fetch('/api/client-sync/api-key')
+      .then(r => r.json())
+      .then(data => {
+        if (data.apiKey) {
+          apiKey = data.apiKey;
+          settings.clientSync.apiKey = apiKey;
+          renderClientSyncSettings(panel);
+        }
+      })
+      .catch(() => {});
+  }
 
   panel.innerHTML = `
     <h3>Connect Clients</h3>
@@ -21797,17 +21810,27 @@ function renderClientSyncSettings(panel) {
             <div class="setting-label">API Key</div>
             <div class="setting-hint">Use this key when connecting from slave clients.</div>
           </div>
-          <input type="text" id="set-client_sync-apiKey" value="${esc(apiKey)}" placeholder="Auto-generated" style="width:200px" readonly>
+          <input type="text" id="set-client_sync-apiKey" value="${esc(apiKey)}" placeholder="Auto-generated" style="width:200px">
+          <button class="sm" onclick="generateNewApiKey()">Generate New</button>
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Password</div>
+            <div class="setting-hint">Optional password for slave authentication.</div>
+          </div>
+          <input type="password" id="set-client_sync-password" value="${esc(password)}" placeholder="Optional" style="width:200px">
         </div>
 
         <div class="setting-row">
           <div>
             <div class="setting-label">Connected Clients</div>
-            <div class="setting-hint">Slaves registered to this master.</div>
+            <div class="setting-hint">Slaves registered to this master. Auto-refreshes every 5s.</div>
           </div>
+          <button class="sm" onclick="refreshClientSyncConnectedClients()">Refresh Now</button>
         </div>
         <div id="clientSyncConnectedClients" style="font-size:12px;color:var(--text-dim);margin-bottom:8px">
-          No clients connected
+          Loading...
         </div>
       </div>
 
@@ -21932,17 +21955,55 @@ function updateClientSyncModeUI() {
   document.getElementById('clientSyncMasterPanel').style.display = mode === 'master' ? '' : 'none';
   document.getElementById('clientSyncSlavePanel').style.display = mode === 'slave' ? '' : 'none';
   document.getElementById('clientSyncOptionsPanel').style.display = mode === 'slave' ? '' : 'none';
+  if (mode === 'master') refreshClientSyncConnectedClients();
 }
+
+function generateNewApiKey() {
+  const newKey = 'master_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+  document.getElementById('set-client_sync-apiKey').value = newKey;
+  saveClientSyncSettings();
+}
+
+function refreshClientSyncConnectedClients() {
+  fetch('/api/client-sync/clients')
+    .then(r => r.json())
+    .then(clients => {
+      const container = document.getElementById('clientSyncConnectedClients');
+      if (!container) return;
+      if (!Array.isArray(clients) || clients.length === 0) {
+        container.textContent = 'No clients connected';
+        return;
+      }
+      container.innerHTML = clients.map(c => 
+        `<div style="margin-bottom:4px;padding:4px;background:#1a1a1a;border-radius:4px">
+          <span style="font-weight:500">${esc(c.label || c.clientId)}</span>
+          <span style="color:var(--text-dim);font-size:11px;margin-left:8px">${new Date(c.connectedAt).toLocaleString()}</span>
+        </div>`
+      ).join('');
+    })
+    .catch(() => {});
+}
+
+setInterval(() => {
+  if (document.getElementById('page-settings')?.classList.contains('active')) {
+    const mode = document.getElementById('set-client_sync-mode')?.value;
+    if (mode === 'master') refreshClientSyncConnectedClients();
+  }
+}, 5000);
 
 function saveClientSyncSettings() {
   const cs = settings.clientSync || {};
+  const mode = document.getElementById('set-client_sync-mode').value;
+  const apiKey = document.getElementById('set-client_sync-apiKey').value;
+  const password = document.getElementById('set-client_sync-password').value;
+  
   const newSettings = {
     clientSync: {
       enabled: document.getElementById('set-client_sync-enabled').checked,
-      mode: document.getElementById('set-client_sync-mode').value,
+      mode: mode,
       masterUrl: document.getElementById('set-client_sync-masterUrl').value,
-      apiKey: document.getElementById('set-client_sync-apiKey').value,
-      password: document.getElementById('set-client_sync-password').value,
+      apiKey: apiKey,
+      password: password,
       label: document.getElementById('set-client_sync-label').value,
       pollIntervalSec: parseInt(document.getElementById('set-client_sync-pollIntervalSec').value) || 15,
       syncMap: document.getElementById('set-client_sync-syncMap').checked,
@@ -21960,6 +22021,19 @@ function saveClientSyncSettings() {
   };
   settings = Object.assign({}, settings, newSettings);
   send({ type: 'saveSettings', routine: 'clientSync', settings: settings.clientSync });
+  
+  if (mode === 'master') {
+    fetch('/api/client-sync/set-api-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey })
+    });
+    fetch('/api/client-sync/set-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password })
+    });
+  }
 }
 
 function fcMove() {

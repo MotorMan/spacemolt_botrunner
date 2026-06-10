@@ -20,13 +20,44 @@ export type {
   HelloResponse,
 } from "./client_sync_types.js";
 
+function generateApiKey(): string {
+  return `master_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export class ClientSyncMaster {
   private settings: Record<string, unknown>;
   private clients = new Map<string, RegisteredClient>();
   private readonly version = "1.0.0";
+  private apiKey: string;
+  private password: string;
 
   constructor(settings: Record<string, unknown>) {
     this.settings = settings;
+    this.apiKey = (settings.apiKey as string) || generateApiKey();
+    this.password = (settings.password as string) || "";
+  }
+
+  public getApiKey(): string {
+    return this.apiKey;
+  }
+
+  public getPassword(): string {
+    return this.password;
+  }
+
+  public setApiKey(key: string): void {
+    this.apiKey = key;
+    this.settings.apiKey = key;
+  }
+
+  public setPassword(pwd: string): void {
+    this.password = pwd;
+    this.settings.password = pwd;
+  }
+
+  public saveSettings(): void {
+    this.settings.apiKey = this.apiKey;
+    this.settings.password = this.password;
   }
 
   public getSettings(): Record<string, unknown> {
@@ -43,7 +74,13 @@ export class ClientSyncMaster {
     return { ok: true, version: this.version, clientId, connectedClients: clients };
   }
 
-  public async register(payload: { label: string; apiKey: string; password?: string }): Promise<{ clientId: string }> {
+  public async register(payload: { label: string; apiKey: string; password?: string }): Promise<{ clientId: string; ok?: boolean; error?: string }> {
+    if (payload.apiKey !== this.apiKey) {
+      return { clientId: "", ok: false, error: "Invalid API key" };
+    }
+    if (this.password && payload.password !== this.password) {
+      return { clientId: "", ok: false, error: "Invalid password" };
+    }
     const id = `c_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     const now = Date.now();
     this.clients.set(id, {
@@ -54,7 +91,7 @@ export class ClientSyncMaster {
       connectedAt: now,
       lastSeen: now,
     });
-    return { clientId: id };
+    return { clientId: id, ok: true };
   }
 
   public disconnect(clientId: string): boolean {

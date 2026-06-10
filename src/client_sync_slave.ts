@@ -90,38 +90,29 @@ export class ClientSyncSlave {
 
 private async register(): Promise<{ ok: boolean; error?: string }> {
     const url = new URL("/api/client-sync/register", this.settings.masterUrl).toString();
-    this.log(`Registering with master at ${url}`);
-    const headers: Record<string, string> = { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" };
-    if (this.settings.apiKey) headers["X-API-Key"] = this.settings.apiKey;
-    if (this.settings.password) headers["X-Password"] = this.settings.password;
-    
     this.connectionState = 'connecting';
     this.lastConnectAttempt = Date.now();
     
     try {
-      const res = await fetch(url, { method: "POST", headers, body: JSON.stringify({ apiKey: this.settings.apiKey, label: this.settings.label || "slave", password: this.settings.password }) });
-      this.log(`Register response: ${res.status}`);
+      const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKey: this.settings.apiKey, label: this.settings.label || "slave", password: this.settings.password }) });
       let payload: { ok: boolean; clientId?: string; error?: string };
       try { 
-        const text = await res.text();
-        payload = JSON.parse(text) as { ok: boolean; clientId?: string; error?: string }; 
+        payload = await res.json(); 
       } catch { 
         payload = { ok: false, error: "invalid response" }; 
       }
       if (payload.ok && payload.clientId) {
         this.clientId = payload.clientId;
         this.connectionState = 'connected';
-        this.log(`Registered as ${payload.clientId}`);
       } else {
         this.connectionState = 'disconnected';
-        const errMsg = payload.error || `HTTP ${res.status}`;
-        this.logError(`Registration failed: ${errMsg}`);
+        this.lastError = payload.error || `HTTP ${res.status}`;
       }
       return payload;
     } catch (err) {
       this.connectionState = 'disconnected';
       const msg = err instanceof Error ? err.message : String(err);
-      this.logError(`Registration error: ${msg}`);
+      this.lastError = msg;
       return { ok: false, error: msg };
     }
   }

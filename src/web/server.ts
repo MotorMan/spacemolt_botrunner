@@ -343,7 +343,7 @@ export class WebServer {
   // Client sync state
   private syncMaster: ClientSyncMaster | null = null;
 
-  constructor(port: number = 3000) {
+constructor(port: number = 3000) {
     this.port = port;
     this.settings = loadSettings();
     delete (this.settings as Record<string, unknown>).flock;
@@ -959,7 +959,7 @@ export class WebServer {
           }
         }
 
-        // Client sync routes
+// Client sync routes
         if (url.pathname.startsWith("/api/client-sync/")) {
           if (!this.syncMaster) {
             const csSettings = this.settings.clientSync || {};

@@ -169,6 +169,26 @@ main {
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
+.bot-table-separator {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+.bot-table-header .station-fuel-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.bot-table-header .station-fuel-item {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+.bot-table-header .station-fuel-separator {
+  color: var(--border);
+  font-weight: 300;
+}
 .bot-table-scroll {
   flex: 1;
   min-height: 0;

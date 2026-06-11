@@ -83,27 +83,39 @@
       </div>
     </div>
 <div class="bot-table-wrap" id="originalTableWrap">
-       <div class="bot-table-header">
-          <span>Bots</span>
-          <span id="factionFuelDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">Fuel: 0.0K</span>
-          <span id="bandwidthDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">BW: 0.0 KB/s ↓ | 0.0 b/s ↑</span>
-         <div style="display:flex;gap:8px;align-items:center;">
-          <button class="sm" id="aiChatToggleBtn" onclick="toggleAiChat()" title="Enable/Disable AI Chat">
-            <span id="aiChatToggleIcon">🔌</span> <span id="aiChatToggleText">AI Chat: Off</span>
-          </button>
-          <button class="sm danger" onclick="emergencyReturnHome()">⚠ Emergency Return Home</button>
-          <button class="sm" onclick="showAddModal()">+ Add Bot</button>
-          <button class="sm" onclick="toggleRoutineGroupsLayout()" title="Switch to Routine Groups layout">📊 Groups View</button>
-          <div style="display:flex;gap:6px;align-items:center;border-left:1px solid var(--border);padding-left:8px;margin-left:4px;">
-            <select id="bulkStartRoutine" style="font-size:12px;padding:4px 8px;">
-              <!-- populated by JS -->
-            </select>
-            <button class="sm primary" onclick="bulkStartIdleBots()">▶ Start All Idle</button>
-            <button class="sm danger" onclick="bulkStopRunningBots()">⏹ Stop All Running</button>
-          </div>
-        </div>
-      </div>
-      <div class="bot-table-scroll">
+<div class="bot-table-header">
+           <span>Bots</span>
+           <span id="factionFuelDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">Fuel: 0.0K</span>
+           <div class="station-fuel-container">
+             <span id="stationFuelSC" class="station-fuel-item" style="opacity:0.5">SC: 0.0K</span>
+             <span class="station-fuel-separator">|</span>
+             <span id="stationFuelS" class="station-fuel-item" style="opacity:0.5">S: 0.0K</span>
+             <span class="station-fuel-separator">|</span>
+             <span id="stationFuelNT" class="station-fuel-item" style="opacity:0.5">NT: 0.0K</span>
+             <span class="station-fuel-separator">|</span>
+             <span id="stationFuelPA" class="station-fuel-item" style="opacity:0.5">PA: 0.0K</span>
+             <span class="station-fuel-separator">|</span>
+             <span id="stationFuelAC" class="station-fuel-item" style="opacity:0.5">AC: 0.0K</span>
+           </div>
+           <span id="bandwidthDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">BW: 0.0 KB/s ↓ | 0.0 b/s ↑</span>
+           <div style="display:flex;gap:8px;align-items:center;">
+           <button class="sm" id="aiChatToggleBtn" onclick="toggleAiChat()" title="Enable/Disable AI Chat">
+             <span id="aiChatToggleIcon">🔌</span> <span id="aiChatToggleText">AI Chat: Off</span>
+           </button>
+           <button class="sm danger" onclick="emergencyReturnHome()">⚠ Emergency Return Home</button>
+           <button class="sm" onclick="showAddModal()">+ Add Bot</button>
+           <button class="sm" onclick="toggleRoutineGroupsLayout()" title="Switch to Routine Groups layout">📊 Groups View</button>
+           <div style="display:flex;gap:6px;align-items:center;border-left:1px solid var(--border);padding-left:8px;margin-left:4px;">
+             <select id="bulkStartRoutine" style="font-size:12px;padding:4px 8px;">
+               <!-- populated by JS -->
+             </select>
+             <button class="sm primary" onclick="bulkStartIdleBots()">▶ Start All Idle</button>
+             <button class="sm danger" onclick="bulkStopRunningBots()">⏹ Stop All Running</button>
+           </div>
+         </div>
+       </div>
+       <div class="bot-table-separator"></div>
+       <div class="bot-table-scroll">
         <table class="bot-table" id="botTable">
           <thead>
             <tr id="botTableHeaderRow">
@@ -973,6 +985,8 @@ lastUsedRoutines = lastUsedRoutinesRes || {};
         }
         renderBots();
         setTimeout(refreshFactionFunds, 2000);
+        refreshStationFuelDisplay();
+        setInterval(refreshStationFuelDisplay, 30000);
         updateChatBotSelect();
         // Only re-render settings if settings tab is not active (to avoid clearing unsaved changes)
         if (!document.getElementById('page-settings')?.classList.contains('active')) {
@@ -2103,6 +2117,38 @@ function refreshFactionFunds() {
       }
     }
   });
+}
+
+function getStationInitials(stationId) {
+  const stationNameMap = {
+    'sol_central': 'SC',
+    'sirius_observatory_station': 'S',
+    'nova_terra_central': 'NT',
+    'procyon_colonial_station': 'PC',
+    'alpha_centauri_colonial_station': 'AC'
+  };
+  return stationNameMap[stationId] || stationId.slice(0, 2).toUpperCase();
+}
+
+async function refreshStationFuelDisplay() {
+  try {
+    const response = await fetch('/api/faction-fuel-stations');
+    if (!response.ok) return;
+    const data = await response.json();
+    const stations = data.stations || [];
+    
+    stations.forEach(station => {
+      const initials = getStationInitials(station.stationId);
+      const el = document.getElementById(`stationFuel${initials.replace(/[^A-Z]/g, '')}`);
+      if (el) {
+        const fuelK = (station.fuelReserve / 1000).toFixed(1);
+        el.textContent = `${initials}: ${fuelK}K`;
+        el.style.opacity = station.fuelCapacity > 0 ? '1' : '0.5';
+      }
+    });
+  } catch (e) {
+    console.warn('Failed to refresh station fuel:', e);
+  }
 }
 
 // ── Bot Profile ────────────────────────────────────────────

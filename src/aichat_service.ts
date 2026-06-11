@@ -1386,28 +1386,14 @@ export class AiChatService {
 
     // Get skills
     try {
-      const skillsResp = await bot.exec("get_skills", {});
-      if (!skillsResp.error && skillsResp.result) {
-        const skillsData = skillsResp.result as any;
-        lines.push("## Skills (get_skills)");
+      const statusResp = await bot.exec("get_status", {});
+      if (!statusResp.error && statusResp.result) {
+        const statusData = statusResp.result as any;
+        const skillsData = statusData.skills;
+        lines.push("## Skills");
         
-        // Handle different response formats (same as bot.ts checkSkills)
-        let skillsContainer = skillsData;
-        if (!Array.isArray(skillsData) && skillsData.skills !== undefined) {
-          skillsContainer = skillsData.skills;
-        }
-
-        if (Array.isArray(skillsContainer) && skillsContainer.length > 0) {
-          const skillEntries = skillsContainer.map((s: any) => {
-            const name = s.name || s.skill_name || s.id || "Unknown";
-            const level = s.level ?? s.current_level ?? 0;
-            const xp = s.xp !== undefined ? ` (${s.xp} XP)` : "";
-            return `${name}: ${level}${xp}`;
-          });
-          lines.push(`- ${skillEntries.join(", ")}`);
-        } else if (typeof skillsContainer === "object" && !Array.isArray(skillsContainer)) {
-          // Dict format: { skill_name: { level, xp, ... } } or { skill_name: level }
-          const entries = Object.entries(skillsContainer).map(([key, val]: [string, any]) => {
+        if (skillsData && typeof skillsData === "object") {
+          const entries = Object.entries(skillsData).map(([key, val]: [string, any]) => {
             if (typeof val === "number") {
               return `${key}: ${val}`;
             }

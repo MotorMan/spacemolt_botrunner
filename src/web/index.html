@@ -5696,7 +5696,7 @@ const FORMATTERS = {
 // Rate limiting: 10s cooldown on action (mutation) commands per bot
 const QUERY_COMMANDS = new Set([
   'get_status', 'get_cargo', 'get_ship', 'get_system', 'get_nearby',
-  'get_skills', 'get_missions', 'get_active_missions',
+  'get_missions', 'get_active_missions',
   'get_battle_status', 'get_notifications', 'get_trades', 'get_wrecks',
   'view_market', 'view_orders', 'view_storage', 'view_faction_storage',
   'list_ships', 'get_ships', 'catalog', 'shipyard_showroom', 'commission_status', 'scan', 'help', 'get_location',
@@ -6225,71 +6225,44 @@ function fetchMarket(username) {
 }
 
 function fetchSkills(username) {
-  // Set to null to show "Loading..." message
-  profileSkillsList = null;
-  renderProfileSidebar();
-
-  // Track retry count to avoid infinite loops
-  if (!fetchSkills.retryCount) fetchSkills.retryCount = {};
-  if (!fetchSkills.retryCount[username]) fetchSkills.retryCount[username] = 0;
-  const maxRetries = 2;
-
-  // Set a timeout to retry if callback doesn't fire within 5 seconds
-  const timeoutId = setTimeout(() => {
-    if (profileBot === username && profileSkillsList === null) {
-      if (fetchSkills.retryCount[username] < maxRetries) {
-        fetchSkills.retryCount[username]++;
-        logResponse(`<span class="resp-warn">Skills load timed out, retrying (${fetchSkills.retryCount[username]}/${maxRetries})...</span>`);
-        fetchSkills(username); // Retry
-      } else {
-        profileSkillsList = [];
-        profileSkills = {};
-        renderProfileSidebar();
-        logResponse('<span class="resp-err">Skills load failed after retries. Click Retry to try again.</span>');
-        fetchSkills.retryCount[username] = 0;
-      }
-    }
-  }, 5000);
-
-  sendExec(username, 'get_skills', undefined, (result) => {
-    clearTimeout(timeoutId); // Clear the timeout since callback fired
-    fetchSkills.retryCount[username] = 0; // Reset retry count on success
-
-    if (profileBot !== username) return; // stale response
-    if (!result.ok || !result.data) {
-      profileSkillsList = [];
-      profileSkills = {};
-      renderProfileSidebar();
-      return;
-    }
-    const d = result.data;
-    let raw = d.skills || d.player_skills || d;
-
-    // Normalize: if skills is an object keyed by name, convert to array
-    let skills;
-    if (Array.isArray(raw)) {
-      skills = raw;
-    } else if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-      skills = Object.entries(raw).map(([name, val]) => {
-        if (val && typeof val === 'object') {
-          return { name, ...val };
-        }
-        return { name, level: val };
-      });
-    } else {
-      skills = [];
-    }
-
+  // Use skills from get_status (included in bot.status()) instead of separate get_skills call
+  const bot = bots.find(b => b.username === username);
+  if (!bot) {
+    profileSkillsList = [];
     profileSkills = {};
-    profileSkillsList = skills;
-    for (const s of skills) {
-      const id = s.skill_id || s.id || s.name || '';
-      if (id) profileSkills[id] = s.level || 0;
-      if (s.name && s.name !== id) profileSkills[s.name] = s.level || 0;
-    }
     renderProfileSidebar();
-    renderManualControls();
-  });
+    return;
+  }
+
+  const skillsData = bot.skills;
+  if (!skillsData) {
+    profileSkillsList = [];
+    profileSkills = {};
+    renderProfileSidebar();
+    return;
+  }
+
+  // Normalize skills data into array format for rendering
+  const skills = Object.entries(skillsData).map(([id, data]) => ({
+    name: id,
+    skill_id: id,
+    id: id,
+    level: data.level ?? 0,
+    xp: data.xp,
+    xp_to_next: data.xpToNext,
+    next_level_xp: data.xpToNext,
+    total_xp: data.totalXP,
+  }));
+
+  profileSkills = {};
+  profileSkillsList = skills;
+  for (const s of skills) {
+    const id = s.skill_id || s.id || s.name || '';
+    if (id) profileSkills[id] = s.level || 0;
+    if (s.name && s.name !== id) profileSkills[s.name] = s.level || 0;
+  }
+  renderProfileSidebar();
+  renderManualControls();
 }
 
 function fetchStandings(username) {

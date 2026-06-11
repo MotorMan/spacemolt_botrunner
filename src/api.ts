@@ -413,7 +413,6 @@ const COMMAND_TTL: Record<string, number> = {
   get_nearby: 10_000, //1 tick! must always know who is nearby!
   get_poi: 10_000, //doesn't need to be 30s
   get_base: 120_000,
-  get_skills: 30_000, //doesn't need to be 2 min.
   get_missions: 60_000,
   view_storage: 30_000,
   view_faction_storage: 120_000,
@@ -429,7 +428,7 @@ const COMMAND_TTL: Record<string, number> = {
   get_map: 3600_000, //cached once per session, invalidated on server version change or client restart.
 };
 
-const INV_STATUS   = ["get_status", "get_player", "get_queue", "get_skills"];
+const INV_STATUS   = ["get_status", "get_player", "get_queue"];
 const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey_system", "find_route"];
 const INV_CARGO    = ["get_cargo"];
 const INV_SHIP     = ["get_ship"];

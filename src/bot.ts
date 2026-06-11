@@ -58,6 +58,7 @@ export interface BotStatus {
   storage: CargoItem[];
   stats: BotStats;
   stopAfterCycle: boolean;
+  skills?: Record<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>;
 }
 
 export interface RoutineContext {
@@ -1033,6 +1034,29 @@ docked = false;
 
       // Fallback: fuel at top level
       if (typeof r.fuel === "number") this.fuel = r.fuel;
+
+      // Extract skills from get_status response (v2 API includes skills)
+      const skillsData = r.skills as Record<string, unknown> | undefined;
+      if (skillsData && typeof skillsData === "object") {
+        this.skillLevels.clear();
+        this.skillXP.clear();
+        this.skillTotalXP.clear();
+        this.skillXpToNext.clear();
+        for (const [skillId, skillVal] of Object.entries(skillsData)) {
+          if (skillVal && typeof skillVal === "object") {
+            const s = skillVal as Record<string, unknown>;
+            const level = (s.level as number) ?? (s.current_level as number) ?? 0;
+            const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
+            const xp = typeof rawXP === "number" ? rawXP : 0;
+            const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number) ?? (s.xp_remaining as number) ?? (s.next_level_xp as number);
+            const totalXP = (s.total_xp as number) ?? (s.total_experience as number) ?? (s.cumulative_xp as number);
+            this.skillLevels.set(skillId, level);
+            this.skillXP.set(skillId, xp);
+            if (xpToNext !== undefined) this.skillXpToNext.set(skillId, xpToNext);
+            if (totalXP !== undefined) this.skillTotalXP.set(skillId, totalXP);
+          }
+        }
+      }
     }
 
     // Log position change if system or poi updated
@@ -1668,63 +1692,23 @@ docked = false;
       }
     }
 
-     /** Fetch all skills as a Map<skillId, {level, xp, xpToNext, totalXP?}>. */
+     /** Fetch all skills as a Map<skillId, {level, xp, xpToNext, totalXP?}>.
+     * Uses cached skills from get_status (skills are included in get_status response). */
      private async fetchAllSkills(): Promise<Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>> {
-     const resp = await this.api.execute('get_skills');
-     if (resp.error || !resp.result) return new Map();
-     const r = resp.result as Record<string, unknown>;
-     let skillsContainer: unknown = r;
-     if (!Array.isArray(r) && r.skills !== undefined) {
-       skillsContainer = r.skills;
+       const map = new Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>();
+       for (const [id, level] of this.skillLevels.entries()) {
+         const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = {
+           level,
+           xp: this.skillXP.get(id) ?? 0,
+         };
+         const xpToNext = this.skillXpToNext.get(id);
+         if (xpToNext !== undefined) entry.xpToNext = xpToNext;
+         const totalXP = this.skillTotalXP.get(id);
+         if (totalXP !== undefined) entry.totalXP = totalXP;
+         map.set(id, entry);
+       }
+       return map;
      }
-      const map = new Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>();
-      if (Array.isArray(skillsContainer)) {
-        for (const skill of skillsContainer as Array<Record<string, unknown>>) {
-          const id = (skill.skill_id as string) || (skill.id as string) || (skill.name as string) || "";
-          const level = (skill.level as number) ?? 0;
-          const rawXP = (skill.xp as number) ?? (skill.experience as number) ?? (skill.current_xp as string) ?? 0;
-          const xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
-          const xpToNext = (skill.xp_to_next_level as number) ??
-                           (skill.xp_to_next as number) ??
-                           (skill.xp_needed as number) ??
-                           (skill.xp_remaining as number) ??
-                           (skill.next_level_xp as number);
-          const totalXP = (skill.total_xp as number) ??
-                          (skill.total_experience as number) ??
-                          (skill.cumulative_xp as number);
-          const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = { level, xp, xpToNext: xpToNext ?? undefined };
-          if (totalXP !== undefined) entry.totalXP = totalXP;
-          if (id) map.set(id, entry);
-        }
-      } else if (skillsContainer && typeof skillsContainer === 'object') {
-        for (const [key, val] of Object.entries(skillsContainer as Record<string, unknown>)) {
-          let level = 0;
-          let xp = 0;
-          let xpToNext: number | undefined;
-          let totalXP: number | undefined;
-          if (typeof val === 'number') {
-            level = val;
-          } else if (val && typeof val === 'object') {
-            const s = val as Record<string, unknown>;
-            level = (s.level as number) ?? (s.current_level as number) ?? 0;
-            const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as string) ?? 0;
-            xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
-            xpToNext = (s.xp_to_next_level as number) ??
-                       (s.xp_to_next as number) ??
-                       (s.xp_needed as number) ??
-                       (s.xp_remaining as number) ??
-                       (s.next_level_xp as number);
-            totalXP = (s.total_xp as number) ??
-                      (s.total_experience as number) ??
-                      (s.cumulative_xp as number);
-          }
-          const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = { level, xp, xpToNext: xpToNext ?? undefined };
-          if (totalXP !== undefined) entry.totalXP = totalXP;
-          map.set(key, entry);
-        }
-      }
-      return map;
-    }
 
     /** Capture current skill levels & XP for before/after comparison. */
     captureSkillSnapshot(): void {
@@ -2393,47 +2377,17 @@ docked = false;
      }
    }
 
-   /** Fetch piloting skill info (level and XP) via get_skills. */
-   async getPilotingSkill(): Promise<{ level: number; xp: number } | null> {
-     const resp = await this.api.execute('get_skills');
-     if (resp.error || !resp.result) return null;
-     const r = resp.result as Record<string, unknown>;
-     let skillsContainer: unknown = r;
-     if (!Array.isArray(r) && r.skills !== undefined) {
-       skillsContainer = r.skills;
-     }
-     let result: { level: number; xp: number } | null = null;
-     const process = (id: string, name: string, level: number, xp: number) => {
-       if (!result && (id.toLowerCase().includes('pilot') || name.toLowerCase().includes('pilot'))) {
-         result = { level, xp };
-       }
-     };
-     if (Array.isArray(skillsContainer)) {
-       for (const skill of skillsContainer as Array<Record<string, unknown>>) {
-         const id = (skill.skill_id as string) || (skill.id as string) || (skill.name as string) || "";
-         const name = (skill.name as string) || id;
-         const level = (skill.level as number) ?? 0;
-         const rawXP = (skill.xp as number) ?? (skill.experience as number) ?? (skill.current_xp as string) ?? 0;
-         const xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
-         if (id) process(id, name, level, xp);
-       }
-     } else if (skillsContainer && typeof skillsContainer === 'object') {
-       for (const [key, val] of Object.entries(skillsContainer as Record<string, unknown>)) {
-         let level = 0;
-         let xp = 0;
-         if (typeof val === 'number') {
-           level = val;
-         } else if (val && typeof val === 'object') {
-           const s = val as Record<string, unknown>;
-           level = (s.level as number) ?? (s.current_level as number) ?? 0;
-           const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as string) ?? 0;
-           xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
-         }
-         process(key, key, level, xp);
-       }
-     }
-     return result;
-   }
+/** Fetch piloting skill info (level and XP) from cached skills in get_status. */
+    async getPilotingSkill(): Promise<{ level: number; xp: number } | null> {
+      let result: { level: number; xp: number } | null = null;
+      for (const [id, level] of this.skillLevels.entries()) {
+        if (id.toLowerCase().includes('pilot')) {
+          result = { level, xp: this.skillXP.get(id) ?? 0 };
+          break;
+        }
+      }
+      return result;
+    }
 
    /**
     * Send a witty battle response to the AI chat service when attacked.
@@ -2918,7 +2872,24 @@ docked = false;
       storage: this.storage,
       stats: { ...this.stats },
       stopAfterCycle: this._stopAfterCycle,
+      skills: this.getSkillsSnapshot(),
     };
+  }
+
+  private getSkillsSnapshot(): Record<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }> {
+    const result: Record<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }> = {};
+    for (const [id, level] of this.skillLevels.entries()) {
+      const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = {
+        level,
+        xp: this.skillXP.get(id) ?? 0,
+      };
+      const xpToNext = this.skillXpToNext.get(id);
+      if (xpToNext !== undefined) entry.xpToNext = xpToNext;
+      const totalXP = this.skillTotalXP.get(id);
+      if (totalXP !== undefined) entry.totalXP = totalXP;
+      result[id] = entry;
+    }
+    return result;
   }
 }
 

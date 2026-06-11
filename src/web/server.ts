@@ -1032,12 +1032,10 @@ constructor(port: number = 3000) {
           }
           if (url.pathname === "/api/client-sync/register" && req.method === "POST") {
             const body = await req.json() as { apiKey: string; label: string; password?: string };
-            console.log(`[WebServer] /api/client-sync/register received:`, JSON.stringify(body));
             if (!this.syncMaster) {
               return Response.json({ ok: false, error: "syncMaster not initialized" }, { headers: cors });
             }
             const result = await this.syncMaster.register(body);
-            console.log(`[WebServer] /api/client-sync/register result:`, JSON.stringify(result));
             return Response.json(result, { headers: cors });
           }
           if (url.pathname === "/api/client-sync/chat-relay" && req.method === "POST") {

@@ -86,8 +86,6 @@ export class ClientSyncMaster {
   }
 
   public register(payload: { label: string; apiKey: string; password?: string }): Promise<{ clientId: string; ok?: boolean; error?: string }> {
-    console.log(`[ClientSyncMaster] register() - received:`, JSON.stringify(payload));
-    console.log(`[ClientSyncMaster] register() - mode:`, this.mode, `apiKey:`, this.apiKey, `password:`, this.password);
     if (this.mode !== "master") {
       return Promise.resolve({ clientId: "", ok: false, error: "Master not in master mode" });
     }

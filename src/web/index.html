@@ -22035,10 +22035,10 @@ function testClientSyncConnection() {
   statusEl.textContent = 'Testing...';
   statusEl.style.color = 'var(--text-bright)';
   
-  fetch(`${masterUrl}/api/client-sync/register`, {
+  fetch('/api/client-sync/test-register', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ apiKey, label: label || 'test', password })
+    body: JSON.stringify({ masterUrl, apiKey, label: label || 'test', password })
   })
   .then(r => r.json())
   .then(data => {

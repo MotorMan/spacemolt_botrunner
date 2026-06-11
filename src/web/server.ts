@@ -1038,6 +1038,31 @@ constructor(port: number = 3000) {
             const result = await this.syncMaster.register(body);
             return Response.json(result, { headers: cors });
           }
+          if (url.pathname === "/api/client-sync/test-register" && req.method === "POST") {
+            const body = await req.json() as { masterUrl: string; apiKey: string; label: string; password?: string };
+            const testCors = { "Access-Control-Allow-Origin": "*" } as Record<string, string>;
+            if (!body.masterUrl) {
+              return Response.json({ ok: false, error: "masterUrl required" }, { headers: testCors });
+            }
+            try {
+              const testUrl = `${body.masterUrl}/api/client-sync/register`;
+              const res = await fetch(testUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ apiKey: body.apiKey, label: body.label || "test", password: body.password })
+              });
+              let payload: { ok: boolean; clientId?: string; error?: string };
+              try { 
+                payload = await res.json(); 
+              } catch { 
+                payload = { ok: false, error: "invalid response" }; 
+              }
+              return Response.json(payload, { headers: testCors });
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              return Response.json({ ok: false, error: msg }, { headers: testCors });
+            }
+          }
           if (url.pathname === "/api/client-sync/chat-relay" && req.method === "POST") {
             const body = await req.json() as { channel: string; content: string; sender?: string };
             const clientId = req.headers.get("x-client-id") || "";

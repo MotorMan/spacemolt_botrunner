@@ -1764,7 +1764,8 @@ async function* scanStation(
 
       let removed = 0;
       for (const listingId of Object.keys(shipsData.listings)) {
-        if (!currentListingIds.has(listingId)) {
+        const listing = shipsData.listings[listingId];
+        if (!currentListingIds.has(listingId) && listing.systemId === systemId && listing.stationPoiId === poi.id) {
           delete shipsData.listings[listingId];
           removed++;
         }
@@ -2593,7 +2594,8 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
                 let removed = 0;
                 for (const listingId of Object.keys(shipsData.listings)) {
-                  if (!currentListingIds.has(listingId)) {
+                  const listing = shipsData.listings[listingId];
+                  if (!currentListingIds.has(listingId) && listing.systemId === target.systemId && listing.stationPoiId === target.stationPoi) {
                     delete shipsData.listings[listingId];
                     removed++;
                   }

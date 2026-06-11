@@ -104,6 +104,7 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
       if (payload.ok && payload.clientId) {
         this.clientId = payload.clientId;
         this.connectionState = 'connected';
+        this.lastError = null;
       } else {
         this.connectionState = 'disconnected';
         this.lastError = payload.error || `HTTP ${res.status}`;

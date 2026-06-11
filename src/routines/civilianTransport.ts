@@ -61,6 +61,12 @@ function isPirateDestination(stationId: string, systemId: string | undefined): b
 const fs = require("fs");
 const path = require("path");
 
+const MOBILE_STATIONS = new Set(["mobile_capitol", "frontier_station"]);
+
+function isMobileStation(poiId: string): boolean {
+  return MOBILE_STATIONS.has(poiId.toLowerCase());
+}
+
 interface RouteResult {
   system: string;
   poi: string;
@@ -69,7 +75,7 @@ interface RouteResult {
 }
 
 async function resolveDestination(ctx: RoutineContext, bot: Bot, destinationId: string, destinationName: string, destinationSystem?: string): Promise<RouteResult | null> {
-  if (destinationId.toLowerCase() === "frontier_station" || destinationId.toLowerCase() === "mobile_capitol") {
+  if (isMobileStation(destinationId)) {
     ctx.log("transport", `resolveDestination: ${destinationId} is mobile, using find_route directly`);
     const routeResp = await bot.exec("find_route", { target: destinationId });
     if (!routeResp.error && routeResp.result) {
@@ -1961,7 +1967,23 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         ctx.log("transport", `Traveling to poi ${waypoint.poi}`);
         const tr = await bot.exec("travel", { target_poi: waypoint.poi });
         if (tr.error) {
-          ctx.log("transport", `Travel to ${waypoint.poi} failed: ${tr.error.message}`);
+          const errMsg = tr.error.message || "";
+          if (isMobileStation(waypoint.poi) && state.routeRebuildAttempts < 3) {
+            ctx.log("transport", `Travel to mobile station ${waypoint.poi} failed: ${errMsg}. Re-resolving destination.`);
+            const resolved = await resolveDestination(ctx, bot, waypoint.poi, waypoint.poiName);
+            if (resolved && resolved.system && resolved.poi) {
+              const newRoute = await planTourRoute(bot.system || "", [resolved], 6, bot);
+              if (newRoute.length > 0) {
+                state.route = newRoute;
+                state.currentRouteIndex = 0;
+                state.currentDestination = newRoute[0].poiName;
+                state.routeRebuildAttempts = (state.routeRebuildAttempts || 0) + 1;
+                ctx.log("transport", `Updated route to ${resolved.poi} in ${resolved.system}`);
+                continue;
+              }
+            }
+          }
+          ctx.log("transport", `Travel to ${waypoint.poi} failed: ${errMsg}`);
           await ctx.sleep(30000);
           continue;
         }
@@ -1979,6 +2001,10 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           await ctx.sleep(30000);
           continue;
         }
+      }
+
+      if (isMobileStation(waypoint.poi)) {
+        state.routeRebuildAttempts = 0;
       }
 
       await collectFuelCells(ctx, settings);

@@ -158,9 +158,9 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
     }
   }
 
-  private async pushStatuses(): Promise<void> {
+private async pushStatuses(): Promise<void> {
     const statuses: Record<string, unknown>[] = [];
-    await this.pushLocal("bot-status", { statuses });
+    await this.pushLocal("bot-status", { clientId: this.clientId, statuses });
   }
 
   private async pollCycle(): Promise<void> {

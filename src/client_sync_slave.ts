@@ -90,14 +90,17 @@ export class ClientSyncSlave {
 
 private async register(): Promise<{ ok: boolean; error?: string }> {
     const url = new URL("/api/client-sync/register", this.settings.masterUrl).toString();
+    console.log(`[ClientSync] register() - url:`, url, `apiKey:`, this.settings.apiKey, `password:`, this.settings.password);
     this.connectionState = 'connecting';
     this.lastConnectAttempt = Date.now();
     
     try {
       const res = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ apiKey: this.settings.apiKey, label: this.settings.label || "slave", password: this.settings.password }) });
+      console.log(`[ClientSync] register() - response status:`, res.status);
       let payload: { ok: boolean; clientId?: string; error?: string };
       try { 
         payload = await res.json(); 
+        console.log(`[ClientSync] register() - response payload:`, JSON.stringify(payload));
       } catch { 
         payload = { ok: false, error: "invalid response" }; 
       }
@@ -113,6 +116,7 @@ private async register(): Promise<{ ok: boolean; error?: string }> {
       this.connectionState = 'disconnected';
       const msg = err instanceof Error ? err.message : String(err);
       this.lastError = msg;
+      console.log(`[ClientSync] register() - error:`, msg);
       return { ok: false, error: msg };
     }
   }

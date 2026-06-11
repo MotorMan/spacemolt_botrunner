@@ -59,6 +59,8 @@ export interface BotStatus {
   stats: BotStats;
   stopAfterCycle: boolean;
   skills?: Record<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>;
+  factionFuelReserve?: number;
+  factionFuelCapacity?: number;
 }
 
 export interface RoutineContext {
@@ -768,7 +770,30 @@ docked = false;
           // Try to get faction name from response, then from existing cache, then fall back to this.faction
           const factionName = (result?.faction_name as string) || (result?.faction_id as string) || (station ? getFactionStorageCacheByStationOnly(station)?.factionName : null) || this.faction || "";
           if (factionName) {
-            updateFactionStorageCache(factionName, entries, station);
+            const fuelReserve = (result?.faction_fuel_reserve as number) || 0;
+            const fuelCapacity = (result?.faction_fuel_capacity as number) || 0;
+            updateFactionStorageCache(factionName, entries, station, fuelReserve, fuelCapacity);
+          }
+        }
+
+        // Update faction fuel cache whenever get_poi is called at a station
+        if (command === "get_poi" && !resp.error && resp.result) {
+          const result = resp.result as Record<string, unknown>;
+          const fuelReserve = (result.faction_fuel_reserve as number) || 0;
+          const fuelCapacity = (result.faction_fuel_capacity as number) || 0;
+          if (fuelCapacity > 0) {
+            this.factionFuelReserve = fuelReserve;
+            this.factionFuelCapacity = fuelCapacity;
+            const station = (result.poi as Record<string, unknown>)?.id as string || this.poi;
+            // Try to get faction name from response (base.empire), cache, or this.faction
+            const base = (result.base as Record<string, unknown>) || {};
+            const factionFromResponse = (base.empire as string) || (base.faction as string) || (base.faction_id as string);
+            const cached = station ? getFactionStorageCacheByStationOnly(station) : null;
+            const factionFromCache = cached?.factionName || null;
+            const factionName = factionFromResponse || factionFromCache || this.faction;
+            if (factionName) {
+              updateFactionStorageCache(factionName, [], station, fuelReserve, fuelCapacity);
+            }
           }
         }
 
@@ -2873,6 +2898,8 @@ docked = false;
       stats: { ...this.stats },
       stopAfterCycle: this._stopAfterCycle,
       skills: this.getSkillsSnapshot(),
+      factionFuelReserve: this.factionFuelReserve,
+      factionFuelCapacity: this.factionFuelCapacity,
     };
   }
 

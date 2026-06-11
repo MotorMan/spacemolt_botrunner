@@ -1025,6 +1025,19 @@ lastUsedRoutines = lastUsedRoutinesRes || {};
           renderBots();
           renderStats();
           updateChatBotSelect();
+          // Update faction fuel from any bot that has it
+          for (const bot of bots) {
+            if (bot.factionFuelReserve != null && bot.factionFuelCapacity != null && bot.factionFuelCapacity > 0) {
+              factionFuelReserve = bot.factionFuelReserve;
+              factionFuelCapacity = bot.factionFuelCapacity;
+              const fuelDisplayEl = document.getElementById('factionFuelDisplay');
+              if (fuelDisplayEl) {
+                const fuelK = (factionFuelReserve / 1000).toFixed(1);
+                fuelDisplayEl.textContent = `Fuel: ${fuelK}K`;
+              }
+              break;
+            }
+          }
           // Update profile sidebar if open (location, credits, cargo, etc.)
           if (profileBot) {
             updateProfileSidebar();
@@ -2050,7 +2063,20 @@ function refreshFactionFunds() {
   // but it requires docking. Prefer a docked running bot; fall back to any docked bot.
   const docked = bots.filter(b => b.docked);
   const pick = docked.find(b => b.state === 'running') ?? docked[0] ?? null;
-  if (!pick) return; // no docked bot — display already shows cached data
+  if (!pick) {
+    // No docked bot — fetch from faction-storage API endpoint
+    fetch('/api/faction-storage').then(r => r.json()).then(data => {
+      if (data.factionFuelReserve != null) {
+        factionFuelReserve = data.factionFuelReserve;
+        factionFuelCapacity = data.factionFuelCapacity || 0;
+        if (fuelDisplayEl) {
+          const fuelK = (factionFuelReserve / 1000).toFixed(1);
+          fuelDisplayEl.textContent = `Fuel: ${fuelK}K`;
+        }
+      }
+    }).catch(() => {});
+    return;
+  }
 
   _factionFundsInFlight = true;
   sendExec(pick.username, 'view_faction_storage', undefined, (result) => {

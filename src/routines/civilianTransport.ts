@@ -1176,6 +1176,8 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
   const { bot } = ctx;
   const settings = getCivilianTransportSettings(bot.username);
   let state = loadTransportState(bot.username);
+  let idleStartTime = 0;
+  const IDLE_RETURN_THRESHOLD_MS = 60 * 60 * 1000; // Return home after 1 hour of idle time
 
   // Get current ship info via get_ship
   const currentShipId = bot.shipId || "";
@@ -1405,6 +1407,31 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
 
     // --- State machine ---
     if (state.status === "idle") {
+      // Check idle timeout - return home if stuck idle for too long
+      const isAwayFromHome = settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase();
+      if (isAwayFromHome && !bot.docked) {
+        if (idleStartTime === 0) {
+          idleStartTime = Date.now();
+        }
+        const elapsedMs = Date.now() - idleStartTime;
+        if (elapsedMs >= IDLE_RETURN_THRESHOLD_MS) {
+          ctx.log("transport", `⏱️ Idle for ${Math.round(elapsedMs / 1000)}s away from home - returning home...`);
+          state.status = "idle";
+          state.route = [];
+          state.currentRouteIndex = 0;
+          state.currentDestination = null;
+          state.pickupStation = settings.homeStation || null;
+          state.pickupSystem = settings.homeSystem || null;
+          state.roundsWithoutPassengers = 0;
+          saveTransportState(state);
+          idleStartTime = 0;
+          await ctx.sleep(5000);
+          continue;
+        }
+      } else if (idleStartTime !== 0) {
+        idleStartTime = 0;
+      }
+
       // Need to find passengers and load up
       // If already docked at a station, check for passengers to loaf
       if (bot.docked && bot.poi && bot.system) {
@@ -1424,19 +1451,28 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
               ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
               const nextPickup = await selectNextPickupStation(ctx, state, settings);
               if (!nextPickup) {
-                await ctx.sleep(60000);
-                continue;
+                // No next pickup available - try to return home
+                if (settings.homeSystem) {
+                  ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
+                  state.pickupStation = settings.homeStation || null;
+                  state.pickupSystem = settings.homeSystem || null;
+                  state.roundsWithoutPassengers = 0;
+                } else {
+                  await ctx.sleep(60000);
+                  continue;
+                }
+              } else {
+                const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+                if (isSameStation) {
+                  ctx.log("transport", `Next pickup is same station, incrementing counter and continuing`);
+                  state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+                  await ctx.sleep(60000);
+                  continue;
+                }
+                state.roundsWithoutPassengers = 0;
+                state.pickupStation = nextPickup.poi;
+                state.pickupSystem = nextPickup.system;
               }
-              const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
-              if (isSameStation) {
-                ctx.log("transport", `Next pickup is same station, incrementing counter and continuing`);
-                state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
-                await ctx.sleep(60000);
-                continue;
-              }
-              state.roundsWithoutPassengers = 0;
-              state.pickupStation = nextPickup.poi;
-              state.pickupSystem = nextPickup.system;
             } else {
               await ctx.sleep(60000);
               continue;
@@ -1449,12 +1485,21 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       } else {
         const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
         if (!pickup) {
-          await ctx.sleep(60000);
-          continue;
+          // No passengers found anywhere - check if we should return home
+          if (settings.homeSystem && bot.system && bot.system.toLowerCase() !== settings.homeSystem.toLowerCase()) {
+            ctx.log("transport", `No passengers found, returning home from ${bot.system}`);
+            state.pickupStation = settings.homeStation || null;
+            state.pickupSystem = settings.homeSystem || null;
+            state.roundsWithoutPassengers = 0;
+          } else {
+            await ctx.sleep(60000);
+            continue;
+          }
+        } else {
+          state.pickupStation = pickup.poi;
+          state.pickupSystem = pickup.system;
+          state.roundsWithoutPassengers = 0;
         }
-        state.pickupStation = pickup.poi;
-        state.pickupSystem = pickup.system;
-        state.roundsWithoutPassengers = 0;
       }
 
       // Check if already at pickup station before any travel

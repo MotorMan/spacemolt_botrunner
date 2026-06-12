@@ -982,7 +982,7 @@ constructor(port: number = 3000) {
             return Response.json({ bots: {} });
           }
           const files = readdirSync(logsDir).filter(f => f.endsWith("_debug.log"));
-          const result: Record<string, { skills: Record<string, number>; lastUpdated: string }> = {};
+          const result: Record<string, { skills: Record<string, { level: number; xp?: number; nextLevelXp?: number }>; lastUpdated: string }> = {};
           
           for (const file of files) {
             const botName = file.replace(/_debug\.log$/, "");
@@ -1000,11 +1000,15 @@ constructor(port: number = 3000) {
                     const jsonStr = line.substring(jsonStart + "get_status response ".length);
                     try {
                       const status = JSON.parse(jsonStr);
-                      const skillsData = status.skills as Record<string, { level?: number }> | undefined;
+                      const skillsData = status.skills as Record<string, { level?: number; xp?: number; next_level_xp?: number }> | undefined;
                       if (skillsData) {
-                        const skills: Record<string, number> = {};
+                        const skills: Record<string, { level: number; xp?: number; nextLevelXp?: number }> = {};
                         for (const [skillId, skillData] of Object.entries(skillsData)) {
-                          skills[skillId] = skillData.level || 0;
+                          skills[skillId] = {
+                            level: skillData.level || 0,
+                            xp: skillData.xp,
+                            nextLevelXp: skillData.next_level_xp
+                          };
                         }
                         result[botName] = { skills, lastUpdated: new Date().toISOString() };
                       }

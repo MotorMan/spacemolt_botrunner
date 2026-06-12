@@ -1165,12 +1165,27 @@ function renderCatalogItem(item, catalogType) {
   const effect = item.effect || {};
   const parts = [];
   
+  const STAT_COLORS = {
+    'armor_bypass': 'var(--green)',
+    'shield_bypass': 'var(--cyan)',
+    'damage_mod': 'var(--yellow)',
+    'hull_damage_mod': 'var(--orange, #ea580c)',
+    'splash_pct': 'var(--red)',
+    'armor_melt_pct': 'var(--red)',
+    'armor_melt_ticks': 'var(--magenta)',
+    'disrupt_speed': 'var(--cyan)',
+    'disrupt_ticks': 'var(--magenta)',
+    'ammo_capacity': 'var(--green)',
+    'reload_time': 'var(--yellow)'
+  };
+  
   if (catalogType === 'items') {
     if (effect.ammo) {
       for (const [k, v] of Object.entries(effect.ammo)) {
         const label = k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
         const val = typeof v === 'number' ? (v < 1 ? `${(v * 100).toFixed(0)}%` : v) : v;
-        parts.push(`${label}: ${val}`);
+        const color = STAT_COLORS[k] || 'var(--text)';
+        parts.push(`<span style="color:${color}">${label}: ${val}</span>`);
       }
     }
     
@@ -1225,7 +1240,7 @@ function renderCatalogItem(item, catalogType) {
         ${effect.type ? `<span class="item-subtype">${esc(effect.type)}</span>` : ''}
         ${effect.subtype ? `<span class="item-subtype">${esc(effect.subtype)}</span>` : ''}
       </div>
-      ${statLines ? `<div class="item-stats" style="font-size:10px;color:var(--text-dim);margin-top:4px">${statLines}</div>` : ''}
+      ${statLines ? `<div class="item-stats" style="font-size:10px;margin-top:4px">${statLines}</div>` : ''}
     </div>
   `;
 }
@@ -1410,7 +1425,11 @@ lastUsedRoutines = lastUsedRoutinesRes || {};
               if (bot.skills) {
                 const skills = {};
                 for (const [skillId, skillData] of Object.entries(bot.skills)) {
-                  skills[skillId] = skillData.level || 0;
+                  skills[skillId] = {
+                    level: skillData.level || 0,
+                    xp: skillData.xp,
+                    nextLevelXp: skillData.next_level_xp
+                  };
                 }
                 skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
               }
@@ -2436,7 +2455,11 @@ async function loadSkillsData() {
         if (bot.skills) {
           const skills = {};
           for (const [skillId, skillData] of Object.entries(bot.skills)) {
-            skills[skillId] = skillData.level || 0;
+            skills[skillId] = {
+              level: skillData.level || 0,
+              xp: skillData.xp,
+              nextLevelXp: skillData.next_level_xp
+            };
           }
           skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
         }
@@ -2465,6 +2488,15 @@ function renderSkillsTab() {
     return;
   }
   
+  // Skill categories for coloring
+  const combatSkills = ['armor', 'shields', 'weapons', 'gunnery', 'bounty_hunting'];
+  const importantSkills = {
+    'piloting': 'piloting',
+    'navigation': 'navigation',
+    'engineering': 'engineering',
+    'piracy': 'piracy'
+  };
+  
   content.innerHTML = `
     <div class="skills-grid">
       ${botNames.sort().map(botName => {
@@ -2476,12 +2508,28 @@ function renderSkillsTab() {
             <div class="skills-bot-name">${esc(botName)}</div>
             <div class="skills-list">
               ${skillEntries.length > 0
-                ? skillEntries.map(([skillId, level]) => `
-                  <div class="skills-item">
-                    <span class="skills-name">${esc(catalogName(skillId))}</span>
-                    <span class="skills-level">Lv ${level}</span>
-                  </div>
-                `).join('')
+                ? skillEntries.map(([skillId, skill]) => {
+                    const level = skill.level || 0;
+                    const xp = skill.xp || 0;
+                    const nextLevelXp = skill.nextLevelXp;
+                    const xpPercent = nextLevelXp ? Math.min(100, Math.round((xp / nextLevelXp) * 100)) : 0;
+                    const xpDisplay = xp && nextLevelXp ? `${xp}/${nextLevelXp} (${xpPercent}%)` : '';
+                    
+                    let skillClass = '';
+                    if (importantSkills[skillId]) {
+                      skillClass = importantSkills[skillId];
+                    } else if (combatSkills.includes(skillId)) {
+                      skillClass = 'combat';
+                    }
+                    
+                    const friendlyName = catalogName(skillId);
+                    return `
+                      <div class="skills-item">
+                        <span class="skills-name ${skillClass}">${esc(friendlyName)}</span>
+                        <span class="skills-level">Lv ${level}${xpDisplay ? '<br><span class="skills-xp">' + xpDisplay + '</span>' : ''}</span>
+                      </div>
+                    `;
+                  }).join('')
                 : '<div class="skills-empty" style="padding:8px">No skills data</div>'
               }
             </div>

@@ -258,7 +258,10 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
 
       let station: BestStation | null = null;
       if (settings.sellAtHome) {
-        station = { systemId: settings.homeSystem, poiId: settings.homeStation, poiName: "Home" };
+        const homePoiId = settings.homeStation.includes("|") 
+          ? settings.homeStation.split("|")[1] 
+          : settings.homeStation;
+        station = { systemId: settings.homeSystem, poiId: homePoiId, poiName: "Home" };
       } else {
         station = findBestSellStation(storageItem.itemId);
         if (!station) {
@@ -316,7 +319,7 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
         }
 
         const { pois } = await getSystemInfo(ctx);
-        const targetStationPoi = pois.find(p => p.id === targetPoi);
+        const targetStationPoi = pois.find(p => normalizePoiId(p.id) === normalizePoiId(targetPoi));
         if (!targetStationPoi || !targetStationPoi.has_base) {
           ctx.log("warn", `ModuleSeller: target POI ${targetPoi} not found in ${targetSystem} — skipping ${sellItem.name}`);
           continue;

@@ -366,6 +366,7 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
    'sell_wreck': 'sell',
    'scrap_wreck': 'scrap',
    'release_tow': 'release',
+   'buy_insurance': 'insure',
 };
 
 // Commands that use payload.action for the action (like facility and battle)

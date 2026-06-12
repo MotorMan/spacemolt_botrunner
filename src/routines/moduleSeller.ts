@@ -350,7 +350,7 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
 
       const orderResp = await bot.exec("create_sell_order", {
         item_id: sellItem.itemId,
-        price: sellItem.price,
+        price_each: sellItem.price,
         quantity: sellItem.sellQty,
       });
 

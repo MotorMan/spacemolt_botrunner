@@ -200,11 +200,41 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
       continue;
     }
 
-    const docked = await ensureDocked(ctx);
-    if (!docked) {
-      ctx.log("error", "ModuleSeller: failed to dock at station");
-      await ctx.sleep(30000);
-      continue;
+    const homePoiId = settings.homeStation.includes("|") 
+      ? settings.homeStation.split("|")[1] 
+      : settings.homeStation;
+
+    if (normalizeSystemId(settings.homeSystem) !== normalizeSystemId(bot.system) || normalizePoiId(homePoiId) !== normalizePoiId(bot.poi)) {
+      ctx.log("travel", `ModuleSeller: navigating to home station ${homePoiId} in ${settings.homeSystem}...`);
+      
+      if (normalizeSystemId(settings.homeSystem) !== normalizeSystemId(bot.system)) {
+        const ok = await navigateToSystem(ctx, settings.homeSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
+        if (!ok) {
+          ctx.log("error", "ModuleSeller: failed to reach home system — will retry next cycle");
+          await ctx.sleep(30000);
+          continue;
+        }
+      }
+
+      await ensureUndocked(ctx);
+      const travelResp = await bot.exec("travel", { target_poi: homePoiId });
+      if (travelResp.error && !travelResp.error.message.includes("already")) {
+        ctx.log("warn", `ModuleSeller: failed to travel to home station: ${travelResp.error.message}`);
+      }
+
+      const dockResp = await bot.exec("dock");
+      if (dockResp.error && !dockResp.error.message.includes("already")) {
+        ctx.log("warn", `ModuleSeller: failed to dock at home station: ${dockResp.error.message}`);
+      }
+      bot.docked = true;
+      bot.poi = homePoiId;
+    } else {
+      const docked = await ensureDocked(ctx);
+      if (!docked) {
+        ctx.log("error", "ModuleSeller: failed to dock at station");
+        await ctx.sleep(30000);
+        continue;
+      }
     }
 
     await tryRefuel(ctx);
@@ -241,20 +271,22 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
       const maxWithdraw = Math.min(storageItem.quantity, maxSellQty, remainingCargo);
       if (maxWithdraw <= 0) continue;
 
-      const withdrawResp = await bot.exec("faction_withdraw_items", {
-        item_id: storageItem.itemId,
-        quantity: maxWithdraw,
-      });
-      if (!withdrawResp.error) {
+      const stationId = settings.homeStation.includes("|") 
+        ? settings.homeStation.split("|")[1] 
+        : settings.homeStation;
+      const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', station_id: stationId, item_id: storageItem.itemId, quantity: maxWithdraw });
+      if (withdrawResp.error) {
+        ctx.log("warn", `ModuleSeller: failed to withdraw ${storageItem.itemId}: ${withdrawResp.error.message}`);
+      } else {
         ctx.log("trade", `ModuleSeller: withdrawn ${maxWithdraw}x ${storageItem.itemId}`);
         remainingCargo -= maxWithdraw;
       }
     }
 
-    await ctx.sleep(1000);
-    await bot.refreshCargo();
+    await ctx.sleep(2000);
 
-    const cargoItems = bot.inventory.filter((item: { itemId: string }) => isShipModule(item.itemId));
+    const cargoResp = await bot.exec("get_cargo");
+    const cargoItems = (Array.isArray(cargoResp.result) ? cargoResp.result : []).filter((item: { itemId: string }) => isShipModule(item.itemId));
     if (cargoItems.length === 0) {
       ctx.log("trade", "ModuleSeller: no modules in cargo — waiting");
       await ctx.sleep(60000);
@@ -286,9 +318,6 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
 
       let station: BestStation | null = null;
       if (settings.sellAtHome) {
-        const homePoiId = settings.homeStation.includes("|") 
-          ? settings.homeStation.split("|")[1] 
-          : settings.homeStation;
         station = { systemId: settings.homeSystem, poiId: homePoiId, poiName: "Home" };
       } else {
         station = findBestSellStation(cargoItem.itemId);
@@ -381,7 +410,10 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
 
       if (orderResp.error) {
         ctx.log("error", `ModuleSeller: sell order failed for ${sellItem.name}: ${orderResp.error.message}`);
-        await bot.exec("faction_deposit_items", { item_id: sellItem.itemId, quantity: sellItem.sellQty });
+        const stationId = settings.homeStation.includes("|") 
+          ? settings.homeStation.split("|")[1] 
+          : settings.homeStation;
+        await bot.exec("storage", { action: 'deposit', target: 'faction', station_id: stationId, item_id: sellItem.itemId, quantity: sellItem.sellQty });
         continue;
       }
 

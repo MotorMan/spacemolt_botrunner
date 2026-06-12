@@ -43,6 +43,7 @@ import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_
 import { flushMinerActivity } from "./routines/minerActivity.js";
 import { type SyncSettings } from "./client_sync_types.js";
 import { ClientSyncSlave } from "./client_sync_slave.js";
+import { buyInsurance } from "./routines/common.js";
 
 interface BotState {
   wasRunning: boolean;
@@ -739,6 +740,10 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   ]);
   if (refreshCommands.has(command)) {
     await bot.refreshStatus();
+
+    if (command === "switch_ship") {
+      await buyInsurance({ bot, log: (cat, msg) => bot.log(cat, msg), sleep: (ms: number) => new Promise(r => setTimeout(r, ms)), api: bot.api });
+    }
 
     // Also refresh the recipient bot after gift/trade
     if (command === "send_gift" || command === "trade_offer") {

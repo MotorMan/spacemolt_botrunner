@@ -2899,6 +2899,28 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
   }
 }
 
+export async function buyInsurance(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  ctx.log("insurance", "Buying insurance for 7 days...");
+  const insureResp = await bot.exec("buy_insurance", { ticks: 9999 });
+  if (!insureResp.error && insureResp.result) {
+    const r = insureResp.result as Record<string, unknown>;
+    const msg = (r?.message as string) || `Insurance purchased for 7 days`;
+    ctx.log("insurance", msg);
+    logFactionActivity(ctx, "insurance", `Bought insurance: ${msg}`);
+    await bot.refreshStatus();
+  } else {
+    const errMsg = insureResp.error?.message || "Unknown error";
+    if (errMsg.toLowerCase().includes("already_insured")) {
+      ctx.log("insurance", "Already insured - skipping purchase");
+      logFactionActivity(ctx, "insurance", "Skipped - already insured");
+    } else {
+      ctx.log("insurance", `Insurance purchase failed: ${errMsg}`);
+      logFactionActivity(ctx, "insurance", `Failed: ${errMsg}`);
+    }
+  }
+}
+
 /**
  * Detect death (hull=0) and attempt recovery: claim insurance, dock, refuel, repair, re-insure.
  * Returns true if alive/recovered, false if stuck dead.

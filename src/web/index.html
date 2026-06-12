@@ -1404,6 +1404,23 @@ lastUsedRoutines = lastUsedRoutinesRes || {};
               break;
             }
           }
+          // Update skills data for live updates (when debug logging is disabled)
+          if (skillsLoaded && skillsData && skillsData.bots) {
+            for (const bot of bots) {
+              if (bot.skills) {
+                const skills: Record<string, number> = {};
+                for (const [skillId, skillData] of Object.entries(bot.skills as Record<string, { level?: number }>)) {
+                  skills[skillId] = (skillData as { level?: number }).level || 0;
+                }
+                skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
+              }
+            }
+            // Re-render skills tab if it's currently visible
+            if (document.getElementById('page-stats')?.classList.contains('active') && 
+                document.getElementById('statsSkillsView')?.style.display !== 'none') {
+              renderSkillsTab();
+            }
+          }
           // Update profile sidebar if open (location, credits, cargo, etc.)
           if (profileBot) {
             updateProfileSidebar();
@@ -2395,15 +2412,37 @@ let skillsData = null;
 let skillsLoaded = false;
 
 async function loadSkillsData() {
-  if (skillsLoaded && skillsData) return;
-  try {
-    const res = await fetch('/api/skills');
-    if (res.ok) {
-      skillsData = await res.json();
+  // Check if debug logging is enabled for traders (the main ones with debugLogging setting)
+  const debugLoggingEnabled = settings?.trader?.debugLogging !== false && settings?.general?.disableDebugLog !== true;
+  
+  if (debugLoggingEnabled) {
+    // Read from log files
+    if (skillsLoaded && skillsData) return;
+    try {
+      const res = await fetch('/api/skills');
+      if (res.ok) {
+        skillsData = await res.json();
+        skillsLoaded = true;
+      }
+    } catch (err) {
+      console.warn('Failed to load skills data:', err);
+    }
+  } else {
+    // Live updates from WebSocket status messages
+    // Initialize skillsData from current bots if available
+    if (!skillsData) {
+      skillsData = { bots: {}, lastUpdated: new Date().toISOString() };
+      for (const bot of bots) {
+        if (bot.skills) {
+          const skills: Record<string, number> = {};
+          for (const [skillId, skillData] of Object.entries(bot.skills as Record<string, { level?: number }>)) {
+            skills[skillId] = (skillData as { level?: number }).level || 0;
+          }
+          skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
+        }
+      }
       skillsLoaded = true;
     }
-  } catch (err) {
-    console.warn('Failed to load skills data:', err);
   }
 }
 
@@ -2413,12 +2452,16 @@ function renderSkillsTab() {
   
   const bots = skillsData?.bots || {};
   const botNames = Object.keys(bots);
+  const debugLoggingEnabled = settings?.trader?.debugLogging !== false && settings?.general?.disableDebugLog !== true;
   
   document.getElementById('skillsTotalBots').textContent = botNames.length;
   document.getElementById('skillsLastUpdated').textContent = skillsData?.lastUpdated ? new Date(skillsData.lastUpdated).toLocaleTimeString() : '-';
   
   if (botNames.length === 0) {
-    content.innerHTML = `<div class="skills-empty">No skills data found. <button class="sm" style="margin-left:8px;font-size:10px" onclick="loadSkillsData();renderSkillsTab()">Refresh</button></div>`;
+    const msg = debugLoggingEnabled 
+      ? 'No skills data found in log files. Start bots to collect skills from get_status responses.'
+      : 'Waiting for live updates from bots...';
+    content.innerHTML = `<div class="skills-empty">${msg}</div>`;
     return;
   }
   

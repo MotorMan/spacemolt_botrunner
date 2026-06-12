@@ -14,6 +14,7 @@ import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderC
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { loadSettings, saveStoppedState } from "./web/server.js";
+import { buyInsurance } from "./routines/common.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -1359,6 +1360,8 @@ docked = false;
       sendBotChat: opts?.sendBotChat,
       getAllBotNames: opts?.getAllBotNames,
     };
+
+    await buyInsurance(ctx);
 
     try {
       for await (const stateName of routine(ctx)) {

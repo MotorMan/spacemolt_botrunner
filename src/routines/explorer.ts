@@ -88,6 +88,9 @@ interface ShipListing {
   last_updated: string;
 }
 
+/** Threshold in days for considering a ship listing stale and removing it. */
+const SHIP_LISTING_EXPIRY_DAYS = 30;
+
 interface ShipsForSaleData {
   lastSaved: string;
   listings: Record<string, ShipListing>;
@@ -134,14 +137,20 @@ function saveMarketDetails(data: MarketDetailsData): void {
   writeFileSync(MARKET_DETAILS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
 }
 
-function loadShipsForSale(): ShipsForSaleData {
+function loadShipsForSale(log?: (cat: string, msg: string) => void): ShipsForSaleData {
   if (!existsSync(DATA_DIR)) {
     mkdirSync(DATA_DIR, { recursive: true });
   }
   if (existsSync(SHIPS_FOR_SALE_FILE)) {
     try {
       const raw = readFileSync(SHIPS_FOR_SALE_FILE, "utf-8");
-      return JSON.parse(raw) as ShipsForSaleData;
+      const data = JSON.parse(raw) as ShipsForSaleData;
+      const removed = cleanupExpiredShipListings(data);
+      if (removed > 0 && log) {
+        log("info", `Removed ${removed} expired ship listing(s) from shipsForSale.json`);
+        saveShipsForSale(data);
+      }
+      return data;
     } catch {
       // Corrupt file — start fresh
     }
@@ -155,6 +164,19 @@ function saveShipsForSale(data: ShipsForSaleData): void {
   }
   data.lastSaved = now();
   writeFileSync(SHIPS_FOR_SALE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function cleanupExpiredShipListings(data: ShipsForSaleData): number {
+  const cutoff = Date.now() - SHIP_LISTING_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
+  let removed = 0;
+  for (const [listingId, listing] of Object.entries(data.listings)) {
+    const lastUpdated = new Date(listing.last_updated).getTime();
+    if (isNaN(lastUpdated) || lastUpdated < cutoff) {
+      delete data.listings[listingId];
+      removed++;
+    }
+  }
+  return removed;
 }
 
 function loadRawMissions(): RawMissionsData {
@@ -1726,8 +1748,9 @@ async function* scanStation(
 
     if (listings.length > 0) {
       ctx.log("info", `Saving ${listings.length} ship listings from ${poi.name}...`);
-      const shipsData = loadShipsForSale();
+      const shipsData = loadShipsForSale(ctx.log);
       let updated = 0;
+      const expiredRemoved = cleanupExpiredShipListings(shipsData);
 
       const currentListingIds = new Set<string>();
 
@@ -1762,20 +1785,21 @@ async function* scanStation(
         updated++;
       }
 
-      let removed = 0;
+      let soldRemoved = 0;
       for (const listingId of Object.keys(shipsData.listings)) {
         const listing = shipsData.listings[listingId];
         if (!currentListingIds.has(listingId) && listing.systemId === systemId && listing.stationPoiId === poi.id) {
           delete shipsData.listings[listingId];
-          removed++;
+          soldRemoved++;
         }
       }
 
-      if (updated > 0 || removed > 0) {
+      if (updated > 0 || soldRemoved > 0 || expiredRemoved > 0) {
         saveShipsForSale(shipsData);
         const msgs: string[] = [];
         if (updated > 0) msgs.push(`${updated} added/updated`);
-        if (removed > 0) msgs.push(`${removed} sold/removed`);
+        if (soldRemoved > 0) msgs.push(`${soldRemoved} sold/removed`);
+        if (expiredRemoved > 0) msgs.push(`${expiredRemoved} expired`);
         ctx.log("info", `Saved ship listings to shipsForSale.json (${msgs.join(", ")})`);
       }
     }
@@ -2556,8 +2580,9 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
               if (listings.length > 0) {
                 ctx.log("info", `Saving ${listings.length} ship listings from ${target.stationName}...`);
-                const shipsData = loadShipsForSale();
+                const shipsData = loadShipsForSale(ctx.log);
                 let updated = 0;
+                const expiredRemoved = cleanupExpiredShipListings(shipsData);
 
                 const currentListingIds = new Set<string>();
 
@@ -2592,20 +2617,21 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
                   updated++;
                 }
 
-                let removed = 0;
+                let soldRemoved = 0;
                 for (const listingId of Object.keys(shipsData.listings)) {
                   const listing = shipsData.listings[listingId];
                   if (!currentListingIds.has(listingId) && listing.systemId === target.systemId && listing.stationPoiId === target.stationPoi) {
                     delete shipsData.listings[listingId];
-                    removed++;
+                    soldRemoved++;
                   }
                 }
 
-                if (updated > 0 || removed > 0) {
+                if (updated > 0 || soldRemoved > 0 || expiredRemoved > 0) {
                   saveShipsForSale(shipsData);
                   const msgs: string[] = [];
                   if (updated > 0) msgs.push(`${updated} added/updated`);
-                  if (removed > 0) msgs.push(`${removed} sold/removed`);
+                  if (soldRemoved > 0) msgs.push(`${soldRemoved} sold/removed`);
+                  if (expiredRemoved > 0) msgs.push(`${expiredRemoved} expired`);
                   ctx.log("info", `Saved ship listings to shipsForSale.json (${msgs.join(", ")})`);
                 }
               }

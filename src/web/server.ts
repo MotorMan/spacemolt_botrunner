@@ -975,6 +975,53 @@ constructor(port: number = 3000) {
           return Response.json({ lines, total: botOnLogLines.length });
         }
 
+        // GET /api/skills - Extract skills from last get_status in each bot's log
+        if (url.pathname === "/api/skills" && req.method === "GET") {
+          const logsDir = join(process.cwd(), "data", "logs");
+          if (!existsSync(logsDir)) {
+            return Response.json({ bots: {} });
+          }
+          const files = readdirSync(logsDir).filter(f => f.endsWith("_debug.log"));
+          const result: Record<string, { skills: Record<string, number>; lastUpdated: string }> = {};
+          
+          for (const file of files) {
+            const botName = file.replace(/_debug\.log$/, "");
+            const logPath = join(logsDir, file);
+            try {
+              const content = readFileSync(logPath, "utf-8");
+              const lines = content.split("\n");
+              
+              // Find the last get_status response
+              for (let i = lines.length - 1; i >= 0; i--) {
+                const line = lines[i];
+                if (line.includes("get_status response")) {
+                  const jsonStart = line.indexOf("get_status response ");
+                  if (jsonStart !== -1) {
+                    const jsonStr = line.substring(jsonStart + "get_status response ".length);
+                    try {
+                      const status = JSON.parse(jsonStr);
+                      const skillsData = status.skills as Record<string, { level?: number }> | undefined;
+                      if (skillsData) {
+                        const skills: Record<string, number> = {};
+                        for (const [skillId, skillData] of Object.entries(skillsData)) {
+                          skills[skillId] = skillData.level || 0;
+                        }
+                        result[botName] = { skills, lastUpdated: new Date().toISOString() };
+                      }
+                    } catch (parseErr) {
+                      // JSON parse failed, continue to next line
+                    }
+                    break;
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn(`Failed to parse skills from ${file}:`, e);
+            }
+          }
+          return Response.json({ bots: result });
+        }
+
         // Flock state endpoint
         if (url.pathname.startsWith("/api/flock/") && req.method === "GET") {
           const flockName = decodeURIComponent(url.pathname.slice("/api/flock/".length));

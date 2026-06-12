@@ -1998,6 +1998,57 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 }
 
 /* ── Faction page ───────────────────────────────────── */
+.skills-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+}
+.skills-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+.skills-bot-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+.skills-bot-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.skills-list {
+  font-size: 12px;
+}
+.skills-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  border-bottom: 1px solid #21262d;
+}
+.skills-item:last-child { border-bottom: none; }
+.skills-name {
+  color: var(--text);
+  font-weight: 500;
+}
+.skills-level {
+  color: var(--text-dim);
+  font-family: monospace;
+  font-size: 11px;
+}
+.skills-empty {
+  color: var(--text-dim);
+  font-style: italic;
+  text-align: center;
+  padding: 40px;
+}
 .faction-layout {
   display: flex;
   gap: 16px;

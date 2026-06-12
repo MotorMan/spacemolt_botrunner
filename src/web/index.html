@@ -541,12 +541,13 @@
        <div class="stat-item"><span class="stat-value" id="pStatFaction">-</span><span class="stat-label">Faction Funds</span></div>
      </div>
      
-     <!-- Taxes Tab Navigation -->
-     <div class="stats-taxes-nav" id="statsTaxesNav" style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
-       <span class="stats-title">View:</span>
-       <button class="active" id="statsTabMain" onclick="switchStatsView('main')">Main</button>
-       <button id="statsTabTaxes" onclick="switchStatsView('taxes')">Taxes</button>
-     </div>
+<!-- Taxes Tab Navigation -->
+      <div class="stats-taxes-nav" id="statsTaxesNav" style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+        <span class="stats-title">View:</span>
+        <button class="active" id="statsTabMain" onclick="switchStatsView('main')">Main</button>
+        <button id="statsTabTaxes" onclick="switchStatsView('taxes')">Taxes</button>
+        <button id="statsTabSkills" onclick="switchStatsView('skills')">Skills</button>
+      </div>
      
      <!-- Main Stats View -->
      <div id="statsMainView">
@@ -589,37 +590,49 @@
        </div>
      </div>
      
-     <!-- Taxes View (hidden by default) -->
-     <div id="statsTaxesView" style="display:none">
-       <div class="stats-bar">
-         <span class="stats-title">Fleet Tax Summary</span>
-         <div class="stat-item"><span class="stat-value" id="taxTotalIncome">0</span><span class="stat-label">Total Taxable Income</span></div>
-         <div class="stat-item"><span class="stat-value" id="taxTotalIncomeTax">0</span><span class="stat-label">Total Income Tax</span></div>
-         <div class="stat-item"><span class="stat-value" id="taxTotalPropertyTax">0</span><span class="stat-label">Total Property Tax</span></div>
-         <div class="stat-item"><span class="stat-value" id="taxTotalAssessed">0</span><span class="stat-label">Total Assessed Value</span></div>
-       </div>
-       <div class="bot-table-wrap" style="flex:1;overflow:auto">
-         <div class="bot-table-header">
-           <span>Tax History by Bot</span>
-           <div style="display:flex;gap:8px">
-             <input type="text" class="filter-input" placeholder="🔍 Search bots..." id="taxSearch" oninput="filterTaxBots()">
-           </div>
-         </div>
-         <div class="bot-table-scroll">
-           <table class="bot-table" id="taxTable">
-             <thead><tr>
-               <th style="text-align:left;padding:6px 12px">Bot</th>
-               <th style="text-align:right;padding:6px 12px">Taxable Income</th>
-               <th style="text-align:right;padding:6px 12px">Income Tax</th>
-               <th style="text-align:right;padding:6px 12px">Property Tax</th>
-               <th style="text-align:right;padding:6px 12px">Assessed Value</th>
-               <th style="text-align:right;padding:6px 12px">Last Updated</th>
-             </tr></thead>
-             <tbody id="taxTableBody"></tbody>
-           </table>
-         </div>
-       </div>
-     </div>
+<!-- Taxes View (hidden by default) -->
+      <div id="statsTaxesView" style="display:none">
+        <div class="stats-bar">
+          <span class="stats-title">Fleet Tax Summary</span>
+          <div class="stat-item"><span class="stat-value" id="taxTotalIncome">0</span><span class="stat-label">Total Taxable Income</span></div>
+          <div class="stat-item"><span class="stat-value" id="taxTotalIncomeTax">0</span><span class="stat-label">Total Income Tax</span></div>
+          <div class="stat-item"><span class="stat-value" id="taxTotalPropertyTax">0</span><span class="stat-label">Total Property Tax</span></div>
+          <div class="stat-item"><span class="stat-value" id="taxTotalAssessed">0</span><span class="stat-label">Total Assessed Value</span></div>
+        </div>
+        <div class="bot-table-wrap" style="flex:1;overflow:auto">
+          <div class="bot-table-header">
+            <span>Tax History by Bot</span>
+            <div style="display:flex;gap:8px">
+              <input type="text" class="filter-input" placeholder="🔍 Search bots..." id="taxSearch" oninput="filterTaxBots()">
+            </div>
+          </div>
+          <div class="bot-table-scroll">
+            <table class="bot-table" id="taxTable">
+              <thead><tr>
+                <th style="text-align:left;padding:6px 12px">Bot</th>
+                <th style="text-align:right;padding:6px 12px">Taxable Income</th>
+                <th style="text-align:right;padding:6px 12px">Income Tax</th>
+                <th style="text-align:right;padding:6px 12px">Property Tax</th>
+                <th style="text-align:right;padding:6px 12px">Assessed Value</th>
+                <th style="text-align:right;padding:6px 12px">Last Updated</th>
+              </tr></thead>
+              <tbody id="taxTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Skills View -->
+      <div id="statsSkillsView" style="display:none">
+        <div class="stats-bar">
+          <span class="stats-title">Fleet Skills</span>
+          <div class="stat-item"><span class="stat-value" id="skillsTotalBots">0</span><span class="stat-label">Bots with Skills</span></div>
+          <div class="stat-item"><span class="stat-value" id="skillsLastUpdated">-</span><span class="stat-label">Last Updated</span></div>
+        </div>
+        <div class="skills-content" id="skillsContent">
+          <div class="skills-empty">Loading skills data...</div>
+        </div>
+      </div>
    </div>
 
   <!-- ══ Bot Profile Page (hidden by default) ══ -->
@@ -1975,13 +1988,19 @@ async function switchStatsView(view) {
   statsTaxesView = view;
   document.getElementById('statsTabMain').classList.toggle('active', view === 'main');
   document.getElementById('statsTabTaxes').classList.toggle('active', view === 'taxes');
+  document.getElementById('statsTabSkills').classList.toggle('active', view === 'skills');
   document.getElementById('statsMainView').style.display = view === 'main' ? '' : 'none';
   document.getElementById('statsTaxesView').style.display = view === 'taxes' ? '' : 'none';
+  document.getElementById('statsSkillsView').style.display = view === 'skills' ? '' : 'none';
   if (view === 'taxes') {
     if (!taxesLoaded) {
       await loadTaxesData();
     }
     renderTaxesTab();
+  }
+  if (view === 'skills') {
+    await loadSkillsData();
+    renderSkillsTab();
   }
 }
 
@@ -2031,6 +2050,64 @@ function renderTaxesTab() {
       <td style="padding:6px 12px;text-align:right">${esc(lastUpdated)}</td>
     </tr>`;
   }).join('');
+}
+
+let skillsData = null;
+let skillsLoaded = false;
+
+async function loadSkillsData() {
+  if (skillsLoaded && skillsData) return;
+  try {
+    const res = await fetch('/api/skills');
+    if (res.ok) {
+      skillsData = await res.json();
+      skillsLoaded = true;
+    }
+  } catch (err) {
+    console.warn('Failed to load skills data:', err);
+  }
+}
+
+function renderSkillsTab() {
+  const content = document.getElementById('skillsContent');
+  if (!content) return;
+  
+  const bots = skillsData?.bots || {};
+  const botNames = Object.keys(bots);
+  
+  document.getElementById('skillsTotalBots').textContent = botNames.length;
+  document.getElementById('skillsLastUpdated').textContent = skillsData?.lastUpdated ? new Date(skillsData.lastUpdated).toLocaleTimeString() : '-';
+  
+  if (botNames.length === 0) {
+    content.innerHTML = `<div class="skills-empty">No skills data found. <button class="sm" style="margin-left:8px;font-size:10px" onclick="loadSkillsData();renderSkillsTab()">Refresh</button></div>`;
+    return;
+  }
+  
+  content.innerHTML = `
+    <div class="skills-grid">
+      ${botNames.sort().map(botName => {
+        const data = bots[botName];
+        const skills = data.skills || {};
+        const skillEntries = Object.entries(skills);
+        return `
+          <div class="skills-bot-card">
+            <div class="skills-bot-name">${esc(botName)}</div>
+            <div class="skills-list">
+              ${skillEntries.length > 0
+                ? skillEntries.map(([skillId, level]) => `
+                  <div class="skills-item">
+                    <span class="skills-name">${esc(catalogName(skillId))}</span>
+                    <span class="skills-level">Lv ${level}</span>
+                  </div>
+                `).join('')
+                : '<div class="skills-empty" style="padding:8px">No skills data</div>'
+              }
+            </div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
 }
 
 async function loadTaxesDataAndRender() {

@@ -24,9 +24,10 @@
        <div class="top-tab" data-tab="players" onclick="switchTab('players')">Players</div>
        <div class="top-tab" data-tab="shipsforsale" onclick="switchTab('shipsforsale')">Ships For Sale</div>
        <div class="top-tab" data-tab="settings" onclick="switchTab('settings')">Settings</div>
-       <div class="top-tab" data-tab="fa" onclick="switchTab('fa')">FA</div>
-    </div>
-  </div>
+<div class="top-tab" data-tab="fa" onclick="switchTab('fa')">FA</div>
+        <div class="top-tab" data-tab="catalog" onclick="switchTab('catalog')">Catalog</div>
+     </div>
+   </div>
   <div class="header-right">
     <div class="conn-status">
       <div class="conn-dot" id="connDot"></div>
@@ -632,7 +633,25 @@
         <div class="skills-content" id="skillsContent">
           <div class="skills-empty">Loading skills data...</div>
         </div>
-      </div>
+</div>
+    </div>
+
+   <!-- ══ Catalog Tab ══ -->
+   <div class="tab-page" id="page-catalog">
+     <div class="catalog-layout">
+       <div class="catalog-sidebar">
+         <div class="catalog-sidebar-header">
+           <span>Categories</span>
+           <input type="text" class="filter-input" placeholder="🔍 Filter..." id="catalogFilter" oninput="renderCatalog()" style="font-size:12px;padding:4px 8px;width:100%">
+         </div>
+         <div class="catalog-sidebar-body" id="catalogSidebarBody">
+           <!-- filled by JS -->
+         </div>
+       </div>
+       <div class="catalog-content" id="catalogContent">
+         <div class="catalog-empty">Select a category to browse items.</div>
+       </div>
+     </div>
    </div>
 
   <!-- ══ Bot Profile Page (hidden by default) ══ -->
@@ -889,6 +908,118 @@ function switchTab(name) {
     const frame = document.getElementById('faFrame');
     if (frame) frame.src = frame.src;
   }
+  if (name === 'catalog') {
+    renderCatalog();
+  }
+}
+
+// ── Catalog Browser ─────────────────────────────────────────────
+let catalogState = {
+  currentCategory: null,
+  currentSubcategory: null,
+  filter: ''
+};
+
+function getCatalogCategories() {
+  const categories = new Set();
+  for (const item of Object.values(catalog.items || {})) {
+    if (item.category) categories.add(item.category);
+  }
+  return Array.from(categories).sort();
+}
+
+function getCatalogSubcategories(category) {
+  const subs = new Set();
+  for (const item of Object.values(catalog.items || {})) {
+    if (item.category === category) {
+      if (item.effect?.subtype) subs.add(item.effect.subtype);
+      if (item.effect?.type) subs.add(item.effect.type);
+    }
+  }
+  return Array.from(subs).sort();
+}
+
+function getCatalogItems(category, subcategory) {
+  const items = [];
+  for (const [id, item] of Object.entries(catalog.items || {})) {
+    if (item.category !== category) continue;
+    if (subcategory) {
+      if (item.effect?.subtype !== subcategory && item.effect?.type !== subcategory) continue;
+    }
+    items.push({ id, ...item });
+  }
+  return items.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+}
+
+function renderCatalog() {
+  const sidebar = document.getElementById('catalogSidebarBody');
+  const content = document.getElementById('catalogContent');
+  const filter = document.getElementById('catalogFilter');
+  
+  const categories = getCatalogCategories();
+  
+  sidebar.innerHTML = categories.map(cat => `
+    <div class="catalog-category" onclick="selectCatalogCategory('${cat}')">
+      <span class="cat-name">${esc(cat)}</span>
+      <span class="cat-count">${getCatalogSubcategories(cat).length}</span>
+    </div>
+  `).join('');
+  
+  if (catalogState.currentCategory) {
+    const subs = getCatalogSubcategories(catalogState.currentCategory);
+    const items = getCatalogItems(catalogState.currentCategory, catalogState.currentSubcategory);
+    
+    content.innerHTML = `
+      <div class="catalog-header">
+        <h3>${esc(catalogState.currentCategory)}</h3>
+        <span class="cat-count">${items.length} items</span>
+      </div>
+      ${subs.length > 0 ? `
+        <div class="catalog-subcats">
+          ${subs.map(sub => `
+            <button class="subcat-btn ${catalogState.currentSubcategory === sub ? 'active' : ''}" onclick="selectCatalogSubcategory('${sub}')">
+              ${esc(sub)}
+            </button>
+          `).join('')}
+        </div>
+      ` : ''}
+      <div class="catalog-items">
+        ${items.map(item => renderCatalogItem(item)).join('')}
+      </div>
+    `;
+  } else {
+    content.innerHTML = `
+      <div class="catalog-empty">
+        <div class="empty-icon">📁</div>
+        <div class="empty-title">Browse Catalog</div>
+        <div class="empty-desc">Select a category from the sidebar to view items.</div>
+      </div>
+    `;
+  }
+}
+
+function selectCatalogCategory(category) {
+  catalogState.currentCategory = category;
+  catalogState.currentSubcategory = null;
+  renderCatalog();
+}
+
+function selectCatalogSubcategory(subcategory) {
+  catalogState.currentSubcategory = catalogState.currentSubcategory === subcategory ? null : subcategory;
+  renderCatalog();
+}
+
+function renderCatalogItem(item) {
+  const effect = item.effect || {};
+  return `
+    <div class="catalog-item" title="${esc(item.name || item.id)}">
+      <div class="item-name">${esc(item.name || item.id)}</div>
+      <div class="item-meta">
+        ${effect.type ? `<span class="item-type">${esc(effect.type)}</span>` : ''}
+        ${effect.subtype ? `<span class="item-subtype">${esc(effect.subtype)}</span>` : ''}
+      </div>
+    </div>
+  `;
 }
 
 // ── WebSocket ──────────────────────────────────────────────

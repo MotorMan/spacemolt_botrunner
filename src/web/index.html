@@ -1408,9 +1408,9 @@ lastUsedRoutines = lastUsedRoutinesRes || {};
           if (skillsLoaded && skillsData && skillsData.bots) {
             for (const bot of bots) {
               if (bot.skills) {
-                const skills: Record<string, number> = {};
-                for (const [skillId, skillData] of Object.entries(bot.skills as Record<string, { level?: number }>)) {
-                  skills[skillId] = (skillData as { level?: number }).level || 0;
+                const skills = {};
+                for (const [skillId, skillData] of Object.entries(bot.skills)) {
+                  skills[skillId] = skillData.level || 0;
                 }
                 skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
               }
@@ -2434,9 +2434,9 @@ async function loadSkillsData() {
       skillsData = { bots: {}, lastUpdated: new Date().toISOString() };
       for (const bot of bots) {
         if (bot.skills) {
-          const skills: Record<string, number> = {};
-          for (const [skillId, skillData] of Object.entries(bot.skills as Record<string, { level?: number }>)) {
-            skills[skillId] = (skillData as { level?: number }).level || 0;
+          const skills = {};
+          for (const [skillId, skillData] of Object.entries(bot.skills)) {
+            skills[skillId] = skillData.level || 0;
           }
           skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
         }

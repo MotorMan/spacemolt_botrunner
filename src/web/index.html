@@ -916,7 +916,10 @@ function switchTab(name) {
 // ── Catalog Browser ─────────────────────────────────────────────
 let catalogState = {
   currentSection: null,
-  currentFilter: ''
+  currentCategory: null,
+  currentSubcategory: null,
+  sortBy: null,
+  sortDirection: 'asc'
 };
 
 const CATALOG_SECTIONS = [
@@ -958,17 +961,33 @@ function getCatalogCategories(section) {
   return [];
 }
 
-function getCatalogItems(section, category) {
-  const items = [];
+function getCatalogSubcategories(section, category) {
+  if (section !== 'items' || !category) return [];
+  const subs = new Set();
+  for (const item of Object.values(catalog.items || {})) {
+    if (item.category !== category) continue;
+    if (item.effect?.subtype) subs.add(item.effect.subtype);
+    if (item.effect?.type && item.effect.type !== 'ammo') subs.add(item.effect.type);
+  }
+  return Array.from(subs).sort();
+}
+
+function getCatalogItems(section, category, subcategory) {
+  let items = [];
   if (section === 'items') {
     for (const [id, item] of Object.entries(catalog.items || {})) {
       if (category && item.category !== category) continue;
+      if (subcategory) {
+        if (item.effect?.subtype !== subcategory && item.effect?.type !== subcategory) continue;
+      }
       items.push({ id, ...item, _section: 'items' });
     }
   }
   if (section === 'ships') {
     for (const [id, ship] of Object.entries(catalog.ships || {})) {
       if (category && ship['class'] !== category) continue;
+      if (catalogState.empireFilter && ship.faction !== catalogState.empireFilter) continue;
+      if (catalogState.tierFilter !== '' && String(ship.tier) !== catalogState.tierFilter) continue;
       items.push({ id, ...ship, _section: 'ships' });
     }
   }
@@ -984,7 +1003,23 @@ function getCatalogItems(section, category) {
       items.push({ id, ...recipe, _section: 'recipes' });
     }
   }
-  return items.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+  
+  // Apply sorting
+  if (catalogState.sortBy) {
+    items.sort((a, b) => {
+      let aVal = a[catalogState.sortBy] ?? a.effect?.[catalogState.sortBy] ?? 0;
+      let bVal = b[catalogState.sortBy] ?? b.effect?.[catalogState.sortBy] ?? 0;
+      if (typeof aVal === 'string') aVal = aVal.toLowerCase();
+      if (typeof bVal === 'string') bVal = bVal.toLowerCase();
+      if (aVal < bVal) return catalogState.sortDirection === 'asc' ? -1 : 1;
+      if (aVal > bVal) return catalogState.sortDirection === 'asc' ? 1 : -1;
+      return (a.name || a.id).localeCompare(b.name || b.id);
+    });
+  } else {
+    items.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+  }
+  
+  return items;
 }
 
 function renderCatalog() {
@@ -1004,18 +1039,72 @@ function renderCatalog() {
   if (catalogState.currentSection) {
     const categories = getCatalogCategories(catalogState.currentSection);
     const currentCategory = catalogState.currentCategory;
-    const items = getCatalogItems(catalogState.currentSection, currentCategory);
+    const subcategories = getCatalogSubcategories(catalogState.currentSection, currentCategory);
+    const currentSubcategory = catalogState.currentSubcategory;
+    const items = getCatalogItems(catalogState.currentSection, currentCategory, currentSubcategory);
+    
+    const sortOptions = catalogState.currentSection === 'ships' ? [
+      { key: 'name', label: 'Name' },
+      { key: 'tier', label: 'Tier' },
+      { key: 'base_hull', label: 'Hull' },
+      { key: 'base_shield', label: 'Shield' },
+      { key: 'base_speed', label: 'Speed' },
+      { key: 'cargo_capacity', label: 'Cargo' },
+      { key: 'base_fuel', label: 'Fuel' }
+    ] : [];
+    
+    const shipFilters = catalogState.currentSection === 'ships' ? `
+      <div class="ship-filters" style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+        <select onchange="filterShipsByEmpire(this.value)" style="font-size:12px;padding:4px 8px">
+          <option value="">All Empires</option>
+          <option value="crimson" ${catalogState.empireFilter === 'crimson' ? 'selected' : ''}>Crimson Fleet</option>
+          <option value="nebula" ${catalogState.empireFilter === 'nebula' ? 'selected' : ''}>Nebula Collective</option>
+          <option value="outerrim" ${catalogState.empireFilter === 'outerrim' ? 'selected' : ''}>Outer Rim</option>
+          <option value="solarian" ${catalogState.empireFilter === 'solarian' ? 'selected' : ''}>Solarian Empire</option>
+          <option value="voidborn" ${catalogState.empireFilter === 'voidborn' ? 'selected' : ''}>Voidborn</option>
+        </select>
+        <select onchange="filterShipsByTier(this.value)" style="font-size:12px;padding:4px 8px">
+          <option value="">All Tiers</option>
+          <option value="0" ${catalogState.tierFilter === '0' ? 'selected' : ''}>T0</option>
+          <option value="1" ${catalogState.tierFilter === '1' ? 'selected' : ''}>T1</option>
+          <option value="2" ${catalogState.tierFilter === '2' ? 'selected' : ''}>T2</option>
+          <option value="3" ${catalogState.tierFilter === '3' ? 'selected' : ''}>T3</option>
+          <option value="4" ${catalogState.tierFilter === '4' ? 'selected' : ''}>T4</option>
+          <option value="5" ${catalogState.tierFilter === '5' ? 'selected' : ''}>T5</option>
+        </select>
+      </div>
+    ` : '';
     
     content.innerHTML = `
       <div class="catalog-header">
         <h3>${catalogState.currentSection.charAt(0).toUpperCase() + catalogState.currentSection.slice(1)}</h3>
         <span class="cat-count">${items.length} items</span>
       </div>
+      ${shipFilters}
       ${categories.length > 0 ? `
         <div class="catalog-subcats">
           ${categories.map(cat => `
             <button class="subcat-btn ${currentCategory === cat ? 'active' : ''}" onclick="selectCatalogCategory('${cat}')">
               ${esc(cat)}
+            </button>
+          `).join('')}
+        </div>
+      ` : ''}
+      ${subcategories.length > 0 ? `
+        <div class="catalog-subcats" style="margin-top:6px">
+          ${subcategories.map(sub => `
+            <button class="subcat-btn ${currentSubcategory === sub ? 'active' : ''}" onclick="selectCatalogSubcategory('${sub}')">
+              ${esc(sub)}
+            </button>
+          `).join('')}
+        </div>
+      ` : ''}
+      ${sortOptions.length > 0 ? `
+        <div class="catalog-sort" style="margin-top:8px;font-size:11px;color:var(--text-dim)">
+          <span style="margin-right:8px">Sort by:</span>
+          ${sortOptions.map(opt => `
+            <button class="subcat-btn ${catalogState.sortBy === opt.key ? 'active' : ''}" onclick="sortCatalog('${opt.key}')" style="margin-right:4px">
+              ${opt.label}${catalogState.sortBy === opt.key ? (catalogState.sortDirection === 'asc' ? ' ↑' : ' ↓') : ''}
             </button>
           `).join('')}
         </div>
@@ -1036,13 +1125,39 @@ function renderCatalog() {
 }
 
 function selectCatalogSection(section) {
-  catalogState.currentSection = section;
-  catalogState.currentCategory = null;
+  catalogState = { ...catalogState, currentSection: section, currentCategory: null, currentSubcategory: null };
   renderCatalog();
 }
 
 function selectCatalogCategory(category) {
-  catalogState.currentCategory = catalogState.currentCategory === category ? null : category;
+  catalogState = { ...catalogState, currentCategory: category, currentSubcategory: null };
+  renderCatalog();
+}
+
+function selectCatalogSubcategory(subcategory) {
+  catalogState.currentSubcategory = catalogState.currentSubcategory === subcategory ? null : subcategory;
+  renderCatalog();
+}
+
+function sortCatalog(key) {
+  if (catalogState.sortBy === key) {
+    catalogState.sortDirection = catalogState.sortDirection === 'asc' ? 'desc' : 'asc';
+  } else {
+    catalogState.sortBy = key;
+    catalogState.sortDirection = 'asc';
+  }
+  renderCatalog();
+}
+
+function filterShipsByEmpire(empire) {
+  catalogState.empireFilter = empire;
+  catalogState.tierFilter = null;
+  renderCatalog();
+}
+
+function filterShipsByTier(tier) {
+  catalogState.tierFilter = tier;
+  catalogState.empireFilter = null;
   renderCatalog();
 }
 
@@ -1076,7 +1191,7 @@ function renderCatalogItem(item, catalogType) {
   }
   
   if (catalogType === 'ships') {
-    const stats = ['base_hull', 'base_shield', 'base_armor', 'base_speed', 'base_fuel', 'cargo_capacity', 'cpu_capacity', 'power_capacity'];
+    const stats = ['tier', 'faction', 'base_hull', 'base_shield', 'base_armor', 'base_speed', 'base_fuel', 'cargo_capacity', 'cpu_capacity', 'power_capacity', 'weapon_slots', 'defense_slots', 'utility_slots'];
     for (const stat of stats) {
       if (item[stat] !== undefined) {
         const label = stat.replace(/base_/, '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());

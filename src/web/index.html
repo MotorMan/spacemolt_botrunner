@@ -2434,43 +2434,25 @@ let skillsData = null;
 let skillsLoaded = false;
 
 async function loadSkillsData() {
-  // Check if debug logging is enabled for traders (the main ones with debugLogging setting)
-  const debugLoggingEnabled = settings?.trader?.debugLogging !== false && settings?.general?.disableDebugLog !== true;
-  
-  if (debugLoggingEnabled) {
-    // Read from log files
-    if (skillsLoaded && skillsData) return;
-    try {
-      const res = await fetch('/api/skills');
-      if (res.ok) {
-        skillsData = await res.json();
-        skillsLoaded = true;
-      }
-    } catch (err) {
-      console.warn('Failed to load skills data:', err);
-    }
-  } else {
-    // Live updates from WebSocket status messages
-    // Initialize skillsData from current bots if available
-    if (!skillsData) {
-      skillsData = { bots: {}, lastUpdated: new Date().toISOString() };
-      for (const bot of bots) {
-        if (bot.skills) {
-          const skills = {};
-          for (const [skillId, skillData] of Object.entries(bot.skills)) {
-            const xp = skillData.xp || skillData['xp'] || 0;
-            const nextLevelXp = skillData.xpToNext || skillData['xp_to_next'] || skillData.next_level_xp;
-            skills[skillId] = {
-              level: skillData.level || 0,
-              xp: xp,
-              nextLevelXp: nextLevelXp
-            };
-          }
-          skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
+  // Initialize skillsData from current bots (live WebSocket updates)
+  if (!skillsData) {
+    skillsData = { bots: {}, lastUpdated: new Date().toISOString() };
+    for (const bot of bots) {
+      if (bot.skills) {
+        const skills = {};
+        for (const [skillId, skillData] of Object.entries(bot.skills)) {
+          const xp = skillData.xp || skillData['xp'] || 0;
+          const nextLevelXp = skillData.xpToNext || skillData['xp_to_next'] || skillData.next_level_xp;
+          skills[skillId] = {
+            level: skillData.level || 0,
+            xp: xp,
+            nextLevelXp: nextLevelXp
+          };
         }
+        skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
       }
-      skillsLoaded = true;
     }
+    skillsLoaded = true;
   }
 }
 
@@ -2480,16 +2462,12 @@ function renderSkillsTab() {
   
   const bots = skillsData?.bots || {};
   const botNames = Object.keys(bots);
-  const debugLoggingEnabled = settings?.trader?.debugLogging !== false && settings?.general?.disableDebugLog !== true;
   
   document.getElementById('skillsTotalBots').textContent = botNames.length;
   document.getElementById('skillsLastUpdated').textContent = skillsData?.lastUpdated ? new Date(skillsData.lastUpdated).toLocaleTimeString() : '-';
   
   if (botNames.length === 0) {
-    const msg = debugLoggingEnabled 
-      ? 'No skills data found in log files. Start bots to collect skills from get_status responses.'
-      : 'Waiting for live updates from bots...';
-    content.innerHTML = `<div class="skills-empty">${msg}</div>`;
+    content.innerHTML = `<div class="skills-empty">No skills data yet. Skills update automatically when bots receive get_status responses.</div>`;
     return;
   }
   

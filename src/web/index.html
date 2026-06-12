@@ -1425,10 +1425,13 @@ lastUsedRoutines = lastUsedRoutinesRes || {};
               if (bot.skills) {
                 const skills = {};
                 for (const [skillId, skillData] of Object.entries(bot.skills)) {
+                  // Handle both camelCase (from bot) and snake_case (from logs)
+                  const xp = skillData.xp || skillData['xp'] || 0;
+                  const nextLevelXp = skillData.xpToNext || skillData['xp_to_next'] || skillData.next_level_xp;
                   skills[skillId] = {
                     level: skillData.level || 0,
-                    xp: skillData.xp,
-                    nextLevelXp: skillData.next_level_xp
+                    xp: xp,
+                    nextLevelXp: nextLevelXp
                   };
                 }
                 skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
@@ -2455,10 +2458,12 @@ async function loadSkillsData() {
         if (bot.skills) {
           const skills = {};
           for (const [skillId, skillData] of Object.entries(bot.skills)) {
+            const xp = skillData.xp || skillData['xp'] || 0;
+            const nextLevelXp = skillData.xpToNext || skillData['xp_to_next'] || skillData.next_level_xp;
             skills[skillId] = {
               level: skillData.level || 0,
-              xp: skillData.xp,
-              nextLevelXp: skillData.next_level_xp
+              xp: xp,
+              nextLevelXp: nextLevelXp
             };
           }
           skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
@@ -2510,8 +2515,9 @@ function renderSkillsTab() {
               ${skillEntries.length > 0
                 ? skillEntries.map(([skillId, skill]) => {
                     const level = skill.level || 0;
-                    const xp = skill.xp || 0;
-                    const nextLevelXp = skill.nextLevelXp;
+                    // Handle both camelCase (from bot) and snake_case (from logs)
+                    const xp = skill.xp || skill['xp'] || 0;
+                    const nextLevelXp = skill.nextLevelXp || skill['xp_to_next'] || skill['xpToNext'] || 0;
                     const xpPercent = nextLevelXp ? Math.min(100, Math.round((xp / nextLevelXp) * 100)) : 0;
                     const xpDisplay = xp && nextLevelXp ? `${xp}/${nextLevelXp} (${xpPercent}%)` : '';
                     

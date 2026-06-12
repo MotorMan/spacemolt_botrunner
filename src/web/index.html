@@ -19553,6 +19553,10 @@ async function renderCivilianTransportSettings(panel) {
       </div>
     </div>
 
+    <div style="margin-top:12px">
+      <label><input type="checkbox" id="set-civilian_transport-announceDestination" ${ct.announceDestination !== false ? 'checked' : ''}> Announce destinations in transport messages</label>
+    </div>
+
     <div style="margin-top:18px">
       <button class="primary" onclick="saveCivilianTransportSettings()">Save Settings</button>
     </div>
@@ -19574,6 +19578,7 @@ function saveCivilianTransportSettings() {
   const allowFirstClass = document.getElementById('set-civilian_transport-allowFirstClass')?.checked ?? true;
   const allowBusinessClass = document.getElementById('set-civilian_transport-allowBusinessClass')?.checked ?? true;
   const allowEconomyClass = document.getElementById('set-civilian_transport-allowEconomyClass')?.checked ?? true;
+  const announceDestination = document.getElementById('set-civilian_transport-announceDestination')?.checked ?? true;
 
   const s = {};
   if (homeStation && homeStation.includes('|')) {
@@ -19595,6 +19600,7 @@ function saveCivilianTransportSettings() {
   s.allowFirstClass = allowFirstClass;
   s.allowBusinessClass = allowBusinessClass;
   s.allowEconomyClass = allowEconomyClass;
+  s.announceDestination = announceDestination;
 
   send({ type: 'saveSettings', routine: 'civilian_transport', settings: s });
   alert('Civilian Transport settings saved');

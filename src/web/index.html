@@ -915,38 +915,74 @@ function switchTab(name) {
 
 // ── Catalog Browser ─────────────────────────────────────────────
 let catalogState = {
-  currentCategory: null,
-  currentSubcategory: null,
-  filter: ''
+  currentSection: null,
+  currentFilter: ''
 };
 
-function getCatalogCategories() {
-  const categories = new Set();
-  for (const item of Object.values(catalog.items || {})) {
-    if (item.category) categories.add(item.category);
-  }
-  return Array.from(categories).sort();
-}
+const CATALOG_SECTIONS = [
+  { id: 'items', name: 'Items', icon: '📦' },
+  { id: 'ships', name: 'Ships', icon: '🚢' },
+  { id: 'skills', name: 'Skills', icon: '📜' },
+  { id: 'recipes', name: 'Recipes', icon: '📝' }
+];
 
-function getCatalogSubcategories(category) {
-  const subs = new Set();
-  for (const item of Object.values(catalog.items || {})) {
-    if (item.category === category) {
-      if (item.effect?.subtype) subs.add(item.effect.subtype);
-      if (item.effect?.type) subs.add(item.effect.type);
+function getCatalogCategories(section) {
+  if (section === 'items') {
+    const categories = new Set();
+    for (const item of Object.values(catalog.items || {})) {
+      if (item.category) categories.add(item.category);
     }
+    return Array.from(categories).sort();
   }
-  return Array.from(subs).sort();
+  if (section === 'ships') {
+    const classes = new Set();
+    for (const ship of Object.values(catalog.ships || {})) {
+      if (ship['class']) classes.add(ship['class']);
+    }
+    return Array.from(classes).sort();
+  }
+  if (section === 'skills') {
+    const categories = new Set();
+    for (const skill of Object.values(catalog.skills || {})) {
+      if (skill.category) categories.add(skill.category);
+    }
+    return Array.from(categories).sort();
+  }
+  if (section === 'recipes') {
+    const categories = new Set();
+    for (const recipe of Object.values(catalog.recipes || {})) {
+      if (recipe.category) categories.add(recipe.category);
+    }
+    return Array.from(categories).sort();
+  }
+  return [];
 }
 
-function getCatalogItems(category, subcategory) {
+function getCatalogItems(section, category) {
   const items = [];
-  for (const [id, item] of Object.entries(catalog.items || {})) {
-    if (item.category !== category) continue;
-    if (subcategory) {
-      if (item.effect?.subtype !== subcategory && item.effect?.type !== subcategory) continue;
+  if (section === 'items') {
+    for (const [id, item] of Object.entries(catalog.items || {})) {
+      if (category && item.category !== category) continue;
+      items.push({ id, ...item, _section: 'items' });
     }
-    items.push({ id, ...item });
+  }
+  if (section === 'ships') {
+    for (const [id, ship] of Object.entries(catalog.ships || {})) {
+      if (category && ship['class'] !== category) continue;
+      items.push({ id, ...ship, _section: 'ships' });
+    }
+  }
+  if (section === 'skills') {
+    for (const [id, skill] of Object.entries(catalog.skills || {})) {
+      if (category && skill.category !== category) continue;
+      items.push({ id, ...skill, _section: 'skills' });
+    }
+  }
+  if (section === 'recipes') {
+    for (const [id, recipe] of Object.entries(catalog.recipes || {})) {
+      if (category && recipe.category !== category) continue;
+      items.push({ id, ...recipe, _section: 'recipes' });
+    }
   }
   return items.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
 }
@@ -954,37 +990,38 @@ function getCatalogItems(category, subcategory) {
 function renderCatalog() {
   const sidebar = document.getElementById('catalogSidebarBody');
   const content = document.getElementById('catalogContent');
-  const filter = document.getElementById('catalogFilter');
   
-  const categories = getCatalogCategories();
+  const sections = CATALOG_SECTIONS;
+  const currentSection = catalogState.currentSection;
   
-  sidebar.innerHTML = categories.map(cat => `
-    <div class="catalog-category" onclick="selectCatalogCategory('${cat}')">
-      <span class="cat-name">${esc(cat)}</span>
-      <span class="cat-count">${getCatalogSubcategories(cat).length}</span>
+  sidebar.innerHTML = sections.map(sec => `
+    <div class="catalog-category ${currentSection === sec.id ? 'active' : ''}" onclick="selectCatalogSection('${sec.id}')">
+      <span class="cat-name">${sec.icon} ${esc(sec.name)}</span>
+      <span class="cat-count">${Object.keys(catalog[sec.id] || {}).length}</span>
     </div>
   `).join('');
   
-  if (catalogState.currentCategory) {
-    const subs = getCatalogSubcategories(catalogState.currentCategory);
-    const items = getCatalogItems(catalogState.currentCategory, catalogState.currentSubcategory);
+  if (catalogState.currentSection) {
+    const categories = getCatalogCategories(catalogState.currentSection);
+    const currentCategory = catalogState.currentCategory;
+    const items = getCatalogItems(catalogState.currentSection, currentCategory);
     
     content.innerHTML = `
       <div class="catalog-header">
-        <h3>${esc(catalogState.currentCategory)}</h3>
+        <h3>${catalogState.currentSection.charAt(0).toUpperCase() + catalogState.currentSection.slice(1)}</h3>
         <span class="cat-count">${items.length} items</span>
       </div>
-      ${subs.length > 0 ? `
+      ${categories.length > 0 ? `
         <div class="catalog-subcats">
-          ${subs.map(sub => `
-            <button class="subcat-btn ${catalogState.currentSubcategory === sub ? 'active' : ''}" onclick="selectCatalogSubcategory('${sub}')">
-              ${esc(sub)}
+          ${categories.map(cat => `
+            <button class="subcat-btn ${currentCategory === cat ? 'active' : ''}" onclick="selectCatalogCategory('${cat}')">
+              ${esc(cat)}
             </button>
           `).join('')}
         </div>
       ` : ''}
       <div class="catalog-items">
-        ${items.map(item => renderCatalogItem(item)).join('')}
+        ${items.map(item => renderCatalogItem(item, item._section)).join('')}
       </div>
     `;
   } else {
@@ -992,32 +1029,88 @@ function renderCatalog() {
       <div class="catalog-empty">
         <div class="empty-icon">📁</div>
         <div class="empty-title">Browse Catalog</div>
-        <div class="empty-desc">Select a category from the sidebar to view items.</div>
+        <div class="empty-desc">Select a section from the sidebar to browse items.</div>
       </div>
     `;
   }
 }
 
+function selectCatalogSection(section) {
+  catalogState.currentSection = section;
+  catalogState.currentCategory = null;
+  renderCatalog();
+}
+
 function selectCatalogCategory(category) {
-  catalogState.currentCategory = category;
-  catalogState.currentSubcategory = null;
+  catalogState.currentCategory = catalogState.currentCategory === category ? null : category;
   renderCatalog();
 }
 
-function selectCatalogSubcategory(subcategory) {
-  catalogState.currentSubcategory = catalogState.currentSubcategory === subcategory ? null : subcategory;
-  renderCatalog();
-}
-
-function renderCatalogItem(item) {
+function renderCatalogItem(item, catalogType) {
   const effect = item.effect || {};
+  const parts = [];
+  
+  if (catalogType === 'items') {
+    if (effect.ammo) {
+      for (const [k, v] of Object.entries(effect.ammo)) {
+        const label = k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        const val = typeof v === 'number' ? (v < 1 ? `${(v * 100).toFixed(0)}%` : v) : v;
+        parts.push(`${label}: ${val}`);
+      }
+    }
+    
+    if (effect.type === 'buff' && (effect.amount || effect.duration || effect.stat)) {
+      if (effect.amount !== undefined) parts.push(`Amount: ${effect.amount}`);
+      if (effect.duration !== undefined) parts.push(`Duration: ${effect.duration}s`);
+      if (effect.stat) parts.push(`Stat: ${esc(effect.stat)}`);
+    }
+    
+    for (const [k, v] of Object.entries(effect)) {
+      if (['ammo', 'type', 'subtype'].includes(k)) continue;
+      if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') {
+        const label = k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        const val = typeof v === 'number' ? (v < 1 ? `${(v * 100).toFixed(0)}%` : v) : v;
+        if (!parts.some(p => p.startsWith(label))) parts.push(`${label}: ${val}`);
+      }
+    }
+  }
+  
+  if (catalogType === 'ships') {
+    const stats = ['base_hull', 'base_shield', 'base_armor', 'base_speed', 'base_fuel', 'cargo_capacity', 'cpu_capacity', 'power_capacity'];
+    for (const stat of stats) {
+      if (item[stat] !== undefined) {
+        const label = stat.replace(/base_/, '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        parts.push(`${label}: ${item[stat]}`);
+      }
+    }
+  }
+  
+  if (catalogType === 'skills') {
+    if (item.max_level !== undefined) parts.push(`Max Level: ${item.max_level}`);
+    if (item.category) parts.push(`Category: ${esc(item.category)}`);
+  }
+  
+  if (catalogType === 'recipes') {
+    if (item.inputs && item.inputs.length > 0) {
+      parts.push(`Inputs: ${item.inputs.map(i => `${i.quantity}x ${i.item_id}`).join(', ')}`);
+    }
+    if (item.outputs && item.outputs.length > 0) {
+      parts.push(`Outputs: ${item.outputs.map(i => `${i.quantity}x ${i.item_id}`).join(', ')}`);
+    }
+    if (item.crafting_time !== undefined) parts.push(`Time: ${item.crafting_time}s`);
+  }
+  
+  const statLines = parts.join('<br>');
+  
   return `
-    <div class="catalog-item" title="${esc(item.name || item.id)}">
+    <div class="catalog-item" title="${esc(item.description || item.name || item.id)}">
       <div class="item-name">${esc(item.name || item.id)}</div>
       <div class="item-meta">
-        ${effect.type ? `<span class="item-type">${esc(effect.type)}</span>` : ''}
+        ${item.category ? `<span class="item-type">${esc(item.category)}</span>` : ''}
+        ${effect.type ? `<span class="item-subtype">${esc(effect.type)}</span>` : ''}
         ${effect.subtype ? `<span class="item-subtype">${esc(effect.subtype)}</span>` : ''}
       </div>
+      ${statLines ? `<div class="item-stats" style="font-size:10px;color:var(--text-dim);margin-top:4px">${statLines}</div>` : ''}
     </div>
   `;
 }

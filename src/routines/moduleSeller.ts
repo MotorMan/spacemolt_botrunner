@@ -233,6 +233,34 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
     const freeCargo = bot.cargoMax - bot.cargo;
     ctx.log("trade", `ModuleSeller: free cargo ${freeCargo.toFixed(0)}/${bot.cargoMax}`);
 
+    ctx.log("trade", "ModuleSeller: withdrawing modules from faction storage...");
+    let remainingCargo = freeCargo;
+    for (const storageItem of moduleStorage) {
+      const config = settings.moduleItems.find(m => m.itemId === storageItem.itemId);
+      const maxSellQty = config ? config.maxQty : settings.maxQtyDefault;
+      const maxWithdraw = Math.min(storageItem.quantity, maxSellQty, remainingCargo);
+      if (maxWithdraw <= 0) continue;
+
+      const withdrawResp = await bot.exec("faction_withdraw_items", {
+        item_id: storageItem.itemId,
+        quantity: maxWithdraw,
+      });
+      if (!withdrawResp.error) {
+        ctx.log("trade", `ModuleSeller: withdrawn ${maxWithdraw}x ${storageItem.itemId}`);
+        remainingCargo -= maxWithdraw;
+      }
+    }
+
+    await ctx.sleep(1000);
+    await bot.refreshCargo();
+
+    const cargoItems = bot.inventory.filter((item: { itemId: string }) => isShipModule(item.itemId));
+    if (cargoItems.length === 0) {
+      ctx.log("trade", "ModuleSeller: no modules in cargo — waiting");
+      await ctx.sleep(60000);
+      continue;
+    }
+
     const itemsToSell: Array<{
       itemId: string;
       name: string;
@@ -243,16 +271,16 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
       station: BestStation;
     }> = [];
 
-    for (const storageItem of moduleStorage) {
+    for (const cargoItem of cargoItems) {
       const { price, source: priceSource } = computeSellPrice(
-        storageItem.itemId,
+        cargoItem.itemId,
         settings.priceMode,
         settings.premiumPct,
         settings.undercutCr,
       );
 
       if (price <= 0) {
-        ctx.log("trade", `ModuleSeller: no buy demand for ${storageItem.itemId} — skipping`);
+        ctx.log("trade", `ModuleSeller: no buy demand for ${cargoItem.itemId} — skipping`);
         continue;
       }
 
@@ -263,30 +291,27 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
           : settings.homeStation;
         station = { systemId: settings.homeSystem, poiId: homePoiId, poiName: "Home" };
       } else {
-        station = findBestSellStation(storageItem.itemId);
+        station = findBestSellStation(cargoItem.itemId);
         if (!station) {
-          ctx.log("warn", `ModuleSeller: no valid sell station for ${storageItem.itemId} — skipping`);
+          ctx.log("warn", `ModuleSeller: no valid sell station for ${cargoItem.itemId} — skipping`);
           continue;
         }
       }
 
-      const config = settings.moduleItems.find(m => m.itemId === storageItem.itemId);
+      const config = settings.moduleItems.find(m => m.itemId === cargoItem.itemId);
       let maxSellQty = config ? config.maxQty : settings.maxQtyDefault;
-      let qtyToSell = storageItem.quantity;
+      let qtyToSell = cargoItem.quantity;
 
       if (maxSellQty > 0) {
         qtyToSell = Math.min(qtyToSell, maxSellQty);
       }
 
-      const cargoLimit = maxItemsForCargo(freeCargo, storageItem.itemId);
-      qtyToSell = Math.min(qtyToSell, cargoLimit);
-
       if (qtyToSell <= 0) continue;
 
       itemsToSell.push({
-        itemId: storageItem.itemId,
-        name: storageItem.name,
-        availableQty: storageItem.quantity,
+        itemId: cargoItem.itemId,
+        name: cargoItem.name,
+        availableQty: cargoItem.quantity,
         sellQty: qtyToSell,
         price,
         priceSource,
@@ -356,6 +381,7 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
 
       if (orderResp.error) {
         ctx.log("error", `ModuleSeller: sell order failed for ${sellItem.name}: ${orderResp.error.message}`);
+        await bot.exec("faction_deposit_items", { item_id: sellItem.itemId, quantity: sellItem.sellQty });
         continue;
       }
 

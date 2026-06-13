@@ -4,6 +4,15 @@ import { debugLogForBot } from "./debug.js";
 import { SessionManager } from "./session.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
 
+let zstdPromise: Promise<{ ZstdSimple: { decompress: (data: Uint8Array) => Uint8Array } }> | null = null;
+
+async function getZstd() {
+  if (!zstdPromise) {
+    zstdPromise = import("@oneidentity/zstd-js").then(({ ZstdInit }) => ZstdInit());
+  }
+  return zstdPromise;
+}
+
 interface QueuedRequest {
   command: string;
   payload: Record<string, unknown> | undefined;
@@ -1016,9 +1025,23 @@ export class SpaceMoltAPI {
       
       if (contentType === "zstd") {
         const compressed = await resp.arrayBuffer();
-        const { ZstdSimple } = await import("@oneidentity/zstd-js");
-        const decompressed = ZstdSimple.decompress(new Uint8Array(compressed));
-        text = Buffer.from(decompressed).toString("utf8");
+        let decompressed: Uint8Array | null = null;
+        
+        if (!decompressed) {
+          try {
+            const zstd = await getZstd();
+            decompressed = zstd.ZstdSimple.decompress(new Uint8Array(compressed));
+          } catch {}
+        }
+        
+        if (!decompressed) {
+          try {
+            const zlibMod = await import("zlib");
+            decompressed = Uint8Array.from(zlibMod.gunzipSync(Buffer.from(compressed)));
+          } catch {}
+        }
+        
+        text = decompressed ? Buffer.from(decompressed).toString("utf8") : Buffer.from(compressed).toString("utf8");
       } else {
         text = await resp.text();
       }
@@ -1046,9 +1069,12 @@ export class SpaceMoltAPI {
         this.session = data.session;
       }
       return data as ApiResponse;
-    } catch {
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const detailMsg = `HTTP ${resp.status}: ${resp.statusText} - ${errMsg}`;
+      log("error", `decode error: ${detailMsg}`);
       return {
-        error: { code: "http_error", message: `HTTP ${resp.status}: ${resp.statusText}` },
+        error: { code: "http_error", message: detailMsg },
       };
     }
   }

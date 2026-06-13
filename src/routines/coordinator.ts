@@ -645,7 +645,7 @@ async function placeMarketOrders(
     const qty = Math.min(item.quantity, 50); // cap at 50
 
     // Withdraw items from faction storage
-    const wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: item.itemId, quantity: qty });
+    const wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', station_id: bot.poi, item_id: item.itemId, quantity: qty });
     if (wResp.error) continue;
 
     const resp = await bot.exec("create_sell_order", {

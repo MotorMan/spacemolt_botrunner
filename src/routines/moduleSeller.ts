@@ -10,6 +10,7 @@ import {
   getSystemInfo,
   detectAndRecoverFromDeath,
   maxItemsForCargo,
+  getItemSize,
   readSettings,
   logFactionActivity,
   checkAndFleeFromBattle,
@@ -145,6 +146,10 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
   };
 
   while (bot.state === "running") {
+    if (bot.state !== "running") {
+      ctx.log("system", "Stop requested — canceling all pending operations immediately");
+      break;
+    }
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await ctx.sleep(30000); continue; }
 
@@ -268,18 +273,17 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
     for (const storageItem of moduleStorage) {
       const config = settings.moduleItems.find(m => m.itemId === storageItem.itemId);
       const maxSellQty = config ? config.maxQty : settings.maxQtyDefault;
-      const maxWithdraw = Math.min(storageItem.quantity, maxSellQty, remainingCargo);
+      const maxFit = maxItemsForCargo(remainingCargo, storageItem.itemId);
+      const maxWithdraw = Math.min(storageItem.quantity, maxSellQty, maxFit);
       if (maxWithdraw <= 0) continue;
 
-      const stationId = settings.homeStation.includes("|") 
-        ? settings.homeStation.split("|")[1] 
-        : settings.homeStation;
+      const stationId = bot.poi;
       const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', station_id: stationId, item_id: storageItem.itemId, quantity: maxWithdraw });
       if (withdrawResp.error) {
         ctx.log("warn", `ModuleSeller: failed to withdraw ${storageItem.itemId}: ${withdrawResp.error.message}`);
       } else {
         ctx.log("trade", `ModuleSeller: withdrawn ${maxWithdraw}x ${storageItem.itemId}`);
-        remainingCargo -= maxWithdraw;
+        remainingCargo -= maxWithdraw * (getItemSize(storageItem.itemId) || 10);
       }
     }
 
@@ -355,7 +359,10 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
     }
 
     for (const sellItem of itemsToSell) {
-      if (bot.state !== "running") break;
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — canceling all pending operations immediately");
+        break;
+      }
       if (sellItem.sellQty <= 0) continue;
 
       const targetSystem = sellItem.station.systemId;
@@ -410,10 +417,7 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
 
       if (orderResp.error) {
         ctx.log("error", `ModuleSeller: sell order failed for ${sellItem.name}: ${orderResp.error.message}`);
-        const stationId = settings.homeStation.includes("|") 
-          ? settings.homeStation.split("|")[1] 
-          : settings.homeStation;
-        await bot.exec("storage", { action: 'deposit', target: 'faction', station_id: stationId, item_id: sellItem.itemId, quantity: sellItem.sellQty });
+        await bot.exec("storage", { action: 'deposit', target: 'faction', station_id: bot.poi, item_id: sellItem.itemId, quantity: sellItem.sellQty });
         continue;
       }
 

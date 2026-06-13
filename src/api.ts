@@ -3,7 +3,6 @@ import { reconnectQueue } from "./reconnectqueue.js";
 import { debugLogForBot } from "./debug.js";
 import { SessionManager } from "./session.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
-import * as zstd from "zstd-codec";
 
 interface QueuedRequest {
   command: string;
@@ -1017,7 +1016,8 @@ export class SpaceMoltAPI {
       
       if (contentType === "zstd") {
         const compressed = await resp.arrayBuffer();
-        const decompressed = zstd.decompress(new Uint8Array(compressed));
+        const { ZstdSimple } = await import("@oneidentity/zstd-js");
+        const decompressed = ZstdSimple.decompress(new Uint8Array(compressed));
         text = Buffer.from(decompressed).toString("utf8");
       } else {
         text = await resp.text();

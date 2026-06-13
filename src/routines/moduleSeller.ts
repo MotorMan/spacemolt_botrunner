@@ -247,9 +247,33 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
 
     await bot.refreshFactionStorage();
     if (bot.factionStorage.length === 0) {
-      ctx.log("trade", "ModuleSeller: faction storage empty — waiting for items");
-      await ctx.sleep(60000);
-      continue;
+      ctx.log("trade", "ModuleSeller: faction storage empty — attempting direct fetch...");
+      const storageResp = await bot.exec("view_storage", { target: "faction" });
+      if (!storageResp.error && storageResp.result && typeof storageResp.result === "object") {
+        const result = storageResp.result as Record<string, unknown>;
+        const r = result.data && typeof result.data === "object" ? result.data as Record<string, unknown> : result;
+        const entries = (
+          Array.isArray(r) ? r :
+          Array.isArray(r.items) ? r.items :
+          Array.isArray(r.cargo) ? r.cargo :
+          []
+        ) as Array<Record<string, unknown>>;
+        const parsedItems = entries.map((item) => ({
+          itemId: ((item.item_id as string) || (item.resource_id as string) || (item.id as string) || "").replace(/ /g, '_').toLowerCase(),
+          name: (item.name as string) || (item.item_name as string) || (item.resource_name as string) || (item.item_id as string) || "",
+          quantity: (item.quantity as number) || (item.count as number) || (item.amount as number) || 0,
+        })).filter((i) => i.itemId && i.quantity > 0);
+        if (parsedItems.length > 0) {
+          bot.factionStorage = parsedItems;
+          bot.faction = (result.faction_name as string) || (result.faction_id as string) || bot.faction;
+          ctx.log("info", `ModuleSeller: loaded ${parsedItems.length} items from direct faction storage fetch`);
+        }
+      }
+      if (bot.factionStorage.length === 0) {
+        ctx.log("trade", "ModuleSeller: faction storage empty — waiting for items");
+        await ctx.sleep(60000);
+        continue;
+      }
     }
 
     const moduleStorage = bot.factionStorage.filter(item => {
@@ -271,6 +295,10 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
     ctx.log("trade", "ModuleSeller: withdrawing modules from faction storage...");
     let remainingCargo = freeCargo;
     for (const storageItem of moduleStorage) {
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — aborting withdrawal");
+        break;
+      }
       const config = settings.moduleItems.find(m => m.itemId === storageItem.itemId);
       const maxSellQty = config ? config.maxQty : settings.maxQtyDefault;
       const maxFit = maxItemsForCargo(remainingCargo, storageItem.itemId);
@@ -279,19 +307,56 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
 
       const stationId = bot.poi;
       const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', station_id: stationId, item_id: storageItem.itemId, quantity: maxWithdraw });
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — aborting withdrawal");
+        break;
+      }
       if (withdrawResp.error) {
         ctx.log("warn", `ModuleSeller: failed to withdraw ${storageItem.itemId}: ${withdrawResp.error.message}`);
       } else {
         ctx.log("trade", `ModuleSeller: withdrawn ${maxWithdraw}x ${storageItem.itemId}`);
         remainingCargo -= maxWithdraw * (getItemSize(storageItem.itemId) || 10);
       }
-    }
+}
 
-    await ctx.sleep(2000);
+    await ctx.sleep(3000);
 
     const cargoResp = await bot.exec("get_cargo");
-    const cargoItems = (Array.isArray(cargoResp.result) ? cargoResp.result : []).filter((item: { itemId: string }) => isShipModule(item.itemId));
-    if (cargoItems.length === 0) {
+    let cargoItems: Array<{ itemId: string; name: string; quantity: number }> = [];
+    
+    if (cargoResp.result) {
+      const result = cargoResp.result;
+      if (typeof result === "string") {
+        const lines = result.trim().split('\n');
+        for (const line of lines) {
+          const match = line.trim().match(/(\d+)\s*x?\s*(\S+)/i);
+          if (match) {
+            cargoItems.push({
+              itemId: match[2].toLowerCase().replace(/ /g, '_'),
+              name: match[2],
+              quantity: parseInt(match[1], 10)
+            });
+          }
+        }
+      } else if (typeof result === "object") {
+        const r = result as Record<string, unknown>;
+        const cargoArray = Array.isArray(r.cargo) ? r.cargo : 
+                          Array.isArray(r.items) ? r.items : [];
+        for (const item of cargoArray) {
+          const itemObj = item as Record<string, unknown>;
+          cargoItems.push({
+            itemId: ((itemObj.item_id as string) || "").replace(/ /g, '_').toLowerCase(),
+            name: (itemObj.name as string) || (itemObj.item_id as string) || "",
+            quantity: (itemObj.quantity as number) || 0,
+          });
+        }
+      }
+    }
+    
+    cargoItems = cargoItems.filter(item => item.quantity > 0 && item.itemId);
+    let shipModules = cargoItems.filter(item => isShipModule(item.itemId));
+    
+    if (shipModules.length === 0) {
       ctx.log("trade", "ModuleSeller: no modules in cargo — waiting");
       await ctx.sleep(60000);
       continue;
@@ -341,12 +406,19 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
 
       if (qtyToSell <= 0) continue;
 
+      const minPrice = 100;
+      const finalPrice = Math.max(price, minPrice);
+      if (finalPrice <= minPrice && price < minPrice) {
+        ctx.log("warn", `ModuleSeller: computed price ${price}cr is below minimum ${minPrice}cr - skipping ${cargoItem.itemId}`);
+        continue;
+      }
+
       itemsToSell.push({
         itemId: cargoItem.itemId,
         name: cargoItem.name,
         availableQty: cargoItem.quantity,
         sellQty: qtyToSell,
-        price,
+        price: finalPrice,
         priceSource,
         station,
       });
@@ -389,6 +461,10 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
         if (bot.poi !== targetPoi) {
           await ensureUndocked(ctx);
           const travelResp = await bot.exec("travel", { target_poi: targetPoi });
+          if (bot.state !== "running") {
+            ctx.log("system", "Stop requested — aborting travel");
+            break;
+          }
           if (travelResp.error && !travelResp.error.message.includes("already")) {
             ctx.log("warn", `ModuleSeller: travel to ${targetPoi} failed: ${travelResp.error.message} — skipping ${sellItem.name}`);
             continue;
@@ -397,6 +473,10 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
         }
 
         const dockResp = await bot.exec("dock");
+        if (bot.state !== "running") {
+          ctx.log("system", "Stop requested — aborting dock");
+          break;
+        }
         if (dockResp.error && !dockResp.error.message.includes("already")) {
           ctx.log("warn", `ModuleSeller: dock at ${targetPoi} failed: ${dockResp.error.message} — skipping ${sellItem.name}`);
           continue;
@@ -415,14 +495,28 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
         quantity: sellItem.sellQty,
       });
 
+      if (bot.state !== "running") {
+        ctx.log("system", "Stop requested — aborting sale");
+        break;
+      }
+
       if (orderResp.error) {
         ctx.log("error", `ModuleSeller: sell order failed for ${sellItem.name}: ${orderResp.error.message}`);
         await bot.exec("storage", { action: 'deposit', target: 'faction', station_id: bot.poi, item_id: sellItem.itemId, quantity: sellItem.sellQty });
+        if (bot.state !== "running") {
+          ctx.log("system", "Stop requested — aborting deposit");
+          break;
+        }
         continue;
       }
 
       ctx.log("trade", `ModuleSeller: sold ${sellItem.sellQty}x ${sellItem.name} @ ${sellItem.price}cr (total: ${(sellItem.sellQty * sellItem.price).toLocaleString()}cr)`);
       logFactionActivity(ctx, "sell", `Sold ${sellItem.sellQty}x ${sellItem.name} @ ${sellItem.price}cr`);
+    }
+
+    if (bot.state !== "running") {
+      ctx.log("system", "Stop requested — exiting routine");
+      break;
     }
 
     const returnHome = normalizeSystemId(settings.homeSystem) !== normalizeSystemId(bot.system);
@@ -435,6 +529,11 @@ export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext
     }
 
     await ctx.sleep(30000);
+
+    if (bot.state !== "running") {
+      ctx.log("system", "Stop requested — exiting routine");
+      break;
+    }
   }
 };
 

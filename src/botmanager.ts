@@ -1109,11 +1109,11 @@ async function main(): Promise<void> {
   // Periodic live refresh (hit API for all logged-in bots)
   intervals.push(setInterval(async () => {
     try {
-      // Run all refreshStatus calls in parallel to avoid blocking the event loop
       const refreshPromises = [];
       for (const [, bot] of bots) {
         if (bot.api.getSession()) {
-          refreshPromises.push(bot.refreshStatus().catch(() => {}));
+          refreshPromises.push(bot.refreshShip().catch(() => {}));
+          refreshPromises.push(bot.refreshLocation().catch(() => {}));
         }
       }
       await Promise.allSettled(refreshPromises);

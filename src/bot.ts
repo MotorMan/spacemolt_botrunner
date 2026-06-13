@@ -798,6 +798,54 @@ docked = false;
           }
         }
 
+        if (!resp.error && resp.result) {
+          const r = resp.result as Record<string, unknown>;
+          if (command === "mine") {
+            this.cargo += (r.quantity as number) || 0;
+            const xpGained = r.xp_gained as Record<string, number> | undefined;
+            if (xpGained) {
+              for (const [skill, gained] of Object.entries(xpGained)) {
+                this.skillXP.set(skill, (this.skillXP.get(skill) || 0) + gained);
+              }
+            }
+          } else if (command === "jump" || command === "travel") {
+            const sysId = (r.system_id as string) || (r.system as string);
+            const poiId = (r.poi as string) || (r.poi_id as string);
+            if (sysId) this.system = sysId;
+            if (poiId) this.poi = poiId;
+            if (r.auto_docked) this.docked = true;
+            if (r.auto_undocked) this.docked = false;
+          } else if (command === "dock") {
+            this.docked = true;
+          } else if (command === "undock") {
+            this.docked = false;
+          } else if (command === "sell" || command === "create_sell_order") {
+            const creditsEarned = (r.credits_earned as number) || (r.credits as number) || 0;
+            if (creditsEarned) this.credits += creditsEarned;
+            const qty = (r.quantity as number) || 0;
+            if (qty) this.cargo = Math.max(0, this.cargo - qty);
+          } else if (command === "buy" || command === "create_buy_order") {
+            const creditsSpent = (r.credits_spent as number) || (r.credits as number) || 0;
+            if (creditsSpent) this.credits = Math.max(0, this.credits - creditsSpent);
+            const qty = (r.quantity as number) || 0;
+            if (qty) this.cargo += qty;
+          } else if (command === "refuel") {
+            const fuelAdded = (r.fuel_added as number) || (r.quantity as number) || 0;
+            if (fuelAdded) this.fuel = Math.min(this.maxFuel, this.fuel + fuelAdded);
+          } else if (command === "repair") {
+            const hullRepaired = (r.hull_repaired as number) || (r.hull as number) || 0;
+            if (hullRepaired) this.hull = Math.min(this.maxHull, this.hull + hullRepaired);
+            const shieldRepaired = (r.shield_repaired as number) || (r.shield as number) || 0;
+            if (shieldRepaired) this.shield = Math.min(this.maxShield, this.shield + shieldRepaired);
+          } else if (command === "jettison") {
+            const qty = (r.quantity as number) || 0;
+            if (qty) this.cargo = Math.max(0, this.cargo - qty);
+          } else if (command === "craft") {
+            const qty = (r.quantity as number) || (r.count as number) || 0;
+            if (qty) this.cargo += qty;
+          }
+        }
+
         if (resp.error) {
           // Suppress noisy expected errors — callers handle these gracefully
           const code = resp.error.code || "";
@@ -1100,6 +1148,97 @@ docked = false;
     }
 
     return resp;
+  }
+
+  async refreshLocation(): Promise<ApiResponse> {
+    const resp = await this.api.execute("get_location");
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      const location = r.location as Record<string, unknown> | undefined;
+      const player = r.player as Record<string, unknown> | undefined;
+      const p = location || player || r;
+      this.system = (location?.system_id as string) || (location?.system_name as string) || (p.current_system as string) || this.system;
+      this.poi = (location?.poi_id as string) || (location?.poi_name as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+      this.docked = location?.docked_at != null
+        ? !!(location.docked_at)
+        : (p.docked_at_base != null
+          ? !!(p.docked_at_base)
+          : (p.docked as boolean) ?? (p.status === "docked"));
+      this.location =
+        (location?.system_name as string) ||
+        (location?.system_id as string) ||
+        (p.current_system as string) ||
+        (p.location as string) ||
+        this.location;
+      this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+      this.isCloaked = !!(p.is_cloaked || p.cloaked);
+    }
+    return resp;
+  }
+
+  async refreshShip(): Promise<ApiResponse> {
+    const resp = await this.api.execute("get_ship");
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      const ship = (r.ship as Record<string, unknown>) || r;
+      if (ship) {
+        this.fuel = (ship.fuel as number) ?? this.fuel;
+        this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
+        this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+        this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
+        this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
+        this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
+        this.shipSpeed = (ship.speed as number) || this.shipSpeed;
+        this.cargo = (ship.cargo_used as number) ?? this.cargo;
+        this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
+        this.shipId = (ship.id as string) || this.shipId;
+        const modulesArray = Array.isArray(ship.modules) ? ship.modules as Array<Record<string, unknown>> : [];
+        let totalAmmo = 0;
+        for (const mod of modulesArray) {
+          if (mod && typeof mod === "object" && mod.current_ammo != null) totalAmmo += mod.current_ammo as number;
+        }
+        if (totalAmmo > 0) this.ammo = totalAmmo;
+        else if (ship.ammo != null) this.ammo = ship.ammo as number;
+        this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
+        this.installedMods = modulesArray.map(m => (m.name as string) || (m.type_id as string) || "").filter(Boolean);
+      }
+    }
+    return resp;
+  }
+
+  async refreshCargoAndStorage(): Promise<ApiResponse> {
+    const cargoResp = await this.api.execute("get_cargo");
+    if (!cargoResp.error && cargoResp.result) {
+      this.inventory = this.parseItemList(cargoResp.result);
+    }
+    if (this.docked) {
+      await this.refreshStorage();
+    }
+    return cargoResp;
+  }
+
+  async refreshPOI(): Promise<ApiResponse> {
+    const resp = await this.api.execute("get_poi");
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      const poi = (r.poi as Record<string, unknown>) || {};
+      this.system = (poi.system_id as string) || (poi.system as string) || this.system;
+      this.poi = (poi.id as string) || (poi.poi_id as string) || (poi.name as string) || this.poi;
+      this.docked = poi.docked != null ? !!(poi.docked as boolean) : this.docked;
+    }
+    return resp;
+  }
+
+  async refreshMissions(): Promise<ApiResponse> {
+    return this.api.execute("get_missions");
+  }
+
+  async refreshQueue(): Promise<ApiResponse> {
+    return this.api.execute("get_queue");
+  }
+
+  async refreshNearby(): Promise<ApiResponse> {
+    return this.api.execute("get_nearby");
   }
 
   /** Parse an item list from API response, handling both item_id and resource_id formats. */

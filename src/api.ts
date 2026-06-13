@@ -91,7 +91,7 @@ export interface ApiResponse {
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
-const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-6-5-26-flood-protected-Version";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-6-14-26-BW-Opt-Start-Cahasler-Rocks-Ver";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;
@@ -407,11 +407,12 @@ class ResponseCache {
 }
 
 const COMMAND_TTL: Record<string, number> = {
-  get_status: 10_000, //doesn't need to be 15s.
+  get_status: 120_000, //doesn't need to be 15s.
   get_system: 30_000,
   get_ship: 60_000,
   get_cargo: 10_000,
   get_nearby: 10_000, //1 tick! must always know who is nearby!
+  get_location: 10_000,
   get_poi: 10_000, //doesn't need to be 30s
   get_base: 120_000,
   get_missions: 60_000,
@@ -430,7 +431,7 @@ const COMMAND_TTL: Record<string, number> = {
 };
 
 const INV_STATUS   = ["get_status", "get_player", "get_queue"];
-const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey_system", "find_route"];
+const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey_system", "find_route", "get_location"];
 const INV_CARGO    = ["get_cargo"];
 const INV_SHIP     = ["get_ship"];
 const INV_MISSIONS = ["get_missions"];
@@ -587,7 +588,6 @@ export class SpaceMoltAPI {
 
   async execute(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
-    debugLogForBot(botName, "api:execute", `${botName} > ${command}`, payload);
 
     const cacheTtl = COMMAND_TTL[command];
     let cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
@@ -597,8 +597,12 @@ export class SpaceMoltAPI {
     }
     if (cacheTtl !== undefined) {
       const cached = this._cache.get(cacheKey);
-      if (cached) return cached;
+      if (cached) {
+        debugLogForBot(botName, "api:execute", `${botName} > ${command} [Cached]`, payload);
+        return cached;
+      }
     }
+    debugLogForBot(botName, "api:execute", `${botName} > ${command}`, payload);
 
     try {
       await this.ensureSession();

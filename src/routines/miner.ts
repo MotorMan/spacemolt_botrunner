@@ -2415,7 +2415,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= 40) {
       ctx.log("system", `Hull critical (${hullPct}%) — returning to station for repair`);
@@ -2993,7 +2993,7 @@ if (effectiveTarget) {
       
       // CRITICAL FIX: Check cargo after traveling to target system (both success and failure cases)
       // If cargo is full, return home to deposit before traveling to POI
-      await bot.refreshStatus();
+      await bot.refreshCargoAndStorage();
       const postTravelFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
       if (postTravelFillRatio >= cargoThresholdRatio) {
         ctx.log("mining", `Cargo full (${Math.round(postTravelFillRatio * 100)}%) after arriving at ${targetSystemId} — returning home to deposit before continuing`);
@@ -3283,9 +3283,9 @@ if (effectiveTarget) {
             ctx.log("debug", `[sort] Chosen for ${effectiveTarget}: ${chosen.poiName} in ${chosen.systemName} — remaining=${chosen.remaining} max=${chosen.maxRemaining} rich=${chosen.richness} depPct=${chosen.depletionPercent} jumps=${chosen.jumps}`);
             ctx.log("mining", `Found ${effectiveTarget} at ${chosen.poiName} in ${chosen.systemName} (${chosen.jumps} jumps) — navigating there`);
             
-            // CRITICAL FIX: Check cargo before traveling to alternative POI after depletion
-            await bot.refreshStatus();
-            const altFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+             // CRITICAL FIX: Check cargo before traveling to alternative POI after depletion
+             await bot.refreshCargoAndStorage();
+             const altFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
             if (altFillRatio >= cargoThresholdRatio) {
               ctx.log("mining", `Cargo full (${Math.round(altFillRatio * 100)}%) — returning home to deposit before traveling to alternative POI`);
               yield "return_home";
@@ -3857,7 +3857,7 @@ if (effectiveTarget) {
         ctx.log("flock", `Leader heartbeat: target=${effectiveTarget || "none"}, phase=${flockPhase}`);
       }
 
-      await bot.refreshStatus();
+      await bot.refreshShip();
 
       const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       if (midHull <= 40) { stopReason = `hull critical (${midHull}%)`; break; }
@@ -4066,9 +4066,9 @@ if (effectiveTarget) {
                 if (bestLoc.systemId !== bot.system) {
                   ctx.log("mining", `Traveling to ${bestLoc.systemName} for better POI...`);
                   
-                  // CRITICAL FIX: Check cargo before traveling to new POI
-                  await bot.refreshStatus();
-                  const upgradeFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+             // CRITICAL FIX: Check cargo before traveling to new POI
+             await bot.refreshCargoAndStorage();
+             const upgradeFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
                   if (upgradeFillRatio >= cargoThresholdRatio) {
                     ctx.log("mining", `Cargo full (${Math.round(upgradeFillRatio * 100)}%) — returning home to deposit before richness upgrade`);
                     yield "return_home";

@@ -28,6 +28,6 @@
   },
   "dependencies": {
     "@mariozechner/pi-ai": "^0.61.0",
-    "@oneidentity/zstd-js": "^1.0.3"
+
   }
 }

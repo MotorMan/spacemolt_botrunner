@@ -4,14 +4,6 @@ import { debugLogForBot } from "./debug.js";
 import { SessionManager } from "./session.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
 
-let zstdPromise: Promise<{ ZstdSimple: { decompress: (data: Uint8Array) => Uint8Array } }> | null = null;
-
-async function getZstd() {
-  if (!zstdPromise) {
-    zstdPromise = import("@oneidentity/zstd-js").then(({ ZstdInit }) => ZstdInit());
-  }
-  return zstdPromise;
-}
 
 interface QueuedRequest {
   command: string;
@@ -1029,8 +1021,7 @@ export class SpaceMoltAPI {
         
         if (!decompressed) {
           try {
-            const zstd = await getZstd();
-            decompressed = zstd.ZstdSimple.decompress(new Uint8Array(compressed));
+            decompressed = (Bun as any).zstd.decompress(new Uint8Array(compressed));
           } catch {}
         }
         

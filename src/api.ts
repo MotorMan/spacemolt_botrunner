@@ -487,9 +487,8 @@ export class SpaceMoltAPI {
   private _recoveryCount = 0;
   private _recoveryInProgress = false;
   private _forceFullLogin = false;
-  private _totalBytesIn = 0;
-  private _totalBytesOut = 0;
-  private _bandwidthStartTime = Date.now();
+  private _bytesHistory: { in: number; out: number; timestamp: number }[] = [];
+  private _rollingWindowMs = 60_000;
   private _rateLimiter = new SessionRateLimiter();
   private _isGameServer: boolean;
   private _rateLimitingDisabled = false;
@@ -553,13 +552,29 @@ export class SpaceMoltAPI {
     this._recoveryCount = 0;
   }
 
-  /** Get current bandwidth usage in KB/s (kilobytes per second) */
+  /** Get current bandwidth usage in KB/s (1-minute rolling average) */
+  private recordBytes(inBytes: number, outBytes: number): void {
+    const now = Date.now();
+    this._bytesHistory.push({ in: inBytes, out: outBytes, timestamp: now });
+  }
+
   getBandwidthUsage(): { inKBps: number; outKBps: number } {
-    const elapsed = (Date.now() - this._bandwidthStartTime) / 1000;
-    if (elapsed <= 0) return { inKBps: 0, outKBps: 0 };
-    const inKBps = this._totalBytesIn / 1024 / elapsed;
-    const outKBps = this._totalBytesOut / 1024 / elapsed;
-    return { inKBps, outKBps };
+    const now = Date.now();
+    const cutoff = now - this._rollingWindowMs;
+    this._bytesHistory = this._bytesHistory.filter(h => h.timestamp > cutoff);
+    
+    const totalIn = this._bytesHistory.reduce((sum, h) => sum + h.in, 0);
+    const totalOut = this._bytesHistory.reduce((sum, h) => sum + h.out, 0);
+    
+    const elapsedS = this._rollingWindowMs / 1000;
+    return { inKBps: totalIn / 1024 / elapsedS, outKBps: totalOut / 1024 / elapsedS };
+  }
+
+  /** Clear old history entries to prevent memory growth */
+  clearBandwidthHistory(): void {
+    const now = Date.now();
+    const cutoff = now - this._rollingWindowMs;
+    this._bytesHistory = this._bytesHistory.filter(h => h.timestamp > cutoff);
   }
 
   getCachedResponse(cacheKey: string): ApiResponse | null {
@@ -810,7 +825,7 @@ export class SpaceMoltAPI {
         }
 
         const text = await resp.text();
-        this._totalBytesIn += Buffer.byteLength(text, 'utf8');
+        this.recordBytes(Buffer.byteLength(text, 'utf8'), 0);
         const data = JSON.parse(text) as ApiResponse;
         if (data.session) {
           this.session = data.session;
@@ -978,9 +993,10 @@ export class SpaceMoltAPI {
     }
 
     let requestBody: string | undefined;
+    let outBytes = 0;
     if (body) {
       requestBody = JSON.stringify(body);
-      this._totalBytesOut += Buffer.byteLength(requestBody, 'utf8');
+      outBytes = Buffer.byteLength(requestBody, 'utf8');
     }
 
     const resp = await fetch(url, {
@@ -998,7 +1014,8 @@ export class SpaceMoltAPI {
 
     try {
       const text = await resp.text();
-      this._totalBytesIn += Buffer.byteLength(text, 'utf8');
+      const inBytes = Buffer.byteLength(text, 'utf8');
+      this.recordBytes(inBytes, outBytes);
       
       if (text.trim() === "undefined" || text.trim() === "") {
         return {

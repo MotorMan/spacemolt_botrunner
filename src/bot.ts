@@ -10,8 +10,11 @@ import { playerNameStore } from "./playernamestore.js";
 import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsChatResponse, isEmpireSystem } from "./customs.js";
 import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
-import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, type PathfinderTravelRecord } from "./pathfinder.js";
+import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord, getDirectPathfinderJump, getCorrectionPathfinderJump, getCorrectionBearingAtTick, isPathfinderLandingAtVoid, type CorrectionPathfinderJump, getMccWindowInfo, type MccWindowInfo } from "./pathfinder.js";
 import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
+import { chatBuffer } from "./chatbuffer.js";
+import { loadSettings, saveStoppedState } from "./web/server.js";
+import { buyInsurance } from "./routines/common.js";
 
 export type BotState = "idle" | "running" | "stopping" | "error";
 
@@ -55,6 +58,10 @@ export interface BotStatus {
   inventory: CargoItem[];
   storage: CargoItem[];
   stats: BotStats;
+  stopAfterCycle: boolean;
+  skills?: Record<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>;
+  factionFuelReserve?: number;
+  factionFuelCapacity?: number;
 }
 
 export interface RoutineContext {
@@ -121,6 +128,7 @@ export class Bot {
   poi = "";
 docked = false;
   shipName = "";
+  shipId = "";
   shipClass = "";
   tier: number | null = null;
   hull = 0;
@@ -240,6 +248,9 @@ docked = false;
   /** Track ongoing login to prevent duplicate concurrent logins */
   private _loginPromise: Promise<boolean> | null = null;
 
+  /** Flag to request stop after current cycle completes (for civilian transport). */
+  private _stopAfterCycle = false;
+
   constructor(username: string, baseDir: string) {
     this.username = username;
     this.baseDir = baseDir;
@@ -276,6 +287,12 @@ docked = false;
 
   get routineName(): string | null {
     return this._routine;
+  }
+
+  clearError(): void {
+    this._state = "idle";
+    this._routine = null;
+    this._error = null;
   }
 
   /** Get the bot's empire affiliation from session credentials. */
@@ -496,6 +513,9 @@ docked = false;
         );
       }
 
+      // Mark bot as stopped-by-emergency so it won't auto-restart on mass disconnect
+      saveStoppedState(this.username, "emergency");
+
       // Stop the routine immediately
       if (this._state === "running") {
         this._state = "stopping";
@@ -537,82 +557,157 @@ docked = false;
       }
     }
 
-     this._lastAction = command;
-     debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
+      this._lastAction = command;
+      debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}`, payload);
 
-     // Capture skill snapshot before command to measure gains later
-     this.captureSkillSnapshot();
+      // Capture skill snapshot before command to measure gains later
+      this.captureSkillSnapshot();
 
-       // Create AbortController for this command
-       const controller = new AbortController();
-       const key = command + (payload ? JSON.stringify(payload) : "");
-       this.pendingCommands.set(key, controller);
+      // Create AbortController for this command
+      const controller = new AbortController();
+      const key = command + (payload ? JSON.stringify(payload) : "");
+      this.pendingCommands.set(key, controller);
 
-         let resp: ApiResponse;
-         try {
-           let timeoutMs = 60000;
-           let targetId = "";
-           if (command === "jump") {
-             const t = (payload as Record<string, unknown>)?.target_system;
-             if (typeof t === "number") {
-               timeoutMs = 5000;
-               targetId = `bearing:${t.toFixed(4)}`;
-               this.log("travel", `Pathfinder jump to bearing ${t.toFixed(4)}° (immediate return, poll get_location for progress)`);
-             } else {
-               timeoutMs = this.calculateJumpTimeout();
-               targetId = (typeof t === "string" ? t : "") || "";
-               this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
-             }
-           } else if (command === "mine" || command === "jettison") {
-             timeoutMs = 15000;
-           } else if (command === "travel") {
-             timeoutMs = this.calculateTravelTimeout();
-             targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
-             this.log("travel", `Travel timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
-           }
-           resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
+      let resp: ApiResponse;
+      try {
+        let timeoutMs = 60000;
+        let targetId = "";
+        if (command === "jump") {
+          const t = (payload as Record<string, unknown>)?.target_system;
+          const id = (payload as Record<string, unknown>)?.id;
+          if (typeof t === "number" || typeof id === "number") {
+            timeoutMs = 30000;
+            const bearingValue = typeof t === "number" ? t : (typeof id === "number" ? id : 0);
+            targetId = `bearing:${bearingValue.toFixed(4)}`;
+            this.log("travel", `Pathfinder jump to bearing ${bearingValue.toFixed(4)}° (immediate return, poll get_location for progress)`);
+          } else {
+            timeoutMs = this.calculateJumpTimeout();
+            targetId = (typeof t === "string" ? t : "") || "";
+            this.log("travel", `Jump timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+          }
+        } else if (command === "mine" || command === "jettison") {
+          timeoutMs = 15000;
+        } else if (command === "travel") {
+          timeoutMs = this.calculateTravelTimeout();
+          targetId = (payload as Record<string, unknown>)?.target_poi as string || (payload as Record<string, unknown>)?.target_system as string || "";
+          this.log("travel", `Travel timeout set to ${timeoutMs / 1000}s (speed ${this.shipSpeed}${this.towingWreck ? ", towing" : ""})`);
+        }
+        resp = await this.execWithTimeout(command, payload, timeoutMs, targetId, controller.signal);
 
-        // Handle HTTP 502 Bad Gateway — server-side issue, retry with backoff
-        // This prevents 502 errors from breaking routines mid-operation
+        // Handle HTTP 502 Bad Gateway — server-side issue, but could be battle interrupt
+        // The server may return 502 when a battle starts during the request
+        // Retry and check for battle state via WebSocket
         if (resp.error && resp.error.message && resp.error.message.includes("502")) {
-          const MAX_502_RETRIES = 3;
+          let battleDetectedDuring502 = false;
+          const MAX_502_RETRIES = 15; // Max ~4 minutes of retries before giving up
+          const MUTATION_COMMANDS = new Set(["storage", "deposit_items", "withdraw_items", "faction_deposit_items", 
+            "faction_withdraw_items", "faction_deposit_credits", "faction_withdraw_credits", "craft", "mine", 
+            "sell", "buy", "jettison", "attack", "jump", "travel", "dock", "undock"]);
+          this.log("warn", `HTTP 502 on command "${command}" with payload: ${JSON.stringify(payload)}`);
+          
           for (let retry = 0; retry < MAX_502_RETRIES; retry++) {
             // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+            // Return a battle interrupt error instead of the misleading 502
             if (this.currentBattle.inBattle) {
-              this.log("combat", `HTTP 502 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              this.log("combat", `Battle detected during 502 retry - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              battleDetectedDuring502 = true;
+              resp = {
+                error: { code: "battle_interrupt", message: `Jump interrupted by battle ${this.currentBattle.battleId}` },
+                result: undefined,
+                notifications: [],
+              };
               break;
             }
 
-            const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
+            // For mutation commands, check if the bot state changed (indicating the command may have succeeded)
+            if (MUTATION_COMMANDS.has(command) && retry >= 2) {
+              await this.refreshStatus();
+              this.log("system", `Detected persistent 502 on mutation command "${command}" - checking bot state`);
+              resp = { result: {}, notifications: [] };
+              break;
+            }
+
+            const waitTime = Math.min(30000, 3000 * (retry + 1)); // capped at 30s
             this.log("warn", `HTTP 502 Bad Gateway — retry ${retry + 1}/${MAX_502_RETRIES} after ${waitTime/1000}s...`);
             await sleep(waitTime);
             resp = await this.api.execute(command, payload);
             if (!resp.error || !resp.error.message?.includes("502")) break;
           }
-          if (resp.error && resp.error.message?.includes("502")) {
-            this.log("error", `HTTP 502: Bad Gateway (after ${MAX_502_RETRIES} retries)`);
+          // Only log error if battle was NOT detected (battle detection means we're handling it)
+          if (resp.error && resp.error.message?.includes("502") && !battleDetectedDuring502) {
+            this.log("error", `HTTP 502: Bad Gateway (retried ${MAX_502_RETRIES} times, giving up)`);
           }
         }
 
         // Handle HTTP 524 Timeout — server took too long to respond (common during battles)
-        // Retry with backoff since battle notifications may still be flowing via WebSocket
+        // The server may return 524 when a battle starts during the request
+        // Retry and check for battle state via WebSocket
+        // Also handles "false 524" where server returns 524 but command succeeded
         if (resp.error && resp.error.message && resp.error.message.includes("524")) {
-          const MAX_524_RETRIES = 3;
+          let battleDetectedDuring524 = false;
+          const MAX_524_RETRIES = 15; // Max ~4 minutes of retries before giving up
+          const READ_ONLY_COMMANDS = new Set(["get_status", "get_player", "get_nearby", "get_cargo", "get_ship", 
+            "view_storage", "view_faction_storage", "catalog", "get_commands", "get_version", "get_base", 
+            "get_poi", "get_system", "get_system_agents", "get_map", "survey_system", "find_route", 
+            "search_systems", "get_missions", "get_active_missions", "completed_missions", "view_market",
+            "view_orders", "get_queue", "get_chat_history", "forum_list", "get_notifications"]);
+          const MUTATION_COMMANDS = new Set(["storage", "deposit_items", "withdraw_items", "faction_deposit_items", 
+            "faction_withdraw_items", "faction_deposit_credits", "faction_withdraw_credits", "craft", "mine", 
+            "sell", "buy", "jettison", "attack", "jump", "travel", "dock", "undock"]);
+          
+          this.log("warn", `HTTP 524 on command "${command}" with payload: ${JSON.stringify(payload)}`);
+          
           for (let retry = 0; retry < MAX_524_RETRIES; retry++) {
             // CRITICAL: Check if we're in battle - if so, stop retrying immediately
+            // Return a battle interrupt error instead of the misleading 524
             if (this.currentBattle.inBattle) {
-              this.log("combat", `HTTP 524 retry cancelled - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              this.log("combat", `Battle detected during 524 retry - battle detected! Battle ID: ${this.currentBattle.battleId}`);
+              battleDetectedDuring524 = true;
+              resp = {
+                error: { code: "battle_interrupt", message: `Travel interrupted by battle ${this.currentBattle.battleId}` },
+                result: undefined,
+                notifications: [],
+              };
               break;
             }
 
-            const waitTime = 3000 * (retry + 1); // 3s, 6s, 9s
+            // For read-only commands, if we keep getting 524, the server is likely having issues
+            // but the data should still be valid from cache. Return cached data if available.
+            if (READ_ONLY_COMMANDS.has(command) && retry >= 3) {
+              const cacheKey = command + (payload ? ":" + JSON.stringify(payload) : "");
+              const cached = this.api.getCachedResponse(cacheKey);
+              if (cached) {
+                this.log("system", `Detected persistent 524 on read-only command "${command}" - using cached data`);
+                resp = cached;
+                break;
+              }
+              // No cached data available, return success with empty result
+              // This allows the routine to continue with default/fallback behavior
+              this.log("system", `Detected persistent 524 on read-only command "${command}" - returning success`);
+              resp = { result: {}, notifications: [] };
+              break;
+            }
+
+            // For mutation commands, check if the bot state changed (indicating the command may have succeeded)
+            if (MUTATION_COMMANDS.has(command) && retry >= 2) {
+              await this.refreshStatus();
+              // If bot was docked and is still docked (or in same system), the command likely succeeded
+              // but the server returned a false 524
+              this.log("system", `Detected persistent 524 on mutation command "${command}" - checking bot state`);
+              // Return success - the command may have actually worked
+              resp = { result: {}, notifications: [] };
+              break;
+            }
+
+            const waitTime = Math.min(30000, 3000 * (retry + 1)); // capped at 30s
             this.log("warn", `HTTP 524 Timeout — retry ${retry + 1}/${MAX_524_RETRIES} after ${waitTime/1000}s...`);
             await sleep(waitTime);
             resp = await this.api.execute(command, payload);
             if (!resp.error || !resp.error.message?.includes("524")) break;
           }
-          if (resp.error && resp.error.message?.includes("524")) {
-            this.log("error", `HTTP 524: Timeout (after ${MAX_524_RETRIES} retries)`);
+          // Only log error if battle was NOT detected (battle detection means we're handling it)
+          if (resp.error && resp.error.message?.includes("524") && !battleDetectedDuring524) {
+            this.log("error", `HTTP 524: Timeout (retried ${MAX_524_RETRIES} times, giving up)`);
           }
         }
 
@@ -669,10 +764,38 @@ docked = false;
         }
 
         // Update faction storage cache whenever view_storage is called for faction
-        if (command === "view_storage" && payload?.target === "faction" && !resp.error && this.faction) {
+        if (command === "view_storage" && payload?.target === "faction" && !resp.error) {
           const entries = this.parseItemList(resp.result);
           const station = (payload.station_id as string) || this.poi;
-          updateFactionStorageCache(this.faction, entries, station);
+          const result = resp.result as Record<string, unknown> | undefined;
+          // Try to get faction name from response, then from existing cache, then fall back to this.faction
+          const factionName = (result?.faction_name as string) || (result?.faction_id as string) || (station ? getFactionStorageCacheByStationOnly(station)?.factionName : null) || this.faction || "";
+          if (factionName) {
+            const fuelReserve = (result?.faction_fuel_reserve as number) || 0;
+            const fuelCapacity = (result?.faction_fuel_capacity as number) || 0;
+            updateFactionStorageCache(factionName, entries, station, fuelReserve, fuelCapacity);
+          }
+        }
+
+        // Update faction fuel cache whenever get_poi is called at a station
+        if (command === "get_poi" && !resp.error && resp.result) {
+          const result = resp.result as Record<string, unknown>;
+          const fuelReserve = (result.faction_fuel_reserve as number) || 0;
+          const fuelCapacity = (result.faction_fuel_capacity as number) || 0;
+          if (fuelCapacity > 0) {
+            this.factionFuelReserve = fuelReserve;
+            this.factionFuelCapacity = fuelCapacity;
+            const station = (result.poi as Record<string, unknown>)?.id as string || this.poi;
+            // Try to get faction name from response (base.empire), cache, or this.faction
+            const base = (result.base as Record<string, unknown>) || {};
+            const factionFromResponse = (base.empire as string) || (base.faction as string) || (base.faction_id as string);
+            const cached = station ? getFactionStorageCacheByStationOnly(station) : null;
+            const factionFromCache = cached?.factionName || null;
+            const factionName = factionFromResponse || factionFromCache || this.faction;
+            if (factionName) {
+              updateFactionStorageCache(factionName, [], station, fuelReserve, fuelCapacity);
+            }
+          }
         }
 
         if (resp.error) {
@@ -876,6 +999,9 @@ docked = false;
         // Cache ship speed (1-6, where 1=slowest at 120s/jump, 6=fastest at 30s/jump)
         this.shipSpeed = (ship.speed as number) || 1;
         
+        // Ship ID
+        this.shipId = (ship.id as string) || "";
+        
         // Ammo is stored per-weapon-module, not at ship level.
         // get_status may return modules as full objects or just IDs.
         // Check both the ship.modules array and root-level modules array.
@@ -934,6 +1060,29 @@ docked = false;
 
       // Fallback: fuel at top level
       if (typeof r.fuel === "number") this.fuel = r.fuel;
+
+      // Extract skills from get_status response (v2 API includes skills)
+      const skillsData = r.skills as Record<string, unknown> | undefined;
+      if (skillsData && typeof skillsData === "object") {
+        this.skillLevels.clear();
+        this.skillXP.clear();
+        this.skillTotalXP.clear();
+        this.skillXpToNext.clear();
+        for (const [skillId, skillVal] of Object.entries(skillsData)) {
+          if (skillVal && typeof skillVal === "object") {
+            const s = skillVal as Record<string, unknown>;
+            const level = (s.level as number) ?? (s.current_level as number) ?? 0;
+            const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
+            const xp = typeof rawXP === "number" ? rawXP : 0;
+            const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number) ?? (s.xp_remaining as number) ?? (s.next_level_xp as number);
+            const totalXP = (s.total_xp as number) ?? (s.total_experience as number) ?? (s.cumulative_xp as number);
+            this.skillLevels.set(skillId, level);
+            this.skillXP.set(skillId, xp);
+            if (xpToNext !== undefined) this.skillXpToNext.set(skillId, xpToNext);
+            if (totalXP !== undefined) this.skillTotalXP.set(skillId, totalXP);
+          }
+        }
+      }
     }
 
     // Log position change if system or poi updated
@@ -1105,10 +1254,23 @@ docked = false;
     if (entries.length === 0) {
       this.log("warn", "Faction storage refresh returned 0 items");
     }
+    // Try to get faction name from response, then from existing cache, then fall back to this.faction
+    let respFactionName = (result.faction_name as string) || (result.faction_id as string);
+    if (!respFactionName && station) {
+      const cached = getFactionStorageCacheByStationOnly(station);
+      if (cached) {
+        respFactionName = cached.factionName;
+      }
+    }
+    if (!respFactionName) {
+      respFactionName = factionName;
+    }
     this.factionStorage = entries;
     this.factionFuelReserve = (result.faction_fuel_reserve as number) || 0;
     this.factionFuelCapacity = (result.faction_fuel_capacity as number) || 0;
-    updateFactionStorageCache(factionName, entries, station, this.factionFuelReserve, this.factionFuelCapacity);
+    if (respFactionName) {
+      updateFactionStorageCache(respFactionName, entries, station, this.factionFuelReserve, this.factionFuelCapacity);
+    }
   }
 
   /** Start running a routine. */
@@ -1130,6 +1292,13 @@ docked = false;
     this._routine = routineName;
     this._error = null;
     this._abortController = new AbortController();
+
+    const settings = loadSettings();
+    const generalSettings = (settings.general as Record<string, unknown>) || {};
+    if (generalSettings.disableRateLimiting === true) {
+      this.api.setRateLimitingDisabled(true);
+      this.log("system", "Rate limiting disabled via settings");
+    }
 
     const creds = this.session.loadCredentials();
     if (!creds) {
@@ -1191,6 +1360,8 @@ docked = false;
       sendBotChat: opts?.sendBotChat,
       getAllBotNames: opts?.getAllBotNames,
     };
+
+    await buyInsurance(ctx);
 
     try {
       for await (const stateName of routine(ctx)) {
@@ -1254,21 +1425,282 @@ docked = false;
 
   async pollCurrentTick(): Promise<number | null> {
     const resp = await this.exec("get_notifications");
-    if (resp.error || !resp.result) return null;
+    if (resp.error || !resp.result) {
+      if (this.lastKnownTick !== null) {
+        this.log("warn", "get_notifications failed, using lastKnownTick for tick estimation");
+      }
+      return null;
+    }
     const r = resp.result as Record<string, unknown>;
     let tick = r.current_tick as number | undefined;
     if (typeof tick !== "number") {
-      const sc = r.structuredContent as Record<string, unknown> | undefined;
-      tick = sc?.current_tick as number | undefined;
+      tick = r.tick as number | undefined;
     }
     if (typeof tick === "number") {
       this.lastKnownTick = tick;
       return tick;
     }
+    if (this.lastKnownTick !== null) {
+      this.log("debug", `current_tick not in response, using lastKnownTick=${this.lastKnownTick}`);
+    }
     return null;
   }
 
-  /** Get the current cached level for a skill. Returns 0 if unknown. Call checkSkills() first to populate. */
+  async awaitNextTick(pollIntervalMs = 5000): Promise<number> {
+    const startTick = await this.pollCurrentTick();
+    if (startTick === null) throw new Error("Could not determine current tick");
+    while (this.state === "running") {
+      await new Promise(r => setTimeout(r, pollIntervalMs));
+      const nextTick = await this.pollCurrentTick();
+      if (nextTick !== null && nextTick > startTick) return nextTick;
+    }
+    throw new Error("Bot stopped while waiting for next tick");
+  }
+
+  async waitForTick(tickNumber: number, pollIntervalMs = 5000): Promise<boolean> {
+    while (this.state === "running") {
+      const current = await this.pollCurrentTick();
+      if (current !== null && current >= tickNumber) return true;
+      await new Promise(r => setTimeout(r, pollIntervalMs));
+    }
+    return false;
+  }
+
+  async performPathfinderJump(
+    targetSystemId: string
+  ): Promise<{ success: boolean; arrivedTick?: number; landing?: { systemId: string; ticks: number } }> {
+    if (!this.hasPathfinderDrive) {
+      await this.refreshShipMods();
+    }
+    if (!this.hasPathfinderDrive) {
+      this.log("error", "Pathfinder jump attempted without Pathfinder Drive module.");
+      return { success: false };
+    }
+
+    await this.refreshStatus();
+    
+    const originSystem = this.system;
+    
+    let directJump = getDirectPathfinderJump(originSystem, targetSystemId);
+    let correctionJump = getCorrectionPathfinderJump(originSystem, targetSystemId);
+    
+    let bearing: number;
+    let landingTicks: number;
+    let landingSystemId: string;
+    
+    if (directJump) {
+      bearing = directJump.bearing;
+      landingTicks = directJump.ticks;
+      landingSystemId = directJump.to;
+      this.log("travel", `Using precomputed direct jump: ${originSystem} -> ${targetSystemId}, bearing ${bearing.toFixed(4)}°, ETA ${landingTicks} ticks`);
+    } else if (correctionJump) {
+      bearing = correctionJump.legs[0].bearing;
+      landingTicks = correctionJump.total_ticks;
+      landingSystemId = targetSystemId;
+      this.log("travel", `Using precomputed correction jump: ${originSystem} -> ${targetSystemId}, bearing ${bearing.toFixed(4)}°, ETA ${landingTicks} ticks (${correctionJump.corrections_used} corrections)`);
+    } else {
+      const calculatedBearing = mapStore.calculatePathfinderBearing(originSystem, targetSystemId);
+      if (typeof calculatedBearing !== "number") {
+        this.log("error", `Could not calculate bearing to ${targetSystemId} from ${originSystem}`);
+        return { success: false };
+      }
+      bearing = calculatedBearing;
+      const landing = mapStore.simulatePathfinderLanding(originSystem, bearing);
+      if (!landing) {
+        this.log("error", `No landing predicted for bearing ${bearing}° — aborting pathfinder jump`);
+        return { success: false };
+      }
+      landingTicks = landing.ticks;
+      landingSystemId = landing.systemId;
+      this.log("travel", `Calculated jump: ${originSystem} -> ${targetSystemId}, bearing ${bearing.toFixed(4)}°, ETA ${landingTicks} ticks`);
+    }
+    
+    this.log("travel", `Pathfinder jump: ${originSystem} -> ${targetSystemId}, bearing ${bearing.toFixed(4)}°, ETA ${landingTicks} ticks (${landingTicks * 10}s)`);
+    this.log("travel", `Predicted landing on ${landingSystemId}`);
+
+    const travelRecord: PathfinderTravelRecord = {
+      botName: this.username,
+      originSystem: originSystem,
+      originTick: 0,
+      initialBearing: bearing,
+      corrections: [],
+      lastPolledTick: 0,
+      status: "in_transit",
+      destinationSystem: targetSystemId,
+    };
+    setPathfinderTravelState(this.username, travelRecord as any);
+
+    const originTick = await this.pollCurrentTick();
+    travelRecord.originTick = (originTick ?? 0) + 1;
+    travelRecord.lastPolledTick = originTick ?? 0;
+    setPathfinderTravelState(this.username, travelRecord as any);
+
+    const jumpResp = await this.exec("jump", { target_system: bearing });
+    if (jumpResp.error) {
+      this.log("error", `Pathfinder jump failed: ${jumpResp.error.message}`);
+      clearPathfinderTravel(this.username);
+      return { success: false };
+    }
+
+    const jr = jumpResp.result as Record<string, unknown> | undefined;
+    const arrivalSystemId = (jr?.arrival_system_id as string) || (jr?.system_id as string) || (jr?.from_system as string) || "";
+    const arrivalSystemName = (jr?.arrival_system as string) || (jr?.system as string) || (jr?.from_system as string) || "";
+    const exitPoi = (jr?.poi as string) || (jr?.exit_poi as string) || "";
+    if (arrivalSystemId || exitPoi) {
+      this.log("travel", `Jump result from server: system=${arrivalSystemName || '?'} (${arrivalSystemId}), exit_poi=${exitPoi || 'n/a'}`);
+      this.log("travel", `Intended destination: ${landingSystemId} (${targetSystemId}) — match: ${arrivalSystemId.toLowerCase() === landingSystemId.toLowerCase()}`);
+    } else {
+      this.log("info", `Jump command accepted. Use get_poi to determine actual transit path.`);
+    }
+
+    await new Promise(r => setTimeout(r, 500));
+    const poiResp = await this.api.execute("get_poi");
+    if (!poiResp.result || typeof poiResp.result !== "object") {
+      this.log("error", "Pathfinder jump: failed to get initial transit status");
+      clearPathfinderTravel(this.username);
+      return { success: false };
+    }
+    const poi = poiResp.result as Record<string, unknown>;
+    let inTransit = (poi.in_transit as boolean) ?? false;
+    let ticksRemaining = (poi.ticks_remaining as number) ?? landingTicks;
+    let currentFrom = (poi.from_system as string) ?? "";
+    let currentTo = (poi.to_system as string) ?? "";
+    let currentBearing = bearing;
+
+    this.log("travel", `Pathfinder transit: from=${currentFrom}, to=${currentTo}, in_transit=${inTransit}, ticks_remaining=${ticksRemaining}`);
+
+    const maxPolls = Math.max(landingTicks * 3 + 50, 300);
+    let arrived = false;
+    let poll = 0;
+    let correctionIssued = false;
+    let elapsedTicks = 0;
+    let nearMccWindow = false;
+    let lastLoggedTick: number | null = null;
+
+    while (this.state === "running" && poll < maxPolls) {
+      await new Promise(r => setTimeout(r, 5000));
+      poll++;
+
+      const poiResp2 = await this.api.execute("get_poi");
+      if (poiResp2.result && typeof poiResp2.result === "object") {
+        const poi2 = poiResp2.result as Record<string, unknown>;
+        inTransit = (poi2.in_transit as boolean) ?? false;
+        ticksRemaining = (poi2.ticks_remaining as number) ?? ticksRemaining;
+        currentFrom = (poi2.from_system as string) ?? "";
+        currentTo = (poi2.to_system as string) ?? "";
+        if (correctionJump && !correctionIssued) {
+          const mccInfo = getMccWindowInfo(correctionJump, elapsedTicks);
+          const targetTick = mccInfo?.ticksUntilMcc !== undefined 
+            ? elapsedTicks + mccInfo.ticksUntilMcc 
+            : null;
+          nearMccWindow = targetTick !== null && Math.abs(elapsedTicks - targetTick) <= 2;
+        }
+      }
+
+      const tick = await this.pollCurrentTick();
+      if (tick !== null) {
+        updatePathfinderTravelTick(this.username, tick);
+        elapsedTicks = tick - travelRecord.originTick;
+        if (tick !== lastLoggedTick) {
+          lastLoggedTick = tick;
+          let mccInfoStr = "";
+          if (correctionJump && !correctionIssued) {
+            const mccInfo = getMccWindowInfo(correctionJump, elapsedTicks);
+            if (mccInfo && mccInfo.ticksUntilMcc > 0) {
+              mccInfoStr = `, mcc_in=${mccInfo.ticksUntilMcc} ticks (bearing ${mccInfo.correctionBearing.toFixed(1)}°)`;
+            }
+          }
+          this.log("travel", `Pathfinder in transit — from=${currentFrom}, to=${currentTo}, ticks_remaining=${ticksRemaining}${mccInfoStr}`);
+        }
+      }
+
+      if (!inTransit) {
+        const locResp = await this.api.execute("get_location");
+        if (locResp.result && typeof locResp.result === "object") {
+          const loc = locResp.result as Record<string, unknown>;
+          const newSystem = (loc.system_id as string) || (loc.system_name as string) || null;
+          if (newSystem) this.system = newSystem;
+        }
+        const lowerCurrent = this.system.toLowerCase();
+        const lowerTarget = landingSystemId.toLowerCase();
+        if (lowerCurrent === lowerTarget || lowerCurrent === targetSystemId.toLowerCase()) {
+          arrived = true;
+          this.log("travel", `Pathfinder jump complete: arrived at ${this.system}`);
+          break;
+        }
+      }
+
+      if (ticksRemaining <= 0) {
+        arrived = true;
+        this.log("travel", `Pathfinder jump complete: all ticks elapsed`);
+        break;
+      }
+
+      if ((poll % 10 === 0 || nearMccWindow) && poll > 1 && !correctionIssued) {
+        const expectedFrom = travelRecord.originSystem;
+        const expectedTo = landingSystemId;
+        if (currentFrom && currentTo) {
+          const fromMatch = currentFrom.toLowerCase() === expectedFrom.toLowerCase();
+          const toMatch = currentTo.toLowerCase() === expectedTo.toLowerCase();
+          if (!fromMatch || !toMatch) {
+            this.log("travel", `Pathfinder deviation detected: expected ${expectedFrom} -> ${expectedTo}, but transit shows ${currentFrom} -> ${currentTo}`);
+            
+            if (correctionJump && tick !== null) {
+              const correctionInfo = getCorrectionBearingAtTick(correctionJump, tick, travelRecord.originTick);
+              if (correctionInfo) {
+                this.log("travel", `Pathfinder correction jump to bearing ${correctionInfo.bearing.toFixed(4)}° (leg ${correctionInfo.legIndex + 1}/${correctionJump.legs.length})`);
+                recordPathfinderCorrection(this.username, tick + 1, correctionInfo.bearing);
+                const correctionResp = await this.exec("jump", { target_system: correctionInfo.bearing });
+                if (correctionResp.error) {
+                  this.log("error", `Correction jump failed: ${correctionResp.error.message}`);
+                } else {
+                  this.log("travel", `Correction jump issued successfully`);
+                  currentBearing = correctionInfo.bearing;
+                  correctionIssued = true;
+                  await new Promise(r => setTimeout(r, 1000));
+                }
+              }
+            } else {
+              const currentSystem = this.system || currentFrom;
+              const correctionBearing = mapStore.calculatePathfinderBearing(currentSystem, targetSystemId);
+              if (typeof correctionBearing === "number") {
+                const correctedLanding = mapStore.simulatePathfinderLanding(currentSystem, correctionBearing);
+                if (correctedLanding && correctedLanding.systemId.toLowerCase() === targetSystemId.toLowerCase()) {
+                  this.log("travel", `Pathfinder correction jump to bearing ${correctionBearing.toFixed(4)}°`);
+                  recordPathfinderCorrection(this.username, (tick ?? 0) + 1, correctionBearing);
+                  const correctionResp = await this.exec("jump", { target_system: correctionBearing });
+                  if (correctionResp.error) {
+                    this.log("error", `Correction jump failed: ${correctionResp.error.message}`);
+                  } else {
+                    this.log("travel", `Correction jump issued successfully`);
+                    currentBearing = correctionBearing;
+                    correctionIssued = true;
+                    await new Promise(r => setTimeout(r, 1000));
+                  }
+                } else {
+                  this.log("warn", `Correction bearing ${correctionBearing.toFixed(4)}° does not land at target — cannot correct`);
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const existingRecord = getActivePathfinderTravel(this.username);
+    if (existingRecord) {
+      setPathfinderTravelState(this.username, {
+        ...existingRecord,
+        status: arrived ? "arrived" : "unknown",
+      });
+    }
+
+    if (!arrived) {
+      this.log("warn", "Pathfinder jump finished but arrival not confirmed via location polling");
+    }
+
+    return { success: arrived, arrivedTick: (await this.pollCurrentTick()) ?? undefined, landing: { systemId: landingSystemId, ticks: landingTicks } };
+  }
   getSkillLevel(skillId: string): number {
     return this.skillLevels.get(skillId) ?? 0;
   }
@@ -1288,63 +1720,23 @@ docked = false;
       }
     }
 
-     /** Fetch all skills as a Map<skillId, {level, xp, xpToNext, totalXP?}>. */
+     /** Fetch all skills as a Map<skillId, {level, xp, xpToNext, totalXP?}>.
+     * Uses cached skills from get_status (skills are included in get_status response). */
      private async fetchAllSkills(): Promise<Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>> {
-     const resp = await this.api.execute('get_skills');
-     if (resp.error || !resp.result) return new Map();
-     const r = resp.result as Record<string, unknown>;
-     let skillsContainer: unknown = r;
-     if (!Array.isArray(r) && r.skills !== undefined) {
-       skillsContainer = r.skills;
+       const map = new Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>();
+       for (const [id, level] of this.skillLevels.entries()) {
+         const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = {
+           level,
+           xp: this.skillXP.get(id) ?? 0,
+         };
+         const xpToNext = this.skillXpToNext.get(id);
+         if (xpToNext !== undefined) entry.xpToNext = xpToNext;
+         const totalXP = this.skillTotalXP.get(id);
+         if (totalXP !== undefined) entry.totalXP = totalXP;
+         map.set(id, entry);
+       }
+       return map;
      }
-      const map = new Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>();
-      if (Array.isArray(skillsContainer)) {
-        for (const skill of skillsContainer as Array<Record<string, unknown>>) {
-          const id = (skill.skill_id as string) || (skill.id as string) || (skill.name as string) || "";
-          const level = (skill.level as number) ?? 0;
-          const rawXP = (skill.xp as number) ?? (skill.experience as number) ?? (skill.current_xp as string) ?? 0;
-          const xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
-          const xpToNext = (skill.xp_to_next_level as number) ??
-                           (skill.xp_to_next as number) ??
-                           (skill.xp_needed as number) ??
-                           (skill.xp_remaining as number) ??
-                           (skill.next_level_xp as number);
-          const totalXP = (skill.total_xp as number) ??
-                          (skill.total_experience as number) ??
-                          (skill.cumulative_xp as number);
-          const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = { level, xp, xpToNext: xpToNext ?? undefined };
-          if (totalXP !== undefined) entry.totalXP = totalXP;
-          if (id) map.set(id, entry);
-        }
-      } else if (skillsContainer && typeof skillsContainer === 'object') {
-        for (const [key, val] of Object.entries(skillsContainer as Record<string, unknown>)) {
-          let level = 0;
-          let xp = 0;
-          let xpToNext: number | undefined;
-          let totalXP: number | undefined;
-          if (typeof val === 'number') {
-            level = val;
-          } else if (val && typeof val === 'object') {
-            const s = val as Record<string, unknown>;
-            level = (s.level as number) ?? (s.current_level as number) ?? 0;
-            const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as string) ?? 0;
-            xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
-            xpToNext = (s.xp_to_next_level as number) ??
-                       (s.xp_to_next as number) ??
-                       (s.xp_needed as number) ??
-                       (s.xp_remaining as number) ??
-                       (s.next_level_xp as number);
-            totalXP = (s.total_xp as number) ??
-                      (s.total_experience as number) ??
-                      (s.cumulative_xp as number);
-          }
-          const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = { level, xp, xpToNext: xpToNext ?? undefined };
-          if (totalXP !== undefined) entry.totalXP = totalXP;
-          map.set(key, entry);
-        }
-      }
-      return map;
-    }
 
     /** Capture current skill levels & XP for before/after comparison. */
     captureSkillSnapshot(): void {
@@ -1495,11 +1887,12 @@ docked = false;
    * @returns true if in battle, false otherwise
    */
   isInBattle(): boolean {
-    // Check if we're in battle and the last update was recent (within 60 seconds)
+    // Check if we're in battle and the last update was recent (within 120 seconds)
     if (!this.currentBattle.inBattle) return false;
     
     const timeSinceUpdate = Date.now() - this.currentBattle.lastUpdate;
-    if (timeSinceUpdate > 60000) {
+    // Use 120 second timeout instead of 60 to be more lenient during HTTP errors
+    if (timeSinceUpdate > 120000) {
       // Battle state is stale - clear it
       this.currentBattle.inBattle = false;
       this.currentBattle.battleId = null;
@@ -1581,10 +1974,20 @@ docked = false;
            this.lastChatMessage = content;
            this.lastChatMessageTime = now;
 
-           this.log("chat", `Received [${channel}] ${sender}: ${content}`);
+            this.log("chat", `Received [${channel}] ${sender}: ${content}`);
 
-          // Track player name from chat (but NOT from MAYDAY messages - those can be fake/pirate names)
-          // Also skip empire NPCs like customs agents and police
+            chatBuffer.addMessage({
+              botUsername: this.username,
+              channel,
+              sender,
+              content,
+              timestamp: Date.now(),
+              direction: "in",
+              ...(channel === "private" && data.target_id ? { targetId: data.target_id as string } : {}),
+            });
+
+           // Track player name from chat (but NOT from MAYDAY messages - those can be fake/pirate names)
+           // Also skip empire NPCs like customs agents and police
           if (sender && sender !== "Unknown" && sender !== this.username) {
             const contentLower = content.toLowerCase();
             const senderLower = sender.toLowerCase();
@@ -2002,47 +2405,17 @@ docked = false;
      }
    }
 
-   /** Fetch piloting skill info (level and XP) via get_skills. */
-   async getPilotingSkill(): Promise<{ level: number; xp: number } | null> {
-     const resp = await this.api.execute('get_skills');
-     if (resp.error || !resp.result) return null;
-     const r = resp.result as Record<string, unknown>;
-     let skillsContainer: unknown = r;
-     if (!Array.isArray(r) && r.skills !== undefined) {
-       skillsContainer = r.skills;
-     }
-     let result: { level: number; xp: number } | null = null;
-     const process = (id: string, name: string, level: number, xp: number) => {
-       if (!result && (id.toLowerCase().includes('pilot') || name.toLowerCase().includes('pilot'))) {
-         result = { level, xp };
-       }
-     };
-     if (Array.isArray(skillsContainer)) {
-       for (const skill of skillsContainer as Array<Record<string, unknown>>) {
-         const id = (skill.skill_id as string) || (skill.id as string) || (skill.name as string) || "";
-         const name = (skill.name as string) || id;
-         const level = (skill.level as number) ?? 0;
-         const rawXP = (skill.xp as number) ?? (skill.experience as number) ?? (skill.current_xp as string) ?? 0;
-         const xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
-         if (id) process(id, name, level, xp);
-       }
-     } else if (skillsContainer && typeof skillsContainer === 'object') {
-       for (const [key, val] of Object.entries(skillsContainer as Record<string, unknown>)) {
-         let level = 0;
-         let xp = 0;
-         if (typeof val === 'number') {
-           level = val;
-         } else if (val && typeof val === 'object') {
-           const s = val as Record<string, unknown>;
-           level = (s.level as number) ?? (s.current_level as number) ?? 0;
-           const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as string) ?? 0;
-           xp = typeof rawXP === 'number' ? rawXP : (typeof rawXP === 'string' ? parseFloat(rawXP) : 0) || 0;
-         }
-         process(key, key, level, xp);
-       }
-     }
-     return result;
-   }
+/** Fetch piloting skill info (level and XP) from cached skills in get_status. */
+    async getPilotingSkill(): Promise<{ level: number; xp: number } | null> {
+      let result: { level: number; xp: number } | null = null;
+      for (const [id, level] of this.skillLevels.entries()) {
+        if (id.toLowerCase().includes('pilot')) {
+          result = { level, xp: this.skillXP.get(id) ?? 0 };
+          break;
+        }
+      }
+      return result;
+    }
 
    /**
     * Send a witty battle response to the AI chat service when attacked.
@@ -2471,6 +2844,33 @@ docked = false;
     this.log("system", "Stop requested — canceling all pending operations immediately");
   }
 
+  /** Signal the bot to stop after completing the current cycle. */
+  stopAfterCycle(): void {
+    if (this._state !== "running") return;
+    this._stopAfterCycle = true;
+    this.log("system", "Stop after cycle requested — will stop after current transport cycle completes");
+  }
+
+  /** Check if stop-after-cycle is pending. */
+  shouldStopAfterCycle(): boolean {
+    return this._stopAfterCycle;
+  }
+
+  /** Clear the stop-after-cycle flag (called when stopping is processed). */
+  clearStopAfterCycle(): void {
+    this._stopAfterCycle = false;
+  }
+
+  /** Initiate the stop process (used internally after stop-after-cycle is processed). */
+  initiateStop(): void {
+    this._state = "stopping";
+    this._abortController?.abort();
+    for (const controller of this.pendingCommands.values()) {
+      controller.abort();
+    }
+    this.pendingCommands.clear();
+  }
+
   /** Get a summary of the bot's current state. */
   status(): BotStatus {
     return {
@@ -2499,7 +2899,27 @@ docked = false;
       inventory: this.inventory,
       storage: this.storage,
       stats: { ...this.stats },
+      stopAfterCycle: this._stopAfterCycle,
+      skills: this.getSkillsSnapshot(),
+      factionFuelReserve: this.factionFuelReserve,
+      factionFuelCapacity: this.factionFuelCapacity,
     };
+  }
+
+  private getSkillsSnapshot(): Record<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }> {
+    const result: Record<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }> = {};
+    for (const [id, level] of this.skillLevels.entries()) {
+      const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = {
+        level,
+        xp: this.skillXP.get(id) ?? 0,
+      };
+      const xpToNext = this.skillXpToNext.get(id);
+      if (xpToNext !== undefined) entry.xpToNext = xpToNext;
+      const totalXP = this.skillTotalXP.get(id);
+      if (totalXP !== undefined) entry.totalXP = totalXP;
+      result[id] = entry;
+    }
+    return result;
   }
 }
 

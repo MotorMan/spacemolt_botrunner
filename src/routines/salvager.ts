@@ -32,6 +32,8 @@ import {
   handleBattleNotifications,
   fleeFromBattle,
   parseWrecks,
+} from "./common.js";
+import {
   fleetStatus,
   fleetCreate,
   fleetInvite,
@@ -40,7 +42,7 @@ import {
   getFleetMemberByUsername,
   isFleetLeader,
   type FleetStatusResponse,
-} from "./common.js";
+} from "./fleet.js";
 import { getSystemBlacklist } from "../web/server.js";
 import {
   readFlockSettings,
@@ -591,7 +593,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
   const chatHandler = (message: BotChatMessage) => {
     ctx.log("escort", `chatHandler: received message from ${message.sender} in ${message.channel} to [${message.recipients.join(", ")}]: "${message.content}"`);
     if (message.channel === "escort") {
-      if (message.recipients.includes(bot.username) && message.content === "LOCATION_QUERY") {
+      if (message.recipients.includes(bot.username) && message.content === "QUERY_LOCATION") {
         chatChannel.send({ sender: bot.username, recipients: [message.sender], channel: "escort", content: `LOCATION: ${bot.system}` });
         ctx.log("escort", `Responded to location query: ${bot.system}`);
       }
@@ -925,6 +927,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
   let flockTargetSystemId = "";
   let flockPhase: FlockState["phase"] = "gathering";
   let flockGroup: FlockGroupConfig | undefined;
+  let lastFlockHeartbeat = 0;
 
   while (bot.state === "running") {
     // Clean up expired temporary blacklists
@@ -1076,16 +1079,29 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       flockTargetSystemId = "";
       flockPhase = "gathering";
     }
+
+    // ── Leader: broadcast heartbeat AND target updates every 30 seconds ──
+    if (isFlockLeader && settings.flockEnabled && settings.flockName && (Date.now() - lastFlockHeartbeat) > 30_000) {
+      await broadcastFlockHeartbeat(settings.flockName, bot.username, {
+        targetSystemId: flockTargetSystemId,
+        phase: flockPhase,
+      });
+      lastFlockHeartbeat = Date.now();
+      ctx.log("flock", `Leader broadcast: target=${flockTargetSystemId}, phase=${flockPhase}`);
+    }
+
     let flockState: FlockState | null = null;
-    let lastFlockHeartbeat = 0;
 
     if (settings.flockEnabled && settings.flockName) {
       flockState = await readFlockState(settings.flockName);
       if (!flockState) {
         ctx.log("flock", "Nothing here to hold on");
+      } else if (!isFlockLeader) {
+        flockTargetSystemId = flockState.targetSystemId;
+        flockPhase = flockState.phase;
+        ctx.log("flock", `Follower updating: target=${flockTargetSystemId}, phase=${flockPhase}`);
       }
     }
-
     // ── Fleet coordination for escort ──
     // The escort bot sends FLEET_INVITE messages - we respond by creating fleet and inviting them
     // If escort is required and not in fleet, wait indefinitely before departure
@@ -1296,12 +1312,6 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       const wrecksResp = await bot.exec("get_wrecks");
       const wrecks = parseWrecks(wrecksResp.result);
       availableWrecks = wrecks.map((w: any) => ({ poiId: poi.id, wreckId: w.wreck_id }));
-
-      if (isFlockLeader && Date.now() - lastFlockHeartbeat > 30_000) {
-        await broadcastFlockHeartbeat(settings.flockName, bot.username);
-        lastFlockHeartbeat = Date.now();
-        ctx.log("flock", `Heartbeat: phase=${flockPhase}, wrecks at ${poi.name}=${wrecks.length}`);
-      }
 
           if (isFlockLeader) {
             // Leader reports found wrecks

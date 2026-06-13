@@ -8,6 +8,8 @@
  * 4. Returns a flat crafting order (prerequisites first)
  */
 
+import { readSettings } from "./common.js";
+
 interface Recipe {
   recipe_id: string;
   name: string;
@@ -42,31 +44,55 @@ interface CraftingPlan {
   totalSteps: number;
 }
 
-/** Recipes that should NEVER be used - they are inefficient/wasteful */
-const BLACKLISTED_RECIPES = new Set([
-  "basic_silicon_refinement", // Noob trap - severe waste of basic materials
+const DEFAULT_BLACKLISTED_RECIPES = new Set([
+  "basic_silicon_refinement",
+  "wrap_processed_thorium",
+  "wrap_thorium_fuel_rod",
+  "wrap_reactor_fuel_assembly",
+  "wrap_reactor_grade_plutonium",
+  "wrap_enriched_uranium_rod",
+  "wrap_weapons_grade_plutonium",
+  "wrap_highly_enriched_uranium",
+  "wrap_low_enriched_uranium",
+  "wrap_liquid_tritium",
+  "wrap_uranium_hexafluoride",
+  "synthesize_energy_crystal",
+  "synthesize_xenon_power_cell",
+  "chlorine_circuit_etching",
 ]);
 
-/** Recipes that should be heavily penalized - only use as absolute last resort */
+export function getBlacklistedRecipes(): Set<string> {
+  const all = readSettings();
+  const c = all.crafter || {};
+  const userBlacklisted = (c.blacklistedRecipes as string[]) || [];
+  return new Set([...DEFAULT_BLACKLISTED_RECIPES, ...userBlacklisted]);
+}
+
 const PENALTY_RECIPES: Record<string, number> = {
-  "synthesize_bio_polymer": -1000, // Massive penalty - materials better suited for other recipes
+  "synthesize_bio_polymer": -1000,
 };
 
-/**
- * Score a recipe based on material availability.
- * Returns a score from 0-100 where higher means more materials are available.
- * Blacklisted recipes return -Infinity. Penalized recipes get a massive score reduction.
- */
+function isUnwrapRecipe(recipe: Recipe): boolean {
+  return recipe.recipe_id.startsWith("unwrap_");
+}
+
+function hasDirectRecipe(recipeId: string, recipes: Recipe[]): boolean {
+  const itemMatch = recipeId.match(/^unwrap_(.+)$/);
+  if (!itemMatch) return false;
+  const itemId = itemMatch[1];
+  return recipes.some(r => r.output_item_id === itemId && !isUnwrapRecipe(r));
+}
+
 export function scoreRecipeAvailability(
   recipe: Recipe,
   countItemFn: (itemId: string) => number,
 ): number {
-  // Check if recipe is blacklisted
-  if (BLACKLISTED_RECIPES.has(recipe.recipe_id)) {
+  const blacklistedRecipes = getBlacklistedRecipes();
+  if (blacklistedRecipes.has(recipe.recipe_id)) {
     return -Infinity;
   }
 
-  if (recipe.components.length === 0) return 50; // No ingredients needed
+  if (recipe.components.length === 0) return 50;
 
   let totalAvailability = 0;
   let totalNeeded = 0;
@@ -75,16 +101,13 @@ export function scoreRecipeAvailability(
     const have = countItemFn(comp.item_id);
     const needed = comp.quantity;
     totalNeeded += needed;
-    // Count available materials (capped at what's needed)
     totalAvailability += Math.min(have, needed);
   }
 
   if (totalNeeded === 0) return 50;
   
-  // Return percentage of materials available (0-100)
   let score = Math.round((totalAvailability / totalNeeded) * 100);
   
-  // Apply penalties for undesirable recipes
   if (recipe.recipe_id in PENALTY_RECIPES) {
     score += PENALTY_RECIPES[recipe.recipe_id];
   }
@@ -92,9 +115,6 @@ export function scoreRecipeAvailability(
   return score;
 }
 
-/**
- * Check if a recipe has all materials available (at least 1 batch worth).
- */
 function hasRecipeMaterials(
   recipe: Recipe,
   countItemFn: (itemId: string) => number,
@@ -115,28 +135,48 @@ export function findRecipeForItem(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
 ): Recipe | null {
-  // Find all recipes that produce this item and are craftable manually
-  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok);
+  const blacklistedRecipes = getBlacklistedRecipes();
+  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok && !blacklistedRecipes.has(r.recipe_id));
 
   if (candidates.length === 0) return null;
   if (candidates.length === 1) return candidates[0];
 
-  // Score each recipe by material availability
+  const unwrapCandidates = candidates.filter(isUnwrapRecipe);
+  const nonUnwrapCandidates = candidates.filter(r => !isUnwrapRecipe(r));
+
+  if (unwrapCandidates.length > 0 && nonUnwrapCandidates.length > 0) {
+    const hasDirect = hasDirectRecipe(unwrapCandidates[0].recipe_id, recipes);
+    if (hasDirect) {
+      const scored = nonUnwrapCandidates.map(recipe => ({
+        recipe,
+        canCraft: hasRecipeMaterials(recipe, countItemFn),
+        score: scoreRecipeAvailability(recipe, countItemFn),
+      }));
+
+      scored.sort((a, b) => {
+        if (a.score !== b.score) {
+          return b.score - a.score;
+        }
+        return a.canCraft ? -1 : 1;
+      });
+
+      return scored[0].recipe;
+    }
+  }
+
   const scored = candidates.map(recipe => ({
     recipe,
     canCraft: hasRecipeMaterials(recipe, countItemFn),
     score: scoreRecipeAvailability(recipe, countItemFn),
   }));
 
-  // Sort by score descending (higher material availability first), then by canCraft descending
   scored.sort((a, b) => {
     if (a.score !== b.score) {
       return b.score - a.score;
     }
-    return a.canCraft ? -1 : 1; // canCraft true comes first among equal scores
+    return a.canCraft ? -1 : 1;
   });
 
-  // Return the recipe with highest priority
   return scored[0].recipe;
 }
 
@@ -304,8 +344,32 @@ export function findAllRecipesForItem(
   recipes: Recipe[],
   countItemFn: (itemId: string) => number,
 ): Recipe[] {
-  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok);
+  const blacklistedRecipes = getBlacklistedRecipes();
+  const candidates = recipes.filter(r => r.output_item_id === itemId && isRecipeCraftable(r).ok && !blacklistedRecipes.has(r.recipe_id));
   if (candidates.length === 0) return [];
+
+  const unwrapCandidates = candidates.filter(isUnwrapRecipe);
+  const nonUnwrapCandidates = candidates.filter(r => !isUnwrapRecipe(r));
+
+  if (unwrapCandidates.length > 0 && nonUnwrapCandidates.length > 0) {
+    const hasDirect = hasDirectRecipe(unwrapCandidates[0].recipe_id, recipes);
+    if (hasDirect) {
+      const scored = nonUnwrapCandidates.map(recipe => ({
+        recipe,
+        canCraft: hasRecipeMaterials(recipe, countItemFn),
+        score: scoreRecipeAvailability(recipe, countItemFn),
+      }));
+
+      scored.sort((a, b) => {
+        if (a.score !== b.score) {
+          return b.score - a.score;
+        }
+        return a.canCraft ? -1 : 1;
+      });
+
+      return scored.map(s => s.recipe);
+    }
+  }
 
   const scored = candidates.map(recipe => ({
     recipe,
@@ -313,12 +377,11 @@ export function findAllRecipesForItem(
     score: scoreRecipeAvailability(recipe, countItemFn),
   }));
 
-  // Sort by score descending (higher material availability first), then by canCraft descending
   scored.sort((a, b) => {
     if (a.score !== b.score) {
       return b.score - a.score;
     }
-    return a.canCraft ? -1 : 1; // canCraft true comes first among equal scores
+    return a.canCraft ? -1 : 1;
   });
 
   return scored.map(s => s.recipe);

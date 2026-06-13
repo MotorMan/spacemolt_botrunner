@@ -2,11 +2,16 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, writeF
 import { join } from "path";
 import os from "os";
 import type { BotStatus } from "../bot.js";
-import { getBot, getTotalBandwidth } from "../botmanager.js";
+import { getBot, getTotalBandwidth, getDiscoveredBots } from "../botmanager.js";
+import { chatBuffer, type ChatMessage } from "../chatbuffer.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { botChatChannel } from "../bot_chat_channel.js";
 import type { ServerWebSocket } from "bun";
+import { getFacilityTransferLoadouts, saveFacilityTransferLoadout, deleteFacilityTransferLoadout, getStationCompletions, setLoadoutActive, clearLoadoutCompletions, clearAllCompletions } from "../routines/fuelTransferTracking.js";
+import { playerNameStore } from "../playernamestore.js";
+import { ClientSyncMaster, type RegisteredClient, type PoiPayload, type MarketPayload, type CoordinationPayload, type PlayerNamePayload, type PassengerPayload, type BotStatusPush, type HelloResponse } from "../client_sync_master.js";
+import { configureSync, onPlayerNameUpdate, onCoordinationUpdate, onCivilianTransportUpdate, onRescueUpdate } from "../client_sync_hooks.js";
 
 function getLocalIp(): string | null {
   const interfaces = os.networkInterfaces();
@@ -25,7 +30,7 @@ function getLocalIp(): string | null {
 // ── Types ──────────────────────────────────────────────────
 
 export interface WebAction {
-  type: "start" | "stop" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc";
+  type: "start" | "stop" | "stop_after_cycle" | "add" | "register" | "chat" | "saveSettings" | "exec" | "remove" | "shutdown" | "emergencyReturn" | "manual_rescue_request" | "pathfinder_calc";
   bot?: string;
   routine?: string;
   username?: string;
@@ -63,12 +68,14 @@ const MAIN_LOG_FILE = join(DATA_DIR, "main_logs.json");
 const FACILITIES_FILE = join(DATA_DIR, "facilities.json");
 const TAXES_FILE = join(DATA_DIR, "taxes.json");
 const FLOCK_FILE = join(DATA_DIR, "flock.json");
+const LAST_USED_ROUTINE_FILE = join(DATA_DIR, "lastUsedRoutine.json");
 
 interface CachedFacilities {
   version: string;
   lastUpdated: string;
   personal: { facility_type: string; name: string; description: string; category: string; level?: number }[];
   production: { facility_type: string; name: string; description: string; category: string; level?: number }[];
+  faction: { facility_type: string; name: string; description: string; category: string; level?: number }[];
   details: Record<string, unknown>;
 }
 
@@ -80,7 +87,7 @@ function loadFacilities(): CachedFacilities {
       console.warn(`Warning: corrupt facilities.json, starting fresh —`, err);
     }
   }
-  return { version: "", lastUpdated: "", personal: [], production: [], details: {} };
+  return { version: "", lastUpdated: "", personal: [], production: [], faction: [], details: {} };
 }
 
 function saveFacilities(data: CachedFacilities): void {
@@ -123,6 +130,76 @@ function loadSettings(): RoutineSettings {
 }
 
 export { loadSettings };
+
+export interface LastUsedRoutineData {
+  [botUsername: string]: string;
+}
+
+function loadLastUsedRoutines(): LastUsedRoutineData {
+  if (existsSync(LAST_USED_ROUTINE_FILE)) {
+    try {
+      return JSON.parse(readFileSync(LAST_USED_ROUTINE_FILE, "utf-8")) as LastUsedRoutineData;
+    } catch (err) {
+      console.warn(`Warning: corrupt lastUsedRoutine.json, starting fresh —`, err);
+    }
+  }
+  return {};
+}
+
+function saveLastUsedRoutine(botUsername: string, routine: string): void {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  const data = loadLastUsedRoutines();
+  data[botUsername] = routine;
+  writeFileSync(LAST_USED_ROUTINE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function getLastUsedRoutine(botUsername: string): string | null {
+  const data = loadLastUsedRoutines();
+  return data[botUsername] || null;
+}
+
+function getAllLastUsedRoutines(): LastUsedRoutineData {
+  return loadLastUsedRoutines();
+}
+
+export { loadLastUsedRoutines, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines };
+
+const STOPPED_STATE_FILE = join(DATA_DIR, "stoppedState.json");
+
+export interface StoppedStateData {
+  [botUsername: string]: "user" | "emergency" | true;
+}
+
+function loadStoppedState(): StoppedStateData {
+  if (existsSync(STOPPED_STATE_FILE)) {
+    try {
+      return JSON.parse(readFileSync(STOPPED_STATE_FILE, "utf-8")) as StoppedStateData;
+    } catch (err) {
+      console.warn(`Warning: corrupt stoppedState.json, starting fresh —`, err);
+    }
+  }
+  return {};
+}
+
+export function saveStoppedState(botUsername: string, reason: "user" | "emergency" | true): void {
+  if (!existsSync(DATA_DIR)) mkdirSync(DATA_DIR, { recursive: true });
+  const data = loadStoppedState();
+  data[botUsername] = reason;
+  writeFileSync(STOPPED_STATE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+export function getStoppedState(botUsername: string): "user" | "emergency" | true | null {
+  const data = loadStoppedState();
+  return data[botUsername] || null;
+}
+
+export function clearStoppedState(botUsername: string): void {
+  const data = loadStoppedState();
+  if (data[botUsername] !== undefined) {
+    delete data[botUsername];
+    writeFileSync(STOPPED_STATE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+  }
+}
 
 /** Get the global system blacklist from settings. */
 export function getSystemBlacklist(): string[] {
@@ -263,16 +340,75 @@ export class WebServer {
   // Available routines — set by botmanager
   routines: string[] = [];
 
-  constructor(port: number = 3000) {
+  // Client sync state
+  private syncMaster: ClientSyncMaster | null = null;
+
+constructor(port: number = 3000) {
     this.port = port;
     this.settings = loadSettings();
     delete (this.settings as Record<string, unknown>).flock;
+    if (!this.settings.module_seller) {
+      this.settings.module_seller = {
+        homeSystem: "",
+        homeStation: "",
+        fuelCostPerJump: 50,
+        refuelThreshold: 50,
+        repairThreshold: 40,
+        priceMode: "premium",
+        premiumPct: 5,
+        undercutCr: 100,
+        sellAtHome: true,
+        maxQtyDefault: 10,
+        moduleItems: [],
+      };
+      saveSettings(this.settings);
+    }
+    if (!this.settings.clientSync) {
+      this.settings.clientSync = {
+        enabled: false,
+        mode: "slave",
+        masterUrl: "http://192.168.1.100:3000",
+        apiKey: "",
+        password: "",
+        label: "",
+        pollIntervalSec: 15,
+        syncMap: true,
+        syncMarket: true,
+        syncCatalog: true,
+        syncStats: true,
+        syncBotChat: true,
+        syncPlayerNames: true,
+        syncCoordination: true,
+        syncCivilianTransport: true,
+        syncRescue: true,
+        allowRemoteBotsInDropdowns: true,
+        remoteBotNameStyle: "prefix",
+        pushLocalDiscoveries: true,
+      };
+      saveSettings(this.settings);
+    }
+    if (this.settings.clientSync.mode === "master" && !this.settings.clientSync.apiKey) {
+      const generatedKey = `master_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+      this.settings.clientSync.apiKey = generatedKey;
+      saveSettings(this.settings);
+    }
     this.statsData = loadStats();
     const mainLogs = loadMainLogs();
     this.activityLog = mainLogs.activity.slice(-MAX_LOG_BUFFER);
     this.broadcastLog = mainLogs.broadcast.slice(-MAX_LOG_BUFFER);
     this.systemLog = mainLogs.system.slice(-MAX_LOG_BUFFER);
     this.factionLog = mainLogs.faction.slice(-MAX_LOG_BUFFER);
+    this.applyInitialLogSettings();
+  }
+
+  applyInitialLogSettings(): void {
+    const { setDebugLog, setActivityLog } = require("../debug.js");
+    if ((this.settings.general as Record<string, unknown>)?.disableDebugLog === true) {
+      setDebugLog(false);
+    }
+    if ((this.settings.general as Record<string, unknown>)?.disableActivityLog === true) {
+      setActivityLog(false);
+    }
   }
 
   /** Schedule save of main logs to disk (debounced). */
@@ -300,6 +436,19 @@ export class WebServer {
   saveRoutineSettings(routine: string, s: Record<string, unknown>): void {
     this.settings[routine] = s;
     saveSettings(this.settings);
+    this.applySettingsChanges(routine, s);
+  }
+
+  applySettingsChanges(routine: string, s: Record<string, unknown>): void {
+    if (routine === "general") {
+      const { setDebugLog, setActivityLog } = require("../debug.js");
+      if (s.disableDebugLog !== undefined) {
+        setDebugLog(!s.disableDebugLog);
+      }
+      if (s.disableActivityLog !== undefined) {
+        setActivityLog(!s.disableActivityLog);
+      }
+    }
   }
 
   /** Reload settings from disk and broadcast to all connected clients.
@@ -379,9 +528,77 @@ export class WebServer {
         }
         if (url.pathname === "/api/bots/discovered") {
           // Return list of discovered bot usernames (even if not logged in)
-          const { getDiscoveredBots } = await import("../botmanager.js");
           const discovered = getDiscoveredBots();
           return Response.json({ usernames: discovered });
+        }
+        if (url.pathname === "/api/chat-bots") {
+          // Return bot list in format expected by chat UI
+          const discovered = getDiscoveredBots();
+          return Response.json({ bots: discovered });
+        }
+        if (url.pathname === "/api/channels" && req.method === "GET") {
+          const bot = url.searchParams.get("bot") || "";
+          let channels = bot ? chatBuffer.getChannels(bot) : [];
+          if (channels.length === 0) {
+            channels = [{ name: "local", displayName: "Local" }, { name: "faction", displayName: "Faction" }, { name: "system", displayName: "System" }];
+          }
+          return Response.json({ channels }, { headers: { "Access-Control-Allow-Origin": "*" } });
+        }
+        if (url.pathname === "/api/messages" && req.method === "GET") {
+          const bot = url.searchParams.get("bot") || "";
+          const channel = url.searchParams.get("channel") || "";
+          const limit = parseInt(url.searchParams.get("limit") || "200", 10);
+          const after = url.searchParams.get("after");
+          const messages = chatBuffer.getMessages({ bot, channel, limit, after: after ? parseInt(after, 10) : undefined });
+          return Response.json({ messages, count: chatBuffer.getMessageCount({ bot, channel }) }, { headers: { "Access-Control-Allow-Origin": "*" } });
+        }
+        if (url.pathname === "/api/send" && req.method === "POST") {
+          const body = (await req.json()) as { bot: string; channel: string; content: string; targetId?: string };
+          const { bot, channel, content, targetId } = body;
+          const corsHeader = { "Access-Control-Allow-Origin": "*" };
+
+          if (!bot || !channel || !content) {
+            return Response.json({ error: "Missing bot, channel, or content" }, { status: 400, headers: corsHeader });
+          }
+
+          const botInstance = getBot(bot);
+          if (!botInstance) {
+            return Response.json({ error: `Bot ${bot} not found` }, { status: 404, headers: corsHeader });
+          }
+
+          try {
+            const chatBody: Record<string, unknown> = { channel, content };
+            if (channel === "private") {
+              if (!targetId) {
+                return Response.json({ error: "targetId is required for private messages" }, { status: 400, headers: corsHeader });
+              }
+              chatBody.target_id = targetId;
+            }
+
+            const result = await botInstance.exec("chat", chatBody);
+
+            if (result.error) {
+              return Response.json({ error: result.error.message || "Chat failed" }, { status: 500, headers: corsHeader });
+            }
+
+            const sentMsg: ChatMessage = {
+              botUsername: bot,
+              channel,
+              sender: bot,
+              content,
+              timestamp: Date.now(),
+              direction: "out",
+              ...(targetId ? { targetId } : {}),
+            };
+            chatBuffer.addMessage(sentMsg);
+
+            return Response.json({ ok: true, message: "Message sent" }, { headers: corsHeader });
+          } catch (err) {
+            return Response.json(
+              { error: err instanceof Error ? err.message : String(err) },
+              { status: 500, headers: corsHeader }
+            );
+          }
         }
         if (url.pathname === "/api/bandwidth") {
           const bandwidth = getTotalBandwidth();
@@ -445,6 +662,26 @@ export class WebServer {
           }
           return Response.json({ ok: false, error: "Missing system_data" }, { status: 400 });
         }
+        if (url.pathname === "/api/map/reset-poi" && req.method === "POST") {
+          const body = await req.json() as { system_id: string; poi_id: string };
+          if (body?.system_id && body?.poi_id) {
+            mapStore.resetPoi(body.system_id, body.poi_id);
+            return Response.json({ ok: true });
+          }
+          return Response.json({ ok: false, error: "Missing system_id or poi_id" }, { status: 400 });
+        }
+        if (url.pathname === "/api/map/reset-corrupted" && req.method === "POST") {
+          const result = mapStore.resetCorruptedPois();
+          return Response.json(result);
+        }
+        if (url.pathname === "/api/map/clear-poi-resources" && req.method === "POST") {
+          const body = await req.json() as { system_id: string; poi_id: string };
+          if (body?.system_id && body?.poi_id) {
+            mapStore.clearPoiResources(body.system_id, body.poi_id);
+            return Response.json({ ok: true });
+          }
+          return Response.json({ ok: false, error: "Missing system_id or poi_id" }, { status: 400 });
+        }
         if (url.pathname === "/api/routines") {
           return Response.json(this.routines);
         }
@@ -481,6 +718,19 @@ export class WebServer {
             if (updates.assignments !== undefined) current.assignments = updates.assignments as FlockSettingsData["assignments"];
             saveFlockSettings(current);
             return Response.json(current);
+          }
+        }
+        if (url.pathname === "/api/last-used-routines") {
+          if (req.method === "GET") {
+            return Response.json(getAllLastUsedRoutines());
+          }
+          if (req.method === "POST") {
+            const body = await req.json() as { bot: string; routine: string };
+            if (!body.bot || !body.routine) {
+              return Response.json({ error: "Missing bot or routine" }, { status: 400 });
+            }
+            saveLastUsedRoutine(body.bot, body.routine);
+            return Response.json({ ok: true });
           }
         }
         if (url.pathname === "/api/stats") {
@@ -563,27 +813,141 @@ export class WebServer {
           });
         }
         if (url.pathname === "/api/faction-storage") {
-          // Return faction shared warehouse contents for a specific station
           const station = url.searchParams.get("station") || "";
-          const faction = url.searchParams.get("faction") || "";
-          const factionStoragePath = join(process.cwd(), "data", "factionStorage", `${faction}::${station || "default"}.json`);
-          if (!existsSync(factionStoragePath)) {
-            return Response.json({ items: [] });
+          const factionName = url.searchParams.get("faction") || "";
+          
+          const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
+          
+          if (!existsSync(CACHE_DIR)) {
+            return Response.json({ items: [], factionName: "", station: "" });
           }
+          
+          if (factionName) {
+            const factionStoragePath = join(CACHE_DIR, `${factionName}--${station || "default"}.json`);
+            if (!existsSync(factionStoragePath)) {
+              return Response.json({ items: [], factionName, station });
+            }
+            try {
+              const raw = readFileSync(factionStoragePath, "utf-8");
+              const data = JSON.parse(raw);
+              const items = data.entries || data.items || [];
+              return Response.json({
+                items,
+                factionFuelReserve: data.factionFuelReserve || 0,
+                factionFuelCapacity: data.factionFuelCapacity || 0,
+                factionName: data.factionName,
+                station: data.station,
+              });
+            } catch {
+              return Response.json({ items: [], factionName, station });
+            }
+          }
+          
           try {
-            const raw = readFileSync(factionStoragePath, "utf-8");
-            const data = JSON.parse(raw);
-            const items = data.entries || data.items || [];
-            return Response.json({
-              items,
-              factionFuelReserve: data.factionFuelReserve || 0,
-              factionFuelCapacity: data.factionFuelCapacity || 0,
-              factionName: data.factionName,
-              station: data.station,
-            });
+            const files = readdirSync(CACHE_DIR);
+            for (const file of files) {
+              if (!file.endsWith(".json")) continue;
+              const match1 = file.match(/^(.+)::(.+)\.json$/);
+              const match2 = file.match(/^(.+)--(.+)\.json$/);
+              const match = match1 || match2;
+              if (!match) continue;
+              const [, fn, st] = match;
+              if (st === station || (station === "" && st === "default")) {
+                const factionStoragePath = join(CACHE_DIR, file);
+                const raw = readFileSync(factionStoragePath, "utf-8");
+                const data = JSON.parse(raw);
+                const items = data.entries || data.items || [];
+                return Response.json({
+                  items,
+                  factionFuelReserve: data.factionFuelReserve || 0,
+                  factionFuelCapacity: data.factionFuelCapacity || 0,
+                  factionName: data.factionName,
+                  station: data.station,
+                });
+              }
+            }
+            for (const file of files) {
+              if (!file.endsWith(".json")) continue;
+              const match1 = file.match(/^(.+)::(.+)\.json$/);
+              const match2 = file.match(/^(.+)--(.+)\.json$/);
+              const match = match1 || match2;
+              if (!match) continue;
+              const factionStoragePath = join(CACHE_DIR, file);
+              const raw = readFileSync(factionStoragePath, "utf-8");
+              const data = JSON.parse(raw);
+              const items = data.entries || data.items || [];
+              if (items && items.length > 0) {
+                return Response.json({
+                  items,
+                  factionFuelReserve: data.factionFuelReserve || 0,
+                  factionFuelCapacity: data.factionFuelCapacity || 0,
+                  factionName: data.factionName,
+                  station: data.station,
+                });
+              }
+            }
+            return Response.json({ items: [], factionName: "", station });
           } catch {
             return Response.json({ items: [] });
           }
+        }
+        
+        if (url.pathname === "/api/faction-storage/list") {
+          // List all available faction storage caches
+          const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
+          if (!existsSync(CACHE_DIR)) {
+            return Response.json({ caches: [] });
+          }
+          try {
+            const files = readdirSync(CACHE_DIR);
+            const caches = files
+              .filter(f => f.endsWith(".json"))
+              .map(f => {
+                // Try both formats: with :: and with --
+                const match1 = f.match(/^(.+)::(.+)\.json$/);
+                const match2 = f.match(/^(.+)--(.+)\.json$/);
+                const match = match1 || match2;
+                if (!match) return null;
+                const [, factionName, station] = match;
+                return { factionName, station };
+              })
+              .filter((c): c is { factionName: string; station: string } => c !== null);
+            return Response.json({ caches });
+          } catch {
+            return Response.json({ caches: [] });
+          }
+        }
+
+        if (url.pathname === "/api/faction-fuel-stations" && req.method === "GET") {
+          // Get faction fuel for all approved refueling stations
+          const settings = this.settings;
+          const approvedStations = (settings.general as Record<string, unknown>)?.approvedFuelStations as string[] || [];
+          const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
+
+          const stationsData: Array<{ stationId: string; systemId: string; fuelReserve: number; fuelCapacity: number }> = [];
+
+          for (const stationKey of approvedStations) {
+            const [systemId, stationId] = stationKey.split("|");
+            if (!stationId) continue;
+
+            const factionStoragePath = join(CACHE_DIR, `Busy Being Dead--${stationId}.json`);
+            if (!existsSync(factionStoragePath)) continue;
+
+            try {
+              const raw = readFileSync(factionStoragePath, "utf-8");
+              const data = JSON.parse(raw);
+              stationsData.push({
+                stationId,
+                systemId,
+                fuelReserve: data.factionFuelReserve || 0,
+                fuelCapacity: data.factionFuelCapacity || 0,
+              });
+            } catch {
+              // Ignore errors for individual stations
+            }
+          }
+
+          return Response.json({ stations: stationsData });
         }
 
         // Shutdown endpoint
@@ -611,6 +975,57 @@ export class WebServer {
           return Response.json({ lines, total: botOnLogLines.length });
         }
 
+        // GET /api/skills - Extract skills from last get_status in each bot's log
+        if (url.pathname === "/api/skills" && req.method === "GET") {
+          const logsDir = join(process.cwd(), "data", "logs");
+          if (!existsSync(logsDir)) {
+            return Response.json({ bots: {} });
+          }
+          const files = readdirSync(logsDir).filter(f => f.endsWith("_debug.log"));
+          const result: Record<string, { skills: Record<string, { level: number; xp?: number; nextLevelXp?: number }>; lastUpdated: string }> = {};
+          
+          for (const file of files) {
+            const botName = file.replace(/_debug\.log$/, "");
+            const logPath = join(logsDir, file);
+            try {
+              const content = readFileSync(logPath, "utf-8");
+              const lines = content.split("\n");
+              
+              // Find the last get_status response
+              for (let i = lines.length - 1; i >= 0; i--) {
+                const line = lines[i];
+                if (line.includes("get_status response")) {
+                  const jsonStart = line.indexOf("get_status response ");
+                  if (jsonStart !== -1) {
+                    const jsonStr = line.substring(jsonStart + "get_status response ".length);
+                    try {
+                      const status = JSON.parse(jsonStr);
+                      const skillsData = status.skills as Record<string, { level?: number; xp?: number; next_level_xp?: number }> | undefined;
+                      if (skillsData) {
+                        const skills: Record<string, { level: number; xp?: number; nextLevelXp?: number }> = {};
+                        for (const [skillId, skillData] of Object.entries(skillsData)) {
+                          skills[skillId] = {
+                            level: skillData.level || 0,
+                            xp: skillData.xp,
+                            nextLevelXp: skillData.next_level_xp
+                          };
+                        }
+                        result[botName] = { skills, lastUpdated: new Date().toISOString() };
+                      }
+                    } catch (parseErr) {
+                      // JSON parse failed, continue to next line
+                    }
+                    break;
+                  }
+                }
+              }
+            } catch (e) {
+              console.warn(`Failed to parse skills from ${file}:`, e);
+            }
+          }
+          return Response.json({ bots: result });
+        }
+
         // Flock state endpoint
         if (url.pathname.startsWith("/api/flock/") && req.method === "GET") {
           const flockName = decodeURIComponent(url.pathname.slice("/api/flock/".length));
@@ -625,6 +1040,155 @@ export class WebServer {
           } catch (e) {
             return new Response("Invalid flock state", { status: 500 });
           }
+        }
+
+// Client sync routes
+        if (url.pathname.startsWith("/api/client-sync/")) {
+          if (!this.syncMaster) {
+            const csSettings = this.settings.clientSync || {};
+            this.syncMaster = new ClientSyncMaster(csSettings);
+            this.syncMaster.saveSettings();
+          }
+          const cors = { "Access-Control-Allow-Origin": "*" } as Record<string, string>;
+
+          if (url.pathname === "/api/client-sync/hello" && req.method === "GET") {
+            const clientId = req.headers.get("x-client-id") || "unknown";
+            const master = this.syncMaster;
+            master?.touch(clientId);
+            return Response.json(master?.hello(clientId), { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/map" && req.method === "GET") {
+            return Response.json(mapStore.getAllSystems(), { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/catalog" && req.method === "GET") {
+            return Response.json(catalogStore.getAll(), { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/stats" && req.method === "GET") {
+            return Response.json(this.statsData.daily, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/chat-history" && req.method === "GET") {
+            const history = botChatChannel.getHistory(undefined, 100);
+            return Response.json(history, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/bots" && req.method === "GET") {
+            return Response.json(this.latestStatuses, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/clients" && req.method === "GET") {
+            return Response.json(this.syncMaster?.getClients() ?? [], { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/api-key" && req.method === "GET") {
+            return Response.json({ apiKey: this.syncMaster?.getApiKey() ?? "" }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/set-password" && req.method === "POST") {
+            const body = await req.json() as { password: string };
+            this.syncMaster?.setPassword(body.password);
+            this.syncMaster?.saveSettings();
+            return Response.json({ ok: true }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/set-api-key" && req.method === "POST") {
+            const body = await req.json() as { apiKey: string };
+            this.syncMaster?.setApiKey(body.apiKey);
+            this.syncMaster?.saveSettings();
+            return Response.json({ ok: true }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/slave-state" && req.method === "GET") {
+            const syncSlave = (globalThis as any).syncSlave;
+            if (syncSlave) {
+              return Response.json(syncSlave.getState(), { headers: cors });
+            }
+            return Response.json({ connected: false, lastError: "Slave not running" }, { headers: cors });
+          }
+          if (url.pathname.startsWith("/api/client-sync/coordination") && req.method === "GET") {
+            const file = url.searchParams.get("file") || "";
+            const path = join(process.cwd(), "data", file);
+            if (!existsSync(path)) return new Response("not found", { status: 404, headers: cors });
+            try {
+              const raw = readFileSync(path, "utf-8");
+              const data = JSON.parse(raw);
+              return Response.json(data, { headers: cors });
+            } catch {
+              return new Response("invalid json", { status: 500, headers: cors });
+            }
+          }
+          if (url.pathname === "/api/client-sync/player-names" && req.method === "GET") {
+            return Response.json({ names: playerNameStore.getAll() }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/register" && req.method === "POST") {
+            const body = await req.json() as { apiKey: string; label: string; password?: string };
+            if (!this.syncMaster) {
+              return Response.json({ ok: false, error: "syncMaster not initialized" }, { headers: cors });
+            }
+            const result = await this.syncMaster.register(body);
+            return Response.json(result, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/test-register" && req.method === "POST") {
+            const body = await req.json() as { masterUrl: string; apiKey: string; label: string; password?: string };
+            const testCors = { "Access-Control-Allow-Origin": "*" } as Record<string, string>;
+            if (!body.masterUrl) {
+              return Response.json({ ok: false, error: "masterUrl required" }, { headers: testCors });
+            }
+            try {
+              const testUrl = `${body.masterUrl}/api/client-sync/register`;
+              const res = await fetch(testUrl, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ apiKey: body.apiKey, label: body.label || "test", password: body.password })
+              });
+              let payload: { ok: boolean; clientId?: string; error?: string };
+              try { 
+                payload = await res.json(); 
+              } catch { 
+                payload = { ok: false, error: "invalid response" }; 
+              }
+              return Response.json(payload, { headers: testCors });
+            } catch (err) {
+              const msg = err instanceof Error ? err.message : String(err);
+              return Response.json({ ok: false, error: msg }, { headers: testCors });
+            }
+          }
+          if (url.pathname === "/api/client-sync/chat-relay" && req.method === "POST") {
+            const body = await req.json() as { channel: string; content: string; sender?: string };
+            const clientId = req.headers.get("x-client-id") || "";
+            const result = this.syncMaster?.chatRelay(body);
+            return Response.json(result ?? { ok: false }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/bot-status" && req.method === "POST") {
+            const body = await req.json() as { clientId?: string; statuses: BotStatusPush[] };
+            const cid = body.clientId || req.headers.get("x-client-id") || "";
+            const ok = this.syncMaster?.botStatusPush(cid, body.statuses);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/poi-update" && req.method === "POST") {
+            const body = await req.json() as PoiPayload;
+            const ok = this.syncMaster?.poiUpdate(body);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/market-update" && req.method === "POST") {
+            const body = await req.json() as MarketPayload;
+            const ok = this.syncMaster?.marketUpdate(body);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/coordination-sync" && req.method === "POST") {
+            const body = await req.json() as CoordinationPayload;
+            const ok = this.syncMaster?.coordinationSync(body);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/player-names-update" && req.method === "POST") {
+            const body = await req.json() as PlayerNamePayload;
+            const ok = this.syncMaster?.playerNamesUpdate(body);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname === "/api/client-sync/civilian-transport-update" && req.method === "POST") {
+            const body = await req.json() as PassengerPayload;
+            const ok = this.syncMaster?.civilianTransportUpdate(body);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          if (url.pathname.startsWith("/api/client-sync/clients/") && req.method === "DELETE") {
+            const id = decodeURIComponent(url.pathname.slice("/api/client-sync/clients/".length));
+            const ok = this.syncMaster?.disconnect(id);
+            return Response.json({ ok: !!ok }, { headers: cors });
+          }
+          return new Response("not found", { status: 404, headers: cors });
         }
 
         // POST actions (fallback for non-WS clients)
@@ -939,6 +1503,7 @@ export class WebServer {
             lastUpdated: new Date().toISOString(),
             personal: body.personal || existing.personal,
             production: body.production || existing.production,
+            faction: body.faction || existing.faction,
             details: { ...existing.details, ...body.details },
           };
           saveFacilities(merged);
@@ -1045,6 +1610,65 @@ export class WebServer {
             return Response.json({ ok: true, name });
           }
 
+          // GET /api/facility-transfer-loadouts - Load all facility transfer loadouts
+          if (url.pathname === "/api/facility-transfer-loadouts" && req.method === "GET") {
+            const loadouts = getFacilityTransferLoadouts();
+            return Response.json({ loadouts });
+          }
+
+          // POST /api/facility-transfer-loadouts - Save a facility transfer loadout
+          if (url.pathname === "/api/facility-transfer-loadouts" && req.method === "POST") {
+            const body = await req.json() as { name: string; items: Array<{ itemId: string; itemName: string; targetQuantity: number }> };
+            if (!body?.name || !Array.isArray(body.items)) {
+              return Response.json({ error: "Missing name or items" }, { status: 400 });
+            }
+            const loadout: any = {
+              name: body.name,
+              items: body.items,
+              createdAt: new Date().toISOString(),
+            };
+            saveFacilityTransferLoadout(body.name, { items: body.items });
+            return Response.json({ ok: true, name: body.name });
+          }
+
+          // DELETE /api/facility-transfer-loadouts/:name - Delete a facility transfer loadout
+          if (url.pathname.startsWith("/api/facility-transfer-loadouts/") && req.method === "DELETE") {
+            const name = decodeURIComponent(url.pathname.slice("/api/facility-transfer-loadouts/".length));
+            const success = deleteFacilityTransferLoadout(name);
+            if (!success) {
+              return Response.json({ error: "Loadout not found" }, { status: 404 });
+            }
+            return Response.json({ ok: true, name });
+          }
+
+          // PATCH /api/facility-transfer-loadouts/:name/active - Set loadout active state
+          if (url.pathname.match(/^\/api\/facility-transfer-loadouts\/[^/]+\/active$/) && req.method === "PATCH") {
+            const name = decodeURIComponent(url.pathname.slice("/api/facility-transfer-loadouts/".length, -"/active".length));
+            const body = await req.json() as { active: boolean };
+            setLoadoutActive(name, body.active);
+            return Response.json({ ok: true, name, active: body.active });
+          }
+
+          // GET /api/facility-transfer-completions?station=X - Get completions for a station
+          if (url.pathname === "/api/facility-transfer-completions" && req.method === "GET") {
+            const station = url.searchParams.get("station") || "";
+            const completions = getStationCompletions(station);
+            return Response.json({ completions });
+          }
+
+          // DELETE /api/facility-transfer-completions/loadout/:name - Clear completions for a loadout
+          if (url.pathname.startsWith("/api/facility-transfer-completions/loadout/") && req.method === "DELETE") {
+            const name = decodeURIComponent(url.pathname.slice("/api/facility-transfer-completions/loadout/".length));
+            clearLoadoutCompletions(name);
+            return Response.json({ ok: true, cleared: name });
+          }
+
+          // DELETE /api/facility-transfer-completions - Clear all completions
+          if (url.pathname === "/api/facility-transfer-completions" && req.method === "DELETE") {
+            clearAllCompletions();
+            return Response.json({ ok: true, cleared: "all" });
+          }
+
           // Serve index.css
 
         if (url.pathname === "/index.css") {
@@ -1082,17 +1706,6 @@ export class WebServer {
           } catch {
             return Response.json({ players: {}, total: 0 });
           }
-        }
-
-        // Serve settings.html for settings route
-        if (url.pathname === "/settings.html") {
-          const settingsPath = join(import.meta.dir, "settings.html");
-          return new Response(readFileSync(settingsPath, "utf-8"), {
-            headers: {
-              "Content-Type": "text/html; charset=utf-8",
-              "Cache-Control": "no-store",
-            },
-          });
         }
 
         // Serve players.html for players route
@@ -1161,12 +1774,56 @@ export class WebServer {
           });
         }
 
+        // Serve chat.html for chat UI route
+        if (url.pathname === "/chat.html" || url.pathname === "/chat") {
+          const chatPath = join(import.meta.dir, "chat.html");
+          return new Response(readFileSync(chatPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve chat.css for chat UI
+        if (url.pathname === "/chat.css") {
+          const chatCssPath = join(import.meta.dir, "chat.css");
+          return new Response(readFileSync(chatCssPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/css; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve map.html for map route
         if (url.pathname === "/map.html") {
           const mapPath = join(import.meta.dir, "map.html");
           return new Response(readFileSync(mapPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve chat.html for chat route
+        if (url.pathname === "/chat.html" || url.pathname === "/chat/") {
+          const chatPath = join(import.meta.dir, "chat.html");
+          return new Response(readFileSync(chatPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve chat.css for chat route
+        if (url.pathname === "/chat.css") {
+          const chatCssPath = join(import.meta.dir, "chat.css");
+          return new Response(readFileSync(chatCssPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/css; charset=utf-8",
               "Cache-Control": "no-store",
             },
           });
@@ -1209,17 +1866,6 @@ export class WebServer {
         if (url.pathname === "/stats.html") {
           const statsPath = join(import.meta.dir, "stats.html");
           return new Response(readFileSync(statsPath, "utf-8"), {
-            headers: {
-              "Content-Type": "text/html; charset=utf-8",
-              "Cache-Control": "no-store",
-            },
-          });
-        }
-
-        // Serve settings.html for settings route
-        if (url.pathname === "/settings.html") {
-          const settingsPath = join(import.meta.dir, "settings.html");
-          return new Response(readFileSync(settingsPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",
@@ -1271,6 +1917,7 @@ export class WebServer {
                 },
                 botLogs: botLogsObj,
                 flockSettings: loadFlockSettings(),
+                lastUsedRoutines: getAllLastUsedRoutines(),
               }));
 
               // Send large data separately to avoid blocking with JSON serialization

@@ -8,7 +8,7 @@ const GLOBAL_LOG_FILE = join(LOGS_DIR, "debug.log");
 const OLD_LOGS_DIR = join(process.cwd(), "old-logs");
 const OLD_ACTIVITY_LOGS_DIR = join(OLD_LOGS_DIR, "activity");
 
-const LOG_ROTATION_SIZE = 200 * 1024 * 1024;
+const LOG_ROTATION_SIZE = 50 * 1024 * 1024;  //changed to 50kb, since 200kb seems still too big and slows startup.
 
 // Ensure directories exist once at module load
 if (!existsSync(DATA_DIR)) {
@@ -27,7 +27,8 @@ if (!existsSync(OLD_ACTIVITY_LOGS_DIR)) {
   mkdirSync(OLD_ACTIVITY_LOGS_DIR, { recursive: true });
 }
 
-let enabled = true;
+let debugEnabled = true;
+let activityEnabled = true;
 
 function shouldRotateLog(logPath: string): boolean {
   if (!existsSync(logPath)) return false;
@@ -61,7 +62,11 @@ function rotateBotLog(botName: string): void {
 }
 
 export function setDebugLog(on: boolean): void {
-  enabled = on;
+  debugEnabled = on;
+}
+
+export function setActivityLog(on: boolean): void {
+  activityEnabled = on;
 }
 
 /**
@@ -69,7 +74,7 @@ export function setDebugLog(on: boolean): void {
  * @deprecated Use debugLogForBot instead for per-bot logging.
  */
 export function debugLog(source: string, message: string, data?: unknown): void {
-  if (!enabled) return;
+  if (!debugEnabled) return;
   const timestamp = new Date().toISOString();
   let line = `${timestamp} [${source}] ${message}`;
   if (data !== undefined) {
@@ -92,7 +97,7 @@ export function debugLog(source: string, message: string, data?: unknown): void 
  * This creates per-bot log files in data/logs/{botName}_debug.log
  */
 export function debugLogForBot(botName: string, source: string, message: string, data?: unknown): void {
-  if (!enabled) return;
+  if (!debugEnabled) return;
   const timestamp = new Date().toISOString();
   let line = `${timestamp} [${source}] ${message}`;
   if (data !== undefined) {
@@ -118,7 +123,7 @@ export function debugLogForBot(botName: string, source: string, message: string,
  * Designed for song lyric generation - contains only the essential activity information.
  */
 export function logBotActivity(botName: string, category: string, message: string): void {
-  if (!enabled) return;
+  if (!activityEnabled) return;
   const timestamp = new Date().toISOString();
   const line = `${timestamp} [${botName}] [${category}] ${message}\n`;
   try {

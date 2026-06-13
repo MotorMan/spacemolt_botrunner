@@ -3,6 +3,7 @@ import type { BotChatMessage } from "../bot_chat_channel.js";
 import { mapStore, isDepletionExpired } from "../mapstore.js";
 import { getBotChatChannel } from "../botmanager.js";
 import { getSystemBlacklist } from "../web/server.js";
+import { onCoordinationUpdate } from "../client_sync_hooks.js";
 import {
   isOreBeltPoi,
   isGasCloudPoi,
@@ -450,7 +451,7 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   let shipData: Record<string, unknown>;
   let usingCachedModules = false;
 
-  if (cachedModules) {
+  if (cachedModules && cachedModules.length > 0) {
     shipData = { modules: cachedModules };
     usingCachedModules = true;
   } else {
@@ -492,10 +493,10 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
     if (checkStr.includes("ice_harvester") || checkStr.includes("ice harvester")) {
       hasIceHarvester = true;
     }
-    if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo")) {
+    if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo") || checkStr.includes("hazmat_cargo")) {
       hasLeadLinedCargo = true;
     }
-    if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester")) {
+    if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester") || checkStr.includes("rad_harvesting")) {
       hasRadHarvester = true;
     }
   }
@@ -590,12 +591,12 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
         if (checkStr.includes("ice_harvester") || checkStr.includes("ice harvester")) {
           hasIceHarvester = true;
         }
-        if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo")) {
-          hasLeadLinedCargo = true;
-        }
-        if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester")) {
-          hasRadHarvester = true;
-        }
+if (checkStr.includes("lead_lined_cargo") || checkStr.includes("lead lined cargo") || checkStr.includes("hazmat_cargo")) {
+        hasLeadLinedCargo = true;
+      }
+      if (checkStr.includes("rad_harvester") || checkStr.includes("rad harvester") || checkStr.includes("rad_harvesting")) {
+        hasRadHarvester = true;
+      }
       }
 
       const freshHasRadioactiveEquipment = hasLeadLinedCargo && hasRadHarvester;
@@ -649,7 +650,7 @@ export async function hasEquipmentForMiningType(ctx: RoutineContext, miningType:
   const { bot } = ctx;
   let modules: unknown[];
 
-  if (cachedModules) {
+  if (cachedModules && cachedModules.length > 0) {
     modules = cachedModules;
   } else {
     const shipResp = await bot.exec("get_ship");
@@ -1267,6 +1268,7 @@ async function signalEscort(
     if (!existsSync(escortDir)) mkdirSync(escortDir, { recursive: true });
     const signalFile = join(escortDir, `${bot.username}.signal`);
     writeFileSync(signalFile, JSON.stringify({ action, systemId, timestamp: Date.now() }));
+    void onCoordinationUpdate("escort", { action, systemId, timestamp: Date.now() });
   }
 }
 
@@ -1478,6 +1480,31 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
    // when the server is still processing (e.g. after a jump timeout).
    let cachedModules: unknown[] | null = await cacheShipModules(ctx);
 
+   // CRITICAL FIX: If modules are empty at startup, wait and retry a few times
+   // This handles the case where get_ship returns empty data due to server lag
+   if (!cachedModules || cachedModules.length === 0) {
+     ctx.log("warn", "Ship modules empty at startup — waiting for server to process...");
+     let retryCount = 0;
+     const maxRetries = 5;
+     while ((!cachedModules || cachedModules.length === 0) && retryCount < maxRetries) {
+       await ctx.sleep(2000);
+       cachedModules = await cacheShipModules(ctx);
+       retryCount++;
+     }
+     if (!cachedModules || cachedModules.length === 0) {
+       ctx.log("error", `Failed to get ship modules after ${maxRetries} retries — cannot determine mining type`);
+       yield "error";
+       return;
+     }
+   }
+
+// ── Flock heartbeat tracking (persists across cycles) ──
+    let lastFlockHeartbeat = 0;
+    let lastFlockStateUpdate = 0;
+
+    // ── Escort location broadcast tracking ──
+    let lastEscortLocationBroadcast = 0;
+
    // ── CRITICAL FIX: Refresh faction storage at startup for accurate quota checks ──
    ctx.log("miner", "Refreshing faction storage at startup...");
    await bot.refreshFactionStorage();
@@ -1503,6 +1530,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (!hasEquipment) {
           ctx.log("error", `Session invalid: no equipment for ${sessionMiningType} mining (${activeSession.targetResourceName}) — abandoning`);
           await failMiningSession(bot.username, "No equipment for resource type");
+          recoveredSession = null;
         } else {
           // Check if bot is at the expected location for the session
           if (bot.system !== activeSession.targetSystemId || bot.poi !== activeSession.targetPoiId) {
@@ -1547,6 +1575,22 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // ── Refresh cached ship modules after death recovery ──
     // (modules could change if ship was destroyed and replaced)
     cachedModules = await cacheShipModules(ctx);
+    
+    // CRITICAL FIX: If modules are empty after death recovery, wait and retry
+    if (!cachedModules || cachedModules.length === 0) {
+      ctx.log("warn", "Ship modules empty after death recovery — waiting for server...");
+      let retryCount = 0;
+      while ((!cachedModules || cachedModules.length === 0) && retryCount < 3) {
+        await ctx.sleep(2000);
+        cachedModules = await cacheShipModules(ctx);
+        retryCount++;
+      }
+      if (!cachedModules || cachedModules.length === 0) {
+        ctx.log("error", "Failed to get ship modules after death recovery — skipping cycle");
+        await ctx.sleep(30000);
+        continue;
+      }
+    }
 
     // ── Battle state tracking (per-cycle initialization) ──
     const battleState: BattleState = {
@@ -1564,6 +1608,31 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       hullThresholdPct: settings.repairThreshold,
     };
     const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
+
+    // ── Flock state heartbeat for leader ──
+    // Update flock state file immediately at cycle start if we're the leader
+    // This ensures followers always see fresh data, even if the leader is stuck
+    if (settings.flockEnabled && settings.flockName && settings.flockRole === "leader") {
+      const flockGroup = settings.flockGroups.find(g => g.name === settings.flockName);
+      if (flockGroup) {
+        const { writeFileSync, existsSync } = await import("fs");
+        const { join } = await import("path");
+        const flockDir = join(process.cwd(), "data", "flock_signals");
+        const flockPath = join(flockDir, `${settings.flockName}.json`);
+        
+        if (existsSync(flockPath)) {
+          try {
+            const { readFileSync } = await import("fs");
+            const raw = readFileSync(flockPath, "utf-8");
+            const existingState = JSON.parse(raw) as FlockState;
+            existingState.lastUpdate = Date.now();
+            writeFileSync(flockPath, JSON.stringify(existingState, null, 2));
+          } catch {
+            // Ignore errors - the regular flock logic will handle updates
+          }
+        }
+      }
+    }
 
     // ── CRITICAL FIX: Always refresh faction storage at cycle start ──
     // This ensures quota decisions are based on fresh data, not stale cached state
@@ -1622,7 +1691,6 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     let flockMiningType: FlockState["miningType"] = "ore";
     let flockPhase: FlockState["phase"] = "gathering";
     let flockGroup: FlockGroupConfig | undefined;
-    let lastFlockHeartbeat = 0;
 
     if (settings.flockEnabled && settings.flockName) {
       flockGroup = settings.flockGroups.find(g => g.name === settings.flockName);
@@ -1650,21 +1718,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
           actualMiningType = detected;
         } else {
-          actualMiningType = groupMiningType as "ore" | "gas" | "ice";
+          actualMiningType = groupMiningType as "ore" | "gas" | "ice" | "radioactive";
         }
         
-        const groupTarget = actualMiningType === "ice"
-          ? (flockGroup?.targetIce || settings.targetIce)
-          : (actualMiningType === "ore"
-            ? (flockGroup?.targetOre || settings.targetOre)
-            : (flockGroup?.targetGas || settings.targetGas));
+        const groupTarget: string = (() => {
+          if (actualMiningType === "ice") return (flockGroup?.targetIce || settings.targetIce || "") as string;
+          if (actualMiningType === "ore") return (flockGroup?.targetOre || settings.targetOre || "") as string;
+          if (actualMiningType === "radioactive") return (flockGroup?.targetRadioactive || settings.targetRadioactive || "") as string;
+          return (flockGroup?.targetGas || settings.targetGas || "") as string;
+        })();
 
         // CRITICAL FIX: Use type-specific system from flock group config if available
-        const groupSystem = actualMiningType === "ice"
-          ? (flockGroup?.systemIce || settings.systemIce || settings.system)
-          : (actualMiningType === "ore"
-            ? (flockGroup?.systemOre || settings.systemOre || settings.system)
-            : (flockGroup?.systemGas || settings.systemGas || settings.system));
+        const groupSystem: string = (() => {
+          if (actualMiningType === "ice") return (flockGroup?.systemIce || settings.systemIce || settings.system || "") as string;
+          if (actualMiningType === "ore") return (flockGroup?.systemOre || settings.systemOre || settings.system || "") as string;
+          if (actualMiningType === "radioactive") return (flockGroup?.systemRadioactive || settings.systemRadioactive || settings.system || "") as string;
+          return (flockGroup?.systemGas || settings.systemGas || settings.system || "") as string;
+        })();
 
         flockTargetResource = groupTarget || "";
         flockMiningType = actualMiningType;
@@ -1678,6 +1748,13 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           flockTargetResource = "";
         }
 
+        // RADIOACTIVE MINER RESTRICTION: Radioactive miners must mine radioactive ores only
+        // They should NEVER fall back to regular ores or gas
+        if (actualMiningType === "radioactive" && flockTargetResource && !isRadioactiveOre(flockTargetResource)) {
+          ctx.log("flock", `Radioactive miner — ignoring non-radioactive target "${flockTargetResource}", will search for radioactive ores`);
+          flockTargetResource = "";
+        }
+
         ctx.log("flock", `Leader target: ${flockTargetResource || "any deep core ore"} (${flockMiningType}) @ ${groupSystem || "any system"}`);
       } else {
         // Follower: read flock state and follow leader's decisions
@@ -1685,8 +1762,32 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         
         if (!flockState) {
           ctx.log("flock", `Flock mode: FOLLOWER of "${settings.flockName}" — waiting for leader...`);
-          // Wait for leader to announce target
+          // Check if leader has been inactive for too long (60 seconds stale)
+          // If so, return home and wait for fresh leader data
+          const statePath = await (await import("path")).join(process.cwd(), "data", "flock_signals", `${settings.flockName}.json`);
+          const { existsSync } = await import("fs");
+          if (existsSync(statePath)) {
+            const { statSync } = await import("fs");
+            const fileStat = statSync(statePath);
+            const ageMs = Date.now() - fileStat.mtimeMs;
+            if (ageMs > 120_000) {
+              ctx.log("flock", `Leader state stale (${Math.round(ageMs/1000)}s old) — returning home to wait for fresh coordination`);
+              yield "return_home";
+              await ensureDocked(ctx);
+              await ctx.sleep(10000);
+              continue;
+            }
+          }
           await ctx.sleep(5000);
+          continue;
+        }
+        
+        // Check if leader state is too stale (older than 120 seconds - must match readFlockState threshold)
+        if (Date.now() - flockState.lastUpdate > 120_000) {
+          ctx.log("flock", `Leader state stale (${Math.round((Date.now() - flockState.lastUpdate)/1000)}s) — returning home to wait for fresh coordination`);
+          yield "return_home";
+          await ensureDocked(ctx);
+          await ctx.sleep(10000);
           continue;
         }
         
@@ -1714,44 +1815,49 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         } else {
           ctx.log("flock", `Following leader to: ${flockTargetPoiName || flockTargetSystemId || "TBD"} (${flockTargetResource || "any"}, ${flockMiningType})`);
         }
-      }
-    }
 
-    // ── Leader: broadcast immediate heartbeat to let followers know we're alive ──
-    if (isFlockLeader && settings.flockEnabled && settings.flockName) {
-      await broadcastFlockHeartbeat(settings.flockName, bot.username);
-      lastFlockHeartbeat = Date.now();
-    }
-
-     // ── Re-evaluate mining type and target from settings each cycle ──
-      let miningType: "ore" | "gas" | "ice" | "radioactive" = "ore";
-      if (settings.miningType === "auto") {
-        const detected = await detectMiningType(ctx, cachedModules || undefined);
-        if (!detected) {
-          // CRITICAL FIX: Refresh cached modules and try again
-          ctx.log("warn", "Mining type detection failed — refreshing cached modules and retrying");
-          cachedModules = await cacheShipModules(ctx);
-          const retryDetected = await detectMiningType(ctx, cachedModules || undefined);
-          if (!retryDetected) {
-            ctx.log("error", "Cannot determine mining type even after refreshing modules — please check ship equipment");
-            await ctx.sleep(30000);
-            continue;
-          }
-          miningType = retryDetected;
-        } else {
-          miningType = detected;
+        // RADIOACTIVE MINER RESTRICTION: Radioactive miners must mine radioactive ores only
+        // They should NEVER fall back to regular ores or gas
+        if (flockMiningType === "radioactive" && flockTargetResource && !isRadioactiveOre(flockTargetResource)) {
+          ctx.log("flock", `Radioactive miner — ignoring non-radioactive target "${flockTargetResource}", will mine radioactive ores instead`);
+          // Don't clear the target - let the solo mining logic handle finding a radioactive target
         }
-       } else {
-         miningType = settings.miningType;
-       }
-
-      // CRITICAL FIX: Validate miningType against actual ship equipment after resolution.
-      // Prevents the miner from looping forever in an impossible mode (e.g. forced "gas" with no gas harvester).
-      const detectedFromModules = await detectMiningType(ctx, cachedModules || undefined);
-      if (detectedFromModules && detectedFromModules !== miningType) {
-        ctx.log("warn", `Resolved miningType="${miningType}" does not match ship equipment (detected: ${detectedFromModules}) — overriding miningType for this cycle`);
-        miningType = detectedFromModules;
       }
+    }
+
+    // ── Leader: broadcast heartbeat AND target updates every 30 seconds ──
+    // Always broadcast current state to keep followers updated
+    // NOTE: This must be AFTER the target variables are declared (below)
+    
+    // ── Re-evaluate mining type and target from settings each cycle ──
+    let miningType: "ore" | "gas" | "ice" | "radioactive" = "ore";
+    if (settings.miningType === "auto") {
+      const detected = await detectMiningType(ctx, cachedModules || undefined);
+      if (!detected) {
+        // CRITICAL FIX: Refresh cached modules and try again
+        ctx.log("warn", "Mining type detection failed — refreshing cached modules and retrying");
+        cachedModules = await cacheShipModules(ctx);
+        const retryDetected = await detectMiningType(ctx, cachedModules || undefined);
+        if (!retryDetected) {
+          ctx.log("error", "Cannot determine mining type even after refreshing modules — please check ship equipment");
+          await ctx.sleep(30000);
+          continue;
+        }
+        miningType = retryDetected;
+      } else {
+        miningType = detected;
+      }
+   } else {
+      miningType = settings.miningType;
+    }
+
+    // CRITICAL FIX: Validate miningType against actual ship equipment after resolution.
+    // Prevents the miner from looping forever in an impossible mode (e.g. forced "gas" with no gas harvester).
+    const detectedFromModules = await detectMiningType(ctx, cachedModules || undefined);
+    if (detectedFromModules && detectedFromModules !== miningType) {
+      ctx.log("warn", `Resolved miningType="${miningType}" does not match ship equipment (detected: ${detectedFromModules}) — overriding miningType for this cycle`);
+      miningType = detectedFromModules;
+    }
 
     // Deep core capability check - needed for target selection
     const deepCoreCap = await getDeepCoreCapability(ctx, fieldTestActive);
@@ -1792,7 +1898,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // Smart target selection: when mining type is auto-detected, only use the
     // matching target field (no cross-type fallback). A gas harvester should
     // never be forced to mine ore just because targetGas is empty.
-    // When mining type is manually forced, fall back to other targets as backup.
+// When mining type is manually forced, fall back to other targets as backup.
+    // CRITICAL: Radioactive miners should NEVER mine regular ores - they must stay in radioactive mode
+    // Gas/Ice miners can fall back to other types if their primary target is unavailable
     let targetResource = "";
     let resourceLabel = "";
     const isAutoDetected = settings.miningType === "auto";
@@ -1804,7 +1912,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       targetResource = isAutoDetected ? (useDeepCore ? settings.targetDeepCore : settings.targetOre) : ( (useDeepCore ? settings.targetDeepCore : settings.targetOre) || settings.targetGas || settings.targetIce);
       resourceLabel = (targetResource === settings.targetGas && targetResource !== "") ? "gas" : (targetResource === settings.targetIce && targetResource !== "" ? "ice" : (targetResource === settings.targetDeepCore && targetResource !== "" ? "deep core" : "ore"));
     } else if (miningType === "radioactive") {
-      targetResource = isAutoDetected ? settings.targetRadioactive : (settings.targetRadioactive || settings.targetOre || settings.targetGas);
+      // Radioactive miners MUST mine radioactive ores only - no fallback to regular ores!
+      targetResource = isAutoDetected ? settings.targetRadioactive : settings.targetRadioactive;
       resourceLabel = "radioactive";
     } else {
       // gas
@@ -2274,8 +2383,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           effectiveTarget = flockTargetResource;
           ctx.log("mining", `Flock deep core target validated: ${flockTargetResource}`);
         }
+      } else if (isRadioactiveOre(flockTargetResource)) {
+        // Radioactive validation for flock target
+        if (miningType !== "radioactive") {
+          ctx.log("error", `Flock target ${flockTargetResource} is a radioactive ore — skipping (not in radioactive mode)`);
+          // Don't override effectiveTarget — continue with solo mining instead
+        } else {
+          effectiveTarget = flockTargetResource;
+          ctx.log("mining", `Flock radioactive target validated: ${flockTargetResource}`);
+        }
       } else {
-        effectiveTarget = flockTargetResource;
+        // Regular ore target - validate for radioactive miners
+        if (miningType === "radioactive") {
+          ctx.log("error", `Flock target ${flockTargetResource} is NOT a radioactive ore — skipping (radioactive miner must mine radioactive ores)`);
+          // Don't override effectiveTarget — continue with solo mining instead
+        } else {
+          effectiveTarget = flockTargetResource;
+        }
       }
     }
 
@@ -2711,7 +2835,8 @@ if (effectiveTarget) {
               rallySystem,
             );
             ctx.log("flock", `Announced target to flock: ${targetPoiName} @ ${targetSystemId} (${miningType})`);
-            await updateFlockPhase(settings.flockName, "traveling");
+            flockPhase = "traveling";
+            await updateFlockPhase(settings.flockName, "traveling", isFlockLeader);
           }
         }
       }
@@ -2785,6 +2910,12 @@ if (effectiveTarget) {
       yield "navigate_to_target";
       if (recoveredSession) {
         await updateMiningSession(bot.username, { state: "traveling_to_ore" });
+      }
+      
+      // Update flock phase to traveling for leader
+      if (isFlockLeader && settings.flockEnabled && settings.flockName) {
+        flockPhase = "traveling";
+        await updateFlockPhase(settings.flockName, "traveling", isFlockLeader);
       }
 
       // Flock followers wait for leader to arrive first (optional synchronization)
@@ -2958,7 +3089,7 @@ if (effectiveTarget) {
         
         if (settings.flockEnabled && settings.flockName) {
           // Update flock phase after successful arrival
-          await updateFlockPhase(settings.flockName, "traveling");
+          await updateFlockPhase(settings.flockName, "traveling", isFlockLeader);
         }
       }
     }
@@ -3582,7 +3713,8 @@ if (effectiveTarget) {
 
     // Update flock phase to mining
     if (settings.flockEnabled && settings.flockName && miningPoi) {
-      await updateFlockPhase(settings.flockName, "mining");
+      flockPhase = "mining";
+      await updateFlockPhase(settings.flockName, "mining", isFlockLeader);
       ctx.log("flock", "Flock phase updated: mining");
     }
 
@@ -3676,9 +3808,53 @@ if (effectiveTarget) {
 
     while (bot.state === "running") {
       const harvestNow = Date.now();
-      if (isFlockLeader && settings.flockEnabled && settings.flockName && (harvestNow - lastFlockHeartbeat) > 30_000) {
-        await broadcastFlockHeartbeat(settings.flockName, bot.username);
+
+      // ── Update follower state from flock ──
+      if (!isFlockLeader && settings.flockEnabled && settings.flockName) {
+        const updatedState = await readFlockState(settings.flockName);
+        if (updatedState) {
+          // Check if leader state is too stale (older than 120 seconds - must match readFlockState threshold)
+          if (Date.now() - updatedState.lastUpdate > 120_000) {
+            ctx.log("flock", `Leader state stale (${Math.round((Date.now() - updatedState.lastUpdate)/1000)}s) — returning home to wait for fresh coordination`);
+            yield "return_home";
+            await ensureDocked(ctx);
+            await ctx.sleep(10000);
+            continue;
+          }
+          flockTargetSystemId = updatedState.targetSystemId;
+          flockTargetResource = updatedState.targetResourceId;
+          flockMiningType = updatedState.miningType;
+          flockPhase = updatedState.phase;
+          ctx.log("flock", `Follower updating: target=${flockTargetResource || flockTargetSystemId}, phase=${flockPhase}`);
+        } else {
+          // No state - check if file is stale
+          const { existsSync, statSync } = await import("fs");
+          const { join } = await import("path");
+          const statePath = join(process.cwd(), "data", "flock_signals", `${settings.flockName}.json`);
+          if (existsSync(statePath)) {
+            const fileStat = statSync(statePath);
+            const ageMs = Date.now() - fileStat.mtimeMs;
+            if (ageMs > 120_000) {
+              ctx.log("flock", `Leader state stale (${Math.round(ageMs/1000)}s) — returning home to wait for fresh coordination`);
+              yield "return_home";
+              await ensureDocked(ctx);
+              await ctx.sleep(10000);
+              continue;
+            }
+          }
+        }
+      }
+      
+      if (isFlockLeader && settings.flockEnabled && settings.flockName && (harvestNow - lastFlockHeartbeat) > 10_000) {
+        await broadcastFlockHeartbeat(settings.flockName, bot.username, {
+          targetSystemId: targetSystemId || "",
+          targetResourceId: effectiveTarget || "",
+          miningType: miningType,
+          phase: flockPhase,
+        });
         lastFlockHeartbeat = harvestNow;
+        lastFlockStateUpdate = harvestNow;
+        ctx.log("flock", `Leader heartbeat: target=${effectiveTarget || "none"}, phase=${flockPhase}`);
       }
 
       await bot.refreshStatus();
@@ -4292,9 +4468,21 @@ if (effectiveTarget) {
 
       // Verify mining equipment before attempting to mine
       if (!await hasEquipmentForMiningType(ctx, miningType)) {
-        ctx.log("warn", "Mining equipment error: No mining equipment installed");
-        await ctx.sleep(5000);
-        continue;
+        ctx.log("warn", "Mining equipment error: No mining equipment installed — refreshing modules and re-detecting");
+        cachedModules = await cacheShipModules(ctx);
+        const retryDetected = await detectMiningType(ctx, cachedModules || undefined);
+        if (!retryDetected) {
+          ctx.log("error", "Still no mining equipment detected after refresh — clearing target and returning home to retry next cycle");
+          effectiveTarget = "";
+          targetResource = "";
+          if (recoveredSession) {
+            await failMiningSession(bot.username, "Equipment lost after refresh");
+            recoveredSession = null;
+          }
+          break;
+        }
+        miningType = retryDetected;
+        ctx.log("mining", `Re-detected mining type: ${miningType} after equipment refresh`);
       }
 
       const mineResp = await bot.exec("mine");
@@ -5397,7 +5585,8 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     // Signal flock that we're docking
     if (settings.flockEnabled && settings.flockName) {
       ctx.log("flock", "Signaling flock: miner docking...");
-      await updateFlockPhase(settings.flockName, "docked");
+      flockPhase = "docked";
+      await updateFlockPhase(settings.flockName, "docked", isFlockLeader);
     }
 
     const dockResp = await bot.exec("dock");
@@ -5564,11 +5753,6 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     await bot.refreshStatus();
     const endFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Cycle done — ${bot.credits} credits, ${endFuel}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
-
-    if (isFlockLeader && settings.flockEnabled && settings.flockName) {
-      await broadcastFlockHeartbeat(settings.flockName, bot.username);
-      lastFlockHeartbeat = Date.now();
-    }
   }
 
   // Unregister chat handler

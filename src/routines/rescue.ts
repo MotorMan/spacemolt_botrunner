@@ -159,6 +159,34 @@ function isPrimaryCreditTopOffBot(botUsername: string): boolean {
 }
 
 /**
+ * Check if this bot should ONLY run credit top-off (no rescue operations).
+ * Returns true if:
+ * - This bot is the primary credit top-off bot, AND
+ * - Fleet rescue bot is empty/none/different, AND
+ * - MAYDAY rescue bot is empty/none/different
+ * This allows a bot to be dedicated to credit top-off without doing actual rescues.
+ */
+function shouldOnlyCreditTopOff(botUsername: string): boolean {
+  const settings = getRescueSettings();
+  
+  // Must be the primary credit top-off bot
+  if (!settings.creditTopOffBot || botUsername !== settings.creditTopOffBot) {
+    return false;
+  }
+  
+  // If no fleet rescue bot is assigned (or it's a different bot), we're not doing fleet rescues
+  const fleetBotEmpty: boolean = !settings.fleetRescueBot || settings.fleetRescueBot === 'none' || settings.fleetRescueBot === '';
+  const fleetBotDifferent: boolean = !!(settings.fleetRescueBot && settings.fleetRescueBot !== botUsername);
+  
+  // If no mayday rescue bot is assigned (or it's a different bot), we're not doing mayday rescues
+  const maydayBotEmpty: boolean = !settings.maydayRescueBot || settings.maydayRescueBot === 'none' || settings.maydayRescueBot === '';
+  const maydayBotDifferent: boolean = !!(settings.maydayRescueBot && settings.maydayRescueBot !== botUsername);
+  
+  // We should only do credit top-off if we're NOT the fleet or mayday rescue bot
+  return (fleetBotEmpty || fleetBotDifferent) && (maydayBotEmpty || maydayBotDifferent);
+}
+
+/**
  * Check if this bot is the primary assigned for fleet rescue operations.
  * Returns true if this bot is the primary fleet rescue bot, or if no assignment exists (legacy behavior).
  */
@@ -1313,20 +1341,20 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     // Verify actual credits via debug log
     ctx.log("rescue", `💰 ${member.username} has 5 consecutive 0 credit readings, verifying via debug log...`);
     const actualCredits = await getActualCreditsFromLog(member.username, ctx);
+    
     if (actualCredits === null) {
-      ctx.log("rescue", `💰 Failed to verify credits for ${member.username} from log, skipping`);
-      continue;
-    }
-
-    if (actualCredits >= minThreshold) {
+      ctx.log("rescue", `💰 Failed to verify credits for ${member.username} from log, but has ${consecutiveCount} consecutive 0 readings - proceeding with top-off as fallback`);
+    } else if (actualCredits >= minThreshold) {
       ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr (>= ${minThreshold}), false 0 reading. Resetting count.`);
       consecutiveZeroCredits.delete(member.username);
       continue;
+    } else {
+      ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr, needs top-off`);
     }
 
-    // Proceed with top-off using verified credits
-    const needed = targetAmount - actualCredits;
-    ctx.log("rescue", `💰 Verified ${member.username} has ${actualCredits}cr, needs ${needed}cr to reach ${targetAmount}cr`);
+    const verifiedCredits = actualCredits ?? 0;
+    const needed = targetAmount - verifiedCredits;
+    ctx.log("rescue", `💰 ${member.username} verified credits: ${verifiedCredits}, needs ${needed}cr to reach ${targetAmount}cr`);
 
     const withdrawResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: needed }); // NEVER CHANGE THIS - credits must be withdrawn from faction storage using target=faction, not source=faction
     if (withdrawResp.error) {
@@ -1513,6 +1541,22 @@ export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext
   const homeSystem = settings.homeSystem || bot.system;
 
   ctx.log("system", "FuelTransfer bot online — ready to refuel stranded ships...");
+
+  // Check if this bot should ONLY do credit top-off (no rescue operations)
+  if (shouldOnlyCreditTopOff(bot.username)) {
+    ctx.log("rescue", "💰 CREDIT TOP-OFF ONLY MODE: Fleet and MAYDAY bots are not assigned to this bot");
+    ctx.log("rescue", "💰 Will ONLY perform credit top-off operations, skipping all rescue missions");
+    
+    // Start the credit top-off background loop and idle
+    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+    
+    while (bot.state === "running") {
+      await ctx.sleep(30000);
+    }
+    
+    stopCreditTopOffBackground();
+    return;
+  }
 
   if (settings.homeSystem) {
     ctx.log("system", `Home base configured: ${homeSystem}`);
@@ -1786,28 +1830,28 @@ skipToReturnHome = true;
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
 
-          // ── IMMEDIATE DUPLICATE CHECK: Prevent rapid-fire spam ──
-          // This MUST happen first, before any other processing, to prevent MASS SPAM
-          // when multiple MAYDAY messages arrive in quick succession
-          if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
-            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (1-hour cooldown)`);
-            markMaydayHandled(mayday);
-            markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
-            continue;
-          }
-          
+          // ── ESTABLISH 1-HOUR COOLDOWN IMMEDIATELY ──
+          // Mark as received BEFORE any checks to establish the cooldown upfront
+          // This prevents the MAYDAY from re-triggering even if accepted or declined
+          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
+          ctx.log("mayday_debug", `📝 MAYDAY from ${mayday.sender} marked as received (1-hour cooldown active)`);
+
           // ── DECLINED MAYDAY CHECK: Prevent spam for already-declined rescues ──
           // This prevents the bot from sending multiple decline messages for the same MAYDAY
+          // Check this FIRST, before the duplicate check, to catch declined MAYDAYS immediately
           if (isMaydayDeclined(mayday.sender, mayday.system, mayday.poi)) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - previously declined (1-hour cooldown)`);
             markMaydayHandled(mayday);
-            markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
             continue;
           }
           
-          // Mark as received IMMEDIATELY to catch subsequent rapid duplicates
-          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
-          ctx.log("mayday_debug", `📝 MAYDAY from ${mayday.sender} marked as received (1-hour cooldown active)`);
+          // ── IMMEDIATE DUPLICATE CHECK: Prevent rapid-fire spam ──
+          // This uses a 5-second grace period for newly received MAYDAYs
+          if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (1-hour cooldown)`);
+            markMaydayHandled(mayday);
+            continue;
+          }
 
           // Check if sender is a known player (from playerNames.json)
           const knownPlayer = isKnownPlayer(mayday.sender);
@@ -1815,6 +1859,7 @@ skipToReturnHome = true;
           if (!knownPlayer) {
             // Unknown sender - skip this MAYDAY (possible ambush)
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - not a known player (possible ambush)`);
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             markMaydayHandled(mayday);
             continue;
           }
@@ -1825,6 +1870,7 @@ skipToReturnHome = true;
           // Prevents wasting fuel on players who aren't actually in distress (potential ambushes)
           if (mayday.fuelPct > settings.maydayFuelThreshold) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - fuel too high (${mayday.fuelPct}% > ${settings.maydayFuelThreshold}% threshold)`);
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             markMaydayHandled(mayday);
             continue;
           }
@@ -1858,6 +1904,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 ctx.log("warn", `Failed to send MAYDAY decline message: ${e}`);
               }
             }
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             markMaydayHandled(mayday);
             continue;
           }
@@ -1867,6 +1914,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           const rescueDecision = shouldRescuePlayer(mayday.sender, ghostThresholdOverride);
           if (!rescueDecision.shouldRescue) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - ${rescueDecision.reason}`);
+            markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
             markMaydayHandled(mayday);
             continue;
           }
@@ -1880,6 +1928,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             // First check if this player is already locked out
             if (isMaydayPirateLocked(mayday.sender)) {
               ctx.log("mayday", `🔒 Ignoring MAYDAY from ${mayday.sender} - currently locked out (pirate base proximity)`);
+              markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
               markMaydayHandled(mayday);
               continue;
             }
@@ -4100,6 +4149,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     
     if (maxJumps > 0 && jumpsToTarget > maxJumps) {
       ctx.log("mayday", `⚠️ MAYDAY too far: ${jumpsToTarget} jumps (max: ${maxJumps}) - ignoring`);
+      markMaydayDeclined(mayday.sender, mayday.system, mayday.poi);
       markMaydayHandled(mayday);
       await ctx.sleep(5000);
       continue;
@@ -4602,6 +4652,22 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshStatus();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
+
+  // Check if this bot should ONLY do credit top-off (no rescue operations)
+  if (shouldOnlyCreditTopOff(bot.username)) {
+    ctx.log("rescue", "💰 CREDIT TOP-OFF ONLY MODE: Fleet and MAYDAY bots are not assigned to this bot");
+    ctx.log("rescue", "💰 Will ONLY perform credit top-off operations, skipping all rescue missions");
+    
+    // Start the credit top-off background loop and idle
+    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+    
+    while (bot.state === "running") {
+      await ctx.sleep(30000);
+    }
+    
+    stopCreditTopOffBackground();
+    return;
+  }
 
   // ── Register cooperation handler for Bot Chat Channel coordination ──
   if (isCooperationEnabled()) {

@@ -264,11 +264,14 @@ function selectShip() {
       const hiddenUtilityModules = [
         { id: 'onboard_hydrogen_refinery', name: 'Onboard Hydrogen Refinery', category: 'utility', cpu_usage: 22, power_usage: 56, wear: 0, size: 10 }
       ];
+      const hiddenDefenseModules = [
+        { id: 'force_field_generator_ii', name: 'Force Field Generator II', category: 'defense', cpu_usage: 11, power_usage: 29, wear: 0, special: 'invulnerable_5_ticks,cooldown_90' }
+      ];
 
       // Group modules by category
       const categories = {
         weapons: modules.filter(m => (m.category || m.type || '').toLowerCase().includes('weapon')),
-        defense: modules.filter(m => (m.category || m.type || '').toLowerCase().includes('defense') || (m.category || m.type || '').toLowerCase().includes('shield') || (m.category || m.type || '').toLowerCase().includes('armor')),
+        defense: [...modules.filter(m => (m.category || m.type || '').toLowerCase().includes('defense') || (m.category || m.type || '').toLowerCase().includes('shield') || (m.category || m.type || '').toLowerCase().includes('armor')), ...hiddenDefenseModules],
         utility: [...modules.filter(m => (m.category || m.type || '').toLowerCase().includes('utility') || (m.category || m.type || '').toLowerCase().includes('mining') || (m.category || m.type || '').toLowerCase().includes('cargo')), ...hiddenUtilityModules]
       };
 
@@ -410,6 +413,11 @@ function selectShip() {
           module = { id: 'cpu_co_processor', name: 'CPU Co-Processor', category: 'utility', cpu_usage: 0, power_usage: 3, wear: 0, cpu_bonus: 5 };
         } else if (moduleId === 'onboard_hydrogen_refinery') {
           module = { id: 'onboard_hydrogen_refinery', name: 'Onboard Hydrogen Refinery', category: 'utility', cpu_usage: 22, power_usage: 56, wear: 0, size: 10 };
+        }
+      }
+      if (!module && category === 'defense') {
+        if (moduleId === 'force_field_generator_ii') {
+          module = { id: 'force_field_generator_ii', name: 'Force Field Generator II', category: 'defense', cpu_usage: 11, power_usage: 29, wear: 0, special: 'invulnerable_5_ticks,cooldown_90' };
         }
       }
 
@@ -606,13 +614,19 @@ function selectShip() {
       const hiddenUtilityModules = {
         'onboard_hydrogen_refinery': { id: 'onboard_hydrogen_refinery', name: 'Onboard Hydrogen Refinery', category: 'utility', cpu_usage: 22, power_usage: 56, wear: 0, size: 10 }
       };
+      const hiddenDefenseModules = {
+        'force_field_generator_ii': { id: 'force_field_generator_ii', name: 'Force Field Generator II', category: 'defense', cpu_usage: 11, power_usage: 29, wear: 0, special: 'invulnerable_5_ticks,cooldown_90' }
+      };
 
       ['weapons', 'defense', 'utility'].forEach(cat => {
         (preset.modules[cat] || []).forEach(modId => {
           let mod = allModules.find(m => m.id === modId);
-          // Also check hidden modules for utility category
+          // Also check hidden modules for utility and defense categories
           if (!mod && cat === 'utility' && hiddenUtilityModules[modId]) {
             mod = hiddenUtilityModules[modId];
+          }
+          if (!mod && cat === 'defense' && hiddenDefenseModules[modId]) {
+            mod = hiddenDefenseModules[modId];
           }
           if (mod) {
             currentLoadout[cat].push(mod);

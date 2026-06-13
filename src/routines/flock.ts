@@ -201,6 +201,7 @@ export async function unregisterFlockMember(
 
 /**
  * Leader announces target selection to flock.
+ * Leader-only: writes directly to file, bypassing staleness check.
  */
 export async function announceFlockTarget(
   flockName: string,
@@ -212,7 +213,24 @@ export async function announceFlockTarget(
   miningType: "ore" | "gas" | "ice" | "radioactive" | "salvage",
   rallySystem?: string,
 ): Promise<void> {
-  const existingState = await readFlockState(flockName);
+  const { readFileSync, writeFileSync, existsSync, mkdirSync } = await import("fs");
+  const { join } = await import("path");
+  const flockDir = join(process.cwd(), "data", "flock_signals");
+  const flockPath = await getFlockStatePath(flockName);
+
+  if (!existsSync(flockDir)) {
+    mkdirSync(flockDir, { recursive: true });
+  }
+
+  let existingState: FlockState | undefined;
+  if (existsSync(flockPath)) {
+    try {
+      const raw = readFileSync(flockPath, "utf-8");
+      existingState = JSON.parse(raw) as FlockState;
+    } catch {
+      // fall through
+    }
+  }
 
   const newState: FlockState = {
     leader,
@@ -233,17 +251,57 @@ export async function announceFlockTarget(
 
 /**
  * Update flock phase.
+ * Leader-only: writes directly to file, bypassing staleness check.
  */
 export async function updateFlockPhase(
   flockName: string,
   phase: FlockState["phase"],
+  isLeader: boolean = false,
 ): Promise<void> {
-  const existingState = await readFlockState(flockName);
+  const { readFileSync, writeFileSync, existsSync, mkdirSync } = await import("fs");
+  const { join } = await import("path");
+  const flockDir = join(process.cwd(), "data", "flock_signals");
+  const flockPath = await getFlockStatePath(flockName);
 
-  if (existingState) {
-    existingState.phase = phase;
-    await writeFlockState(flockName, existingState);
+  if (!existsSync(flockDir)) {
+    mkdirSync(flockDir, { recursive: true });
   }
+
+  let existingState: FlockState;
+  if (existsSync(flockPath)) {
+    try {
+      const raw = readFileSync(flockPath, "utf-8");
+      existingState = JSON.parse(raw) as FlockState;
+    } catch {
+      existingState = {
+        leader: "",
+        targetSystemId: "",
+        targetPoiId: "",
+        targetPoiName: "",
+        targetResourceId: "",
+        miningType: "ore",
+        phase,
+        members: [],
+        lastUpdate: Date.now(),
+      };
+    }
+  } else {
+    existingState = {
+      leader: "",
+      targetSystemId: "",
+      targetPoiId: "",
+      targetPoiName: "",
+      targetResourceId: "",
+      miningType: "ore",
+      phase,
+      members: [],
+      lastUpdate: Date.now(),
+    };
+  }
+
+  existingState.phase = phase;
+  existingState.lastUpdate = Date.now();
+  writeFileSync(flockPath, JSON.stringify(existingState, null, 2));
 }
 
 // ── Salvage-Specific Functions ─────────────────────────────────
@@ -355,15 +413,25 @@ export async function isFlockTimeoutExpired(flockName: string): Promise<boolean>
 /**
  * Leader broadcasts a heartbeat/status update to keep flock state fresh.
  * Re-writes current state with an updated lastUpdate timestamp.
+ * Leader-only: reads directly from file, bypassing staleness check.
  */
 export async function broadcastFlockHeartbeat(
   flockName: string,
   leader: string,
   extra?: Partial<FlockState>,
 ): Promise<void> {
-  const existingState = await readFlockState(flockName);
+  const { readFileSync, writeFileSync, existsSync } = await import("fs");
+  const flockPath = await getFlockStatePath(flockName);
 
-  if (!existingState) {
+  if (!existsSync(flockPath)) {
+    return;
+  }
+
+  let existingState: FlockState;
+  try {
+    const raw = readFileSync(flockPath, "utf-8");
+    existingState = JSON.parse(raw) as FlockState;
+  } catch {
     return;
   }
 

@@ -568,7 +568,7 @@ export async function collectFromStorage(ctx: RoutineContext, minBalance: number
     }
     
     if (amountToWithdraw > 0) {
-      const wResp = await bot.exec("spacemolt_storage", { action: "withdraw", item_id: "credits", quantity: amountToWithdraw, target: "self", source: "storage" });
+      const wResp = await bot.exec("storage", { action: "withdraw", item_id: "credits", quantity: amountToWithdraw, target: "self", source: "storage" });
       if (!wResp.error) {
         ctx.log("trade", `Collected ${amountToWithdraw} credits from storage`);
         await bot.refreshStatus();
@@ -1790,6 +1790,12 @@ export async function navigateToSystem(
         // Fall through to retry logic below
       }
 
+      // Check for undefined/null error message (session loss indicator)
+      if (!jumpResp.error.message || jumpResp.error.message === "undefined") {
+        ctx.log("error", `Jump response has undefined/null error message - treating as session loss`);
+        return false;
+      }
+
       const errorMsg = jumpResp.error.message.toLowerCase();
 
       // Check for in_battle error - for escorts, this means they got pulled into a battle
@@ -1933,7 +1939,11 @@ export async function navigateToSystem(
     }
 
     ctx.log("travel", `Arrived in ${bot.system}`);
-    if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
+    if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) {
+      await sleep(1000);
+      await bot.refreshStatus();
+      return true;
+    }
     if (bot.state !== "running") return false;
   }
 
@@ -2889,6 +2899,28 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
   }
 }
 
+export async function buyInsurance(ctx: RoutineContext): Promise<void> {
+  const { bot } = ctx;
+  ctx.log("insurance", "Buying insurance for 7 days...");
+  const insureResp = await bot.exec("buy_insurance", { ticks: 9999 });
+  if (!insureResp.error && insureResp.result) {
+    const r = insureResp.result as Record<string, unknown>;
+    const msg = (r?.message as string) || `Insurance purchased for 7 days`;
+    ctx.log("insurance", msg);
+    logFactionActivity(ctx, "insurance", `Bought insurance: ${msg}`);
+    await bot.refreshStatus();
+  } else {
+    const errMsg = insureResp.error?.message || "Unknown error";
+    if (errMsg.toLowerCase().includes("already_insured")) {
+      ctx.log("insurance", "Already insured - skipping purchase");
+      logFactionActivity(ctx, "insurance", "Skipped - already insured");
+    } else {
+      ctx.log("insurance", `Insurance purchase failed: ${errMsg}`);
+      logFactionActivity(ctx, "insurance", `Failed: ${errMsg}`);
+    }
+  }
+}
+
 /**
  * Detect death (hull=0) and attempt recovery: claim insurance, dock, refuel, repair, re-insure.
  * Returns true if alive/recovered, false if stuck dead.
@@ -3553,8 +3585,11 @@ export function parseNearbyEntities(result: unknown): NearbyEntitiesResult {
  */
 export async function getBattleStatus(ctx: RoutineContext): Promise<BattleStatus | null> {
   const { bot } = ctx;
+  
+  // Always check API first to get fresh data
   const resp = await bot.exec("get_battle_status");
   if (resp.error || !resp.result) {
+    // On 502/524 errors, return null but don't log - rely on WebSocket state
     return null;
   }
 
@@ -4176,198 +4211,6 @@ export function parsePiratesFromBattleParticipants(battleParticipants: unknown[]
   };
 }
 
-// ── Fleet Commands ───────────────────────────────────────────
-
-export interface FleetMember {
-  player_id: string;
-  username: string;
-  is_leader: boolean;
-  system_id?: string;
-  poi_id?: string;
-  ship?: Record<string, unknown>;
-  modules?: Array<Record<string, unknown>>;
-  fuel_per_jump?: number;
-  cargo?: Array<Record<string, unknown>>;
-}
-
-export interface FleetStatusResponse {
-  action: string;
-  in_fleet: boolean;
-  fleet_id: string;
-  leader: string;
-  is_leader: boolean;
-  members: FleetMember[];
-  max_size: number;
-  system_id: string;
-  poi_id: string;
-  pending_invite?: boolean;
-  invites?: Array<{ player_id: string; username: string }>;
-}
-
-export interface FleetCreateResponse {
-  action: string;
-  fleet_id: string;
-  max_size: number;
-  message: string;
-}
-
-export async function fleetCreate(ctx: RoutineContext): Promise<{ success: boolean; fleetId?: string; message: string }> {
-  const { bot } = ctx;
-  const resp = await bot.exec("fleet", { action: "create" });
-  if (resp.error) {
-    return { success: false, message: resp.error.message };
-  }
-  const result = resp.result as Record<string, unknown>;
-  const structuredContent = (result?.structuredContent as FleetCreateResponse) || result;
-  return {
-    success: true,
-    fleetId: structuredContent.fleet_id as string,
-    message: structuredContent.message as string,
-  };
-}
-
-export interface FleetInviteResponse {
-  action: string;
-  fleet_id: string;
-  message: string;
-  invited: string[];
-}
-
-export async function fleetStatus(ctx: RoutineContext): Promise<FleetStatusResponse | null> {
-  const { bot } = ctx;
-  const resp = await bot.exec("fleet", { action: "status" });
-  if (resp.error) {
-    return null;
-  }
-  const result = resp.result as Record<string, unknown>;
-  const structuredContent = (result?.structuredContent as FleetStatusResponse) || result;
-  return structuredContent;
-}
-
-export async function fleetInvite(ctx: RoutineContext, playerId: string): Promise<{ success: boolean; message: string }> {
-  const { bot } = ctx;
-  const resp = await bot.exec("fleet", { action: "invite", id: playerId });
-  if (resp.error) {
-    return { success: false, message: resp.error.message };
-  }
-  const result = resp.result as Record<string, unknown>;
-  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
-  return {
-    success: true,
-    message: structuredContent.message as string,
-  };
-}
-
-export async function fleetKick(ctx: RoutineContext, playerId: string): Promise<{ success: boolean; message: string }> {
-  const { bot } = ctx;
-  const resp = await bot.exec("fleet", { action: "kick", id: playerId });
-  if (resp.error) {
-    return { success: false, message: resp.error.message };
-  }
-  const result = resp.result as Record<string, unknown>;
-  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
-  return {
-    success: true,
-    message: structuredContent.message as string,
-  };
-}
-
-export async function fleetLeave(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
-  const { bot } = ctx;
-  const resp = await bot.exec("fleet", { action: "leave" });
-  if (resp.error) {
-    return { success: false, message: resp.error.message };
-  }
-  const result = resp.result as Record<string, unknown>;
-  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
-  return {
-    success: true,
-    message: structuredContent.message as string,
-  };
-}
-
-export async function fleetDisband(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
-  const { bot } = ctx;
-  const resp = await bot.exec("fleet", { action: "disband" });
-  if (resp.error) {
-    return { success: false, message: resp.error.message };
-  }
-  const result = resp.result as Record<string, unknown>;
-  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
-  return {
-    success: true,
-    message: structuredContent.message as string,
-  };
-}
-
-export async function fleetAccept(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
-  const { bot } = ctx;
-  const resp = await bot.exec("fleet", { action: "accept" });
-  if (resp.error) {
-    return { success: false, message: resp.error.message };
-  }
-  const result = resp.result as Record<string, unknown>;
-  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
-  return {
-    success: true,
-    message: structuredContent.message as string,
-  };
-}
-
-export async function fleetDecline(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
-  const { bot } = ctx;
-  const resp = await bot.exec("fleet", { action: "decline" });
-  if (resp.error) {
-    return { success: false, message: resp.error.message };
-  }
-  const result = resp.result as Record<string, unknown>;
-  const structuredContent = (result?.structuredContent as FleetInviteResponse) || result;
-  return {
-    success: true,
-    message: structuredContent.message as string,
-  };
-}
-
-export async function fleetJump(ctx: RoutineContext, targetSystem: string): Promise<{ success: boolean; message: string }> {
-  const { bot } = ctx;
-  const resp = await bot.exec("fleet", { action: "jump", target_system: targetSystem });
-  if (resp.error) {
-    return { success: false, message: resp.error.message };
-  }
-  return { success: true, message: "Fleet jump commanded" };
-}
-
-export async function fleetDock(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
-  const { bot } = ctx;
-  const resp = await bot.exec("fleet", { action: "dock" });
-  if (resp.error) {
-    return { success: false, message: resp.error.message };
-  }
-  return { success: true, message: "Fleet dock commanded" };
-}
-
-export async function fleetUndock(ctx: RoutineContext): Promise<{ success: boolean; message: string }> {
-  const { bot } = ctx;
-  const resp = await bot.exec("fleet", { action: "undock" });
-  if (resp.error) {
-    return { success: false, message: resp.error.message };
-  }
-  return { success: true, message: "Fleet undock commanded" };
-}
-
-export function getFleetMemberByUsername(status: FleetStatusResponse | null, username: string): FleetMember | null {
-  if (!status?.members) return null;
-  const lower = username.toLowerCase();
-  return status.members.find(m => m.username.toLowerCase() === lower) || null;
-}
-
-export function isFleetLeader(status: FleetStatusResponse | null, username: string): boolean {
-  if (!status) return false;
-  if (status.is_leader) return true;
-  const member = getFleetMemberByUsername(status, username);
-  return member?.is_leader ?? false;
-}
-
 // ── Customs Inspection ───────────────────────────────────────────
 
 /**
@@ -4434,12 +4277,79 @@ export async function checkCustomsInspection(
  */
 export { getBotCustomsStats };
 
-const MOBILE_CAPITAL_NOT_FOUND_REGEX = /It's called a Mobile Capital for a reason[^.]*\.?\s*Jump to (\w+) to find it/i;
+export const MOBILE_CAPITAL_NOT_FOUND_REGEX = /It's called a Mobile Capital for a reason[^.]*\.?\s*Jump to (\w+) to find it/i;
 
 export function parseTravelHint(errorMessage: string): string | null {
   if (!errorMessage) return null;
   const match = MOBILE_CAPITAL_NOT_FOUND_REGEX.exec(errorMessage);
   return match ? match[1] : null;
+}
+
+export async function smartTravel(
+  ctx: RoutineContext,
+  stationId: string,
+  opts?: {
+    target_system?: string;
+    fuelThresholdPct?: number;
+    hullThresholdPct?: number;
+    noJettison?: boolean;
+    autoCloak?: boolean;
+  },
+): Promise<{ success: boolean; usedHint: boolean; hintSystem?: string }> {
+  const { bot } = ctx;
+  const maxRetries = 3;
+  let currentTargetSystemId = opts?.target_system ?? getMobileCapitolSystem();
+  let hintSystem: string | null = null;
+  let usedHint = false;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    ctx.log("travel", `Traveling to ${stationId}${currentTargetSystemId ? ` in ${currentTargetSystemId}` : ""}... (attempt ${attempt + 1}/${maxRetries})`);
+    const travelResp = await bot.exec("travel", { target_poi: stationId, target_system: currentTargetSystemId });
+
+    if (!travelResp.error) {
+      ctx.log("travel", `Arrived at ${stationId}`);
+      return { success: true, usedHint, hintSystem: hintSystem || undefined };
+    }
+
+    const errorMsg = travelResp.error?.message || "";
+    ctx.log("error", `Travel failed: ${errorMsg}`);
+
+    if (!hintSystem) {
+      const parsedHint = parseTravelHint(errorMsg);
+      if (parsedHint) {
+        ctx.log("travel", `[error] travel: It's called a Mobile Capital for a reason — it's not here right now. Jump to ${parsedHint} to find it.`);
+        hintSystem = parsedHint;
+        usedHint = true;
+      }
+    }
+
+    if (hintSystem && attempt < maxRetries - 1) {
+      ctx.log("travel", `Rerouting to hint system ${hintSystem}...`);
+      const navResult = await navigateToSystem(ctx, hintSystem, {
+        fuelThresholdPct: opts?.fuelThresholdPct ?? 40,
+        hullThresholdPct: opts?.hullThresholdPct ?? 30,
+        noJettison: opts?.noJettison,
+        autoCloak: opts?.autoCloak,
+      });
+
+      if (!navResult) {
+        ctx.log("error", `Failed to navigate to hint system ${hintSystem}`);
+        return { success: false, usedHint, hintSystem };
+      }
+
+      const jumpResp = await bot.exec("jump", { target_system: hintSystem });
+      if (jumpResp.error && !jumpResp.error.message.includes("already")) {
+        ctx.log("error", `Jump to ${hintSystem} failed: ${jumpResp.error.message}`);
+        return { success: false, usedHint, hintSystem };
+      }
+
+      ctx.log("travel", `Jumped to ${hintSystem}, retrying travel to ${stationId}...`);
+      currentTargetSystemId = hintSystem;
+      hintSystem = null;
+    }
+  }
+
+  return { success: false, usedHint, hintSystem: hintSystem || undefined };
 }
 
 export async function travelToStationWithHint(

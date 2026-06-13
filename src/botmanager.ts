@@ -19,14 +19,20 @@ import { returnHomeRoutine } from "./routines/return_home.js";
 import { commandReceiverRoutine } from "./routines/command_receiver.js";
 import { fleetHunterCommanderRoutine } from "./routines/fleet_hunter_commander.js";
 import { fleetHunterSubordinateRoutine } from "./routines/fleet_hunter_subordinate.js";
-import { escortRoutine } from "./routines/escort.js";
+import { escortRoutine } from "./routines/escort-fleet.js";
+import { escortFlockRoutine } from "./routines/escort-flock.js";
 import { fuelCellSellerRoutine } from "./routines/fuelCellSeller.js";
 import { fuelTransportRoutine } from "./routines/fuelTransfer.js";
+import { civilianTransportRoutine } from "./routines/civilianTransport.js";
+import { pathfinderTestRoutine } from "./routines/pathfinder_test.js";
+import { moduleSellerRoutine } from "./routines/moduleSeller.js";
 import { mapStore } from "./mapstore.js";
 import { catalogStore } from "./catalogstore.js";
 import { formatBearing, getPathfinderTravelTime } from "./pathfinder.js";
 import { flushFactionStorageCache } from "./factionStorageCache.js";
-import { WebServer, type WebAction, type WebActionResult, loadSettings } from "./web/server.js";
+import { WebServer, type WebAction, type WebActionResult, loadSettings, saveLastUsedRoutine, getLastUsedRoutine, getAllLastUsedRoutines, saveStoppedState, getStoppedState, clearStoppedState } from "./web/server.js";
+import { ChatWebServer } from "./web/chatserver.js";
+import { chatBuffer } from "./chatbuffer.js";
 import { setLogSink } from "./ui.js";
 import { debugLogForBot, logBotActivity } from "./debug.js";
 import { reconnectQueue } from "./reconnectqueue.js";
@@ -35,6 +41,9 @@ import { massDisconnectDetector } from "./massdisconnect.js";
 import { addManualRescueRequest, type ManualRescueRequest } from "./manualrescue.js";
 import { botChatChannel, type BotChatMessage, type BotChatChannel } from "./bot_chat_channel.js";
 import { flushMinerActivity } from "./routines/minerActivity.js";
+import { type SyncSettings } from "./client_sync_types.js";
+import { ClientSyncSlave } from "./client_sync_slave.js";
+import { buyInsurance } from "./routines/common.js";
 
 interface BotState {
   wasRunning: boolean;
@@ -46,6 +55,7 @@ const SESSIONS_DIR = join(BASE_DIR, "sessions");
 
 const bots: Map<string, Bot> = new Map();
 let server: WebServer;
+let chatServer: ChatWebServer;
 let aiChatService: AiChatService | null = null;
 
 // Track failed session restore attempts per bot (timestamps in ms)
@@ -115,7 +125,11 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   cargo_mover: { name: "CargoMover", fn: cargoMoverRoutine },
   return_home: { name: "ReturnHome", fn: returnHomeRoutine },
   command_receiver: { name: "CommandReceiver", fn: commandReceiverRoutine },
-  escort: { name: "Escort", fn: escortRoutine },
+  escort: { name: "Escort (Fleet)", fn: escortRoutine },
+  escort_flock: { name: "Escort (Flock)", fn: escortFlockRoutine },
+  pathfinder_test: { name: "PathfinderTest", fn: pathfinderTestRoutine },
+  civilian_transport: { name: "CivilianTransport", fn: civilianTransportRoutine },
+  module_seller: { name: "ModuleSeller", fn: moduleSellerRoutine },
 };
 
 // ── Auto-discover existing sessions ─────────────────────────
@@ -173,6 +187,8 @@ async function handleAction(action: WebAction): Promise<WebActionResult> {
       return handleStart(action);
     case "stop":
       return handleStop(action);
+    case "stop_after_cycle":
+      return handleStopAfterCycle(action);
     case "add":
       return handleAdd(action);
     case "register":
@@ -229,6 +245,49 @@ async function handleSaveSettings(action: WebAction): Promise<WebActionResult> {
 
   server.saveRoutineSettings(routine, s);
   server.logSystem(`Settings saved for ${routine}`);
+  
+  // Update client sync slave settings if changed
+  if (routine === "clientSync") {
+    const newSettings: SyncSettings = {
+      enabled: (s.enabled as boolean) ?? false,
+      mode: ((s.mode as string) || "slave"),
+      masterUrl: ((s.masterUrl as string) || ""),
+      apiKey: ((s.apiKey as string) || ""),
+      password: ((s.password as string) || ""),
+      label: ((s.label as string) || ""),
+      pollIntervalSec: ((s.pollIntervalSec as number) || 15),
+      syncMap: ((s.syncMap as boolean) ?? true),
+      syncMarket: ((s.syncMarket as boolean) ?? true),
+      syncCatalog: ((s.syncCatalog as boolean) ?? true),
+      syncStats: ((s.syncStats as boolean) ?? true),
+      syncBotChat: ((s.syncBotChat as boolean) ?? true),
+      syncPlayerNames: ((s.syncPlayerNames as boolean) ?? true),
+      syncCoordination: ((s.syncCoordination as boolean) ?? true),
+      syncCivilianTransport: ((s.syncCivilianTransport as boolean) ?? true),
+      syncRescue: ((s.syncRescue as boolean) ?? true),
+      allowRemoteBotsInDropdowns: ((s.allowRemoteBotsInDropdowns as boolean) ?? true),
+      remoteBotNameStyle: ((s.remoteBotNameStyle as "prefix" | "suffix") || "prefix"),
+      pushLocalDiscoveries: ((s.pushLocalDiscoveries as boolean) ?? true),
+    };
+    const syncSlave = (globalThis as any).syncSlave as ClientSyncSlave | undefined;
+    if (newSettings.enabled && newSettings.mode === "slave" && newSettings.masterUrl) {
+      if (syncSlave) {
+        syncSlave.updateSettings(newSettings);
+      } else {
+        const newSlave = new ClientSyncSlave(newSettings);
+        newSlave.start();
+        (globalThis as any).syncSlave = newSlave;
+        server.logSystem(`Client sync slave started`);
+      }
+    } else {
+      if (syncSlave) {
+        syncSlave.stop();
+        delete (globalThis as any).syncSlave;
+        server.logSystem(`Client sync slave stopped`);
+      }
+    }
+  }
+  
   return { ok: true, message: `${routine} settings saved`, settings: server.settings };
 }
 
@@ -331,6 +390,26 @@ async function handlePathfinderCalc(action: WebAction): Promise<WebActionResult>
   return { ok: false, error: "Provide from+to for bearing calc, or originSystem+bearing to simulate, or just bearing for reverse" };
 }
 
+async function handleAutoRestart(botName: string): Promise<void> {
+  const stoppedState = getStoppedState(botName);
+  if (stoppedState) {
+    server.logSystem(`Bot ${botName} was stopped intentionally (${stoppedState}), skipping auto-restart`);
+    return;
+  }
+
+  const bot = bots.get(botName);
+  if (!bot || bot.state !== "error") return;
+  
+  const lastRoutine = getLastUsedRoutine(botName);
+  if (!lastRoutine || !ROUTINES[lastRoutine]) {
+    server.logSystem(`Bot ${botName} in ERROR state but no last-used routine found, defaulting to miner`);
+    await handleStart({ type: "start", bot: botName, routine: "miner" });
+    return;
+  }
+  server.logSystem(`Bot ${botName} in ERROR state, auto-restarting with last-used routine: ${lastRoutine}`);
+  await handleStart({ type: "start", bot: botName, routine: lastRoutine });
+}
+
 async function handleStart(action: WebAction): Promise<WebActionResult> {
   const botName = action.bot;
   if (!botName) return { ok: false, error: "No bot specified" };
@@ -338,11 +417,18 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   const bot = bots.get(botName);
   if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
   if (bot.state === "running") return { ok: false, error: `${botName} is already running` };
+  if (bot.state === "error") {
+    bot.clearError();
+  }
+
+  // Clear any stopped state when manually starting the bot
+  clearStoppedState(botName);
 
   const routineKey = action.routine || "miner";
   const routine = ROUTINES[routineKey];
   if (!routine) return { ok: false, error: `Unknown routine: ${routineKey}` };
 
+  saveLastUsedRoutine(botName, routineKey);
   server.logSystem(`Starting ${bot.username} with ${routine.name} routine...`);
 
   // Store routine parameters on bot object if provided (for manual_rescue etc.)
@@ -368,6 +454,7 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
   bot.start(routineKey, routine.fn, chatStartOpts).then(() => {
     server.logSystem(`Bot ${bot.username} routine finished.`);
     server.clearBotAssignment(botName);
+    clearStoppedState(botName);
     // Clear params after routine completes
     (bot as unknown as Record<string, unknown>).routineParams = undefined;
   }).catch((err: unknown) => {
@@ -376,9 +463,12 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
     server.clearBotAssignment(botName);
     // Clear params after error
     (bot as unknown as Record<string, unknown>).routineParams = undefined;
+    // Auto-restart on ERROR state
+    handleAutoRestart(botName);
   });
 
   server.saveBotAssignment(botName, routineKey);
+  saveLastUsedRoutine(botName, routineKey);
 
   return { ok: true, message: `Started ${botName} with ${routine.name}` };
 }
@@ -393,8 +483,23 @@ async function handleStop(action: WebAction): Promise<WebActionResult> {
 
   bot.stop();
   server.clearBotAssignment(botName);
+  saveStoppedState(botName, "user");
   server.logSystem(`Stop signal sent to ${bot.username}`);
   return { ok: true, message: `Stop signal sent to ${botName}` };
+}
+
+async function handleStopAfterCycle(action: WebAction): Promise<WebActionResult> {
+  const botName = action.bot;
+  if (!botName) return { ok: false, error: "No bot specified" };
+
+  const bot = bots.get(botName);
+  if (!bot) return { ok: false, error: `Bot not found: ${botName}` };
+  if (bot.state !== "running") return { ok: false, error: `${botName} is not running` };
+
+  bot.stopAfterCycle();
+  saveStoppedState(botName, "user");
+  server.logSystem(`Stop after cycle requested for ${bot.username}`);
+  return { ok: true, message: `Stop after cycle requested for ${botName} — will stop after current transport cycle` };
 }
 
 async function handleEmergencyReturn(): Promise<WebActionResult> {
@@ -410,6 +515,7 @@ async function handleEmergencyReturn(): Promise<WebActionResult> {
   for (const bot of runningBots) {
     bot.stop();
     server.clearBotAssignment(bot.username);
+    saveStoppedState(bot.username, "emergency");
     server.logSystem(`Stop requested for ${bot.username}`);
   }
 
@@ -484,6 +590,7 @@ async function handleRemove(action: WebAction): Promise<WebActionResult> {
   bots.delete(botName);
   server.clearBotAssignment(botName);
   server.removePerBotSettings(botName);
+  clearStoppedState(botName);
 
   // Delete session directory
   const sessionDir = join(SESSIONS_DIR, botName);
@@ -577,6 +684,29 @@ async function handleChat(action: WebAction): Promise<WebActionResult> {
   }
 
   server.logSystem(`[${channel || "system"}] ${bot.username}: ${message}`);
+
+  const targetId = (action as any).targetId as string | undefined;
+  if (targetId) {
+    chatBuffer.addMessage({
+      botUsername: botName,
+      channel: channel || "system",
+      sender: bot.username,
+      content: message,
+      timestamp: Date.now(),
+      direction: "out",
+      targetId,
+    });
+  } else {
+    chatBuffer.addMessage({
+      botUsername: botName,
+      channel: channel || "system",
+      sender: bot.username,
+      content: message,
+      timestamp: Date.now(),
+      direction: "out",
+    });
+  }
+
   return { ok: true, message: `Message sent as ${bot.username}` };
 }
 
@@ -610,6 +740,10 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
   ]);
   if (refreshCommands.has(command)) {
     await bot.refreshStatus();
+
+    if (command === "switch_ship") {
+      await buyInsurance({ bot, log: (cat, msg) => bot.log(cat, msg), sleep: (ms: number) => new Promise(r => setTimeout(r, ms)), api: bot.api });
+    }
 
     // Also refresh the recipient bot after gift/trade
     if (command === "send_gift" || command === "trade_offer") {
@@ -685,6 +819,46 @@ async function main(): Promise<void> {
     (globalThis as any).shutdownServer("web-ui");
   };
 
+  server.logSystem("SpaceMolt Bot Manager v0.2");
+  server.logSystem("Loading saved sessions...");
+  discoverBots();
+
+  const chatPort = parseInt(process.env.CHAT_PORT || String(Number(settings.general?.port || 3000) + 1000), 10);
+  chatServer = new ChatWebServer(chatPort);
+  chatServer.start();
+
+  // Initialize client sync slave if configured
+  const csSettings = settings.clientSync as Record<string, unknown> | undefined;
+  if (csSettings) {
+    const clientSyncSettings: SyncSettings = {
+      enabled: csSettings.enabled as boolean ?? false,
+      mode: (csSettings.mode as string) || "slave",
+      masterUrl: (csSettings.masterUrl as string) || "",
+      apiKey: (csSettings.apiKey as string) || "",
+      password: (csSettings.password as string) || "",
+      label: (csSettings.label as string) || "",
+      pollIntervalSec: (csSettings.pollIntervalSec as number) || 15,
+      syncMap: (csSettings.syncMap as boolean) ?? true,
+      syncMarket: (csSettings.syncMarket as boolean) ?? true,
+      syncCatalog: (csSettings.syncCatalog as boolean) ?? true,
+      syncStats: (csSettings.syncStats as boolean) ?? true,
+      syncBotChat: (csSettings.syncBotChat as boolean) ?? true,
+      syncPlayerNames: (csSettings.syncPlayerNames as boolean) ?? true,
+      syncCoordination: (csSettings.syncCoordination as boolean) ?? true,
+      syncCivilianTransport: (csSettings.syncCivilianTransport as boolean) ?? true,
+      syncRescue: (csSettings.syncRescue as boolean) ?? true,
+      allowRemoteBotsInDropdowns: (csSettings.allowRemoteBotsInDropdowns as boolean) ?? true,
+      remoteBotNameStyle: (csSettings.remoteBotNameStyle as "prefix" | "suffix") || "prefix",
+      pushLocalDiscoveries: (csSettings.pushLocalDiscoveries as boolean) ?? true,
+    };
+    if (clientSyncSettings.enabled && clientSyncSettings.mode === "slave" && clientSyncSettings.masterUrl) {
+      const syncSlave = new ClientSyncSlave(clientSyncSettings);
+      syncSlave.start();
+      (globalThis as any).syncSlave = syncSlave;
+      server.logSystem(`Client sync slave enabled, connecting to ${clientSyncSettings.masterUrl}`);
+    }
+  }
+
   // Route global ui.log() calls through the web server
   setLogSink((category, message) => {
     const timestamp = new Date().toLocaleTimeString("en-US", { hour12: false });
@@ -747,11 +921,6 @@ async function main(): Promise<void> {
   });
   server.logSystem("Mass disconnect detector initialized");
 
-  server.logSystem("SpaceMolt Bot Manager v0.2");
-  server.logSystem("Loading saved sessions...");
-
-  discoverBots();
-
   // Seed galaxy map from public API so pathfinding works from first run
   server.logSystem("Seeding galaxy map from /api/map...");
   mapStore.seedFromMapAPI().then(({ seeded, known, failed }) => {
@@ -766,13 +935,23 @@ async function main(): Promise<void> {
 
   if (bots.size > 0) {
     const assignments = server.getBotAssignments();
+    const existingLastUsedRoutines = getAllLastUsedRoutines();
+    
+    // Migrate any missing last-used routines from assignments (one-time migration)
+    for (const [botName, routine] of Object.entries(assignments)) {
+      if (!existingLastUsedRoutines[botName] && routine && ROUTINES[routine]) {
+        saveLastUsedRoutine(botName, routine);
+      }
+    }
+    
     server.logSystem(`Found ${bots.size} saved bot(s): ${[...bots.keys()].sort((a, b) => a.localeCompare(b)).join(", ")}`);
     server.logSystem(`Bot assignments: ${JSON.stringify(assignments)}`);
+    server.logSystem(`Last-used routines: ${JSON.stringify(getAllLastUsedRoutines())}`);
     // Push initial bot list to UI immediately (shows as "idle" with default values)
     refreshStatusTable();
 
     // Session resume is fast (5s delay to match renewal queue), full login requires rate limiting (25s delay)
-    const SESSION_RESUME_DELAY_MS = 5000;
+    const SESSION_RESUME_DELAY_MS = 7000;
     const FULL_LOGIN_DELAY_MS = 13000;
     let botIndex = 0;
 
@@ -799,10 +978,15 @@ async function main(): Promise<void> {
                 server.logSystem(`Catalog fetch failed: ${err}`);
               }
             }
-            const routineKey = assignments[name];
+            const routineKey = getLastUsedRoutine(name) || assignments[name];
             if (routineKey && ROUTINES[routineKey]) {
-              server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-              await handleStart({ type: "start", bot: name, routine: routineKey });
+              const stoppedState = getStoppedState(name);
+              if (stoppedState) {
+                server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
+              } else {
+                server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+                await handleStart({ type: "start", bot: name, routine: routineKey });
+              }
             }
             return;
           }
@@ -835,13 +1019,18 @@ async function main(): Promise<void> {
                   server.logSystem(`Catalog fetch failed: ${err}`);
                 }
               }
-              const routineKey = assignments[name];
+              const routineKey = getLastUsedRoutine(name) || assignments[name];
               if (!routineKey || !ROUTINES[routineKey]) {
                 server.logSystem(`${name} logged in but no routine assigned`);
                 return;
               }
-              server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-              await handleStart({ type: "start", bot: name, routine: routineKey });
+              const stoppedState = getStoppedState(name);
+              if (stoppedState) {
+                server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
+              } else {
+                server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+                await handleStart({ type: "start", bot: name, routine: routineKey });
+              }
             }).catch((err) => {
               server.logSystem(`Forced login failed for ${name}: ${err}`);
               refreshStatusTable();
@@ -870,13 +1059,18 @@ async function main(): Promise<void> {
                     server.logSystem(`Catalog fetch failed: ${err}`);
                   }
                 }
-                const routineKey = assignments[name];
+                const routineKey = getLastUsedRoutine(name) || assignments[name];
                 if (!routineKey || !ROUTINES[routineKey]) {
                   server.logSystem(`${name} logged in but no routine assigned`);
                   return;
                 }
-                server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
-                await handleStart({ type: "start", bot: name, routine: routineKey });
+                const stoppedState = getStoppedState(name);
+                if (stoppedState) {
+                  server.logSystem(`Bot ${name} was stopped intentionally (${stoppedState}), skipping auto-resume`);
+                } else {
+                  server.logSystem(`Auto-resuming ${name} with ${ROUTINES[routineKey].name}...`);
+                  await handleStart({ type: "start", bot: name, routine: routineKey });
+                }
               }).catch((err) => {
                 server.logSystem(`Login failed for ${name}: ${err}`);
                 refreshStatusTable();
@@ -965,6 +1159,16 @@ async function main(): Promise<void> {
     }
   }, 24 * 60 * 60 * 1000));
 
+  // Periodic ERROR state check - auto-restart bots that crashed
+  intervals.push(setInterval(() => {
+    for (const [name, bot] of bots) {
+      if (bot.state === "error") {
+        server.logSystem(`Detected ${name} in ERROR state, attempting auto-restart...`);
+        handleAutoRestart(name);
+      }
+    }
+  }, 30000));
+
   // Start HTTP + WebSocket server
   server.start();
 
@@ -1003,10 +1207,14 @@ async function main(): Promise<void> {
       server.logSystem(`ERROR flushing miner activity data: ${err}`);
     });
     server.stop();
+    chatServer.stop();
     
     // If restarting due to mass session loss, clear all session files
     // This forces fresh logins on restart, avoiding the invalid session loop
-    if (restart && signal === "mass_session_loss") {
+    // But only if the setting allows it (default: true for backward compatibility)
+    const generalSettings = server.getSettings("general");
+    const clearSession = generalSettings.clearSessionOnRestart !== false;
+    if (restart && signal === "mass_session_loss" && clearSession) {
       server.logSystem(`Clearing session files for all bots...`);
       const sessionsDir = join(BASE_DIR, "sessions");
       if (existsSync(sessionsDir)) {

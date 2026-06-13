@@ -169,6 +169,26 @@ main {
   text-transform: uppercase;
   letter-spacing: 0.5px;
 }
+.bot-table-separator {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+.bot-table-header .station-fuel-container {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+.bot-table-header .station-fuel-item {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-family: 'SF Mono', 'Fira Code', monospace;
+}
+.bot-table-header .station-fuel-separator {
+  color: var(--border);
+  font-weight: 300;
+}
 .bot-table-scroll {
   flex: 1;
   min-height: 0;
@@ -588,6 +608,8 @@ button.primary { background: #238636; border-color: #2ea043; color: #fff; }
 button.primary:hover { background: #2ea043; }
 button.danger { background: #da3633; border-color: #f85149; color: #fff; }
 button.danger:hover { background: #f85149; }
+button.warning { background: #a371f7; border-color: #a371f7; color: #fff; }
+button.warning:hover { background: #b98cff; }
 button.sm { padding: 3px 10px; font-size: 11px; }
 
 /* ── Log panels ─────────────────────────────────── */
@@ -1372,6 +1394,18 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   cursor: default;
 }
 
+/* Ore summary in system body */
+.sys-ore-summary {
+  margin-bottom: 8px;
+}
+.sys-ore-summary .resource-label {
+  color: var(--text-dim);
+}
+.sys-ore-summary .resource-value {
+  color: var(--text-bright);
+  font-weight: 500;
+}
+
 /* POI inside system body */
 .poi-card {
   background: var(--bg);
@@ -1964,6 +1998,69 @@ button.sm { padding: 3px 10px; font-size: 11px; }
 }
 
 /* ── Faction page ───────────────────────────────────── */
+.skills-content {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 12px;
+}
+.skills-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+}
+.skills-bot-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+}
+.skills-bot-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+.skills-list {
+  font-size: 12px;
+}
+.skills-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 0;
+  border-bottom: 1px solid #21262d;
+}
+.skills-item:last-child { border-bottom: none; }
+.skills-name {
+  color: var(--text);
+  font-weight: 500;
+}
+.skills-level {
+  color: var(--text-dim);
+  font-family: monospace;
+  font-size: 11px;
+}
+.skills-xp {
+  display: block;
+  color: var(--text-dim);
+  font-size: 9px;
+  opacity: 0.7;
+  margin-top: 2px;
+}
+.skills-name.piloting { color: var(--green); font-weight: 600; }
+.skills-name.combat { color: var(--yellow); }
+.skills-name.piracy { color: var(--red); font-weight: 600; }
+.skills-name.engineering { color: #a371f7; }
+.skills-name.navigation { color: var(--cyan); }
+.skills-empty {
+  color: var(--text-dim);
+  font-style: italic;
+  text-align: center;
+  padding: 40px;
+}
 .faction-layout {
   display: flex;
   gap: 16px;
@@ -3609,14 +3706,273 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   padding: 8px 10px;
   font-size: 13px;
 }
-#nameShipModal input[type="text"]:disabled {
-  opacity: 0.7;
-  cursor: not-allowed;
-}
 
 
 
 .weapon-energy {
   color: var(--cyan);
   font-weight: 500;
+}
+
+/* ── Client Sync Status ─────────────────────────────── */
+.sync-status-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 6px;
+}
+.sync-status-dot.connected { background: var(--green); }
+.sync-status-dot.disconnected { background: var(--red); }
+.sync-status-dot.reconnecting { background: var(--yellow); animation: pulse 1s infinite; }
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+.sync-settings-row { margin-bottom: 12px; }
+.sync-settings-row label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
+.sync-settings-row input, .sync-settings-row select { width: 100%; background: var(--bg-input); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 6px; font-size: 13px; }
+
+/* ── Catalog Page ───────────────────────────────────── */
+.catalog-layout {
+  display: flex;
+  gap: 16px;
+  flex: 1;
+  min-height: 0;
+}
+
+.catalog-sidebar {
+  width: 220px;
+  flex-shrink: 0;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.catalog-sidebar-header {
+  padding: 10px 14px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.catalog-sidebar-body {
+  padding: 8px;
+  overflow-y: auto;
+  flex: 1;
+  min-height: 0;
+}
+
+.catalog-category {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 10px;
+  font-size: 12px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  margin-bottom: 2px;
+  transition: all 0.15s;
+}
+
+.catalog-category:hover {
+  background: var(--bg-row-hover);
+  border-color: var(--border);
+}
+
+.catalog-category.active {
+  background: rgba(88, 166, 255, 0.1);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.cat-name {
+  font-weight: 500;
+}
+
+.cat-count {
+  font-size: 10px;
+  color: var(--text-dim);
+  background: #21262d;
+  padding: 1px 6px;
+  border-radius: 10px;
+}
+
+.catalog-content {
+  flex: 1;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px;
+  overflow-y: auto;
+}
+
+.catalog-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.catalog-header h3 {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-bright);
+  margin: 0;
+}
+
+.cat-count {
+  font-size: 11px;
+  color: var(--text-dim);
+  background: #21262d;
+  padding: 2px 8px;
+  border-radius: 10px;
+}
+
+.catalog-subcats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 16px;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.subcat-btn {
+  padding: 4px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.subcat-btn:hover {
+  background: var(--bg-row-hover);
+  color: var(--text);
+}
+
+.subcat-btn.active {
+  background: rgba(88, 166, 255, 0.15);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.catalog-items {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+  gap: 8px;
+}
+
+.catalog-item {
+  background: var(--bg);
+  border: 1px solid #21262d;
+  border-radius: 6px;
+  padding: 10px 12px;
+  transition: background 0.15s;
+}
+
+.catalog-item:hover {
+  background: var(--bg-row-hover);
+  border-color: var(--accent);
+}
+
+.item-name {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-bright);
+  margin-bottom: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.item-meta {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
+.item-type,
+.item-subtype {
+  font-size: 10px;
+  padding: 1px 5px;
+  background: #21262d;
+  color: var(--text-dim);
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.catalog-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-dim);
+  text-align: center;
+}
+
+.catalog-empty .empty-icon {
+  font-size: 48px;
+  margin-bottom: 16px;
+}
+
+.catalog-empty .empty-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 8px;
+}
+
+.catalog-empty .empty-desc {
+  font-size: 12px;
+}
+
+.catalog-sort {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.ship-filters {
+  margin-bottom: 12px;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.ship-filters select {
+  background: var(--bg-input);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+@media (max-width: 768px) {
+  .catalog-layout {
+    flex-direction: column;
+  }
+  .catalog-sidebar {
+    width: 100%;
+    max-height: 150px;
+  }
 }

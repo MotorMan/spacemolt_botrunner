@@ -3,6 +3,7 @@ import { join } from "path";
 import { cachedFetch } from "./httpcache.js";
 import { log } from "./ui.js";
 import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
+import { onPoiUpdate } from "./client_sync_hooks.js";
 
 // ── Data model ──────────────────────────────────────────────
 
@@ -205,6 +206,10 @@ export interface StoredSystem {
   pirate_sightings: PirateSighting[];
   wrecks: WreckRecord[];
   last_updated: string;
+  /** Server-verified visited status from get_map */
+  visited?: boolean;
+  /** ISO timestamp of first visit from get_map */
+  visited_at?: string | null;
 }
 
 export interface MapData {
@@ -392,6 +397,14 @@ class MapStore {
 
     sys.last_updated = now();
 
+    // Merge visited status from get_map
+    if (systemData.visited !== undefined) {
+      sys.visited = Boolean(systemData.visited);
+    }
+    if (systemData.visited_at !== undefined) {
+      sys.visited_at = (systemData.visited_at as string) || null;
+    }
+
     // Merge connections
     const conns = systemData.connections as Array<Record<string, unknown>> | undefined;
     if (Array.isArray(conns)) {
@@ -477,6 +490,7 @@ class MapStore {
 
     this.data.systems[id] = sys;
     this.scheduleSave();
+    void onPoiUpdate(id, systemData as Record<string, unknown>);
   }
 
   /** Update market prices for a station POI from view_market response. */
@@ -667,6 +681,17 @@ class MapStore {
     this.scheduleSave();
   }
 
+  /** Mark a system as visited (sets visited=true and visited_at timestamp). */
+  markSystemVisited(systemId: string): void {
+    const sys = this.data.systems[systemId];
+    if (!sys) return;
+
+    sys.visited = true;
+    sys.visited_at = now();
+    sys.last_updated = now();
+    this.scheduleSave();
+  }
+
   /** Get minutes since a POI was last explored. Returns Infinity if never explored. */
   minutesSinceExplored(systemId: string, poiId: string): number {
     const sys = this.data.systems[systemId];
@@ -762,17 +787,20 @@ class MapStore {
     const poi = sys.pois.find((p) => p.id === poiId);
     if (!poi) return;
 
-    poi.resources = resources.map((r) => ({
-      resource_id: r.resource_id,
-      name: r.name,
-      richness: r.richness,
-      remaining: r.remaining,
-      max_remaining: r.max_remaining,
-      depletion_percent: r.depletion_percent,
-      last_scanned: now(),
-    }));
+    const timestamp = now();
+    poi.resources = resources
+      .filter((r) => r.remaining <= r.max_remaining)
+      .map((r) => ({
+        resource_id: r.resource_id,
+        name: r.name,
+        richness: r.richness,
+        remaining: r.remaining,
+        max_remaining: r.max_remaining,
+        depletion_percent: r.depletion_percent,
+        last_scanned: timestamp,
+      }));
 
-    poi.last_updated = now();
+    poi.last_updated = timestamp;
     this.scheduleSave();
   }
 
@@ -843,18 +871,21 @@ class MapStore {
 
     // Update resources if provided
     if (poiData.resources && poiData.resources.length > 0) {
-      poi.resources = poiData.resources.map((r) => ({
-        resource_id: r.resource_id,
-        name: r.name,
-        richness: r.richness,
-        remaining: r.remaining,
-        max_remaining: r.max_remaining,
-        depletion_percent: r.depletion_percent,
-        last_scanned: now(),
-      }));
+      poi.resources = poiData.resources
+        .filter((r) => r.remaining <= r.max_remaining)
+        .map((r) => ({
+          resource_id: r.resource_id,
+          name: r.name,
+          richness: r.richness,
+          remaining: r.remaining,
+          max_remaining: r.max_remaining,
+          depletion_percent: r.depletion_percent,
+          last_scanned: now(),
+        }));
     }
 
     this.scheduleSave();
+    void onPoiUpdate(systemId, poiData as Record<string, unknown>);
   }
 
   /** Mark an ore as depleted at a POI. */
@@ -871,6 +902,72 @@ class MapStore {
       existing.depleted_at = now();
       this.scheduleSave();
     }
+  }
+
+  /** Clear all resource data from a POI. Use when POI data is known to be corrupted or outdated. */
+  clearPoiResources(systemId: string, poiId: string): void {
+    const sys = this.data.systems[systemId];
+    if (!sys) return;
+
+    const poi = sys.pois.find((p) => p.id === poiId);
+    if (!poi) return;
+
+    poi.resources = [];
+    poi.ores_found = [];
+    poi.last_updated = now();
+    this.scheduleSave();
+  }
+
+  /** Reset a POI to its initial state, clearing all discovered data. */
+  resetPoi(systemId: string, poiId: string): void {
+    const sys = this.data.systems[systemId];
+    if (!sys) return;
+
+    const poi = sys.pois.find((p) => p.id === poiId);
+    if (!poi) return;
+
+    poi.ores_found = [];
+    poi.resources = [];
+    poi.market = [];
+    poi.orders = [];
+    poi.missions = [];
+    poi.last_explored = null;
+    poi.last_updated = now();
+    this.scheduleSave();
+  }
+
+  /** Check if a resource record has corrupted data (remaining > max_remaining). */
+  private isResourceCorrupted(resource: ResourceRecord): boolean {
+    return resource.remaining > resource.max_remaining;
+  }
+
+  /** Check if a POI has any corrupted resource data. */
+  hasCorruptedResources(systemId: string, poiId: string): boolean {
+    const sys = this.data.systems[systemId];
+    if (!sys) return false;
+
+    const poi = sys.pois.find((p) => p.id === poiId);
+    if (!poi || !poi.resources) return false;
+
+    return poi.resources.some((r) => this.isResourceCorrupted(r));
+  }
+
+  /** Reset all POIs with corrupted resource data across the entire map. */
+  resetCorruptedPois(): { reset: number; total: number } {
+    let resetCount = 0;
+    let totalCount = 0;
+
+    for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      for (const poi of sys.pois) {
+        if (poi.resources && poi.resources.some((r) => this.isResourceCorrupted(r))) {
+          totalCount++;
+          this.clearPoiResources(sysId, poi.id);
+          resetCount++;
+        }
+      }
+    }
+
+    return { reset: resetCount, total: totalCount };
   }
 
   /** Record a pirate sighting in a system. */
@@ -1200,6 +1297,9 @@ findOreLocations(oreId: string): Array<{
       if (this.isPirateSystem(sysId)) continue;
       const hasStation = sys.pois.some((p) => p.has_base || !!p.base_id);
       for (const poi of sys.pois) {
+        // Skip POIs with corrupted resource data
+        if (poi.resources && poi.resources.some((r) => r.remaining > r.max_remaining)) continue;
+
         // CRITICAL FIX: Only skip POIs where the SPECIFIC oreId being searched is exhausted.
         // Previously this skipped any POI with ANY exhausted resource, so a POI containing
         // iron_ore + copper_ore would be skipped when searching for iron_ore if copper was depleted.
@@ -2072,6 +2172,17 @@ findOreLocations(oreId: string): Array<{
       }));
   }
 
+  /** Get all system positions as a record keyed by system ID. */
+  getAllSystemPositionsRecord(): Record<string, { x: number; y: number }> {
+    const result: Record<string, { x: number; y: number }> = {};
+    for (const [id, sys] of Object.entries(this.data.systems)) {
+      if (sys.position && typeof sys.position.x === "number" && typeof sys.position.y === "number") {
+        result[id] = { x: sys.position.x, y: sys.position.y };
+      }
+    }
+    return result;
+  }
+
   calculatePathfinderBearing(fromSystemId: string, toSystemId: string): number | null {
     const from = this.data.systems[fromSystemId.toLowerCase()];
     const to = this.data.systems[toSystemId.toLowerCase()];
@@ -2120,6 +2231,36 @@ findOreLocations(oreId: string): Array<{
 
   getPathfinderTravelTime(proj: number): { ticks: number; seconds: number } {
     return getPathfinderTravelTime(proj);
+  }
+
+  /** Get systems that have not been visited according to the server's visited flag. */
+  getUnvisitedSystems(): Array<{ systemId: string; systemName: string; visited: boolean; visited_at: string | null }> {
+    const unvisited: Array<{ systemId: string; systemName: string; visited: boolean; visited_at: string | null }> = [];
+    for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      if (!sys.visited) {
+        unvisited.push({
+          systemId: sysId,
+          systemName: sys.name || sysId,
+          visited: sys.visited ?? false,
+          visited_at: sys.visited_at ?? null,
+        });
+      }
+    }
+    return unvisited;
+  }
+
+  /** Get count of visited vs unvisited systems. */
+  getVisitStats(): { total: number; visited: number; unvisited: number } {
+    let visitedCount = 0;
+    for (const sys of Object.values(this.data.systems)) {
+      if (sys.visited) visitedCount++;
+    }
+    const total = Object.keys(this.data.systems).length;
+    return {
+      total,
+      visited: visitedCount,
+      unvisited: total - visitedCount,
+    };
   }
 }
 

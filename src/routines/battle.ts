@@ -233,10 +233,21 @@ export async function getWeaponModules(ctx: RoutineContext): Promise<WeaponModul
   return weapons;
 }
 
+/**
+ * Ensure the hunter has ammo loaded.
+ * Uses absolute threshold for low-capacity weapons (≤50 ammo), percent threshold for high-capacity weapons (>50 ammo).
+ * Uses proper reload command with weapon_instance_id and ammo_item_id from cargo.
+ * Returns false if out of ammo and needs to dock for resupply.
+ * 
+ * Handles both traditional weapons (with reported ammo) and missile launchers
+ * (which may not report ammo state but still need cargo ammo).
+ */
 export async function ensureAmmoLoaded(
   ctx: RoutineContext,
   _threshold: number,
   maxAttempts: number,
+  absoluteThreshold: number = 1,
+  percentThreshold: number = 25,
 ): Promise<boolean> {
   const { bot } = ctx;
   const weapons = await getWeaponModules(ctx);
@@ -254,15 +265,19 @@ export async function ensureAmmoLoaded(
   let anyReloaded = false;
   for (const weapon of weapons) {
     if (!weapon.ammoType) {
-      ctx.log("warn", `Weapon "${weapon.name}" has no ammo type defined — skipping`);
+      ctx.log("combat", `Weapon "${weapon.name}" does not use ammo — skipping reload check`);
       continue;
     }
 
     let needsReload = false;
     if (weapon.maxAmmo > 0) {
-      needsReload = weapon.currentAmmo <= Math.floor(weapon.maxAmmo * 0.25);
+      const absThreshold = weapon.maxAmmo <= 50 ? absoluteThreshold : 0;
+      const pctThreshold = weapon.maxAmmo > 50 ? percentThreshold : 0;
+      const absCheck = absThreshold > 0 ? weapon.currentAmmo <= absThreshold : false;
+      const pctCheck = pctThreshold > 0 ? weapon.currentAmmo <= Math.floor(weapon.maxAmmo * pctThreshold / 100) : false;
+      needsReload = absCheck || pctCheck;
       if (needsReload) {
-        ctx.log("combat", `Weapon "${weapon.name}" ammo low: ${weapon.currentAmmo}/${weapon.maxAmmo} (<=25%, type: ${weapon.ammoType})`);
+        ctx.log("combat", `Weapon "${weapon.name}" ammo low: ${weapon.currentAmmo}/${weapon.maxAmmo} (abs:${absThreshold}, pct:${pctThreshold}%)`);
       }
     } else {
       const matchingAmmo = catalogStore.findMatchingAmmoInCargo(cargoItems, weapon.ammoType);
@@ -316,19 +331,28 @@ export async function ensureAmmoLoaded(
   const updatedWeapons = await getWeaponModules(ctx);
   let updatedTotalAmmo = 0;
   let updatedTotalMaxAmmo = 0;
+  let hasAmmoWeapons = false;
 
   for (const weapon of updatedWeapons) {
-    updatedTotalAmmo += weapon.currentAmmo;
-    updatedTotalMaxAmmo += weapon.maxAmmo;
+    if (weapon.ammoType) {
+      hasAmmoWeapons = true;
+      updatedTotalAmmo += weapon.currentAmmo;
+      updatedTotalMaxAmmo += weapon.maxAmmo;
+    }
   }
 
-  if (updatedTotalMaxAmmo > 0) {
+  if (hasAmmoWeapons && updatedTotalMaxAmmo > 0) {
     const updatedPct = (updatedTotalAmmo / updatedTotalMaxAmmo) * 100;
     ctx.log("combat", `Post-reload ammo: ${updatedTotalAmmo}/${updatedTotalMaxAmmo} (${updatedPct.toFixed(0)}%)`);
     return updatedTotalAmmo > 0 || anyReloaded;
   }
 
-  return updatedTotalAmmo > 0 || anyReloaded;
+  if (hasAmmoWeapons) {
+    ctx.log("combat", `Post-reload ammo: ${updatedTotalAmmo} rounds available`);
+    return updatedTotalAmmo > 0 || anyReloaded;
+  }
+
+  return true;
 }
 
 // ── Emergency Flee ────────────────────────────────────────────
@@ -555,6 +579,7 @@ export async function engageTarget(
   sideId?: number, // Optional: if provided, skip analysis and directly join this side
   skipScan: boolean = false,
   repairThreshold: number = 0,   // if >0, enables in-combat emergency repair/recharge using repairThreshold as %
+  onlyNPCs: boolean = false,     // if true, flee when encountering players
 ): Promise<boolean> {
   const { bot } = ctx;
   if (!target.id) return false;
@@ -567,7 +592,7 @@ export async function engageTarget(
       ctx.log("error", `Failed to join battle side ${sideId}: ${engageResp.error.message}`);
       return false;
     }
-    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold);
+    return await fightJoinedBattle(ctx, target, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
   }
 
   const battleStatus = await getBattleStatus(ctx);
@@ -591,7 +616,7 @@ export async function engageTarget(
     }
 
     const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold);
+    return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
   }
 
   ctx.log("combat", `🎯 Engaging ${target.name}...`);
@@ -637,7 +662,7 @@ export async function engageTarget(
         // Prefer a real participant from the battle we just detected.
         // This is the key fix for "boss jumped us while we were attacking something else".
         const betterTarget = pickRealBattleTarget(battleStatus, analysis.sideId) ?? target;
-        return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold);
+        return await fightJoinedBattle(ctx, betterTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, true, 80, onlyNPCs);
       }
     }
     return false;
@@ -684,6 +709,11 @@ export async function fightFreshBattle(
     ctx.log("combat", `Advancing to zone ${zone + 1}/3...`);
     const advResp = await bot.exec("battle", { action: "advance" });
     if (advResp.error) {
+      const errMsg = advResp.error.message.toLowerCase();
+      if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+        ctx.log("combat", `✅ Battle ended during advance - victory!`);
+        return true;
+      }
       ctx.log("error", `Advance failed: ${advResp.error.message}`);
       break;
     }
@@ -717,12 +747,14 @@ export async function fightFreshBattle(
 
     if (tickCount > MAX_BATTLE_TICKS) {
       ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
+      await checkAndPraiseMorgThar(ctx, true);
       return true;
     }
 
     const status = await getBattleStatus(ctx);
     if (!status) {
       ctx.log("combat", `✅ ${target.name} eliminated — battle complete (${tickCount} ticks, victory!)`);
+      await checkAndPraiseMorgThar(ctx, true);
       return true;
     }
 
@@ -743,6 +775,10 @@ export async function fightFreshBattle(
         target = better;
         await bot.exec("battle", { action: "target", target_id: better.id });
         await ctx.sleep(300);
+      } else if (!better) {
+        ctx.log("combat", `✅ No valid targets remaining — battle complete (${tickCount} ticks, victory!)`);
+        await checkAndPraiseMorgThar(ctx, true);
+        return true;
       }
     }
 
@@ -792,6 +828,13 @@ export async function fightFreshBattle(
   }
 }
 
+const PLAYER_KEYWORDS = ["pirate", "drifter", "raider", "outlaw", "bandit", "corsair", "marauder", "hostile", "executioner", "sentinel", "prowler", "apex", "razor", "striker", "rampart", "stalwart", "bastion", "onslaught", "iron", "strike"];
+
+function isPlayerParticipant(participant: import("../types/game.js").BattleParticipant): boolean {
+  const name = (participant.username || "").toLowerCase();
+  return !PLAYER_KEYWORDS.some(kw => name.includes(kw));
+}
+
 /** Pick a real enemy participant from the current battle (opposite side of ourSideId).
  *  Prefers boss-like names when present. Returns null if no valid enemy is listed yet. */
 function pickRealBattleTarget(
@@ -829,6 +872,66 @@ function pickRealBattleTarget(
   } as NearbyEntity;
 }
 
+const MORG_THAR_NAME = "Morg'Thar";
+
+/**
+ * Check if we just battled alongside Morg'Thar and send a Klingon praise message.
+ * This is called after a battle ends successfully.
+ */
+export async function checkAndPraiseMorgThar(
+  ctx: RoutineContext,
+  battleJustEnded: boolean,
+): Promise<void> {
+  if (!battleJustEnded) return;
+
+  const { bot } = ctx;
+  const aiChatService = (globalThis as any).aiChatService;
+  if (!aiChatService || typeof aiChatService.translateToKlingon !== "function") {
+    ctx.log("combat", "AI Chat service not available for Morg'Thar praise");
+    return;
+  }
+
+  const battleStatus = await getBattleStatus(ctx);
+  if (!battleStatus) return;
+
+  const wasWithMorgThar = battleStatus.participants.some(p => 
+    p.username?.toLowerCase() === MORG_THAR_NAME.toLowerCase() ||
+    p.player_id?.toLowerCase() === MORG_THAR_NAME.toLowerCase()
+  );
+
+  if (!wasWithMorgThar) {
+    ctx.log("combat", "Did not fight alongside Morg'Thar this battle");
+    return;
+  }
+
+  const ourPlayerName = bot.username;
+  const praiseMessage = `${ourPlayerName} and I have defeated our enemies together. A victory worthy of the Empire!`;
+
+  ctx.log("combat", `Translating praise for Morg'Thar to Klingon...`);
+  const translation = await aiChatService.translateToKlingon(
+    praiseMessage,
+    "battle",
+    ourPlayerName
+  );
+
+  if (!translation.ok) {
+    ctx.log("combat", `Klingon translation failed: ${translation.error}`);
+    return;
+  }
+
+  const klingonMessage = translation.message || praiseMessage;
+  ctx.log("combat", `Sending Klingon praise to system chat: ${klingonMessage}`);
+
+  const chatResp = await bot.exec("chat", {
+    channel: "system",
+    content: klingonMessage,
+  });
+
+  if (chatResp.error) {
+    ctx.log("error", `Failed to send Klingon praise: ${chatResp.error.message}`);
+  }
+}
+
 export async function fightJoinedBattle(
   ctx: RoutineContext,
   target: NearbyEntity | null,
@@ -838,6 +941,7 @@ export async function fightJoinedBattle(
   repairThreshold: number = 0,
   canFlee: boolean = true,
   shieldRechargePct: number = 80,
+  onlyNPCs: boolean = false,
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
@@ -897,12 +1001,14 @@ export async function fightJoinedBattle(
 
     if (tickCount > MAX_BATTLE_TICKS) {
       ctx.log("combat", `⚠️ Battle timeout after ${MAX_BATTLE_TICKS} ticks — assuming victory or server issue`);
+      await checkAndPraiseMorgThar(ctx, true);
       return true;
     }
 
     const status = await getBattleStatus(ctx);
     if (!status) {
       ctx.log("combat", `✅ Battle complete — victory! (${tickCount} ticks)`);
+      await checkAndPraiseMorgThar(ctx, true);
       return true;
     }
 
@@ -924,6 +1030,15 @@ export async function fightJoinedBattle(
         targetParticipant = status.participants.find(
           p => p.player_id === better.id || p.username === better.name
         );
+        // Check if new target is a player and we should flee
+        if (onlyNPCs && targetParticipant && isPlayerParticipant(targetParticipant)) {
+          ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
+          await emergencyFleeSpam(ctx, `target switched to player`);
+          return false;
+        }
+      } else if (!better) {
+        ctx.log("combat", `✅ No valid targets remaining — battle complete (${tickCount} ticks)!`);
+        return true;
       }
     }
 
@@ -931,6 +1046,12 @@ export async function fightJoinedBattle(
       ctx.log("combat", `⚠️ ${currentTarget.name} marked destroyed but battle still active — waiting...`);
       await ctx.sleep(2000);
       continue;
+    }
+
+    if (onlyNPCs && targetParticipant && isPlayerParticipant(targetParticipant)) {
+      ctx.log("combat", `🚨 ${currentTarget?.name ?? "Enemy"} is a PLAYER — fleeing (onlyNPCs=true)!`);
+      await emergencyFleeSpam(ctx, `target is a player`);
+      return false;
     }
 
     await bot.refreshStatus();
@@ -998,10 +1119,28 @@ export async function fightJoinedBattle(
     // Advance to engaged if enemy is in inner/mid and we're not there yet
     if (enemyZoneNum >= 1 && ourZoneNum < 3) {
       ctx.log("combat", `⚔️ Advancing to engaged (enemy in ${enemyZone})`);
-      await bot.exec("battle", { action: "advance" });
+      const advResp = await bot.exec("battle", { action: "advance" });
+      if (advResp.error) {
+        const errMsg = advResp.error.message.toLowerCase();
+        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+          ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+          await checkAndPraiseMorgThar(ctx, true);
+          return true;
+        }
+        ctx.log("error", `Advance failed: ${advResp.error.message}`);
+      }
       await ctx.sleep(10000);
     } else {
-      await bot.exec("battle", { action: "stance", stance: "fire" });
+      const stanceResp = await bot.exec("battle", { action: "stance", stance: "fire" });
+      if (stanceResp.error) {
+        const errMsg = stanceResp.error.message.toLowerCase();
+        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+          ctx.log("combat", `✅ Battle ended (stance failed: not in battle) - victory!`);
+          await checkAndPraiseMorgThar(ctx, true);
+          return true;
+        }
+        ctx.log("error", `Stance failed: ${stanceResp.error.message}`);
+      }
       await ctx.sleep(10000);
     }
   }

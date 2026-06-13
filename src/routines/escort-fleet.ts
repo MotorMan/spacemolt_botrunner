@@ -248,7 +248,7 @@ async function checkPositionAndCoordinate(
     sender: bot.username,
     recipients: [minerName],
     channel: "escort",
-    content: "QUERY_LOCATION"
+    content: "LOCATION_QUERY"
   });
   
   ctx.log("escort", `Sent location query to ${minerName}...`);

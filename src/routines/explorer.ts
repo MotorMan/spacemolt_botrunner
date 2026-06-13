@@ -88,6 +88,9 @@ interface ShipListing {
   last_updated: string;
 }
 
+/** Threshold in days for considering a ship listing stale and removing it. */
+const SHIP_LISTING_EXPIRY_DAYS = 30;
+
 interface ShipsForSaleData {
   lastSaved: string;
   listings: Record<string, ShipListing>;
@@ -134,14 +137,20 @@ function saveMarketDetails(data: MarketDetailsData): void {
   writeFileSync(MARKET_DETAILS_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
 }
 
-function loadShipsForSale(): ShipsForSaleData {
+function loadShipsForSale(log?: (cat: string, msg: string) => void): ShipsForSaleData {
   if (!existsSync(DATA_DIR)) {
     mkdirSync(DATA_DIR, { recursive: true });
   }
   if (existsSync(SHIPS_FOR_SALE_FILE)) {
     try {
       const raw = readFileSync(SHIPS_FOR_SALE_FILE, "utf-8");
-      return JSON.parse(raw) as ShipsForSaleData;
+      const data = JSON.parse(raw) as ShipsForSaleData;
+      const removed = cleanupExpiredShipListings(data);
+      if (removed > 0 && log) {
+        log("info", `Removed ${removed} expired ship listing(s) from shipsForSale.json`);
+        saveShipsForSale(data);
+      }
+      return data;
     } catch {
       // Corrupt file — start fresh
     }
@@ -155,6 +164,19 @@ function saveShipsForSale(data: ShipsForSaleData): void {
   }
   data.lastSaved = now();
   writeFileSync(SHIPS_FOR_SALE_FILE, JSON.stringify(data, null, 2) + "\n", "utf-8");
+}
+
+function cleanupExpiredShipListings(data: ShipsForSaleData): number {
+  const cutoff = Date.now() - SHIP_LISTING_EXPIRY_DAYS * 24 * 60 * 60 * 1000;
+  let removed = 0;
+  for (const [listingId, listing] of Object.entries(data.listings)) {
+    const lastUpdated = new Date(listing.last_updated).getTime();
+    if (isNaN(lastUpdated) || lastUpdated < cutoff) {
+      delete data.listings[listingId];
+      removed++;
+    }
+  }
+  return removed;
 }
 
 function loadRawMissions(): RawMissionsData {
@@ -280,7 +302,7 @@ const RESOURCE_REFRESH_MINS = 120;
 
 // ── Per-bot settings ─────────────────────────────────────────
 
-export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan";
+export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all";
 
 function getExplorerSettings(username?: string): {
   mode: ExplorerMode;
@@ -361,7 +383,7 @@ function getExplorerSettings(username?: string): {
       : false;
 
   return {
-    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : "explore") as ExplorerMode,
+    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : "explore") as ExplorerMode,
     acceptMissions,
     focusAreaSystem,
     maxJumps,
@@ -387,6 +409,13 @@ export function setExplorerMode(username: string, mode: ExplorerMode): void {
 export function setExplorerDeepCoreScan(username: string, enabled: boolean): void {
   writeSettings({
     [username]: { explorerMode: enabled ? "deep_core_scan" : "explore" },
+  });
+}
+
+/** Persist visit_all mode setting for a specific bot. */
+export function setExplorerVisitAll(username: string, enabled: boolean): void {
+  writeSettings({
+    [username]: { explorerMode: enabled ? "visit_all" : "explore" },
   });
 }
 
@@ -465,6 +494,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
   if (initialSettings.mode === "deep_core_scan") {
     yield* deepCoreScanRoutine(ctx);
+    return;
+  }
+  if (initialSettings.mode === "visit_all") {
+    yield* visitAllRoutine(ctx);
     return;
   }
 
@@ -640,6 +673,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       yield* deepCoreScanRoutine(ctx);
       return;
     }
+    if (modeCheck.mode === "visit_all") {
+      ctx.log("system", "Mode changed to visit_all — switching routines...");
+      yield* visitAllRoutine(ctx);
+      return;
+    }
 
     // ── Get current system data ──
     yield "scan_system";
@@ -655,6 +693,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
     visitedSystems.add(systemId);
     visitedSystemTimes.set(systemId, Date.now());
+    mapStore.markSystemVisited(systemId);
     if (path.length === 0) {
       path.push(systemId); // Initialize path with starting system
     }
@@ -1207,6 +1246,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("travel", `Jumping to ${random.name || random.id}...`);
         const jumpResp = await bot.exec("jump", { target_system: random.id });
         if (jumpResp.error) {
+          if (!jumpResp.error.message) {
+            ctx.log("error", `Jump response has undefined/null error message`);
+            await ctx.sleep(10000);
+            continue;
+          }
           const msg = jumpResp.error.message.toLowerCase();
           // CRITICAL: Check for battle interrupt error
           if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
@@ -1290,6 +1334,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("travel", `Jumping to ${nextSystem.name || nextSystem.id}...`);
     const jumpResp = await bot.exec("jump", { target_system: nextSystem.id });
     if (jumpResp.error) {
+      if (!jumpResp.error.message) {
+        ctx.log("error", `Jump response has undefined/null error message`);
+        await ctx.sleep(10000);
+        continue;
+      }
       const msg = jumpResp.error.message.toLowerCase();
       // CRITICAL: Check for battle interrupt error
       if (jumpResp.error.code === "battle_interrupt" || msg.includes("interrupted by battle") || msg.includes("interrupted by combat")) {
@@ -1699,12 +1748,16 @@ async function* scanStation(
 
     if (listings.length > 0) {
       ctx.log("info", `Saving ${listings.length} ship listings from ${poi.name}...`);
-      const shipsData = loadShipsForSale();
+      const shipsData = loadShipsForSale(ctx.log);
       let updated = 0;
+      const expiredRemoved = cleanupExpiredShipListings(shipsData);
+
+      const currentListingIds = new Set<string>();
 
       for (const listing of listings) {
         const listing_id = (listing.listing_id as string) || "";
         if (!listing_id) continue;
+        currentListingIds.add(listing_id);
 
         const shipListing: ShipListing = {
           systemId: systemId,
@@ -1732,9 +1785,22 @@ async function* scanStation(
         updated++;
       }
 
-      if (updated > 0) {
+      let soldRemoved = 0;
+      for (const listingId of Object.keys(shipsData.listings)) {
+        const listing = shipsData.listings[listingId];
+        if (!currentListingIds.has(listingId) && listing.systemId === systemId && listing.stationPoiId === poi.id) {
+          delete shipsData.listings[listingId];
+          soldRemoved++;
+        }
+      }
+
+      if (updated > 0 || soldRemoved > 0 || expiredRemoved > 0) {
         saveShipsForSale(shipsData);
-        ctx.log("info", `Saved ${updated} ship listings to shipsForSale.json`);
+        const msgs: string[] = [];
+        if (updated > 0) msgs.push(`${updated} added/updated`);
+        if (soldRemoved > 0) msgs.push(`${soldRemoved} sold/removed`);
+        if (expiredRemoved > 0) msgs.push(`${expiredRemoved} expired`);
+        ctx.log("info", `Saved ship listings to shipsForSale.json (${msgs.join(", ")})`);
       }
     }
   }
@@ -2514,12 +2580,16 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
               if (listings.length > 0) {
                 ctx.log("info", `Saving ${listings.length} ship listings from ${target.stationName}...`);
-                const shipsData = loadShipsForSale();
+                const shipsData = loadShipsForSale(ctx.log);
                 let updated = 0;
+                const expiredRemoved = cleanupExpiredShipListings(shipsData);
+
+                const currentListingIds = new Set<string>();
 
                 for (const listing of listings) {
                   const listing_id = (listing.listing_id as string) || "";
                   if (!listing_id) continue;
+                  currentListingIds.add(listing_id);
 
                   const shipListing: ShipListing = {
                     systemId: target.systemId,
@@ -2547,9 +2617,22 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
                   updated++;
                 }
 
-                if (updated > 0) {
+                let soldRemoved = 0;
+                for (const listingId of Object.keys(shipsData.listings)) {
+                  const listing = shipsData.listings[listingId];
+                  if (!currentListingIds.has(listingId) && listing.systemId === target.systemId && listing.stationPoiId === target.stationPoi) {
+                    delete shipsData.listings[listingId];
+                    soldRemoved++;
+                  }
+                }
+
+                if (updated > 0 || soldRemoved > 0 || expiredRemoved > 0) {
                   saveShipsForSale(shipsData);
-                  ctx.log("info", `Saved ${updated} ship listings to shipsForSale.json`);
+                  const msgs: string[] = [];
+                  if (updated > 0) msgs.push(`${updated} added/updated`);
+                  if (soldRemoved > 0) msgs.push(`${soldRemoved} sold/removed`);
+                  if (expiredRemoved > 0) msgs.push(`${expiredRemoved} expired`);
+                  ctx.log("info", `Saved ship listings to shipsForSale.json (${msgs.join(", ")})`);
                 }
               }
             }
@@ -2634,6 +2717,151 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const cycleFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Trade update cycle done — ${stationSystems.length} stations, ${bot.credits} cr, ${cycleFuel}% fuel`);
     await ctx.sleep(5000);
+  }
+}
+
+// ── Visit All Systems Routine ───────────────────────────────────
+
+/**
+ * Visit all systems mode — systematically visits every system in the galaxy
+ * to update the server's visited flag and achieve 100% exploration.
+ */
+async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  ctx.log("system", "Visit All mode — systematically visiting all systems to update visited flags...");
+
+  const visitedSystems = new Set<string>();
+  const fledFromSystems = new Set<string>();
+  const path: string[] = [];
+  let lastSystem: string | null = null;
+
+  // Get initial system info
+  yield "startup";
+  await bot.refreshStatus();
+  let { systemId } = await getSystemInfo(ctx);
+  if (!systemId) {
+    ctx.log("error", "Could not determine current system — waiting 30s");
+    await ctx.sleep(30000);
+    return;
+  }
+
+  const blacklist = getSystemBlacklist();
+
+  while (bot.state === "running") {
+    // Check for battle
+    if (await checkAndFleeFromBattle(ctx, "visit_all")) {
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // Refresh settings
+    const settings = getExplorerSettings(bot.username);
+
+    await bot.refreshStatus();
+    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("info", `Visit All ${bot.system} — ${bot.credits} cr, ${fuelPct}% fuel`);
+
+    let { pois, connections, systemId } = await getSystemInfo(ctx);
+    if (!systemId) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    // Mark this system as visited (both locally and via mapStore)
+    visitedSystems.add(systemId);
+    mapStore.markSystemVisited(systemId);
+
+    // Get visit stats
+    const stats = mapStore.getVisitStats();
+    ctx.log("exploration", `Progress: ${stats.visited}/${stats.total} systems visited (${Math.round(stats.visited/stats.total*100)}%)`);
+
+    // Check if we're done
+    if (stats.unvisited === 0) {
+      ctx.log("info", "All systems visited! Explore mode complete.");
+      return;
+    }
+
+    // Find unvisited systems reachable from current position
+    const unvisited = findUnvisitedSystemsByServerFlag(ctx, systemId, blacklist, fledFromSystems);
+
+    if (unvisited.length === 0) {
+      ctx.log("info", "No unvisited systems in connected region — picking nearest unvisited from map...");
+      
+      // Get all unvisited systems and find nearest
+      const allUnvisited = mapStore.getUnvisitedSystems();
+      if (allUnvisited.length === 0) {
+        ctx.log("info", "All systems visited! Explore mode complete.");
+        return;
+      }
+
+      // Find nearest unvisited system
+      const allPos = mapStore.getAllSystemPositionsRecord();
+      const currentPos = allPos[systemId];
+      if (!currentPos) {
+        ctx.log("error", "Could not get current position — waiting 30s");
+        await ctx.sleep(30000);
+        continue;
+      }
+
+      // Sort by distance
+      allUnvisited.sort((a, b) => {
+        const aPos = allPos[a.systemId];
+        const bPos = allPos[b.systemId];
+        if (!aPos || !bPos) return 0;
+        const aDist = Math.sqrt(Math.pow(aPos.x - currentPos.x, 2) + Math.pow(aPos.y - currentPos.y, 2));
+        const bDist = Math.sqrt(Math.pow(bPos.x - currentPos.x, 2) + Math.pow(bPos.y - currentPos.y, 2));
+        return aDist - bDist;
+      });
+
+      const target = allUnvisited[0];
+      if (!target) {
+        ctx.log("info", "All systems visited! Explore mode complete.");
+        return;
+      }
+
+      ctx.log("travel", `Navigating to ${target.systemName} (${target.systemId})...`);
+      const arrived = await navigateToSystem(ctx, target.systemId, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 });
+      if (!arrived) {
+        await ctx.sleep(10000);
+        continue;
+      }
+      bot.stats.totalSystems++;
+      path.push(target.systemId);
+      lastSystem = systemId;
+      continue;
+    }
+
+    // Jump to nearest unvisited system
+    const target = unvisited[0];
+    ctx.log("travel", `Jumping to ${target.name} (${target.id}) - ${target.distance} jumps away`);
+
+    // Ensure fueled
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    if (!fueled) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    await ensureUndocked(ctx);
+    const jumpResp = await bot.exec("jump", { target_system: target.id });
+
+    if (jumpResp.error) {
+      const msg = jumpResp.error.message.toLowerCase();
+      if (msg.includes("battle") || msg.includes("in battle")) {
+        const fled = await fleeFromBattle(ctx);
+        if (!fled) await ctx.sleep(5000);
+        continue;
+      }
+      ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
+      await ctx.sleep(10000);
+      continue;
+    }
+
+    ctx.log("travel", `Jumped to ${target.name}`);
+    bot.stats.totalSystems++;
+    path.push(target.id);
+    lastSystem = systemId;
   }
 }
 
@@ -2824,6 +3052,70 @@ function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps:
   }
 
   return nearby;
+}
+
+/**
+ * Find all systems that have not been visited according to the server's visited flag.
+ * Returns systems sorted by distance from current system.
+ */
+function findUnvisitedSystemsByServerFlag(ctx: RoutineContext, currentSystem: string, blacklist: string[], fledFromSystems: Set<string>): Array<{
+  id: string;
+  name: string;
+  distance: number;
+  route: string[];
+}> {
+  const unvisited: Array<{
+    id: string;
+    name: string;
+    distance: number;
+    route: string[];
+  }> = [];
+
+  // BFS to find all reachable systems and their distances
+  const visited = new Set<string>();
+  const queue: Array<{ systemId: string; distance: number; route: string[] }> = [
+    { systemId: currentSystem, distance: 0, route: [currentSystem] }
+  ];
+  visited.add(currentSystem);
+
+  while (queue.length > 0) {
+    const { systemId, distance, route } = queue.shift()!;
+    const sys = mapStore.getSystem(systemId);
+    if (!sys) continue;
+
+    for (const conn of sys.connections) {
+      const connId = conn.system_id;
+      if (!connId) continue;
+      if (visited.has(connId)) continue;
+      // Skip blacklisted systems, temporarily blacklisted systems, and systems we've fled from
+      if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
+      if (isTemporarilyBlacklisted(connId)) continue;
+      if (fledFromSystems.has(connId)) continue;
+
+      visited.add(connId);
+      const newRoute = [...route, connId];
+      const newDistance = distance + 1;
+
+      const targetSys = mapStore.getSystem(connId);
+      if (targetSys) {
+        // Check server's visited flag
+        if (!targetSys.visited) {
+          unvisited.push({
+            id: connId,
+            name: conn.system_name || connId,
+            distance: newDistance,
+            route: newRoute,
+          });
+        }
+        // Continue BFS to find more unvisited systems
+        queue.push({ systemId: connId, distance: newDistance, route: newRoute });
+      }
+    }
+  }
+
+  // Sort by distance (nearest first)
+  unvisited.sort((a, b) => a.distance - b.distance);
+  return unvisited;
 }
 
 /**
@@ -3430,7 +3722,6 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
   // Priority 1: Systems not in map.json at all (completely unexplored)
   const unmapped = candidates.filter(c => !mapStore.getSystem(c.id));
 
-
   if (unmapped.length > 0) {
     // If multiple unmapped, prefer non-pirate
     const unmappedNonPirate = unmapped.filter(c => !isPirateSystem(c.id));
@@ -3440,7 +3731,7 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
     return unmapped[Math.floor(Math.random() * unmapped.length)];
   }
 
-  // Priority 2: Systems in map.json but not visited this session
+  // Priority 2: Systems in map.json but not visited (per server flag or session)
   // Apply penalty to systems visited in the last hour to avoid loops
   const unvisited = candidates.filter(c => {
     if (visited.has(c.id)) {
@@ -3448,6 +3739,11 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
       if (lastVisit && (now - lastVisit) < ONE_HOUR_MS) {
         return false; // Skip systems visited in the last hour
       }
+    }
+    // Also check server's visited flag
+    const sys = mapStore.getSystem(c.id);
+    if (sys?.visited === true) {
+      return false;
     }
     return true;
   });
@@ -3539,6 +3835,7 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     const isExploredThisSession = conn.id ? visited.has(conn.id) : false;
     const lastVisit = conn.id ? visitedTimes.get(conn.id) : null;
     const visitedRecently = lastVisit && (now - lastVisit) < ONE_HOUR_MS;
+    const isVisitedServer = sys?.visited === true;
 
     // Higher score = better
     let score = 0;
@@ -3546,6 +3843,11 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     // Big bonus for systems not in map.json (completely unexplored)
     if (!isInMap) {
       score += 1000;
+    }
+
+    // Bonus for unvisited systems according to server flag
+    if (isInMap && !isVisitedServer) {
+      score += 500;
     }
 
     // Reduce selection of systems that are directly in the recent path to avoid 3-system loops

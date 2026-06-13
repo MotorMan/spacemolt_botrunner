@@ -237,3 +237,153 @@ export function clearPathfinderTravel(botName: string): void {
   delete data.travels[botName];
   saveTravelData(data);
 }
+
+export interface DirectPathfinderJump {
+  from: string;
+  fromName: string;
+  to: string;
+  toName: string;
+  bearing: number;
+  bearing_full: string;
+  proj: number;
+  perpToTarget: number;
+  ticks: number;
+  travel_seconds: number;
+}
+
+export interface PathfinderCorrectionLeg {
+  bearing: number;
+  bearing_full?: string;
+  proj: number;
+  ticks: number;
+  correction_frac?: number;
+  correction_tick?: number;
+  correction_tick_min?: number;
+  correction_tick_max?: number;
+}
+
+export interface CorrectionPathfinderJump {
+  from: string;
+  fromName: string;
+  to: string;
+  toName: string;
+  corrections_used: number;
+  total_ticks: number;
+  total_seconds: number;
+  legs: PathfinderCorrectionLeg[];
+  granularity_used?: string;
+  min_tolerance_achieved?: number;
+}
+
+let directJumpsCache: DirectPathfinderJump[] | null = null;
+let correctionJumpsCache: CorrectionPathfinderJump[] | null = null;
+
+function loadDirectJumps(): DirectPathfinderJump[] {
+  if (directJumpsCache) return directJumpsCache;
+  try {
+    const file = join(DATA_DIR, "pathfinder_level1_direct.json");
+    if (existsSync(file)) {
+      const raw = readFileSync(file, "utf-8");
+      directJumpsCache = JSON.parse(raw);
+    }
+  } catch {
+    directJumpsCache = [];
+  }
+  return directJumpsCache || [];
+}
+
+function loadCorrectionJumps(): CorrectionPathfinderJump[] {
+  if (correctionJumpsCache) return correctionJumpsCache;
+  try {
+    const file = join(DATA_DIR, "pathfinder_level2_1correction.json");
+    if (existsSync(file)) {
+      const raw = readFileSync(file, "utf-8");
+      correctionJumpsCache = JSON.parse(raw);
+    }
+  } catch {
+    correctionJumpsCache = [];
+  }
+  return correctionJumpsCache || [];
+}
+
+export function getDirectPathfinderJump(fromSystem: string, toSystem: string): DirectPathfinderJump | null {
+  const jumps = loadDirectJumps();
+  const fromLower = fromSystem.toLowerCase();
+  const toLower = toSystem.toLowerCase();
+  return jumps.find(j => j.from.toLowerCase() === fromLower && j.to.toLowerCase() === toLower) || null;
+}
+
+export function getCorrectionPathfinderJump(fromSystem: string, toSystem: string): CorrectionPathfinderJump | null {
+  const jumps = loadCorrectionJumps();
+  const fromLower = fromSystem.toLowerCase();
+  const toLower = toSystem.toLowerCase();
+  return jumps.find(j => j.from.toLowerCase() === fromLower && j.to.toLowerCase() === toLower) || null;
+}
+
+export function getCorrectionBearingAtTick(
+  jump: CorrectionPathfinderJump,
+  currentTick: number,
+  originTick: number
+): { bearing: number; legIndex: number; ticksRemaining: number } | null {
+  const elapsed = currentTick - originTick;
+  let accumulated = 0;
+  let lastLegIndex = jump.legs.length - 1;
+  
+  for (let i = 0; i < jump.legs.length; i++) {
+    const leg = jump.legs[i];
+    if (leg.correction_tick_min !== undefined && leg.correction_tick_max !== undefined) {
+      const targetTick = leg.correction_tick_min + Math.floor((leg.correction_tick_max - leg.correction_tick_min) / 2);
+      if (elapsed >= targetTick && elapsed <= leg.correction_tick_max) {
+        const nextLeg = jump.legs[i + 1];
+        if (nextLeg) {
+          return { bearing: nextLeg.bearing, legIndex: i + 1, ticksRemaining: jump.total_ticks - accumulated - (elapsed - (leg.correction_tick_min || 0)) };
+        }
+        return { bearing: leg.bearing, legIndex: i, ticksRemaining: jump.total_ticks - accumulated - (elapsed - (leg.correction_tick_min || 0)) };
+      }
+    }
+    accumulated += leg.ticks;
+    lastLegIndex = i;
+  }
+  
+  if (elapsed >= accumulated - 5) {
+    return { bearing: jump.legs[lastLegIndex].bearing, legIndex: lastLegIndex, ticksRemaining: 0 };
+  }
+  
+  return null;
+}
+
+export interface MccWindowInfo {
+  ticksUntilMcc: number;
+  correctionBearing: number;
+  legIndex: number;
+}
+
+export function getMccWindowInfo(
+  jump: CorrectionPathfinderJump,
+  elapsed: number
+): MccWindowInfo | null {
+  for (let i = 0; i < jump.legs.length; i++) {
+    const leg = jump.legs[i];
+    if (leg.correction_tick_min !== undefined && leg.correction_tick_max !== undefined) {
+      const targetTick = leg.correction_tick_min + Math.floor((leg.correction_tick_max - leg.correction_tick_min) / 2);
+      if (elapsed < targetTick) {
+        const nextLeg = jump.legs[i + 1];
+        if (nextLeg) {
+          return {
+            ticksUntilMcc: targetTick - elapsed,
+            correctionBearing: nextLeg.bearing,
+            legIndex: i + 1
+          };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+export function isPathfinderLandingAtVoid(landing: PathfinderResult | null): boolean {
+  if (!landing) return true;
+  const systemId = landing.systemId.toLowerCase();
+  const voidSystems = ["void", "empty", "deep_space", "interstellar", "space"];
+  return voidSystems.some(v => systemId.includes(v));
+}

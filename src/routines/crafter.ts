@@ -1,6 +1,6 @@
 import type { Routine, RoutineContext } from "../bot.js";
 import { catalogStore } from "../catalogstore.js";
-import { updateFactionStorageCache } from "../factionStorageCache.js";
+import { updateFactionStorageCache, getFactionStorageCache, getFactionStorageCacheByStationOnly } from "../factionStorageCache.js";
 import {
   ensureDocked,
   tryRefuel,
@@ -11,39 +11,24 @@ import {
   scavengeWrecks,
   logFactionActivity,
 } from "./common.js";
+import {
+  calculateCraftingPlan,
+  calculateMultiGoalPlan,
+  formatCraftingPlan,
+  isRecipeCraftable as isRecipeCraftableNew,
+} from "./craft-goals.js";
 
 // ── Custom faction storage refresh for debugging ──
-
-async function refreshFactionStorageDirectly(ctx: RoutineContext, bot: any): Promise<void> {
-  const factionName = bot.faction;
-  const station = bot.poi;
-  if (!factionName) {
-    return;
-  }
-
-  const resp = await bot.exec("view_storage", { target: "faction" });
-
-  if (resp.result === null || resp.result === undefined) {
-    bot.factionStorage = [];
-    return;
-  }
-
-  const items = parseFactionStorageItems(resp.result);
-  bot.factionStorage = items;
-  updateFactionStorageCache(factionName, items, station);
-}
 
 function parseFactionStorageItems(result: unknown): Array<{itemId: string, name: string, quantity: number}> {
   if (!result || typeof result !== "object") return [];
 
   const r = result as Record<string, unknown>;
 
-  // Try different possible array locations
   let items: Array<Record<string, unknown>> = [];
   if (Array.isArray(r)) {
     items = r;
   } else {
-    // Check various possible field names
     const possibleFields = ['items', 'cargo', 'storage', 'stored_items', 'faction_items', 'faction_storage', 'data', 'result'];
     for (const field of possibleFields) {
       if (Array.isArray(r[field])) {
@@ -55,9 +40,7 @@ function parseFactionStorageItems(result: unknown): Array<{itemId: string, name:
 
   if (items.length === 0) return [];
 
-  // Parse each item
   return items.map((item) => {
-    // Try various field name patterns
     const itemId = (item.item_id as string) ||
                    (item.resource_id as string) ||
                    (item.id as string) ||
@@ -80,12 +63,43 @@ function parseFactionStorageItems(result: unknown): Array<{itemId: string, name:
     return { itemId, name, quantity };
   }).filter(i => i.itemId && i.quantity > 0);
 }
-import {
-  calculateCraftingPlan,
-  calculateMultiGoalPlan,
-  formatCraftingPlan,
-  isRecipeCraftable as isRecipeCraftableNew,
-} from "./craft-goals.js";
+
+async function refreshFactionStorageDirectly(ctx: RoutineContext, bot: any): Promise<void> {
+  const station = bot.poi;
+  const resp = await bot.exec("view_storage", { target: "faction" });
+
+  if (resp.error) {
+    if (bot.faction) {
+      ctx.log("craft", `Could not refresh faction storage: ${resp.error.message}`);
+    }
+    return;
+  }
+
+  if (resp.result === null || resp.result === undefined) {
+    bot.factionStorage = [];
+    return;
+  }
+
+  const result = resp.result as Record<string, unknown>;
+  const items = parseFactionStorageItems(result);
+
+  let factionName = (result.faction_name as string) || (result.faction_id as string) || bot.faction;
+  if (!factionName && station) {
+    const cached = getFactionStorageCacheByStationOnly(station);
+    if (cached) {
+      factionName = cached.factionName;
+    }
+  }
+  if (!factionName) {
+    return;
+  }
+
+  bot.factionStorage = items;
+  if (bot.faction !== factionName) {
+    bot.faction = factionName;
+  }
+  updateFactionStorageCache(factionName, items, station);
+}
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -113,10 +127,21 @@ const SHIP_PASSIVE_RECIPE_IDS = new Set([
 ]);
 
 /** Recipes that should NEVER be used - they are inefficient/wasteful */
-const BLACKLISTED_RECIPES = new Set([
+const DEFAULT_BLACKLISTED_RECIPES = new Set([
   "basic_silicon_refinement", // Noob trap - severe waste of basic materials
-  "Fabricate Circuit Boards", // Force base materials only - never use expensive alternate paths
+  "fabricate_circuit_boards", // Force base materials only - never use expensive alternate paths
+  "synthesize_energy_crystal", // Extremely wasteful - raw materials are easier to obtain
+  "synthesize_xenon_power_cell", // Extremely wasteful - raw materials are easier to obtain
+  "chlorine_circuit_etching", // Extremely wasteful - raw materials are easier to obtain
 ]);
+
+/** Get the current set of blacklisted recipes (combines defaults with user-configured). */
+export function getBlacklistedRecipes(): Set<string> {
+  const all = readSettings();
+  const c = all.crafter || {};
+  const userBlacklisted = (c.blacklistedRecipes as string[]) || [];
+  return new Set([...DEFAULT_BLACKLISTED_RECIPES, ...userBlacklisted]);
+}
 
 /** Recipes that should be heavily penalized - only use as absolute last resort */
 const PENALTY_RECIPES: Record<string, number> = {
@@ -136,9 +161,18 @@ export function getCrafterSettings(): {
   botQuotaOverrides: Record<string, Record<string, number>>;
   goalProcessingMode: GoalProcessingMode;
   autoBuy: AutoBuySettings;
+  blacklistedRecipes: string[];
 } {
   const all = readSettings();
   const c = all.crafter || {};
+
+  const blacklistedRecipes: string[] = (c.blacklistedRecipes as string[]) || [
+    "basic_silicon_refinement",
+    "fabricate_circuit_boards",
+    "synthesize_energy_crystal",
+    "synthesize_xenon_power_cell",
+    "chlorine_circuit_etching",
+  ];
 
 
 
@@ -244,6 +278,7 @@ export function getCrafterSettings(): {
     botQuotaOverrides,
     goalProcessingMode,
     autoBuy,
+    blacklistedRecipes,
   };
 }
 
@@ -779,9 +814,10 @@ async function craftPrerequisites(
     // Score each recipe by material availability
     let bestRecipe: Recipe | null = null;
     let bestScore = -Infinity;
+    const blacklistedRecipes = getBlacklistedRecipes();
     for (const r of allRecipesForComp) {
       // Skip blacklisted recipes
-      if (BLACKLISTED_RECIPES.has(r.recipe_id)) continue;
+      if (blacklistedRecipes.has(r.recipe_id)) continue;
 
       let score = 0;
       let totalNeeded = 0;
@@ -960,7 +996,8 @@ async function craftFromCategories(
     if (!enabledCategories.includes(recipeCategory)) continue;
 
     // Skip blacklisted recipes
-    if (BLACKLISTED_RECIPES.has(recipe.recipe_id)) continue;
+    const blacklistedRecipes = getBlacklistedRecipes();
+    if (blacklistedRecipes.has(recipe.recipe_id)) continue;
 
     // Skip recipes with no ingredients
     if (recipe.components.length === 0) continue;

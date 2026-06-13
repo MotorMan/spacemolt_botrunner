@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chat UI</title>
+  <link rel="stylesheet" href="/chat.css">
+</head>
+<body>
+  <div class="app">
+    <header class="header">
+      <h1 class="title">Chat</h1>
+      <div class="controls">
+        <select id="botSelect" class="select" title="Bot">
+          <option value="">Loading bots…</option>
+        </select>
+        <select id="channelSelect" class="select" title="Channel">
+          <option value="local">Local</option>
+          <option value="faction">Faction</option>
+          <option value="system">System</option>
+          <option value="private">Private</option>
+        </select>
+        <input id="targetInput" type="text" class="target-input" placeholder="To (player name)…" disabled>
+      </div>
+    </header>
+
+    <main class="chat-area" id="chatArea">
+      <div class="messages" id="messages"></div>
+      <div class="empty-state" id="emptyState">No messages yet.</div>
+    </main>
+
+    <footer class="footer">
+      <input id="messageInput" type="text" class="message-input" placeholder="Type a message…" autocomplete="off">
+      <button id="sendBtn" class="send-btn">Send</button>
+    </footer>
+  </div>
+
+  <script>
+    const API_BASE = "";
+    const POLL_INTERVAL_MS = 2000;
+
+    const botSelect = document.getElementById("botSelect");
+    const channelSelect = document.getElementById("channelSelect");
+    const targetInput = document.getElementById("targetInput");
+    const messagesEl = document.getElementById("messages");
+    const emptyState = document.getElementById("emptyState");
+    const chatArea = document.getElementById("chatArea");
+    const messageInput = document.getElementById("messageInput");
+    const sendBtn = document.getElementById("sendBtn");
+
+    let currentBot = "";
+    let currentChannel = "local";
+    let ws: WebSocket | null = null;
+    let pollTimer: number | null = null;
+    let lastMessageTimestamp = 0;
+    let isAtBottom = true;
+
+    function formatTime(ts: number): string {
+      const d = new Date(ts);
+      return d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: false });
+    }
+
+    function escapeHtml(str: string): string {
+      return str
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+    }
+
+    function renderMessage(msg: { botUsername: string; channel: string; sender: string; content: string; timestamp: number; direction: string; targetId?: string }) {
+      const el = document.createElement("div");
+      el.className = `message ${msg.direction === "out" ? "message-out" : "message-in"}`;
+
+      const time = formatTime(msg.timestamp);
+      const sender = escapeHtml(msg.sender);
+      const content = escapeHtml(msg.content);
+
+      const meta = msg.direction === "out"
+        ? `→ ${escapeHtml(msg.targetId || msg.channel)}`
+        : `← ${sender}`;
+
+      el.innerHTML = `
+        <div class="message-meta">
+          <span class="message-time">${time}</span>
+          <span class="message-meta-text">${meta}</span>
+        </div>
+        <div class="message-content">${content}</div>
+      `;
+
+      messagesEl.appendChild(el);
+    }
+
+    function scrollToBottom() {
+      chatArea.scrollTop = chatArea.scrollHeight;
+    }
+
+    function checkEmpty() {
+      emptyState.style.display = messagesEl.children.length === 0 ? "flex" : "none";
+    }
+
+    function setAtBottom() {
+      isAtBottom = chatArea.scrollHeight - chatArea.scrollTop - chatArea.clientHeight < 60;
+    }
+
+    async function loadBots() {
+      try {
+        const res = await fetch(`${API_BASE}/api/chat-bots`);
+        if (!res.ok) {
+          console.error(`[Chat] /api/chat-bots failed: ${res.status} ${res.statusText}`);
+          throw new Error(`HTTP ${res.status}`);
+        }
+        const data = await res.json();
+        console.log(`[Chat] /api/chat-bots response:`, data);
+        botSelect.innerHTML = "";
+
+        if (!data.bots || data.bots.length === 0) {
+          botSelect.innerHTML = `<option value="">No bots available</option>`;
+          return;
+        }
+
+        for (const bot of data.bots) {
+          const opt = document.createElement("option");
+          opt.value = bot;
+          opt.textContent = bot;
+          botSelect.appendChild(opt);
+        }
+
+        if (!currentBot && data.bots.length > 0) {
+          currentBot = data.bots[0];
+          botSelect.value = currentBot;
+        }
+      } catch (err) {
+        console.error(`[Chat] Failed to load bots:`, err);
+        botSelect.innerHTML = `<option value="">Failed to load bots: ${err}</option>`;
+      }
+    }
+
+    async function loadChannels() {
+      try {
+        const url = currentBot ? `${API_BASE}/api/channels?bot=${encodeURIComponent(currentBot)}` : `${API_BASE}/api/channels`;
+        const res = await fetch(url);
+        const data = await res.json();
+        const currentVal = channelSelect.value;
+        channelSelect.innerHTML = "";
+
+        for (const ch of data.channels) {
+          const opt = document.createElement("option");
+          opt.value = ch.name;
+          opt.textContent = ch.displayName;
+          channelSelect.appendChild(opt);
+        }
+
+        if (data.channels.some((ch: { name: string }) => ch.name === currentVal)) {
+          channelSelect.value = currentVal;
+        } else if (data.channels.length > 0) {
+          channelSelect.value = data.channels[0].name;
+        }
+        currentChannel = channelSelect.value;
+        updateTargetInput();
+      } catch (err) {
+        console.error("Failed to load channels:", err);
+      }
+    }
+
+    function updateTargetInput() {
+      if (currentChannel === "private") {
+        targetInput.disabled = false;
+        targetInput.placeholder = "To (player name)…";
+      } else {
+        targetInput.disabled = true;
+        targetInput.value = "";
+        targetInput.placeholder = "To (player name)…";
+      }
+    }
+
+    async function loadMessages() {
+      if (!currentBot) return;
+
+      try {
+        const url = new URL(`${API_BASE}/api/messages`, window.location.origin);
+        url.searchParams.set("bot", currentBot);
+        url.searchParams.set("channel", currentChannel);
+        url.searchParams.set("limit", "200");
+        if (lastMessageTimestamp > 0) {
+          url.searchParams.set("after", String(lastMessageTimestamp));
+        }
+
+        const res = await fetch(url.toString());
+        if (!res.ok) {
+          console.error(`[Chat] /api/messages failed: ${res.status} ${res.statusText}`);
+          return;
+        }
+        const data = await res.json();
+        console.log(`[Chat] /api/messages response:`, data);
+
+        if (data.messages && data.messages.length > 0) {
+          for (const msg of data.messages) {
+            renderMessage(msg);
+            lastMessageTimestamp = Math.max(lastMessageTimestamp, msg.timestamp);
+          }
+          checkEmpty();
+          if (isAtBottom) scrollToBottom();
+        }
+      } catch (err) {
+        console.error("Failed to load messages:", err);
+      }
+    }
+
+    async function sendMessage() {
+      const content = messageInput.value.trim();
+      if (!content) return;
+      if (!currentBot) {
+        alert("Select a bot first.");
+        return;
+      }
+      if (!currentChannel) {
+        alert("Select a channel first.");
+        return;
+      }
+      if (currentChannel === "private" && !targetInput.value.trim()) {
+        alert("Enter a player name for private messages.");
+        return;
+      }
+
+      const body: Record<string, unknown> = {
+        bot: currentBot,
+        channel: currentChannel,
+        content,
+      };
+
+      if (currentChannel === "private") {
+        body.targetId = targetInput.value.trim();
+      }
+
+      try {
+        const res = await fetch(`${API_BASE}/api/send`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+
+        const data = await res.json();
+        if (!res.ok) {
+          alert(data.error || "Failed to send message");
+          return;
+        }
+
+        messageInput.value = "";
+        messageInput.focus();
+      } catch (err) {
+        alert(err instanceof Error ? err.message : "Failed to send message");
+      }
+    }
+
+    function connectWebSocket() {
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const wsUrl = `${proto}//${window.location.host}/ws`;
+
+      try {
+        ws = new WebSocket(wsUrl);
+
+        ws.onopen = () => {
+          console.log("Chat WebSocket connected");
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const data = JSON.parse(event.data);
+            if (data.type === "new_message" && data.message) {
+              const msg = data.message;
+              if (msg.botUsername === currentBot && msg.channel === currentChannel) {
+                renderMessage(msg);
+                lastMessageTimestamp = Math.max(lastMessageTimestamp, msg.timestamp);
+                checkEmpty();
+                if (isAtBottom) scrollToBottom();
+              }
+            }
+          } catch {
+            // ignore parse errors
+          }
+        };
+
+        ws.onclose = () => {
+          console.log("Chat WebSocket disconnected, reconnecting in 3s…");
+          setTimeout(connectWebSocket, 3000);
+        };
+
+        ws.onerror = () => {
+          ws?.close();
+        };
+      } catch {
+        setTimeout(connectWebSocket, 3000);
+      }
+    }
+
+    function startPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = window.setInterval(() => {
+        if (currentBot && currentChannel) {
+          loadMessages();
+        }
+      }, POLL_INTERVAL_MS);
+    }
+
+    function switchBot() {
+      currentBot = botSelect.value;
+      messagesEl.innerHTML = "";
+      lastMessageTimestamp = 0;
+      isAtBottom = true;
+      loadChannels().then(() => {
+        loadMessages();
+      });
+    }
+
+    function switchChannel() {
+      currentChannel = channelSelect.value;
+      messagesEl.innerHTML = "";
+      lastMessageTimestamp = 0;
+      isAtBottom = true;
+      updateTargetInput();
+      loadMessages();
+    }
+
+    botSelect.addEventListener("change", switchBot);
+    channelSelect.addEventListener("change", switchChannel);
+
+    sendBtn.addEventListener("click", sendMessage);
+    messageInput.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    chatArea.addEventListener("scroll", () => {
+      setAtBottom();
+    });
+
+    async function init() {
+      await loadBots();
+      await loadChannels();
+      updateTargetInput();
+      await loadMessages();
+      connectWebSocket();
+      startPolling();
+      messageInput.focus();
+    }
+
+    init();
+  </script>
+</body>
+</html>

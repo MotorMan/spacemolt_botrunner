@@ -24,9 +24,10 @@
        <div class="top-tab" data-tab="players" onclick="switchTab('players')">Players</div>
        <div class="top-tab" data-tab="shipsforsale" onclick="switchTab('shipsforsale')">Ships For Sale</div>
        <div class="top-tab" data-tab="settings" onclick="switchTab('settings')">Settings</div>
-       <div class="top-tab" data-tab="fa" onclick="switchTab('fa')">FA</div>
-    </div>
-  </div>
+<div class="top-tab" data-tab="fa" onclick="switchTab('fa')">FA</div>
+        <div class="top-tab" data-tab="catalog" onclick="switchTab('catalog')">Catalog</div>
+     </div>
+   </div>
   <div class="header-right">
     <div class="conn-status">
       <div class="conn-dot" id="connDot"></div>
@@ -61,7 +62,8 @@
         <option value="trader">Trader</option>
         <option value="explorer">Explorer</option>
         <option value="hunter">Hunter</option>
-        <option value="escort">Escort</option>
+        <option value="escort">Escort (Fleet)</option>
+        <option value="escort_flock">Escort (Flock)</option>
         <option value="hauler">Hauler</option>
         <option value="salvager">Salvager</option>
         <option value="scout">Scout</option>
@@ -82,27 +84,39 @@
       </div>
     </div>
 <div class="bot-table-wrap" id="originalTableWrap">
-       <div class="bot-table-header">
-          <span>Bots</span>
-          <span id="factionFuelDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">Fuel: 0.0K</span>
-          <span id="bandwidthDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">BW: 0.0 KB/s ↓ | 0.0 b/s ↑</span>
-         <div style="display:flex;gap:8px;align-items:center;">
-          <button class="sm" id="aiChatToggleBtn" onclick="toggleAiChat()" title="Enable/Disable AI Chat">
-            <span id="aiChatToggleIcon">🔌</span> <span id="aiChatToggleText">AI Chat: Off</span>
-          </button>
-          <button class="sm danger" onclick="emergencyReturnHome()">⚠ Emergency Return Home</button>
-          <button class="sm" onclick="showAddModal()">+ Add Bot</button>
-          <button class="sm" onclick="toggleRoutineGroupsLayout()" title="Switch to Routine Groups layout">📊 Groups View</button>
-          <div style="display:flex;gap:6px;align-items:center;border-left:1px solid var(--border);padding-left:8px;margin-left:4px;">
-            <select id="bulkStartRoutine" style="font-size:12px;padding:4px 8px;">
-              <!-- populated by JS -->
-            </select>
-            <button class="sm primary" onclick="bulkStartIdleBots()">▶ Start All Idle</button>
-            <button class="sm danger" onclick="bulkStopRunningBots()">⏹ Stop All Running</button>
-          </div>
-        </div>
-      </div>
-      <div class="bot-table-scroll">
+<div class="bot-table-header">
+           <span>Bots</span>
+           <span id="factionFuelDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">Fuel: 0.0K</span>
+           <div class="station-fuel-container">
+             <span id="stationFuelSC" class="station-fuel-item" style="opacity:0.5">SC: 0.0K</span>
+             <span class="station-fuel-separator">|</span>
+             <span id="stationFuelS" class="station-fuel-item" style="opacity:0.5">S: 0.0K</span>
+             <span class="station-fuel-separator">|</span>
+             <span id="stationFuelNT" class="station-fuel-item" style="opacity:0.5">NT: 0.0K</span>
+             <span class="station-fuel-separator">|</span>
+             <span id="stationFuelPA" class="station-fuel-item" style="opacity:0.5">PA: 0.0K</span>
+             <span class="station-fuel-separator">|</span>
+             <span id="stationFuelAC" class="station-fuel-item" style="opacity:0.5">AC: 0.0K</span>
+           </div>
+           <span id="bandwidthDisplay" style="color:var(--text-dim);font-size:12px;margin:0 12px;">BW: 0.0 KB/s ↓ | 0.0 b/s ↑</span>
+           <div style="display:flex;gap:8px;align-items:center;">
+           <button class="sm" id="aiChatToggleBtn" onclick="toggleAiChat()" title="Enable/Disable AI Chat">
+             <span id="aiChatToggleIcon">🔌</span> <span id="aiChatToggleText">AI Chat: Off</span>
+           </button>
+           <button class="sm danger" onclick="emergencyReturnHome()">⚠ Emergency Return Home</button>
+           <button class="sm" onclick="showAddModal()">+ Add Bot</button>
+           <button class="sm" onclick="toggleRoutineGroupsLayout()" title="Switch to Routine Groups layout">📊 Groups View</button>
+           <div style="display:flex;gap:6px;align-items:center;border-left:1px solid var(--border);padding-left:8px;margin-left:4px;">
+             <select id="bulkStartRoutine" style="font-size:12px;padding:4px 8px;">
+               <!-- populated by JS -->
+             </select>
+             <button class="sm primary" onclick="bulkStartIdleBots()">▶ Start All Idle</button>
+             <button class="sm danger" onclick="bulkStopRunningBots()">⏹ Stop All Running</button>
+           </div>
+         </div>
+       </div>
+       <div class="bot-table-separator"></div>
+       <div class="bot-table-scroll">
         <table class="bot-table" id="botTable">
           <thead>
             <tr id="botTableHeaderRow">
@@ -363,7 +377,10 @@
         <div class="sidebar-item" onclick="switchSettingsTab('escort')">Escort</div>
         <div class="sidebar-item" onclick="switchSettingsTab('fleet_hunter')">Fleet Hunter</div>
         <div class="sidebar-item" onclick="switchSettingsTab('cargo_mover')">CargoMover</div>
-        <div class="sidebar-item" onclick="switchSettingsTab('fuel_transport')">Fuel Transport</div>
+         <div class="sidebar-item" onclick="switchSettingsTab('fuel_transport')">Fuel Transport</div>
+          <div class="sidebar-item" onclick="switchSettingsTab('civilian_transport')">Civilian Transport</div>
+         <div class="sidebar-item" onclick="switchSettingsTab('module_seller')">Module Seller</div>
+        <div class="sidebar-item" onclick="switchSettingsTab('client_sync')">Connect Clients</div>
       </div>
       <div class="settings-panel" id="settingsContent">
         <!-- filled by JS -->
@@ -397,7 +414,16 @@
             <option value="updated">Last Updated</option>
             <option value="name">Name</option>
             <option value="pois">Most POIs</option>
+            <option value="jumps">Most Jumps</option>
             <option value="security">Security Level</option>
+            <option value="" disabled style="font-weight:500;color:var(--text-dim)">— Ore Sorting —</option>
+            <option value="ore_richness">&nbsp; Highest Richness</option>
+            <option value="ore_amount">&nbsp; Most Available</option>
+            <option value="ore_newest">&nbsp; Recently Scanned</option>
+            <option value="ore_best_station">&nbsp; Best Station Price</option>
+            <option value="" disabled style="font-weight:500;color:var(--text-dim)">— Combo Sorting —</option>
+            <option value="ore_amount_jumps">&nbsp; Most Available + Fewest Jumps</option>
+            <option value="ore_price_jumps">&nbsp; Best Price + Fewest Jumps</option>
           </select>
           <div style="margin-top:12px;border-top:1px solid #21262d;padding-top:10px">
             <button class="sm" style="width:100%" onclick="switchTab('market')">Market Overview</button>
@@ -516,12 +542,13 @@
        <div class="stat-item"><span class="stat-value" id="pStatFaction">-</span><span class="stat-label">Faction Funds</span></div>
      </div>
      
-     <!-- Taxes Tab Navigation -->
-     <div class="stats-taxes-nav" id="statsTaxesNav" style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
-       <span class="stats-title">View:</span>
-       <button class="active" id="statsTabMain" onclick="switchStatsView('main')">Main</button>
-       <button id="statsTabTaxes" onclick="switchStatsView('taxes')">Taxes</button>
-     </div>
+<!-- Taxes Tab Navigation -->
+      <div class="stats-taxes-nav" id="statsTaxesNav" style="display:flex;gap:8px;margin-bottom:12px;align-items:center">
+        <span class="stats-title">View:</span>
+        <button class="active" id="statsTabMain" onclick="switchStatsView('main')">Main</button>
+        <button id="statsTabTaxes" onclick="switchStatsView('taxes')">Taxes</button>
+        <button id="statsTabSkills" onclick="switchStatsView('skills')">Skills</button>
+      </div>
      
      <!-- Main Stats View -->
      <div id="statsMainView">
@@ -564,35 +591,65 @@
        </div>
      </div>
      
-     <!-- Taxes View (hidden by default) -->
-     <div id="statsTaxesView" style="display:none">
-       <div class="stats-bar">
-         <span class="stats-title">Fleet Tax Summary</span>
-         <div class="stat-item"><span class="stat-value" id="taxTotalIncome">0</span><span class="stat-label">Total Taxable Income</span></div>
-         <div class="stat-item"><span class="stat-value" id="taxTotalIncomeTax">0</span><span class="stat-label">Total Income Tax</span></div>
-         <div class="stat-item"><span class="stat-value" id="taxTotalPropertyTax">0</span><span class="stat-label">Total Property Tax</span></div>
-         <div class="stat-item"><span class="stat-value" id="taxTotalAssessed">0</span><span class="stat-label">Total Assessed Value</span></div>
+<!-- Taxes View (hidden by default) -->
+      <div id="statsTaxesView" style="display:none">
+        <div class="stats-bar">
+          <span class="stats-title">Fleet Tax Summary</span>
+          <div class="stat-item"><span class="stat-value" id="taxTotalIncome">0</span><span class="stat-label">Total Taxable Income</span></div>
+          <div class="stat-item"><span class="stat-value" id="taxTotalIncomeTax">0</span><span class="stat-label">Total Income Tax</span></div>
+          <div class="stat-item"><span class="stat-value" id="taxTotalPropertyTax">0</span><span class="stat-label">Total Property Tax</span></div>
+          <div class="stat-item"><span class="stat-value" id="taxTotalAssessed">0</span><span class="stat-label">Total Assessed Value</span></div>
+        </div>
+        <div class="bot-table-wrap" style="flex:1;overflow:auto">
+          <div class="bot-table-header">
+            <span>Tax History by Bot</span>
+            <div style="display:flex;gap:8px">
+              <input type="text" class="filter-input" placeholder="🔍 Search bots..." id="taxSearch" oninput="filterTaxBots()">
+            </div>
+          </div>
+          <div class="bot-table-scroll">
+            <table class="bot-table" id="taxTable">
+              <thead><tr>
+                <th style="text-align:left;padding:6px 12px">Bot</th>
+                <th style="text-align:right;padding:6px 12px">Taxable Income</th>
+                <th style="text-align:right;padding:6px 12px">Income Tax</th>
+                <th style="text-align:right;padding:6px 12px">Property Tax</th>
+                <th style="text-align:right;padding:6px 12px">Assessed Value</th>
+                <th style="text-align:right;padding:6px 12px">Last Updated</th>
+              </tr></thead>
+              <tbody id="taxTableBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <!-- Skills View -->
+      <div id="statsSkillsView" style="display:none">
+        <div class="stats-bar">
+          <span class="stats-title">Fleet Skills</span>
+          <div class="stat-item"><span class="stat-value" id="skillsTotalBots">0</span><span class="stat-label">Bots with Skills</span></div>
+          <div class="stat-item"><span class="stat-value" id="skillsLastUpdated">-</span><span class="stat-label">Last Updated</span></div>
+        </div>
+        <div class="skills-content" id="skillsContent">
+          <div class="skills-empty">Loading skills data...</div>
+        </div>
+</div>
+    </div>
+
+   <!-- ══ Catalog Tab ══ -->
+   <div class="tab-page" id="page-catalog">
+     <div class="catalog-layout">
+       <div class="catalog-sidebar">
+         <div class="catalog-sidebar-header">
+           <span>Categories</span>
+           <input type="text" class="filter-input" placeholder="🔍 Filter..." id="catalogFilter" oninput="renderCatalog()" style="font-size:12px;padding:4px 8px;width:100%">
+         </div>
+         <div class="catalog-sidebar-body" id="catalogSidebarBody">
+           <!-- filled by JS -->
+         </div>
        </div>
-       <div class="bot-table-wrap" style="flex:1;overflow:auto">
-         <div class="bot-table-header">
-           <span>Tax History by Bot</span>
-           <div style="display:flex;gap:8px">
-             <input type="text" class="filter-input" placeholder="🔍 Search bots..." id="taxSearch" oninput="filterTaxBots()">
-           </div>
-         </div>
-         <div class="bot-table-scroll">
-           <table class="bot-table" id="taxTable">
-             <thead><tr>
-               <th style="text-align:left;padding:6px 12px">Bot</th>
-               <th style="text-align:right;padding:6px 12px">Taxable Income</th>
-               <th style="text-align:right;padding:6px 12px">Income Tax</th>
-               <th style="text-align:right;padding:6px 12px">Property Tax</th>
-               <th style="text-align:right;padding:6px 12px">Assessed Value</th>
-               <th style="text-align:right;padding:6px 12px">Last Updated</th>
-             </tr></thead>
-             <tbody id="taxTableBody"></tbody>
-           </table>
-         </div>
+       <div class="catalog-content" id="catalogContent">
+         <div class="catalog-empty">Select a category to browse items.</div>
        </div>
      </div>
    </div>
@@ -684,8 +741,6 @@
   <div class="modal">
     <h2>Name Ship</h2>
     <div id="nameShipForm">
-      <label>Ship ID</label>
-      <input type="text" id="nameShipId" placeholder="Ship ID" disabled>
       <label>New Name</label>
       <input type="text" id="nameShipNewName" placeholder="Enter custom name">
     </div>
@@ -705,7 +760,7 @@ let settings = {};
 let flockSettings = { flockGroups: [], assignments: {} };
 let knownSystems = [];
 let knownOres = [];
-let mobileCapitol = null;     // { systemId, systemName, poiId, discoveredAt }
+let mobileCapitol = null;
 let reconnectDelay = 1000;
 let mapData = {};
 let modalMode = 'add';
@@ -718,6 +773,7 @@ let catalog = { items: {}, ships: {}, skills: {}, recipes: {}, lastFetched: null
 let globalFactionStorage = [];
 let statsDaily = {};
 let profileReturnHomeIgnoreBlacklist = false;
+let lastUsedRoutines = {};
 
 // ── Resolve a system ID + optional POI ID to display names using mapData. ──
 
@@ -852,6 +908,341 @@ function switchTab(name) {
     const frame = document.getElementById('faFrame');
     if (frame) frame.src = frame.src;
   }
+  if (name === 'catalog') {
+    renderCatalog();
+  }
+}
+
+// ── Catalog Browser ─────────────────────────────────────────────
+let catalogState = {
+  currentSection: null,
+  currentCategory: null,
+  currentSubcategory: null,
+  sortBy: null,
+  sortDirection: 'asc'
+};
+
+const CATALOG_SECTIONS = [
+  { id: 'items', name: 'Items', icon: '📦' },
+  { id: 'ships', name: 'Ships', icon: '🚢' },
+  { id: 'skills', name: 'Skills', icon: '📜' },
+  { id: 'recipes', name: 'Recipes', icon: '📝' }
+];
+
+function getCatalogCategories(section) {
+  if (section === 'items') {
+    const categories = new Set();
+    for (const item of Object.values(catalog.items || {})) {
+      if (item.category) categories.add(item.category);
+    }
+    return Array.from(categories).sort();
+  }
+  if (section === 'ships') {
+    const classes = new Set();
+    for (const ship of Object.values(catalog.ships || {})) {
+      if (ship['class']) classes.add(ship['class']);
+    }
+    return Array.from(classes).sort();
+  }
+  if (section === 'skills') {
+    const categories = new Set();
+    for (const skill of Object.values(catalog.skills || {})) {
+      if (skill.category) categories.add(skill.category);
+    }
+    return Array.from(categories).sort();
+  }
+  if (section === 'recipes') {
+    const categories = new Set();
+    for (const recipe of Object.values(catalog.recipes || {})) {
+      if (recipe.category) categories.add(recipe.category);
+    }
+    return Array.from(categories).sort();
+  }
+  return [];
+}
+
+function getCatalogSubcategories(section, category) {
+  if (section !== 'items' || !category) return [];
+  const subs = new Set();
+  for (const item of Object.values(catalog.items || {})) {
+    if (item.category !== category) continue;
+    if (item.effect?.subtype) subs.add(item.effect.subtype);
+    if (item.effect?.type && item.effect.type !== 'ammo') subs.add(item.effect.type);
+  }
+  return Array.from(subs).sort();
+}
+
+function getCatalogItems(section, category, subcategory) {
+  let items = [];
+  if (section === 'items') {
+    for (const [id, item] of Object.entries(catalog.items || {})) {
+      if (category && item.category !== category) continue;
+      if (subcategory) {
+        if (item.effect?.subtype !== subcategory && item.effect?.type !== subcategory) continue;
+      }
+      items.push({ id, ...item, _section: 'items' });
+    }
+  }
+  if (section === 'ships') {
+    for (const [id, ship] of Object.entries(catalog.ships || {})) {
+      if (category && ship['class'] !== category) continue;
+      if (catalogState.empireFilter && ship.faction !== catalogState.empireFilter) continue;
+      if (catalogState.tierFilter !== '' && String(ship.tier) !== catalogState.tierFilter) continue;
+      items.push({ id, ...ship, _section: 'ships' });
+    }
+  }
+  if (section === 'skills') {
+    for (const [id, skill] of Object.entries(catalog.skills || {})) {
+      if (category && skill.category !== category) continue;
+      items.push({ id, ...skill, _section: 'skills' });
+    }
+  }
+  if (section === 'recipes') {
+    for (const [id, recipe] of Object.entries(catalog.recipes || {})) {
+      if (category && recipe.category !== category) continue;
+      items.push({ id, ...recipe, _section: 'recipes' });
+    }
+  }
+  
+  // Apply sorting
+  if (catalogState.sortBy) {
+    items.sort((a, b) => {
+      let aVal = a[catalogState.sortBy] ?? a.effect?.[catalogState.sortBy] ?? 0;
+      let bVal = b[catalogState.sortBy] ?? b.effect?.[catalogState.sortBy] ?? 0;
+      if (typeof aVal === 'string') aVal = aVal.toLowerCase();
+      if (typeof bVal === 'string') bVal = bVal.toLowerCase();
+      if (aVal < bVal) return catalogState.sortDirection === 'asc' ? -1 : 1;
+      if (aVal > bVal) return catalogState.sortDirection === 'asc' ? 1 : -1;
+      return (a.name || a.id).localeCompare(b.name || b.id);
+    });
+  } else {
+    items.sort((a, b) => (a.name || a.id).localeCompare(b.name || b.id));
+  }
+  
+  return items;
+}
+
+function renderCatalog() {
+  const sidebar = document.getElementById('catalogSidebarBody');
+  const content = document.getElementById('catalogContent');
+  
+  const sections = CATALOG_SECTIONS;
+  const currentSection = catalogState.currentSection;
+  
+  sidebar.innerHTML = sections.map(sec => `
+    <div class="catalog-category ${currentSection === sec.id ? 'active' : ''}" onclick="selectCatalogSection('${sec.id}')">
+      <span class="cat-name">${sec.icon} ${esc(sec.name)}</span>
+      <span class="cat-count">${Object.keys(catalog[sec.id] || {}).length}</span>
+    </div>
+  `).join('');
+  
+  if (catalogState.currentSection) {
+    const categories = getCatalogCategories(catalogState.currentSection);
+    const currentCategory = catalogState.currentCategory;
+    const subcategories = getCatalogSubcategories(catalogState.currentSection, currentCategory);
+    const currentSubcategory = catalogState.currentSubcategory;
+    const items = getCatalogItems(catalogState.currentSection, currentCategory, currentSubcategory);
+    
+    const sortOptions = catalogState.currentSection === 'ships' ? [
+      { key: 'name', label: 'Name' },
+      { key: 'tier', label: 'Tier' },
+      { key: 'base_hull', label: 'Hull' },
+      { key: 'base_shield', label: 'Shield' },
+      { key: 'base_speed', label: 'Speed' },
+      { key: 'cargo_capacity', label: 'Cargo' },
+      { key: 'base_fuel', label: 'Fuel' }
+    ] : [];
+    
+    const shipFilters = catalogState.currentSection === 'ships' ? `
+      <div class="ship-filters" style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+        <select onchange="filterShipsByEmpire(this.value)" style="font-size:12px;padding:4px 8px">
+          <option value="">All Empires</option>
+          <option value="crimson" ${catalogState.empireFilter === 'crimson' ? 'selected' : ''}>Crimson Fleet</option>
+          <option value="nebula" ${catalogState.empireFilter === 'nebula' ? 'selected' : ''}>Nebula Collective</option>
+          <option value="outerrim" ${catalogState.empireFilter === 'outerrim' ? 'selected' : ''}>Outer Rim</option>
+          <option value="solarian" ${catalogState.empireFilter === 'solarian' ? 'selected' : ''}>Solarian Empire</option>
+          <option value="voidborn" ${catalogState.empireFilter === 'voidborn' ? 'selected' : ''}>Voidborn</option>
+        </select>
+        <select onchange="filterShipsByTier(this.value)" style="font-size:12px;padding:4px 8px">
+          <option value="">All Tiers</option>
+          <option value="0" ${catalogState.tierFilter === '0' ? 'selected' : ''}>T0</option>
+          <option value="1" ${catalogState.tierFilter === '1' ? 'selected' : ''}>T1</option>
+          <option value="2" ${catalogState.tierFilter === '2' ? 'selected' : ''}>T2</option>
+          <option value="3" ${catalogState.tierFilter === '3' ? 'selected' : ''}>T3</option>
+          <option value="4" ${catalogState.tierFilter === '4' ? 'selected' : ''}>T4</option>
+          <option value="5" ${catalogState.tierFilter === '5' ? 'selected' : ''}>T5</option>
+        </select>
+      </div>
+    ` : '';
+    
+    content.innerHTML = `
+      <div class="catalog-header">
+        <h3>${catalogState.currentSection.charAt(0).toUpperCase() + catalogState.currentSection.slice(1)}</h3>
+        <span class="cat-count">${items.length} items</span>
+      </div>
+      ${shipFilters}
+      ${categories.length > 0 ? `
+        <div class="catalog-subcats">
+          ${categories.map(cat => `
+            <button class="subcat-btn ${currentCategory === cat ? 'active' : ''}" onclick="selectCatalogCategory('${cat}')">
+              ${esc(cat)}
+            </button>
+          `).join('')}
+        </div>
+      ` : ''}
+      ${subcategories.length > 0 ? `
+        <div class="catalog-subcats" style="margin-top:6px">
+          ${subcategories.map(sub => `
+            <button class="subcat-btn ${currentSubcategory === sub ? 'active' : ''}" onclick="selectCatalogSubcategory('${sub}')">
+              ${esc(sub)}
+            </button>
+          `).join('')}
+        </div>
+      ` : ''}
+      ${sortOptions.length > 0 ? `
+        <div class="catalog-sort" style="margin-top:8px;font-size:11px;color:var(--text-dim)">
+          <span style="margin-right:8px">Sort by:</span>
+          ${sortOptions.map(opt => `
+            <button class="subcat-btn ${catalogState.sortBy === opt.key ? 'active' : ''}" onclick="sortCatalog('${opt.key}')" style="margin-right:4px">
+              ${opt.label}${catalogState.sortBy === opt.key ? (catalogState.sortDirection === 'asc' ? ' ↑' : ' ↓') : ''}
+            </button>
+          `).join('')}
+        </div>
+      ` : ''}
+      <div class="catalog-items">
+        ${items.map(item => renderCatalogItem(item, item._section)).join('')}
+      </div>
+    `;
+  } else {
+    content.innerHTML = `
+      <div class="catalog-empty">
+        <div class="empty-icon">📁</div>
+        <div class="empty-title">Browse Catalog</div>
+        <div class="empty-desc">Select a section from the sidebar to browse items.</div>
+      </div>
+    `;
+  }
+}
+
+function selectCatalogSection(section) {
+  catalogState = { ...catalogState, currentSection: section, currentCategory: null, currentSubcategory: null };
+  renderCatalog();
+}
+
+function selectCatalogCategory(category) {
+  catalogState = { ...catalogState, currentCategory: category, currentSubcategory: null };
+  renderCatalog();
+}
+
+function selectCatalogSubcategory(subcategory) {
+  catalogState.currentSubcategory = catalogState.currentSubcategory === subcategory ? null : subcategory;
+  renderCatalog();
+}
+
+function sortCatalog(key) {
+  if (catalogState.sortBy === key) {
+    catalogState.sortDirection = catalogState.sortDirection === 'asc' ? 'desc' : 'asc';
+  } else {
+    catalogState.sortBy = key;
+    catalogState.sortDirection = 'asc';
+  }
+  renderCatalog();
+}
+
+function filterShipsByEmpire(empire) {
+  catalogState.empireFilter = empire;
+  catalogState.tierFilter = null;
+  renderCatalog();
+}
+
+function filterShipsByTier(tier) {
+  catalogState.tierFilter = tier;
+  catalogState.empireFilter = null;
+  renderCatalog();
+}
+
+function renderCatalogItem(item, catalogType) {
+  const effect = item.effect || {};
+  const parts = [];
+  
+  const STAT_COLORS = {
+    'armor_bypass': 'var(--green)',
+    'shield_bypass': 'var(--cyan)',
+    'damage_mod': 'var(--yellow)',
+    'hull_damage_mod': 'var(--orange, #ea580c)',
+    'splash_pct': 'var(--red)',
+    'armor_melt_pct': 'var(--red)',
+    'armor_melt_ticks': 'var(--magenta)',
+    'disrupt_speed': 'var(--cyan)',
+    'disrupt_ticks': 'var(--magenta)',
+    'ammo_capacity': 'var(--green)',
+    'reload_time': 'var(--yellow)'
+  };
+  
+  if (catalogType === 'items') {
+    if (effect.ammo) {
+      for (const [k, v] of Object.entries(effect.ammo)) {
+        const label = k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        const val = typeof v === 'number' ? (v < 1 ? `${(v * 100).toFixed(0)}%` : v) : v;
+        const color = STAT_COLORS[k] || 'var(--text)';
+        parts.push(`<span style="color:${color}">${label}: ${val}</span>`);
+      }
+    }
+    
+    if (effect.type === 'buff' && (effect.amount || effect.duration || effect.stat)) {
+      if (effect.amount !== undefined) parts.push(`Amount: ${effect.amount}`);
+      if (effect.duration !== undefined) parts.push(`Duration: ${effect.duration}s`);
+      if (effect.stat) parts.push(`Stat: ${esc(effect.stat)}`);
+    }
+    
+    for (const [k, v] of Object.entries(effect)) {
+      if (['ammo', 'type', 'subtype'].includes(k)) continue;
+      if (typeof v === 'number' || typeof v === 'string' || typeof v === 'boolean') {
+        const label = k.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        const val = typeof v === 'number' ? (v < 1 ? `${(v * 100).toFixed(0)}%` : v) : v;
+        if (!parts.some(p => p.startsWith(label))) parts.push(`${label}: ${val}`);
+      }
+    }
+  }
+  
+  if (catalogType === 'ships') {
+    const stats = ['tier', 'faction', 'base_hull', 'base_shield', 'base_armor', 'base_speed', 'base_fuel', 'cargo_capacity', 'cpu_capacity', 'power_capacity', 'weapon_slots', 'defense_slots', 'utility_slots'];
+    for (const stat of stats) {
+      if (item[stat] !== undefined) {
+        const label = stat.replace(/base_/, '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+        parts.push(`${label}: ${item[stat]}`);
+      }
+    }
+  }
+  
+  if (catalogType === 'skills') {
+    if (item.max_level !== undefined) parts.push(`Max Level: ${item.max_level}`);
+    if (item.category) parts.push(`Category: ${esc(item.category)}`);
+  }
+  
+  if (catalogType === 'recipes') {
+    if (item.inputs && item.inputs.length > 0) {
+      parts.push(`Inputs: ${item.inputs.map(i => `${i.quantity}x ${i.item_id}`).join(', ')}`);
+    }
+    if (item.outputs && item.outputs.length > 0) {
+      parts.push(`Outputs: ${item.outputs.map(i => `${i.quantity}x ${i.item_id}`).join(', ')}`);
+    }
+    if (item.crafting_time !== undefined) parts.push(`Time: ${item.crafting_time}s`);
+  }
+  
+  const statLines = parts.join('<br>');
+  
+  return `
+    <div class="catalog-item" title="${esc(item.description || item.name || item.id)}">
+      <div class="item-name">${esc(item.name || item.id)}</div>
+      <div class="item-meta">
+        ${item.category ? `<span class="item-type">${esc(item.category)}</span>` : ''}
+        ${effect.type ? `<span class="item-subtype">${esc(effect.type)}</span>` : ''}
+        ${effect.subtype ? `<span class="item-subtype">${esc(effect.subtype)}</span>` : ''}
+      </div>
+      ${statLines ? `<div class="item-stats" style="font-size:10px;margin-top:4px">${statLines}</div>` : ''}
+    </div>
+  `;
 }
 
 // ── WebSocket ──────────────────────────────────────────────
@@ -860,7 +1251,7 @@ let wsInitTimer = null;
 /** Fetch initial data via REST API as fallback if WebSocket is slow */
 async function fetchInitialData() {
   try {
-    const [botsRes, discoveredRes, routinesRes, settingsRes, flockRes, mapRes, statsRes, catalogRes, mainLogsRes, factionStorageRes] = await Promise.all([
+    const [botsRes, discoveredRes, routinesRes, settingsRes, flockRes, mapRes, statsRes, catalogRes, mainLogsRes, factionStorageRes, lastUsedRoutinesRes] = await Promise.all([
       fetch('/api/bots').then(r => r.json()),
       fetch('/api/bots/discovered').then(r => r.json()),
       fetch('/api/routines').then(r => r.json()),
@@ -870,70 +1261,15 @@ async function fetchInitialData() {
       fetch('/api/stats').then(r => r.json()),
       fetch('/api/catalog').then(r => r.json()),
       fetch('/api/logs/main').then(r => r.json()),
-      fetch('/api/faction-storage').then(r => r.json()).catch(() => ({ items: [] })), // Best effort
+      fetch('/api/faction-storage').then(r => r.json()).catch(() => ({ items: [] })),
+      fetch('/api/last-used-routines').then(r => r.json()).catch(() => ({}))
     ]);
     settings = settingsRes || {};
     flockSettings = flockRes || { flockGroups: [], assignments: {} };
-
-    // Merge discovered bots with status data (discovered gives us usernames even if not logged in)
-    const statusBots = botsRes || [];
-    const discoveredUsernames = discoveredRes?.usernames || [];
-    window.discoveredBots = discoveredUsernames;
-    const statusByUsername = new Map(statusBots.map(b => [b.username, b]));
-
-    // Build complete bot list: include discovered bots even if no status yet
-    const botSet = new Set([...discoveredUsernames, ...statusBots.map(b => b.username)]);
-    bots = [...botSet].map(username => {
-      const status = statusByUsername.get(username);
-      if (status) return status;
-      // Bot discovered but not logged in yet - show as idle
-      return {
-        username,
-        state: 'idle',
-        routine: null,
-        credits: 0,
-        fuel: 0,
-        maxFuel: 0,
-        cargo: 0,
-        cargoMax: 0,
-        location: 'unknown',
-        system: 'unknown',
-        poi: '',
-        docked: false,
-        lastAction: '',
-        error: null,
-         shipName: '-',
-         shipClass: '',
-         hull: 0,
-        maxHull: 0,
-        shield: 0,
-        maxShield: 0,
-        ammo: 0,
-        inventory: [],
-        storage: [],
-        stats: { totalMined: 0, totalCrafted: 0, totalTrades: 0, totalProfit: 0, totalSystems: 0 },
-      };
-    });
-
-    routines = routinesRes || [];
-    settings = settingsRes || {};
-    mapData = mapRes.systems || {};
-    knownSystems = Object.entries(mapData).map(([id, sys]) => ({ id, name: sys?.name || id }));
-    knownOres = [];
-    statsDaily = statsRes || {};
-    catalog = catalogRes || { items: {}, ships: {}, skills: {}, recipes: {}, lastFetched: null };
-    // Load faction storage (shared warehouse)
-    globalFactionStorage = (factionStorageRes?.items || factionStorageRes?.entries || []).map(e => ({
-      item_id: e.itemId || e.item_id,
-      name: e.name || '?',
-      quantity: e.quantity || 0,
-    }));
-    factionFuelReserve = factionStorageRes?.factionFuelReserve || 0;
-    factionFuelCapacity = factionStorageRes?.factionFuelCapacity || 0;
-    const fuelDisplayEl = document.getElementById('factionFuelDisplay');
-    if (fuelDisplayEl) {
-      const fuelK = (factionFuelReserve / 1000).toFixed(1);
-      fuelDisplayEl.textContent = `Fuel: ${fuelK}K`;
+lastUsedRoutines = lastUsedRoutinesRes || {};
+    // Fallback: migrate from settings.botAssignments if lastUsedRoutines is empty
+    if (Object.keys(lastUsedRoutines).length === 0 && settings.botAssignments) {
+      lastUsedRoutines = { ...settings.botAssignments };
     }
     renderBots();
     renderStats();
@@ -1009,8 +1345,15 @@ async function fetchInitialData() {
         knownOres = msg.knownOres || [];
         mobileCapitol = msg.mobileCapitol || null;
         flockSettings = msg.flockSettings || { flockGroups: [], assignments: {} };
+        lastUsedRoutines = msg.lastUsedRoutines || {};
+        // Fallback: migrate from settings.botAssignments if lastUsedRoutines is empty
+        if (Object.keys(lastUsedRoutines).length === 0 && settings.botAssignments) {
+          lastUsedRoutines = { ...settings.botAssignments };
+        }
         renderBots();
         setTimeout(refreshFactionFunds, 2000);
+        refreshStationFuelDisplay();
+        setInterval(refreshStationFuelDisplay, 30000);
         updateChatBotSelect();
         // Only re-render settings if settings tab is not active (to avoid clearing unsaved changes)
         if (!document.getElementById('page-settings')?.classList.contains('active')) {
@@ -1063,6 +1406,43 @@ async function fetchInitialData() {
           renderBots();
           renderStats();
           updateChatBotSelect();
+          // Update faction fuel from any bot that has it
+          for (const bot of bots) {
+            if (bot.factionFuelReserve != null && bot.factionFuelCapacity != null && bot.factionFuelCapacity > 0) {
+              factionFuelReserve = bot.factionFuelReserve;
+              factionFuelCapacity = bot.factionFuelCapacity;
+              const fuelDisplayEl = document.getElementById('factionFuelDisplay');
+              if (fuelDisplayEl) {
+                const fuelK = (factionFuelReserve / 1000).toFixed(1);
+                fuelDisplayEl.textContent = `Fuel: ${fuelK}K`;
+              }
+              break;
+            }
+          }
+          // Update skills data for live updates (when debug logging is disabled)
+          if (skillsLoaded && skillsData && skillsData.bots) {
+            for (const bot of bots) {
+              if (bot.skills) {
+                const skills = {};
+                for (const [skillId, skillData] of Object.entries(bot.skills)) {
+                  // Handle both camelCase (from bot) and snake_case (from logs)
+                  const xp = skillData.xp || skillData['xp'] || 0;
+                  const nextLevelXp = skillData.xpToNext || skillData['xp_to_next'] || skillData.next_level_xp;
+                  skills[skillId] = {
+                    level: skillData.level || 0,
+                    xp: xp,
+                    nextLevelXp: nextLevelXp
+                  };
+                }
+                skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
+              }
+            }
+            // Re-render skills tab if it's currently visible
+            if (document.getElementById('page-stats')?.classList.contains('active') && 
+                document.getElementById('statsSkillsView')?.style.display !== 'none') {
+              renderSkillsTab();
+            }
+          }
           // Update profile sidebar if open (location, credits, cargo, etc.)
           if (profileBot) {
             updateProfileSidebar();
@@ -1263,16 +1643,16 @@ function renderBots() {
     const fuelClass = isLowFuel ? 'low-fuel' : '';
     const fuelGradient = getFuelGradient(fuelPct);
     const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
-    const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+    const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : (bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state);
     const cargoPct = bot.cargoMax > 0 ? Math.round((bot.cargo / bot.cargoMax) * 100) : 0;
     const cargoDisplay = bot.cargoMax > 0 ? `${bot.cargo}/${bot.cargoMax}` : `${bot.cargo}`;
     const isCargoFull = bot.cargoMax > 0 && (bot.cargo / bot.cargoMax) > 0.9;
     const cargoClass = isCargoFull ? 'cargo-full' : '';
     const hullShd = (bot.maxHull > 0 || bot.maxShield > 0) ? `${bot.hull}/${bot.shield}` : '-';
-    let actions = '';
+let actions = '';
     if (bot.state !== 'running' && bot.state !== 'stopping') {
-      const prevSel = document.getElementById(`routine-${bot.username}`);
-      const prevRoutine = prevSel ? prevSel.value : (bot.routine || 'miner');
+      const prevSel = document.getElementById(`routine-${esc(bot.username)}`);
+      const prevRoutine = prevSel ? prevSel.value : (lastUsedRoutines[bot.username] || bot.routine || 'miner');
       actions = `
         <select id="routine-${esc(bot.username)}" onclick="event.stopPropagation()" onchange="toggleReturnHomeOptions('${esc(bot.username)}')">
           ${routines.map(r => `<option value="${esc(r)}"${r === prevRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
@@ -1284,7 +1664,9 @@ function renderBots() {
         <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>
         <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕</button>`;
     } else if (bot.state === 'running') {
-      actions = `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
+      actions = bot.routine === 'civilian_transport'
+        ? `<button class="warning sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+        : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
     }
     return `<tr data-bot="${esc(bot.username)}">
       <td class="bot-name-cell" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}</td>
@@ -1317,7 +1699,7 @@ function updateBotTableBadges() {
     if (!row) return;
     const badge = row.querySelector(`.state-badge[data-bot="${bot.username}"]`);
     if (badge) {
-      const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+      const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : (bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state);
       badge.textContent = esc(stateLabel);
       badge.className = `state-badge state-${bot.state}`;
     }
@@ -1483,7 +1865,7 @@ function renderBotGridCard(bot) {
   const fuelGradient = getFuelGradient(fuelPct);
   const cargoGradient = getCargoGradient(cargoPct);
   const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
-  const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+  const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : (bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state);
 
   return `
     <div class="grid-bot-card" onclick="openProfile('${esc(bot.username)}')">
@@ -1514,7 +1896,9 @@ function renderBotGridCard(bot) {
           <button class="primary sm" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>
           <button class="danger sm" onclick="event.stopPropagation();removeBot('${esc(bot.username)}')" style="padding:2px 6px">✕</button>
         ` : bot.state === 'running' ? `
-          <button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>
+          ${bot.routine === 'civilian_transport' 
+            ? `<button class="warning sm" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+            : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`}
         ` : ''}
       </div>
     </div>
@@ -1528,7 +1912,8 @@ function renderRoutineGroups() {
 
   const filteredBots = bots.filter(bot => {
     const matchesSearch = !routineGroupsState.currentFilter.search || bot.username.toLowerCase().includes(routineGroupsState.currentFilter.search);
-    const matchesRoutine = !routineGroupsState.currentFilter.routine || bot.routine === routineGroupsState.currentFilter.routine;
+    const botRoutine = bot.state === 'error' ? (lastUsedRoutines[bot.username] || bot.routine) : bot.routine;
+    const matchesRoutine = !routineGroupsState.currentFilter.routine || botRoutine === routineGroupsState.currentFilter.routine;
     const matchesStatus = !routineGroupsState.currentFilter.status || bot.state === routineGroupsState.currentFilter.status;
     return matchesSearch && matchesRoutine && matchesStatus;
   });
@@ -1543,7 +1928,8 @@ function renderRoutineGroups() {
 
   const grouped = {};
   filteredBots.forEach(bot => {
-    const r = bot.routine || 'unknown';
+    const botRoutine = bot.state === 'error' ? (lastUsedRoutines[bot.username] || bot.routine) : bot.routine;
+    const r = botRoutine || 'unknown';
     if (!grouped[r]) grouped[r] = [];
     grouped[r].push(bot);
   });
@@ -1668,9 +2054,10 @@ function renderBotCard(bot) {
   const isLowFuel = fuelPct < 20;
   const fuelGradient = getFuelGradient(fuelPct);
   const cargoGradient = getCargoGradient(cargoPct);
+  const displayRoutine = bot.state === 'error' ? (lastUsedRoutines[bot.username] || bot.routine || 'unknown') : bot.routine;
 
   return `
-    <div class="bot-card routine-${bot.routine} ${isExpanded ? 'expanded' : ''}"
+    <div class="bot-card routine-${displayRoutine} ${isExpanded ? 'expanded' : ''}"
          data-bot="${esc(bot.username)}"
          onclick="handleBotCardClick(event, '${esc(bot.username)}')">
       <div class="bot-card-header">
@@ -1681,7 +2068,7 @@ function renderBotCard(bot) {
         </div>
         <div class="bot-card-status">
           <span class="status-dot ${bot.state}"></span>
-          <span class="status-label">${bot.state}</span>
+          <span class="status-label">${bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state}</span>
         </div>
       </div>
       <div class="bot-card-bars">
@@ -1721,7 +2108,9 @@ function renderBotCard(bot) {
       <div class="bot-card-actions">
         ${bot.state !== 'running'
           ? `<button class="sm primary" onclick="event.stopPropagation();startBot('${esc(bot.username)}')">Start</button>`
-          : `<button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+          : bot.routine === 'civilian_transport'
+            ? `<button class="sm warning" onclick="event.stopPropagation();stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
+            : `<button class="sm danger" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`
         }
         <button class="sm" onclick="event.stopPropagation();openProfile('${esc(bot.username)}')">Details</button>
       </div>
@@ -1977,13 +2366,19 @@ async function switchStatsView(view) {
   statsTaxesView = view;
   document.getElementById('statsTabMain').classList.toggle('active', view === 'main');
   document.getElementById('statsTabTaxes').classList.toggle('active', view === 'taxes');
+  document.getElementById('statsTabSkills').classList.toggle('active', view === 'skills');
   document.getElementById('statsMainView').style.display = view === 'main' ? '' : 'none';
   document.getElementById('statsTaxesView').style.display = view === 'taxes' ? '' : 'none';
+  document.getElementById('statsSkillsView').style.display = view === 'skills' ? '' : 'none';
   if (view === 'taxes') {
     if (!taxesLoaded) {
       await loadTaxesData();
     }
     renderTaxesTab();
+  }
+  if (view === 'skills') {
+    await loadSkillsData();
+    renderSkillsTab();
   }
 }
 
@@ -2035,6 +2430,100 @@ function renderTaxesTab() {
   }).join('');
 }
 
+let skillsData = null;
+let skillsLoaded = false;
+
+async function loadSkillsData() {
+  // Initialize skillsData from current bots (live WebSocket updates)
+  if (!skillsData) {
+    skillsData = { bots: {}, lastUpdated: new Date().toISOString() };
+    for (const bot of bots) {
+      if (bot.skills) {
+        const skills = {};
+        for (const [skillId, skillData] of Object.entries(bot.skills)) {
+          const xp = skillData.xp || skillData['xp'] || 0;
+          const nextLevelXp = skillData.xpToNext || skillData['xp_to_next'] || skillData.next_level_xp;
+          skills[skillId] = {
+            level: skillData.level || 0,
+            xp: xp,
+            nextLevelXp: nextLevelXp
+          };
+        }
+        skillsData.bots[bot.username] = { skills, lastUpdated: new Date().toISOString() };
+      }
+    }
+    skillsLoaded = true;
+  }
+}
+
+function renderSkillsTab() {
+  const content = document.getElementById('skillsContent');
+  if (!content) return;
+  
+  const bots = skillsData?.bots || {};
+  const botNames = Object.keys(bots);
+  
+  document.getElementById('skillsTotalBots').textContent = botNames.length;
+  document.getElementById('skillsLastUpdated').textContent = skillsData?.lastUpdated ? new Date(skillsData.lastUpdated).toLocaleTimeString() : '-';
+  
+  if (botNames.length === 0) {
+    content.innerHTML = `<div class="skills-empty">No skills data yet. Skills update automatically when bots receive get_status responses.</div>`;
+    return;
+  }
+  
+  // Skill categories for coloring
+  const combatSkills = ['armor', 'shields', 'weapons', 'gunnery', 'bounty_hunting'];
+  const importantSkills = {
+    'piloting': 'piloting',
+    'navigation': 'navigation',
+    'engineering': 'engineering',
+    'piracy': 'piracy'
+  };
+  
+  content.innerHTML = `
+    <div class="skills-grid">
+      ${botNames.sort().map(botName => {
+        const data = bots[botName];
+        const skills = data.skills || {};
+        const skillEntries = Object.entries(skills);
+        return `
+          <div class="skills-bot-card">
+            <div class="skills-bot-name">${esc(botName)}</div>
+            <div class="skills-list">
+              ${skillEntries.length > 0
+                ? skillEntries.map(([skillId, skill]) => {
+                    const level = skill.level || 0;
+                    // Handle both camelCase (from bot) and snake_case (from logs)
+                    const xp = skill.xp || skill['xp'] || 0;
+                    const nextLevelXp = skill.nextLevelXp || skill['xp_to_next'] || skill['xpToNext'] || 0;
+                    const xpPercent = nextLevelXp ? Math.min(100, Math.round((xp / nextLevelXp) * 100)) : 0;
+                    const xpDisplay = xp && nextLevelXp ? `${xp}/${nextLevelXp} (${xpPercent}%)` : '';
+                    
+                    let skillClass = '';
+                    if (importantSkills[skillId]) {
+                      skillClass = importantSkills[skillId];
+                    } else if (combatSkills.includes(skillId)) {
+                      skillClass = 'combat';
+                    }
+                    
+                    const friendlyName = catalogName(skillId);
+                    return `
+                      <div class="skills-item">
+                        <span class="skills-name ${skillClass}">${esc(friendlyName)}</span>
+                        <span class="skills-level">Lv ${level}${xpDisplay ? '<br><span class="skills-xp">' + xpDisplay + '</span>' : ''}</span>
+                      </div>
+                    `;
+                  }).join('')
+                : '<div class="skills-empty" style="padding:8px">No skills data</div>'
+              }
+            </div>
+          </div>
+        `;
+      }).join('')}
+    </div>
+  `;
+}
+
 async function loadTaxesDataAndRender() {
   await loadTaxesData();
   loadTaxesBar();
@@ -2079,7 +2568,20 @@ function refreshFactionFunds() {
   // but it requires docking. Prefer a docked running bot; fall back to any docked bot.
   const docked = bots.filter(b => b.docked);
   const pick = docked.find(b => b.state === 'running') ?? docked[0] ?? null;
-  if (!pick) return; // no docked bot — display already shows cached data
+  if (!pick) {
+    // No docked bot — fetch from faction-storage API endpoint
+    fetch('/api/faction-storage').then(r => r.json()).then(data => {
+      if (data.factionFuelReserve != null) {
+        factionFuelReserve = data.factionFuelReserve;
+        factionFuelCapacity = data.factionFuelCapacity || 0;
+        if (fuelDisplayEl) {
+          const fuelK = (factionFuelReserve / 1000).toFixed(1);
+          fuelDisplayEl.textContent = `Fuel: ${fuelK}K`;
+        }
+      }
+    }).catch(() => {});
+    return;
+  }
 
   _factionFundsInFlight = true;
   sendExec(pick.username, 'view_faction_storage', undefined, (result) => {
@@ -2106,6 +2608,38 @@ function refreshFactionFunds() {
       }
     }
   });
+}
+
+function getStationInitials(stationId) {
+  const stationNameMap = {
+    'sol_central': 'SC',
+    'sirius_observatory_station': 'S',
+    'nova_terra_central': 'NT',
+    'procyon_colonial_station': 'PC',
+    'alpha_centauri_colonial_station': 'AC'
+  };
+  return stationNameMap[stationId] || stationId.slice(0, 2).toUpperCase();
+}
+
+async function refreshStationFuelDisplay() {
+  try {
+    const response = await fetch('/api/faction-fuel-stations');
+    if (!response.ok) return;
+    const data = await response.json();
+    const stations = data.stations || [];
+    
+    stations.forEach(station => {
+      const initials = getStationInitials(station.stationId);
+      const el = document.getElementById(`stationFuel${initials.replace(/[^A-Z]/g, '')}`);
+      if (el) {
+        const fuelK = (station.fuelReserve / 1000).toFixed(1);
+        el.textContent = `${initials}: ${fuelK}K`;
+        el.style.opacity = station.fuelCapacity > 0 ? '1' : '0.5';
+      }
+    });
+  } catch (e) {
+    console.warn('Failed to refresh station fuel:', e);
+  }
 }
 
 // ── Bot Profile ────────────────────────────────────────────
@@ -2187,7 +2721,7 @@ function renderProfileTopbar() {
   const bot = getProfileBot();
   if (!bot) return;
 
-  const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+  const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : (bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state);
   document.getElementById('profileName').textContent = bot.username;
   document.getElementById('profileShip').textContent = bot.shipName || 'No ship';
   document.getElementById('profileBadge').innerHTML = `<span class="state-badge state-${bot.state}">${esc(stateLabel)}</span>`;
@@ -2202,7 +2736,7 @@ function renderProfileTopbar() {
   let actions = '';
   if (bot.state !== 'running' && bot.state !== 'stopping') {
     const prevProfileSel = document.getElementById('profile-routine');
-    const prevProfileRoutine = prevProfileSel ? prevProfileSel.value : (bot.routine || 'miner');
+    const prevProfileRoutine = prevProfileSel ? prevProfileSel.value : ((lastUsedRoutines[bot.username] || bot.routine) || 'miner');
     actions = `
       <select id="profile-routine" onchange="renderProfileSidebar()">
         ${routines.map(r => `<option value="${esc(r)}"${r === prevProfileRoutine ? ' selected' : ''}>${esc(r)}</option>`).join('')}
@@ -2210,7 +2744,10 @@ function renderProfileTopbar() {
       <button class="primary sm" onclick="startBotFromProfile()">Start</button>
       <button class="danger sm" onclick="removeBot('${esc(bot.username)}')" title="Remove bot" style="padding:2px 6px;min-width:auto">✕ Remove</button>`;
   } else if (bot.state === 'running') {
-    actions = `<button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop</button>`;
+    const isCivilianTransport = bot.routine === 'civilian_transport';
+    actions = isCivilianTransport
+      ? `<button class="warning sm" onclick="stopBotAfterCycle('${esc(bot.username)}')">Stop After Cycle</button><button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop Now</button>`
+      : `<button class="danger sm" onclick="stopBot('${esc(bot.username)}')">Stop</button>`;
   }
 
   // Per-bot target ore selector (visible when miner is selected or running)
@@ -2260,6 +2797,7 @@ function renderProfileTopbar() {
         <option value="explore"${explorerMode === 'explore' ? ' selected' : ''}>Explore new systems</option>
         <option value="trade_update"${explorerMode === 'trade_update' ? ' selected' : ''}>Update trade data</option>
         <option value="deep_core_scan"${explorerMode === 'deep_core_scan' ? ' selected' : ''}>Scan hidden POIs</option>
+        <option value="visit_all"${explorerMode === 'visit_all' ? ' selected' : ''}>Visit all systems</option>
       </select>
       <span class="profile-ore-label" style="margin-left:8px">Direct to Unknown:</span>
       <select id="profile-directToUnknown" onchange="saveProfileDirectToUnknown()" style="width:auto;padding:2px 6px;font-size:11px">
@@ -2290,6 +2828,39 @@ function renderProfileTopbar() {
         <span class="profile-ore-label" style="margin-left:8px">Max Jumps:</span>
         <input type="number" id="profile-maxJumps" value="${maxJumps}" min="1" max="100" style="width:60px" onchange="saveProfileMaxJumps()">`;
     }
+  }
+
+  // Per-bot pathfinder_test settings (visible when pathfinder_test is selected or running)
+  const isPathfinderTest = (bot.state === 'running' && bot.routine === 'pathfinder_test')
+    || (bot.state !== 'running' && bot.state !== 'stopping' && getProfileSelectedRoutine() === 'pathfinder_test');
+  if (isPathfinderTest) {
+    const botSettings = settings[bot.username] || {};
+    const originSystem = botSettings.originSystem || 'sol';
+    const targetSystem = botSettings.targetSystem || 'alpha';
+    const refuelThreshold = botSettings.refuelThreshold ?? 50;
+    const sysOpts = [`<option value=""${!originSystem ? ' selected' : ''}>(current)</option>`];
+    for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+      const sel = sys.id === originSystem ? ' selected' : '';
+      sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+    }
+    if (originSystem && !knownSystems.find(s => s.id === originSystem)) {
+      sysOpts.push(`<option value="${esc(originSystem)}" selected>${esc(originSystem)}</option>`);
+    }
+    const targetOpts = [`<option value=""${!targetSystem ? ' selected' : ''}>(none)</option>`];
+    for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+      const sel = sys.id === targetSystem ? ' selected' : '';
+      targetOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+    }
+    if (targetSystem && !knownSystems.find(s => s.id === targetSystem)) {
+      targetOpts.push(`<option value="${esc(targetSystem)}" selected>${esc(targetSystem)}</option>`);
+    }
+    actions += `
+      <span class="profile-ore-label">Origin System:</span>
+      <select id="profile-pathfinderOrigin" onchange="saveProfilePathfinderOrigin()" style="width:auto;padding:2px 6px;font-size:11px">${sysOpts.join('')}</select>
+      <span class="profile-ore-label" style="margin-left:8px">Target System:</span>
+      <select id="profile-pathfinderTarget" onchange="saveProfilePathfinderTarget()" style="width:auto;padding:2px 6px;font-size:11px">${targetOpts.join('')}</select>
+      <span class="profile-ore-label" style="margin-left:8px">Refuel %:</span>
+      <input type="number" id="profile-pathfinderRefuel" value="${refuelThreshold}" min="10" max="90" style="width:60px" onchange="saveProfilePathfinderRefuel()">`;
   }
 
   // Per-bot hunter mode selector (visible when hunter is selected or running)
@@ -2460,9 +3031,9 @@ function renderProfileTopbar() {
       </label>`;
   }
 
-  // Per-bot miner to follow (for escort routine)
-  const isEscort = (bot.state === 'running' && bot.routine === 'escort')
-    || (bot.state !== 'running' && bot.state !== 'stopping' && getProfileSelectedRoutine() === 'escort');
+  // Per-bot miner to follow (for escort and escort_flock routines)
+  const isEscort = (bot.state === 'running' && (bot.routine === 'escort' || bot.routine === 'escort_flock'))
+    || (bot.state !== 'running' && bot.state !== 'stopping' && (getProfileSelectedRoutine() === 'escort' || getProfileSelectedRoutine() === 'escort_flock'));
   if (isEscort) {
     const botSettings = settings[bot.username] || {};
     const globalMiner = (settings.escort || {}).minerName || '';
@@ -2643,6 +3214,42 @@ function saveProfileGroupUnknowns() {
   const groupUnknowns = sel.value === 'true';
   const existing = settings[bot.username] || {};
   const updated = Object.assign({}, existing, { groupUnknowns });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfilePathfinderOrigin() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const sel = document.getElementById('profile-pathfinderOrigin');
+  if (!sel) return;
+  const originSystem = sel.value;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { originSystem });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfilePathfinderTarget() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const sel = document.getElementById('profile-pathfinderTarget');
+  if (!sel) return;
+  const targetSystem = sel.value;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { targetSystem });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfilePathfinderRefuel() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  const inp = document.getElementById('profile-pathfinderRefuel');
+  if (!inp) return;
+  const refuelThreshold = parseInt(inp.value, 10) || 50;
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { refuelThreshold });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
 }
@@ -2982,7 +3589,7 @@ function updateProfileSidebar() {
       // Still update badge/name since those are separate elements
       const bot = getProfileBot();
       if (bot) {
-        const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : bot.state;
+        const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : (bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state);
         document.getElementById('profileName').textContent = bot.username;
         document.getElementById('profileShip').textContent = bot.shipName || 'No ship';
         document.getElementById('profileBadge').innerHTML = `<span class="state-badge state-${bot.state}">${esc(stateLabel)}</span>`;
@@ -5652,7 +6259,7 @@ const FORMATTERS = {
 // Rate limiting: 10s cooldown on action (mutation) commands per bot
 const QUERY_COMMANDS = new Set([
   'get_status', 'get_cargo', 'get_ship', 'get_system', 'get_nearby',
-  'get_skills', 'get_missions', 'get_active_missions',
+  'get_missions', 'get_active_missions',
   'get_battle_status', 'get_notifications', 'get_trades', 'get_wrecks',
   'view_market', 'view_orders', 'view_storage', 'view_faction_storage',
   'list_ships', 'get_ships', 'catalog', 'shipyard_showroom', 'commission_status', 'scan', 'help', 'get_location',
@@ -6168,8 +6775,8 @@ function fetchMarket(username) {
     const items = Array.isArray(d) ? d : (d.items || d.market || d.listings || []);
     profileMarket = items
       .map(i => ({
-        item_id: i.item_id || i.id || '',
-        name: i.name || i.item_id || i.id || '?',
+        item_id: i.itemId || i.item_id || i.id || '',
+        name: i.name || i.itemId || '',
         buy_price: i.buy_price ?? i.price ?? null,
         sell_price: i.sell_price ?? null,
         stock: i.stock ?? i.quantity ?? null,
@@ -6181,71 +6788,44 @@ function fetchMarket(username) {
 }
 
 function fetchSkills(username) {
-  // Set to null to show "Loading..." message
-  profileSkillsList = null;
-  renderProfileSidebar();
-
-  // Track retry count to avoid infinite loops
-  if (!fetchSkills.retryCount) fetchSkills.retryCount = {};
-  if (!fetchSkills.retryCount[username]) fetchSkills.retryCount[username] = 0;
-  const maxRetries = 2;
-
-  // Set a timeout to retry if callback doesn't fire within 5 seconds
-  const timeoutId = setTimeout(() => {
-    if (profileBot === username && profileSkillsList === null) {
-      if (fetchSkills.retryCount[username] < maxRetries) {
-        fetchSkills.retryCount[username]++;
-        logResponse(`<span class="resp-warn">Skills load timed out, retrying (${fetchSkills.retryCount[username]}/${maxRetries})...</span>`);
-        fetchSkills(username); // Retry
-      } else {
-        profileSkillsList = [];
-        profileSkills = {};
-        renderProfileSidebar();
-        logResponse('<span class="resp-err">Skills load failed after retries. Click Retry to try again.</span>');
-        fetchSkills.retryCount[username] = 0;
-      }
-    }
-  }, 5000);
-
-  sendExec(username, 'get_skills', undefined, (result) => {
-    clearTimeout(timeoutId); // Clear the timeout since callback fired
-    fetchSkills.retryCount[username] = 0; // Reset retry count on success
-
-    if (profileBot !== username) return; // stale response
-    if (!result.ok || !result.data) {
-      profileSkillsList = [];
-      profileSkills = {};
-      renderProfileSidebar();
-      return;
-    }
-    const d = result.data;
-    let raw = d.skills || d.player_skills || d;
-
-    // Normalize: if skills is an object keyed by name, convert to array
-    let skills;
-    if (Array.isArray(raw)) {
-      skills = raw;
-    } else if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
-      skills = Object.entries(raw).map(([name, val]) => {
-        if (val && typeof val === 'object') {
-          return { name, ...val };
-        }
-        return { name, level: val };
-      });
-    } else {
-      skills = [];
-    }
-
+  // Use skills from get_status (included in bot.status()) instead of separate get_skills call
+  const bot = bots.find(b => b.username === username);
+  if (!bot) {
+    profileSkillsList = [];
     profileSkills = {};
-    profileSkillsList = skills;
-    for (const s of skills) {
-      const id = s.skill_id || s.id || s.name || '';
-      if (id) profileSkills[id] = s.level || 0;
-      if (s.name && s.name !== id) profileSkills[s.name] = s.level || 0;
-    }
     renderProfileSidebar();
-    renderManualControls();
-  });
+    return;
+  }
+
+  const skillsData = bot.skills;
+  if (!skillsData) {
+    profileSkillsList = [];
+    profileSkills = {};
+    renderProfileSidebar();
+    return;
+  }
+
+  // Normalize skills data into array format for rendering
+  const skills = Object.entries(skillsData).map(([id, data]) => ({
+    name: id,
+    skill_id: id,
+    id: id,
+    level: data.level ?? 0,
+    xp: data.xp,
+    xp_to_next: data.xpToNext,
+    next_level_xp: data.xpToNext,
+    total_xp: data.totalXP,
+  }));
+
+  profileSkills = {};
+  profileSkillsList = skills;
+  for (const s of skills) {
+    const id = s.skill_id || s.id || s.name || '';
+    if (id) profileSkills[id] = s.level || 0;
+    if (s.name && s.name !== id) profileSkills[s.name] = s.level || 0;
+  }
+  renderProfileSidebar();
+  renderManualControls();
 }
 
 function fetchStandings(username) {
@@ -7050,6 +7630,123 @@ function poiIcon(type) {
   return '&#8226;'; // bullet
 }
 
+/** Get the best (highest) richness for a specific ore across all POIs in a system */
+function getBestOreRichness(sys, oreIds) {
+  if (!oreIds || oreIds.size === 0) return 0;
+  let bestRichness = 0;
+  for (const poi of (sys.pois || [])) {
+    for (const res of (poi.resources || [])) {
+      if (oreIds.has(res.resource_id) && (res.richness || 0) > bestRichness) {
+        bestRichness = res.richness;
+      }
+    }
+    for (const ore of (poi.ores_found || [])) {
+      if (oreIds.has(ore.item_id) && (ore.richness || 0) > bestRichness) {
+        bestRichness = ore.richness;
+      }
+    }
+  }
+  return bestRichness;
+}
+
+/** Get total amount available for a specific ore across all POIs in a system */
+function getOreTotalAmount(sys, oreIds) {
+  if (!oreIds || oreIds.size === 0) return 0;
+  let total = 0;
+  for (const poi of (sys.pois || [])) {
+    for (const res of (poi.resources || [])) {
+      if (oreIds.has(res.resource_id)) {
+        total += res.remaining || 0;
+      }
+    }
+    for (const ore of (poi.ores_found || [])) {
+      if (oreIds.has(ore.item_id)) {
+        total += ore.amount || 0;
+      }
+    }
+  }
+  return total;
+}
+
+/** Get most recent scan time for a specific ore (for "newest first" sorting) */
+function getBestOreScanTime(sys, oreIds) {
+  if (!oreIds || oreIds.size === 0) return 0;
+  let newestTime = 0;
+  for (const poi of (sys.pois || [])) {
+    for (const res of (poi.resources || [])) {
+      if (oreIds.has(res.resource_id) && res.last_scanned) {
+        const t = new Date(res.last_scanned).getTime();
+        if (t > newestTime) newestTime = t;
+      }
+    }
+    for (const ore of (poi.ores_found || [])) {
+      if (oreIds.has(ore.item_id) && ore.last_scanned) {
+        const t = new Date(ore.last_scanned).getTime();
+        if (t > newestTime) newestTime = t;
+      }
+    }
+  }
+  return newestTime;
+}
+
+/** Get best price for a specific ore (highest sell price to station) */
+function getBestOrePrice(sys, oreIds) {
+  if (!oreIds || oreIds.size === 0) return 0;
+  let bestPrice = 0;
+  for (const poi of (sys.pois || [])) {
+    // Check market data for sell prices (station buys from us)
+    if (poi.market) {
+      for (const m of poi.market) {
+        if (oreIds.has(m.item_id) && (m.best_buy || 0) > bestPrice) {
+          bestPrice = m.best_buy;
+        }
+      }
+    }
+  }
+  return bestPrice;
+}
+
+/** Build adjacency list for system jumps */
+function buildJumpGraph() {
+  const graph = new Map();
+  for (const [sysId, sys] of Object.entries(mapData)) {
+    if (!graph.has(sysId)) graph.set(sysId, []);
+    for (const conn of (sys.connections || [])) {
+      const targetId = conn.system_id;
+      if (targetId && !graph.get(sysId).includes(targetId)) {
+        graph.get(sysId).push(targetId);
+      }
+    }
+  }
+  return graph;
+}
+
+/** BFS to find shortest path length between systems */
+function bfsShortestPath(graph, startId, targetId) {
+  if (startId === targetId) return 0;
+  const visited = new Set([startId]);
+  const queue = [{ id: startId, dist: 0 }];
+  while (queue.length > 0) {
+    const { id, dist } = queue.shift();
+    for (const neighbor of (graph.get(id) || [])) {
+      if (neighbor === targetId) return dist + 1;
+      if (!visited.has(neighbor)) {
+        visited.add(neighbor);
+        queue.push({ id: neighbor, dist: dist + 1 });
+      }
+    }
+  }
+  return Infinity;
+}
+
+/** Get number of jumps from a system to the home base (faction storage station) */
+function getJumpsFromHome(sysId) {
+  const graph = buildJumpGraph();
+  const homeSystem = settings.general?.factionStorageSystem || '';
+  if (!homeSystem) return 0;
+  return bfsShortestPath(graph, sysId, homeSystem);
+}
+
 function renderMap() {
   const container = document.getElementById('mapContent');
   if (!container) return;
@@ -7108,7 +7805,55 @@ function renderMap() {
     if (sortBy === 'name') return (a.name || a.id || '').localeCompare(b.name || b.id || '');
     if (sortBy === 'updated') return (b.last_updated || '').localeCompare(a.last_updated || '');
     if (sortBy === 'pois') return (b.pois || []).length - (a.pois || []).length;
+    if (sortBy === 'jumps') return (b.connections || []).length - (a.connections || []).length;
     if (sortBy === 'security') return securityOrder(a.security_level) - securityOrder(b.security_level);
+    
+    // Ore-specific sorting (only meaningful when an ore is selected)
+    if (sortBy === 'ore_richness') {
+      const aRich = getBestOreRichness(a, activeOreFilters);
+      const bRich = getBestOreRichness(b, activeOreFilters);
+      return bRich - aRich;
+    }
+    if (sortBy === 'ore_amount') {
+      const aAmt = getOreTotalAmount(a, activeOreFilters);
+      const bAmt = getOreTotalAmount(b, activeOreFilters);
+      return bAmt - aAmt;
+    }
+    if (sortBy === 'ore_newest') {
+      const aTime = getBestOreScanTime(a, activeOreFilters);
+      const bTime = getBestOreScanTime(b, activeOreFilters);
+      return bTime - aTime;
+    }
+    if (sortBy === 'ore_best_station') {
+      const aPrice = getBestOrePrice(a, activeOreFilters);
+      const bPrice = getBestOrePrice(b, activeOreFilters);
+      return bPrice - aPrice;
+    }
+    
+    // Combo sorting: Most Available + Fewest Jumps from home base
+    if (sortBy === 'ore_amount_jumps') {
+      const aAmt = getOreTotalAmount(a, activeOreFilters);
+      const bAmt = getOreTotalAmount(b, activeOreFilters);
+      const aJumps = getJumpsFromHome(a.id);
+      const bJumps = getJumpsFromHome(b.id);
+      // Primary: most available (descending)
+      if (bAmt !== aAmt) return bAmt - aAmt;
+      // Secondary: fewest jumps (ascending)
+      return aJumps - bJumps;
+    }
+    
+    // Combo sorting: Best Price + Fewest Jumps from home base
+    if (sortBy === 'ore_price_jumps') {
+      const aPrice = getBestOrePrice(a, activeOreFilters);
+      const bPrice = getBestOrePrice(b, activeOreFilters);
+      const aJumps = getJumpsFromHome(a.id);
+      const bJumps = getJumpsFromHome(b.id);
+      // Primary: best price (descending)
+      if (bPrice !== aPrice) return bPrice - aPrice;
+      // Secondary: fewest jumps (ascending)
+      return aJumps - bJumps;
+    }
+    
     return 0;
   });
 
@@ -7140,6 +7885,39 @@ function renderMap() {
     const poiCount = pois.length;
     const connections = sys.connections || [];
     const updated = sys.last_updated ? new Date(sys.last_updated).toLocaleDateString() : 'Never';
+    
+    // Ore-specific summary when an ore is selected
+    let oreSummary = '';
+    if (filterOres && activeOreFilters.size > 0) {
+      const bestRichness = getBestOreRichness(sys, activeOreFilters);
+      const totalAmount = getOreTotalAmount(sys, activeOreFilters);
+      const newestScan = getBestOreScanTime(sys, activeOreFilters);
+      const bestPrice = getBestOrePrice(sys, activeOreFilters);
+      const homeJumps = getJumpsFromHome(sys.id);
+      
+      const richnessStr = bestRichness > 0 ? `${bestRichness}%` : '-';
+      const amountStr = totalAmount > 0 ? totalAmount.toLocaleString() : '-';
+      const priceStr = bestPrice > 0 ? `${bestPrice.toLocaleString()}cr` : '-';
+      
+      const newestStr = newestScan > 0 
+        ? Math.floor((Date.now() - newestScan) / 60000) + 'm ago' 
+        : '-';
+      
+      const homeJumpsStr = homeJumps === Infinity ? 'Unreachable' : `${homeJumps} jump${homeJumps !== 1 ? 's' : ''}`;
+      
+      oreSummary = `
+        <div class="sys-ore-summary" style="margin-top:8px;padding:8px;background:rgba(79,195,247,0.08);border-radius:4px;border:1px solid rgba(79,195,247,0.2)">
+          <div style="font-size:11px;color:var(--text-dim);margin-bottom:4px;font-weight:500">Ore Analysis (${[...activeOreFilters].map(id => catalog.items[id]?.name || catalogName(id) || id).join(', ')})</div>
+          <div style="display:flex;gap:12px;font-size:11px">
+            <span><span style="color:var(--text-dim)">Richness:</span> <span style="color:var(--text-bright)">${richnessStr}</span></span>
+            <span><span style="color:var(--text-dim)">Amount:</span> <span style="color:var(--text-bright)">${amountStr}</span></span>
+            <span><span style="color:var(--text-dim)">Best Price:</span> <span style="color:var(--text-bright)">${priceStr}</span></span>
+            <span><span style="color:var(--text-dim)">Latest:</span> <span style="color:var(--text-bright)">${newestStr}</span></span>
+            <span><span style="color:var(--text-dim)">From Home:</span> <span style="color:var(--text-bright)">${homeJumpsStr}</span></span>
+          </div>
+        </div>
+      `;
+    }
 
     html += `
       <div class="sys-card" data-sys="${esc(sys.id)}">
@@ -7156,6 +7934,7 @@ function renderMap() {
           </div>
         </div>
         <div class="sys-body">
+          ${oreSummary}
           <div class="sys-connections">
             <span class="conn-label">Connections:</span>
             ${connections.length > 0 ? connections.map(c => {
@@ -7240,13 +8019,26 @@ function renderMap() {
   }
 
   container.innerHTML = html;
+
+  // Restore expanded state for system cards
+  for (const sysId of expandedSystems) {
+    const card = document.querySelector(`.sys-card[data-sys="${sysId}"]`);
+    if (card) {
+      card.classList.add('expanded');
+    }
+  }
 }
 
 // System card interactions
 function toggleSystemCard(systemId) {
   const card = document.querySelector(`.sys-card[data-sys="${systemId}"]`);
   if (card) {
-    card.classList.toggle('expanded');
+    const isExpanded = card.classList.toggle('expanded');
+    if (isExpanded) {
+      expandedSystems.add(systemId);
+    } else {
+      expandedSystems.delete(systemId);
+    }
   }
 }
 
@@ -7311,12 +8103,20 @@ function renderSettingsPanel() {
     renderHunterSettings(panel);
   } else if (activeSettingsTab === 'escort') {
     renderEscortSettings(panel);
+  } else if (activeSettingsTab === 'pathfinder_test') {
+    renderPathfinderTestSettings(panel);
   } else if (activeSettingsTab === 'fleet_hunter') {
     renderFleetHunterSettings(panel);
   } else if (activeSettingsTab === 'cargo_mover') {
     renderCargoMoverSettings(panel);
   } else if (activeSettingsTab === 'fuel_transport') {
     renderFuelTransportSettings(panel);
+  } else if (activeSettingsTab === 'civilian_transport') {
+    renderCivilianTransportSettings(panel);
+  } else if (activeSettingsTab === 'module_seller') {
+    renderModuleSellerSettings(panel);
+  } else if (activeSettingsTab === 'client_sync') {
+    renderClientSyncSettings(panel);
   }
 }
 
@@ -7489,17 +8289,49 @@ function renderGeneralSettings(panel) {
        </div>
      </div>
 
-     <div class="setting-row">
-       <div>
-         <div class="setting-label">Jump Timeout Buffer</div>
-         <div class="setting-hint">Additional buffer time added to all jump timeouts (10s = 1 game tick default).</div>
+<div class="setting-row">
+        <div>
+          <div class="setting-label">Jump Timeout Buffer</div>
+          <div class="setting-hint">Additional buffer time added to all jump timeouts (10s = 1 game tick default).</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="number" id="set-general-jumpBuffer" min="0" max="60" step="5" value="${general.jumpBuffer ?? 10}" style="width:80px" />
+          <span style="color:var(--text-secondary);font-size:12px">s buffer</span>
+        </div>
        </div>
-       <div style="display:flex;align-items:center;gap:8px">
-         <input type="number" id="set-general-jumpBuffer" min="0" max="60" step="5" value="${general.jumpBuffer ?? 10}" style="width:80px" />
-         <span style="color:var(--text-secondary);font-size:12px">s buffer</span>
-       </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Disable Debug Log</div>
+          <div class="setting-hint">Disable writing to debug log files (data/logs/{botName}_debug.log). Activity logs remain unaffected.</div>
+        </div>
+        <input type="checkbox" id="set-general-disableDebugLog" ${general.disableDebugLog ? 'checked' : ''} />
       </div>
- 
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Disable Activity Log</div>
+          <div class="setting-hint">Disable writing to activity log files (data/logs/activity/{botName}_activity.log). Debug logs remain unaffected.</div>
+        </div>
+        <input type="checkbox" id="set-general-disableActivityLog" ${general.disableActivityLog ? 'checked' : ''} />
+      </div>
+
+<div class="setting-row">
+        <div>
+          <div class="setting-label">Clear Session on Restart</div>
+          <div class="setting-hint">Delete session.json files when server restarts due to mass session loss. Disable to preserve sessions across patches (HTTP API sessions now survive restarts).</div>
+        </div>
+        <input type="checkbox" id="set-general-clearSessionOnRestart" ${general.clearSessionOnRestart !== false ? 'checked' : ''} />
+      </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Disable Rate Limiting</div>
+          <div class="setting-hint">Disable the 5 requests/second rate limiter for the game API. Use only if experiencing connection issues that may be rate-limiting related.</div>
+        </div>
+        <input type="checkbox" id="set-general-disableRateLimiting" ${general.disableRateLimiting ? 'checked' : ''} />
+      </div>
+  
       <div class="settings-save-bar">
         <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
       </div>
@@ -7535,6 +8367,10 @@ function saveGeneralSettings() {
     jumpSpeed6: parseInt(document.getElementById('set-general-jumpSpeed6').value) || 30,
     jumpBuffer: parseInt(document.getElementById('set-general-jumpBuffer').value) || 10,
     approvedFuelStations,
+    disableDebugLog: document.getElementById('set-general-disableDebugLog').checked,
+    disableActivityLog: document.getElementById('set-general-disableActivityLog').checked,
+    clearSessionOnRestart: document.getElementById('set-general-clearSessionOnRestart').checked,
+    disableRateLimiting: document.getElementById('set-general-disableRateLimiting').checked,
   };
   send({ type: 'saveSettings', routine: 'general', settings: s });
 }
@@ -7695,17 +8531,16 @@ function renderCleanupSettings(panel) {
   const cleanupSystem = cleanup.homeSystem || '';
   const cleanupStation = cleanup.homeStation || '';
   const focusStationId = cleanup.focusStationId || '';
+  const depositAllStorage = cleanup.depositAllStorage !== false;
   const generalSystem = general.factionStorageSystem || '';
   const generalStation = general.factionStorageStation || '';
 
-  // Resolve general station name for the fallback label
   let generalLabel = 'not set';
   if (generalSystem && generalStation && mapData[generalSystem]) {
     const gPoi = (mapData[generalSystem].pois || []).find(p => p.id === generalStation);
     if (gPoi) generalLabel = (gPoi.base_name || gPoi.name || generalStation) + ' (' + (mapData[generalSystem].name || generalSystem) + ')';
   }
 
-  // Build station options from mapData (same format as general settings: "systemId|poiId")
   let stationOpts = `<option value="">(use general: ${esc(generalLabel)})</option>`;
   let focusOpts = `<option value="">(clean all stations)</option>`;
   for (const [sysId, sys] of Object.entries(mapData)) {
@@ -7713,11 +8548,9 @@ function renderCleanupSettings(panel) {
     for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
       if (!(poi.has_base || poi.base_id)) continue;
       const val = sysId + '|' + poi.id;
-      // For deposit station
       const sel = (sysId === cleanupSystem && poi.id === cleanupStation) ? ' selected' : '';
       const label = poi.base_name || poi.name || poi.id;
       stationOpts += `<option value="${val}"${sel}>${label} (${sysName})</option>`;
-      // For focus station (use base_id if available)
       const focusVal = poi.base_id || poi.id;
       const focusSel = focusStationId === focusVal ? ' selected' : '';
       focusOpts += `<option value="${esc(focusVal)}"${focusSel}>${esc(label)} (${esc(sysName)})</option>`;
@@ -7744,6 +8577,17 @@ function renderCleanupSettings(panel) {
       <select id="set-cleanup-focusStation">${focusOpts}</select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Deposit All Storage</div>
+        <div class="setting-hint">When enabled, station storage items are deposited directly to faction storage (using source: storage). When disabled, only cargo is deposited and station storage is left in place.</div>
+      </div>
+      <select id="set-cleanup-depositAllStorage">
+        <option value="true" ${depositAllStorage ? 'selected' : ''}>Yes</option>
+        <option value="false" ${!depositAllStorage ? 'selected' : ''}>No</option>
+      </select>
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveCleanupSettings()">Save Settings</button>
     </div>
@@ -7754,7 +8598,8 @@ function saveCleanupSettings() {
   const stationVal = document.getElementById('set-cleanup-station').value;
   const [homeSystem, homeStation] = stationVal ? stationVal.split('|') : ['', ''];
   const focusStationId = document.getElementById('set-cleanup-focusStation').value;
-  const s = { homeSystem, homeStation, focusStationId };
+  const depositAllStorage = document.getElementById('set-cleanup-depositAllStorage').value === 'true';
+  const s = { homeSystem, homeStation, focusStationId, depositAllStorage };
   send({ type: 'saveSettings', routine: 'cleanup', settings: s });
   settings.cleanup = Object.assign(settings.cleanup || {}, s);
 }
@@ -8191,6 +9036,22 @@ async function renderCrafterSettings(panel) {
       <input type="number" id="set-crafter-repairThreshold" min="20" max="80" value="${repairThreshold}">
     </div>
 
+    <div class="setting-row" style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div>
+        <div class="setting-label">Blacklisted Recipes</div>
+        <div class="setting-hint">Recipes that will NEVER be used for crafting (extremely wasteful). Defaults are shown below. Add custom recipe IDs to blacklist additional recipes.</div>
+      </div>
+      <div style="flex:1">
+        <div id="blacklisted-recipes-list" style="max-height:100px;overflow-y:auto;margin-bottom:6px;font-size:11px">
+          ${renderBlacklistedRecipesList()}
+        </div>
+        <div style="display:flex;gap:6px">
+          <input type="text" id="blacklisted-recipe-input" placeholder="recipe_id (e.g., synthesize_energy_crystal)" style="flex:1;font-size:11px;padding:4px">
+          <button class="sm primary" onclick="addBlacklistedRecipe()">Add</button>
+        </div>
+      </div>
+    </div>
+
     <div class="settings-save-bar">
       <button class="sm" onclick="cachedSettingsRecipes=null;renderCrafterSettings(document.getElementById('settingsContent'))">Refresh Recipes</button>
       <button class="primary" onclick="saveCrafterSettings()">Save Settings</button>
@@ -8421,6 +9282,7 @@ function saveCrafterSettings() {
       excludeCategories: autoBuyExcludeCategories,
     },
     requestItems,
+    blacklistedRecipes: settings.crafter.blacklistedRecipes || [],
   };
   send({ type: 'saveSettings', routine: 'crafter', settings: s });
 
@@ -8660,6 +9522,65 @@ function deleteCrafterProfile() {
     window._currentCrafterProfile = "Default Crafter";
   }
 
+  saveCrafterSettings();
+}
+
+// ── Ship Loadouts ───────────────────────────────────────
+
+// ── Blacklisted Recipes Management ───────────────────────
+
+const DEFAULT_BLACKLISTED_RECIPES = [
+  "basic_silicon_refinement",
+  "fabricate_circuit_boards",
+  "synthesize_energy_crystal",
+  "synthesize_xenon_power_cell",
+  "chlorine_circuit_etching",
+];
+
+function renderBlacklistedRecipesList() {
+  const userBlacklisted = settings.crafter?.blacklistedRecipes || [];
+  const allBlacklisted = new Set([...DEFAULT_BLACKLISTED_RECIPES, ...userBlacklisted]);
+  
+  if (allBlacklisted.size === 0) {
+    return '<span style="color:var(--dim);">No recipes blacklisted</span>';
+  }
+  
+  const sorted = [...allBlacklisted].sort();
+  return sorted.map(id => {
+    const isUserAdded = userBlacklisted.includes(id);
+    const isDefault = DEFAULT_BLACKLISTED_RECIPES.includes(id);
+    return `
+      <div style="display:flex;align-items:center;gap:4px;margin-bottom:2px;padding:4px;background:${isUserAdded ? 'rgba(211,47,47,0.1)' : 'rgba(88,166,255,0.05)'};border-radius:3px">
+        <span>${esc(id)}</span>
+        <span style="font-size:10px;color:var(--dim)">${isDefault && !isUserAdded ? '(default)' : isUserAdded ? '(custom)' : ''}</span>
+        ${isUserAdded ? `<button style="margin-left:auto;font-size:10px;padding:2px 6px;background:#d32f2f;color:#fff;border:none;border-radius:3px;cursor:pointer" onclick="removeBlacklistedRecipe('${esc(id)}')">✕ Remove</button>` : ''}
+      </div>
+    `;
+  }).join('');
+}
+
+function addBlacklistedRecipe() {
+  const input = document.getElementById('blacklisted-recipe-input');
+  const recipeId = input?.value.trim();
+  if (!recipeId) return;
+  
+  if (!settings.crafter) settings.crafter = {};
+  if (!settings.crafter.blacklistedRecipes) settings.crafter.blacklistedRecipes = [];
+  
+  const blacklisted = settings.crafter.blacklistedRecipes;
+  if (!blacklisted.includes(recipeId)) {
+    blacklisted.push(recipeId);
+    input.value = '';
+    saveCrafterSettings();
+  } else {
+    alert(`Recipe "${recipeId}" is already blacklisted.`);
+  }
+}
+
+function removeBlacklistedRecipe(recipeId) {
+  if (!settings.crafter?.blacklistedRecipes) return;
+  
+  settings.crafter.blacklistedRecipes = settings.crafter.blacklistedRecipes.filter(id => id !== recipeId);
   saveCrafterSettings();
 }
 
@@ -9870,6 +10791,17 @@ function renderTraderSettings(panel) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Debug Logging</div>
+        <div class="setting-hint">Enable verbose logging for trade route discovery (shows profit calculations, skipped routes, etc).</div>
+      </div>
+      <select id="set-trader-debugLogging">
+        <option value="false" ${t.debugLogging === true ? '' : 'selected'}>Disabled</option>
+        <option value="true" ${t.debugLogging === true ? 'selected' : ''}>Enabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Min Profit Per Unit (credits)</div>
         <div class="setting-hint">Only run trade routes where per-item profit exceeds this amount after fuel costs.</div>
       </div>
@@ -9940,6 +10872,7 @@ function saveTraderSettings() {
     repairThreshold: parseInt(document.getElementById('set-trader-repairThreshold').value) || 40,
     homeSystem: document.getElementById('set-trader-homeSystem').value.trim(),
     enableMissions: document.getElementById('set-trader-enableMissions').value === 'true',
+    debugLogging: document.getElementById('set-trader-debugLogging').value === 'true',
   };
   send({ type: 'saveSettings', routine: 'trader', settings: s });
   settings.trader = s;
@@ -9953,6 +10886,11 @@ function renderFactionTraderSettings(panel) {
   const repairThreshold = t.repairThreshold ?? 40;
   const minSellPrice = t.minSellPrice ?? 0;
   const stationPriority = t.stationPriority ?? false;
+  
+  // Category trade settings with defaults
+  const categoryTrade = t.categoryTrade || [];
+  const defaultCategoryPercent = 50;
+  const defaultPricePercent = 25;
 
   // Build trade items array from new format or migrate old format
   let tradeItems = [];
@@ -10007,6 +10945,17 @@ function renderFactionTraderSettings(panel) {
       </tr>`;
   }).join('');
 
+  // Build category options from catalog
+  const categories = new Map();
+  for (const item of catalogItems) {
+    const cat = item.category || 'Other';
+    if (!categories.has(cat)) categories.set(cat, []);
+    categories.get(cat).push(item);
+  }
+  const categoryOptions = [...categories.keys()].sort().map(cat => 
+    `<option value="${esc(cat)}">${esc(cat)} (${categories.get(cat).length})</option>`
+  ).join('');
+
   panel.innerHTML = `
     <h3>Faction Trader Settings</h3>
     <div class="settings-desc">The faction trader bot liquidates items from faction storage. It withdraws items and sells them at the best known buyer station, then returns home. Unlike the regular trader, it never buys from markets.</div>
@@ -10056,7 +11005,7 @@ function renderFactionTraderSettings(panel) {
 
     <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
       <div class="setting-label" style="margin-bottom:8px">📦 Trade Items</div>
-      <div class="setting-hint" style="margin-bottom:12px">Select items to trade. Empty list = trade all items in faction storage. Items from faction storage show quantity in parentheses. Use Max Qty = 0 to sell all of that item. Set individual Min Price to override the global minimum.</div>
+      <div class="setting-hint" style="margin-bottom:12px">Select individual items to trade. Empty list = trade all items in faction storage. Items from faction storage show quantity in parentheses. Use Max Qty = 0 to sell all of that item. Set individual Min Price to override the global minimum.</div>
       <table id="faction-trader-items-table" style="width:100%;border-collapse:collapse;margin-bottom:8px">
         <thead><tr style="border-bottom:1px solid var(--border)">
           <th style="padding:6px 8px;text-align:left;font-size:12px">Item</th>
@@ -10072,6 +11021,32 @@ function renderFactionTraderSettings(panel) {
         <input type="number" id="ft-add-max-qty" min="0" max="9999999" value="0" style="width:80px" placeholder="Max Qty" title="0 = sell all" />
         <input type="number" id="ft-add-min-price" min="0" max="9999999" value="0" style="width:80px" placeholder="Min Price" title="0 = use global" />
         <button class="secondary" onclick="addFactionTradeItem()">Add</button>
+      </div>
+    </div>
+
+    <div style="margin-top:16px;border-top:1px solid var(--border);padding-top:16px">
+      <div class="setting-label" style="margin-bottom:8px">🎯 Category Trade</div>
+      <div class="setting-hint" style="margin-bottom:12px">Add entire crafting categories to trade. Items are sold at 50% of available quantity with min price at 25% of best buy price (or 969696cr if no market data).</div>
+      
+      <div id="category-trade-list" style="margin-bottom:8px">
+        ${categoryTrade.length > 0 ? categoryTrade.map(function(ct, idx) {
+        return '<div class="craft-limit-row" style="display:flex;gap:8px;align-items:center;margin-bottom:6px" data-cat-idx="' + idx + '">' +
+          '<span style="flex:1;font-weight:500">' + esc(ct.category) + '</span>' +
+          '<input type="number" min="1" max="100" value="' + (ct.sellPercentOfAvailable || 50) + '" class="cat-sell-pct" style="width:70px" title="Sell % of available" />' +
+          '<input type="number" min="1" max="100" value="' + (ct.pricePercentOfBestBuy || 25) + '" class="cat-price-pct" style="width:70px" title="% of best buy price" />' +
+          '<button class="sm danger" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeCategoryTrade(' + idx + ')">✕</button>' +
+          '</div>';
+      }).join('') : '<div style="color:var(--dim);font-size:11px">No categories configured</div>'}
+      </div>
+      
+      <div style="display:flex;gap:8px;align-items:center">
+        <select id="ct-add-category" style="flex:1">
+          <option value="">-- add category --</option>
+          ${categoryOptions}
+        </select>
+        <input type="number" id="ct-sell-pct" min="1" max="100" value="50" style="width:70px" title="Sell % of available" />
+        <input type="number" id="ct-price-pct" min="1" max="100" value="25" style="width:70px" title="% of best buy price" />
+        <button class="secondary" onclick="addCategoryTrade()">Add</button>
       </div>
     </div>
 
@@ -10155,6 +11130,41 @@ function resetAllFactionTradeSold() {
   renderFactionTraderSettings(document.querySelector('#settings-panel'));
 }
 
+function addCategoryTrade() {
+  const catSelect = document.getElementById('ct-add-category');
+  const sellPctInput = document.getElementById('ct-sell-pct');
+  const pricePctInput = document.getElementById('ct-price-pct');
+  const category = catSelect.value;
+  const sellPercent = parseInt(sellPctInput.value) || 50;
+  const pricePercent = parseInt(pricePctInput.value) || 25;
+  
+  if (!category) return;
+  
+  const s = settings.faction_trader || {};
+  if (!s.categoryTrade) s.categoryTrade = [];
+  
+  // Check if already exists
+  const existing = s.categoryTrade.find(c => c.category === category);
+  if (existing) {
+    alert(`Category "${category}" is already configured.`);
+    return;
+  }
+  
+  s.categoryTrade.push({ category, sellPercentOfAvailable: sellPercent, pricePercentOfBestBuy: pricePercent });
+  send({ type: 'saveSettings', routine: 'faction_trader', settings: s });
+  settings.faction_trader = s;
+  renderFactionTraderSettings(document.querySelector('#settings-panel'));
+}
+
+function removeCategoryTrade(idx) {
+  const s = settings.faction_trader || {};
+  if (!s.categoryTrade || idx < 0 || idx >= s.categoryTrade.length) return;
+  s.categoryTrade.splice(idx, 1);
+  send({ type: 'saveSettings', routine: 'faction_trader', settings: s });
+  settings.faction_trader = s;
+  renderFactionTraderSettings(document.querySelector('#settings-panel'));
+}
+
 function saveFactionTraderSettings() {
   // Collect trade items from table, preserving soldQty from existing settings
   const existingTradeItems = settings.faction_trader?.tradeItems || [];
@@ -10169,6 +11179,15 @@ function saveFactionTraderSettings() {
     tradeItems.push({ itemId, maxSellQty: maxQty, minSellPrice: minPrice, soldQty });
   }
 
+  // Collect category trade settings
+  const categoryTrade = [];
+  for (const row of document.querySelectorAll('#category-trade-list .craft-limit-row')) {
+    const cat = row.querySelector('span').textContent;
+    const sellPct = parseInt(row.querySelector('.cat-sell-pct').value) || 50;
+    const pricePct = parseInt(row.querySelector('.cat-price-pct').value) || 25;
+    categoryTrade.push({ category: cat, sellPercentOfAvailable: sellPct, pricePercentOfBestBuy: pricePct });
+  }
+
   const s = {
     fuelCostPerJump: parseInt(document.getElementById('set-faction_trader-fuelCostPerJump').value) || 50,
     refuelThreshold: parseInt(document.getElementById('set-faction_trader-refuelThreshold').value) || 50,
@@ -10176,6 +11195,7 @@ function saveFactionTraderSettings() {
     minSellPrice: parseInt(document.getElementById('set-faction_trader-minSellPrice').value) || 0,
     tradeItems: tradeItems,
     stationPriority: document.getElementById('set-faction_trader-stationPriority').value === 'true',
+    categoryTrade: categoryTrade,
   };
   send({ type: 'saveSettings', routine: 'faction_trader', settings: s });
   settings.faction_trader = s;
@@ -11085,6 +12105,10 @@ function toggleReturnHomeOptions(username) {
 
 function stopBot(username) {
   send({ type: 'stop', bot: username });
+}
+
+function stopBotAfterCycle(username) {
+  send({ type: 'stop_after_cycle', bot: username });
 }
 
 function removeBot(username) {
@@ -12592,7 +13616,7 @@ function fetchFactionStorageForWithdraw(username) {
     }
     
     const opts = items.map(i => {
-      const id = i.item_id || i.id || '';
+      const id = i.itemId || i.item_id || i.id || '';
       const name = i.name || i.item_name || id;
       const qty = i.quantity || i.count || 0;
       return `<option value="${esc(id)}" data-max="${qty}">${esc(name)} (${qty})</option>`;
@@ -12944,10 +13968,26 @@ let factionFacilityCategory = 'faction';
 async function fetchFactionBuildableTypes(username) {
   const container = document.getElementById('factionBuildableTypes');
   if (!container) return;
+  
+  // Check if we have cached data first (check both factionFacilityTypes and personalFacilityTypes for production)
+  let cachedTypes;
+  if (factionFacilityCategory === 'production') {
+    cachedTypes = [...factionFacilityTypes.filter(t => t._category === 'production'),
+                   ...personalFacilityTypes.filter(t => t._category === 'production')];
+  } else {
+    cachedTypes = factionFacilityTypes.filter(t => t._category === factionFacilityCategory);
+  }
+  
+  if (cachedTypes.length > 0 && personalFacilityVersion) {
+    console.log('Using cached faction facility types:', cachedTypes.length);
+    renderFactionBuildableTypesList(username);
+    return;
+  }
+  
   container.innerHTML = '<div class="faction-no-data">Loading available types...</div>';
   const cat = factionFacilityCategory || 'faction';
   
-  factionFacilityTypes = [];
+  factionFacilityTypes = factionFacilityTypes.filter(t => t._category !== factionFacilityCategory);
   factionFacilityLoading = true;
   
   let page = 0;
@@ -12976,7 +14016,12 @@ async function fetchFactionBuildableTypes(username) {
       return;
     }
     
-    factionFacilityTypes.push(...types);
+    // Add category marker and deduplicate
+    const existingIds = new Set(factionFacilityTypes.filter(t => t._category === cat).map(t => t.facility_type || t.type || t.id));
+    const typedTypes = types
+      .filter(t => !existingIds.has(t.facility_type || t.type || t.id))
+      .map(t => ({ ...t, _category: cat }));
+    factionFacilityTypes.push(...typedTypes);
     
     hasMore = types.length >= factionFacilityPageSize && page < totalPages - 1;
     page++;
@@ -12987,6 +14032,11 @@ async function fetchFactionBuildableTypes(username) {
   }
   
   factionFacilityLoading = false;
+  
+  // Save to cache
+  if (personalFacilityVersion) {
+    saveFacilitiesCache();
+  }
   
   renderFactionBuildableTypesList(username);
 }
@@ -13003,8 +14053,10 @@ function renderFactionBuildableTypesList(username) {
   
   container.innerHTML = types.map(t => {
     const typeId = t.facility_type || t.type || t.id || '';
+    // Use cached details if available
+    const detail = personalFacilityDetails[typeId] || t;
     return `<div id="fac-type-${esc(typeId)}" class="faction-card" style="opacity:0.5">
-      <div class="fc-name">${esc(t.name || typeId)}</div>
+      <div class="fc-name">${esc(detail.name || typeId)}</div>
       <div class="fc-detail">Loading details...</div>
     </div>`;
   }).join('');
@@ -13012,6 +14064,17 @@ function renderFactionBuildableTypesList(username) {
   for (const t of types) {
     const typeId = t.facility_type || t.type || t.id || '';
     if (!typeId) continue;
+    
+    // Check if we have cached details
+    if (personalFacilityDetails[typeId]) {
+      const el = document.getElementById(`fac-type-${typeId}`);
+      if (el) {
+        el.style.opacity = '1';
+        el.innerHTML = renderFacilityTypeCard(personalFacilityDetails[typeId], username);
+      }
+      continue;
+    }
+    
     sendExec(username, 'facility', { action: 'types', facility_type: typeId }, (detailResult) => {
       const el = document.getElementById(`fac-type-${typeId}`);
       if (!el) return;
@@ -13022,6 +14085,13 @@ function renderFactionBuildableTypesList(username) {
       }
       const dd = detailResult.data;
       const detail = Array.isArray(dd) ? dd[0] : (dd.type || dd.facility || dd);
+      if (detail) {
+        personalFacilityDetails[typeId] = detail;
+        // Save to cache
+        if (personalFacilityVersion) {
+          saveFacilitiesCache();
+        }
+      }
       el.innerHTML = renderFacilityTypeCard(detail || t, username);
     });
   }
@@ -13091,7 +14161,9 @@ function renderFacilityTypeCard(t, username) {
 function renderFactionProductionFromCache(username) {
   const container = document.getElementById('factionBuildableTypes');
   if (!container) return;
-  const prodTypes = factionFacilityTypes.filter(t => t._category === 'production');
+  // Check both factionFacilityTypes and personalFacilityTypes for production facilities
+  const prodTypes = [...factionFacilityTypes.filter(t => t._category === 'production'),
+                      ...personalFacilityTypes.filter(t => t._category === 'production')];
   if (prodTypes.length === 0) {
     container.innerHTML = '<div class="faction-no-data">No cached production types</div>';
     return;
@@ -13111,6 +14183,13 @@ function renderFactionProductionFromCache(username) {
 function showFactionProductionDetail(username, facilityType) {
   const container = document.getElementById('factionBuildableTypes');
   if (!container) return;
+  
+  // Check cached details first
+  if (personalFacilityDetails[facilityType]) {
+    renderFactionProductionDetailCard(container, username, facilityType, personalFacilityDetails[facilityType]);
+    return;
+  }
+  
   container.innerHTML = `<div class="faction-card"><div style="font-size:14px">Loading details for ${esc(facilityType)}...</div></div>`;
   
   sendExec(username, 'facility', { action: 'types', facility_type: facilityType }, (detailResult) => {
@@ -13120,72 +14199,125 @@ function showFactionProductionDetail(username, facilityType) {
       detail = Array.isArray(dd) ? dd[0] : (dd.type || dd.facility || dd);
     }
     
-    const name = detail.name || detail.facility_type || facilityType;
-    const level = detail.level ?? detail.tier ?? '';
-    const levelStr = level ? ` Level ${level}` : '';
-    const category = detail.category || 'production';
-    const desc = detail.description || detail.desc || '';
-    const buildCost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? 0;
-    const buildCostStr = buildCost ? `${Number(buildCost).toLocaleString()}cr` : '';
-    const labor = detail.labor_cost ?? detail.labor ?? '';
-    const laborStr = labor ? `${labor} labor` : '';
-    const buildTime = detail.build_time ?? detail.time ?? '';
-    const buildTimeStr = buildTime ? `${buildTime}s` : '';
-    
-    const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || detail.resources || [];
-    let matsHtml = '';
-    if (Array.isArray(mats) && mats.length > 0) {
-      matsHtml = '<div style="margin-top:8px"><span style="color:var(--text-dim)">Materials required:</span> ' +
-        mats.map(m => {
-          const mName = m.name || m.item_name || m.item_id || '?';
-          const mQty = m.quantity || m.count || m.amount || 1;
-          return `${mQty}x ${esc(mName)}`;
-        }).join(', ') + '</div>';
+    if (detail) {
+      personalFacilityDetails[facilityType] = detail;
+      // Save to cache
+      if (personalFacilityVersion) {
+        saveFacilitiesCache();
+      }
     }
     
-    const rawRecipe = detail.recipe || null;
-    let recipeDisplay = '';
-    if (rawRecipe && typeof rawRecipe === 'object') {
-      const recipeName = rawRecipe.name || rawRecipe.id || detail.recipe_id || '';
-      const craftingTime = rawRecipe.crafting_time || rawRecipe.time || '';
-      const timeStr = craftingTime ? ` (${craftingTime}s)` : '';
-      const inputs = rawRecipe.inputs || rawRecipe.components || rawRecipe.ingredients || [];
-      const outputs = rawRecipe.outputs || rawRecipe.output || rawRecipe.result || rawRecipe.produces || [];
-      const inputsStr = inputs.length > 0 ? inputs.map(i => `${i.quantity || 1}x ${i.name || i.item_id || '?'}`).join(', ') : '-';
-      const outputsStr = outputs.length > 0 ? outputs.map(o => `${o.quantity || 1}x ${o.name || o.item_id || '?'}`).join(', ') : '-';
-      recipeDisplay = `<span style="font-weight:600">${esc(recipeName)}${timeStr}</span><br/>` +
-        `<span style="color:var(--text-dim)">Inputs:</span> ${esc(inputsStr)}<br/>` +
-        `<span style="color:var(--text-dim)">Outputs:</span> <span style="color:var(--green)">${esc(outputsStr)}</span>`;
-    } else if (typeof rawRecipe === 'string') {
-      recipeDisplay = esc(rawRecipe);
-    }
-    let recipeHtml = recipeDisplay ? `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">Recipe: ${recipeDisplay}</div>` : '';
-    
-    const detailHtml = `
-      <div class="faction-card" style="padding:12px">
-        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
-          <div>
-            <div style="font-size:14px;font-weight:700;color:var(--text-bright)">${esc(name)}${esc(levelStr)}</div>
-            <div style="font-size:11px;color:var(--text-dim)">${esc(category)}</div>
-          </div>
-          <button class="sm" onclick="renderFactionProductionFromCache('${esc(username)}')">Back to List</button>
-        </div>
-        <div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>
-        ${buildCostStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Build Cost: ${esc(buildCostStr)}</div>` : ''}
-        ${laborStr ? `<div style="font-size:11px;color:var(--yellow);margin-top:2px">${esc(laborStr)}</div>` : ''}
-        ${buildTimeStr ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">Build Time: ${esc(buildTimeStr)}</div>` : ''}
-        ${matsHtml}
-        ${recipeHtml}
-        <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
-          <button class="primary sm" style="width:100%" onclick="factionBuildFacility('${esc(username)}','${esc(facilityType)}')">Build Facility</button>
-        </div>
-        <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
-          This will withdraw required materials from faction storage and build the facility using faction_build.
-        </div>
-      </div>
-    `;
-    container.innerHTML = detailHtml;
+    renderFactionProductionDetailCard(container, username, facilityType, detail);
   });
+}
+
+function renderFactionProductionDetailCard(container, username, facilityType, detail) {
+  if (!detail) {
+    container.innerHTML = '<div class="faction-no-data">No details available</div>';
+    return;
+  }
+  
+  const name = detail.name || detail.facility_type || facilityType;
+  const desc = detail.description || detail.desc || '';
+  const category = detail.category || 'production';
+  const level = detail.level ?? detail.tier ?? '';
+  const levelStr = level ? ` Level ${level}` : '';
+  const hint = detail.hint || '';
+  const buildable = detail.buildable !== false;
+  
+  const rawRecipe = detail.recipe || null;
+  let recipeDisplay = '';
+  if (rawRecipe && typeof rawRecipe === 'object') {
+    const recipeName = rawRecipe.name || rawRecipe.id || detail.recipe_id || '';
+    const craftingTime = rawRecipe.crafting_time || rawRecipe.time || '';
+    const timeStr = craftingTime ? ` (${craftingTime}s)` : '';
+    
+    const inputs = rawRecipe.inputs || rawRecipe.components || rawRecipe.ingredients || [];
+    const outputs = rawRecipe.outputs || rawRecipe.output || rawRecipe.result || rawRecipe.produces || [];
+    
+    const inputsStr = inputs.length > 0 
+      ? inputs.map(i => `${i.quantity || 1}x ${i.name || i.item_id || '?'}`).join(', ')
+      : '-';
+    const outputsStr = outputs.length > 0
+      ? outputs.map(o => `${o.quantity || 1}x ${o.name || o.item_id || '?'}`).join(', ')
+      : '-';
+    
+    recipeDisplay = `<span style="font-weight:600">${esc(recipeName)}${timeStr}</span><br/>` +
+      `<span style="color:var(--text-dim)">Inputs:</span> ${esc(inputsStr)}<br/>` +
+      `<span style="color:var(--text-dim)">Outputs:</span> <span style="color:var(--green)">${esc(outputsStr)}</span>`;
+  } else if (typeof rawRecipe === 'string') {
+    recipeDisplay = esc(rawRecipe);
+  }
+  
+  const buildCost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? 0;
+  const buildCostStr = buildCost ? `${Number(buildCost).toLocaleString()}cr` : '';
+  
+  const laborCost = detail.labor_cost ?? 0;
+  const laborCostStr = laborCost ? `${laborCost} labor` : '';
+  
+  const buildTime = detail.build_time ?? 0;
+  const buildTimeStr = buildTime ? `${buildTime}s` : '';
+  
+  const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || detail.resources || [];
+  let matsHtml = '';
+  if (Array.isArray(mats) && mats.length > 0) {
+    matsHtml = '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
+      mats.map(m => {
+        const mName = m.name || m.item_name || m.item_id || m.resource || '?';
+        const mQty = m.quantity || m.count || m.amount || 1;
+        return `<span style="color:var(--text)">${mQty}x ${esc(mName)}</span>`;
+      }).join(', ') + '</div>';
+  } else if (typeof mats === 'object' && !Array.isArray(mats) && Object.keys(mats).length > 0) {
+    matsHtml = '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
+      Object.entries(mats).map(([k, v]) => `<span style="color:var(--text)">${v}x ${esc(k)}</span>`).join(', ') + '</div>';
+  }
+  
+  const stats = [];
+  if (detail.capacity) stats.push(`Capacity: ${detail.capacity}`);
+  if (detail.storage_capacity) stats.push(`Storage: ${detail.storage_capacity}`);
+  if (detail.production_rate) stats.push(`Production: ${detail.production_rate}`);
+  let statsHtml = '';
+  if (stats.length > 0) {
+    statsHtml = `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">${stats.join(' | ')}</div>`;
+  }
+  
+  let recipeHtml = '';
+  if (recipeDisplay) {
+    recipeHtml = `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">Recipe: ${recipeDisplay}</div>`;
+  }
+  
+  const warningHtml = hint ? `<div style="margin-top:6px;font-size:11px;color:var(--orange)">${esc(hint)}</div>` : '';
+  const notBuildableHtml = !buildable ? `<div style="margin-top:6px;font-size:11px;color:var(--red)">Cannot build directly - ${esc(hint || 'must upgrade existing facility')}</div>` : '';
+  
+  const detailHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+        <div>
+          <div style="font-size:14px;font-weight:700;color:var(--text-bright)">${esc(name)}${esc(levelStr)}</div>
+          <div style="font-size:11px;color:var(--text-dim)">${esc(category)}</div>
+        </div>
+        <button class="sm" onclick="renderFactionProductionFromCache('${esc(username)}')">Back to List</button>
+      </div>
+      <div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>
+      ${buildCostStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Build Cost: ${esc(buildCostStr)}</div>` : ''}
+      ${laborCostStr ? `<div style="font-size:11px;color:var(--yellow);margin-top:2px">${esc(laborCostStr)}</div>` : ''}
+      ${buildTimeStr ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">Build Time: ${esc(buildTimeStr)}</div>` : ''}
+      ${matsHtml}
+      ${statsHtml}
+      ${recipeHtml}
+      ${warningHtml}
+      ${notBuildableHtml}
+      ${buildable ? `
+      <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+        <button class="primary sm" style="width:100%" onclick="factionBuildFacility('${esc(username)}','${esc(facilityType)}')">Build Facility</button>
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
+        This will withdraw required materials from faction storage and build the facility using faction_build.
+      </div>
+      ` : ''}
+    </div>
+  `;
+  container.innerHTML = detailHtml;
 }
 
 async function factionBuildFacility(username, facilityType) {
@@ -13391,7 +14523,7 @@ async function loadFacilitiesCache() {
     const data = await res.json();
     console.log('Cache API response:', data);
     if (data.version) {
-      const hasData = (data.personal?.length > 0 || data.production?.length > 0);
+      const hasData = (data.personal?.length > 0 || data.production?.length > 0 || data.faction?.length > 0);
       const currentVersion = await fetchGameVersion();
       if (!hasData) {
         console.log('Cache is empty, fetching fresh data.');
@@ -13417,6 +14549,12 @@ async function loadFacilitiesCache() {
         const existingIds = new Set(personalFacilityTypes.map(t => t.facility_type || t.type || t.id));
         const newProduction = data.production.filter(t => !existingIds.has(t.facility_type || t.id)).map(t => ({ ...t, _category: 'production' }));
         personalFacilityTypes.push(...newProduction);
+      }
+      // Load faction types
+      if (data.faction && data.faction.length > 0) {
+        const existingIds = new Set(factionFacilityTypes.map(t => t.facility_type || t.type || t.id));
+        const newFaction = data.faction.filter(t => !existingIds.has(t.facility_type || t.id)).map(t => ({ ...t, _category: 'faction' }));
+        factionFacilityTypes.push(...newFaction);
       }
       // Load cached details
       if (data.details) {
@@ -13472,6 +14610,12 @@ async function saveFacilitiesCache() {
       description: t.description,
       category: t.category
     }));
+    const faction = factionFacilityTypes.filter(t => t._category === 'faction').map(t => ({
+      facility_type: t.facility_type || t.type || t.id,
+      name: t.name,
+      description: t.description,
+      category: t.category
+    }));
     await fetch('/api/facilities', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -13479,6 +14623,7 @@ async function saveFacilitiesCache() {
         version: personalFacilityVersion,
         personal,
         production,
+        faction,
         details: personalFacilityDetails
       })
     });
@@ -13635,7 +14780,10 @@ function switchFactionFacilityCategory(category, username) {
       productionBtn.style.color = '';
     }
   }
-  if (category === 'production' && factionFacilityTypes.some(t => t._category === 'production')) {
+  // Check both factionFacilityTypes (personal cache) and personalFacilityTypes (production cache)
+  const hasCached = factionFacilityTypes.some(t => t._category === 'production') || 
+                     personalFacilityTypes.some(t => t._category === 'production');
+  if (category === 'production' && hasCached) {
     renderFactionProductionFromCache(username);
   } else {
     fetchFactionBuildableTypes(username);
@@ -16432,6 +17580,8 @@ function renderHunterSettings(panel) {
   const singleLoop = h.singleLoop ?? false;
   const hunterHomeSystem = h.homeSystem || '';
   const hunterHomeStation = h.homeStation || '';
+  const ammoReloadAbsoluteThreshold = h.ammoReloadAbsoluteThreshold ?? 1;
+  const ammoReloadPercentThreshold = h.ammoReloadPercentThreshold ?? 25;
 
   const tierOptions = ['small', 'medium', 'large', 'capitol', 'boss'];
   const tierOpts = tierOptions.map(t => `<option value="${t}"${t === maxAttackTier ? ' selected' : ''}>${t.charAt(0).toUpperCase() + t.slice(1)}</option>`).join('');
@@ -16678,6 +17828,22 @@ function renderHunterSettings(panel) {
       </select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ammo Reload: Absolute Threshold</div>
+        <div class="setting-hint">For weapons with ≤50 ammo capacity, reload when ammo drops to this absolute number. Higher value = earlier reload.</div>
+      </div>
+      <input type="number" id="set-hunter-ammoReloadAbsoluteThreshold" min="1" max="50" value="${ammoReloadAbsoluteThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ammo Reload: Percent Threshold</div>
+        <div class="setting-hint">For weapons with >50 ammo capacity, reload when ammo drops below this percentage. 25% = reload when ammo is at 25% of max capacity.</div>
+      </div>
+      <input type="number" id="set-hunter-ammoReloadPercentThreshold" min="5" max="50" value="${ammoReloadPercentThreshold}">
+    </div>
+
     <div class="settings-save-bar">
       <button class="primary" onclick="saveHunterSettings()">Save Settings</button>
     </div>
@@ -16702,6 +17868,8 @@ function saveHunterSettings() {
     disableWreckSalvaging: document.getElementById('set-hunter-disableWreckSalvaging').value === 'true',
     singleLoop: document.getElementById('set-hunter-singleLoop').value === 'true',
     homeStation: document.getElementById('set-hunter-homeStation').value.trim(),
+    ammoReloadAbsoluteThreshold: parseInt(document.getElementById('set-hunter-ammoReloadAbsoluteThreshold').value) || 1,
+    ammoReloadPercentThreshold: parseInt(document.getElementById('set-hunter-ammoReloadPercentThreshold').value) || 25,
     hunterPatrols: Array.isArray(settings.hunter?.hunterPatrols) ? settings.hunter.hunterPatrols : [],
     botHunterPatrolAssignments: settings.hunter?.botHunterPatrolAssignments || {},
   };
@@ -17059,6 +18227,75 @@ function saveEscortSettings() {
   settings.escort = s;
 }
 
+// ── Pathfinder Test settings ─────────────────────────────────────
+function renderPathfinderTestSettings(panel) {
+  const p = settings.pathfinder_test || {};
+  const originSystem = p.originSystem || 'sol';
+  const targetSystem = p.targetSystem || 'alpha';
+  const refuelThreshold = p.refuelThreshold ?? 50;
+
+  const sysOpts = ['<option value="">(current system)</option>'];
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+    const sel = sys.id === originSystem ? ' selected' : '';
+    sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+  }
+  if (originSystem && !knownSystems.find(s => s.id === originSystem)) {
+    sysOpts.push(`<option value="${esc(originSystem)}" selected>${esc(originSystem)} (custom)</option>`);
+  }
+
+  const targetOpts = ['<option value="">(none)</option>'];
+  for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+    const sel = sys.id === targetSystem ? ' selected' : '';
+    targetOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+  }
+  if (targetSystem && !knownSystems.find(s => s.id === targetSystem)) {
+    targetOpts.push(`<option value="${esc(targetSystem)}" selected>${esc(targetSystem)} (custom)</option>`);
+  }
+
+  panel.innerHTML = `
+    <h3>Pathfinder Test Settings</h3>
+    <div class="settings-desc">Configure the pathfinder test routine: navigate to an origin system, then perform a single line-of-sight Pathfinder jump to a target.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Origin System</div>
+        <div class="setting-hint">System to navigate to before performing the Pathfinder jump. Leave as "(current system)" to skip the pre-jump travel phase.</div>
+      </div>
+      <select id="set-pathfinder_test-originSystem">${sysOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Target System</div>
+        <div class="setting-hint">Target system for the Pathfinder jump. Must be within line-of-sight from the origin.</div>
+      </div>
+      <select id="set-pathfinder_test-targetSystem">${targetOpts.join('')}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Minimum fuel percentage before attempting jumps.</div>
+      </div>
+      <input type="number" id="set-pathfinder_test-refuelThreshold" min="10" max="90" value="${refuelThreshold}">
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="savePathfinderTestSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function savePathfinderTestSettings() {
+  const s = {
+    originSystem: document.getElementById('set-pathfinder_test-originSystem').value || 'sol',
+    targetSystem: document.getElementById('set-pathfinder_test-targetSystem').value || 'alpha',
+    refuelThreshold: parseInt(document.getElementById('set-pathfinder_test-refuelThreshold').value) || 50,
+  };
+  send({ type: 'saveSettings', routine: 'pathfinder_test', settings: s });
+  settings.pathfinder_test = s;
+}
+
 // ── Fleet Hunter settings ─────────────────────────────────────
 function renderFleetHunterSettings(panel) {
   const fh = settings.fleet_hunter || {};
@@ -17075,6 +18312,8 @@ function renderFleetHunterSettings(panel) {
   const fleetSize = fh.fleetSize ?? 6;
   const autoCloak = fh.autoCloak ?? false;
   const ammoThreshold = fh.ammoThreshold ?? 5;
+  const ammoReloadAbsoluteThreshold = fh.ammoReloadAbsoluteThreshold ?? 1;
+  const ammoReloadPercentThreshold = fh.ammoReloadPercentThreshold ?? 25;
   const maxReloadAttempts = fh.maxReloadAttempts ?? 3;
   const huntingEnabled = fh.huntingEnabled ?? true;
   const manualMode = fh.manualMode ?? false;
@@ -17247,6 +18486,22 @@ function renderFleetHunterSettings(panel) {
 
     <div class="setting-row">
       <div>
+        <div class="setting-label">Ammo Reload: Absolute Threshold</div>
+        <div class="setting-hint">For weapons with ≤50 ammo capacity, reload when ammo drops to this absolute number.</div>
+      </div>
+      <input type="number" id="set-fleet-hunter-ammoReloadAbsoluteThreshold" min="1" max="50" value="${ammoReloadAbsoluteThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ammo Reload: Percent Threshold</div>
+        <div class="setting-hint">For weapons with >50 ammo capacity, reload when ammo drops below this percentage.</div>
+      </div>
+      <input type="number" id="set-fleet-hunter-ammoReloadPercentThreshold" min="5" max="50" value="${ammoReloadPercentThreshold}">
+    </div>
+
+    <div class="setting-row">
+      <div>
         <div class="setting-label">Max Reload Attempts</div>
         <div class="setting-hint">Maximum attempts to reload before giving up and returning to station.</div>
       </div>
@@ -17274,6 +18529,8 @@ function saveFleetHunterSettings() {
     fleetSize: parseInt(document.getElementById('set-fleet-hunter-fleetSize').value) || 6,
     autoCloak: document.getElementById('set-fleet-hunter-autoCloak').value === 'true',
     ammoThreshold: parseInt(document.getElementById('set-fleet-hunter-ammoThreshold').value) || 5,
+    ammoReloadAbsoluteThreshold: parseInt(document.getElementById('set-fleet-hunter-ammoReloadAbsoluteThreshold').value) || 1,
+    ammoReloadPercentThreshold: parseInt(document.getElementById('set-fleet-hunter-ammoReloadPercentThreshold').value) || 25,
     maxReloadAttempts: parseInt(document.getElementById('set-fleet-hunter-maxReloadAttempts').value) || 3,
     huntingEnabled: document.getElementById('set-fleet-hunter-huntingEnabled').value === 'true',
     manualMode: document.getElementById('set-fleet-hunter-manualMode').value === 'true',
@@ -17790,8 +19047,8 @@ function loadCargoMoverFactionStorage() {
       // Faction storage is in result.data.items
       const items = Array.isArray(result.data.items) ? result.data.items : [];
       cmFactionItems = items.map(i => ({
-        itemId: i.item_id || i.id || '',
-        name: i.name || i.item_id || '',
+        itemId: i.itemId || i.item_id || i.id || '',
+        name: i.name || i.itemId || '',
         quantity: i.quantity || 0,
         category: i.category || ''
       })).filter(i => i.itemId && i.quantity > 0);
@@ -17830,8 +19087,8 @@ function loadCargoMoverPersonalStorage() {
       // Personal storage is in result.data.storage, but handle fallback cases
       const items = Array.isArray(d) ? d : (Array.isArray(d.storage) ? d.storage : (Array.isArray(d.items) ? d.items : []));
       cmPersonalItems = items.map(i => ({
-        itemId: i.item_id || i.id || '',
-        name: i.name || i.item_id || '',
+        itemId: i.itemId || i.item_id || i.id || '',
+        name: i.name || i.itemId || '',
         quantity: i.quantity || 0,
         category: i.category || ''
       })).filter(i => i.itemId && i.quantity > 0);
@@ -18069,13 +19326,31 @@ async function loadShipLoadoutToCargoMover() {
 
 // ── Fuel Transport Settings ──────────────────────────────────
 let ftFactionItems = [];
+let ftLoadouts = {};
 
-function renderFuelTransportSettings(panel) {
+async function loadFuelTransferLoadouts() {
+  try {
+    const response = await fetch('/api/facility-transfer-loadouts');
+    if (response.ok) {
+      const data = await response.json();
+      ftLoadouts = data.loadouts || {};
+    }
+  } catch (e) {
+    console.warn('Failed to load facility transfer loadouts:', e);
+    ftLoadouts = {};
+  }
+}
+
+async function renderFuelTransportSettings(panel) {
+  await loadFuelTransferLoadouts();
+
   const ft = settings.fuel_transport || {};
   const stations = ft.stations || [];
   const items = ft.items || [];
   const refuelThreshold = ft.refuelThreshold ?? 35;
   const repairThreshold = ft.repairThreshold ?? 40;
+  const useLoadouts = ft.useLoadouts ?? false;
+  const selectedLoadout = ft.selectedLoadout ?? "";
 
   const general = settings.general || {};
   const generalSystem = general.factionStorageSystem || '';
@@ -18101,6 +19376,16 @@ function renderFuelTransportSettings(panel) {
   for (const bot of [...bots].sort((a, b) => (a.username || '').localeCompare(b.username || ''))) {
     botOpts += `<option value="${esc(bot.username)}">${esc(bot.username)}</option>`;
   }
+
+  const loadoutOptions = Object.keys(ftLoadouts).sort().map(name => {
+    const loadout = ftLoadouts[name];
+    const isActive = loadout?.active || false;
+    return `<label style="display:flex;align-items:center;gap:6px;padding:4px 0;font-size:12px">
+      <input type="checkbox" ${isActive ? 'checked' : ''} onchange="setFuelTransferLoadoutActive('${esc(name)}', this.checked)">
+      <span>${esc(name)}</span>
+    </label>`;
+  }).join('');
+  const hasLoadouts = Object.keys(ftLoadouts).length > 0;
 
   const stationsList = stations.length > 0
     ? stations.map((s, idx) => {
@@ -18158,13 +19443,39 @@ function renderFuelTransportSettings(panel) {
       ${itemsList}
       <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <select id="ft-home-bot-select" style="flex:1;min-width:100px">${botOpts}</select>
-        <button class="sm" onclick="loadFuelTransportFactionStorage()">📥 Load Home Faction Storage</button>
+        <button class="sm" onclick="loadFuelTransportFactionStorage()">📥 Load from Docked Bot</button>
+        <button class="sm primary" onclick="loadFuelTransportFactionStorageFromCache()">💾 Load from Cache</button>
       </div>
-      <div style="font-size:10px;color:var(--dim);margin-top:4px">Select a bot docked at home, then load items from its faction storage.</div>
+      <div style="font-size:10px;color:var(--dim);margin-top:4px">Select a bot docked at home, or load from the cached faction storage.</div>
       <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
         <select id="ft-item-select" style="flex:1;min-width:0">${factionItemOpts}</select>
         <input type="number" id="ft-item-qty" min="1" value="5000" placeholder="Target qty" style="width:100px">
         <button class="primary sm" onclick="addFuelTransportItem()">+ Add Item</button>
+      </div>
+    </div>
+
+    <div style="margin-top:16px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+      <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🏗 Facility Transfer Loadouts (One-Time Transfers)</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
+        Create loadouts for specific facility builds. Enable loadouts below to use them. Stations completed with an active loadout won't receive those materials again via that loadout.
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <select id="ft-loadout-select" style="flex:1;min-width:150px">
+          <option value="">-- Select Loadout --</option>
+          ${Object.keys(ftLoadouts).sort().map(name => `<option value="${esc(name)}">${esc(name)}</option>`).join('')}
+        </select>
+        <button class="sm primary" onclick="loadFuelTransferLoadout()">Load</button>
+        <button class="sm" onclick="saveFuelTransferLoadoutPrompt()">💾 Save</button>
+        <button class="sm" onclick="createNewFuelTransferLoadout()">🆕 New</button>
+        <button class="sm danger" onclick="deleteFuelTransferLoadout()" ${!hasLoadouts ? 'disabled' : ''}>🗑 Delete</button>
+      </div>
+      <div style="font-weight:600;margin-bottom:4px;color:var(--text-bright)">Active Loadouts:</div>
+      <div style="font-size:11px;color:var(--dim)">
+        ${loadoutOptions || '<div style="color:var(--dim);font-size:11px">No loadouts created yet. Create one, then enable it to use for facility construction.</div>'}
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <button class="sm" onclick="resetFuelTransferLoadoutCompletions()">🔄 Reset Loadout Status</button>
+        <span class="setting-hint" style="color:var(--text-dim);font-size:11px">Clear completion tracking for selected loadout</span>
       </div>
     </div>
 
@@ -18185,7 +19496,7 @@ function renderFuelTransportSettings(panel) {
     </div>
 
     <div class="settings-save-bar">
-      <button class="sm" onclick="renderFuelTransportSettings(document.getElementById('settingsContent'))">Refresh</button>
+      <button class="sm" onclick="loadFuelTransferLoadouts(); renderFuelTransportSettings(document.getElementById('settingsContent'))">Refresh</button>
       <button class="primary" onclick="saveFuelTransportSettings()">Save Settings</button>
     </div>
   `;
@@ -18231,32 +19542,56 @@ function removeFuelTransportItem(idx) {
   renderFuelTransportSettings(document.getElementById('settingsContent'));
 }
 
-function loadFuelTransportFactionStorage() {
+async function loadFuelTransportFactionStorage() {
   const botSel = document.getElementById('ft-home-bot-select');
   const botName = botSel?.value;
-  if (!botName) {
-    alert('Please select a bot first');
+  const bot = botName ? bots.find(b => b.username === botName) : null;
+
+  // Try to load from docked bot if one is selected and docked
+  if (bot && bot.docked) {
+    sendExec(botName, 'view_storage', { target: 'faction' }, (result) => {
+      if (result.ok && result.data) {
+        const d = result.data;
+        const items = Array.isArray(d.items) ? d.items : [];
+        ftFactionItems = items.map(i => ({
+          itemId: i.itemId || i.item_id || i.id || '',
+          name: i.name || i.itemId || '',
+          quantity: i.quantity || 0
+        })).filter(i => i.itemId && i.quantity > 0);
+        renderFuelTransportSettings(document.getElementById('settingsContent'));
+      } else {
+        alert('Failed to load faction storage: ' + (result.error || 'Unknown error'));
+      }
+    });
     return;
   }
-  const bot = bots.find(b => b.username === botName);
-  if (!bot || !bot.docked) {
-    alert('Bot must be docked to query faction storage');
+
+  // Fall back to loading from disk cache using General Settings
+  const general = settings.general || {};
+  const homeStation = general.factionStorageStation || '';
+
+  if (!homeStation) {
+    alert('No home station configured. Set General > Faction Storage Station, or select a docked bot.');
     return;
   }
-  sendExec(botName, 'view_faction_storage', undefined, (result) => {
-    if (result.ok && result.data) {
-      const d = result.data;
-      const items = Array.isArray(d.items) ? d.items : [];
+
+  try {
+    const response = await fetch(`/api/faction-storage?station=${encodeURIComponent(homeStation)}`);
+    if (response.ok) {
+      const data = await response.json();
+      const items = data.items || [];
       ftFactionItems = items.map(i => ({
-        itemId: i.item_id || i.id || '',
-        name: i.name || i.item_id || '',
+        itemId: i.itemId || i.item_id || i.id || '',
+        name: i.name || i.itemId || '',
         quantity: i.quantity || 0
       })).filter(i => i.itemId && i.quantity > 0);
       renderFuelTransportSettings(document.getElementById('settingsContent'));
     } else {
-      alert('Failed to load faction storage: ' + (result.error || 'Unknown error'));
+      alert('Failed to load faction storage from cache');
     }
-  });
+  } catch (e) {
+    alert('Failed to load faction storage: ' + e.message);
+  }
 }
 
 function saveFuelTransportSettings() {
@@ -18268,6 +19603,726 @@ function saveFuelTransportSettings() {
   };
   send({ type: 'saveSettings', routine: 'fuel_transport', settings: s });
   settings.fuel_transport = s;
+}
+
+async function loadFuelTransportFactionStorageFromCache() {
+  // First, try to get the configured home station from General Settings
+  const general = settings.general || {};
+  const homeStation = general.factionStorageStation || '';
+
+  // If configured, try that first
+  if (homeStation) {
+    try {
+      const response = await fetch(`/api/faction-storage?station=${encodeURIComponent(homeStation)}`);
+      if (response.ok) {
+        const data = await response.json();
+        if (data.items && data.items.length > 0) {
+          const items = data.items;
+          ftFactionItems = items.map(i => ({
+            itemId: i.itemId || i.item_id || i.id || '',
+            name: i.name || i.itemId || '',
+            quantity: i.quantity || 0
+          })).filter(i => i.itemId && i.quantity > 0);
+          renderFuelTransportSettings(document.getElementById('settingsContent'));
+          alert(`Loaded ${ftFactionItems.length} items from faction storage cache (${data.factionName || 'unknown'} at ${homeStation}).`);
+          return;
+        }
+      }
+    } catch (e) {
+      console.log('[FT] Failed to load from configured station:', e);
+    }
+  }
+
+  // Fall back to listing available caches and picking the first one with items
+  try {
+    const response = await fetch(`/api/faction-storage/list`);
+    if (response.ok) {
+      const data = await response.json();
+      const caches = data.caches || [];
+      console.log('[FT] Available caches:', caches);
+      
+      // Try each cache in order until we find one with items
+      for (const cache of caches) {
+        const cacheResponse = await fetch(`/api/faction-storage?station=${encodeURIComponent(cache.station)}`);
+        if (cacheResponse.ok) {
+          const cacheData = await cacheResponse.json();
+          if (cacheData.items && cacheData.items.length > 0) {
+            const items = cacheData.items;
+            ftFactionItems = items.map(i => ({
+              itemId: i.itemId || i.item_id || i.id || '',
+              name: i.name || i.itemId || '',
+              quantity: i.quantity || 0
+            })).filter(i => i.itemId && i.quantity > 0);
+            renderFuelTransportSettings(document.getElementById('settingsContent'));
+            alert(`Loaded ${ftFactionItems.length} items from faction storage cache (${cacheData.factionName || 'unknown'} at ${cache.station}).`);
+            return;
+          }
+        }
+      }
+      alert('No faction storage caches with items found.');
+    } else {
+      alert('Failed to list faction storage caches');
+    }
+  } catch (e) {
+    alert('Failed to load faction storage: ' + e.message);
+  }
+}
+
+function createNewFuelTransferLoadout() {
+  const items = settings.fuel_transport?.items || [];
+  if (items.length === 0) {
+    alert('No items configured to save. Add some items first!');
+    return;
+  }
+  const name = prompt('Enter a name for this facility transfer loadout:');
+  if (!name || !name.trim()) return;
+  saveFuelTransferLoadout(name.trim(), items);
+}
+
+async function loadFuelTransferLoadout() {
+  const select = document.getElementById('ft-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to load.');
+    return;
+  }
+
+  const loadout = ftLoadouts[name];
+  if (!loadout) {
+    alert(`Loadout "${name}" not found!`);
+    return;
+  }
+
+  if (!settings.fuel_transport) settings.fuel_transport = {};
+  settings.fuel_transport.items = loadout.items.map(item => ({
+    itemId: item.itemId,
+    itemName: item.itemName || item.itemId,
+    targetQuantity: item.targetQuantity,
+  }));
+  renderFuelTransportSettings(document.getElementById('settingsContent'));
+}
+
+async function saveFuelTransferLoadoutPrompt() {
+  const name = prompt('Enter a name for this facility transfer loadout:');
+  if (!name || !name.trim()) return;
+  const items = settings.fuel_transport?.items || [];
+  const loadoutItems = items.map(item => ({
+    itemId: item.itemId,
+    itemName: item.itemName || item.itemId,
+    targetQuantity: item.targetQuantity,
+  }));
+  await saveFuelTransferLoadout(name.trim(), loadoutItems);
+}
+
+async function saveFuelTransferLoadout(name, items) {
+  if (!name || !name.trim()) {
+    alert('Please enter a name for the loadout!');
+    return;
+  }
+
+  try {
+    const response = await fetch('/api/facility-transfer-loadouts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, items: items || [] }),
+    });
+
+    if (response.ok) {
+      await loadFuelTransferLoadouts();
+      renderFuelTransportSettings(document.getElementById('settingsContent'));
+      alert(`Loadout "${name}" saved successfully!`);
+    } else {
+      const error = await response.json();
+      alert(`Failed to save loadout: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to save loadout: ${e.message}`);
+  }
+}
+
+async function deleteFuelTransferLoadout() {
+  const select = document.getElementById('ft-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to delete.');
+    return;
+  }
+
+  if (!confirm(`Are you sure you want to delete the loadout "${name}"?`)) return;
+
+  try {
+    const response = await fetch(`/api/facility-transfer-loadouts/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+
+    if (response.ok) {
+      await loadFuelTransferLoadouts();
+      renderFuelTransportSettings(document.getElementById('settingsContent'));
+    } else {
+      const error = await response.json();
+      alert(`Failed to delete loadout: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to delete loadout: ${e.message}`);
+  }
+}
+
+async function setFuelTransferLoadoutActive(name, active) {
+  try {
+    const response = await fetch(`/api/facility-transfer-loadouts/${encodeURIComponent(name)}/active`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active }),
+    });
+    if (response.ok) {
+      await loadFuelTransferLoadouts();
+      renderFuelTransportSettings(document.getElementById('settingsContent'));
+    }
+  } catch (e) {
+    console.warn(`Failed to set loadout active: ${e.message}`);
+  }
+}
+
+// ── Facility Transfer Loadout Functions ─────────────────────────
+
+function loadFuelTransferLoadout() {
+  const select = document.getElementById('ft-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to load.');
+    return;
+  }
+
+  const loadout = ftLoadouts[name];
+  if (!loadout) {
+    alert(`Loadout "${name}" not found!`);
+    return;
+  }
+
+  if (!settings.fuel_transport) settings.fuel_transport = {};
+  settings.fuel_transport.items = loadout.items.map(item => ({
+    itemId: item.itemId,
+    itemName: item.itemName || item.itemId,
+    targetQuantity: item.targetQuantity,
+  }));
+  renderFuelTransportSettings(document.getElementById('settingsContent'));
+}
+
+function saveFuelTransferLoadoutPrompt() {
+  const name = prompt('Enter a name for this facility transfer loadout:');
+  if (!name || !name.trim()) return;
+  const items = settings.fuel_transport?.items || [];
+  const loadoutItems = items.map(item => ({
+    itemId: item.itemId,
+    itemName: item.itemName || item.itemId,
+    targetQuantity: item.targetQuantity,
+  }));
+  saveFuelTransferLoadout(name.trim(), loadoutItems);
+}
+
+async function saveFuelTransferLoadout(name, items) {
+  if (!name || !name.trim()) {
+    alert('Please enter a name for the loadout!');
+    return;
+  }
+
+  try {
+    const response = await fetch('/api/facility-transfer-loadouts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, items: items || [] }),
+    });
+
+    if (response.ok) {
+      await loadFuelTransferLoadouts();
+      renderFuelTransportSettings(document.getElementById('settingsContent'));
+      alert(`Loadout "${name}" saved successfully!`);
+    } else {
+      const error = await response.json();
+      alert(`Failed to save loadout: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to save loadout: ${e.message}`);
+  }
+}
+
+async function deleteFuelTransferLoadout() {
+  const select = document.getElementById('ft-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to delete.');
+    return;
+  }
+
+  if (!confirm(`Are you sure you want to delete the loadout "${name}"?`)) return;
+
+  try {
+    const response = await fetch(`/api/facility-transfer-loadouts/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+
+    if (response.ok) {
+      await loadFuelTransferLoadouts();
+      renderFuelTransportSettings(document.getElementById('settingsContent'));
+    } else {
+      const error = await response.json();
+      alert(`Failed to delete loadout: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to delete loadout: ${e.message}`);
+  }
+}
+
+function createNewFuelTransferLoadout() {
+  const name = prompt('Enter a name for the new loadout:');
+  if (!name || !name.trim()) return;
+  const trimmedName = name.trim();
+  
+  const items = settings.fuel_transport?.items || [];
+  const loadoutItems = items.map(item => ({
+    itemId: item.itemId,
+    itemName: item.itemName || item.itemId,
+    targetQuantity: item.targetQuantity,
+  }));
+  
+  // Allow creating empty loadouts
+  saveFuelTransferLoadout(trimmedName, loadoutItems);
+}
+
+async function resetFuelTransferLoadoutCompletions() {
+  const select = document.getElementById('ft-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to reset.');
+    return;
+  }
+
+  if (!confirm(`Are you sure you want to delete the loadout completions for "${name}"? This will allow bots to re-check and re-deliver to all stations.`)) return;
+
+  try {
+    const response = await fetch(`/api/facility-transfer-completions/loadout/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+
+    if (response.ok) {
+      alert(`Reset completion status for "${name}"`);
+    } else {
+      const error = await response.json();
+      alert(`Failed to reset: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to reset: ${e.message}`);
+  }
+}
+
+// ── Civilian Transport ───────────────────────────────────────
+async function renderCivilianTransportSettings(panel) {
+  const ct = settings.civilian_transport || {};
+  const refuelThreshold = ct.refuelThreshold ?? 50;
+  const repairThreshold = ct.repairThreshold ?? 40;
+  const maxJumps = Number(ct.maxJumps ?? 5);
+  const roundsBeforeMoving = Number(ct.roundsBeforeMoving ?? 5);
+
+  const general = settings.general || {};
+  const homeSystem = ct.homeSystem || general.homeSystem || '';
+  const homeStation = ct.homeStation || general.homeStation || '';
+
+  let homeStationOpts = '<option value="">(none)</option>';
+  for (const [sysId, sys] of Object.entries(mapData)) {
+    const sysName = sys.name || sysId;
+    for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
+      if (!(poi.has_base || poi.base_id)) continue;
+      const val = sysId + '|' + poi.id;
+      const label = poi.base_name || poi.name || poi.id;
+      const sel = (sysId === homeSystem && poi.id === homeStation) ? ' selected' : '';
+      homeStationOpts += `<option value="${esc(val)}"${sel}>${label} (${esc(sysName)})</option>`;
+    }
+  }
+
+  panel.innerHTML = `
+    <h3>Civilian Transport Settings</h3>
+    <div class="settings-desc">Configure the civilian passenger transport routine. Values below are stored under <b>data/settings.json</b> → <b>civilian_transport</b> and are applied the next time a bot starts or restarts this routine.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max jumps from pickup</div>
+        <div class="setting-hint">Limit how far the bot will travel to pick up passengers. A lower value keeps runs short and fast.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-maxJumps" min="1" max="50" value="${esc(String(maxJumps))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Rounds before moving</div>
+        <div class="setting-hint">Number of rounds with no passengers before the bot moves to the next closest station.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-roundsBeforeMoving" min="1" max="50" value="${esc(String(roundsBeforeMoving))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Trigger a refuel when fuel drops below this percentage while running transport routes.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-refuelThreshold" min="10" max="90" value="${esc(String(refuelThreshold))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold (%)</div>
+        <div class="setting-hint">Dock for repairs when hull drops below this percentage.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-repairThreshold" min="10" max="90" value="${esc(String(repairThreshold))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home system / station</div>
+        <div class="setting-hint">Optional home base the transport routine will return to when idle or in an emergency.</div>
+      </div>
+      <select id="set-civilian_transport-homeStation">${homeStationOpts}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max passengers per run</div>
+        <div class="setting-hint">Global passenger cap. Set to 0 for unlimited (only limited by berths).</div>
+      </div>
+      <input type="number" id="set-civilian_transport-maxPassengers" min="0" max="100" value="${esc(String(ct.maxPassengers ?? 0))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max economy passengers</div>
+        <div class="setting-hint">Class-specific cap for economy berths. Set to 0 to allow up to the ship's capacity.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-maxEconomy" min="0" max="50" value="${esc(String(ct.maxEconomy ?? 0))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max business passengers</div>
+        <div class="setting-hint">Class-specific cap for business berths. Set to 0 to allow up to the ship's capacity.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-maxBusiness" min="0" max="50" value="${esc(String(ct.maxBusiness ?? 0))}">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Max first-class passengers</div>
+        <div class="setting-hint">Class-specific cap for first-class berths. Set to 0 to allow up to the ship's capacity.</div>
+      </div>
+      <input type="number" id="set-civilian_transport-maxFirst" min="0" max="50" value="${esc(String(ct.maxFirst ?? 0))}">
+    </div>
+
+    <div style="margin-top:18px">
+      <label>
+        <input type="checkbox" id="set-civilian_transport-blockPirateStations" ${ct.blockPirateStations !== false ? 'checked' : ''}>
+        Block pirate stations (recommended)
+      </label>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Passenger loading priority</div>
+        <div class="setting-hint">Prioritize loading higher-class passengers first. "off" loads passengers in API order.</div>
+      </div>
+      <select id="set-civilian_transport-passengerPriority">
+        <option value="off" ${ct.passengerPriority === 'off' || !ct.passengerPriority ? 'selected' : ''}>Off (API order)</option>
+        <option value="first" ${ct.passengerPriority === 'first' ? 'selected' : ''}>First class first</option>
+        <option value="business" ${ct.passengerPriority === 'business' ? 'selected' : ''}>Business first</option>
+        <option value="economy" ${ct.passengerPriority === 'economy' ? 'selected' : ''}>Economy first</option>
+      </select>
+    </div>
+
+    <div style="margin-top:12px">
+      <label style="display:block;margin-bottom:6px">Allow passenger classes:</label>
+      <div style="display:flex;gap:12px">
+        <label><input type="checkbox" id="set-civilian_transport-allowFirstClass" ${ct.allowFirstClass !== false ? 'checked' : ''}> First class</label>
+        <label><input type="checkbox" id="set-civilian_transport-allowBusinessClass" ${ct.allowBusinessClass !== false ? 'checked' : ''}> Business class</label>
+        <label><input type="checkbox" id="set-civilian_transport-allowEconomyClass" ${ct.allowEconomyClass !== false ? 'checked' : ''}> Economy class</label>
+      </div>
+    </div>
+
+    <div style="margin-top:12px">
+      <label><input type="checkbox" id="set-civilian_transport-announceDestination" ${ct.announceDestination !== false ? 'checked' : ''}> Announce destinations in transport messages</label>
+    </div>
+
+    <div style="margin-top:18px">
+      <button class="primary" onclick="saveCivilianTransportSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function saveCivilianTransportSettings() {
+  const maxJumps = Number(document.getElementById('set-civilian_transport-maxJumps')?.value || 5);
+  const roundsBeforeMoving = Number(document.getElementById('set-civilian_transport-roundsBeforeMoving')?.value || 5);
+  const refuelThreshold = Number(document.getElementById('set-civilian_transport-refuelThreshold')?.value || 50);
+  const repairThreshold = Number(document.getElementById('set-civilian_transport-repairThreshold')?.value || 40);
+  const homeStation = document.getElementById('set-civilian_transport-homeStation')?.value || '';
+  const maxPassengers = Number(document.getElementById('set-civilian_transport-maxPassengers')?.value || 0);
+  const maxEconomy = Number(document.getElementById('set-civilian_transport-maxEconomy')?.value || 0);
+  const maxBusiness = Number(document.getElementById('set-civilian_transport-maxBusiness')?.value || 0);
+  const maxFirst = Number(document.getElementById('set-civilian_transport-maxFirst')?.value || 0);
+  const blockPirateStations = document.getElementById('set-civilian_transport-blockPirateStations')?.checked ?? true;
+  const passengerPriority = document.getElementById('set-civilian_transport-passengerPriority')?.value || 'off';
+  const allowFirstClass = document.getElementById('set-civilian_transport-allowFirstClass')?.checked ?? true;
+  const allowBusinessClass = document.getElementById('set-civilian_transport-allowBusinessClass')?.checked ?? true;
+  const allowEconomyClass = document.getElementById('set-civilian_transport-allowEconomyClass')?.checked ?? true;
+  const announceDestination = document.getElementById('set-civilian_transport-announceDestination')?.checked ?? true;
+
+  const s = {};
+  if (homeStation && homeStation.includes('|')) {
+    const [sys, poi] = homeStation.split('|');
+    s.homeSystem = sys;
+    s.homeStation = poi;
+  }
+
+  s.maxJumps = maxJumps;
+  s.roundsBeforeMoving = roundsBeforeMoving;
+  s.refuelThreshold = refuelThreshold;
+  s.repairThreshold = repairThreshold;
+  s.maxPassengers = maxPassengers;
+  s.maxEconomy = maxEconomy;
+  s.maxBusiness = maxBusiness;
+  s.maxFirst = maxFirst;
+  s.blockPirateStations = blockPirateStations;
+  s.passengerPriority = passengerPriority;
+  s.allowFirstClass = allowFirstClass;
+  s.allowBusinessClass = allowBusinessClass;
+  s.allowEconomyClass = allowEconomyClass;
+  s.announceDestination = announceDestination;
+
+  send({ type: 'saveSettings', routine: 'civilian_transport', settings: s });
+  alert('Civilian Transport settings saved');
+}
+
+function renderModuleSellerSettings(panel) {
+  const ms = settings.module_seller || {};
+  const homeSystem = ms.homeSystem || settings.general?.factionStorageSystem || '';
+  const homeStation = ms.homeStation || settings.general?.factionStorageStation || '';
+  const fuelCostPerJump = ms.fuelCostPerJump ?? 50;
+  const refuelThreshold = ms.refuelThreshold ?? 50;
+  const repairThreshold = ms.repairThreshold ?? 40;
+  const priceMode = ms.priceMode || 'premium';
+  const premiumPct = ms.premiumPct ?? 5;
+  const undercutCr = ms.undercutCr ?? 100;
+  const sellAtHome = ms.sellAtHome !== false;
+  const maxQtyDefault = ms.maxQtyDefault ?? 10;
+  const moduleItems = Array.isArray(ms.moduleItems) ? ms.moduleItems : [];
+
+  let stationOpts = '<option value="">(use faction storage station)</option>';
+  for (const [sysId, sys] of Object.entries(mapData || {})) {
+    const sysName = sys.name || sysId;
+    for (const poi of [...(sys.pois || [])].sort((a, b) => ((a.base_name || a.name || a.id) || '').localeCompare((b.base_name || b.name || b.id) || ''))) {
+      if (!(poi.has_base || poi.base_id)) continue;
+      const val = sysId + '|' + poi.id;
+      const sel = (sysId === homeSystem && poi.id === homeStation) ? ' selected' : '';
+      const label = poi.base_name || poi.name || poi.id;
+      stationOpts += `<option value="${esc(val)}"${sel}>${esc(label)} (${esc(sysName)})</option>`;
+    }
+  }
+
+  let moduleItemsHtml = '';
+  for (const item of moduleItems) {
+    moduleItemsHtml += `
+      <tr>
+        <td><input type="text" value="${esc(item.itemId || '')}" data-field="itemId" style="width:100%;font-family:monospace;font-size:11px"></td>
+        <td><input type="number" min="0" value="${item.maxQty ?? 0}" data-field="maxQty" style="width:60px"></td>
+        <td><input type="checkbox" data-field="doNotSell" ${item.doNotSell ? 'checked' : ''}></td>
+        <td><button class="sm danger" onclick="removeModuleItem(this)">Remove</button></td>
+      </tr>`;
+  }
+
+  panel.innerHTML = `
+    <h3>Module Seller Settings</h3>
+    <div class="settings-desc">Configure the module seller routine. Bots will buy ship modules from faction storage and sell them to the highest buyer at stations with markets.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home System</div>
+        <div class="setting-hint">System containing your faction storage station. Defaults to general faction storage system.</div>
+      </div>
+      <input type="text" id="set-module_seller-homeSystem" value="${esc(homeSystem)}" placeholder="e.g. sol, alpha_centauri" style="width:200px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Home Station</div>
+        <div class="setting-hint">Station where the bot docks to check faction storage. Defaults to general faction storage station.</div>
+      </div>
+      <select id="set-module_seller-homeStation">${stationOpts}</select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Fuel Cost Per Jump</div>
+        <div class="setting-hint">Estimated fuel cost per jump. Used for pricing calculations.</div>
+      </div>
+      <input type="number" id="set-module_seller-fuelCostPerJump" min="0" value="${fuelCostPerJump}" style="width:80px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Refuel Threshold (%)</div>
+        <div class="setting-hint">Refuel at station when fuel drops below this %.</div>
+      </div>
+      <input type="number" id="set-module_seller-refuelThreshold" min="10" max="90" value="${refuelThreshold}" style="width:80px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Repair Threshold (%)</div>
+        <div class="setting-hint">Repair hull at station when HP drops below this %.</div>
+      </div>
+      <input type="number" id="set-module_seller-repairThreshold" min="10" max="90" value="${repairThreshold}" style="width:80px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Price Mode</div>
+        <div class="setting-hint">How to calculate sell prices: Premium adds markup, Undercut subtracts from best buy.</div>
+      </div>
+      <select id="set-module_seller-priceMode">
+        <option value="premium"${priceMode === 'premium' ? ' selected' : ''}>Premium (+markup)</option>
+        <option value="undercut"${priceMode === 'undercut' ? ' selected' : ''}>Undercut (-cr)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Premium %</div>
+        <div class="setting-hint">Markup percentage over best buy price when using Premium mode.</div>
+      </div>
+      <input type="number" id="set-module_seller-premiumPct" min="0" max="100" value="${premiumPct}" style="width:80px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Undercut (cr)</div>
+        <div class="setting-hint">Amount to subtract from best buy price when using Undercut mode.</div>
+      </div>
+      <input type="number" id="set-module_seller-undercutCr" min="0" value="${undercutCr}" style="width:80px">
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Sell At Home</div>
+        <div class="setting-hint">Sell at the home station instead of traveling to the highest buyer.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-module_seller-sellAtHome"${sellAtHome ? ' checked' : ''}></label>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Default Max Quantity</div>
+        <div class="setting-hint">Default max quantity to sell per item when no specific config exists.</div>
+      </div>
+      <input type="number" id="set-module_seller-maxQtyDefault" min="0" value="${maxQtyDefault}" style="width:80px">
+    </div>
+
+    <div class="setting-section">
+      <div class="setting-label">Module Items (Per-Item Overrides)</div>
+      <div class="setting-hint">Configure specific items to sell. Leave empty to sell all ship modules. Item IDs are case-sensitive.</div>
+      <table class="settings-table" style="width:100%;border-collapse:collapse">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border)">
+            <th style="text-align:left;padding:4px">Item ID</th>
+            <th style="text-align:left;padding:4px">Max Qty</th>
+            <th style="text-align:left;padding:4px">Do Not Sell</th>
+            <th style="width:60px"></th>
+          </tr>
+        </thead>
+        <tbody>
+          ${moduleItemsHtml}
+        </tbody>
+      </table>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+        <input type="text" id="new-module-item-id" placeholder="Item ID (e.g., weapon_module_id)" style="flex:1;font-family:monospace;font-size:11px">
+        <input type="number" id="new-module-item-qty" min="0" value="0" placeholder="Max Qty" style="width:80px">
+        <button class="sm primary" onclick="addModuleItem()">Add Item</button>
+      </div>
+    </div>
+
+    <div class="settings-save-bar">
+      <button class="primary" onclick="saveModuleSellerSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+function addModuleItem() {
+  const itemId = document.getElementById('new-module-item-id').value.trim();
+  const maxQty = parseInt(document.getElementById('new-module-item-qty').value) || 0;
+  if (!itemId) { alert('Please enter an Item ID'); return; }
+  const ms = settings.module_seller || {};
+  if (!Array.isArray(ms.moduleItems)) ms.moduleItems = [];
+  ms.moduleItems.push({ itemId, maxQty, doNotSell: false });
+  settings.module_seller = ms;
+  renderModuleSellerSettings(document.getElementById('settingsContent'));
+}
+
+function removeModuleItem(btn) {
+  const row = btn.closest('tr');
+  const itemId = row.querySelector('[data-field="itemId"]').value;
+  const ms = settings.module_seller || {};
+  if (!Array.isArray(ms.moduleItems)) ms.moduleItems = [];
+  ms.moduleItems = ms.moduleItems.filter(i => i.itemId !== itemId);
+  settings.module_seller = ms;
+  renderModuleSellerSettings(document.getElementById('settingsContent'));
+}
+
+function saveModuleSellerSettings() {
+  const ms = settings.module_seller || {};
+  ms.homeSystem = document.getElementById('set-module_seller-homeSystem').value;
+  ms.homeStation = document.getElementById('set-module_seller-homeStation').value;
+  ms.fuelCostPerJump = parseInt(document.getElementById('set-module_seller-fuelCostPerJump').value) || 50;
+  ms.refuelThreshold = parseInt(document.getElementById('set-module_seller-refuelThreshold').value) || 50;
+  ms.repairThreshold = parseInt(document.getElementById('set-module_seller-repairThreshold').value) || 40;
+  ms.priceMode = document.getElementById('set-module_seller-priceMode').value;
+  ms.premiumPct = parseInt(document.getElementById('set-module_seller-premiumPct').value) || 5;
+  ms.undercutCr = parseInt(document.getElementById('set-module_seller-undercutCr').value) || 100;
+  ms.sellAtHome = document.getElementById('set-module_seller-sellAtHome').checked;
+  ms.maxQtyDefault = parseInt(document.getElementById('set-module_seller-maxQtyDefault').value) || 10;
+
+  const items = [];
+  document.querySelectorAll('#settingsContent tr td:first-child input').forEach(input => {
+    const itemId = input.value.trim();
+    if (!itemId) return;
+    const row = input.closest('tr');
+    const maxQty = parseInt(row.querySelector('[data-field="maxQty"]')?.value) || 0;
+    const doNotSell = row.querySelector('[data-field="doNotSell"]')?.checked || false;
+    items.push({ itemId, maxQty, doNotSell });
+  });
+  ms.moduleItems = items;
+
+  send({ type: 'saveSettings', routine: 'module_seller', settings: ms });
+  settings.module_seller = ms;
+}
+
+async function resetFuelTransferLoadoutCompletions() {
+  const select = document.getElementById('ft-loadout-select');
+  const name = select?.value;
+  if (!name) {
+    alert('Please select a loadout to reset.');
+    return;
+  }
+
+  if (!confirm(`Are you sure you want to delete the loadout completions for "${name}"? This will allow bots to re-check and re-deliver to all stations.`)) return;
+
+  try {
+    const response = await fetch(`/api/facility-transfer-completions/loadout/${encodeURIComponent(name)}`, {
+      method: 'DELETE',
+    });
+
+    if (response.ok) {
+      alert(`Reset completion status for "${name}"`);
+    } else {
+      const error = await response.json();
+      alert(`Failed to reset: ${error.error || 'Unknown error'}`);
+    }
+  } catch (e) {
+    alert(`Failed to reset: ${e.message}`);
+  }
 }
 
 // ── Shipyard ────────────────────────────────────────────────
@@ -18600,7 +20655,7 @@ function renderShipOverview(data, username) {
     <div class="faction-section" style="display:flex;gap:6px;flex-wrap:wrap">
       <button class="sm" onclick="shipRepair('${esc(username)}')">Repair</button>
       <button class="sm" onclick="shipRefuel('${esc(username)}')">Refuel</button>
-      <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}','${shipIdVal}','${shipNameForModal}')">Name Ship</button>
+      <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}')">Name Ship</button>
     </div>
     <div class="faction-section"><div class="faction-section-title">Modules</div>${slotsHtml}</div>
     <details style="margin-top:12px">
@@ -18832,12 +20887,16 @@ const activeShip = shipyardShipData?.ship || shipyardShipData || {};
         </select>
         <input type="text" class="ship-gift-custom-input" id="gift-input-${id}" placeholder="Bot name..." style="display:none;width:120px;font-size:11px;padding:2px 6px;">
         <button class="sm" style="color:var(--cyan)" onclick="shipGift('${esc(username)}','${esc(id)}','${escJs(name)}')">Gift</button>
-        <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}','${esc(id)}','${escJs(name)}')">Name</button>
+        <button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}')">Name</button>
       ` : '';
       
       const loadBtn = `<button class="sm" style="color:var(--green)" onclick="shipDepositIntoCarrier('${esc(username)}','${esc(id)}','${escJs(name)}')" title="Load onto carrier">📦 Load Ship</button>`;
       const unloadBtn = canUnloadFromCarrier
         ? `<button class="sm" style="color:var(--cyan)" onclick="shipWithdrawFromCarrier('${esc(username)}','${esc(id)}','${escJs(name)}')" title="Unload from carrier">📤 Unload</button>`
+        : '';
+      
+      const nameBtn = isActive
+        ? `<button class="sm" style="color:var(--yellow)" onclick="openNameShipModal('${esc(username)}')">Name Ship</button>`
         : '';
 
       const storedInCarrierDisplay = storedInCarrierName || '';
@@ -18853,7 +20912,7 @@ const activeShip = shipyardShipData?.ship || shipyardShipData || {};
           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" onclick="shipSwitch('${esc(username)}','${esc(id)}')">Switch</button>` : ''}
           ${loadBtn}${unloadBtn}
           ${!isActive && !isBuilding && !isLoadedOnCarrier ? `<button class="sm" style="color:var(--red)" onclick="shipSell('${esc(username)}','${esc(id)}','${escJs(name)}')">Sell</button>` : ''}
-          ${giftDropdown}
+          ${giftDropdown}${nameBtn}
         </div>
       </div>`;
     }
@@ -19399,33 +21458,29 @@ function handleGiftBotSelect(username, shipId, selectEl) {
   }
 }
 
-function openNameShipModal(username, shipId, shipName) {
-  document.getElementById('nameShipId').value = shipId || '';
+function openNameShipModal(username) {
   document.getElementById('nameShipNewName').value = '';
   document.getElementById('nameShipModal').style.display = 'flex';
-  window._namingShipId = shipId;
   window._namingBot = username;
 }
 
 function closeNameShipModal() {
   document.getElementById('nameShipModal').style.display = 'none';
-  window._namingShipId = null;
   window._namingBot = null;
 }
 
 function submitNameShip() {
-  const shipId = document.getElementById('nameShipId').value;
   const newName = document.getElementById('nameShipNewName').value.trim();
   if (!newName) {
     appendLine('system', 'Please enter a name for the ship');
     return;
   }
   const bot = window._namingBot;
-  if (!bot || !shipId) {
-    appendLine('system', 'Could not determine bot or ship ID');
+  if (!bot) {
+    appendLine('system', 'Could not determine bot');
     return;
   }
-  sendExec(bot, 'rename_ship', { ship_id: shipId, name: newName }, (result) => {
+  sendExec(bot, 'rename_ship', { name: newName }, (result) => {
     if (result.ok) {
       appendLine('system', result.message || `Ship renamed to "${newName}"`);
       closeNameShipModal();
@@ -20230,6 +22285,369 @@ function fcSetManualMode(manual) {
   .catch(err => {
     logFleetCombat(`Error saving: ${err.message}`, 'error');
   });
+}
+
+function renderClientSyncSettings(panel) {
+  const cs = settings.clientSync || {};
+  const enabled = cs.enabled !== false;
+  const mode = cs.mode || 'slave';
+  const masterUrl = cs.masterUrl || '';
+  let apiKey = cs.apiKey || '';
+  let password = cs.password || '';
+  const label = cs.label || '';
+  const pollIntervalSec = cs.pollIntervalSec || 15;
+  const syncMap = cs.syncMap !== false;
+  const syncMarket = cs.syncMarket !== false;
+  const syncCatalog = cs.syncCatalog !== false;
+  const syncStats = cs.syncStats !== false;
+  const syncBotChat = cs.syncBotChat !== false;
+  const syncPlayerNames = cs.syncPlayerNames !== false;
+  const syncCoordination = cs.syncCoordination !== false;
+  const syncCivilianTransport = cs.syncCivilianTransport !== false;
+  const syncRescue = cs.syncRescue !== false;
+  const allowRemoteBots = cs.allowRemoteBotsInDropdowns !== false;
+  const pushLocalDiscoveries = cs.pushLocalDiscoveries !== false;
+
+  if (mode === 'master' && !apiKey) {
+    fetch('/api/client-sync/api-key')
+      .then(r => r.json())
+      .then(data => {
+        if (data.apiKey) {
+          apiKey = data.apiKey;
+          settings.clientSync.apiKey = apiKey;
+          renderClientSyncSettings(panel);
+        }
+      })
+      .catch(() => {});
+  }
+
+  panel.innerHTML = `
+    <h3>Connect Clients</h3>
+    <div class="settings-desc">Connect multiple botrunner clients to share map data, market data, and coordinate bot activities across machines.</div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Enable Client Sync</div>
+        <div class="setting-hint">Enable cross-client synchronization.</div>
+      </div>
+      <label class="checkbox-label"><input type="checkbox" id="set-client_sync-enabled" ${enabled ? 'checked' : ''} onchange="saveClientSyncSettings()"></label>
+    </div>
+
+    <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Mode</div>
+          <div class="setting-hint">Master receives updates from slaves. Slave pulls data from master.</div>
+        </div>
+        <select id="set-client_sync-mode" onchange="saveClientSyncSettings(); updateClientSyncModeUI()">
+          <option value="disabled" ${mode === 'disabled' ? 'selected' : ''}>Disabled</option>
+          <option value="master" ${mode === 'master' ? 'selected' : ''}>Master</option>
+          <option value="slave" ${mode === 'slave' ? 'selected' : ''}>Slave</option>
+        </select>
+      </div>
+
+      <div id="clientSyncMasterPanel" style="${mode === 'master' ? '' : 'display:none'}">
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">API Key</div>
+            <div class="setting-hint">Use this key when connecting from slave clients.</div>
+          </div>
+          <input type="text" id="set-client_sync-apiKey" value="${esc(apiKey)}" placeholder="Auto-generated" style="width:200px">
+          <button class="sm" onclick="generateNewApiKey()">Generate New</button>
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Password</div>
+            <div class="setting-hint">Optional password for slave authentication.</div>
+          </div>
+          <input type="password" id="set-client_sync-password" value="${esc(password)}" placeholder="Optional" style="width:200px">
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Connected Clients</div>
+            <div class="setting-hint">Slaves registered to this master. Auto-refreshes every 5s.</div>
+          </div>
+          <button class="sm" onclick="refreshClientSyncConnectedClients()">Refresh Now</button>
+        </div>
+        <div id="clientSyncConnectedClients" style="font-size:12px;color:var(--text-dim);margin-bottom:8px">
+          Loading...
+        </div>
+      </div>
+
+      <div id="clientSyncSlavePanel" style="${mode === 'slave' ? '' : 'display:none'}">
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Master URL</div>
+            <div class="setting-hint">The URL of the master client (e.g., http://192.168.1.100:3000)</div>
+          </div>
+          <input type="text" id="set-client_sync-masterUrl" value="${esc(masterUrl)}" placeholder="http://host:port" style="width:200px">
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Bot Label</div>
+            <div class="setting-hint">Display name for this client in master's client list.</div>
+          </div>
+          <input type="text" id="set-client_sync-label" value="${esc(label)}" placeholder="Bot Runner 2" style="width:150px">
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">API Key</div>
+            <div class="setting-hint">API key from the master client.</div>
+          </div>
+          <input type="password" id="set-client_sync-apiKey" value="${esc(apiKey)}" placeholder="Enter API key" style="width:150px">
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Password</div>
+            <div class="setting-hint">Optional password for master (if set).</div>
+          </div>
+          <input type="password" id="set-client_sync-password" value="${esc(password)}" placeholder="Optional" style="width:150px">
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Poll Interval (seconds)</div>
+            <div class="setting-hint">How often to poll master for updates.</div>
+          </div>
+          <input type="number" id="set-client_sync-pollIntervalSec" min="5" max="300" value="${pollIntervalSec}" style="width:80px">
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Connection Status</div>
+            <div class="setting-hint">Current sync status. Auto-refreshes every 5s.</div>
+          </div>
+          <span id="clientSyncStatus" style="font-size:12px;color:var(--text-dim)">Checking...</span>
+        </div>
+        <div style="margin-top:8px;display:flex;gap:8px">
+          <button class="sm" onclick="refreshClientSyncStatus()">Refresh Status</button>
+          <button class="sm primary" onclick="testClientSyncConnection()">Test Connection</button>
+        </div>
+      </div>
+
+      <div id="clientSyncOptionsPanel" style="${mode === 'slave' ? '' : 'display:none'}">
+        <div style="margin-top:8px;margin-bottom:4px;font-size:13px;font-weight:500;color:var(--text-bright)">Sync Options</div>
+        
+        <div class="setting-row">
+          <div><div class="setting-label">Sync Map</div></div>
+          <input type="checkbox" id="set-client_sync-syncMap" ${syncMap ? 'checked' : ''}>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Sync Market</div></div>
+          <input type="checkbox" id="set-client_sync-syncMarket" ${syncMarket ? 'checked' : ''}>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Sync Catalog</div></div>
+          <input type="checkbox" id="set-client_sync-syncCatalog" ${syncCatalog ? 'checked' : ''}>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Sync Stats</div></div>
+          <input type="checkbox" id="set-client_sync-syncStats" ${syncStats ? 'checked' : ''}>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Sync Bot Chat</div></div>
+          <input type="checkbox" id="set-client_sync-syncBotChat" ${syncBotChat ? 'checked' : ''}>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Sync Player Names</div></div>
+          <input type="checkbox" id="set-client_sync-syncPlayerNames" ${syncPlayerNames ? 'checked' : ''}>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Sync Coordination Files</div></div>
+          <input type="checkbox" id="set-client_sync-syncCoordination" ${syncCoordination ? 'checked' : ''}>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Sync Civilian Transport</div></div>
+          <input type="checkbox" id="set-client_sync-syncCivilianTransport" ${syncCivilianTransport ? 'checked' : ''}>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Sync Rescue</div></div>
+          <input type="checkbox" id="set-client_sync-syncRescue" ${syncRescue ? 'checked' : ''}>
+        </div>
+        <div class="setting-row">
+          <div><div class="setting-label">Push Local Discoveries</div></div>
+          <input type="checkbox" id="set-client_sync-pushLocalDiscoveries" ${pushLocalDiscoveries ? 'checked' : ''}>
+        </div>
+      </div>
+
+      <div style="margin-top:16px;padding-top:16px;border-top:1px solid var(--border)">
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Allow Remote Bots in Dropdowns</div>
+            <div class="setting-hint">Show remote bots in gifting, escort, and cargo destination dropdowns.</div>
+          </div>
+          <label class="checkbox-label"><input type="checkbox" id="set-client_sync-allowRemoteBotsInDropdowns" ${allowRemoteBots ? 'checked' : ''} onchange="saveClientSyncSettings()"></label>
+        </div>
+
+        <div class="setting-row">
+          <div>
+            <div class="setting-label">Save Settings</div>
+            <div class="setting-hint">Save current settings to disk.</div>
+          </div>
+          <button class="primary" onclick="saveClientSyncSettings()">Save</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function updateClientSyncModeUI() {
+  const mode = document.getElementById('set-client_sync-mode').value;
+  document.getElementById('clientSyncMasterPanel').style.display = mode === 'master' ? '' : 'none';
+  document.getElementById('clientSyncSlavePanel').style.display = mode === 'slave' ? '' : 'none';
+  document.getElementById('clientSyncOptionsPanel').style.display = mode === 'slave' ? '' : 'none';
+  if (mode === 'master') refreshClientSyncConnectedClients();
+}
+
+function generateNewApiKey() {
+  const newKey = 'master_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 10);
+  document.getElementById('set-client_sync-apiKey').value = newKey;
+  saveClientSyncSettings();
+}
+
+function refreshClientSyncConnectedClients() {
+  fetch('/api/client-sync/clients')
+    .then(r => r.json())
+    .then(clients => {
+      const container = document.getElementById('clientSyncConnectedClients');
+      if (!container) return;
+      if (!Array.isArray(clients) || clients.length === 0) {
+        container.textContent = 'No clients connected';
+        return;
+      }
+      container.innerHTML = clients.map(c => 
+        `<div style="margin-bottom:4px;padding:4px;background:#1a1a1a;border-radius:4px">
+          <span style="font-weight:500">${esc(c.label || c.clientId)}</span>
+          <span style="color:var(--text-dim);font-size:11px;margin-left:8px">${new Date(c.connectedAt).toLocaleString()}</span>
+        </div>`
+      ).join('');
+    })
+    .catch(() => {});
+}
+
+function refreshClientSyncStatus() {
+  const mode = document.getElementById('set-client_sync-mode').value;
+  const masterUrl = document.getElementById('set-client_sync-masterUrl').value;
+  const statusEl = document.getElementById('clientSyncStatus');
+  if (mode !== 'slave') {
+    if (statusEl) statusEl.textContent = 'Not applicable';
+    return;
+  }
+  
+  // Fetch slave state from server
+  fetch('/api/client-sync/slave-state')
+    .then(r => r.json())
+    .then(state => {
+      const statusEl = document.getElementById('clientSyncStatus');
+      if (!statusEl) return;
+      
+      if (state.connected) {
+        statusEl.textContent = 'Connected';
+        statusEl.style.color = 'var(--green, #00ff00)';
+      } else {
+        statusEl.textContent = `Disconnected: ${state.lastError || 'Unknown error'}`;
+        statusEl.style.color = 'var(--red, #ff4444)';
+      }
+    })
+    .catch(err => {
+      if (statusEl) {
+        statusEl.textContent = `Not connected (${err.message})`;
+        statusEl.style.color = 'var(--red, #ff4444)';
+      }
+    });
+}
+
+function testClientSyncConnection() {
+  const masterUrl = document.getElementById('set-client_sync-masterUrl').value;
+  const apiKey = document.getElementById('set-client_sync-apiKey').value;
+  const password = document.getElementById('set-client_sync-password').value;
+  const label = document.getElementById('set-client_sync-label').value;
+  const statusEl = document.getElementById('clientSyncStatus');
+  
+  if (!masterUrl) {
+    statusEl.textContent = 'Enter master URL first';
+    return;
+  }
+  
+  statusEl.textContent = 'Testing...';
+  statusEl.style.color = 'var(--text-bright)';
+  
+  fetch('/api/client-sync/test-register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ masterUrl, apiKey, label: label || 'test', password })
+  })
+  .then(r => r.json())
+  .then(data => {
+    if (data.ok) {
+      statusEl.textContent = `Success: ${data.clientId}`;
+      statusEl.style.color = 'var(--green, #00ff00)';
+    } else {
+      statusEl.textContent = `Failed: ${data.error || 'Unknown error'}`;
+      statusEl.style.color = 'var(--red, #ff4444)';
+    }
+  })
+  .catch(err => {
+    statusEl.textContent = `Failed: ${err.message}`;
+    statusEl.style.color = 'var(--red, #ff4444)';
+  });
+}
+
+setInterval(() => {
+  if (document.getElementById('page-settings')?.classList.contains('active')) {
+    const mode = document.getElementById('set-client_sync-mode')?.value;
+    if (mode === 'master') refreshClientSyncConnectedClients();
+    if (mode === 'slave') refreshClientSyncStatus();
+  }
+}, 5000);
+
+function saveClientSyncSettings() {
+  const mode = document.getElementById('set-client_sync-mode').value;
+  const apiKey = document.getElementById('set-client_sync-apiKey').value;
+  const password = document.getElementById('set-client_sync-password').value;
+  
+  const newSettings = {
+    clientSync: {
+      enabled: document.getElementById('set-client_sync-enabled').checked,
+      mode: mode,
+      masterUrl: document.getElementById('set-client_sync-masterUrl').value,
+      apiKey: apiKey,
+      password: password,
+      label: document.getElementById('set-client_sync-label').value,
+      pollIntervalSec: parseInt(document.getElementById('set-client_sync-pollIntervalSec').value) || 15,
+      syncMap: document.getElementById('set-client_sync-syncMap').checked,
+      syncMarket: document.getElementById('set-client_sync-syncMarket').checked,
+      syncCatalog: document.getElementById('set-client_sync-syncCatalog').checked,
+      syncStats: document.getElementById('set-client_sync-syncStats').checked,
+      syncBotChat: document.getElementById('set-client_sync-syncBotChat').checked,
+      syncPlayerNames: document.getElementById('set-client_sync-syncPlayerNames').checked,
+      syncCoordination: document.getElementById('set-client_sync-syncCoordination').checked,
+      syncCivilianTransport: document.getElementById('set-client_sync-syncCivilianTransport').checked,
+      syncRescue: document.getElementById('set-client_sync-syncRescue').checked,
+      allowRemoteBotsInDropdowns: document.getElementById('set-client_sync-allowRemoteBotsInDropdowns').checked,
+      pushLocalDiscoveries: document.getElementById('set-client_sync-pushLocalDiscoveries').checked
+    }
+  };
+  settings = Object.assign({}, settings, newSettings);
+  send({ type: 'saveSettings', routine: 'clientSync', settings: settings.clientSync });
+  
+  if (mode === 'master') {
+    fetch('/api/client-sync/set-api-key', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ apiKey })
+    });
+    fetch('/api/client-sync/set-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password })
+    });
+  }
 }
 
 function fcMove() {

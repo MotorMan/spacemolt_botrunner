@@ -25,6 +25,8 @@
  *   desiredRepairKits    — how many repair kits (advanced + regular) the bot tries to keep stocked (default: 12)
  *   Auto-uses repair kits (advanced_repair_kit preferred, then repair_kit) from cargo after fights when hull deficit > 100
  *   onlyNPCs        — only attack NPC pirates, never players (default: true)
+ *   ammoReloadAbsoluteThreshold — ammo count to reload when weapon has ≤50 total ammo (default: 1)
+ *   ammoReloadPercentThreshold — % of max ammo to reload when weapon has >50 total ammo (default: 25)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -76,7 +78,7 @@ import {
   getWeaponModules,
 } from "./battle.js";
 
-async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier, repairThreshold: number = 0): Promise<void> {
+async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: PirateTier, minPiratesToFlee: number, fleeThreshold: number, fleeFromTier: PirateTier, repairThreshold: number = 0, onlyNPCs: boolean = false): Promise<void> {
   const battleStatus = await getBattleStatus(ctx);
   if (!battleStatus) return;
 
@@ -111,7 +113,31 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
   // Pick a real target from battle participants so we get the full combat loop
   const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
   const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
-  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, shieldRechargePct);
+  await fightJoinedBattle(ctx, fakeTarget, fleeThreshold, fleeFromTier, maxAttackTier, repairThreshold, false, shieldRechargePct, hsettings.onlyNPCs);
+}
+
+async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
+  // First check WebSocket state (works even when HTTP is hanging)
+  if (ctx.bot.isInBattle()) {
+    ctx.log("combat", `⚠️ Already in battle (ID: ${ctx.bot.currentBattle.battleId}) - engaging instead of navigating`);
+    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
+    return true;
+  }
+  
+  // Also check via API in case WebSocket state is stale/missing
+  try {
+    const battleStatus = await getBattleStatus(ctx);
+    if (battleStatus) {
+      ctx.log("combat", `⚠️ Battle detected via API (ID: ${battleStatus.battle_id}) - engaging instead of navigating`);
+      await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
+      return true;
+    }
+  } catch (e) {
+    // API check failed - rely on WebSocket state
+    ctx.log("combat", `API battle check failed, relying on WebSocket state`);
+  }
+  
+  return false;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -125,6 +151,14 @@ export interface HunterPatrolProfile {
   patrolSystems: string[];
 }
 
+function seededRandom(seed: number): () => number {
+  let state = seed;
+  return () => {
+    state = (state * 9301 + 49297) % 233280;
+    return state / 233280;
+  };
+}
+
 function getHunterSettings(username?: string): {
   mode: HunterMode;
   patrolCycleMode: PatrolCycleMode;
@@ -136,6 +170,8 @@ function getHunterSettings(username?: string): {
   onlyNPCs: boolean;
   autoCloak: boolean;
   ammoThreshold: number;
+  ammoReloadAbsoluteThreshold: number;
+  ammoReloadPercentThreshold: number;
   maxReloadAttempts: number;
   responseRange: number;
   maxAttackTier: PirateTier;
@@ -180,6 +216,8 @@ function getHunterSettings(username?: string): {
     onlyNPCs: (h.onlyNPCs as boolean) !== false,
     autoCloak: (h.autoCloak as boolean) ?? false,
     ammoThreshold: (h.ammoThreshold as number) || 5,
+    ammoReloadAbsoluteThreshold: (h.ammoReloadAbsoluteThreshold as number) || 1,
+    ammoReloadPercentThreshold: (h.ammoReloadPercentThreshold as number) || 25,
     maxReloadAttempts: (h.maxReloadAttempts as number) || 3,
     responseRange: (h.responseRange as number) ?? 3,
     maxAttackTier: ((h.maxAttackTier as PirateTier) || "large") as PirateTier,
@@ -238,7 +276,20 @@ function isLowOnFieldConsumables(inventory: any[] | undefined, minRepairKits = 5
 }
 
 async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<void> {
-  const battleStatus = await getBattleStatus(ctx);
+  // First check WebSocket state (works even when HTTP is hanging)
+  let battleStatus: Awaited<ReturnType<typeof getBattleStatus>> = null;
+  
+  if (ctx.bot.isInBattle()) {
+    battleStatus = {
+      battle_id: ctx.bot.currentBattle.battleId || "",
+      participants: ctx.bot.currentBattle.participants as any,
+      is_participant: true,
+    } as any;
+  } else {
+    // Fall back to API check
+    battleStatus = await getBattleStatus(ctx);
+  }
+  
   if (!battleStatus) return;
 
   ctx.log("combat", `⚠️ Navigation interrupted by battle (ID: ${battleStatus.battle_id}) - hunter fights, not flees!`);
@@ -262,9 +313,9 @@ async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: Re
       }
     }
 
-    const enemy = battleStatus.participants.find(p => p.side_id !== analysis.sideId && !p.is_destroyed);
+const enemy = (battleStatus?.participants ?? []).find((p: any) => p.side_id !== analysis.sideId && !p.is_destroyed);
     const fakeTarget = enemy ? { id: enemy.player_id || enemy.username || "", name: enemy.username || enemy.player_id || "enemy" } as any : null;
-    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100);
+    await fightJoinedBattle(ctx, fakeTarget, settings.fleeThreshold, settings.fleeFromTier, settings.maxAttackTier, settings.repairThreshold, false, settings.shieldRechargePct / 100, settings.onlyNPCs);
   }
 }
 
@@ -501,28 +552,6 @@ function findNextHuntSystem(fromSystemId: string): string | null {
 
 // ── Ammo management ──────────────────────────────────────────
 
-interface WeaponModule {
-  instanceId: string;
-  moduleId: string;
-  name: string;
-  currentAmmo: number;
-  maxAmmo: number;
-  ammoType?: string;
-}
-
-/**
- * Fetch weapon modules from get_ship and return those with ammo info.
- * Looks up ammo_type from catalog using the module_id.
- * Handles both traditional ammo weapons and missile launchers.
- */
-/**
- * Ensure the hunter has ammo loaded. Only reloads when ammo <= 25% of max capacity.
- * Uses proper reload command with weapon_instance_id and ammo_item_id from cargo.
- * Returns false if out of ammo and needs to dock for resupply.
- * 
- * Handles both traditional weapons (with reported ammo) and missile launchers
- * (which may not report ammo state but still need cargo ammo).
- */
 // ── Faction alert response ────────────────────────────────────
 
 /** Cooldown per system so we don't divert repeatedly (5 minutes). */
@@ -700,6 +729,10 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     yield "faction_alert_check";
     const alertTarget = await checkFactionAlerts(ctx, settings.responseRange);
     if (alertTarget) {
+      // CRITICAL: Check for existing battle before navigating
+      if (await checkAndHandleExistingBattle(ctx, settings)) {
+        continue;
+      }
       const sys = mapStore.getSystem(alertTarget);
       const blacklist = getSystemBlacklist();
       const route = mapStore.findRoute(bot.system, alertTarget, blacklist);
@@ -728,6 +761,11 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // ── Navigate to a huntable (low/unregulated) system ──
     yield "find_patrol_system";
+
+    // CRITICAL: Check for existing battle before navigating
+    if (await checkAndHandleExistingBattle(ctx, settings)) {
+      continue;
+    }
 
     if (patrolSystem && bot.system !== patrolSystem) {
       ctx.log("travel", `Navigating to configured patrol system ${patrolSystem}...`);
@@ -834,6 +872,12 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       }
       if (midFuel < settings.refuelThreshold) {
         ctx.log("system", `Fuel at ${midFuel}% — aborting patrol, heading to refuel`);
+        abortPatrol = true;
+        break;
+      }
+
+      // CRITICAL: Check for existing battle before traveling to POI
+      if (await checkAndHandleExistingBattle(ctx, settings)) {
         abortPatrol = true;
         break;
       }
@@ -971,7 +1015,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         }
 
         // Pre-fight ammo check - use ensureAmmoLoaded since bot.ammo may not reflect module-level ammo
-        const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+        const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
         if (!hasAmmo) {
           ctx.log("combat", "Out of ammo — aborting patrol to resupply");
           abortPatrol = true;
@@ -1028,7 +1072,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           await scavengeWrecks(ctx);
 
           // Post-kill reload
-          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           if (!hasAmmo) {
             ctx.log("combat", "No ammo after kill — aborting patrol to resupply");
             abortPatrol = true;
@@ -1100,7 +1144,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       await repairShip(ctx);
 
       yield "reload";
-      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
 
       yield "fit_mods";
       const modProfile = getModProfile("hunter");
@@ -1267,6 +1311,12 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         break;
       }
 
+      // CRITICAL: Check for existing battle before traveling to POI
+      if (await checkAndHandleExistingBattle(ctx, settings)) {
+        abortPatrol = true;
+        break;
+      }
+
       // Travel to POI
       yield "travel_to_poi";
       ctx.log("travel", `Patrolling ${poi.name}...`);
@@ -1346,7 +1396,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         await useRepairKits(ctx); // use cargo kits if hull deficit >100 before engaging
 
         // Pre-fight ammo check
-        const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+        const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
         if (!hasAmmo) {
           ctx.log("combat", "Out of ammo — aborting patrol to resupply");
           abortPatrol = true;
@@ -1403,7 +1453,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           }
 
           // Post-kill reload
-          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           if (!hasAmmo) {
             ctx.log("combat", "No ammo after kill — aborting patrol to resupply");
             abortPatrol = true;
@@ -1475,7 +1525,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       await repairShip(ctx);
 
       yield "reload";
-      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
 
       yield "fit_mods";
       const modProfile = getModProfile("hunter");
@@ -1656,7 +1706,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       await useRepairKits(ctx); // use cargo kits if hull deficit >100 before engaging
 
       // Pre-fight ammo check
-      const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+      const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
       if (!hasAmmo) {
         ctx.log("combat", "Out of ammo — aborting to resupply");
         break;
@@ -1705,7 +1755,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
           }
 
           // Post-kill reload
-          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          const hasAmmo = await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           if (!hasAmmo) {
             ctx.log("combat", "No ammo after kill — aborting to resupply");
             break;
@@ -1807,7 +1857,7 @@ async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string
         const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
-          await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
           if (won) {
             totalKills++;
@@ -1891,10 +1941,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   }
 
   // Count what we already have in cargo for protected resupply items (so we only top off)
-  const currentAmmo = bot.inventory
-    .filter(i => i.itemId.toLowerCase().includes("ammo") || i.itemId.toLowerCase().includes("cell_pack") || i.itemId.toLowerCase().includes("plasma"))
-    .reduce((sum, i) => sum + (i.quantity || 0), 0);
-
+  // Note: currentAmmo is total across all types; we calculate per-type below
   const currentRepair = bot.inventory
     .filter(i => i.itemId.toLowerCase().includes("repair_kit"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
@@ -1907,12 +1954,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     .filter(i => i.itemId.toLowerCase().includes("shield_charge"))
     .reduce((sum, i) => sum + (i.quantity || 0), 0);
 
-  // Check if we already have ammo in cargo (user may have placed it manually)
-  const existingAmmo = bot.inventory.find(i =>
-    i.itemId.includes("ammo") || i.itemId.includes("_ammo")
-  );
-
-  // 1. Ammo resupply
+  // 1. Ammo resupply - handle ALL ammo types needed by all weapons
   const weapons = await getWeaponModules(ctx);
   ctx.log("debug", `Hunter resupply: detected ${weapons.length} weapons`);
 
@@ -1920,90 +1962,84 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
     ctx.log("debug", `  Weapon: ${w.name} | ammoType: ${w.ammoType || 'none'} | maxAmmo: ${w.maxAmmo}`);
   }
 
-  let ammoToGet = Math.max(0, 30 - currentAmmo);
-
-  if (weapons.length > 0) {
-    const maxAmmo = Math.max(...weapons.map(w => w.maxAmmo || 0));
-    if (maxAmmo > 50) {
-      ammoToGet = Math.max(0, 20 - currentAmmo);
-    } else if (maxAmmo > 0) {
-      ammoToGet = Math.max(0, 40 - currentAmmo);
+  // Collect all unique ammo types needed by weapons
+  const weaponAmmoTypes = new Set<string>();
+  for (const w of weapons) {
+    if (w.ammoType && w.ammoType !== "none") {
+      weaponAmmoTypes.add(w.ammoType);
     }
   }
 
-  let chosenAmmoId: string | null = null;
-
-  if (existingAmmo) {
-    chosenAmmoId = existingAmmo.itemId;
-    ctx.log("trade", `Using existing ammo type from cargo: ${chosenAmmoId}`);
-  } else if (weapons.length > 0) {
-    // Find the first weapon that actually uses ammo
-    const ammoWeapon = weapons.find(w => w.ammoType && w.ammoType !== "none");
-    
-    if (ammoWeapon) {
-      const ammoIndex = catalogStore.getAmmoTypeIndex();
-      const ammoType = ammoWeapon.ammoType!;
-
-      // Prefer the ammo that is currently loaded in the weapon, if available
-      let possibleAmmo = ammoIndex[ammoType] || [];
-
-      if (ammoWeapon.loadedAmmoId && possibleAmmo.includes(ammoWeapon.loadedAmmoId)) {
-        // Move the currently loaded ammo to the front so we prefer it
-        possibleAmmo = [
-          ammoWeapon.loadedAmmoId,
-          ...possibleAmmo.filter(id => id !== ammoWeapon.loadedAmmoId)
-        ];
-        ctx.log("debug", `Preferring currently loaded ammo: ${ammoWeapon.loadedAmmoId}`);
-      }
-
-      ctx.log("debug", `Catalog ammo options for ${ammoType}: ${possibleAmmo.join(", ") || "none"}`);
-
-      if (possibleAmmo.length > 0) {
-        chosenAmmoId = possibleAmmo[0];
-      }
-    } else {
-      ctx.log("debug", "No weapons with ammoType found");
-    }
-  }
-
-  if (chosenAmmoId) {
-    // Try the selected ammo, then fall back through other catalog options if it fails
-    const ammoOptions = [chosenAmmoId];
+  let gotAnyAmmo = false;
+  for (const ammoType of weaponAmmoTypes) {
     const ammoIndex = catalogStore.getAmmoTypeIndex();
-    const ammoWeapon = weapons.find(w => w.ammoType && w.ammoType !== "none");
-    if (ammoWeapon) {
-      const ammoType = ammoWeapon.ammoType!;
-      const extra = ammoIndex[ammoType] || [];
-      for (const opt of extra) {
-        if (!ammoOptions.includes(opt)) ammoOptions.push(opt);
-      }
+    const possibleAmmo = ammoIndex[ammoType] || [];
+    ctx.log("debug", `Catalog ammo options for ${ammoType}: ${possibleAmmo.join(", ") || "none"}`);
+
+    if (possibleAmmo.length === 0) {
+      ctx.log("trade", `No catalog options for ${ammoType} — skipping`);
+      continue;
     }
 
-    let gotAmmo = false;
-    for (const ammoId of ammoOptions) {
-      const ammoSize = getItemSize(ammoId);
-      const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
-      if (actualQty <= 0) continue;
+    // Calculate current ammo count for this specific type
+    const currentAmmoForType = bot.inventory
+      .filter(i => possibleAmmo.includes(i.itemId))
+      .reduce((sum, i) => sum + (i.quantity || 0), 0);
 
-      const wResp = await bot.exec("storage", {
-        action: "withdraw",
-        target: "faction",
-        item_id: ammoId,
-        quantity: actualQty
-      });
-      if (!wResp.error) {
-        ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
-        freeSpace -= actualQty * ammoSize;
-        gotAmmo = true;
-        break;
-      }
+    // Calculate ammo needed for this type
+    const weaponsUsingThisAmmo = weapons.filter(w => w.ammoType === ammoType);
+    const maxAmmoForType = weaponsUsingThisAmmo.length > 0
+      ? Math.max(...weaponsUsingThisAmmo.map(w => w.maxAmmo || 0))
+      : 0;
+    let ammoToGet: number;
+    if (maxAmmoForType > 50) {
+      ammoToGet = Math.max(0, 20 - currentAmmoForType);
+    } else if (maxAmmoForType > 0) {
+      ammoToGet = Math.max(0, 40 - currentAmmoForType);
+    } else {
+      ammoToGet = Math.max(0, 30 - currentAmmoForType);
     }
 
-    if (!gotAmmo) {
-      ctx.log("trade", `Ammo resupply: relying on faction storage (tried ${ammoOptions.length} options)`);
+    // Prefer currently loaded ammo if available
+    let chosenAmmoId: string | null = null;
+    const loadedAmmo = weaponsUsingThisAmmo.find(w => w.loadedAmmoId && possibleAmmo.includes(w.loadedAmmoId));
+    if (loadedAmmo && loadedAmmo.loadedAmmoId) {
+      chosenAmmoId = loadedAmmo.loadedAmmoId;
+      ctx.log("debug", `Preferring currently loaded ammo: ${chosenAmmoId}`);
+    } else {
+      chosenAmmoId = possibleAmmo[0];
     }
-  } else {
-    ctx.log("trade", "No suitable ammo found for equipped weapons — skipping ammo resupply");
+
+    if (!chosenAmmoId) {
+      ctx.log("trade", `No suitable ammo found for ${ammoType} — skipping`);
+      continue;
+    }
+
+    // Try to withdraw the chosen ammo
+    const ammoSize = getItemSize(chosenAmmoId);
+    const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
+    if (actualQty <= 0) {
+      ctx.log("trade", `Not enough cargo space for ${ammoType} ammo — skipping`);
+      continue;
+    }
+
+    const wResp = await bot.exec("storage", {
+      action: "withdraw",
+      target: "faction",
+      item_id: chosenAmmoId,
+      quantity: actualQty
+    });
+    if (!wResp.error) {
+      ctx.log("trade", `Withdrew ${actualQty} ${chosenAmmoId} from faction storage`);
+      freeSpace -= actualQty * ammoSize;
+      gotAnyAmmo = true;
+    } else {
+      ctx.log("trade", `Failed to withdraw ${chosenAmmoId} for ${ammoType}: ${wResp.error.message}`);
+    }
+  }
+
+  if (!gotAnyAmmo) {
+    ctx.log("trade", "No ammo withdrawn — skipping ammo resupply");
   }
 
   const hs = getHunterSettings(bot.username);
@@ -2094,7 +2130,6 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
   await bot.refreshStatus();
   let totalKills = 0;
-  let profileIndex = 0;
 
   const all = readSettings();
   const h = (all.hunter || {}) as any;
@@ -2107,8 +2142,13 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
     return;
   }
 
+  const botSeed = bot.username.split("").reduce((a, c) => a + c.charCodeAt(0), 0);
+  const random = seededRandom(botSeed);
+  const initialProfileIndex = Math.floor(random() * hunterPatrols.length);
+
   let nextShuffle: number[] | null = null;
   let shuffleIndex = 0;
+  let profileIndex = initialProfileIndex;
 
   while (bot.state === "running") {
     const cycleMode = settings.patrolCycleMode || "sequential";
@@ -2116,14 +2156,14 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
 
     if (cycleMode === "random") {
       if (!nextShuffle || shuffleIndex >= nextShuffle.length) {
-        nextShuffle = [...Array(hunterPatrols.length).keys()].sort(() => Math.random() - 0.5);
+        nextShuffle = [...Array(hunterPatrols.length).keys()].sort(() => random() - 0.5);
         shuffleIndex = 0;
       }
       targetIndex = nextShuffle[shuffleIndex];
       shuffleIndex++;
     } else {
-      targetIndex = profileIndex % hunterPatrols.length;
-      profileIndex++;
+      targetIndex = profileIndex;
+      profileIndex = (profileIndex + 1) % hunterPatrols.length;
     }
 
     const profile = hunterPatrols[targetIndex];
@@ -2183,7 +2223,7 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
         const targets = entities.filter(e => isPirateTarget(e, settings.onlyNPCs, settings.maxAttackTier));
         for (const target of targets) {
           await useRepairKits(ctx); // patch hull with kits before fight if deficit >100
-          await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts);
+          await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
           const won = await engageTarget(ctx, target, settings.fleeThreshold, settings.fleeFromTier, settings.minPiratesToFlee, settings.maxAttackTier, undefined, settings.disableScanCommandForPirates, settings.repairThreshold);
           if (won) {
             totalKills++;

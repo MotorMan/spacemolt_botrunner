@@ -1,6 +1,7 @@
 import { debugLogForBot } from "./debug.js";
 import { readFileSync, writeFileSync, existsSync } from "fs";
 import { join } from "path";
+import { onPlayerNameUpdate } from "./client_sync_hooks.js";
 
 const PLAYER_NAMES_FILE = join(process.cwd(), "data", "playerNames.json");
 const FULL_PLAYER_INFO_FILE = join(process.cwd(), "data", "fullPlayerInfo.json");
@@ -329,6 +330,7 @@ export class PlayerNameStore {
       this.fullPlayerInfo.counts.players = Object.keys(this.fullPlayerInfo.players).length;
       this.saveFullPlayerInfo();
       this.save();
+      void onPlayerNameUpdate(name, faction, now);
     }
     return isNew;
   }

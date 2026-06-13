@@ -4,6 +4,78 @@ import { debugLogForBot } from "./debug.js";
 import { SessionManager } from "./session.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
 
+interface QueuedRequest {
+  command: string;
+  payload: Record<string, unknown> | undefined;
+  abortSignal: AbortSignal | undefined;
+  resolve: (value: ApiResponse) => void;
+  reject: (reason: Error) => void;
+}
+
+class SessionRateLimiter {
+  private requestTimestamps: number[] = [];
+  private queue: QueuedRequest[] = [];
+  private processing = false;
+  private readonly maxRequestsPerSecond = 5;
+  private readonly windowMs = 1000;
+
+  canMakeRequest(): boolean {
+    const now = Date.now();
+    this.requestTimestamps = this.requestTimestamps.filter(t => now - t < this.windowMs);
+    return this.requestTimestamps.length < this.maxRequestsPerSecond;
+  }
+
+  recordRequest(): void {
+    this.requestTimestamps.push(Date.now());
+  }
+
+  async enqueue(
+    command: string,
+    payload: Record<string, unknown> | undefined,
+    abortSignal: AbortSignal | undefined,
+    makeRequest: (cmd: string, p: Record<string, unknown> | undefined, sig: AbortSignal | undefined) => Promise<ApiResponse>
+  ): Promise<ApiResponse> {
+    return new Promise((resolve, reject) => {
+      const request: QueuedRequest = { command, payload, abortSignal, resolve, reject };
+      this.queue.push(request);
+      this.processQueue(makeRequest);
+    });
+  }
+
+  private async processQueue(
+    makeRequest: (cmd: string, p: Record<string, unknown> | undefined, sig: AbortSignal | undefined) => Promise<ApiResponse>
+  ): Promise<void> {
+    if (this.processing) return;
+    this.processing = true;
+
+    while (this.queue.length > 0) {
+      while (!this.canMakeRequest() && this.queue.length > 0) {
+        const waitTime = this.windowMs - (Date.now() - (this.requestTimestamps[0] || 0));
+        if (waitTime > 0) {
+          await sleep(Math.min(waitTime, 100));
+        }
+      }
+
+      const request = this.queue.shift();
+      if (!request) break;
+
+      try {
+        this.recordRequest();
+        const result = await makeRequest(request.command, request.payload, request.abortSignal);
+        request.resolve(result);
+      } catch (err) {
+        request.reject(err instanceof Error ? err : new Error(String(err)));
+      }
+    }
+
+    this.processing = false;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export interface ApiSession {
   id: string;
   playerId?: string;
@@ -19,7 +91,7 @@ export interface ApiResponse {
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
-const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-6-2-26-Cow-Version";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-6-5-26-flood-protected-Version";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;
@@ -294,6 +366,7 @@ const COMMAND_ACTION_MAP: Record<string, string> = {
    'sell_wreck': 'sell',
    'scrap_wreck': 'scrap',
    'release_tow': 'release',
+   'buy_insurance': 'insure',
 };
 
 // Commands that use payload.action for the action (like facility and battle)
@@ -341,7 +414,6 @@ const COMMAND_TTL: Record<string, number> = {
   get_nearby: 10_000, //1 tick! must always know who is nearby!
   get_poi: 10_000, //doesn't need to be 30s
   get_base: 120_000,
-  get_skills: 30_000, //doesn't need to be 2 min.
   get_missions: 60_000,
   view_storage: 30_000,
   view_faction_storage: 120_000,
@@ -352,10 +424,12 @@ const COMMAND_TTL: Record<string, number> = {
   view_orders: 30_000,
   estimate_purchase: 30_000,
   get_wrecks: 10_000, //doesn't need to be 15.
+  get_notifications: 5_000, //throttled to once per tick (10s)
   catalog: 3600_000, //only really needs to be once per client restart, it NEVER changes while running.
+  get_map: 3600_000, //cached once per session, invalidated on server version change or client restart.
 };
 
-const INV_STATUS   = ["get_status", "get_player", "get_queue", "get_skills"];
+const INV_STATUS   = ["get_status", "get_player", "get_queue"];
 const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey_system", "find_route"];
 const INV_CARGO    = ["get_cargo"];
 const INV_SHIP     = ["get_ship"];
@@ -397,6 +471,7 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   attack: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
   battle: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
   catalog: [],
+  get_map: [],
 };
 
 export class SpaceMoltAPI {
@@ -414,9 +489,14 @@ export class SpaceMoltAPI {
   private _totalBytesIn = 0;
   private _totalBytesOut = 0;
   private _bandwidthStartTime = Date.now();
+  private _rateLimiter = new SessionRateLimiter();
+  private _isGameServer: boolean;
+  private _rateLimitingDisabled = false;
+  private _serverVersion: string | null = null;
 
   constructor(baseUrl?: string) {
     this.baseUrl = baseUrl || process.env.SPACEMOLT_URL || DEFAULT_BASE_URL;
+    this._isGameServer = this.baseUrl === DEFAULT_BASE_URL;
   }
 
   setBotName(name: string): void {
@@ -429,6 +509,10 @@ export class SpaceMoltAPI {
 
   setSessionManager(sessionManager: SessionManager): void {
     this._sessionManager = sessionManager;
+  }
+
+  setRateLimitingDisabled(disabled: boolean): void {
+    this._rateLimitingDisabled = disabled;
   }
 
   restoreSessionToken(): boolean {
@@ -477,12 +561,40 @@ export class SpaceMoltAPI {
     return { inKBps, outKBps };
   }
 
+  getCachedResponse(cacheKey: string): ApiResponse | null {
+    return this._cache.get(cacheKey);
+  }
+
+  private async getServerVersion(): Promise<string> {
+    if (this._serverVersion) return this._serverVersion;
+    try {
+      const resp = await this.doRequest("get_version");
+      if (!resp.error && resp.result) {
+        this._serverVersion = String(resp.result);
+        return this._serverVersion;
+      }
+    } catch {}
+    return "unknown";
+  }
+
+  private async invalidateVersionCaches(): Promise<void> {
+    const version = await this.getServerVersion();
+    if (version !== this._serverVersion) {
+      this._serverVersion = version;
+      this._cache.invalidate(["catalog:", "get_map:"]);
+    }
+  }
+
   async execute(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
     debugLogForBot(botName, "api:execute", `${botName} > ${command}`, payload);
 
     const cacheTtl = COMMAND_TTL[command];
-    const cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
+    let cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
+    if (command === "catalog" || command === "get_map") {
+      const version = this._serverVersion || await this.getServerVersion();
+      cacheKey = `${command}:${version}:${JSON.stringify(payload ?? {})}`;
+    }
     if (cacheTtl !== undefined) {
       const cached = this._cache.get(cacheKey);
       if (cached) return cached;
@@ -520,6 +632,25 @@ export class SpaceMoltAPI {
         log("wait", `Rate limited — sleeping ${secs}s... (retry ${this._rateLimitRetries}/5)`);
         await sleep(Math.ceil(secs * 1000));
         return this.execute(command, payload);
+      }
+
+      if (!resp.error.message || resp.error.message === "undefined" || resp.error.message === null) {
+        debugLogForBot(botName, "api:execute", `${botName} detected undefined/null error message for ${command}`);
+        massDisconnectDetector.trackSessionLoss(botName);
+        this.session = null;
+        return { error: { code: "session_invalid", message: "Session invalidated (undefined error message)" }, result: undefined, notifications: [] };
+      }
+
+      if (code === "malformed_response") {
+        debugLogForBot(botName, "api:execute", `${botName} detected malformed response for ${command}`);
+        massDisconnectDetector.trackSessionLoss(botName);
+        this.session = null;
+        return { error: { code: "session_invalid", message: "Session invalidated (malformed response)" }, result: undefined, notifications: [] };
+      }
+
+      // Pass through http_error responses - they will be handled by bot.ts retry logic
+      if (code === "http_error") {
+        return resp;
       }
 
       if (code === "session_invalid" || code === "session_expired" || code === "not_authenticated") {
@@ -587,6 +718,13 @@ export class SpaceMoltAPI {
       }
       const toInvalidate = MUTATION_INVALIDATIONS[command];
       if (toInvalidate) this._cache.invalidate(toInvalidate);
+      if (command === "get_version" && resp.result) {
+        const newVersion = String(resp.result);
+        if (newVersion !== this._serverVersion) {
+          this._serverVersion = newVersion;
+          this._cache.invalidate(["catalog:", "get_map:"]);
+        }
+      }
     }
 
     return resp;
@@ -717,6 +855,13 @@ export class SpaceMoltAPI {
   }
 
   private async doRequest(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
+    if (this._isGameServer && !this._rateLimitingDisabled) {
+      return this._rateLimiter.enqueue(command, payload, abortSignal, (cmd, p, sig) => this.makeHttpRequest(cmd, p, sig));
+    }
+    return this.makeHttpRequest(command, payload, abortSignal);
+  }
+
+  private async makeHttpRequest(command: string, payload: Record<string, unknown> | undefined, abortSignal: AbortSignal | undefined): Promise<ApiResponse> {
     const tool = COMMAND_TOOL_MAP[command] || 'spacemolt';
     let url: string;
     let body: Record<string, unknown> = payload ? { ...payload } : {};
@@ -769,6 +914,42 @@ export class SpaceMoltAPI {
       }
     }
 
+    // Remove invalid parameters for find_route (server now only accepts target_system)
+    // But also accept target as alias for station IDs
+    if (command === 'find_route') {
+      delete body.target_poi;
+      // Translate target -> target_system for find_route
+      if (body.target !== undefined && body.target_system === undefined) {
+        body.target_system = body.target;
+        delete body.target;
+      }
+    }
+
+    // Translate target_system -> id for jump (only for string system IDs, not numeric pathfinder bearings)
+    // The server expects target_system to be a number for pathfinder jumps
+    if (command === 'jump' && typeof body.target_system === 'string') {
+      body.id = body.target_system;
+      delete body.target_system;
+    }
+
+    // Translate target -> id for jump (alias)
+    if (command === 'jump' && body.target !== undefined && body.id === undefined) {
+      body.id = body.target;
+      delete body.target;
+    }
+
+    // Translate target_poi -> id for jump (alias for wormhole jumps)
+    if (command === 'jump' && body.target_poi !== undefined && body.id === undefined) {
+      body.id = body.target_poi;
+      delete body.target_poi;
+    }
+
+    // Translate target_poi -> id for travel
+    if (command === 'travel' && body.target_poi !== undefined) {
+      body.id = body.target_poi;
+      delete body.target_poi;
+    }
+
     if (tool === 'spacemolt_catalog') {
       url = `${this.baseUrl}/${tool}`;
     } else if (COMMANDS_WITH_PAYLOAD_ACTION.has(command) && payload?.action) {
@@ -814,6 +995,13 @@ export class SpaceMoltAPI {
     try {
       const text = await resp.text();
       this._totalBytesIn += Buffer.byteLength(text, 'utf8');
+      
+      if (text.trim() === "undefined" || text.trim() === "") {
+        return {
+          error: { code: "malformed_response", message: "Server returned empty/undefined response" },
+        };
+      }
+      
       const data = JSON.parse(text) as ApiResponse & { structuredContent?: unknown };
       if (data.structuredContent !== undefined) {
         data.result = data.structuredContent;
@@ -834,8 +1022,4 @@ export class SpaceMoltAPI {
       };
     }
   }
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

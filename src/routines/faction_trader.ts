@@ -61,6 +61,16 @@ interface TradeItemConfig {
   soldQty?: number;     // Track quantity sold (persisted in settings)
 }
 
+interface CategoryTradeConfig {
+  category: string;
+  sellPercentOfAvailable: number;  // Percentage of available quantity to sell (0-100)
+  pricePercentOfBestBuy: number; // Percentage of best buy price for min sell (25 = 25%)
+}
+
+const DEFAULT_CATEGORY_SELL_PERCENT = 50;
+const DEFAULT_CATEGORY_PRICE_PERCENT = 25;
+const FACTION_TRADER_DEFAULT_MIN_PRICE = 969696;
+
 function getFactionTraderSettings(username?: string): {
   homeSystem: string;
   homeStation: string;
@@ -70,6 +80,7 @@ function getFactionTraderSettings(username?: string): {
   minSellPrice: number;
   tradeItems: TradeItemConfig[];
   stationPriority: boolean;
+  categoryTrade: CategoryTradeConfig[];
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -98,6 +109,13 @@ function getFactionTraderSettings(username?: string): {
     }
   }
 
+  // Load category trade configs with defaults
+  const categoryTrade: CategoryTradeConfig[] = (Array.isArray(t.categoryTrade) ? t.categoryTrade : []).map((c: any) => ({
+    category: c.category || '',
+    sellPercentOfAvailable: c.sellPercentOfAvailable ?? DEFAULT_CATEGORY_SELL_PERCENT,
+    pricePercentOfBestBuy: c.pricePercentOfBestBuy ?? DEFAULT_CATEGORY_PRICE_PERCENT,
+  })).filter((c: CategoryTradeConfig) => c.category);
+
   return {
     // Use faction storage station from general settings as home, fallback to faction_trader-specific
     homeSystem: (botOverrides.homeSystem as string)
@@ -112,6 +130,7 @@ function getFactionTraderSettings(username?: string): {
     minSellPrice: (t.minSellPrice as number) || 0,
     tradeItems,
     stationPriority: (botOverrides.stationPriority as boolean) || false,
+    categoryTrade,
   };
 }
 
@@ -446,6 +465,47 @@ function estimateFuelCost(fromSystem: string, toSystem: string, costPerJump: num
   return { jumps, cost: jumps * costPerJump };
 }
 
+/** Get items from faction storage filtered by categories. */
+function getItemsByCategories(
+  storage: Array<{ itemId: string; name: string; quantity: number }>,
+  categories: string[],
+): Array<{ itemId: string; name: string; quantity: number }> {
+  if (categories.length === 0) return storage;
+  
+  const result: Array<{ itemId: string; name: string; quantity: number }> = [];
+  const categorySet = new Set(categories.map(c => c.toLowerCase()));
+  
+  for (const item of storage) {
+    const catalogItem = catalogStore.getItem(item.itemId);
+    const itemCategory = (catalogItem?.category as string) || '';
+    if (categorySet.has(itemCategory.toLowerCase())) {
+      result.push(item);
+    }
+  }
+  
+  return result;
+}
+
+/** Find the best buy price for an item across all markets. */
+function findBestBuyForItem(itemId: string): { price: number; systemId: string; poiId: string; poiName: string; quantity: number } | null {
+  const allBuys = mapStore.getAllBuyDemand();
+  const buyers = allBuys
+    .filter(b => b.itemId === itemId && b.price > 0)
+    .sort((a, b) => b.price - a.price);
+  
+  if (buyers.length === 0) return null;
+  return buyers[0];
+}
+
+/** Calculate min sell price for category-based items. */
+function calculateCategoryMinSellPrice(itemId: string, pricePercent: number): number {
+  const bestBuy = findBestBuyForItem(itemId);
+  if (!bestBuy || bestBuy.price <= 0) {
+    return FACTION_TRADER_DEFAULT_MIN_PRICE;
+  }
+  return Math.floor(bestBuy.price * (pricePercent / 100));
+}
+
 /** Find sell routes for items currently in faction storage. Factors round-trip fuel cost. */
 function findFactionSellRoutes(
   ctx: RoutineContext,
@@ -467,24 +527,79 @@ function findFactionSellRoutes(
   const homeSystem = settings.homeSystem || currentSystem;
   const costPerJump = settings.fuelCostPerJump;
 
+  // Collect items to process: explicit trade items + category-based items
+  const itemsToProcess: Array<{ item: typeof storage[0]; source: 'explicit' | 'category'; categoryConfig?: CategoryTradeConfig }> = [];
+  const processedItemIds = new Set<string>();
+
+  // First, add explicit trade items
   for (const item of storage) {
     const lower = item.itemId.toLowerCase();
     if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
     if (item.quantity <= 0) continue;
 
-    // Filter by allowed items if configured (case-insensitive match)
+    // Check if in explicit trade items list
     if (settings.tradeItems.length > 0) {
       const itemIdLower = item.itemId.toLowerCase();
       const match = settings.tradeItems.some(t => t.itemId.toLowerCase() === itemIdLower);
-      if (!match) continue;
+      if (match) {
+        itemsToProcess.push({ item, source: 'explicit' });
+        processedItemIds.add(item.itemId);
+        continue;
+      }
     }
+  }
 
+  // Then, add category-based items (items not already in explicit list)
+  if (settings.categoryTrade && settings.categoryTrade.length > 0) {
+    for (const catConfig of settings.categoryTrade) {
+      for (const item of storage) {
+        const lower = item.itemId.toLowerCase();
+        if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+        if (item.quantity <= 0) continue;
+        if (processedItemIds.has(item.itemId)) continue;
+
+        const catalogItem = catalogStore.getItem(item.itemId);
+        const itemCategory = (catalogItem?.category as string) || '';
+        if (itemCategory.toLowerCase() === catConfig.category.toLowerCase()) {
+          itemsToProcess.push({ item, source: 'category', categoryConfig: catConfig });
+          processedItemIds.add(item.itemId);
+        }
+      }
+    }
+  }
+
+  // Now process all collected items
+  for (const { item, source, categoryConfig } of itemsToProcess) {
     // Get per-item settings (case-insensitive match)
     const itemIdLower = item.itemId.toLowerCase();
     const itemConfig = settings.tradeItems.find(t => t.itemId.toLowerCase() === itemIdLower);
-    const itemMinSellPrice = (itemConfig && itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
-    const itemMaxSellQty = itemConfig?.maxSellQty || 0;
-    const itemSoldQty = itemConfig?.soldQty || 0;
+    
+    let itemMinSellPrice: number;
+    let itemMaxSellQty: number;
+    let itemSoldQty: number;
+    
+    if (source === 'explicit' && itemConfig) {
+      // Explicit item settings take precedence
+      itemMinSellPrice = (itemConfig.minSellPrice > 0) ? itemConfig.minSellPrice : settings.minSellPrice;
+      itemMaxSellQty = itemConfig.maxSellQty || 0;
+      itemSoldQty = itemConfig.soldQty || 0;
+    } else if (source === 'category' && categoryConfig) {
+      // Category-based: calculate quantity and price from category config
+      const sellPercent = categoryConfig.sellPercentOfAvailable;
+      itemMaxSellQty = Math.floor(item.quantity * (sellPercent / 100));
+      itemSoldQty = 0; // Category items don't track sold quantity
+      
+      // Calculate min sell price from best buy price
+      itemMinSellPrice = calculateCategoryMinSellPrice(item.itemId, categoryConfig.pricePercentOfBestBuy);
+      
+      ctx.log("trade", `Category ${categoryConfig.category}: ${item.quantity}x ${item.name}, selling ${itemMaxSellQty} (${sellPercent}%), min price ${itemMinSellPrice}cr`);
+    } else {
+      // Fallback to defaults
+      itemMinSellPrice = settings.minSellPrice;
+      itemMaxSellQty = 0;
+      itemSoldQty = 0;
+    }
+    
     const remainingSellQty = itemMaxSellQty > 0 ? Math.max(0, itemMaxSellQty - itemSoldQty) : item.quantity;
 
     // Skip if we've already sold the max quantity

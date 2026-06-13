@@ -167,7 +167,7 @@ async function withdrawCreditsForTrade(
       //const wResp = await bot.exec("withdraw_credits", { amount: withdrawAmount });
       const wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: withdrawAmount }); //fixed by human!
       if (!wResp.error) {
-        await bot.refreshStatus();
+        await bot.refreshLocation();
         ctx.log("trade", `Withdrew ${withdrawAmount}cr from station storage for trade (now ${bot.credits}cr)`);
         return true;
       }
@@ -197,7 +197,7 @@ async function withdrawCreditsForTrade(
         //const wResp = await bot.exec("faction_withdraw_credits", { amount: withdrawAmount });
         const wResp = await bot.exec("storage", { action: 'withdraw', target: 'faction', item_id: 'credits', quantity: withdrawAmount }); //fixed by human!
         if (!wResp.error) {
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           ctx.log("trade", `Withdrew ${withdrawAmount}cr from faction storage for trade (now ${bot.credits}cr)`);
           return true;
         } else {
@@ -1090,7 +1090,7 @@ async function tryMissions(ctx: RoutineContext): Promise<void> {
         const earned = sanitizeCredits((cr.credits_earned as number) ?? 0);
         ctx.log("trade", `Mission complete! +${earned}cr`);
         activeMissionCount--;
-        await bot.refreshStatus();
+        await bot.refreshLocation();
       }
     }
   }
@@ -1146,7 +1146,7 @@ async function tryMissions(ctx: RoutineContext): Promise<void> {
 export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const startSystem = bot.system;
 
   // Battle state tracking for continuous flee re-issuing
@@ -1495,7 +1495,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         
         if (soldHere.length > 0) {
           await bot.refreshCargo();
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           const cargoSellRevenue = Math.max(0, bot.credits - cargoSellCreditsBefore);
           ctx.log("trade", `Sold cargo: ${soldHere.join(", ")} — earned ${cargoSellRevenue}cr`);
           extraRevenue += cargoSellRevenue;
@@ -1593,7 +1593,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     
     // ── Fuel + hull check + mods ──
     yield "maintenance";
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelPct < settings.refuelThreshold) {
       const fueled = await ensureFueled(ctx, settings.refuelThreshold);
@@ -1625,12 +1625,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const modProfile = getModProfile("trader");
     if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
 
-    await bot.refreshStatus();
+    await bot.refreshLocation();
 
     // ── Priority 2: Sell station storage items at current market ── // this should be disabled! we should not sell items from storage at UNKNOWN prices, just take it home!!!! this WILL BE RESPONSABLE for selling a 500k item at 1 credit!!!!!!!!!!!!!!!
     if (bot.docked) {
       // Sell station storage items that this market buys
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       const storageSellCredits = bot.credits;
       await bot.refreshStorage();
       if (bot.storage.length > 0) {
@@ -1654,7 +1654,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             if (!buyableHere.has(item.itemId)) continue;
 
             // Withdraw and sell
-            await bot.refreshStatus();
+            await bot.refreshLocation();
             const freeSpace = getFreeSpace(bot);
             if (freeSpace <= 0) break;
             const qty = Math.min(item.quantity, maxItemsForCargo(freeSpace, item.itemId));
@@ -1669,7 +1669,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
               await bot.exec("storage", { action: 'deposit', target: 'storage', item_id: item.itemId, quantity: qty }); //fixed by human!
             }
           }
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           const storageRevenue = Math.max(0, bot.credits - storageSellCredits);
           if (soldFromStorage.length > 0) {
             ctx.log("trade", `Sold from station storage: ${soldFromStorage.join(", ")} — earned ${storageRevenue}cr`);
@@ -1689,7 +1689,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     let marketRoutes: TradeRoute[] = [];
 
     if (!recoveredSessionHandled) {
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       await bot.refreshCargo();
       // Subtract fuel cell weight from cargo capacity so route planning doesn't over-buy
       let fuelCellWeight = 0;
@@ -2108,7 +2108,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
       // Ensure we have enough fuel cells for the route + return home (exact calc)
       await bot.refreshCargo();
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       let fuelInCargo = 0;
       for (const item of bot.inventory) {
         const lower = item.itemId.toLowerCase();
@@ -2151,7 +2151,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       const alreadyHave = existingInCargo?.quantity ?? 0;
 
       // Determine buy quantity
-      await bot.refreshStatus();
+      await bot.refreshCargo();
       const freeSpace = getFreeSpace(bot);
       let qty = Math.min(candidate.buyQty - alreadyHave, maxItemsForCargo(freeSpace, candidate.itemId));
       if (settings.maxCargoValue > 0) {
@@ -2241,7 +2241,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         ctx.log("trade", `Already have ${alreadyHave}x ${candidate.itemName} in cargo — skipping buy`);
       }
 
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       await bot.refreshCargo();
       const actualInCargo = bot.inventory.find(i => i.itemId === candidate.itemId)?.quantity ?? 0;
       const actualReceived = Math.max(0, actualInCargo - alreadyHave);
@@ -2323,7 +2323,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
           const withdrawnItems: string[] = [];
           for (const si of storageToSell) {
             // Re-check actual free space each iteration
-            await bot.refreshStatus();
+            await bot.refreshCargo();
             const freeSpace = getFreeSpace(bot);
             if (freeSpace <= 0) break;
             const wQty = Math.min(si.qty, maxItemsForCargo(freeSpace, si.itemId));
@@ -2383,7 +2383,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("error", "Cannot refuel for delivery — selling locally instead");
       await ensureDocked(ctx);
       await bot.exec("sell", { item_id: route.itemId, quantity: buyQty });
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       continue;
     }
 
@@ -3056,7 +3056,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Check for next trade before considering excess credit deposit ──
     yield "seek_next_trade";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     await bot.refreshCargo();
     let nextFuelWeight = 0;
     for (const item of bot.inventory) {
@@ -3074,7 +3074,6 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     // Only deposit if:
     // 1. We're currently at the home station (convenient opportunity), OR
     // 2. There are no more profitable trades to do
-    await bot.refreshStatus();
     const hasProfitableTrades = nextRoutes.length > 0;
     const isAtHomeStation = homeSystem && bot.system === homeSystem && bot.docked;
     const noTradesAndHasExcess = !hasProfitableTrades && bot.credits > TRADER_DEPOSIT_THRESHOLD;
@@ -3140,7 +3139,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Maintenance ──
     yield "post_trade_maintenance";
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const postFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (postFuelPct < settings.refuelThreshold) {
       const fueled2 = await ensureFueled(ctx, settings.refuelThreshold);
@@ -3217,7 +3216,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const endFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Credits: ${bot.credits} | Fuel: ${endFuel}% | Cargo: ${bot.cargo}/${bot.cargoMax}`);
   }

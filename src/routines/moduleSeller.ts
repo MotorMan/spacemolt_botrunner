@@ -134,7 +134,7 @@ function findBestSellStation(itemId: string): BestStation | null {
 export const moduleSellerRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
 
   const battleState: BattleState = {
     inBattle: false,

@@ -1,8 +1,9 @@
-import { log, logError } from "./ui.js";
+import { log } from "./ui.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { debugLogForBot } from "./debug.js";
 import { SessionManager } from "./session.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
+import * as zstd from "zstd-codec";
 
 interface QueuedRequest {
   command: string;
@@ -408,6 +409,7 @@ class ResponseCache {
 
 const COMMAND_TTL: Record<string, number> = {
   get_status: 120_000, //doesn't need to be 15s.
+  get_skills: 60_000,
   get_system: 30_000,
   get_ship: 60_000,
   get_cargo: 10_000,
@@ -435,17 +437,18 @@ const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey
 const INV_CARGO    = ["get_cargo"];
 const INV_SHIP     = ["get_ship"];
 const INV_MISSIONS = ["get_missions"];
+const INV_SKILLS   = ["get_skills"];
 const INV_STORAGE  = ["view_storage"];
 const INV_MARKET   = ["view_market", "view_orders"];
 
 const MUTATION_INVALIDATIONS: Record<string, string[]> = {
-  travel: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
-  jump: [...INV_STATUS, ...INV_LOCATION],
+  travel: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION, ...INV_SKILLS],
+  jump: [...INV_STATUS, ...INV_LOCATION, ...INV_SKILLS],
   dock: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION],
   switch_ship: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION, ...INV_CARGO, ...INV_SHIP],
   reload: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION, ...INV_CARGO, ...INV_SHIP],
   undock: INV_STATUS,
-  mine: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
+  mine: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION, ...INV_SKILLS],
   sell: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET, ...INV_STORAGE, ...INV_MISSIONS],
   buy: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET, ...INV_STORAGE, ...INV_MISSIONS],
   jettison: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION, ...INV_STORAGE],
@@ -469,8 +472,8 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   abandon_mission: [...INV_STATUS, ...INV_MISSIONS, ...INV_CARGO, ...INV_STORAGE],
   decline_mission: [...INV_STATUS, ...INV_MISSIONS, ...INV_CARGO, ...INV_STORAGE],
   cloak: INV_STATUS,
-  attack: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
-  battle: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
+  attack: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_SKILLS],
+  battle: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_SKILLS],
   catalog: [],
   get_map: [],
 };
@@ -987,22 +990,18 @@ export class SpaceMoltAPI {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       "User-Agent": USER_AGENT,
+      "Accept-Encoding": "zstd",
     };
     if (this.session) {
       headers["X-Session-Id"] = this.session.id;
     }
 
-    let requestBody: string | undefined;
-    let outBytes = 0;
-    if (body) {
-      requestBody = JSON.stringify(body);
-      outBytes = Buffer.byteLength(requestBody, 'utf8');
-    }
+    const outBytes = outgoingBody ? Buffer.byteLength(outgoingBody, 'utf8') : 0;
 
     const resp = await fetch(url, {
       method: "POST",
       headers,
-      body: requestBody,
+      body: outgoingBody,
       signal: abortSignal,
     });
 
@@ -1013,7 +1012,17 @@ export class SpaceMoltAPI {
     }
 
     try {
-      const text = await resp.text();
+      const contentType = resp.headers.get("content-encoding");
+      let text: string;
+      
+      if (contentType === "zstd") {
+        const compressed = await resp.arrayBuffer();
+        const decompressed = zstd.decompress(new Uint8Array(compressed));
+        text = Buffer.from(decompressed).toString("utf8");
+      } else {
+        text = await resp.text();
+      }
+      
       const inBytes = Buffer.byteLength(text, 'utf8');
       this.recordBytes(inBytes, outBytes);
       

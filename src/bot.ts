@@ -1109,28 +1109,8 @@ docked = false;
       // Fallback: fuel at top level
       if (typeof r.fuel === "number") this.fuel = r.fuel;
 
-      // Extract skills from get_status response (v2 API includes skills)
-      const skillsData = r.skills as Record<string, unknown> | undefined;
-      if (skillsData && typeof skillsData === "object") {
-        this.skillLevels.clear();
-        this.skillXP.clear();
-        this.skillTotalXP.clear();
-        this.skillXpToNext.clear();
-        for (const [skillId, skillVal] of Object.entries(skillsData)) {
-          if (skillVal && typeof skillVal === "object") {
-            const s = skillVal as Record<string, unknown>;
-            const level = (s.level as number) ?? (s.current_level as number) ?? 0;
-            const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
-            const xp = typeof rawXP === "number" ? rawXP : 0;
-            const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number) ?? (s.xp_remaining as number) ?? (s.next_level_xp as number);
-            const totalXP = (s.total_xp as number) ?? (s.total_experience as number) ?? (s.cumulative_xp as number);
-            this.skillLevels.set(skillId, level);
-            this.skillXP.set(skillId, xp);
-            if (xpToNext !== undefined) this.skillXpToNext.set(skillId, xpToNext);
-            if (totalXP !== undefined) this.skillTotalXP.set(skillId, totalXP);
-          }
-        }
-      }
+      // Skills are now tracked incrementally from mutation responses via exec()
+      // Use refreshSkills() for a dedicated skill refresh when needed
     }
 
     // Log position change if system or poi updated
@@ -1157,6 +1137,7 @@ docked = false;
       const location = r.location as Record<string, unknown> | undefined;
       const player = r.player as Record<string, unknown> | undefined;
       const p = location || player || r;
+      this.credits = (player?.credits as number) ?? (p.credits as number) ?? this.credits;
       this.system = (location?.system_id as string) || (location?.system_name as string) || (p.current_system as string) || this.system;
       this.poi = (location?.poi_id as string) || (location?.poi_name as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
       this.docked = location?.docked_at != null
@@ -1239,6 +1220,32 @@ docked = false;
 
   async refreshNearby(): Promise<ApiResponse> {
     return this.api.execute("get_nearby");
+  }
+
+  async refreshSkills(): Promise<ApiResponse> {
+    const resp = await this.api.execute("get_skills");
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      this.skillLevels.clear();
+      this.skillXP.clear();
+      this.skillTotalXP.clear();
+      this.skillXpToNext.clear();
+      for (const [skillId, skillVal] of Object.entries(r)) {
+        if (skillVal && typeof skillVal === "object") {
+          const s = skillVal as Record<string, unknown>;
+          const level = (s.level as number) ?? (s.current_level as number) ?? 0;
+          const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
+          const xp = typeof rawXP === "number" ? rawXP : 0;
+          const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number) ?? (s.xp_remaining as number);
+          const totalXP = (s.total_xp as number) ?? (s.total_experience as number) ?? (s.cumulative_xp as number);
+          this.skillLevels.set(skillId, level);
+          this.skillXP.set(skillId, xp);
+          if (xpToNext !== undefined) this.skillXpToNext.set(skillId, xpToNext);
+          if (totalXP !== undefined) this.skillTotalXP.set(skillId, totalXP);
+        }
+      }
+    }
+    return resp;
   }
 
   /** Parse an item list from API response, handling both item_id and resource_id formats. */

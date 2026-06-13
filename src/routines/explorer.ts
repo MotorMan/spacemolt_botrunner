@@ -290,7 +290,7 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
     if (!completeResp.error) {
       const reward = (mission.reward as number) || (mission.reward_credits as number) || 0;
       ctx.log("trade", `Mission complete: ${(mission.name as string) || missionId}${reward > 0 ? ` (+${reward} credits)` : ""}`);
-      await bot.refreshStatus();
+      await bot.refreshLocation();
     }
   }
 }
@@ -584,7 +584,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Refuel
       yield "startup_refuel";
       await tryRefuel(ctx);
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const startFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       ctx.log("system", `Startup complete — Fuel: ${startFuel}% | Cargo: ${bot.cargo}/${bot.cargoMax}`);
     }
@@ -681,7 +681,8 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Get current system data ──
     yield "scan_system";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
+    await bot.refreshShip();
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Exploring ${bot.system} — ${bot.credits} cr, ${fuelPct}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
 
@@ -736,7 +737,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
           // CRITICAL: Verify actual current system before fleeing
           // During cascade emergency jumps, lastSystem can get out of sync
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           const actualSystemId = bot.system;
           ctx.log("combat", `Verified actual position before flee: system=${actualSystemId}, lastSystem=${lastSystem}`);
 
@@ -904,14 +905,14 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("info", `${bot.system}: ${toVisit.length} to visit, ${skippedCount} already explored`);
     }
 
-    // ── Hull check — repair if <= 40% ──
-    await bot.refreshStatus();
+// ── Hull check — repair if <= 40% ──
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= 40) {
       ctx.log("system", `Hull critical (${hullPct}%) — finding station for repair`);
       const docked = await ensureDocked(ctx);
       if (docked) {
-        await repairShip(ctx);
+         await repairShip(ctx);
       }
     }
 
@@ -925,7 +926,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // If hull repair or refueling moved us to a different system, restart the loop
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     if (bot.system !== systemId) {
       ctx.log("info", `Moved to ${bot.system} during repair/refuel — restarting system scan`);
       continue;
@@ -952,7 +953,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         break;
       }
       // If refueling moved us to a different system, break out to restart
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       if (bot.system !== systemId) {
         ctx.log("info", `Moved to ${bot.system} during refuel — restarting system scan`);
         break;
@@ -1004,8 +1005,8 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             if (destSystemId) mapStore.markExplored(destSystemId, exitPoi);
           }
         }
-        // Refresh status after wormhole jump
-        await bot.refreshStatus();
+        // Refresh location after wormhole jump
+        await bot.refreshLocation();
         continue; // Skip normal POI visit, restart loop in new system
       }
 
@@ -1030,7 +1031,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // ── Check cargo — if full with non-fuel-cell items, return to Sol Central to deposit ──
-      await bot.refreshStatus();
+      await bot.refreshCargoAndStorage();
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
         // Check if cargo is full of only fuel cells (intentional for exploration)
         const cargoResp = await bot.exec("get_cargo");
@@ -1056,10 +1057,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
 
         if (!isOnlyFuelCells) {
-          yield "deposit_cargo";
-          await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
-          // After depositing, we're likely in Sol — break to restart system scan
-          await bot.refreshStatus();
+yield "deposit_cargo";
+           await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+           // After depositing, we're likely in Sol — break to restart system scan
+           await bot.refreshLocation();
           if (bot.system !== systemId) {
             ctx.log("info", `Moved to ${bot.system} after deposit — restarting system scan`);
             break;
@@ -1089,7 +1090,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         yield "return_to_home_fuel_cells";
         const returned = await returnToHomeBaseForFuelCells(ctx);
         if (returned) {
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           ctx.log("info", `Returned to home base — continuing exploration`);
           continue;
         }
@@ -1318,7 +1319,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // Final fuel verify before jumping
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const preJumpFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (preJumpFuel < 25) {
       ctx.log("system", `Fuel too low for jump (${preJumpFuel}%) — refueling first...`);
@@ -1685,7 +1686,7 @@ async function* scanStation(
 
   // Refuel
   yield `refuel_${poi.id}`;
-  await bot.refreshStatus();
+  await bot.refreshShip();
   const stationFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (stationFuel < 90) {
     await tryRefuel(ctx);
@@ -1889,14 +1890,14 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
   ctx.log("system", "Deep Core Scan mode — refreshing known hidden POIs...");
 
   // Initialize path with current system
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   if (path.length === 0 && bot.system) {
     path.push(bot.system);
   }
 
   // ── Startup: dock at local station to clear cargo & refuel ──
   yield "startup_prep";
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const { pois: startPois } = await getSystemInfo(ctx);
   const startStation = findStation(startPois);
   if (startStation) {
@@ -1921,7 +1922,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
       await collectFromStorage(ctx);
       yield "startup_refuel";
       await tryRefuel(ctx);
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const startFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       ctx.log("system", `Startup complete — Fuel: ${startFuel}% | Cargo: ${bot.cargo}/${bot.cargoMax}`);
     }
@@ -2100,7 +2101,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
       mapStore.markExplored(hiddenPoi.systemId, hiddenPoi.poiId);
 
       // ── Check cargo — if full with non-fuel-cell items, return home to deposit ──
-      await bot.refreshStatus();
+      await bot.refreshCargo();
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
         // Check if cargo is full of only fuel cells (intentional for exploration)
         const cargoResp = await bot.exec("get_cargo");
@@ -2142,7 +2143,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
           yield "return_to_home_fuel_cells";
           const returned = await returnToHomeBaseForFuelCells(ctx);
           if (returned) {
-            await bot.refreshStatus();
+            await bot.refreshLocation();
             ctx.log("info", `Returned to home base — continuing deep core scan`);
             break; // Break to restart the while loop
           }
@@ -2155,7 +2156,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
     await bot.checkSkills();
 
     // ── Cycle complete — restart ──
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const cycleFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Deep core scan cycle done — visited ${visitedHiddenPois.size} POI(s), ${bot.credits} cr, ${cycleFuel}% fuel`);
     visitedHiddenPois.clear(); // Reset for next cycle
@@ -2281,7 +2282,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     await ensureDocked(ctx);
     await collectFromStorage(ctx);
     await tryRefuel(ctx);
-    await bot.refreshStatus();
+    await bot.refreshLocation();
   }
 
   while (bot.state === "running") {
@@ -2656,7 +2657,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       }
 
       // ── Check cargo — if full with non-fuel-cell items, return home to deposit ──
-      await bot.refreshStatus();
+      await bot.refreshCargo();
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
         // Check if cargo is full of only fuel cells (intentional for exploration)
         const cargoResp = await bot.exec("get_cargo");
@@ -2698,7 +2699,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           yield "return_to_home_fuel_cells";
           const returned = await returnToHomeBaseForFuelCells(ctx);
           if (returned) {
-            await bot.refreshStatus();
+            await bot.refreshLocation();
             ctx.log("info", `Returned to home base — continuing exploration`);
             continue;
           }
@@ -2710,10 +2711,10 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       yield "check_skills";
       await bot.checkSkills();
 
-      await bot.refreshStatus();
+      await bot.refreshShip();
     }
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const cycleFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Trade update cycle done — ${stationSystems.length} stations, ${bot.credits} cr, ${cycleFuel}% fuel`);
     await ctx.sleep(5000);
@@ -2738,7 +2739,7 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
 
   // Get initial system info
   yield "startup";
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   let { systemId } = await getSystemInfo(ctx);
   if (!systemId) {
     ctx.log("error", "Could not determine current system — waiting 30s");
@@ -2758,7 +2759,7 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     // Refresh settings
     const settings = getExplorerSettings(bot.username);
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Visit All ${bot.system} — ${bot.credits} cr, ${fuelPct}% fuel`);
 
@@ -3309,7 +3310,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
     }
 
     if (!withdrawCreditsResp.error) {
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying military fuel cell purchase...`);
       const retryResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: milToWithdraw });
 

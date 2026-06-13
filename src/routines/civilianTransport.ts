@@ -580,7 +580,7 @@ function saveFleetData(botUsername: string, ships: FleetShip[]): void {
 
 async function collectFuelCells(ctx: RoutineContext, settings: CivilianTransportSettings): Promise<void> {
   const { bot } = ctx;
-  await bot.refreshStatus();
+  await bot.refreshCargo();
 
   const cargoFree = (bot.cargoMax || 0) - (bot.cargo || 0);
   if (cargoFree <= 0) {
@@ -1230,7 +1230,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
   if (settings.homeStation && bot.docked && bot.poi && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()) {
     ctx.log("transport", "At home station - collecting fuel cells");
     await collectFuelCells(ctx, settings);
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const fuelPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : 0;
     ctx.log("transport", `Fuel after collection: ${Math.round(fuelPct)}%`);
   }

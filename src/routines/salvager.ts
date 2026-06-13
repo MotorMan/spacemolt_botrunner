@@ -333,7 +333,7 @@ async function flockSalvageWrecks(
   for (const wreck of allWrecks) {
     if (bot.state !== "running") break;
 
-    await bot.refreshStatus();
+    await bot.refreshCargo();
     if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
       ctx.log("scavenge", "Cargo full — stopping salvage");
       break;
@@ -379,7 +379,7 @@ async function flockSalvageWrecks(
         ctx.log("scavenge", `Looted ${qty}x ${item.name} from ${wreck.name}`);
         remainingOnWreck -= qty;
 
-        await bot.refreshStatus();
+        await bot.refreshCargo();
         if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
           ctx.log("scavenge", "Cargo full after looting — stopping salvage");
           return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
@@ -575,7 +575,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
 
   ctx.log("escort", `[DEBUG] About to call getSalvagerSettings for ${bot.username}`);
   
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const startSystem = bot.system;
   const settings0 = await getSalvagerSettings(bot.username);
   const homeSystem0 = settings0.homeSystem || startSystem;
@@ -992,7 +992,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Verify tow status — sync with server but DON'T release (we may be heading to salvage yard) ──
-    await bot.refreshStatus();
+    await bot.refreshShip();
     if (bot.towingWreck) {
       // Check if server confirms we're towing (don't release — we might be heading to salvage yard)
       const statusResp = await bot.exec("get_status");
@@ -1118,7 +1118,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Status + fuel/hull checks ──
     yield "get_status";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
 
     yield "fuel_check";
     const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
@@ -1128,7 +1128,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= 40) {
       ctx.log("system", `Hull critical (${hullPct}%) — returning to station for repair`);
@@ -1189,7 +1189,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (station) stationPoi = { id: station.id, name: station.name };
 
     // Check if already towing from previous session - if so, skip POI scanning and go to salvage yard
-    await bot.refreshStatus();
+    await bot.refreshShip();
     let skipScanning = false;
     if (bot.towingWreck) {
       ctx.log("scavenge", "Already towing a wreck from previous session — heading to salvage yard");
@@ -1263,7 +1263,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
 
-        await bot.refreshStatus();
+        await bot.refreshCargo();
         const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
         if (fillRatio >= cargoThresholdRatio) {
           ctx.log("scavenge", `Cargo at ${Math.round(fillRatio * 100)}% — heading to station`);
@@ -1366,7 +1366,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
 
         // If towing a wreck, stop scanning and head to salvage yard
-        await bot.refreshStatus(); // Ensure we have latest towing state
+        await bot.refreshShip(); // Ensure we have latest towing state
         if (result.isTowing || bot.towingWreck) {
           ctx.log("scavenge", `*** TOW DETECTED *** (result=${result.isTowing}, bot=${bot.towingWreck}) — heading to salvage yard`);
           cargoFull = true; // Signal to stop all further scanning including neighbor expansion
@@ -1398,7 +1398,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         if (roamSystemId === bot.system) continue;
 
         // Check fuel before jumping
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         if (fuelPct < safetyOpts.fuelThresholdPct) {
           ctx.log("scavenge", `Fuel low (${fuelPct}%) — stopping roam scan`);
@@ -1455,8 +1455,8 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
         for (const poi of roamVisit) {
           if (bot.state !== "running") break;
 
-          await bot.refreshStatus();
-          const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+await bot.refreshShip();
+        const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
           if (fillRatio >= cargoThresholdRatio) {
             ctx.log("scavenge", `Cargo at ${Math.round(fillRatio * 100)}% — heading to station`);
             cargoFull = true;
@@ -1509,7 +1509,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
 
           // If towing a wreck, stop scanning and head to salvage yard
-          await bot.refreshStatus();
+          await bot.refreshShip();
           if (result.isTowing || bot.towingWreck) {
             ctx.log("scavenge", `Now towing a wreck in roam system (result=${result.isTowing}, bot=${bot.towingWreck}) — heading to salvage yard`);
             cargoFull = true; // Signal to stop scanning
@@ -1546,7 +1546,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Process towed wrecks: navigate to salvage yard if towing ──
-    await bot.refreshStatus();
+    await bot.refreshShip();
     let wasTowing = bot.towingWreck;
     let reachedSalvageYard = false;
     if (bot.towingWreck) {
@@ -1949,7 +1949,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     } catch {}
 
-    await bot.refreshStatus();
+    await bot.refreshLocation();
 
     const earnings = bot.credits - creditsBefore;
     if (earnings > 0) {
@@ -1970,7 +1970,7 @@ export const salvagerRoutine: Routine = async function* (ctx: RoutineContext) {
     yield "check_skills";
     await bot.checkSkills();
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const endFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Cycle done — ${bot.credits} credits, ${endFuel}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
   }

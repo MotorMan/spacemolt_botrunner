@@ -605,8 +605,8 @@ async function emergencyFleeFromPirates(
 
   ctx.log("combat", `🏃 Emergency flee initiated - ${pirateResult.pirateCount} pirate(s) detected`);
 
-  // CRITICAL: Verify actual current system via get_status before selecting jump target
-  await bot.refreshStatus();
+  // CRITICAL: Verify actual current system via get_location before selecting jump target
+  await bot.refreshLocation();
   const actualCurrentSystem = bot.system;
   ctx.log("combat", `Verified actual position: system=${actualCurrentSystem}`);
 
@@ -693,7 +693,7 @@ async function emergencyFleeFromPirates(
         }
         
         // Also verify we're still in the same system
-        await bot.refreshStatus();
+        await bot.refreshLocation();
         if (bot.system !== actualCurrentSystem) {
           ctx.log("combat", `[EMERGENCY] System changed during poll - jump succeeded to ${bot.system}`);
           jumpCompleted = true;
@@ -1377,7 +1377,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 
   // Top off self if needed
   ctx.log("rescue", `💰 No other bots need topping off, checking self...`);
-  await bot.refreshStatus();
+  await bot.refreshLocation();
 
   // Track consecutive 0 credits for self
   if (bot.credits === 0) {
@@ -1472,7 +1472,7 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
       }
 
       // Refresh bot status to get current docked state and system
-      await bot.refreshStatus();
+      await bot.refreshLocation();
 
       ctx.log("rescue", `💰 Background credit check - docked: ${bot.docked}, system: ${bot.system}, credits: ${bot.credits}`);
 
@@ -1536,7 +1536,7 @@ function stopCreditTopOffBackground(): void {
 export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
 
@@ -2179,7 +2179,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
             } else {
               // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-              await bot.refreshStatus();
+              await bot.refreshLocation();
               ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
               // If home station is configured, travel there and dock
@@ -2213,7 +2213,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                       if (refuelResp.error) {
                         ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
                       } else {
-                        await bot.refreshStatus();
+                        await bot.refreshLocation();
                         ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                       }
                     }
@@ -2244,7 +2244,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("error", `Failed to return to home system ${homeSystem}`);
           } else {
             // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-            await bot.refreshStatus();
+            await bot.refreshLocation();
             ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
             // If home station is configured, travel there and dock
@@ -2278,7 +2278,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     if (refuelResp.error) {
                       ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
                     } else {
-                      await bot.refreshStatus();
+                      await bot.refreshLocation();
                       ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                     }
                   }
@@ -2441,7 +2441,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     // ── Ensure we have enough fuel to share ──
     yield "self_check";
-    await bot.refreshStatus();
+    await bot.refreshShip();
     logStatus(ctx);
 
     if (hasPumpNow) {
@@ -2755,7 +2755,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           continue;
         }
         // CRITICAL: Refresh status to update bot.system after navigation
-        await bot.refreshStatus();
+        await bot.refreshLocation();
         ctx.log("travel", `Arrived in ${bot.system}`);
 
         // ── PIRATE AWARENESS: Scan for pirates immediately after arrival ──
@@ -3176,7 +3176,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
         } else {
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           ctx.log(logCategory, `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
         }
       } else {
@@ -3218,7 +3218,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (refuelResp.error) {
               ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
             } else {
-              await bot.refreshStatus();
+              await bot.refreshLocation();
               ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
             }
             ctx.log("rescue", `⛽ Filling cargo with premium fuel cells...`);
@@ -3247,7 +3247,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     // ── Refuel self (fallback if not already refueled at station) ──
     ctx.log("rescue_debug", `=== Starting refuel self section ===`);
     yield "self_refuel";
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const fuelAfterRescue = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("rescue_debug", `Fuel after rescue: ${fuelAfterRescue}%, threshold: ${settings.refuelThreshold}%`);
     if (fuelAfterRescue < settings.refuelThreshold) {
@@ -3258,7 +3258,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       ctx.log(logCategory,
         `Fuel at ${fuelAfterRescue}% — above threshold (${settings.refuelThreshold}%), no need to refuel`);
     }
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // ── Calculate and send rescue bill (after refuel, before returning home) ──
@@ -3433,9 +3433,9 @@ interface ManualRescueParams {
  * 6. Return home, dock, and refuel
  */
 export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineContext, params?: ManualRescueParams) {
-  const { bot } = ctx;
+   const { bot } = ctx;
 
-  await bot.refreshStatus();
+   await bot.refreshLocation();
   const homeSystem = bot.system;
 
   // Get parameters (passed from botmanager via action.params)
@@ -3530,7 +3530,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
     // ── Ensure we have enough fuel ──
     yield "self_check";
-    await bot.refreshStatus();
+    await bot.refreshShip();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     if (hasPump) {
@@ -3777,7 +3778,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
         } else {
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
         }
       } else {
@@ -3815,7 +3816,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
             if (refuelResp.error) {
               ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
             } else {
-              await bot.refreshStatus();
+              await bot.refreshShip();
               ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
             }
           }
@@ -3840,7 +3841,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     await ensureDocked(ctx);
 
     // Refuel after mission - but only if below threshold
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const fuelAfterMission = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelAfterMission < settings.refuelThreshold) {
       ctx.log("rescue", `Fuel at ${fuelAfterMission}% — refueling to threshold (${settings.refuelThreshold}%)...`);
@@ -3849,7 +3850,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
         await ensureFueled(ctx, settings.refuelThreshold);
       } else {
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         ctx.log("rescue", `Fuel: ${fuelPct}% (${bot.fuel}/${bot.maxFuel})`);
       }
@@ -3857,7 +3858,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
       ctx.log("rescue", `Fuel at ${fuelAfterMission}% — above threshold, no need to refuel`);
     }
 
-    await bot.refreshStatus();
+    await bot.refreshLocation();
+    await bot.refreshShip();
     logStatus(ctx);
 
     ctx.log("rescue", `✓ Bot is docked and ready for next mission`);
@@ -3887,7 +3889,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
 
@@ -4110,7 +4112,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     // ── Ensure we have enough fuel ──
     yield "self_check";
-    await bot.refreshStatus();
+    await bot.refreshShip();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     if (hasPump) {
@@ -4424,7 +4427,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
     ctx.log("mayday", `=== MAYDAY response complete for ${mayday.sender} ===`);
 
     // Refresh status before returning home
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     ctx.log("mayday", `Current location: ${bot.system}, Home: ${homeSystem || "not set"}`);
 
     // ── Return home ──
@@ -4444,7 +4447,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
         } else {
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           ctx.log("mayday", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
         }
       } else {
@@ -4486,7 +4489,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
             if (refuelResp.error) {
               ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
             } else {
-              await bot.refreshStatus();
+              await bot.refreshShip();
               ctx.log("mayday", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
             }
           }
@@ -4530,7 +4533,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
       }
     }
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const fuelAfterMission = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelAfterMission < settings.refuelThreshold) {
       ctx.log("mayday", `Fuel at ${fuelAfterMission}% — refueling to threshold (${settings.refuelThreshold}%)...`);
@@ -4539,7 +4542,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
         ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
         await ensureFueled(ctx, settings.refuelThreshold);
       } else {
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         ctx.log("mayday", `Fuel: ${fuelPct}% (${bot.fuel}/${bot.maxFuel})`);
       }
@@ -4547,7 +4550,8 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
       ctx.log("mayday", `Fuel at ${fuelAfterMission}% — above threshold, no need to refuel`);
     }
 
-    await bot.refreshStatus();
+    await bot.refreshLocation();
+    await bot.refreshShip();
     logStatus(ctx);
     ctx.log("mayday", "✓ Bot is docked and ready for next MAYDAY");
 
@@ -4649,7 +4653,7 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
 export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
 
@@ -5221,7 +5225,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
             } else {
               // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-              await bot.refreshStatus();
+              await bot.refreshLocation();
               ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
               // If home station is configured, travel there and dock
@@ -5255,7 +5259,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                       if (refuelResp.error) {
                         ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
                       } else {
-                        await bot.refreshStatus();
+                        await bot.refreshLocation();
                         ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                       }
                     }
@@ -5286,7 +5290,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("error", `Failed to return to home system ${homeSystem}`);
           } else {
             // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-            await bot.refreshStatus();
+            await bot.refreshLocation();
             ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
             // If home station is configured, travel there and dock
@@ -5320,7 +5324,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     if (refuelResp.error) {
                       ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
                     } else {
-                      await bot.refreshStatus();
+                      await bot.refreshShip();
                       ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                     }
                   }
@@ -5607,7 +5611,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     // ── Ensure we have fuel ourselves ──
     yield "self_check";
-    await bot.refreshStatus();
+    await bot.refreshShip();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // Only refuel if below threshold - don't waste time refueling when already well-fueled
@@ -6589,7 +6594,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                       ctx.log("rescue", `⛽ Refueling at home station...`);
                       const refuelResp = await bot.exec("refuel");
                       if (!refuelResp.error) {
-                        await bot.refreshStatus();
+                        await bot.refreshShip();
                         ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                       }
                     }
@@ -6875,7 +6880,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         ctx.log("error", `Failed to return to home system ${homeSystem}`);
       } else {
         // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-        await bot.refreshStatus();
+        await bot.refreshLocation();
         ctx.log(logCategory, `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
         // If home station is configured, travel there and dock
@@ -6907,7 +6912,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 if (refuelResp.error) {
                   ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
                 } else {
-                  await bot.refreshStatus();
+                  await bot.refreshShip();
                   ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                 }
               }
@@ -6949,7 +6954,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               ctx.log("rescue", `⛽ Refueling at home station...`);
               const refuelResp = await bot.exec("refuel");
               if (!refuelResp.error) {
-                await bot.refreshStatus();
+                await bot.refreshShip();
                 ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
               }
             }
@@ -6960,17 +6965,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     // ── Refuel self ──
     yield "self_refuel";
-    await bot.refreshStatus();
-    const fuelAfterRescue2 = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-    if (fuelAfterRescue2 < settings.refuelThreshold) {
-      ctx.log(logCategory,
-        `Fuel at ${fuelAfterRescue2}% after rescue — refueling to threshold (${settings.refuelThreshold}%)...`);
+await bot.refreshShip();
+    const fuelAfterRescue = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("rescue_debug", `Fuel after rescue: ${fuelAfterRescue}%, threshold: ${settings.refuelThreshold}%`);
+    if (fuelAfterRescue < settings.refuelThreshold) {
+      ctx.log("rescue_debug", `Fuel after rescue: ${fuelAfterRescue}%, threshold: ${settings.refuelThreshold}%`);
       await ensureFueled(ctx, settings.refuelThreshold);
     } else {
       ctx.log(logCategory,
-        `Fuel at ${fuelAfterRescue2}% — above threshold, no need to refuel`);
+        `Fuel at ${fuelAfterRescue}% — above threshold (${settings.refuelThreshold}%), no need to refuel`);
     }
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // ── Ensure premium fuel reserve for emergency self-rescue ──

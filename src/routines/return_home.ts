@@ -65,7 +65,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   while (waitAttempts < 5) {
     ctx.log("system", "Checking if ready to start (attempt " + (waitAttempts + 1) + "/5)...");
     try {
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       break; // Success — no pending action
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -100,7 +100,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   }
 
   // Check if already at home
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   if (bot.system === homeSystem) {
     if (homeStation && bot.poi === homeStation) {
       ctx.log("travel", "Already at home station — checking repair status...");
@@ -264,17 +264,17 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
           return;
         }
 
-        // Timeout error - wait and retry
-        if (navAttempts < MAX_NAV_ATTEMPTS) {
-          const waitTime = 10000 * navAttempts; // 10s, 20s, 30s
-          ctx.log("travel", `API timeout detected - waiting ${waitTime/1000}s before retry...`);
-          await ctx.sleep(waitTime);
-          await bot.refreshStatus();
-        }
-      }
-    }
+// Timeout error - wait and retry
+         if (navAttempts < MAX_NAV_ATTEMPTS) {
+           const waitTime = 10000 * navAttempts; // 10s, 20s, 30s
+           ctx.log("travel", `API timeout detected - waiting ${waitTime/1000}s before retry...`);
+           await ctx.sleep(waitTime);
+           await bot.refreshLocation();
+         }
+       }
+     }
 
-    if (!arrived) {
+     if (!arrived) {
       ctx.log("error", `Failed to reach ${homeSystem} after ${MAX_NAV_ATTEMPTS} attempts — routine cancelled`);
       return; // Cancel routine
     }
@@ -314,7 +314,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
       return; // Cancel routine
     }
     // Verify travel succeeded by checking position
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     if (bot.poi !== targetStation.id) {
       ctx.log("error", `Travel to station failed: not at target ${targetStation.id} (currently at ${bot.poi})`);
       return; // Cancel routine
@@ -324,7 +324,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   // Dock at station (skip storage collection - return home doesn't need to manage items)
   // Refresh status first to ensure bot.docked is current before calling ensureDocked
   yield "dock";
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const docked = await ensureDocked(ctx, true);
   if (!docked) {
     ctx.log("error", "Failed to dock at home station — routine cancelled");
@@ -332,7 +332,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   }
 
   // After docking at home, repair and refuel if needed
-  await bot.refreshStatus();
+  await bot.refreshShip();
   const dockedHullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
   if (dockedHullPct < 95) {
     ctx.log("system", `Hull at ${dockedHullPct}% — repairing at home station...`);
@@ -352,7 +352,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   }
 
   // Final status
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   ctx.log("travel", `Return Home complete — docked at ${targetStation.name} in ${homeSystem}`);
   ctx.log("info", `Bot status: ${bot.credits} credits, ${bot.fuel}/${bot.maxFuel} fuel, ${bot.hull}/${bot.maxHull} hull`);
 

@@ -478,7 +478,7 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
     if (!completeResp.error) {
       const reward = (mission.reward as number) || (mission.reward_credits as number) || 0;
       ctx.log("trade", `Mission complete: ${(mission.name as string) || missionId}${reward > 0 ? ` (+${reward} credits)` : ""}`);
-      await bot.refreshStatus();
+      await bot.refreshLocation();
     }
   }
 }
@@ -688,7 +688,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // ── Status ──
     yield "get_status";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // ── Position update for visual display ──
@@ -707,7 +707,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     }
 
     // ── Hull check — retreat to a high-security system to repair ──
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= settings.repairThreshold) {
       ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
@@ -862,7 +862,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     for (const poi of patrolPois) {
       if (bot.state !== "running" || abortPatrol) break;
 
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (midHull <= settings.repairThreshold) {
@@ -983,7 +983,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       for (const target of targets) {
         if (bot.state !== "running") break;
 
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
         if (preHull <= settings.repairThreshold) {
           ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
@@ -1085,7 +1085,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
             ctx.log("combat", "Low on repair kits or shield charges — aborting patrol to resupply");
             abortPatrol = true;
           }
-          await bot.refreshStatus();
+          await bot.refreshShip();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
         } else {
           ctx.log("combat", "Retreated — aborting patrol to dock and repair");
@@ -1098,7 +1098,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     // ── Post-patrol decision ──
     yield "post_patrol";
     await bot.refreshCargo();
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
 
@@ -1129,7 +1129,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       yield "complete_missions";
       await completeActiveMissions(ctx);
 
-      await bot.refreshStatus();
+      await bot.refreshLocation();
 
       yield "check_missions";
       await checkAndAcceptMissions(ctx);
@@ -1193,7 +1193,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   let totalKills = 0;
 
   while (bot.state === "running") {
@@ -1212,7 +1212,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // ── Status ──
     yield "get_status";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // ── Position update for visual display ──
@@ -1231,7 +1231,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     }
 
     // ── Hull check — retreat to a high-security system to repair ──
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= settings.repairThreshold) {
       ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
@@ -1297,7 +1297,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     for (const poi of patrolPois) {
       if (bot.state !== "running" || abortPatrol) break;
 
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (midHull <= settings.repairThreshold) {
@@ -1385,7 +1385,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       for (const target of targets) {
         if (bot.state !== "running") break;
 
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
         if (preHull <= settings.repairThreshold) {
           ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
@@ -1466,7 +1466,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             ctx.log("combat", "Low on repair kits or shield charges — aborting patrol to resupply");
             abortPatrol = true;
           }
-          await bot.refreshStatus();
+          await bot.refreshShip();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
         } else {
           ctx.log("combat", "Retreated — aborting patrol to dock and repair");
@@ -1479,7 +1479,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     // ── Post-patrol decision ──
     yield "post_patrol";
     await bot.refreshCargo();
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
 
@@ -1510,7 +1510,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       yield "complete_missions";
       await completeActiveMissions(ctx);
 
-      await bot.refreshStatus();
+      await bot.refreshLocation();
 
       yield "check_missions";
       await checkAndAcceptMissions(ctx);
@@ -1548,7 +1548,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   let totalKills = 0;
 
   // Store the original position to stay in
@@ -1578,7 +1578,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // ── Status ──
     yield "get_status";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // ── Position update for visual display ──
@@ -1597,7 +1597,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     }
 
     // ── Hull check — retreat to a high-security system to repair ──
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= settings.repairThreshold) {
       ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
@@ -1692,12 +1692,12 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     ctx.log("combat", `Found ${targets.length} target(s) at ${originalPoi}: ${targets.map(t => t.name).join(", ")}`);
 
-    // Engage each target
-    for (const target of targets) {
-      if (bot.state !== "running") break;
+// Engage each target
+      for (const target of targets) {
+        if (bot.state !== "running") break;
 
-      await bot.refreshStatus();
-      const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        await bot.refreshShip();
+        const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       if (preHull <= settings.repairThreshold) {
         ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
         break;
@@ -1768,7 +1768,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             ctx.log("combat", "Low on repair kits or shield charges — stopping to resupply");
             break;
           }
-          await bot.refreshStatus();
+          await bot.refreshShip();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
 
       } else {
@@ -1788,7 +1788,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   let totalKills = 0;
   let systemIndex = 0;
 
@@ -1910,7 +1910,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   // Repair hull if damaged
   await repairShip(ctx);
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   await bot.refreshCargo();
 
   // Deposit any extra loot (everything except ammo, fuel cells, repair kits) so user can see what was brought home
@@ -2128,7 +2128,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   let totalKills = 0;
 
   const all = readSettings();

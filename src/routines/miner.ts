@@ -284,7 +284,7 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
     if (!completeResp.error) {
       const reward = (mission.reward as number) || (mission.reward_credits as number) || 0;
       ctx.log("trade", `Mission complete: ${(mission.name as string) || missionId}${reward > 0 ? ` (+${reward} credits)` : ""}`);
-      await bot.refreshStatus();
+      await bot.refreshLocation();
     }
   }
 }
@@ -2405,7 +2405,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Status + fuel/hull checks ──
     yield "get_status";
-    await bot.refreshStatus();
+    await bot.refreshShip();
 
     yield "fuel_check";
     const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
@@ -3398,7 +3398,7 @@ if (effectiveTarget) {
     
     // CRITICAL FIX: Check cargo capacity BEFORE traveling to POI
     // If cargo is full, return home to deposit first
-    await bot.refreshStatus();
+    await bot.refreshCargoAndStorage();
     const travelFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
     if (travelFillRatio >= cargoThresholdRatio) {
       ctx.log("mining", `Cargo full (${Math.round(travelFillRatio * 100)}%) — returning home to deposit before traveling to POI`);
@@ -3455,9 +3455,16 @@ if (effectiveTarget) {
       ctx.log("mining", `Hidden POI ${miningPoi.name} detected — MUST travel to verify actual location`);
     }
 
+    // CRITICAL: For DEEP CORE hidden POIs, we MUST use travel command to get there
+    // get_poi alone is NOT sufficient - it may return data from wherever we actually are
+    // Always try travel first for hidden POIs to ensure we're actually at the right location
+    if (isHiddenPoi) {
+      ctx.log("mining", `Hidden POI ${miningPoi.name} detected — MUST travel to verify actual location`);
+    }
+
     // For hidden POIs: ALWAYS use travel command (not just get_poi) to confirm we're actually at the location
-    // CRITICAL: Refresh status FIRST to get actual current location - don't trust cached bot.poi
-    await bot.refreshStatus();
+    // CRITICAL: Refresh location FIRST to get actual current location - don't trust cached bot.poi
+    await bot.refreshLocation();
     const actualPoi = bot.poi || "";
     ctx.log("mining", `Current actual location before travel: ${actualPoi || "(none)"}`);
     if (!bot.poi || bot.poi !== miningPoi.id) {
@@ -3628,8 +3635,8 @@ if (effectiveTarget) {
       const intendedPoi = targetPoiId;
       
       // CRITICAL: This check runs BEFORE mining - verify actual location, not trust cached bot.poi
-      // We MUST refresh status to get the ACTUAL current POI from the server
-      await bot.refreshStatus();
+      // We MUST refresh location to get the ACTUAL current POI from the server
+      await bot.refreshLocation();
       const realCurrentPoi = bot.poi || "";
       
       if (realCurrentPoi !== intendedPoi) {
@@ -3638,8 +3645,8 @@ if (effectiveTarget) {
         // MUST travel to the correct hidden POI
         const verifyTravel = await travelToPoiWithSurvey(ctx, intendedPoi, targetPoiName || intendedPoi, true);
         
-        // Verify AGAIN after travel - refresh status to get actual location
-        await bot.refreshStatus();
+        // Verify AGAIN after travel - refresh location to get actual location
+        await bot.refreshLocation();
         const afterTravelPoi = bot.poi || "";
         
         if (afterTravelPoi !== intendedPoi) {
@@ -3647,7 +3654,7 @@ if (effectiveTarget) {
           
           // Try one more travel as last resort
           const lastTravel = await bot.exec("travel", { target_poi: intendedPoi });
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           const finalPoi = bot.poi || "";
           
           if (finalPoi === intendedPoi) {
@@ -4286,7 +4293,7 @@ if (effectiveTarget) {
                         ctx.log("mining", `Found next target: ${effectiveTarget} @ ${chosen.poiName} in ${chosen.systemId} (${chosen.jumps} jumps)`);
                         
                         // CRITICAL FIX: Check cargo before traveling to next POI when stayOutUntilFull is enabled
-                        await bot.refreshStatus();
+                        await bot.refreshCargoAndStorage();
                         const nextPoiFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
                         if (nextPoiFillRatio >= cargoThresholdRatio) {
                           ctx.log("mining", `Cargo full (${Math.round(nextPoiFillRatio * 100)}%) — returning home to deposit before switching POIs`);
@@ -5427,7 +5434,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
         }
       }
 
-      await bot.refreshStatus();
+      await bot.refreshCargo();
       const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
       if (fillRatio >= cargoThresholdRatio) {
         stopReason = `cargo at ${Math.round(fillRatio * 100)}%`; break;
@@ -5714,7 +5721,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
       }
     } catch {}
 
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     await bot.refreshStorage();
 
     const earnings = bot.credits - creditsBefore;
@@ -5750,7 +5757,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     yield "check_skills";
     await bot.checkSkills();
 
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     const endFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Cycle done — ${bot.credits} credits, ${endFuel}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
   }

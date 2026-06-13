@@ -9,7 +9,7 @@ export async function ensureFueled(
   opts?: { noJettison?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
-  await bot.refreshStatus();
+  await bot.refreshShip();
   const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (fuelPct >= thresholdPct) return true;
 
@@ -66,7 +66,7 @@ export async function ensureFueled(
           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
           return false;
         }
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const pct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         if (pct < 5) {
           ctx.log("error", `Fuel critical (${pct}%) mid-jump — stranded`);
@@ -101,7 +101,7 @@ export async function ensureFueled(
   }
 
   const ok = await refuelAtStation(ctx, { id: nearest.poiId, name: nearest.poiName }, thresholdPct);
-  await bot.refreshStatus();
+  await bot.refreshShip();
   const finalPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   ctx.log("system", `Refuel complete at ${nearest.poiName} — Fuel: ${finalPct}%`);
   if (finalPct < thresholdPct) return false;

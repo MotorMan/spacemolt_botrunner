@@ -684,7 +684,7 @@ async function placeMarketOrders(
 export const coordinatorRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
 
   while (bot.state === "running") {
     const settings = getCoordinatorSettings();

@@ -327,7 +327,7 @@ export async function ensureAmmoLoaded(
     }
   }
 
-  await bot.refreshStatus();
+  await bot.refreshShip();
   const updatedWeapons = await getWeaponModules(ctx);
   let updatedTotalAmmo = 0;
   let updatedTotalMaxAmmo = 0;
@@ -696,7 +696,7 @@ export async function fightFreshBattle(
       return true;
     }
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
 
     if (hullPct <= fleeThreshold) {
@@ -782,7 +782,7 @@ export async function fightFreshBattle(
       }
     }
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
     const damageThisTick = Math.max(0, lastHull - bot.hull);
@@ -1054,7 +1054,7 @@ export async function fightJoinedBattle(
       return false;
     }
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const shieldPct = bot.maxShield > 0 ? Math.round((bot.shield / bot.maxShield) * 100) : 100;
 

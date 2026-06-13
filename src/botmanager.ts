@@ -1106,22 +1106,32 @@ async function main(): Promise<void> {
     }
   }, 2000));
 
-  // Periodic live refresh (hit API for all logged-in bots)
-  intervals.push(setInterval(async () => {
-    try {
-      const refreshPromises = [];
-      for (const [, bot] of bots) {
-        if (bot.api.getSession()) {
-          refreshPromises.push(bot.refreshShip().catch(() => {}));
-          refreshPromises.push(bot.refreshLocation().catch(() => {}));
+  // Periodic live refresh (hit API for bots that are running routines only)
+  // Set periodicRefreshSec to 0 to disable
+  const periodicRefreshSec = (settings.general as Record<string, unknown>)?.periodicRefreshSec as number || 30;
+  if (periodicRefreshSec > 0) {
+    intervals.push(setInterval(async () => {
+      try {
+        const refreshPromises = [];
+        let refreshCount = 0;
+        for (const [, bot] of bots) {
+          // Only refresh bots that are actively running a routine
+          if (bot.state === "running" && bot.api.getSession()) {
+            refreshPromises.push(bot.refreshShip().catch(() => {}));
+            refreshPromises.push(bot.refreshLocation().catch(() => {}));
+            refreshCount++;
+          }
         }
+        if (refreshCount > 0) {
+          debugLogForBot("SYSTEM", "periodic:refresh", `Refreshing ${refreshCount} running bot(s)`);
+        }
+        await Promise.allSettled(refreshPromises);
+        refreshStatusTable();
+      } catch (err) {
+        console.error('Error in periodic live refresh:', err);
       }
-      await Promise.allSettled(refreshPromises);
-      refreshStatusTable();
-    } catch (err) {
-      console.error('Error in periodic live refresh:', err);
-    }
-  }, 30000));
+    }, periodicRefreshSec * 1000));
+  }
 
   // Periodic map data push (every 15s so dashboard stays current)
   intervals.push(setInterval(() => {

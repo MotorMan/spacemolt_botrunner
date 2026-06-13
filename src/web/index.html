@@ -8331,6 +8331,17 @@ function renderGeneralSettings(panel) {
         </div>
         <input type="checkbox" id="set-general-disableRateLimiting" ${general.disableRateLimiting ? 'checked' : ''} />
       </div>
+
+      <div class="setting-row">
+        <div>
+          <div class="setting-label">Periodic Refresh Interval</div>
+          <div class="setting-hint">How often to refresh ship/location data for bots that are running routines. Set to 0 to disable periodic refresh (bots still refresh when they start routines).</div>
+        </div>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input type="number" id="set-general-periodicRefreshSec" min="0" max="300" step="1" value="${general.periodicRefreshSec ?? 30}" style="width:80px" />
+          <span style="color:var(--text-secondary);font-size:12px">seconds</span>
+        </div>
+      </div>
   
       <div class="settings-save-bar">
         <button class="primary" onclick="saveGeneralSettings()">Save Settings</button>
@@ -8371,6 +8382,7 @@ function saveGeneralSettings() {
     disableActivityLog: document.getElementById('set-general-disableActivityLog').checked,
     clearSessionOnRestart: document.getElementById('set-general-clearSessionOnRestart').checked,
     disableRateLimiting: document.getElementById('set-general-disableRateLimiting').checked,
+    periodicRefreshSec: parseInt(document.getElementById('set-general-periodicRefreshSec').value) || 30,
   };
   send({ type: 'saveSettings', routine: 'general', settings: s });
 }

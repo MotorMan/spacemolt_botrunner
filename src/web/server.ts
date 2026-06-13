@@ -392,6 +392,11 @@ constructor(port: number = 3000) {
       this.settings.clientSync.apiKey = generatedKey;
       saveSettings(this.settings);
     }
+    // Initialize periodic refresh setting in general
+    if ((this.settings.general as Record<string, unknown>)?.periodicRefreshSec === undefined) {
+      (this.settings.general as Record<string, unknown>).periodicRefreshSec = 30;
+      saveSettings(this.settings);
+    }
     this.statsData = loadStats();
     const mainLogs = loadMainLogs();
     this.activityLog = mainLogs.activity.slice(-MAX_LOG_BUFFER);

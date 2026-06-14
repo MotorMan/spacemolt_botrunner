@@ -2733,8 +2733,10 @@ function openProfile(username) {
   fetchRecipes(username);
   const botObj = bots.find(b => b.username === username);
   if (botObj && botObj.docked) fetchMarket(username);
-  // Fetch faction storage (will fail gracefully if not at station)
+  // Fetch faction storage for display panel
   fetchFactionStorage(username);
+  // Fetch faction storage for withdraw dropdown
+  fetchFactionStorageForWithdraw(username);
   fetchStandings(username);
 
   // Refresh nearby players list for manual refuel control
@@ -13578,14 +13580,8 @@ function factionDepositItems(username) {
   const itemId = document.getElementById('faction-dep-item')?.value;
   const qty = parseInt(document.getElementById('faction-dep-qty')?.value) || 1;
   if (!itemId) return;
-  sendExec(username, 'deposit_items', { item_id: itemId, quantity: qty, target: 'faction', source: 'cargo' }, (result) => {
-    if (result.ok) {
-      appendLine('system', `${username} deposited ${qty}x ${itemId} to faction storage`);
-      fetchFactionInfo(username);
-    } else {
-      appendLine('system', `Deposit items failed: ${result.error || 'unknown'}`);
-    }
-  });
+  // Use mcExec to trigger storage refresh
+  mcExec('deposit_items', { item_id: itemId, quantity: qty, target: 'faction', source: 'cargo' });
 }
 
 function fetchFactionStorage(username) {
@@ -13704,13 +13700,8 @@ function factionWithdrawItems(username) {
   const itemId = document.getElementById('faction-wit-item')?.value;
   const qty = parseInt(document.getElementById('faction-wit-qty')?.value) || 1;
   if (!itemId) return;
-  sendExec(username, 'withdraw_items', { item_id: itemId, quantity: qty, source: 'faction', target: 'cargo' }, (result) => {
-    if (result.ok) {
-      appendLine('system', `${username} withdrew ${qty}x ${itemId} from faction storage`);
-    } else {
-      appendLine('system', `Withdraw items failed: ${result.error || 'unknown'}`);
-    }
-  });
+  // Use mcExec to trigger storage refresh
+  mcExec('withdraw_items', { item_id: itemId, quantity: qty, source: 'faction', target: 'cargo' });
 }
 
 // ── Faction Facilities ───────────────────────────────────────

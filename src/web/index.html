@@ -1398,11 +1398,27 @@ lastUsedRoutines = lastUsedRoutinesRes || {};
         case 'status':
         // Only update bots array if we're not in the middle of refreshing storage
         // (to avoid clobbering fresh data from our own fetches)
-        // Also check if we recently refreshed storage (within last 10 seconds)
+        // Also check if we recently refreshed storage (within last 15 seconds to match fresh data timeout)
         const _storageRefreshTime = window._lastStorageRefresh || 0;
-        const _blockStatusUpdate = window._refreshingStorage || (Date.now() - _storageRefreshTime < 10000);
+        const _blockStatusUpdate = window._refreshingStorage || (Date.now() - _storageRefreshTime < 15000);
         if (!_blockStatusUpdate) {
+          // Preserve fresh cargo/storage data if available (from recent storage commands)
+          // The status message may contain stale inventory/storage from bot.status()
+          const freshCargo = window._freshCargo;
+          const freshStorage = window._freshStorage;
+          const freshFactionStorage = window._freshFactionStorage;
+          
           bots = msg.bots || [];
+          
+          // Restore fresh data to the bot that matches the profile bot
+          if (profileBot && (freshCargo || freshStorage || freshFactionStorage)) {
+            const profileBotIndex = bots.findIndex(b => b.username === profileBot);
+            if (profileBotIndex >= 0) {
+              if (freshCargo) bots[profileBotIndex].inventory = freshCargo;
+              if (freshStorage) bots[profileBotIndex].storage = freshStorage;
+              // Note: faction storage is tracked separately in profileFactionStorage
+            }
+          }
           renderBots();
           renderStats();
           updateChatBotSelect();
@@ -1448,6 +1464,32 @@ lastUsedRoutines = lastUsedRoutinesRes || {};
             updateProfileSidebar();
             // Update storage/cargo dropdowns in manual controls (without full re-render)
             updateStorageDropdowns();
+            
+            // Update faction storage panel in manual controls if fresh data is available
+            // (renderManualControls is blocked by _blockRenderUntil, so update manually)
+            if (window._freshFactionStorage !== null && window._freshFactionStorage !== undefined) {
+              const factionItems = window._freshFactionStorage;
+              const factionSelect = document.getElementById('faction-wit-item');
+              if (factionSelect && factionItems) {
+                // Store current selection
+                const currentValue = factionSelect.value;
+                // Rebuild options
+                let sortedFaction = [...factionItems];
+                if (factionWithdrawSortOrder === 'alpha') {
+                  sortedFaction.sort((a, b) => {
+                    const nameA = (a.name || a.item_name || a.item_id || a.id || '').toLowerCase();
+                    const nameB = (b.name || b.item_name || b.item_id || b.id || '').toLowerCase();
+                    return nameA.localeCompare(nameB);
+                  });
+                } else if (factionWithdrawSortOrder === 'quantity') {
+                  sortedFaction.sort((a, b) => (b.quantity || b.count || 0) - (a.quantity || a.count || 0));
+                }
+                const opts = sortedFaction.map(i =>
+                  `<option value="${esc(i.item_id)}" data-max="${i.quantity}"${i.item_id === currentValue ? ' selected' : ''}>${esc(i.name)} (${Number(i.quantity).toLocaleString()})</option>`
+                ).join('');
+                factionSelect.innerHTML = opts || '<option value="">Empty or not available</option>';
+              }
+            }
 
             // If bot changed systems or docked status, refresh relevant data
             // (renderManualControls will be called when the data fetches complete)
@@ -6278,6 +6320,10 @@ function mcExec(command, params) {
   const isStorageCommand = ['deposit_items', 'withdraw_items', 'storage', 'sell', 'buy', 'jettison', 'craft'].includes(command);
   if (isStorageCommand) {
     window._refreshingStorage = true;
+    // Clear any previous fresh data to start fresh
+    window._freshCargo = null;
+    window._freshStorage = null;
+    window._freshFactionStorage = null;
   }
 
   // Rate limit action commands (1 per tick)
@@ -6321,13 +6367,9 @@ function mcExec(command, params) {
           // Also update dropdowns directly to preserve selections
           updateStorageDropdowns();
           window._blockRenderUntil = Date.now() + 10000; // Block re-renders for 10 seconds
-          // Clear fresh data variables after sufficient time (15 seconds)
-          // This gives time for any pending status messages to be processed
-          setTimeout(() => {
-            window._freshCargo = null;
-            window._freshStorage = null;
-            window._freshFactionStorage = null;
-          }, 15000);
+          // Note: fresh data variables (_freshCargo, _freshStorage, _freshFactionStorage)
+          // are NOT auto-cleared. They will be overwritten when the next storage command runs.
+          // This ensures status updates don't revert to stale data.
         }
       };
 

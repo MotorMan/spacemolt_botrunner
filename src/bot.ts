@@ -797,7 +797,8 @@ docked = false;
           const r = resp.result as Record<string, unknown>;
           const ship = (r.ship as Record<string, unknown>) || {};
           const location = (r.location as Record<string, unknown>) || {};
-          const cargo = Array.isArray(r.cargo) ? r.cargo : Array.isArray(r.items) ? r.items : [];
+          const player = (r.player as Record<string, unknown>) || {};
+          const p = location || player || r;
 
           if (command === "mine") {
             const qty = (r.quantity as number) || (r.count as number) || 0;
@@ -848,107 +849,93 @@ docked = false;
             if (qty) this.cargo += qty;
           }
 
-          if (Object.keys(ship).length > 0) {
+if (Object.keys(ship).length > 0) {
             if (typeof ship.fuel === "number") this.fuel = ship.fuel;
             if (typeof ship.max_fuel === "number") this.maxFuel = ship.max_fuel;
-            if (typeof ship.cargo_used === "number") this.cargo = ship.cargo_used;
-            if (typeof ship.cargo_capacity === "number") this.cargoMax = ship.cargo_capacity;
-            if (typeof ship.hull === "number") this.hull = ship.hull;
-            if (typeof ship.max_hull === "number") this.maxHull = ship.max_hull;
-            if (typeof ship.shield === "number") this.shield = ship.shield;
-            if (typeof ship.max_shield === "number") this.maxShield = ship.max_shield;
-            if (typeof ship.speed === "number") this.shipSpeed = ship.speed;
-            if (ship.name && typeof ship.name === "string") this.shipName = ship.name;
-            if (ship.ship_type && typeof ship.ship_type === "string") this.shipClass = ship.ship_type;
-            if (ship.tier !== undefined && ship.tier !== null) this.tier = ship.tier as number;
-            if (ship.id && typeof ship.id === "string") this.shipId = ship.id;
-          }
-
-          if (cargo.length > 0) {
-            this.inventory = this.parseItemList({ items: cargo });
-          }
-
-          if (Object.keys(location).length > 0) {
-            this.system = (location.system_id as string) || (location.system_name as string) || this.system;
-            this.poi = (location.poi_id as string) || (location.poi_name as string) || this.poi;
-            if (location.docked_at !== undefined) this.docked = !!location.docked_at;
-          }
-
-          const player = (r.player as Record<string, unknown>) || {};
-          if (Object.keys(player).length > 0) {
-            if (typeof player.credits === "number") this.credits = player.credits;
-            if (player.faction_id && typeof player.faction_id === "string") this.faction = player.faction_id;
-          }
-
-          const skills = (r.skills as Record<string, Record<string, unknown>>) || {};
-          if (Object.keys(skills).length > 0) {
-            for (const [skillId, skillData] of Object.entries(skills)) {
-              const s = skillData as Record<string, unknown>;
-              const level = (s.level as number) ?? (s.current_level as number) ?? 0;
-              const xp = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
-              const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number);
-              const totalXP = (s.total_xp as number) ?? (s.total_experience as number);
-              this.skillLevels.set(skillId, level);
-              this.skillXP.set(skillId, xp);
-              if (xpToNext !== undefined) this.skillXpToNext.set(skillId, xpToNext);
-              if (totalXP !== undefined) this.skillTotalXP.set(skillId, totalXP);
+            this.cargo = (ship.cargo_used as number) ?? this.cargo;
+            this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
+            this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+            this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
+            this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
+            this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
+            // Cache ship speed (1-6, where 1=slowest at 120s/jump, 6=fastest at 30s/jump)
+            this.shipSpeed = (ship.speed as number) || 1;
+            
+            // Ship ID
+            this.shipId = (ship.id as string) || "";
+            
+            // Ammo is stored per-weapon-module, not at ship level.
+            // get_status may return modules as full objects or just IDs.
+            // Check both the ship.modules array and root-level modules array.
+            const modulesArray = (
+              Array.isArray(r.modules) ? r.modules :
+              Array.isArray(ship.modules) ? ship.modules :
+              []
+            ) as Array<Record<string, unknown>>;
+            
+            let totalAmmo = 0;
+            for (const mod of modulesArray) {
+              if (mod && typeof mod === "object" && mod.current_ammo != null && typeof mod.current_ammo === "number") {
+                totalAmmo += mod.current_ammo as number;
+              }
             }
+            // Update ammo count: prefer calculated from modules, fall back to ship.ammo if it exists
+            if (totalAmmo > 0) {
+              this.ammo = totalAmmo;
+            } else if (ship.ammo != null) {
+              this.ammo = ship.ammo as number;
+            }
+            this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
           }
-        }
 
-        if (resp.error) {
-          // Suppress noisy expected errors — callers handle these gracefully
-          const code = resp.error.code || "";
-          const quiet =
-            code === "mission_incomplete" ||
-            code === "not_in_battle" ||
-            (command === "view_storage" && code !== "session_invalid") ||
-            (command === "get_missions" && code !== "session_invalid") ||
-            (command === "complete_mission" && code === "mission_incomplete") ||
-            (command === "get_insurance_quote" && code !== "session_invalid") ||
-            (command === "survey_system" && code === "no_scanner") ||
-            ((command === "deposit_items" || command === "view_storage") && code === "no_faction_storage") ||
-            (command === "withdraw_items" && code === "cargo_full");
-          if (!quiet) {
-            this.log("error", `${command}: ${resp.error.message}`);
+          // Cloak detection
+          this.isCloaked = !!(p.is_cloaked || p.cloaked);
+
+          // Tow detection - check for towing_wreck flag or tow_attached status
+          const towingField = (p.towing_wreck as boolean) ?? (p.towing as boolean) ?? (p.has_tow as boolean);
+          if (towingField != null) {
+            this.towingWreck = towingField;
           }
-        }
-
-          // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
-          // This helps collect player names faster as we move through the galaxy
-          if (!resp.error) {
-            const navigationCommands = ["travel", "jump", "dock", "undock"];
-            if (navigationCommands.includes(command)) {
-              // Small delay to let the navigation complete
-              await sleep(500);
-              const nearbyResp = await this.api.execute("get_nearby");
-              if (!nearbyResp.error && nearbyResp.result) {
-                this.trackNearbyPlayers(nearbyResp.result);
-              }
-              // For jump commands, also scan the entire system for players
-              if (command === "jump") {
-                const systemResp = await this.api.execute("get_system_agents");
-                if (!systemResp.error && systemResp.result) {
-                  this.trackSystemAgents(systemResp.result);
-                }
-              }
+          // Also check ship-level tow status
+          if (ship) {
+            const shipTowing = (ship.towing_wreck as boolean) ?? (ship.towing as boolean) ?? (ship.has_tow as boolean);
+            if (shipTowing != null) {
+              this.towingWreck = shipTowing;
             }
           }
 
-          // Track piloting XP after ship-based actions that grant exp
-          const PILOTING_EXP_COMMANDS = new Set([
-            'jump', 'travel', 'mine', 'attack', 'salvage_wreck', 'loot_wreck',
-            'refuel', 'repair', 'dock', 'undock', 'survey_system'
-          ]);
-          if (!resp.error && PILOTING_EXP_COMMANDS.has(command)) {
-             try {
-                await this.logSkillGains(command);
-             } catch (e) {
-                // ignore tracking errors
-             }
+          // Add this bot to the player tracking so it appears in the web UI players tab
+          playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
+
+          // Debug: log tow-related fields from status
+          if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
+              (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
+            this.log("debug", `Tow fields in status: p.towing_wreck=${p.towing_wreck}, p.towing=${p.towing}, p.has_tow=${p.has_tow}, ship.towing_wreck=${ship?.towing_wreck}, ship.towing=${ship?.towing}, ship.has_tow=${ship?.has_tow}, this.towingWreck=${this.towingWreck}`);
           }
 
-          return resp;
+          // Death detection
+          if (this.hull <= 0 && this.maxHull > 0) {
+            this.isDead = true;
+          } else if (this.hull > 0 && this.isDead) {
+            this.isDead = false; // respawned
+          }
+
+          // Fallback: fuel at top level
+          if (typeof r.fuel === "number") this.fuel = r.fuel;
+
+          // Skills are now tracked incrementally from mutation responses via exec()
+          // Use refreshSkills() for a dedicated skill refresh when needed
+        }
+
+// Log position change if system or poi updated
+        if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
+          this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
+          this.logPosition();
+          this.lastSystem = this.system;
+          this.lastPoi = this.poi;
+        }
+
+        return resp;
       } catch (err) {
         // Handle abort
         if (err instanceof Error && err.name === "AbortError" && this.currentBattle.inBattle) {
@@ -1163,22 +1150,16 @@ docked = false;
       // Use refreshSkills() for a dedicated skill refresh when needed
     }
 
-    // Log position change if system or poi updated
-    if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
-      this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
-      this.logPosition();
-      this.lastSystem = this.system;
-      this.lastPoi = this.poi;
-    }
+// Log position change if system or poi updated
+        if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
+          this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
+          this.logPosition();
+          this.lastSystem = this.system;
+          this.lastPoi = this.poi;
+        }
 
-    // Also refresh cargo inventory (and storage only if docked)
-    await this.refreshCargo();
-    if (this.docked) {
-      await this.refreshStorage();
-    }
-
-    return resp;
-  }
+        return resp;
+      }
 
   async refreshLocation(): Promise<ApiResponse> {
     const resp = await this.api.execute("get_location");
@@ -1240,7 +1221,7 @@ docked = false;
   async refreshCargoAndStorage(): Promise<ApiResponse> {
     const cargoResp = await this.api.execute("get_cargo");
     if (!cargoResp.error && cargoResp.result) {
-      this.inventory = this.parseItemList(cargoResp.result);
+      this.inventory = this.parseItemList(cargoResp.result, 'cargo');
     }
     if (this.docked) {
       await this.refreshStorage();
@@ -1299,7 +1280,7 @@ docked = false;
   }
 
   /** Parse an item list from API response, handling both item_id and resource_id formats. */
-  private parseItemList(result: unknown): CargoItem[] {
+  private parseItemList(result: unknown, preferField?: string): CargoItem[] {
     if (!result || typeof result !== "object") return [];
 
     let r = result as Record<string, unknown>;
@@ -1317,17 +1298,25 @@ docked = false;
       }
     }
 
-    const items = (
-      Array.isArray(r) ? r :
-      Array.isArray(r.items) ? r.items :
-      Array.isArray(r.cargo) ? r.cargo :
-      Array.isArray(r.storage) ? r.storage :
-      Array.isArray(r.stored_items) ? r.stored_items :
-      Array.isArray(r.faction_items) ? r.faction_items :
-      Array.isArray(r.faction_storage) ? r.faction_storage :
-      Array.isArray(r.data) ? r.data :
-      []
-    ) as Array<Record<string, unknown>>;
+    // Determine which field to use based on preferField or auto-detect
+    // preferField is used to prioritize a specific field (e.g., 'cargo' for get_cargo, 'storage' for view_storage)
+    let items: Array<Record<string, unknown>>;
+    if (preferField && Array.isArray(r[preferField])) {
+      items = r[preferField] as Array<Record<string, unknown>>;
+    } else {
+      // Auto-detect: check multiple fields in order of priority
+      items = (
+        Array.isArray(r) ? r :
+        Array.isArray(r.cargo) ? r.cargo :
+        Array.isArray(r.storage) ? r.storage :
+        Array.isArray(r.items) ? r.items :
+        Array.isArray(r.stored_items) ? r.stored_items :
+        Array.isArray(r.faction_items) ? r.faction_items :
+        Array.isArray(r.faction_storage) ? r.faction_storage :
+        Array.isArray(r.data) ? r.data :
+        []
+      ) as Array<Record<string, unknown>>;
+    }
 
     return items
       .map((item) => {
@@ -1346,13 +1335,13 @@ docked = false;
   async refreshCargo(): Promise<void> {
     const resp = await this.exec("get_cargo");
     // Always update inventory — even if response is empty/null, clear stale data
-    this.inventory = this.parseItemList(resp.result);
+    this.inventory = this.parseItemList(resp.result, 'cargo');
   }
 
   /** Fetch station storage contents and cache them. Pass station_id to check remotely. */
   async refreshStorage(stationId?: string): Promise<void> {
     const resp = await this.exec("view_storage", stationId ? { station_id: stationId } : undefined);
-    this.storage = this.parseItemList(resp.result);
+    this.storage = this.parseItemList(resp.result, 'storage');
   }
 
   /**

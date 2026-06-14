@@ -5338,7 +5338,7 @@ function mcRefreshStorageForDepositAll() {
     // Refresh cargo (get_cargo returns inventory)
     sendExec(profileBot, 'get_cargo', {}, (cargoResult) => {
       if (cargoResult.ok && cargoResult.data) {
-        // get_cargo returns { cargo: [...], cargoMax: N } or { items: [...] }
+        // get_cargo returns { cargo: [...] } or { items: [...] }
         const cargoData = (cargoResult.data.cargo || cargoResult.data.items || []).map(item => ({
           itemId: item.item_id || item.itemId,
           name: item.name || catalogName(item.item_id || item.itemId),
@@ -5738,7 +5738,11 @@ function mcRefreshStorageForGiftSendAll() {
   // Refresh cargo (get_cargo returns inventory)
   sendExec(profileBot, 'get_cargo', {}, (cargoResult) => {
     if (cargoResult.ok && cargoResult.data) {
-      const cargoData = cargoResult.data.cargo || cargoResult.data.items || [];
+      const cargoData = (cargoResult.data.cargo || cargoResult.data.items || []).map(item => ({
+        itemId: item.item_id || item.itemId,
+        name: item.name || catalogName(item.item_id || item.itemId),
+        quantity: item.quantity
+      }));
       bot.inventory = cargoData;
       logResponse(`<span class="resp-ok">Cargo: ${cargoData.length} items</span>`);
     }
@@ -6442,7 +6446,7 @@ function mcExec(command, params) {
       sendExec(profileBot, 'get_cargo', {}, (cargoResult) => {
         const bot = getFreshBot();
         if (bot && cargoResult.ok && cargoResult.data) {
-          const freshCargo = (cargoResult.data.cargo || cargoResult.data.items || []).map(item => ({
+          const freshCargo = (cargoResult.data.cargo || []).map(item => ({
             itemId: item.item_id || item.itemId,
             name: item.name || catalogName(item.item_id || item.itemId),
             quantity: item.quantity

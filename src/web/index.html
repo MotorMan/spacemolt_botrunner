@@ -775,6 +775,12 @@ let statsDaily = {};
 let profileReturnHomeIgnoreBlacklist = false;
 let lastUsedRoutines = {};
 
+// Fresh storage data that persists across status updates
+// These are NOT auto-cleared to prevent stale data from overwriting fresh data
+let _pendingFreshCargo = null;
+let _pendingFreshStorage = null;
+let _pendingFreshFactionStorage = null;
+
 // ── Resolve a system ID + optional POI ID to display names using mapData. ──
 
 /** Resolve a system ID + optional POI ID to display names using mapData. */
@@ -1398,15 +1404,15 @@ lastUsedRoutines = lastUsedRoutinesRes || {};
         case 'status':
         // Only update bots array if we're not in the middle of refreshing storage
         // (to avoid clobbering fresh data from our own fetches)
-        // Also check if we recently refreshed storage (within last 15 seconds to match fresh data timeout)
+        // Also check if we recently refreshed storage (within last 30 seconds to ensure fresh data is rendered)
         const _storageRefreshTime = window._lastStorageRefresh || 0;
-        const _blockStatusUpdate = window._refreshingStorage || (Date.now() - _storageRefreshTime < 15000);
+        const _blockStatusUpdate = window._refreshingStorage || (Date.now() - _storageRefreshTime < 30000);
         if (!_blockStatusUpdate) {
           // Preserve fresh cargo/storage data if available (from recent storage commands)
           // The status message may contain stale inventory/storage from bot.status()
-          const freshCargo = window._freshCargo;
-          const freshStorage = window._freshStorage;
-          const freshFactionStorage = window._freshFactionStorage;
+          const freshCargo = _pendingFreshCargo;
+          const freshStorage = _pendingFreshStorage;
+          const freshFactionStorage = _pendingFreshFactionStorage;
           
           bots = msg.bots || [];
           
@@ -1467,8 +1473,8 @@ lastUsedRoutines = lastUsedRoutinesRes || {};
             
             // Update faction storage panel in manual controls if fresh data is available
             // (renderManualControls is blocked by _blockRenderUntil, so update manually)
-            if (window._freshFactionStorage !== null && window._freshFactionStorage !== undefined) {
-              const factionItems = window._freshFactionStorage;
+            if (_pendingFreshFactionStorage !== null && _pendingFreshFactionStorage !== undefined) {
+              const factionItems = _pendingFreshFactionStorage;
               const factionSelect = document.getElementById('faction-wit-item');
               if (factionSelect && factionItems) {
                 // Store current selection
@@ -3507,12 +3513,8 @@ function renderProfileSidebar() {
 
   renderProfileTopbar();
 
-  const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
-  const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
-
-  // Use fresh data if available (set by handleExecResult callback), otherwise use bot data
-  const freshCargo = window._freshCargo || bot.inventory || [];
-  const freshStorage = window._freshStorage || bot.storage || [];
+  const freshCargo = _pendingFreshCargo || bot.inventory || [];
+  const freshStorage = _pendingFreshStorage || bot.storage || [];
 
   const invItems = freshCargo.length > 0
     ? freshCargo.map(i => `<div class="inv-item"><span class="inv-name">${esc(i.name)}</span><span class="inv-qty">x${i.quantity}</span></div>`).join('')
@@ -3601,8 +3603,8 @@ function updateProfileSidebar() {
   // Only update cargo/storage/skills cards if sidebar doesn't have focus
   if (!sidebar.contains(document.activeElement)) {
     // Use fresh data if available, otherwise use bot data
-    const freshCargo = window._freshCargo || bot.inventory || [];
-    const freshStorage = window._freshStorage || bot.storage || [];
+    const freshCargo = _pendingFreshCargo || bot.inventory || [];
+    const freshStorage = _pendingFreshStorage || bot.storage || [];
 
     // Update cargo hold
     const invItems = freshCargo.length > 0
@@ -3670,9 +3672,9 @@ function updateStorageDropdowns() {
   if (!bot) return;
 
   // Use fresh data if available (set by mcExec callback), otherwise use bot data
-  const cargoItems = window._freshCargo || bot.inventory || [];
-  const storageItems = window._freshStorage || bot.storage || [];
-  const factionItems = window._freshFactionStorage || profileFactionStorage || [];
+  const cargoItems = _pendingFreshCargo || bot.inventory || [];
+  const storageItems = _pendingFreshStorage || bot.storage || [];
+  const factionItems = _pendingFreshFactionStorage || profileFactionStorage || [];
 
   // Helper to update a select element while preserving selection
   function updateSelect(id, items, valueField, nameField, qtyField, selectedValue) {
@@ -3764,9 +3766,9 @@ async function renderManualControls(isFreshRender) {
   if (!bot) return;
 
   // Use fresh data if available (set by mcExec callback), otherwise use bot data
-  const freshCargo = window._freshCargo || bot.inventory || [];
-  const freshStorage = window._freshStorage || bot.storage || [];
-  const freshFaction = window._freshFactionStorage || profileFactionStorage || [];
+  const freshCargo = _pendingFreshCargo || bot.inventory || [];
+  const freshStorage = _pendingFreshStorage || bot.storage || [];
+  const freshFaction = _pendingFreshFactionStorage || profileFactionStorage || [];
 
   const poiOpts = profileSystemData && profileSystemData.pois
     ? [...profileSystemData.pois].sort((a, b) => ((a.name || a.id) || '').localeCompare((b.name || b.id) || '')).map(p => `<option value="${esc(p.id)}">${esc(p.name || p.id)} (${esc(p.type || '')})</option>`).join('')
@@ -4324,13 +4326,19 @@ function mcFactionWithdraw() {
     
     sendExec(profileBot, 'view_storage', { target: 'faction' }, (result) => {
       if (result.ok && result.data) {
-        const items = result.data.items || result.data.storage || [];
+        const items = (result.data.items || result.data.storage || []).map(item => ({
+          item_id: item.item_id || item.itemId,
+          name: item.name || catalogName(item.item_id || item.itemId),
+          quantity: item.quantity
+        }));
         profileFactionStorage = items;
+        _pendingFreshFactionStorage = items;
         logResponse(`<span class="resp-ok">Loaded ${items.length} faction storage items</span>`);
         renderManualControls();
         updateStorageDropdowns();
       } else {
         profileFactionStorage = [];
+        _pendingFreshFactionStorage = [];
         logResponse(`<span class="resp-err">Failed to load faction storage: ${esc(result.error || 'not at station')}</span>`);
         renderManualControls();
         updateStorageDropdowns();
@@ -6322,10 +6330,11 @@ function mcExec(command, params) {
   const isStorageCommand = ['deposit_items', 'withdraw_items', 'storage', 'sell', 'buy', 'jettison', 'craft'].includes(command);
   if (isStorageCommand) {
     window._refreshingStorage = true;
+    window._lastStorageRefresh = Date.now();
     // Clear any previous fresh data to start fresh
-    window._freshCargo = null;
-    window._freshStorage = null;
-    window._freshFactionStorage = null;
+    _pendingFreshCargo = null;
+    _pendingFreshStorage = null;
+    _pendingFreshFactionStorage = null;
   }
 
   // Rate limit action commands (1 per tick)
@@ -6359,20 +6368,23 @@ function mcExec(command, params) {
       const getFreshBot = () => bots.find(b => b.username === profileBot);
       let pendingFetches = 0;
 
-      const checkAllDone = () => {
-        if (pendingFetches <= 0) {
+const checkAllDone = () => {
+        if (pendingFetches > 0) return;
+        
+        // Render with fresh data, then block re-renders for 3 seconds
+        renderProfileSidebar();
+        renderManualControls(true); // true = force render (don't block)
+        // Also update dropdowns directly to preserve selections
+        updateStorageDropdowns();
+        window._blockRenderUntil = Date.now() + 10000; // Block re-renders for 10 seconds
+        
+        // Delay clearing the flag to ensure status updates are blocked
+        setTimeout(() => {
           window._refreshingStorage = false;
-          window._lastStorageRefresh = Date.now(); // Mark when we last refreshed storage
-          // Render with fresh data, then block re-renders for 3 seconds
-          renderProfileSidebar();
-          renderManualControls(true); // true = force render (don't block)
-          // Also update dropdowns directly to preserve selections
-          updateStorageDropdowns();
-          window._blockRenderUntil = Date.now() + 10000; // Block re-renders for 10 seconds
-          // Note: fresh data variables (_freshCargo, _freshStorage, _freshFactionStorage)
-          // are NOT auto-cleared. They will be overwritten when the next storage command runs.
-          // This ensures status updates don't revert to stale data.
-        }
+        }, 100);
+        // Note: fresh data variables (_pendingFreshCargo, _pendingFreshStorage, _pendingFreshFactionStorage)
+        // are NOT auto-cleared. They will be overwritten when the next storage command runs.
+        // This ensures status updates don't revert to stale data.
       };
 
       // Step 1: Fetch updated cargo
@@ -6386,7 +6398,7 @@ function mcExec(command, params) {
             quantity: item.quantity
           }));
           bot.inventory = freshCargo;
-          window._freshCargo = freshCargo;
+          _pendingFreshCargo = freshCargo;
         }
         pendingFetches--;
         checkAllDone();
@@ -6403,7 +6415,7 @@ function mcExec(command, params) {
             quantity: item.quantity
           }));
           bot.storage = freshStorage;
-          window._freshStorage = freshStorage;
+          _pendingFreshStorage = freshStorage;
         }
         pendingFetches--;
         checkAllDone();
@@ -6418,7 +6430,7 @@ function mcExec(command, params) {
             quantity: item.quantity
           }));
           profileFactionStorage = freshFaction;
-          window._freshFactionStorage = freshFaction;
+          _pendingFreshFactionStorage = freshFaction;
         }
         pendingFetches--;
         checkAllDone();

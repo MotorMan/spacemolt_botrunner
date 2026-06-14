@@ -255,8 +255,8 @@ function getHunterSettings(username?: string): {
     homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || "",
     desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
     desiredRepairKits: (h.desiredRepairKits as number) ?? 12,
-    pirateBaseSystem: (h.pirateBaseSystem as string) || "",
-    patrolRadius: (h.patrolRadius as number) || 5,
+    pirateBaseSystem: (botOverrides.pirateBaseSystem as string) || (h.pirateBaseSystem as string) || "",
+    patrolRadius: (botOverrides.patrolRadius as number) || (h.patrolRadius as number) || 5,
   };
 }
 
@@ -278,6 +278,13 @@ export function setPatrolSystems(username: string, systems: string[]): void {
 export function setPatrolCycleMode(username: string, mode: PatrolCycleMode): void {
   writeSettings({
     [username]: { patrolCycleMode: mode },
+  });
+}
+
+/** Persist patrol radius settings for a specific bot. */
+export function setPatrolRadius(username: string, pirateBaseSystem: string, patrolRadius: number): void {
+  writeSettings({
+    [username]: { pirateBaseSystem, patrolRadius },
   });
 }
 

@@ -5351,8 +5351,7 @@ function mcRefreshStorageForDepositAll() {
     // Refresh station storage
     sendExec(profileBot, 'view_storage', {}, (storageResult) => {
       if (storageResult.ok && storageResult.data) {
-        // view_storage returns { storage: [...] } or { items: [...] }
-        const storageData = (storageResult.data.storage || storageResult.data.items || []).map(item => ({
+        const storageData = (storageResult.data.storage || []).map(item => ({
           itemId: item.item_id || item.itemId,
           name: item.name || catalogName(item.item_id || item.itemId),
           quantity: item.quantity
@@ -5747,7 +5746,11 @@ function mcRefreshStorageForGiftSendAll() {
     // Refresh station storage
     sendExec(profileBot, 'view_storage', {}, (storageResult) => {
       if (storageResult.ok && storageResult.data) {
-        const storageData = storageResult.data.storage || storageResult.data.items || [];
+        const storageData = (storageResult.data.storage || []).map(item => ({
+          itemId: item.item_id || item.itemId,
+          name: item.name || catalogName(item.item_id || item.itemId),
+          quantity: item.quantity
+        }));
         bot.storage = storageData;
         logResponse(`<span class="resp-ok">Station storage: ${storageData.length} items</span>`);
       }
@@ -6456,7 +6459,7 @@ function mcExec(command, params) {
       sendExec(profileBot, 'view_storage', {}, (storageResult) => {
         const bot = getFreshBot();
         if (bot && storageResult.ok && storageResult.data) {
-          const freshStorage = (storageResult.data.storage || storageResult.data.items || []).map(item => ({
+          const freshStorage = (storageResult.data.storage || []).map(item => ({
             itemId: item.item_id || item.itemId,
             name: item.name || catalogName(item.item_id || item.itemId),
             quantity: item.quantity

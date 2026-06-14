@@ -6433,6 +6433,7 @@ function mcExec(command, params) {
       });
 
       // Step 3: Fetch updated faction storage using view_storage with target: 'faction'
+      pendingFetches++;
       sendExec(profileBot, 'view_storage', { target: 'faction' }, (factionResult) => {
         if (factionResult.ok && factionResult.data) {
           const freshFaction = (factionResult.data.items || factionResult.data.storage || []).map(item => ({
@@ -6446,6 +6447,9 @@ function mcExec(command, params) {
         pendingFetches--;
         checkAllDone();
       });
+    } else if (isStorageCommand && !result.ok) {
+      // Clear flag on error for storage commands
+      window._refreshingStorage = false;
     } else {
       // Original behavior for other commands
       setTimeout(() => {

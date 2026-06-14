@@ -5353,12 +5353,14 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
       const { oreId, oreName } = parseOreFromMineResult(mineResp.result);
       
       // MINING RESULT SUMMARY: Log exactly what was mined for visibility
+      // The mine response may be nested under 'details' field per OpenAPI spec
       if (mineResp.result && typeof mineResp.result === "object") {
         const result = mineResp.result as Record<string, unknown>;
-        const quantity = (result.quantity as number) ?? (result.amount as number) ?? 1;
-        const richness = (result.richness as number) ?? 0;
-        const resourceType = (result.resource_type as string) ?? (result.type as string) ?? "";
-        const poiName = (result.poi_name as string) ?? (result.location as string) ?? miningPoi?.name ?? "";
+        const responseData = (result.details as Record<string, unknown>) || result;
+        const quantity = (responseData.quantity as number) ?? (responseData.amount as number) ?? 1;
+        const richness = (responseData.richness as number) ?? 0;
+        const resourceType = (responseData.resource_type as string) ?? (responseData.type as string) ?? "";
+        const poiName = (responseData.poi_name as string) ?? (responseData.location as string) ?? miningPoi?.name ?? "";
         
         // Build a detailed summary of what was mined
         const summaryParts = [`Mined ${quantity}x ${oreName || "unknown"}`];
@@ -5371,7 +5373,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
         ctx.log("mining", `${summaryParts.join(" ")}${dcTag}`);
         
         // SKILL XP DISPLAY: Show skill gains from the mine response
-        const xpGained = result.xp_gained as Record<string, number> | undefined;
+        const xpGained = responseData.xp_gained as Record<string, number> | undefined;
         if (xpGained && Object.keys(xpGained).length > 0) {
           const xpParts = Object.entries(xpGained)
             .map(([skill, amount]) => `${skill}: +${amount}`)

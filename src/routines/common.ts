@@ -364,7 +364,12 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
   if (!result || typeof result !== "object") return { oreId: "", oreName: "" };
 
   const mr = result as Record<string, unknown>;
-  const ore = mr.item ?? mr.ore ?? mr.mined;
+  
+  // The mine response may be nested under 'details' field per OpenAPI spec
+  // structuredContent: V2GameState post-mutation delta; command result is under `details` (MineResponse)
+  const responseData = (mr.details as Record<string, unknown>) || mr;
+  
+  const ore = responseData.item ?? responseData.ore ?? responseData.mined;
   let oreId = "";
   let oreName = "";
 
@@ -373,8 +378,8 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
     oreId = (oreObj.item_id as string) || (oreObj.id as string) || (oreObj.name as string) || "";
     oreName = (oreObj.name as string) || oreId;
   } else {
-    oreId = (mr.resource_id as string) || (mr.item_id as string) || (mr.ore_id as string) || "";
-    oreName = (mr.resource_name as string) || (mr.item_name as string) || (mr.ore_name as string) || (mr.name as string) || oreId;
+    oreId = (responseData.resource_id as string) || (responseData.item_id as string) || (responseData.ore_id as string) || "";
+    oreName = (responseData.resource_name as string) || (responseData.item_name as string) || (responseData.ore_name as string) || (responseData.name as string) || oreId;
   }
 
   return { oreId, oreName };

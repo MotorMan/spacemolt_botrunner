@@ -801,9 +801,11 @@ docked = false;
           const p = location || player || r;
 
           if (command === "mine") {
-            const qty = (r.quantity as number) || (r.count as number) || 0;
+            // Mine response is nested under 'details' per OpenAPI spec
+            const details = (r.details as Record<string, unknown>) || r;
+            const qty = (details.quantity as number) || (details.count as number) || 0;
             if (qty) this.cargo = Math.max(0, this.cargo + qty);
-            const xpGained = r.xp_gained as Record<string, number> | undefined;
+            const xpGained = details.xp_gained as Record<string, number> | undefined;
             if (xpGained) {
               for (const [skill, gained] of Object.entries(xpGained)) {
                 this.skillXP.set(skill, (this.skillXP.get(skill) || 0) + gained);

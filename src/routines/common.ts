@@ -31,6 +31,20 @@ export function shouldStopForEmergency(ctx: RoutineContext): boolean {
   return ctx.bot.state !== "running";
 }
 
+/**
+ * Low-bandwidth notification refresh for idle bots.
+ * Calls get_notifications with limit=1, clear=false to keep sessions alive
+ * without heavy API traffic. Returns the notifications for processing.
+ */
+export async function refreshNotifications(ctx: RoutineContext): Promise<unknown> {
+  const resp = await ctx.bot.api.execute("get_notifications", { limit: 1, clear: false });
+  if (resp.error) {
+    ctx.log("system", `Notification refresh failed: ${resp.error.message}`);
+    return { notifications: [] };
+  }
+  return resp.result || { notifications: [] };
+}
+
 // ── Types ────────────────────────────────────────────────────
 
 export interface BaseServices {

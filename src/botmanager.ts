@@ -1119,6 +1119,8 @@ async function main(): Promise<void> {
           if (bot.state === "running" && bot.api.getSession()) {
             refreshPromises.push(bot.refreshShip().catch(() => {}));
             refreshPromises.push(bot.refreshLocation().catch(() => {}));
+            // Also do a lightweight notification check to keep session alive
+            refreshPromises.push(bot.api.execute("get_notifications", { limit: 1, clear: false }).catch(() => {}));
             refreshCount++;
           }
         }
@@ -1132,6 +1134,28 @@ async function main(): Promise<void> {
       }
     }, periodicRefreshSec * 1000));
   }
+
+  // Low-bandwidth session keep-alive: get_notifications every 40s for idle bots
+  // This keeps sessions alive and fetches notifications without heavy API calls
+  intervals.push(setInterval(async () => {
+    try {
+      const keepAlivePromises = [];
+      let keepAliveCount = 0;
+      for (const [name, bot] of bots) {
+        // Only hit API for idle bots (not already doing heavy refresh)
+        if (bot.state === "idle" && bot.api.getSession()) {
+          keepAlivePromises.push(bot.api.execute("get_notifications", { limit: 1, clear: false }).catch(() => {}));
+          keepAliveCount++;
+        }
+      }
+      if (keepAliveCount > 0) {
+        debugLogForBot("SYSTEM", "periodic:keepalive", `Session keep-alive for ${keepAliveCount} idle bot(s)`);
+      }
+      await Promise.allSettled(keepAlivePromises);
+    } catch (err) {
+      console.error('Error in periodic session keep-alive:', err);
+    }
+  }, 40 * 1000));
 
   // Periodic map data push (every 15s so dashboard stays current)
   intervals.push(setInterval(() => {

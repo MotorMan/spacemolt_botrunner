@@ -1816,7 +1816,7 @@ skipToReturnHome = true;
       }
 
       let maydayTarget: RescueTarget | null = null;
-      if (targets.length === 0) {
+if (targets.length === 0) {
         if (!isMaydayRescuePrimary) {
           const ignoredMayday = getNextMayday();
           if (ignoredMayday) {
@@ -1830,15 +1830,7 @@ skipToReturnHome = true;
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
 
-          // ── ESTABLISH 1-HOUR COOLDOWN IMMEDIATELY ──
-          // Mark as received BEFORE any checks to establish the cooldown upfront
-          // This prevents the MAYDAY from re-triggering even if accepted or declined
-          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
-          ctx.log("mayday_debug", `📝 MAYDAY from ${mayday.sender} marked as received (1-hour cooldown active)`);
-
           // ── DECLINED MAYDAY CHECK: Prevent spam for already-declined rescues ──
-          // This prevents the bot from sending multiple decline messages for the same MAYDAY
-          // Check this FIRST, before the duplicate check, to catch declined MAYDAYS immediately
           if (isMaydayDeclined(mayday.sender, mayday.system, mayday.poi)) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - previously declined (1-hour cooldown)`);
             markMaydayHandled(mayday);
@@ -1846,7 +1838,6 @@ skipToReturnHome = true;
           }
           
           // ── IMMEDIATE DUPLICATE CHECK: Prevent rapid-fire spam ──
-          // This uses a 5-second grace period for newly received MAYDAYs
           if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (1-hour cooldown)`);
             markMaydayHandled(mayday);
@@ -2096,16 +2087,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           }
 
           maydayTarget = {
-            username: mayday.sender,
+username: mayday.sender,
             system: mayday.system,
             poi: mayday.poi,
             fuelPct: mayday.fuelPct,
             docked: false,
           };
+          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
           
-          // ── RESCUE COOPERATION: Send claim to partner bot ──
+          // ── RESCUE COOPERATION: Send claim to partner bot ─-
           if (isCooperationEnabled()) {
             const myClaim: RescueClaim = {
               type: "RESCUE_CLAIM",
@@ -4956,6 +4948,20 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
 
+          // ── DECLINED MAYDAY CHECK: Prevent spam for already-declined rescues ──
+          if (isMaydayDeclined(mayday.sender, mayday.system, mayday.poi)) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - previously declined (1-hour cooldown)`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+          
+          // ── IMMEDIATE DUPLICATE CHECK: Prevent rapid-fire spam ──
+          if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (1-hour cooldown)`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+
           // Check if sender is a known player (from playerNames.json)
           const knownPlayer = isKnownPlayer(mayday.sender);
 
@@ -5138,7 +5144,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                   continue;
                 }
               }
-            } catch (e) {
+} catch (e) {
               ctx.log("warn", `Could not calculate route to ${mayday.system}: ${e}`);
             }
           }
@@ -5150,10 +5156,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             fuelPct: mayday.fuelPct,
             docked: false,
           };
+          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
           
-          // ── RESCUE COOPERATION: Send claim to partner bot ──
+          // ── RESCUE COOPERATION: Send claim to partner bot ─-
           if (isCooperationEnabled()) {
             const myClaim: RescueClaim = {
               type: "RESCUE_CLAIM",

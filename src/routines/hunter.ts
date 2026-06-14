@@ -632,9 +632,7 @@ function findSystemsWithinRadius(fromSystemId: string, maxJumps: number): string
   
   while (queue.length > 0) {
     const current = queue.shift()!;
-    if (current.hops > 0) {
-      result.push(current.id);
-    }
+    result.push(current.id);
     
     if (current.hops >= maxJumps) continue;
     

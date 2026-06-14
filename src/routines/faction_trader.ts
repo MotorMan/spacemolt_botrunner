@@ -81,6 +81,7 @@ function getFactionTraderSettings(username?: string): {
   tradeItems: TradeItemConfig[];
   stationPriority: boolean;
   categoryTrade: CategoryTradeConfig[];
+  sellAllItems: boolean;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -131,6 +132,7 @@ function getFactionTraderSettings(username?: string): {
     tradeItems,
     stationPriority: (botOverrides.stationPriority as boolean) || false,
     categoryTrade,
+    sellAllItems: (t.sellAllItems as boolean) || false,
   };
 }
 
@@ -528,7 +530,7 @@ function findFactionSellRoutes(
   const costPerJump = settings.fuelCostPerJump;
 
   // Collect items to process: explicit trade items + category-based items
-  const itemsToProcess: Array<{ item: typeof storage[0]; source: 'explicit' | 'category'; categoryConfig?: CategoryTradeConfig }> = [];
+  const itemsToProcess: Array<{ item: typeof storage[0]; source: 'explicit' | 'category' | 'all'; categoryConfig?: CategoryTradeConfig }> = [];
   const processedItemIds = new Set<string>();
 
   // First, add explicit trade items
@@ -568,6 +570,19 @@ function findFactionSellRoutes(
     }
   }
 
+  // Finally, if sellAllItems is enabled, add remaining storage items
+  if (settings.sellAllItems) {
+    for (const item of storage) {
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+      if (item.quantity <= 0) continue;
+      if (processedItemIds.has(item.itemId)) continue;
+
+      itemsToProcess.push({ item, source: 'all' });
+      processedItemIds.add(item.itemId);
+    }
+  }
+
   // Now process all collected items
   for (const { item, source, categoryConfig } of itemsToProcess) {
     // Get per-item settings (case-insensitive match)
@@ -594,9 +609,9 @@ function findFactionSellRoutes(
       
       ctx.log("trade", `Category ${categoryConfig.category}: ${item.quantity}x ${item.name}, selling ${itemMaxSellQty} (${sellPercent}%), min price ${itemMinSellPrice}cr`);
     } else {
-      // Fallback to defaults
+      // 'all' source - use global minSellPrice
       itemMinSellPrice = settings.minSellPrice;
-      itemMaxSellQty = 0;
+      itemMaxSellQty = 0; // 0 = sell all
       itemSoldQty = 0;
     }
     

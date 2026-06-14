@@ -730,24 +730,62 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
     bot.trackNearbyPlayers(resp.result);
   }
 
-  // Broadcast skills update for get_skills command
+// Broadcast skills update for get_skills command
   if (!resp.error && resp.result && command === "get_skills") {
-    const skills = resp.result as Record<string, Record<string, unknown>>;
-    const skillData: Record<string, { level: number; xp: number; nextLevelXp: number }> = {};
-    for (const [skillId, s] of Object.entries(skills)) {
-      if (s && typeof s === "object") {
-        const skillObj = s as Record<string, unknown>;
-        const level = (skillObj.level as number) ?? (skillObj.current_level as number) ?? 0;
-        const xp = (skillObj.xp as number) ?? (skillObj.experience as number) ?? (skillObj.current_xp as number) ?? 0;
-        const xpToNext = (skillObj.xp_to_next_level as number) ?? (skillObj.xp_to_next as number) ?? (skillObj.xp_needed as number) ?? (skillObj.xp_remaining as number) ?? 0;
-        skillData[skillId] = {
-          level: level || 0,
-          xp: xp || 0,
-          nextLevelXp: xpToNext || 0
-        };
+    let skillsObj: Record<string, Record<string, unknown>> | null = null;
+    
+    // Handle different response formats
+    if (typeof resp.result === "string") {
+      try {
+        const parsed = JSON.parse(resp.result);
+        // Check if it's wrapped in a message/skills format
+        if (parsed.skills && typeof parsed.skills === "object") {
+          skillsObj = parsed.skills as Record<string, Record<string, unknown>>;
+        } else {
+          skillsObj = parsed as Record<string, Record<string, unknown>>;
+        }
+      } catch (e) {
+        // Failed to parse
+      }
+    } else if (resp.result && typeof resp.result === "object") {
+      const r = resp.result as Record<string, unknown>;
+      // Check for structuredContent wrapper (V2 API format)
+      if (r.structuredContent && typeof r.structuredContent === "object") {
+        const sc = r.structuredContent as Record<string, unknown>;
+        if (sc.skills && typeof sc.skills === "object") {
+          skillsObj = sc.skills as Record<string, Record<string, unknown>>;
+        }
+      }
+      // Check if skills is directly in result
+      if (!skillsObj && r.skills && typeof r.skills === "object") {
+        skillsObj = r.skills as Record<string, Record<string, unknown>>;
+      }
+      // Otherwise use result directly
+      if (!skillsObj) {
+        skillsObj = r as Record<string, Record<string, unknown>>;
       }
     }
-    server.broadcastSkillsUpdate(botName, skillData);
+    
+    if (skillsObj) {
+      const skillData: Record<string, { level: number; xp: number; nextLevelXp: number }> = {};
+      for (const [skillId, s] of Object.entries(skillsObj)) {
+        // Skip 'message' key if present (can appear in some API responses)
+        if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
+        
+        if (s && typeof s === "object") {
+          const skillObj = s as Record<string, unknown>;
+          const level = (skillObj.level as number) ?? (skillObj.current_level as number) ?? 0;
+          const xp = (skillObj.xp as number) ?? (skillObj.experience as number) ?? (skillObj.current_xp as number) ?? 0;
+          const xpToNext = (skillObj.xp_to_next_level as number) ?? (skillObj.next_level_xp as number) ?? (skillObj.xp_to_next as number) ?? (skillObj.xp_needed as number) ?? (skillObj.xp_remaining as number) ?? 0;
+          skillData[skillId] = {
+            level: level || 0,
+            xp: xp || 0,
+            nextLevelXp: xpToNext || 0
+          };
+        }
+      }
+      server.broadcastSkillsUpdate(botName, skillData);
+    }
   }
 
   // Refresh cached state after mutating commands

@@ -6958,7 +6958,30 @@ function fetchSkills(username) {
       return;
     }
 
-    const skillsData = result.data;
+    let skillsData = result.data;
+    if (typeof skillsData === 'string') {
+      try {
+        const parsed = JSON.parse(skillsData);
+        // Check for structuredContent.skills
+        if (parsed.structuredContent && parsed.structuredContent.skills) {
+          skillsData = parsed.structuredContent.skills;
+        } else {
+          skillsData = parsed;
+        }
+      } catch (e) {
+        profileSkillsList = [];
+        profileSkills = {};
+        renderProfileSidebar();
+        renderManualControls();
+        return;
+      }
+    } else if (skillsData && typeof skillsData === 'object') {
+      // Check for structuredContent.skills
+      if (skillsData.structuredContent && skillsData.structuredContent.skills) {
+        skillsData = skillsData.structuredContent.skills;
+      }
+    }
+
     const skills = Object.entries(skillsData).map(([id, data]) => {
       const s = (data && typeof data === 'object') ? data : {};
       return {
@@ -6967,8 +6990,8 @@ function fetchSkills(username) {
         id: id,
         level: s.level ?? s.current_level ?? 0,
         xp: s.xp ?? s.experience ?? s.current_xp ?? 0,
-        xp_to_next: s.xp_to_next_level ?? s.xp_to_next ?? s.xp_needed ?? s.xp_remaining,
-        next_level_xp: s.xp_to_next_level ?? s.xp_to_next ?? s.xp_needed ?? s.xp_remaining,
+        xp_to_next: s.xp_to_next_level ?? s.next_level_xp ?? s.xp_to_next ?? s.xp_needed ?? s.xp_remaining,
+        next_level_xp: s.xp_to_next_level ?? s.next_level_xp ?? s.xp_to_next ?? s.xp_needed ?? s.xp_remaining,
         total_xp: s.total_xp ?? s.total_experience ?? s.cumulative_xp,
       };
     });

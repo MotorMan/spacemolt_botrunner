@@ -2924,7 +2924,7 @@ function renderProfileTopbar() {
       <input type="number" id="profile-pathfinderRefuel" value="${refuelThreshold}" min="10" max="90" style="width:60px" onchange="saveProfilePathfinderRefuel()">`;
   }
 
-  // Per-bot hunter mode selector (visible when hunter is selected or running)
+// Per-bot hunter mode selector (visible when hunter is selected or running)
   const isHunter = (bot.state === 'running' && bot.routine === 'hunter')
     || (bot.state !== 'running' && bot.state !== 'stopping' && getProfileSelectedRoutine() === 'hunter');
   if (isHunter) {
@@ -2938,6 +2938,7 @@ function renderProfileTopbar() {
         <option value="stationary"${hunterMode === 'stationary' ? ' selected' : ''}>Stationary</option>
         <option value="patrol_systems"${hunterMode === 'patrol_systems' ? ' selected' : ''}>Patrol specific systems</option>
         <option value="cycle_patrols"${hunterMode === 'cycle_patrols' ? ' selected' : ''}>Cycle patrols</option>
+        <option value="patrol_radius"${hunterMode === 'patrol_radius' ? ' selected' : ''}>Patrol radius</option>
       </select>`;
 
     const patrolCycleMode = botSettings.patrolCycleMode || 'random';
@@ -2970,10 +2971,29 @@ function renderProfileTopbar() {
 
     const singleLoop = botSettings.singleLoop ?? false;
     actions += `
-      <label class="profile-ore-label" style="margin-left:8px;cursor:pointer;display:inline-flex;align-items:center;gap:4px">
+      <label class="profile-ore-label" style="cursor:pointer;display:inline-flex;align-items:center;gap:4px;margin-left:8px">
         <input type="checkbox" id="profile-hunter-singleLoop" onchange="saveProfileHunterSingleLoop()"${singleLoop ? ' checked' : ''}>
         Single Loop
       </label>`;
+
+// patrol_radius specific settings
+    if (hunterMode === 'patrol_radius') {
+      const pirateBaseSystem = botSettings.pirateBaseSystem || '';
+      const patrolRadius = botSettings.patrolRadius ?? 5;
+      const sysOpts = [`<option value=""${!pirateBaseSystem ? ' selected' : ''}>(current system)</option>`];
+      for (const sys of [...knownSystems].sort((a, b) => (a.name || a.id || '').localeCompare(b.name || b.id || ''))) {
+        const sel = sys.id === pirateBaseSystem ? ' selected' : '';
+        sysOpts.push(`<option value="${esc(sys.id)}"${sel}>${esc(sys.name || sys.id)}</option>`);
+      }
+      if (pirateBaseSystem && !knownSystems.find(s => s.id === pirateBaseSystem)) {
+        sysOpts.push(`<option value="${esc(pirateBaseSystem)}" selected>${esc(pirateBaseSystem)} (custom)</option>`);
+      }
+      actions += `
+        <span class="profile-ore-label" style="margin-left:8px">Base:</span>
+        <select id="profile-pirateBaseSystem" onchange="saveProfileHunterPatrolRadius()" style="width:auto;padding:2px 6px;font-size:11px">${sysOpts.join('')}</select>
+        <span class="profile-ore-label" style="margin-left:8px">Radius:</span>
+<input type="number" id="profile-patrolRadius" value="${patrolRadius}" min="1" max="20" style="width:60px" onchange="saveProfileHunterPatrolRadius()">`;
+    }
   }
 
   // Per-bot crafter profile selector (visible when crafter is selected or running)
@@ -3227,6 +3247,22 @@ function saveProfilePatrolCycleMode() {
 
   const existing = settings[bot.username] || {};
   const updated = Object.assign({}, existing, { patrolCycleMode });
+  send({ type: 'saveSettings', routine: bot.username, settings: updated });
+  settings[bot.username] = updated;
+}
+
+function saveProfileHunterPatrolRadius() {
+  const bot = getProfileBot();
+  if (!bot) return;
+  
+  const baseSel = document.getElementById('profile-pirateBaseSystem');
+  const radiusInp = document.getElementById('profile-patrolRadius');
+  
+  const pirateBaseSystem = baseSel ? baseSel.value : '';
+  const patrolRadius = radiusInp ? parseInt(radiusInp.value, 10) || 5 : 5;
+
+  const existing = settings[bot.username] || {};
+  const updated = Object.assign({}, existing, { pirateBaseSystem, patrolRadius });
   send({ type: 'saveSettings', routine: bot.username, settings: updated });
   settings[bot.username] = updated;
 }

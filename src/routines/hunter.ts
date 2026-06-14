@@ -1,6 +1,14 @@
 /**
  * Hunter routine — patrols a system hunting pirate NPCs for bounties and loot.
  *
+ * Modes:
+ *   - roam_systems: Navigate to configured patrol system, or find nearest huntable system
+ *   - roam_system: Stay in current system and patrol POIs
+ *   - stationary: Stay in one POI, wait for targets
+ *   - patrol_systems: Cycle through a configured list of systems
+ *   - cycle_patrols: Cycle through named patrol profiles
+ *   - patrol_radius: Patrol all systems within X jumps of a pirate base system
+ *
  * Loop:
  *   1. Navigate to configured patrol system
  *   2. Visit each non-station POI looking for pirate targets
@@ -27,6 +35,8 @@
  *   onlyNPCs        — only attack NPC pirates, never players (default: true)
  *   ammoReloadAbsoluteThreshold — ammo count to reload when weapon has ≤50 total ammo (default: 1)
  *   ammoReloadPercentThreshold — % of max ammo to reload when weapon has >50 total ammo (default: 25)
+ *   pirateBaseSystem — system ID for patrol_radius mode (default: "" - currently configured base)
+ *   patrolRadius    — max jumps from pirate base for patrol_radius mode (default: 5)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -154,7 +164,7 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
 
 // ── Settings ─────────────────────────────────────────────────
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius";
 
 export type PatrolCycleMode = "random" | "sequential";
 
@@ -197,6 +207,8 @@ function getHunterSettings(username?: string): {
   homeStation: string;
   desiredShieldCharges: number;
   desiredRepairKits: number;
+  pirateBaseSystem: string;
+  patrolRadius: number;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -243,6 +255,8 @@ function getHunterSettings(username?: string): {
     homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || "",
     desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
     desiredRepairKits: (h.desiredRepairKits as number) ?? 12,
+    pirateBaseSystem: (h.pirateBaseSystem as string) || "",
+    patrolRadius: (h.patrolRadius as number) || 5,
   };
 }
 
@@ -580,6 +594,36 @@ function findNextHuntSystem(fromSystemId: string): string | null {
   return null;
 }
 
+function findSystemsWithinRadius(fromSystemId: string, maxJumps: number): string[] {
+  const blacklist = getSystemBlacklist();
+  const blacklistSet = new Set(blacklist.map(s => s.toLowerCase()));
+  
+  const result: string[] = [];
+  const visited = new Set<string>([fromSystemId]);
+  const queue: Array<{ id: string; hops: number }> = [{ id: fromSystemId, hops: 0 }];
+  
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    if (current.hops > 0) {
+      result.push(current.id);
+    }
+    
+    if (current.hops >= maxJumps) continue;
+    
+    const conns = mapStore.getConnections(current.id);
+    for (const conn of conns) {
+      const nextId = conn.system_id;
+      if (!nextId || visited.has(nextId)) continue;
+      if (blacklistSet.has(nextId.toLowerCase())) continue;
+      
+      visited.add(nextId);
+      queue.push({ id: nextId, hops: current.hops + 1 });
+    }
+  }
+  
+  return result;
+}
+
 // ── Ammo management ──────────────────────────────────────────
 
 // ── Faction alert response ────────────────────────────────────
@@ -686,6 +730,10 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   }
   if (initialSettings.mode === "cycle_patrols") {
     yield* cyclePatrolsRoutine(ctx);
+    return;
+  }
+  if (initialSettings.mode === "patrol_radius") {
+    yield* patrolRadiusRoutine(ctx);
     return;
   }
 
@@ -2285,6 +2333,117 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
       }
       await ensureHunterResupply(ctx);
       profileIndex = 0;
+    }
+  }
+}
+
+async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshLocation();
+  let totalKills = 0;
+
+  const settings = getHunterSettings(bot.username);
+  const pirateBase = settings.pirateBaseSystem;
+  const maxJumps = settings.patrolRadius;
+
+  if (!pirateBase) {
+    ctx.log("error", "patrol_radius mode requires pirateBaseSystem to be configured — falling back to roam_systems");
+    yield* roamSystemsRoutine(ctx);
+    return;
+  }
+
+  const patrolList = findSystemsWithinRadius(pirateBase, maxJumps);
+  if (patrolList.length === 0) {
+    ctx.log("error", `patrol_radius mode: no systems found within ${maxJumps} jumps of ${pirateBase} — falling back to roam_systems`);
+    yield* roamSystemsRoutine(ctx);
+    return;
+  }
+
+  ctx.log("info", `Patrol radius mode: ${patrolList.length} systems within ${maxJumps} jumps of ${pirateBase}`);
+  let systemIndex = 0;
+
+  while (bot.state === "running") {
+    const currentSettings = getHunterSettings(bot.username);
+    const currentSafetyOpts = {
+      fuelThresholdPct: currentSettings.refuelThreshold,
+      hullThresholdPct: currentSettings.repairThreshold,
+      autoCloak: currentSettings.autoCloak,
+      skipBlacklist: true,
+      isCombatBot: true,
+    };
+
+    const targetSystem = patrolList[systemIndex % patrolList.length];
+    systemIndex++;
+
+    if (bot.system !== targetSystem) {
+      ctx.log("travel", `Patrol radius: heading to ${targetSystem}...`);
+      const arrived = await navigateToSystem(ctx, targetSystem, currentSafetyOpts);
+      if (!arrived) {
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
+          await handleNavigationBattleInterrupt(ctx, currentSettings);
+        } else {
+          ctx.log("error", `Could not reach ${targetSystem} — skipping`);
+          await ctx.sleep(5000);
+          continue;
+        }
+      }
+    }
+
+    ctx.log("info", `Starting patrol sweep in ${targetSystem}`);
+    yield* (async function* singleSystemPatrol() {
+      await fetchSecurityLevel(ctx, bot.system);
+      const { pois } = await getSystemInfo(ctx);
+      const patrolPois = pois.filter(p => !isStationPoi(p));
+      if (patrolPois.length === 0) {
+        ctx.log("info", "No POIs — moving to next system");
+        return;
+      }
+      for (const poi of patrolPois) {
+        if (bot.state !== "running") break;
+        await bot.exec("travel", { target_poi: poi.id });
+        bot.poi = poi.id;
+        await ctx.sleep(500);
+        const nearbyResp = await bot.exec("get_nearby");
+        if (nearbyResp.error) continue;
+        bot.trackNearbyPlayers(nearbyResp.result);
+        const entities = parseNearby(nearbyResp.result);
+        const targets = entities.filter(e => isPirateTarget(e, currentSettings.onlyNPCs, currentSettings.maxAttackTier));
+        for (const target of targets) {
+          await useRepairKits(ctx);
+          await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts, currentSettings.ammoReloadAbsoluteThreshold, currentSettings.ammoReloadPercentThreshold);
+          const won = await engageTarget(ctx, target, currentSettings.fleeThreshold, currentSettings.fleeFromTier, currentSettings.minPiratesToFlee, currentSettings.maxAttackTier, undefined, currentSettings.disableScanCommandForPirates, currentSettings.repairThreshold);
+          if (won) {
+            totalKills++;
+            await scavengeWrecks(ctx);
+            const csettings = getHunterSettings(bot.username);
+            await topUpShields(ctx, (csettings.shieldRechargePct ?? 80) / 100);
+            await useRepairKits(ctx);
+            await bot.refreshCargo();
+            if (isLowOnFieldConsumables(bot.inventory)) {
+              ctx.log("combat", "Low on repair kits or shield charges — stopping to resupply");
+              break;
+            }
+          }
+        }
+      }
+    })();
+
+    if (currentSettings.singleLoop && systemIndex >= patrolList.length) {
+      ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+      const hs = currentSettings.homeStation || "";
+      const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+      if (hsys && hpoi) {
+        await navigateToSystem(ctx, hsys, currentSafetyOpts);
+        const t = await bot.exec("travel", { target_poi: hpoi });
+        if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+      } else {
+        await navigateToSafeStation(ctx, currentSafetyOpts);
+      }
+      await ensureHunterResupply(ctx);
+      systemIndex = 0;
     }
   }
 }

@@ -2147,4 +2147,8 @@ constructor(port: number = 3000) {
   sendEmpireAlert(sender: string, content: string, botUsername: string): void {
     this.broadcast({ type: "empireAlert", sender, content, botUsername });
   }
+
+  broadcastSkillsUpdate(bot: string, skills: Record<string, { level: number; xp: number; nextLevelXp: number }>): void {
+    this.broadcast({ type: "skillsUpdate", bot, skills });
+  }
 }

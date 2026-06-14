@@ -730,6 +730,26 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
     bot.trackNearbyPlayers(resp.result);
   }
 
+  // Broadcast skills update for get_skills command
+  if (!resp.error && resp.result && command === "get_skills") {
+    const skills = resp.result as Record<string, Record<string, unknown>>;
+    const skillData: Record<string, { level: number; xp: number; nextLevelXp: number }> = {};
+    for (const [skillId, s] of Object.entries(skills)) {
+      if (s && typeof s === "object") {
+        const skillObj = s as Record<string, unknown>;
+        const level = (skillObj.level as number) ?? (skillObj.current_level as number) ?? 0;
+        const xp = (skillObj.xp as number) ?? (skillObj.experience as number) ?? (skillObj.current_xp as number) ?? 0;
+        const xpToNext = (skillObj.xp_to_next_level as number) ?? (skillObj.xp_to_next as number) ?? (skillObj.xp_needed as number) ?? (skillObj.xp_remaining as number) ?? 0;
+        skillData[skillId] = {
+          level: level || 0,
+          xp: xp || 0,
+          nextLevelXp: xpToNext || 0
+        };
+      }
+    }
+    server.broadcastSkillsUpdate(botName, skillData);
+  }
+
   // Refresh cached state after mutating commands
   const refreshCommands = new Set([
     "mine", "sell", "buy", "dock", "undock", "travel", "jump",

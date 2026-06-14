@@ -1602,6 +1602,26 @@ lastUsedRoutines = lastUsedRoutinesRes || {};
           renderStatsTab();
         }
         break;
+      case 'skillsUpdate':
+        if (msg.skills) {
+          const botName = msg.bot;
+          if (!skillsData) skillsData = { bots: {}, lastUpdated: new Date().toISOString() };
+          if (!skillsData.bots) skillsData.bots = {};
+          const skillData = {};
+          for (const [skillId, s] of Object.entries(msg.skills)) {
+            skillData[skillId] = {
+              level: s.level || 0,
+              xp: s.xp || 0,
+              nextLevelXp: s.nextLevelXp || 0
+            };
+          }
+          skillsData.bots[botName] = { skills: skillData, lastUpdated: new Date().toISOString() };
+          if (document.getElementById('page-stats')?.classList.contains('active') && 
+              document.getElementById('statsSkillsView')?.style.display !== 'none') {
+            renderSkillsTab();
+          }
+        }
+        break;
       case 'battleUpdate':
       case 'battleStatus':
         // Handle battle status updates from server
@@ -2425,8 +2445,13 @@ async function switchStatsView(view) {
     renderTaxesTab();
   }
   if (view === 'skills') {
-    await loadSkillsData();
+    if (!skillsLoaded) {
+      await loadSkillsData();
+    }
     renderSkillsTab();
+    startSkillsUpdates();
+  } else {
+    stopSkillsUpdates();
   }
 }
 
@@ -2480,6 +2505,27 @@ function renderTaxesTab() {
 
 let skillsData = null;
 let skillsLoaded = false;
+let skillsUpdateInterval = null;
+
+function startSkillsUpdates() {
+  if (skillsUpdateInterval) return;
+  skillsUpdateInterval = setInterval(() => {
+    if (!document.getElementById('page-stats')?.classList.contains('active')) return;
+    if (document.getElementById('statsSkillsView')?.style.display === 'none') return;
+    for (const bot of bots) {
+      if (bot.state === 'running') {
+        send({ type: 'exec', bot: bot.username, command: 'get_skills' });
+      }
+    }
+  }, 1000);
+}
+
+function stopSkillsUpdates() {
+  if (skillsUpdateInterval) {
+    clearInterval(skillsUpdateInterval);
+    skillsUpdateInterval = null;
+  }
+}
 
 async function loadSkillsData() {
   // Initialize skillsData from current bots (live WebSocket updates)
@@ -6902,44 +6948,41 @@ function fetchMarket(username) {
 }
 
 function fetchSkills(username) {
-  // Use skills from get_status (included in bot.status()) instead of separate get_skills call
-  const bot = bots.find(b => b.username === username);
-  if (!bot) {
-    profileSkillsList = [];
+  sendExec(username, 'get_skills', {}, (result) => {
+    if (profileBot !== username) return;
+    if (!result.ok || !result.data) {
+      profileSkillsList = [];
+      profileSkills = {};
+      renderProfileSidebar();
+      renderManualControls();
+      return;
+    }
+
+    const skillsData = result.data;
+    const skills = Object.entries(skillsData).map(([id, data]) => {
+      const s = (data && typeof data === 'object') ? data : {};
+      return {
+        name: id,
+        skill_id: id,
+        id: id,
+        level: s.level ?? s.current_level ?? 0,
+        xp: s.xp ?? s.experience ?? s.current_xp ?? 0,
+        xp_to_next: s.xp_to_next_level ?? s.xp_to_next ?? s.xp_needed ?? s.xp_remaining,
+        next_level_xp: s.xp_to_next_level ?? s.xp_to_next ?? s.xp_needed ?? s.xp_remaining,
+        total_xp: s.total_xp ?? s.total_experience ?? s.cumulative_xp,
+      };
+    });
+
     profileSkills = {};
+    profileSkillsList = skills;
+    for (const s of skills) {
+      const id = s.skill_id || s.id || s.name || '';
+      if (id) profileSkills[id] = s.level || 0;
+      if (s.name && s.name !== id) profileSkills[s.name] = s.level || 0;
+    }
     renderProfileSidebar();
-    return;
-  }
-
-  const skillsData = bot.skills;
-  if (!skillsData) {
-    profileSkillsList = [];
-    profileSkills = {};
-    renderProfileSidebar();
-    return;
-  }
-
-  // Normalize skills data into array format for rendering
-  const skills = Object.entries(skillsData).map(([id, data]) => ({
-    name: id,
-    skill_id: id,
-    id: id,
-    level: data.level ?? 0,
-    xp: data.xp,
-    xp_to_next: data.xpToNext,
-    next_level_xp: data.xpToNext,
-    total_xp: data.totalXP,
-  }));
-
-  profileSkills = {};
-  profileSkillsList = skills;
-  for (const s of skills) {
-    const id = s.skill_id || s.id || s.name || '';
-    if (id) profileSkills[id] = s.level || 0;
-    if (s.name && s.name !== id) profileSkills[s.name] = s.level || 0;
-  }
-  renderProfileSidebar();
-  renderManualControls();
+    renderManualControls();
+  });
 }
 
 function fetchStandings(username) {

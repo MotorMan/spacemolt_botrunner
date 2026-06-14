@@ -727,8 +727,6 @@ docked = false;
         // This is the PROACTIVE check - wait 2 seconds minimum for customs to respond
         // Only applies to customs empires (Voidborn, Nebula, Crimson, Solarian) in non-lawless systems
         if (!resp.error && (command === "jump" || command === "travel")) {
-          await this.refreshStatus();
-          // Check if we're in an empire system with customs (not Frontier, not Outer Rim, not pirate, not lawless)
           const sysData = mapStore.getSystem(this.system);
           if (isEmpireSystem(this.system, this.getEmpire(), sysData?.security_level)) {
             this.log("customs", `⏱️ Post-jump customs wait @ ${this.system} - 2 second delay...`);
@@ -744,15 +742,12 @@ docked = false;
             debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
             this.log("system", "Action pending — waiting for server to process...");
             await sleep(10_000);
-            // Refresh status before retry to ensure we're in a valid state
-            await this.refreshStatus();
             resp = await this.api.execute(command, payload);
 
             // If still pending, wait a bit longer and try one more time
             if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
               this.log("system", "Action still pending — waiting additional 5s...");
               await sleep(5_000);
-              await this.refreshStatus();
               resp = await this.api.execute(command, payload);
             }
           }
@@ -800,8 +795,13 @@ docked = false;
 
         if (!resp.error && resp.result) {
           const r = resp.result as Record<string, unknown>;
+          const ship = (r.ship as Record<string, unknown>) || {};
+          const location = (r.location as Record<string, unknown>) || {};
+          const cargo = Array.isArray(r.cargo) ? r.cargo : Array.isArray(r.items) ? r.items : [];
+
           if (command === "mine") {
-            this.cargo += (r.quantity as number) || 0;
+            const qty = (r.quantity as number) || (r.count as number) || 0;
+            if (qty) this.cargo = Math.max(0, this.cargo + qty);
             const xpGained = r.xp_gained as Record<string, number> | undefined;
             if (xpGained) {
               for (const [skill, gained] of Object.entries(xpGained)) {
@@ -809,14 +809,16 @@ docked = false;
               }
             }
           } else if (command === "jump" || command === "travel") {
-            const sysId = (r.system_id as string) || (r.system as string);
-            const poiId = (r.poi as string) || (r.poi_id as string);
+            const sysId = (r.system_id as string) || (r.system as string) || (location.system_id as string) || (location.system_name as string);
+            const poiId = (r.poi as string) || (r.poi_id as string) || (location.poi_id as string) || (location.poi_name as string);
             if (sysId) this.system = sysId;
             if (poiId) this.poi = poiId;
-            if (r.auto_docked) this.docked = true;
+            if (r.auto_docked || location.docked_at) this.docked = true;
             if (r.auto_undocked) this.docked = false;
+            if (typeof r.fuel === "number") this.fuel = r.fuel;
           } else if (command === "dock") {
             this.docked = true;
+            if (location.docked_at) this.poi = (location.docked_at as string);
           } else if (command === "undock") {
             this.docked = false;
           } else if (command === "sell" || command === "create_sell_order") {
@@ -832,6 +834,7 @@ docked = false;
           } else if (command === "refuel") {
             const fuelAdded = (r.fuel_added as number) || (r.quantity as number) || 0;
             if (fuelAdded) this.fuel = Math.min(this.maxFuel, this.fuel + fuelAdded);
+            if (typeof ship.fuel === "number") this.fuel = ship.fuel;
           } else if (command === "repair") {
             const hullRepaired = (r.hull_repaired as number) || (r.hull as number) || 0;
             if (hullRepaired) this.hull = Math.min(this.maxHull, this.hull + hullRepaired);
@@ -843,6 +846,53 @@ docked = false;
           } else if (command === "craft") {
             const qty = (r.quantity as number) || (r.count as number) || 0;
             if (qty) this.cargo += qty;
+          }
+
+          if (Object.keys(ship).length > 0) {
+            if (typeof ship.fuel === "number") this.fuel = ship.fuel;
+            if (typeof ship.max_fuel === "number") this.maxFuel = ship.max_fuel;
+            if (typeof ship.cargo_used === "number") this.cargo = ship.cargo_used;
+            if (typeof ship.cargo_capacity === "number") this.cargoMax = ship.cargo_capacity;
+            if (typeof ship.hull === "number") this.hull = ship.hull;
+            if (typeof ship.max_hull === "number") this.maxHull = ship.max_hull;
+            if (typeof ship.shield === "number") this.shield = ship.shield;
+            if (typeof ship.max_shield === "number") this.maxShield = ship.max_shield;
+            if (typeof ship.speed === "number") this.shipSpeed = ship.speed;
+            if (ship.name && typeof ship.name === "string") this.shipName = ship.name;
+            if (ship.ship_type && typeof ship.ship_type === "string") this.shipClass = ship.ship_type;
+            if (ship.tier !== undefined && ship.tier !== null) this.tier = ship.tier as number;
+            if (ship.id && typeof ship.id === "string") this.shipId = ship.id;
+          }
+
+          if (cargo.length > 0) {
+            this.inventory = this.parseItemList({ items: cargo });
+          }
+
+          if (Object.keys(location).length > 0) {
+            this.system = (location.system_id as string) || (location.system_name as string) || this.system;
+            this.poi = (location.poi_id as string) || (location.poi_name as string) || this.poi;
+            if (location.docked_at !== undefined) this.docked = !!location.docked_at;
+          }
+
+          const player = (r.player as Record<string, unknown>) || {};
+          if (Object.keys(player).length > 0) {
+            if (typeof player.credits === "number") this.credits = player.credits;
+            if (player.faction_id && typeof player.faction_id === "string") this.faction = player.faction_id;
+          }
+
+          const skills = (r.skills as Record<string, Record<string, unknown>>) || {};
+          if (Object.keys(skills).length > 0) {
+            for (const [skillId, skillData] of Object.entries(skills)) {
+              const s = skillData as Record<string, unknown>;
+              const level = (s.level as number) ?? (s.current_level as number) ?? 0;
+              const xp = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
+              const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number);
+              const totalXP = (s.total_xp as number) ?? (s.total_experience as number);
+              this.skillLevels.set(skillId, level);
+              this.skillXP.set(skillId, xp);
+              if (xpToNext !== undefined) this.skillXpToNext.set(skillId, xpToNext);
+              if (totalXP !== undefined) this.skillTotalXP.set(skillId, totalXP);
+            }
           }
         }
 

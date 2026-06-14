@@ -117,24 +117,36 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
 }
 
 async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
-  // First check WebSocket state (works even when HTTP is hanging)
-  if (ctx.bot.isInBattle()) {
-    ctx.log("combat", `⚠️ Already in battle (ID: ${ctx.bot.currentBattle.battleId}) - engaging instead of navigating`);
-    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
-    return true;
-  }
-  
-  // Also check via API in case WebSocket state is stale/missing
+  // Check via API first to validate/clear stale WebSocket state
+  let apiChecked = false;
   try {
     const battleStatus = await getBattleStatus(ctx);
+    apiChecked = true;
     if (battleStatus) {
       ctx.log("combat", `⚠️ Battle detected via API (ID: ${battleStatus.battle_id}) - engaging instead of navigating`);
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
       return true;
     }
+    // API returned no battle - clear stale WebSocket state if present
+    if (ctx.bot.isInBattle()) {
+      ctx.log("combat", `Clearing stale WebSocket battle state (API reports no battle)`);
+      ctx.bot.currentBattle.inBattle = false;
+      ctx.bot.currentBattle.battleId = null;
+      ctx.bot.currentBattle.participants = [];
+    }
   } catch (e) {
     // API check failed - rely on WebSocket state
     ctx.log("combat", `API battle check failed, relying on WebSocket state`);
+  }
+  
+  // If API check succeeded and returned no battle, we're done
+  if (apiChecked) return false;
+  
+  // API failed, check WebSocket state as fallback
+  if (ctx.bot.isInBattle()) {
+    ctx.log("combat", `⚠️ WebSocket battle state detected (ID: ${ctx.bot.currentBattle.battleId}) - engaging instead of navigating`);
+    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
+    return true;
   }
   
   return false;
@@ -276,18 +288,36 @@ function isLowOnFieldConsumables(inventory: any[] | undefined, minRepairKits = 5
 }
 
 async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<void> {
-  // First check WebSocket state (works even when HTTP is hanging)
+  // Check via API first to validate/clear stale WebSocket state
   let battleStatus: Awaited<ReturnType<typeof getBattleStatus>> = null;
+  let apiChecked = false;
   
-  if (ctx.bot.isInBattle()) {
+  try {
+    battleStatus = await getBattleStatus(ctx);
+    apiChecked = true;
+    if (!battleStatus && ctx.bot.isInBattle()) {
+      // API says no battle, but WebSocket says there is one - clear stale state
+      ctx.log("combat", `Clearing stale WebSocket battle state (API reports no battle)`);
+      ctx.bot.currentBattle.inBattle = false;
+      ctx.bot.currentBattle.battleId = null;
+      ctx.bot.currentBattle.participants = [];
+      return;
+    }
+  } catch (e) {
+    // API check failed - fall back to WebSocket state
+    ctx.log("combat", `API battle check failed, relying on WebSocket state`);
+  }
+  
+  // If API check succeeded and returned no battle, we're done
+  if (apiChecked && !battleStatus) return;
+  
+  // API failed, check WebSocket state as fallback
+  if (!battleStatus && ctx.bot.isInBattle()) {
     battleStatus = {
       battle_id: ctx.bot.currentBattle.battleId || "",
       participants: ctx.bot.currentBattle.participants as any,
       is_participant: true,
     } as any;
-  } else {
-    // Fall back to API check
-    battleStatus = await getBattleStatus(ctx);
   }
   
   if (!battleStatus) return;

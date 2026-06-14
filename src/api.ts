@@ -89,6 +89,7 @@ export interface ApiResponse {
   notifications?: unknown[];
   session?: ApiSession;
   error?: { code: string; message: string; wait_seconds?: number } | null;
+  details?: unknown;
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
@@ -1049,6 +1050,9 @@ export class SpaceMoltAPI {
       const data = JSON.parse(text) as ApiResponse & { structuredContent?: unknown };
       if (data.structuredContent !== undefined) {
         data.result = data.structuredContent;
+      }
+      if (data.details === undefined && (data as Record<string, unknown>).details !== undefined) {
+        data.details = (data as Record<string, unknown>).details;
       }
       if (data.session) {
         const s = data.session as unknown as Record<string, unknown>;

@@ -732,44 +732,17 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
 
 // Broadcast skills update for get_skills command
   if (!resp.error && resp.result && command === "get_skills") {
-    let skillsObj: Record<string, Record<string, unknown>> | null = null;
-    
-    // Handle different response formats
-    if (typeof resp.result === "string") {
-      try {
-        const parsed = JSON.parse(resp.result);
-        // Check if it's wrapped in a message/skills format
-        if (parsed.skills && typeof parsed.skills === "object") {
-          skillsObj = parsed.skills as Record<string, Record<string, unknown>>;
-        } else {
-          skillsObj = parsed as Record<string, Record<string, unknown>>;
-        }
-      } catch (e) {
-        // Failed to parse
-      }
-    } else if (resp.result && typeof resp.result === "object") {
-      const r = resp.result as Record<string, unknown>;
-      // Check for structuredContent wrapper (V2 API format)
-      if (r.structuredContent && typeof r.structuredContent === "object") {
-        const sc = r.structuredContent as Record<string, unknown>;
-        if (sc.skills && typeof sc.skills === "object") {
-          skillsObj = sc.skills as Record<string, Record<string, unknown>>;
-        }
-      }
-      // Check if skills is directly in result
-      if (!skillsObj && r.skills && typeof r.skills === "object") {
-        skillsObj = r.skills as Record<string, Record<string, unknown>>;
-      }
-      // Otherwise use result directly
-      if (!skillsObj) {
-        skillsObj = r as Record<string, Record<string, unknown>>;
-      }
-    }
+    // The API returns skills directly in resp.result (normalized from structuredContent)
+    const r = resp.result as Record<string, unknown>;
+    const skillsObj: Record<string, unknown> | null = 
+      (r.skills && typeof r.skills === "object") 
+        ? r.skills as Record<string, unknown>
+        : r;
     
     if (skillsObj) {
       const skillData: Record<string, { level: number; xp: number; nextLevelXp: number }> = {};
       for (const [skillId, s] of Object.entries(skillsObj)) {
-        // Skip 'message' key if present (can appear in some API responses)
+        // Skip non-skill keys
         if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
         
         if (s && typeof s === "object") {

@@ -6961,13 +6961,7 @@ function fetchSkills(username) {
     let skillsData = result.data;
     if (typeof skillsData === 'string') {
       try {
-        const parsed = JSON.parse(skillsData);
-        // Check for structuredContent.skills
-        if (parsed.structuredContent && parsed.structuredContent.skills) {
-          skillsData = parsed.structuredContent.skills;
-        } else {
-          skillsData = parsed;
-        }
+        skillsData = JSON.parse(skillsData);
       } catch (e) {
         profileSkillsList = [];
         profileSkills = {};
@@ -6975,10 +6969,12 @@ function fetchSkills(username) {
         renderManualControls();
         return;
       }
-    } else if (skillsData && typeof skillsData === 'object') {
-      // Check for structuredContent.skills
-      if (skillsData.structuredContent && skillsData.structuredContent.skills) {
-        skillsData = skillsData.structuredContent.skills;
+    }
+    
+    // The API normalizes structuredContent into result, so skills are in result.skills or directly in result
+    if (skillsData && typeof skillsData === 'object') {
+      if (skillsData.skills && typeof skillsData.skills === 'object') {
+        skillsData = skillsData.skills;
       }
     }
 

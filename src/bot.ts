@@ -1892,33 +1892,39 @@ if (Object.keys(ship).length > 0) {
 
    /** Fetch skills and log any level-ups since the last check. */
     async checkSkills(): Promise<void> {
-      const fresh = await this.fetchAllSkills();
-      for (const [id, data] of fresh.entries()) {
-        const prev = this.skillLevels.get(id);
-        if (prev !== undefined && data.level > prev) {
-          this.log("skill", `LEVEL UP! ${id}: ${prev} -> ${data.level}`);
+      const resp = await this.refreshSkills();
+      if (resp.error || !resp.result) return;
+      
+      const r = resp.result as Record<string, unknown>;
+      for (const [skillId, skillVal] of Object.entries(r)) {
+        if (skillVal && typeof skillVal === "object") {
+          const s = skillVal as Record<string, unknown>;
+          const level = (s.level as number) ?? (s.current_level as number) ?? 0;
+          const prev = this.skillLevels.get(skillId);
+          if (prev !== undefined && level > prev) {
+            this.log("skill", `LEVEL UP! ${skillId}: ${prev} -> ${level}`);
+          }
         }
-        this.skillLevels.set(id, data.level);
-        this.skillXP.set(id, data.xp);
-        this.skillTotalXP.set(id, data.totalXP ?? 0);
-        this.skillXpToNext.set(id, data.xpToNext ?? 0);
       }
     }
 
-     /** Fetch all skills as a Map<skillId, {level, xp, xpToNext, totalXP?}>.
-     * Uses cached skills from get_status (skills are included in get_status response). */
+     /** Fetch all skills as a Map (calls get_skills API). */
      private async fetchAllSkills(): Promise<Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>> {
        const map = new Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>();
-       for (const [id, level] of this.skillLevels.entries()) {
-         const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = {
-           level,
-           xp: this.skillXP.get(id) ?? 0,
-         };
-         const xpToNext = this.skillXpToNext.get(id);
-         if (xpToNext !== undefined) entry.xpToNext = xpToNext;
-         const totalXP = this.skillTotalXP.get(id);
-         if (totalXP !== undefined) entry.totalXP = totalXP;
-         map.set(id, entry);
+       const resp = await this.api.execute("get_skills");
+       if (resp.error || !resp.result) return map;
+       
+       const r = resp.result as Record<string, unknown>;
+       for (const [id, skillVal] of Object.entries(r)) {
+         if (skillVal && typeof skillVal === "object") {
+           const s = skillVal as Record<string, unknown>;
+           const level = (s.level as number) ?? (s.current_level as number) ?? 0;
+           const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
+           const xp = typeof rawXP === "number" ? rawXP : 0;
+           const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number) ?? (s.xp_remaining as number);
+           const totalXP = (s.total_xp as number) ?? (s.total_experience as number) ?? (s.cumulative_xp as number);
+           map.set(id, { level, xp, xpToNext, totalXP });
+         }
        }
        return map;
      }
@@ -1938,10 +1944,10 @@ if (Object.keys(ship).length > 0) {
       );
     }
 
-    /** Compare skills after a command and log any gains. */
+/** Compare skills after a command and log any gains. */
      private async logSkillGains(command: string): Promise<void> {
        const fresh = await this.fetchAllSkills();
-       if (fresh.size === 0) return; // failed to fetch, keep old snapshot
+       if (fresh.size === 0) return;
        const gains: Array<{
          id: string;
          name: string;
@@ -1958,11 +1964,9 @@ if (Object.keys(ship).length > 0) {
          const old = this.skillSnapshot.get(id);
          if (!old) continue;
          let xpGained: number;
-         // Prefer using total cumulative XP if available for exact gain
          if (old.totalXP !== undefined && data.totalXP !== undefined) {
            xpGained = data.totalXP - old.totalXP;
          } else if (data.level > old.level) {
-           // Level-up: remaining XP to finish old level + XP in new level
            const oldRemaining = (old.xpToNext !== undefined) ? (old.xpToNext - old.xp) : 0;
            xpGained = oldRemaining + data.xp;
          } else {
@@ -1984,32 +1988,30 @@ if (Object.keys(ship).length > 0) {
            });
          }
        }
-      if (gains.length > 0) {
-        const parts = gains.map(g => {
-          if (g.levelAfter > g.levelBefore && g.xpGained > 0) return `+${g.xpGained} ${g.id} (lvl ${g.levelAfter - g.levelBefore})`;
-          if (g.xpGained > 0) return `+${g.xpGained} ${g.id}`;
-          return `+${g.levelAfter - g.levelBefore} ${g.id}`;
-        }).join(", ");
-        this.log("skills", `Skill gains: ${parts}`);
-        recordSkillGains(this, command, this.shipName, gains);
-        // Also update piloting-specific aggregated stats if piloting was among gains
-        const pilotGain = gains.find(g => g.id.toLowerCase().includes('pilot'));
-        if (pilotGain) {
-          recordPilotingActivity(this, command, pilotGain.xpGained, pilotGain.levelAfter, pilotGain.xpAfter, this.shipName);
-        }
-      }
-      // Update in-memory skill maps to the fresh snapshot for next command
-      this.skillLevels.clear();
-      this.skillXP.clear();
-      this.skillTotalXP.clear();
-      this.skillXpToNext.clear();
-      for (const [id, data] of fresh.entries()) {
-        this.skillLevels.set(id, data.level);
-        this.skillXP.set(id, data.xp);
-        this.skillTotalXP.set(id, data.totalXP ?? 0);
-        this.skillXpToNext.set(id, data.xpToNext ?? 0);
-      }
-    }
+       if (gains.length > 0) {
+         const parts = gains.map(g => {
+           if (g.levelAfter > g.levelBefore && g.xpGained > 0) return `+${g.xpGained} ${g.id} (lvl ${g.levelAfter - g.levelBefore})`;
+           if (g.xpGained > 0) return `+${g.xpGained} ${g.id}`;
+           return `+${g.levelAfter - g.levelBefore} ${g.id}`;
+         }).join(", ");
+         this.log("skills", `Skill gains: ${parts}`);
+         recordSkillGains(this, command, this.shipName, gains);
+         const pilotGain = gains.find(g => g.id.toLowerCase().includes('pilot'));
+         if (pilotGain) {
+           recordPilotingActivity(this, command, pilotGain.xpGained, pilotGain.levelAfter, pilotGain.xpAfter, this.shipName);
+         }
+       }
+       this.skillLevels.clear();
+       this.skillXP.clear();
+       this.skillTotalXP.clear();
+       this.skillXpToNext.clear();
+       for (const [id, data] of fresh.entries()) {
+         this.skillLevels.set(id, data.level);
+         this.skillXP.set(id, data.xp);
+         if (data.xpToNext !== undefined) this.skillXpToNext.set(id, data.xpToNext);
+         if (data.totalXP !== undefined) this.skillTotalXP.set(id, data.totalXP);
+       }
+     }
 
     /**
      * Start a customs hold - blocks travel/jump actions until cleared.

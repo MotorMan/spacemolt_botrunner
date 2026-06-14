@@ -2118,26 +2118,30 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       continue;
     }
 
-    // Try to withdraw the chosen ammo
-    const ammoSize = getItemSize(chosenAmmoId);
-    const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
-    if (actualQty <= 0) {
-      ctx.log("trade", `Not enough cargo space for ${ammoType} ammo — skipping`);
-      continue;
-    }
+    const ammoOrder = chosenAmmoId && possibleAmmo.includes(chosenAmmoId)
+      ? [chosenAmmoId, ...possibleAmmo.filter(a => a !== chosenAmmoId)]
+      : possibleAmmo;
+    for (const ammoId of ammoOrder) {
+      const ammoSize = getItemSize(ammoId);
+      const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
+      if (actualQty <= 0) {
+        continue;
+      }
 
-    const wResp = await bot.exec("storage", {
-      action: "withdraw",
-      target: "faction",
-      item_id: chosenAmmoId,
-      quantity: actualQty
-    });
-    if (!wResp.error) {
-      ctx.log("trade", `Withdrew ${actualQty} ${chosenAmmoId} from faction storage`);
-      freeSpace -= actualQty * ammoSize;
-      gotAnyAmmo = true;
-    } else {
-      ctx.log("trade", `Failed to withdraw ${chosenAmmoId} for ${ammoType}: ${wResp.error.message}`);
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: ammoId,
+        quantity: actualQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
+        freeSpace -= actualQty * ammoSize;
+        gotAnyAmmo = true;
+        break;
+      } else {
+        ctx.log("trade", `Failed to withdraw ${ammoId} for ${ammoType}: ${wResp.error.message}`);
+      }
     }
   }
 

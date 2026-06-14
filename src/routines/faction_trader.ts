@@ -165,7 +165,8 @@ function isValidDestination(ctx: RoutineContext, systemId: string, poiId: string
     ctx.log("error", `Destination POI ${poiId} not found in system ${systemId}`);
     return false;
   }
-  if (!poi.has_base) {
+  // Check for either has_base OR base_id (some stations have base_id but not has_base)
+  if (!poi.has_base && !poi.base_id) {
     ctx.log("error", `Destination ${poi.name} (${poiId}) in ${systemId} is not a valid station (no dock)`);
     return false;
   }
@@ -627,14 +628,11 @@ function findFactionSellRoutes(
       
       // Calculate min sell price from best buy price
       itemMinSellPrice = calculateCategoryMinSellPrice(item.itemId, categoryConfig.pricePercentOfBestBuy);
-      
-      ctx.log("trade", `Category ${categoryConfig.category}: ${item.quantity}x ${item.name}, selling ${itemMaxSellQty} (${sellPercent}%), min price ${itemMinSellPrice}cr`);
     } else {
       // 'all' source - use global minSellPrice
       itemMinSellPrice = settings.minSellPrice;
       itemMaxSellQty = 0; // 0 = sell all
       itemSoldQty = 0;
-      ctx.log("trade", `SellAll: ${item.quantity}x ${item.name} at global min ${itemMinSellPrice}cr`);
     }
     
     const remainingSellQty = itemMaxSellQty > 0 ? Math.max(0, itemMaxSellQty - itemSoldQty) : item.quantity;
@@ -653,25 +651,21 @@ function findFactionSellRoutes(
     }
 
     // Material cost = 0 for faction items (we already own them)
-    // The getItemMarketCost function finds replacement cost, not acquisition cost
     const materialCost = 0;
 
     for (const buy of buyers) {
       if (itemMinSellPrice > 0 && buy.price < itemMinSellPrice) {
-        ctx.log("trade", `Skipping ${item.name} @ ${buy.poiName}: ${buy.price}cr < min ${itemMinSellPrice}cr`);
         continue;
       }
 
       // Verify destination is still valid
       if (!isValidDestination(ctx, buy.systemId, buy.poiId)) {
-        ctx.log("trade", `Skipping ${item.name} @ ${buy.poiName}: invalid destination`);
         continue;
       }
 
       const existingLock = getBuyOrderLock(item.itemId, buy.poiId, buy.price);
 
       if (existingLock) {
-        ctx.log("trade", `Skipping ${item.name} @ ${buy.poiName}: locked by ${existingLock.lockedBy}`);
         continue;
       }
 
@@ -685,17 +679,11 @@ function findFactionSellRoutes(
       // Calculate quantity to sell, respecting max sell qty
       const maxQty = itemMaxSellQty > 0 ? Math.min(remainingSellQty, item.quantity) : item.quantity;
       const qty = Math.min(maxQty, buy.quantity, maxItemsForCargo(cargoCapacity, item.itemId));
-      if (qty <= 0) {
-        ctx.log("trade", `Skipping ${item.name}: qty ${qty} <= 0 (buy order has ${buy.quantity})`);
-        continue;
-      }
+      if (qty <= 0) continue;
 
       // Skip routes that sell below material cost + round-trip fuel (would lose money)
       const costPerUnit = materialCost + (roundTripJumps > 0 ? roundTripFuel / qty : 0);
-      if (materialCost > 0 && buy.price <= costPerUnit) {
-        ctx.log("trade", `Skipping ${item.name}: price ${buy.price}cr <= cost ${costPerUnit}cr (fuel: ${roundTripFuel}, qty: ${qty})`);
-        continue;
-      }
+      if (materialCost > 0 && buy.price <= costPerUnit) continue;
 
       const totalProfit = (buy.price - costPerUnit) * qty;
 
@@ -1173,14 +1161,14 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     // Station priority: put routes whose destination is the home station first
     // BUT maintain profit ordering within each group
     if (settings.stationPriority && settings.homeSystem) {
-      const homeStation = mapStore.findNearestStation(settings.homeSystem);
-      if (homeStation) {
-        const homeRoutes = foundRoutes.filter(r => r.destSystem === settings.homeSystem && r.destPoi === homeStation.id);
-        const otherRoutes = foundRoutes.filter(r => !(r.destSystem === settings.homeSystem && r.destPoi === homeStation.id));
+      const homeStationId = settings.homeStation;
+      if (homeStationId) {
+        const homeRoutes = foundRoutes.filter(r => r.destSystem === settings.homeSystem && r.destPoi === homeStationId);
+        const otherRoutes = foundRoutes.filter(r => !(r.destSystem === settings.homeSystem && r.destPoi === homeStationId));
         if (homeRoutes.length > 0) {
           foundRoutes.length = 0;
           foundRoutes.push(...homeRoutes, ...otherRoutes);
-          ctx.log("trade", `Station priority: ${homeRoutes.length} route(s) to home station (highest profit: ${Math.round(homeRoutes[0].totalProfit)}cr)`);
+          ctx.log("trade", `Station priority: ${homeRoutes.length} route(s) to home station`);
         }
       }
     }
@@ -1222,7 +1210,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
           // Verify destination is a valid station with a market
           if (!isValidDestination(ctx, bestBuyer.systemId, bestBuyer.poiId)) {
-            ctx.log("error", `Skipping corrupt destination: ${bestBuyer.poiName} (${bestBuyer.systemId})`);
+            ctx.log("trade", `Skipping ${bestBuyer.poiName} (${bestBuyer.poiId}) in ${bestBuyer.systemId}: invalid destination`);
             continue;
           }
 

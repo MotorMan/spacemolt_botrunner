@@ -5369,6 +5369,15 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
         
         const dcTag = isDeepCoreMining ? " [DEEP CORE]" : "";
         ctx.log("mining", `${summaryParts.join(" ")}${dcTag}`);
+        
+        // SKILL XP DISPLAY: Show skill gains from the mine response
+        const xpGained = result.xp_gained as Record<string, number> | undefined;
+        if (xpGained && Object.keys(xpGained).length > 0) {
+          const xpParts = Object.entries(xpGained)
+            .map(([skill, amount]) => `${skill}: +${amount}`)
+            .join(", ");
+          ctx.log("mining", `Skill XP gained: ${xpParts}`);
+        }
       } else if (oreId) {
         // Fallback if result structure is unexpected
         const dcTag = isDeepCoreMining ? " [deep core]" : "";

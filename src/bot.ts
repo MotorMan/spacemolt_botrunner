@@ -1253,31 +1253,42 @@ if (Object.keys(ship).length > 0) {
     return this.api.execute("get_nearby");
   }
 
-  async refreshSkills(): Promise<ApiResponse> {
-    const resp = await this.api.execute("get_skills");
-    if (!resp.error && resp.result) {
-      const r = resp.result as Record<string, unknown>;
-      this.skillLevels.clear();
-      this.skillXP.clear();
-      this.skillTotalXP.clear();
-      this.skillXpToNext.clear();
-      for (const [skillId, skillVal] of Object.entries(r)) {
-        if (skillVal && typeof skillVal === "object") {
-          const s = skillVal as Record<string, unknown>;
-          const level = (s.level as number) ?? (s.current_level as number) ?? 0;
-          const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
-          const xp = typeof rawXP === "number" ? rawXP : 0;
-          const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number) ?? (s.xp_remaining as number);
-          const totalXP = (s.total_xp as number) ?? (s.total_experience as number) ?? (s.cumulative_xp as number);
-          this.skillLevels.set(skillId, level);
-          this.skillXP.set(skillId, xp);
-          if (xpToNext !== undefined) this.skillXpToNext.set(skillId, xpToNext);
-          if (totalXP !== undefined) this.skillTotalXP.set(skillId, totalXP);
-        }
-      }
-    }
-    return resp;
-  }
+async refreshSkills(): Promise<ApiResponse> {
+     const resp = await this.api.execute("get_skills");
+     if (!resp.error && resp.result) {
+       const r = resp.result as Record<string, unknown>;
+       // Handle various response formats: skills.skills, skills.data, or top-level
+       let skillsData: Record<string, unknown> | null = null;
+       if (r.skills && typeof r.skills === "object") {
+         skillsData = r.skills as Record<string, unknown>;
+       } else if (r.data && typeof r.data === "object") {
+         skillsData = r.data as Record<string, unknown>;
+       } else {
+         skillsData = r;
+       }
+       
+       this.skillLevels.clear();
+       this.skillXP.clear();
+       this.skillTotalXP.clear();
+       this.skillXpToNext.clear();
+       for (const [skillId, skillVal] of Object.entries(skillsData)) {
+         if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
+         if (skillVal && typeof skillVal === "object") {
+           const s = skillVal as Record<string, unknown>;
+           const level = (s.level as number) ?? (s.current_level as number) ?? 0;
+           const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
+           const xp = typeof rawXP === "number" ? rawXP : 0;
+           const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number) ?? (s.xp_remaining as number);
+           const totalXP = (s.total_xp as number) ?? (s.total_experience as number) ?? (s.cumulative_xp as number);
+           this.skillLevels.set(skillId, level);
+           this.skillXP.set(skillId, xp);
+           if (xpToNext !== undefined) this.skillXpToNext.set(skillId, xpToNext);
+           if (totalXP !== undefined) this.skillTotalXP.set(skillId, totalXP);
+         }
+       }
+     }
+     return resp;
+   }
 
   /** Parse an item list from API response, handling both item_id and resource_id formats. */
   private parseItemList(result: unknown, preferField?: string): CargoItem[] {
@@ -1886,9 +1897,13 @@ if (Object.keys(ship).length > 0) {
 
     return { success: arrived, arrivedTick: (await this.pollCurrentTick()) ?? undefined, landing: { systemId: landingSystemId, ticks: landingTicks } };
   }
-  getSkillLevel(skillId: string): number {
-    return this.skillLevels.get(skillId) ?? 0;
-  }
+getSkillLevel(skillId: string): number {
+     const lowerId = skillId.toLowerCase();
+     for (const [id, level] of this.skillLevels.entries()) {
+       if (id.toLowerCase() === lowerId) return level;
+     }
+     return 0;
+   }
 
    /** Fetch skills and log any level-ups since the last check. */
     async checkSkills(): Promise<void> {
@@ -1896,7 +1911,18 @@ if (Object.keys(ship).length > 0) {
       if (resp.error || !resp.result) return;
       
       const r = resp.result as Record<string, unknown>;
-      for (const [skillId, skillVal] of Object.entries(r)) {
+      // Handle various response formats: skills.skills, skills.data, or top-level
+      let skillsData: Record<string, unknown> | null = null;
+      if (r.skills && typeof r.skills === "object") {
+        skillsData = r.skills as Record<string, unknown>;
+      } else if (r.data && typeof r.data === "object") {
+        skillsData = r.data as Record<string, unknown>;
+      } else {
+        skillsData = r;
+      }
+      
+      for (const [skillId, skillVal] of Object.entries(skillsData)) {
+        if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
         if (skillVal && typeof skillVal === "object") {
           const s = skillVal as Record<string, unknown>;
           const level = (s.level as number) ?? (s.current_level as number) ?? 0;
@@ -1915,7 +1941,17 @@ if (Object.keys(ship).length > 0) {
        if (resp.error || !resp.result) return map;
        
        const r = resp.result as Record<string, unknown>;
-       for (const [id, skillVal] of Object.entries(r)) {
+       let skillsData: Record<string, unknown> | null = null;
+       if (r.skills && typeof r.skills === "object") {
+         skillsData = r.skills as Record<string, unknown>;
+       } else if (r.data && typeof r.data === "object") {
+         skillsData = r.data as Record<string, unknown>;
+       } else {
+         skillsData = r;
+       }
+       
+       for (const [id, skillVal] of Object.entries(skillsData)) {
+         if (id === 'message' || id === 'status' || id === 'error') continue;
          if (skillVal && typeof skillVal === "object") {
            const s = skillVal as Record<string, unknown>;
            const level = (s.level as number) ?? (s.current_level as number) ?? 0;

@@ -2917,6 +2917,10 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
 
 export async function buyInsurance(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
+  if (!bot.docked) {
+    ctx.log("insurance", "Cannot buy insurance - not docked");
+    return;
+  }
   ctx.log("insurance", "Buying insurance for 7 days...");
   const insureResp = await bot.exec("buy_insurance", { ticks: 9999 });
   if (!insureResp.error && insureResp.result) {

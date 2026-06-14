@@ -602,12 +602,33 @@ function findNextHuntSystem(fromSystemId: string): string | null {
 }
 
 function findSystemsWithinRadius(fromSystemId: string, maxJumps: number): string[] {
-  const blacklist = getSystemBlacklist();
-  const blacklistSet = new Set(blacklist.map(s => s.toLowerCase()));
+  const normalizedFrom = fromSystemId.toLowerCase().replace(/_/g, ' ');
+  let resolvedSystemId: string | null = null;
+  
+  if (mapStore.getSystem(fromSystemId)) {
+    resolvedSystemId = fromSystemId;
+  } else {
+    for (const sysId of mapStore.getAllSystemIds()) {
+      const sys = mapStore.getSystem(sysId);
+      if (!sys) continue;
+      const sysName = (sys.name || sysId).toLowerCase().replace(/_/g, ' ');
+      const connNames = (sys.connections || []).map(c => 
+        ((c.system_name || c.system_id) || "").toLowerCase().replace(/_/g, ' ')
+      );
+      if (sysName === normalizedFrom || connNames.includes(normalizedFrom)) {
+        resolvedSystemId = sysId;
+        break;
+      }
+    }
+  }
+  
+  if (!resolvedSystemId) {
+    return [];
+  }
   
   const result: string[] = [];
-  const visited = new Set<string>([fromSystemId]);
-  const queue: Array<{ id: string; hops: number }> = [{ id: fromSystemId, hops: 0 }];
+  const visited = new Set<string>([resolvedSystemId]);
+  const queue: Array<{ id: string; hops: number }> = [{ id: resolvedSystemId, hops: 0 }];
   
   while (queue.length > 0) {
     const current = queue.shift()!;
@@ -621,7 +642,6 @@ function findSystemsWithinRadius(fromSystemId: string, maxJumps: number): string
     for (const conn of conns) {
       const nextId = conn.system_id;
       if (!nextId || visited.has(nextId)) continue;
-      if (blacklistSet.has(nextId.toLowerCase())) continue;
       
       visited.add(nextId);
       queue.push({ id: nextId, hops: current.hops + 1 });
@@ -2360,14 +2380,50 @@ async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string,
     return;
   }
 
-  const patrolList = findSystemsWithinRadius(pirateBase, maxJumps);
+  const normalizedPirateBase = pirateBase.toLowerCase().replace(/_/g, ' ');
+  let pirateBaseSystemId: string | null = null;
+  
+  if (mapStore.getSystem(pirateBase)) {
+    pirateBaseSystemId = pirateBase;
+  } else {
+    for (const sysId of mapStore.getAllSystemIds()) {
+      const sys = mapStore.getSystem(sysId);
+      if (!sys) continue;
+      const sysName = (sys.name || sysId).toLowerCase().replace(/_/g, ' ');
+      if (sysName === normalizedPirateBase) {
+        pirateBaseSystemId = sysId;
+        break;
+      }
+    }
+  }
+  
+  if (!pirateBaseSystemId) {
+    ctx.log("info", `Navigating to pirate base ${pirateBase} to map it...`);
+    const safetyOpts = {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
+      skipBlacklist: true,
+      isCombatBot: true,
+    };
+    const arrived = await navigateToSystem(ctx, pirateBase, safetyOpts);
+    if (!arrived) {
+      ctx.log("error", `Could not reach pirate base ${pirateBase} — falling back to roam_systems`);
+      yield* roamSystemsRoutine(ctx);
+      return;
+    }
+    await getSystemInfo(ctx);
+    pirateBaseSystemId = bot.system;
+  }
+
+  const patrolList = findSystemsWithinRadius(pirateBaseSystemId, maxJumps);
   if (patrolList.length === 0) {
-    ctx.log("error", `patrol_radius mode: no systems found within ${maxJumps} jumps of ${pirateBase} — falling back to roam_systems`);
+    ctx.log("error", `patrol_radius mode: no systems found within ${maxJumps} jumps of ${pirateBaseSystemId} — falling back to roam_systems`);
     yield* roamSystemsRoutine(ctx);
     return;
   }
 
-  ctx.log("info", `Patrol radius mode: ${patrolList.length} systems within ${maxJumps} jumps of ${pirateBase}`);
+  ctx.log("info", `Patrol radius mode: ${patrolList.length} systems within ${maxJumps} jumps of ${pirateBaseSystemId}`);
   let systemIndex = 0;
 
   while (bot.state === "running") {

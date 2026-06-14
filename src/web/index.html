@@ -2728,6 +2728,8 @@ function openProfile(username) {
   document.querySelectorAll('.tab-page').forEach(p => p.classList.remove('active'));
   document.getElementById('page-profile').classList.add('active');
 
+  // Render profile sidebar and manual controls
+  // Note: These functions check for bot existence and return early if not available
   renderProfileSidebar();
   renderProfileTopbar();
   renderManualControls();
@@ -2769,7 +2771,16 @@ function getProfileBot() {
 
 function renderProfileTopbar() {
   const bot = getProfileBot();
-  if (!bot) return;
+  if (!bot) {
+    // Don't return - still try to render something
+    const nameEl = document.getElementById('profileName');
+    const shipEl = document.getElementById('profileShip');
+    const badgeEl = document.getElementById('profileBadge');
+    if (nameEl) nameEl.textContent = '-';
+    if (shipEl) shipEl.textContent = '-';
+    if (badgeEl) badgeEl.innerHTML = '';
+    return;
+  }
 
   const stateLabel = bot.state === 'running' && bot.routine ? bot.routine : (bot.state === 'error' ? (lastUsedRoutines[bot.username] || 'miner') : bot.state);
   document.getElementById('profileName').textContent = bot.username;
@@ -3503,7 +3514,14 @@ function savePerBotDepositSettings() {
 
 function renderProfileSidebar() {
   const bot = getProfileBot();
-  if (!bot) return;
+  if (!bot) {
+    // Render placeholder content
+    const sidebar = document.getElementById('profileSidebar');
+    if (sidebar) {
+      sidebar.innerHTML = '<div class="profile-card"><div class="profile-card-header">Status</div><div class="profile-card-body"><div class="inv-empty">Loading...</div></div></div>';
+    }
+    return;
+  }
 
   // Skip sidebar rebuild if a topbar dropdown is open
   if (window._profileActionsOpen) {
@@ -3512,6 +3530,9 @@ function renderProfileSidebar() {
   }
 
   renderProfileTopbar();
+
+  const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
+  const loc = bot.poi ? resolveLocation(bot.system, bot.poi) : (resolveLocation(bot.system) || bot.location);
 
   const freshCargo = _pendingFreshCargo || bot.inventory || [];
   const freshStorage = _pendingFreshStorage || bot.storage || [];
@@ -3763,7 +3784,14 @@ async function renderManualControls(isFreshRender) {
     return;
   }
   const bot = getProfileBot();
-  if (!bot) return;
+  if (!bot) {
+    // Render placeholder content
+    const manualControls = document.getElementById('manualControls');
+    if (manualControls) {
+      manualControls.innerHTML = '<div style="padding:20px;color:var(--text-dim)">Loading bot data...</div>';
+    }
+    return;
+  }
 
   // Use fresh data if available (set by mcExec callback), otherwise use bot data
   const freshCargo = _pendingFreshCargo || bot.inventory || [];

@@ -4352,26 +4352,8 @@ function mcFactionWithdraw() {
     const ts = new Date().toLocaleTimeString('en-US', { hour12: false });
     logResponse(`<span class="resp-cmd">${ts} > refreshing faction storage</span>`);
     
-    sendExec(profileBot, 'view_storage', { target: 'faction' }, (result) => {
-      if (result.ok && result.data) {
-        const items = (result.data.items || result.data.storage || []).map(item => ({
-          item_id: item.item_id || item.itemId,
-          name: item.name || catalogName(item.item_id || item.itemId),
-          quantity: item.quantity
-        }));
-        profileFactionStorage = items;
-        _pendingFreshFactionStorage = items;
-        logResponse(`<span class="resp-ok">Loaded ${items.length} faction storage items</span>`);
-        renderManualControls();
-        updateStorageDropdowns();
-      } else {
-        profileFactionStorage = [];
-        _pendingFreshFactionStorage = [];
-        logResponse(`<span class="resp-err">Failed to load faction storage: ${esc(result.error || 'not at station')}</span>`);
-        renderManualControls();
-        updateStorageDropdowns();
-      }
-    });
+    // Use mcExec to trigger storage refresh
+    mcExec('view_storage', { target: 'faction' });
   }
 
 function toggleManualFactionWithdrawSort() {
@@ -6355,7 +6337,8 @@ function mcExec(command, params) {
   if (!profileBot) return;
 
   // Set flag immediately for storage commands to block status updates
-  const isStorageCommand = ['deposit_items', 'withdraw_items', 'storage', 'sell', 'buy', 'jettison', 'craft'].includes(command);
+  const isStorageCommand = ['deposit_items', 'withdraw_items', 'storage', 'sell', 'buy', 'jettison', 'craft'].includes(command) ||
+    (command === 'view_storage' && params && params.target === 'faction');
   if (isStorageCommand) {
     window._refreshingStorage = true;
     window._lastStorageRefresh = Date.now();
@@ -6396,7 +6379,7 @@ function mcExec(command, params) {
       const getFreshBot = () => bots.find(b => b.username === profileBot);
       let pendingFetches = 0;
 
-const checkAllDone = () => {
+      const checkAllDone = () => {
         if (pendingFetches > 0) return;
         
         // Render with fresh data, then block re-renders for 3 seconds

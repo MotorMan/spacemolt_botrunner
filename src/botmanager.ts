@@ -1152,7 +1152,7 @@ async function main(): Promise<void> {
             refreshPromises.push(bot.refreshLocation().catch(() => {}));
             // Also do a lightweight notification check to keep session alive
             // Use bot.exec() instead of api.execute() to process notifications properly
-            refreshPromises.push(bot.exec("get_notifications", { limit: 1, clear: false }).then((resp) => {
+            refreshPromises.push(bot.exec("get_notifications", { limit: 1, clear: true }).then((resp) => {
               if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
                 debugLogForBot(bot.username, "periodic:notifications", `Received ${resp.notifications.length} notification(s) during refresh`);
               }
@@ -1181,7 +1181,7 @@ async function main(): Promise<void> {
         // Only hit API for idle bots (not already doing heavy refresh)
         if (bot.state === "idle" && bot.api.getSession()) {
           // Use bot.exec() instead of api.execute() to process notifications properly
-          keepAlivePromises.push(bot.exec("get_notifications", { limit: 1, clear: false }).then((resp) => {
+          keepAlivePromises.push(bot.exec("get_notifications", { limit: 1, clear: true }).then((resp) => {
             if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
               debugLogForBot(name, "keepalive:notifications", `Received ${resp.notifications.length} notification(s) for idle bot`);
             }

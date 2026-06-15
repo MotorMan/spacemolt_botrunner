@@ -26272,6 +26272,10 @@ When responding:
       <label><input type="checkbox" id="set-civilian_transport-announceDestination" ${ct.announceDestination !== false ? "checked" : ""}> Announce destinations in transport messages</label>
     </div>
 
+    <div style="margin-top:12px">
+      <label><input type="checkbox" id="set-civilian_transport-disableFactionMessage" ${ct.disableFactionMessage ? "checked" : ""}> Disable faction message when transport cycle completes</label>
+    </div>
+
     <div style="margin-top:18px">
       <button class="primary" onclick="saveCivilianTransportSettings()">Save Settings</button>
     </div>
@@ -26332,6 +26336,9 @@ When responding:
         const announceDestination =
           document.getElementById("set-civilian_transport-announceDestination")
             ?.checked ?? true;
+        const disableFactionMessage =
+          document.getElementById("set-civilian_transport-disableFactionMessage")
+            ?.checked ?? false;
 
         const s = {};
         if (homeStation && homeStation.includes("|")) {
@@ -26354,6 +26361,7 @@ When responding:
         s.allowBusinessClass = allowBusinessClass;
         s.allowEconomyClass = allowEconomyClass;
         s.announceDestination = announceDestination;
+        s.disableFactionMessage = disableFactionMessage;
 
         send({
           type: "saveSettings",

@@ -426,6 +426,7 @@ interface CivilianTransportSettings {
   allowBusinessClass: boolean;
   allowEconomyClass: boolean;
   announceDestination: boolean;
+  disableFactionMessage: boolean;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -453,6 +454,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     allowBusinessClass: (t.allowBusinessClass as boolean) !== false,
     allowEconomyClass: (t.allowEconomyClass as boolean) !== false,
     announceDestination: (t.announceDestination as boolean) !== false,
+    disableFactionMessage: (t.disableFactionMessage as boolean) ?? false,
   };
 }
 
@@ -2125,34 +2127,36 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         state.currentDestination = null;
         saveTransportState(state);
         
-        const announceService = (globalThis as any).aiChatService;
-        if (
-          announceService &&
-          typeof announceService.sendTransportAnnouncement === "function"
-        ) {
-          const routeNames = settings.announceDestination
-            ? completedPassengers.map(p => p.destinationName).filter(name => name && name.trim().length > 0)
-            : [];
-          const passengerInfos = completedPassengers.map(p => ({
-            name: p.name,
-            bio: p.bio || "",
-            destinationName: p.destinationName,
-          }));
-          const shipDisplayName = state.customName || state.shipName;
-          announceService.sendTransportAnnouncement(bot, {
-            shipName: shipDisplayName,
-            route: routeNames,
-            totalPassengers: completedPassengers.length,
-            currentSystem: bot.system || "",
-            cycleType: "cycle_complete",
-            onboardPassengers: passengerInfos,
-          }).then((result: { ok: boolean; message?: string; error?: string }) => {
-            if (!result.ok) {
-              ctx.log("error", `Transport cycle_complete announcement failed: ${result.error}`);
-            }
-          }).catch((err: Error) => {
-            ctx.log("error", `Transport cycle_complete announcement error: ${err.message}`);
-          });
+        if (!settings.disableFactionMessage) {
+          const announceService = (globalThis as any).aiChatService;
+          if (
+            announceService &&
+            typeof announceService.sendTransportAnnouncement === "function"
+          ) {
+            const routeNames = settings.announceDestination
+              ? completedPassengers.map(p => p.destinationName).filter(name => name && name.trim().length > 0)
+              : [];
+            const passengerInfos = completedPassengers.map(p => ({
+              name: p.name,
+              bio: p.bio || "",
+              destinationName: p.destinationName,
+            }));
+            const shipDisplayName = state.customName || state.shipName;
+            announceService.sendTransportAnnouncement(bot, {
+              shipName: shipDisplayName,
+              route: routeNames,
+              totalPassengers: completedPassengers.length,
+              currentSystem: bot.system || "",
+              cycleType: "cycle_complete",
+              onboardPassengers: passengerInfos,
+            }).then((result: { ok: boolean; message?: string; error?: string }) => {
+              if (!result.ok) {
+                ctx.log("error", `Transport cycle_complete announcement failed: ${result.error}`);
+              }
+            }).catch((err: Error) => {
+              ctx.log("error", `Transport cycle_complete announcement error: ${err.message}`);
+            });
+          }
         }
         
         if (bot.shouldStopAfterCycle()) {

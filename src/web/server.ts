@@ -1966,12 +1966,18 @@ constructor(port: number = 3000) {
             if (this.onAction) {
               const result = await this.onAction(data);
               const resType = isExec ? "execResult" : "actionResult";
-              ws.send(JSON.stringify({ type: resType, _seq: seq, ...result }));
+              // Include bot, command, and params fields in execResult for processing in frontend
+              const responseData = { type: resType, _seq: seq, bot: data.bot, command: data.command, params: data.params, ...result };
+              ws.send(JSON.stringify(responseData));
             }
           } catch (err) {
+            const rawData = JSON.parse(typeof msg === "string" ? msg : msg.toString());
             ws.send(JSON.stringify({
               type: isExec ? "execResult" : "actionResult",
               _seq: seq,
+              bot: rawData.bot,
+              command: rawData.command,
+              params: rawData.params,
               ok: false,
               error: err instanceof Error ? err.message : String(err),
             }));

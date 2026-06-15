@@ -8714,6 +8714,64 @@
             if (isStorageCommand) window._refreshingStorage = false;
           }
 
+          // Handle query commands that need to update the UI with fresh data
+          if (result.ok && result.data) {
+            const bot = bots.find((b) => b.username === profileBot);
+            if (!bot) return;
+
+            if (command === "get_cargo" || command === "get_cargo_items") {
+              const items = (result.data.cargo || result.data.items || []).map(
+                (item) => ({
+                  itemId: item.item_id || item.itemId,
+                  name: item.name || catalogName(item.item_id || item.itemId),
+                  quantity: item.quantity,
+                }),
+              );
+              bot.inventory = items;
+              _pendingFreshCargo = items;
+              renderProfileSidebar();
+              renderManualControls(true);
+            } else if (command === "view_storage" && (!params || !params.target)) {
+              const items = (result.data.items || result.data.storage || []).map(
+                (item) => ({
+                  itemId: item.item_id || item.itemId,
+                  name: item.name || catalogName(item.item_id || item.itemId),
+                  quantity: item.quantity,
+                }),
+              );
+              bot.storage = items;
+              _pendingFreshStorage = items;
+              renderProfileSidebar();
+              renderManualControls(true);
+            } else if (command === "view_storage" && params && params.target === "faction") {
+              const items = (result.data.items || result.data.storage || []).map(
+                (item) => ({
+                  item_id: item.item_id || item.itemId,
+                  name: item.name || catalogName(item.item_id || item.itemId),
+                  quantity: item.quantity,
+                }),
+              );
+              profileFactionStorage = items;
+              _pendingFreshFactionStorage = items;
+              renderProfileSidebar();
+              renderManualControls(true);
+            } else if (command === "get_status") {
+              // get_status may update bot location, docked status, etc.
+              const status = result.data.player || result.data;
+              if (status) {
+                bot.system = status.current_system || bot.system;
+                bot.docked = status.docked_at_base || bot.docked;
+                bot.poi = status.current_poi || bot.poi;
+                // Update credits if present
+                if (status.credits != null) {
+                  bot.credits = status.credits;
+                }
+              }
+              renderProfileSidebar();
+              renderManualControls(true);
+            }
+          }
+
           if (isStorageCommand && result.ok) {
             // After commands that modify storage, refresh all data from server then update UI
             const getFreshBot = () =>
@@ -9125,6 +9183,78 @@
           delete execTimers[msg._seq];
           execCallbacks[msg._seq](msg);
           delete execCallbacks[msg._seq];
+        }
+
+        // Also process query commands even without a callback (from bot-initiated commands)
+        // This handles when bots call get_cargo, view_storage, get_status as part of their routines
+        // msg.command is the command that was executed (from the original request)
+        // msg.data contains the actual response data from the command
+        const command = msg.command;
+        const isOk = msg.ok !== false;
+        const data = msg.data;
+        
+        if (!msg._seq && isOk && data) {
+          const bot = bots.find((b) => b.username === msg.bot);
+          if (!bot) return;
+
+          if (command === "get_cargo" || command === "get_cargo_items") {
+            const items = (data.cargo || data.items || []).map(
+              (item) => ({
+                itemId: item.item_id || item.itemId,
+                name: item.name || catalogName(item.item_id || item.itemId),
+                quantity: item.quantity,
+              }),
+            );
+            bot.inventory = items;
+            _pendingFreshCargo = items;
+            if (profileBot === bot.username) {
+              renderProfileSidebar();
+              renderManualControls(true);
+            }
+          } else if (command === "view_storage" && (!msg.params || !msg.params.target)) {
+            const items = (data.items || data.storage || []).map(
+              (item) => ({
+                itemId: item.item_id || item.itemId,
+                name: item.name || catalogName(item.item_id || item.itemId),
+                quantity: item.quantity,
+              }),
+            );
+            bot.storage = items;
+            _pendingFreshStorage = items;
+            if (profileBot === bot.username) {
+              renderProfileSidebar();
+              renderManualControls(true);
+            }
+          } else if (command === "view_storage" && msg.params && msg.params.target === "faction") {
+            const items = (data.items || data.storage || []).map(
+              (item) => ({
+                item_id: item.item_id || item.itemId,
+                name: item.name || catalogName(item.item_id || item.itemId),
+                quantity: item.quantity,
+              }),
+            );
+            bot.factionStorage = items;
+            if (profileBot === bot.username) {
+              profileFactionStorage = items;
+              _pendingFreshFactionStorage = items;
+              renderProfileSidebar();
+              renderManualControls(true);
+            }
+          } else if (command === "get_status") {
+            const status = data.player || data;
+            if (status) {
+              bot.system = status.current_system || bot.system;
+              bot.docked = status.docked_at_base || bot.docked;
+              bot.poi = status.current_poi || bot.poi;
+              if (status.credits != null) {
+                bot.credits = status.credits;
+              }
+            }
+            if (profileBot === bot.username) {
+              renderProfileSidebar();
+              renderManualControls(true);
+            }
+          }
         }
       }
 

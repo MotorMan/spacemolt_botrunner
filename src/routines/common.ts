@@ -4314,7 +4314,6 @@ export async function smartTravel(
   ctx: RoutineContext,
   stationId: string,
   opts?: {
-    target_system?: string;
     fuelThresholdPct?: number;
     hullThresholdPct?: number;
     noJettison?: boolean;
@@ -4323,13 +4322,12 @@ export async function smartTravel(
 ): Promise<{ success: boolean; usedHint: boolean; hintSystem?: string }> {
   const { bot } = ctx;
   const maxRetries = 3;
-  let currentTargetSystemId = opts?.target_system ?? getMobileCapitolSystem();
   let hintSystem: string | null = null;
   let usedHint = false;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    ctx.log("travel", `Traveling to ${stationId}${currentTargetSystemId ? ` in ${currentTargetSystemId}` : ""}... (attempt ${attempt + 1}/${maxRetries})`);
-    const travelResp = await bot.exec("travel", { target_poi: stationId, target_system: currentTargetSystemId });
+    ctx.log("travel", `Traveling to ${stationId}... (attempt ${attempt + 1}/${maxRetries})`);
+    const travelResp = await bot.exec("travel", { target_poi: stationId });
 
     if (!travelResp.error) {
       ctx.log("travel", `Arrived at ${stationId}`);
@@ -4369,7 +4367,6 @@ export async function smartTravel(
       }
 
       ctx.log("travel", `Jumped to ${hintSystem}, retrying travel to ${stationId}...`);
-      currentTargetSystemId = hintSystem;
       hintSystem = null;
     }
   }
@@ -4397,8 +4394,8 @@ export async function travelToStationWithHint(
   let usedHint = false;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    ctx.log("travel", `Traveling to ${stationName || stationId} in ${targetSystemId}... (attempt ${attempt + 1}/${maxRetries})`);
-    const travelResp = await bot.exec("travel", { target_poi: stationId, target_system: targetSystemId });
+    ctx.log("travel", `Traveling to ${stationName || stationId}... (attempt ${attempt + 1}/${maxRetries})`);
+    const travelResp = await bot.exec("travel", { target_poi: stationId });
 
     if (!travelResp.error) {
       ctx.log("travel", `Arrived at ${stationName || stationId}`);

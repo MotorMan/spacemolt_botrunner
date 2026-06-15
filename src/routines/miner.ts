@@ -3495,22 +3495,20 @@ if (effectiveTarget) {
         // it may require a directional jump. Try leaving and coming back.
         if (isHiddenPoi) {
           ctx.log("mining", `Hidden POI may require directional access — trying to leave and re-enter system`);
-          const homeSys = bot.system; // Save current system before traveling out
-          // Get connected systems to try
+          const homeSys = bot.system;
           const currentSysData = mapStore.getSystem(homeSys);
           const connections = currentSysData?.connections || [];
           if (connections.length > 0) {
-            // Try traveling to first connected system and back
             const firstConn = connections[0];
             const targetSysName = firstConn.system_name || firstConn.system_id || "unknown";
-            ctx.log("mining", `Traveling to connected system ${targetSysName} then back...`);
-            const outResp = await bot.exec("travel", { target_system: firstConn.system_id });
+            ctx.log("mining", `Jumping to connected system ${targetSysName} then back...`);
+            const outResp = await bot.exec("jump", { target_system: firstConn.system_id });
             if (!outResp.error) {
-              ctx.log("mining", `Traveled to ${targetSysName} — returning to ${homeSys}`);
+              ctx.log("mining", `Jumped to ${targetSysName} — returning to ${homeSys}`);
               await ctx.sleep(3000);
-              const backResp = await bot.exec("travel", { target_system: homeSys });
+              const backResp = await bot.exec("jump", { target_system: homeSys });
               if (!backResp.error) {
-                bot.system = homeSys;
+                await bot.refreshLocation();
                 ctx.log("mining", `Returned to ${homeSys} — retrying POI discovery`);
                 await ctx.sleep(3000);
                 // Try get_poi again after re-entering

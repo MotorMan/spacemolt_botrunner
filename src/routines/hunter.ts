@@ -545,7 +545,7 @@ async function navigateToSafeStation(ctx: RoutineContext, safetyOpts: { fuelThre
     if (safeSystem) {
       const sys = mapStore.getSystem(safeSystem);
       ctx.log("travel", `Heading to safe system ${sys?.name || safeSystem} (${sys?.security_level}) for repairs...`);
-      const arrived = await navigateToSystem(ctx, safeSystem, safetyOpts);
+      const arrived = await navigateToSystem(ctx, safeSystem, { ...safetyOpts, skipBlacklist: true });
       if (!arrived) {
         ctx.log("error", "Could not reach safe system — attempting local dock");
       }
@@ -734,7 +734,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   // If we started the routine while docked at home base, refuel, repair, then restock
   if (bot.docked) {
     await repairShip(ctx);
-    await tryRefuel(ctx);
+    await tryRefuel(ctx, { skipApprovedCheck: true });
     await ensureHunterResupply(ctx);
   }
 
@@ -800,9 +800,9 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     yield "get_poi";
     if (bot.poi) await bot.exec("get_poi", { poi_id: bot.poi });
 
-    // ── Fuel check ──
+// ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { skipBlacklist: true });
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await ctx.sleep(30000);
@@ -819,7 +819,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       if (docked) {
         await completeActiveMissions(ctx);
         await repairShip(ctx);
-        await tryRefuel(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
         await checkAndAcceptMissions(ctx);
         await ensureInsured(ctx);
         await bot.checkSkills();
@@ -950,7 +950,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         await bot.exec("travel", { target_poi: station.id });
         await bot.exec("dock");
         bot.docked = true;
-        await tryRefuel(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
         await ensureUndocked(ctx);
       }
       continue;
@@ -1241,7 +1241,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       await ensureInsured(ctx);
 
       yield "refuel";
-      await tryRefuel(ctx);
+      await tryRefuel(ctx, { skipApprovedCheck: true });
 
       yield "repair";
       await repairShip(ctx);
@@ -1343,7 +1343,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       if (docked) {
         await completeActiveMissions(ctx);
         await repairShip(ctx);
-        await tryRefuel(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
         await checkAndAcceptMissions(ctx);
         await ensureInsured(ctx);
         await bot.checkSkills();
@@ -1385,7 +1385,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         await bot.exec("travel", { target_poi: station.id });
         await bot.exec("dock");
         bot.docked = true;
-        await tryRefuel(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
         await ensureUndocked(ctx);
       }
       continue;
@@ -1622,7 +1622,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       await ensureInsured(ctx);
 
       yield "refuel";
-      await tryRefuel(ctx);
+      await tryRefuel(ctx, { skipApprovedCheck: true });
 
       yield "repair";
       await repairShip(ctx);
@@ -1709,7 +1709,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       if (docked) {
         await completeActiveMissions(ctx);
         await repairShip(ctx);
-        await tryRefuel(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
         await checkAndAcceptMissions(ctx);
         await ensureInsured(ctx);
         await bot.checkSkills();
@@ -2008,7 +2008,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   const allowBuying = false;
 
   // Always try to refuel when docked at home base (free fuel)
-  await tryRefuel(ctx);
+  await tryRefuel(ctx, { skipApprovedCheck: true });
 
   // Repair hull if damaged
   await repairShip(ctx);

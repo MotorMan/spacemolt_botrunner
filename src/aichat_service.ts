@@ -517,19 +517,21 @@ export class AiChatService {
     this.empireAlertFn = fn;
   }
 
-  /**
+/**
    * Generate a hash for duplicate detection.
    * For mentions, include botUsername so different bots can respond to their own mentions.
-   * For non-mention messages, exclude botUsername so only one bot responds.
+   * For non-mention messages, exclude botUsername so only one bot responds to "respond to all".
+   * Note: We intentionally do NOT include the timestamp in the hash because get_notifications
+   * can return the same messages with new timestamps when called with clear=false. The
+   * SEEN_EXPIRY_MS on the seenMessages map handles the time-based expiration.
    */
   private getMessageHash(msg: ChatMessage, isMention: boolean): string {
-    const minute = Math.floor(msg.timestamp / 60000);
     // For mentions, include botUsername so different bots can respond to their own mentions
     // For non-mentions, exclude botUsername so only one bot responds to "respond to all"
     if (isMention) {
-      return `${msg.sender}|${msg.channel}|${msg.content}|${minute}|${msg.botUsername || "unknown"}`;
+      return `${msg.sender}|${msg.channel}|${msg.content}|${msg.botUsername || "unknown"}`;
     } else {
-      return `${msg.sender}|${msg.channel}|${msg.content}|${minute}`;
+      return `${msg.sender}|${msg.channel}|${msg.content}`;
     }
   }
 

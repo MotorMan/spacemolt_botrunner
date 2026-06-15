@@ -1906,35 +1906,37 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         }
       }
 
-      const announceService = (globalThis as any).aiChatService;
-      const pickupIsHome = state.pickupStation === settings.homeStation || state.pickupSystem === settings.homeSystem;
-      if (
-        announceService &&
-        typeof announceService.sendTransportAnnouncement === "function"
-      ) {
-        const routeNames = settings.announceDestination
-          ? planned.map(d => d.poiName).filter(name => name && name.trim().length > 0)
-          : [];
-        const passengerInfos = onboard.map(p => ({
-          name: p.name,
-          bio: p.bio || "",
-          destinationName: p.destinationName,
-        }));
-        const shipDisplayName = state.customName || state.shipName;
-        announceService.sendTransportAnnouncement(bot, {
-          shipName: shipDisplayName,
-          route: routeNames,
-          totalPassengers: onboard.length,
-          currentSystem: bot.system || "",
-          cycleType: "pickup",
-          onboardPassengers: passengerInfos,
-        }).then((result: { ok: boolean; message?: string; error?: string }) => {
-          if (!result.ok) {
-            ctx.log("error", `Transport announcement failed: ${result.error}`);
-          }
-        }).catch((err: Error) => {
-          ctx.log("error", `Transport announcement error: ${err.message}`);
-        });
+      if (!settings.disableFactionMessage) {
+        const announceService = (globalThis as any).aiChatService;
+        const pickupIsHome = state.pickupStation === settings.homeStation || state.pickupSystem === settings.homeSystem;
+        if (
+          announceService &&
+          typeof announceService.sendTransportAnnouncement === "function"
+        ) {
+          const routeNames = settings.announceDestination
+            ? planned.map(d => d.poiName).filter(name => name && name.trim().length > 0)
+            : [];
+          const passengerInfos = onboard.map(p => ({
+            name: p.name,
+            bio: p.bio || "",
+            destinationName: p.destinationName,
+          }));
+          const shipDisplayName = state.customName || state.shipName;
+          announceService.sendTransportAnnouncement(bot, {
+            shipName: shipDisplayName,
+            route: routeNames,
+            totalPassengers: onboard.length,
+            currentSystem: bot.system || "",
+            cycleType: "pickup",
+            onboardPassengers: passengerInfos,
+          }).then((result: { ok: boolean; message?: string; error?: string }) => {
+            if (!result.ok) {
+              ctx.log("error", `Transport announcement failed: ${result.error}`);
+            }
+          }).catch((err: Error) => {
+            ctx.log("error", `Transport announcement error: ${err.message}`);
+          });
+        }
       }
 
       // Undock and continue to transit handling below

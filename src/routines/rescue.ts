@@ -4703,16 +4703,50 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("rescue", `✓ Bot started at home base (${homeSystem})`);
   }
 
-  // ── Start background credit top-off loop (non-blocking) ──
-  // Only the primary credit top-off bot should run this background loop
-  if (isPrimaryCreditTopOffBot(bot.username)) {
-    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
-  } else {
-    ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
-  }
+// ── Start background credit top-off loop (non-blocking) ──
+    // Only the primary credit top-off bot should run this background loop
+    if (isPrimaryCreditTopOffBot(bot.username)) {
+      startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+    } else {
+      ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
+    }
 
-  // Log category - determined when target is selected
-  let logCategory: string = "rescue";
+    // ── Start background faction storage update loop (non-blocking) ──
+    // Cycles through approved fuel stations to update faction storage data
+    let currentFuelStationIndex = 0;
+    const general = readSettings().general || {};
+    const approvedFuelStations: string[] = (general as any).approvedFuelStations as string[] || [];
+    
+    if (approvedFuelStations.length > 0) {
+      ctx.log("rescue", `📡 Starting faction storage update cycle for ${approvedFuelStations.length} approved fuel stations`);
+      
+      // Start background update loop
+      (async () => {
+        while (bot.state === "running") {
+          try {
+            const stationKey = approvedFuelStations[currentFuelStationIndex];
+            const stationId = stationKey.split("|")[1];
+            if (stationId && bot.docked && bot.poi === stationId) {
+              ctx.log("rescue", `📡 Updating faction storage at ${stationId}...`);
+              const storageResp = await bot.exec("view_storage", { target: "faction", station_id: stationId });
+              if (!storageResp.error && storageResp.result) {
+                const result = storageResp.result as Record<string, unknown>;
+                const items = (result.items as any[]) || [];
+                ctx.log("rescue", `📡 Faction storage updated: ${items.length} items`);
+              }
+            }
+            currentFuelStationIndex = (currentFuelStationIndex + 1) % approvedFuelStations.length;
+          } catch (e) {
+            ctx.log("warn", `Failed to update faction storage: ${e}`);
+          }
+          // Wait 1 minute before next station update
+          await new Promise(resolve => setTimeout(resolve, 60000));
+        }
+      })();
+    }
+
+    // Log category - determined when target is selected
+    let logCategory: string = "rescue";
 
   while (bot.state === "running") {
     // ── Death recovery ──

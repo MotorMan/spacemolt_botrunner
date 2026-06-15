@@ -924,7 +924,6 @@ constructor(port: number = 3000) {
         }
 
         if (url.pathname === "/api/faction-fuel-stations" && req.method === "GET") {
-          // Get faction fuel for all approved refueling stations
           const settings = this.settings;
           const approvedStations = (settings.general as Record<string, unknown>)?.approvedFuelStations as string[] || [];
           const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
@@ -935,18 +934,26 @@ constructor(port: number = 3000) {
             const [systemId, stationId] = stationKey.split("|");
             if (!stationId) continue;
 
-            const factionStoragePath = join(CACHE_DIR, `Busy Being Dead--${stationId}.json`);
-            if (!existsSync(factionStoragePath)) continue;
-
             try {
-              const raw = readFileSync(factionStoragePath, "utf-8");
-              const data = JSON.parse(raw);
-              stationsData.push({
-                stationId,
-                systemId,
-                fuelReserve: data.factionFuelReserve || 0,
-                fuelCapacity: data.factionFuelCapacity || 0,
-              });
+              const files = readdirSync(CACHE_DIR);
+              for (const file of files) {
+                if (!file.endsWith(".json")) continue;
+                const match = file.match(/^(.+)--(.+)\.json$/) || file.match(/^(.+)::(.+)\.json$/);
+                if (!match) continue;
+                const [, , fileStationId] = match;
+                if (fileStationId === stationId) {
+                  const factionStoragePath = join(CACHE_DIR, file);
+                  const raw = readFileSync(factionStoragePath, "utf-8");
+                  const data = JSON.parse(raw);
+                  stationsData.push({
+                    stationId,
+                    systemId,
+                    fuelReserve: data.factionFuelReserve || 0,
+                    fuelCapacity: data.factionFuelCapacity || 0,
+                  });
+                  break;
+                }
+              }
             } catch {
               // Ignore errors for individual stations
             }

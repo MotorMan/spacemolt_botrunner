@@ -3854,9 +3854,11 @@
       function getStationInitials(stationId) {
         const stationNameMap = {
           sol_central: "SC",
+          solarian_colonial_station: "SC",
           sirius_observatory_station: "S",
           nova_terra_central: "NT",
-          procyon_colonial_station: "PC",
+          the_core: "NT",
+          procyon_colonial_station: "PA",
           alpha_centauri_colonial_station: "AC",
         };
         return stationNameMap[stationId] || stationId.slice(0, 2).toUpperCase();

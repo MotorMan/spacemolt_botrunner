@@ -1445,7 +1445,6 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           if (data && data.count > 0) {
             state.pickupStation = bot.poi;
             state.pickupSystem = bot.system;
-            state.roundsWithoutPassengers = 0;
           } else {
             state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
             ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
@@ -1835,6 +1834,27 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           await ctx.sleep(10000);
           continue;
         }
+        state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
+        ctx.log("transport", `No route planned for passengers, round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
+        if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
+          ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
+          const nextPickup = await selectNextPickupStation(ctx, state, settings);
+          if (nextPickup) {
+            state.pickupStation = nextPickup.poi;
+            state.pickupSystem = nextPickup.system;
+            state.roundsWithoutPassengers = 0;
+            state.onboardPassengers = [];
+            state.route = [];
+            state.status = "idle";
+            saveTransportState(state);
+            await ctx.sleep(5000);
+            continue;
+          }
+        }
+        state.status = "idle";
+        saveTransportState(state);
+        await ctx.sleep(10000);
+        continue;
       }
 
       for (const p of aboard) {

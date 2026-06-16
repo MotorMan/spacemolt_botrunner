@@ -2243,17 +2243,26 @@
                       for (const [skillId, skillData] of Object.entries(
                         bot.skills,
                       )) {
-                        // Handle both camelCase (from bot) and snake_case (from logs)
                         const xp = skillData.xp || skillData["xp"] || 0;
                         const nextLevelXp =
                           skillData.xpToNext ||
                           skillData["xp_to_next"] ||
-                          skillData.next_level_xp;
+                          skillData.next_level_xp ||
+                          0;
+                        const cachedNextLevelXp =
+                          skillsNextLevelCache[bot.username]?.[skillId];
+                        const finalNextLevelXp =
+                          nextLevelXp > 0 ? nextLevelXp : cachedNextLevelXp || 0;
                         skills[skillId] = {
                           level: skillData.level || 0,
                           xp: xp,
-                          nextLevelXp: nextLevelXp,
+                          nextLevelXp: finalNextLevelXp,
                         };
+                        if (!skillsNextLevelCache[bot.username])
+                          skillsNextLevelCache[bot.username] = {};
+                        if (nextLevelXp > 0) {
+                          skillsNextLevelCache[bot.username][skillId] = nextLevelXp;
+                        }
                       }
                       skillsData.bots[bot.username] = {
                         skills,
@@ -2485,11 +2494,26 @@
                 if (!skillsData.bots) skillsData.bots = {};
                 const skillData = {};
                 for (const [skillId, s] of Object.entries(msg.skills)) {
-                  skillData[skillId] = {
-                    level: s.level || 0,
-                    xp: s.xp || 0,
-                    nextLevelXp: s.nextLevelXp || 0,
-                  };
+                  const nextLevelXp =
+                    s.nextLevelXp ||
+                    s["xp_to_next"] ||
+                    s["xpToNext"] ||
+                    0;
+                  if (skillsNextLevelCache[botName] && skillsNextLevelCache[botName][skillId] && nextLevelXp === 0) {
+                    skillData[skillId] = {
+                      level: s.level || 0,
+                      xp: s.xp || 0,
+                      nextLevelXp: skillsNextLevelCache[botName][skillId],
+                    };
+                  } else {
+                    skillData[skillId] = {
+                      level: s.level || 0,
+                      xp: s.xp || 0,
+                      nextLevelXp: nextLevelXp,
+                    };
+                    if (!skillsNextLevelCache[botName]) skillsNextLevelCache[botName] = {};
+                    skillsNextLevelCache[botName][skillId] = nextLevelXp;
+                  }
                 }
                 skillsData.bots[botName] = {
                   skills: skillData,
@@ -3599,6 +3623,7 @@
       let skillsData = null;
       let skillsLoaded = false;
       let skillsUpdateInterval = null;
+      let skillsNextLevelCache = {};
 
       function startSkillsUpdates() {
         if (skillsUpdateInterval) return;
@@ -3627,7 +3652,6 @@
       }
 
       async function loadSkillsData() {
-        // Initialize skillsData from current bots (live WebSocket updates)
         if (!skillsData) {
           skillsData = { bots: {}, lastUpdated: new Date().toISOString() };
           for (const bot of bots) {
@@ -3642,8 +3666,13 @@
                 skills[skillId] = {
                   level: skillData.level || 0,
                   xp: xp,
-                  nextLevelXp: nextLevelXp,
+                  nextLevelXp: nextLevelXp || 0,
                 };
+                if (!skillsNextLevelCache[bot.username])
+                  skillsNextLevelCache[bot.username] = {};
+                if (nextLevelXp > 0) {
+                  skillsNextLevelCache[bot.username][skillId] = nextLevelXp;
+                }
               }
               skillsData.bots[bot.username] = {
                 skills,
@@ -3706,20 +3735,26 @@
                   ? skillEntries
                       .map(([skillId, skill]) => {
                         const level = skill.level || 0;
-                        // Handle both camelCase (from bot) and snake_case (from logs)
                         const xp = skill.xp || skill["xp"] || 0;
                         const nextLevelXp =
                           skill.nextLevelXp ||
                           skill["xp_to_next"] ||
                           skill["xpToNext"] ||
                           0;
-                        const xpPercent = nextLevelXp
-                          ? Math.min(100, Math.round((xp / nextLevelXp) * 100))
+                        const cachedNextLevelXp =
+                          skillsNextLevelCache[botName]?.[skillId];
+                        const finalNextLevelXp =
+                          nextLevelXp > 0 ? nextLevelXp : cachedNextLevelXp || 0;
+                        const xpPercent = finalNextLevelXp
+                          ? Math.min(100, Math.round((xp / finalNextLevelXp) * 100))
                           : 0;
-                        const xpDisplay =
-                          xp && nextLevelXp
-                            ? `${xp}/${nextLevelXp} (${xpPercent}%)`
-                            : "";
+
+                        let xpDisplay = "";
+                        if (xp > 0 && finalNextLevelXp > 0) {
+                          xpDisplay = `${xp}/${finalNextLevelXp} (${xpPercent}%)`;
+                        } else if (xp > 0) {
+                          xpDisplay = `${xp} xp`;
+                        }
 
                         let skillClass = "";
                         if (importantSkills[skillId]) {
@@ -3732,7 +3767,7 @@
                         return `
                       <div class="skills-item">
                         <span class="skills-name ${skillClass}">${esc(friendlyName)}</span>
-                        <span class="skills-level">Lv ${level}${xpDisplay ? '<br><span class="skills-xp">' + xpDisplay + "</span>" : ""}</span>
+                        <span class="skills-level">Lv ${level}${xpDisplay ? ' <span class="skills-xp">' + xpDisplay + "</span>" : ""}</span>
                       </div>
                     `;
                       })

@@ -2044,12 +2044,11 @@ button.sm { padding: 3px 10px; font-size: 11px; }
   font-size: 11px;
 }
 .skills-xp {
-  display: block;
-  color: var(--text-dim);
-  font-size: 9px;
-  opacity: 0.7;
-  margin-top: 2px;
-}
+    color: var(--text-dim);
+    font-size: 9px;
+    opacity: 0.7;
+    margin-left: 4px;
+  }
 .skills-name.piloting { color: var(--green); font-weight: 600; }
 .skills-name.combat { color: var(--yellow); }
 .skills-name.piracy { color: var(--red); font-weight: 600; }

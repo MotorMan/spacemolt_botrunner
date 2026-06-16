@@ -1439,6 +1439,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 
 // ── Background credit top-off state ──────────────────────────────────────────
 let creditTopOffIntervalId: NodeJS.Timeout | null = null;
+let creditTopOffRoutineActive = false;
 const consecutiveZeroCredits = new Map<string, number>(); // botUsername -> consecutive 0 credit count
 const ownBotRescueCooldown = new Map<string, number>(); // botUsername -> cooldown expiry timestamp (ms) for unreachable own fleet bots
 
@@ -1458,6 +1459,7 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
     return;
   }
 
+  creditTopOffRoutineActive = true;
   ctx.log("rescue", `💰 Credit top-off background loop started (target: ${targetAmount}cr, interval: 60s)`);
 
   const intervalMs = 60 * 1000; // 1 minute
@@ -1466,9 +1468,9 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
     try {
       const { bot } = ctx;
 
-      // Stop if routine is no longer running
-      if (bot.state !== "running" && bot.state !== "idle") {
-        ctx.log("rescue", "💰 Stopping credit top-off background loop — routine is no longer running");
+      // Stop if routine is no longer active
+      if (!creditTopOffRoutineActive) {
+        ctx.log("rescue", "💰 Stopping credit top-off background loop — routine is no longer active");
         stopCreditTopOffBackground();
         return;
       }
@@ -1519,8 +1521,9 @@ function stopCreditTopOffBackground(): void {
   if (creditTopOffIntervalId !== null) {
     clearInterval(creditTopOffIntervalId);
     creditTopOffIntervalId = null;
-    console.log("[rescue] 💰 Credit top-off background loop stopped");
   }
+  creditTopOffRoutineActive = false;
+  console.log("[rescue] 💰 Credit top-off background loop stopped");
 }
 
 // ── FuelTransfer routine (using refuel command) ─────────────────
@@ -5872,11 +5875,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
       // ── PIRATE BASE PROXIMITY CHECK: Block navigation to systems near pirate bases ──
       // This is a HARD BLOCK - do not attempt to navigate to blacklisted systems
+      // (unless ignoreBlacklist is enabled)
       const { getSystemBlacklist } = await import("../web/server.js");
-      const blacklist = getSystemBlacklist();
+      const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
       const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
       
-      const isTargetBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
+      const isTargetBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
       if (isTargetBlacklisted) {
         ctx.log("rescue", `🚫 BLOCKED: Target system ${target.system} is BLACKLISTED (likely near pirate base)`);
         ctx.log("rescue", `🚫 ABORTING RESCUE - cannot navigate to blacklisted system`);

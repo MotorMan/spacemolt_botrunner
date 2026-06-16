@@ -1220,56 +1220,102 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const reason = needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`;
       ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Returning to safe system (${reason})...`);
 
-      yield "dock";
-      const docked = await navigateToSafeStation(ctx, safetyOpts);
-      if (!docked) {
-        ctx.log("error", "Could not dock anywhere — retrying next cycle");
-        continue;
-      }
-
-      await collectFromStorage(ctx);
-
-      yield "complete_missions";
-      await completeActiveMissions(ctx);
-
-      await bot.refreshLocation();
-
-      yield "check_missions";
-      await checkAndAcceptMissions(ctx);
-
-      yield "ensure_insured";
-      await ensureInsured(ctx);
-
-      yield "refuel";
-      await tryRefuel(ctx, { skipApprovedCheck: true });
-
-      yield "repair";
-      await repairShip(ctx);
-
-      yield "reload";
-      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-
-      yield "fit_mods";
-      const modProfile = getModProfile("hunter");
-      if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
-
-      yield "check_skills";
-      await bot.checkSkills();
-
-      ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
-
-      if (settings.singleLoop) {
-        ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+      // When needsFuel is true, go directly to home base for full resupply
+      if (needsFuel && settings.homeSystem) {
+        ctx.log("system", "Returning to home base for full resupply...");
+        await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
         const hs = settings.homeStation || "";
         const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
         if (hsys && hpoi) {
-          await navigateToSystem(ctx, hsys, safetyOpts);
-          const t = await bot.exec("travel", { target_poi: hpoi });
-          if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+          await bot.exec("travel", { target_poi: hpoi });
+          await bot.exec("dock");
+          bot.docked = true;
         } else {
-          await navigateToSafeStation(ctx, safetyOpts);
+          await ensureDocked(ctx);
         }
+        await collectFromStorage(ctx);
+
+        yield "complete_missions";
+        await completeActiveMissions(ctx);
+
+        await bot.refreshLocation();
+
+        yield "check_missions";
+        await checkAndAcceptMissions(ctx);
+
+        yield "ensure_insured";
+        await ensureInsured(ctx);
+
+        yield "refuel";
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+
+        yield "repair";
+        await repairShip(ctx);
+
+        yield "reload";
+        await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+
+        yield "fit_mods";
+        const modProfile = getModProfile("hunter");
+        if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+
+        yield "check_skills";
+        await bot.checkSkills();
+
+        ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
         await ensureHunterResupply(ctx);
+      } else {
+        yield "dock";
+        const docked = await navigateToSafeStation(ctx, safetyOpts);
+        if (!docked) {
+          ctx.log("error", "Could not dock anywhere — retrying next cycle");
+          continue;
+        }
+
+        await collectFromStorage(ctx);
+
+        yield "complete_missions";
+        await completeActiveMissions(ctx);
+
+        await bot.refreshLocation();
+
+        yield "check_missions";
+        await checkAndAcceptMissions(ctx);
+
+        yield "ensure_insured";
+        await ensureInsured(ctx);
+
+        yield "refuel";
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+
+        yield "repair";
+        await repairShip(ctx);
+
+        yield "reload";
+        await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+
+        yield "fit_mods";
+        const modProfile = getModProfile("hunter");
+        if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+
+        yield "check_skills";
+        await bot.checkSkills();
+
+        ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
+
+        if (settings.singleLoop) {
+          ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+          const hs = settings.homeStation || "";
+          const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+          if (hsys && hpoi) {
+            await navigateToSystem(ctx, hsys, safetyOpts);
+            const t = await bot.exec("travel", { target_poi: hpoi });
+            if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+          } else {
+            await navigateToSafeStation(ctx, safetyOpts);
+          }
+          await ensureHunterResupply(ctx);
+        }
       }
 
     } else {
@@ -1601,43 +1647,89 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       const reason = needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`;
       ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Returning to safe system (${reason})...`);
 
-      yield "dock";
-      const docked = await navigateToSafeStation(ctx, safetyOpts);
-      if (!docked) {
-        ctx.log("error", "Could not dock anywhere — retrying next cycle");
-        continue;
+      // When needsFuel is true, go directly to home base for full resupply
+      if (needsFuel && settings.homeSystem) {
+        ctx.log("system", "Returning to home base for full resupply...");
+        await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+        const hs = settings.homeStation || "";
+        const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+        if (hsys && hpoi) {
+          await bot.exec("travel", { target_poi: hpoi });
+          await bot.exec("dock");
+          bot.docked = true;
+        } else {
+          await ensureDocked(ctx);
+        }
+        await collectFromStorage(ctx);
+
+        yield "complete_missions";
+        await completeActiveMissions(ctx);
+
+        await bot.refreshLocation();
+
+        yield "check_missions";
+        await checkAndAcceptMissions(ctx);
+
+        yield "ensure_insured";
+        await ensureInsured(ctx);
+
+        yield "refuel";
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+
+        yield "repair";
+        await repairShip(ctx);
+
+        yield "reload";
+        await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+
+        yield "fit_mods";
+        const modProfile = getModProfile("hunter");
+        if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+
+        yield "check_skills";
+        await bot.checkSkills();
+
+        ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
+        await ensureHunterResupply(ctx);
+      } else {
+        yield "dock";
+        const docked = await navigateToSafeStation(ctx, safetyOpts);
+        if (!docked) {
+          ctx.log("error", "Could not dock anywhere — retrying next cycle");
+          continue;
+        }
+
+        await collectFromStorage(ctx);
+
+        yield "complete_missions";
+        await completeActiveMissions(ctx);
+
+        await bot.refreshLocation();
+
+        yield "check_missions";
+        await checkAndAcceptMissions(ctx);
+
+        yield "ensure_insured";
+        await ensureInsured(ctx);
+
+        yield "refuel";
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+
+        yield "repair";
+        await repairShip(ctx);
+
+        yield "reload";
+        await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+
+        yield "fit_mods";
+        const modProfile = getModProfile("hunter");
+        if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+
+        yield "check_skills";
+        await bot.checkSkills();
+
+        ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
       }
-
-      await collectFromStorage(ctx);
-
-      yield "complete_missions";
-      await completeActiveMissions(ctx);
-
-      await bot.refreshLocation();
-
-      yield "check_missions";
-      await checkAndAcceptMissions(ctx);
-
-      yield "ensure_insured";
-      await ensureInsured(ctx);
-
-      yield "refuel";
-      await tryRefuel(ctx, { skipApprovedCheck: true });
-
-      yield "repair";
-      await repairShip(ctx);
-
-      yield "reload";
-      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-
-      yield "fit_mods";
-      const modProfile = getModProfile("hunter");
-      if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
-
-      yield "check_skills";
-      await bot.checkSkills();
-
-      ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
 
     } else {
       ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Hull: ${postHull}% | Fuel: ${postFuel}% — continuing hunt in system...`);

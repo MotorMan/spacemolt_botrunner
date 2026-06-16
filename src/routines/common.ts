@@ -730,22 +730,7 @@ export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?
   if (fuelPct >= 95) return;
 
   const startFuel = Math.round(fuelPct);
-
-  // Collect fuel cells from faction storage before refueling
-  // This ensures we have fuel cells available for the return journey
-  const fuelCells = ["military_fuel_cell", "premium_fuel_cell", "fuel_cell"];
-  for (const cellId of fuelCells) {
-    const existing = (bot.inventory || []).filter(i => i.itemId === cellId).reduce((sum, i) => sum + (i.quantity || 0), 0);
-    const needed = Math.max(0, 10 - existing); // Top off to at least 10 fuel cells
-    if (needed > 0) {
-      const wResp = await bot.exec("storage", { action: "withdraw", target: "faction", item_id: cellId, quantity: needed });
-      if (!wResp.error) {
-        ctx.log("trade", `Withdrew ${needed}x ${cellId} from faction storage`);
-        await bot.refreshCargo();
-      }
-    }
-  }
-
+  
   // Check if current station has refuel service
   const { pois } = await getSystemInfo(ctx);
   const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);

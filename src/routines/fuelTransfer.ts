@@ -36,7 +36,7 @@ import {
   type FacilityTransferLoadout,
 } from "./fuelTransferTracking.js";
 
-const FUEL_CELL_ITEM_ID_PREFIXES = ["fuel_cell", "premium_fuel_cell"];
+const FUEL_CELL_ITEM_ID_PREFIXES = ["fuel_cell", "premium_fuel_cell", "military_fuel_cell"];
 
 function isFuelCellItem(itemId: string): boolean {
   const lower = itemId.toLowerCase();
@@ -547,10 +547,16 @@ async function processItemTransfer(
 
   const itemSize = getItemSize(item.itemId);
   const maxCanCarry = Math.floor((bot.cargoMax || 825) / itemSize);
-  const toWithdraw = Math.min(needed, maxCanCarry);
+  
+  const isFuelCell = isFuelCellItem(item.itemId);
+  const toWithdraw = isFuelCell ? (needed >= maxCanCarry ? maxCanCarry : 0) : Math.min(needed, maxCanCarry);
 
   if (toWithdraw <= 0) {
-    ctx.log("warn", `Cannot carry any ${item.itemName} (size ${itemSize})`);
+    if (isFuelCell) {
+      ctx.log("fuel", `${remoteStationId}: Waiting for full cargo load of ${item.itemName} (need ${needed}, max ${maxCanCarry})`);
+    } else {
+      ctx.log("warn", `Cannot carry any ${item.itemName} (size ${itemSize})`);
+    }
     return null;
   }
 

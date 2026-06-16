@@ -684,62 +684,50 @@ export async function fightFreshBattle(
 ): Promise<boolean> {
   const { bot } = ctx;
   const MAX_BATTLE_TICKS = 60;
+  let tickCount = 0;
+  let lastHull = bot.hull;
+  const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
 
-  // Advance to engaged zone
-  // NOTE: bot.exec("battle", ...) ALREADY BLOCKS until server tick (~10s)
-  for (let zone = 0; zone < 3; zone++) {
-    if (bot.state !== "running") return false;
+  ctx.log("combat", `🎯 Fighting fresh battle against ${target.name}...`);
 
-    const status = await getBattleStatus(ctx);
-    if (!status) {
-      ctx.log("combat", `✅ Battle ended during advance — ${target.name} eliminated!`);
-      return true;
-    }
-
-    await bot.refreshShip();
-    const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-
-    if (hullPct <= fleeThreshold) {
-      ctx.log("combat", `💀 Hull critical (${hullPct}%) while advancing — fleeing!`);
-      await emergencyFleeSpam(ctx, "hull critical while advancing");
-      return false;
-    }
-
-    // Battle commands LOCK until server tick - wait for tick completion
-    ctx.log("combat", `Advancing to zone ${zone + 1}/3...`);
-    const advResp = await bot.exec("battle", { action: "advance" });
-    if (advResp.error) {
-      const errMsg = advResp.error.message.toLowerCase();
-      if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
-        ctx.log("combat", `✅ Battle ended during advance - victory!`);
-        return true;
-      }
-      ctx.log("error", `Advance failed: ${advResp.error.message}`);
-      break;
-    }
-
-    // Wait for tick to complete
-    await ctx.sleep(10000);
-    const postAdvanceStatus = await getBattleStatus(ctx);
-    if (postAdvanceStatus) {
-      const zoneNames = ["mid", "inner", "engaged"];
-      ctx.log("combat", `   Advanced to ${zoneNames[zone]} zone (${zone + 1}/3) | Hull: ${hullPct}%`);
-    }
+  // Initial setup - scan and attack
+  let scanResp = await bot.exec("scan", { target_id: target.id });
+  if (scanResp.error && scanResp.error.message.toLowerCase().includes("invalid_target")) {
+    ctx.log("combat", `Scan with pirate_id failed - trying name instead...`);
+    scanResp = await bot.exec("scan", { target_id: target.name });
   }
 
-  // Tactical combat loop - always stay at engaged, never retreat or brace
-  let lastHull = bot.hull;
-  let tickCount = 0;
+  if (!scanResp.error && scanResp.result) {
+    const s = scanResp.result as Record<string, unknown>;
+    const shipType = (s.ship_type as string) || (s.ship as string) || "unknown";
+    const faction = (s.faction as string) || target.faction || "unknown";
+    ctx.log("combat", `   Scan: ${target.name} — ${shipType} | Faction: ${faction}`);
+  }
 
-  ctx.log("combat", `🎯 Targeting ${target.name}...`);
-  await bot.exec("battle", { action: "target", target_id: target.id });
-  await ctx.sleep(1000);
+  let attackResp = await bot.exec("attack", { target_id: target.id });
+  if (attackResp.error) {
+    const msg = attackResp.error.message.toLowerCase();
+    if (msg.includes("not found") || msg.includes("invalid") || msg.includes("not in")) {
+      ctx.log("combat", `${target.name} is no longer available`);
+      return false;
+    }
+    ctx.log("error", `Attack failed on ${target.name}: ${attackResp.error.message}`);
+    return false;
+  }
 
-  ctx.log("combat", `Setting initial stance to FIRE...`);
+  ctx.log("combat", `⚔️ Battle started with ${target.name} — setting initial stance`);
   await bot.exec("battle", { action: "stance", stance: "fire" });
   await ctx.sleep(10000);
-  const initialStatus = await getBattleStatus(ctx);
-  let ourCurrentZone = initialStatus?.your_zone || "outer";
+
+  // Get initial battle status
+  let status = await getBattleStatus(ctx);
+  if (!status) {
+    ctx.log("combat", `✅ Battle ended during setup — ${target.name} eliminated!`);
+    return true;
+  }
+
+  let ourCurrentZone = status.your_zone || "outer";
+  let lastKnownEnemyZone = "outer";
 
   while (true) {
     if (bot.state !== "running") return false;
@@ -751,7 +739,7 @@ export async function fightFreshBattle(
       return true;
     }
 
-    const status = await getBattleStatus(ctx);
+    status = await getBattleStatus(ctx);
     if (!status) {
       ctx.log("combat", `✅ ${target.name} eliminated — battle complete (${tickCount} ticks, victory!)`);
       await checkAndPraiseMorgThar(ctx, true);
@@ -789,8 +777,6 @@ export async function fightFreshBattle(
     lastHull = bot.hull;
 
     // In-combat emergency field repair / shield top-up (hunter style)
-    // Costs one firing round but can use many kits/charges in a single tick.
-    // Only skip firing if we actually consumed items this tick (prevents infinite loop when out of stock).
     if (repairThreshold > 0) {
       let didAction = false;
       if (hullPct <= repairThreshold) {
@@ -799,7 +785,7 @@ export async function fightFreshBattle(
       }
       if (shieldPct <= repairThreshold) {
         ctx.log("combat", `🛡️ Shields ${shieldPct}% ≤ repairThreshold — topping up shields in combat!`);
-        if (await topUpShields(ctx, 1.0)) didAction = true; // go for full in one tick if possible
+        if (await topUpShields(ctx, 1.0)) didAction = true;
       }
       if (didAction) {
         await ctx.sleep(10000);
@@ -811,16 +797,56 @@ export async function fightFreshBattle(
     const enemyZone = targetParticipant?.zone || "unknown";
     ctx.log("combat", `Tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Shields=${shieldPct}% | Dmg=${damageThisTick}`);
 
-    const zoneDirMap: Record<string, number> = { outer: 0, mid: 1, inner: 2, engaged: 3 };
     const enemyZoneNum = zoneDirMap[enemyZone] ?? 0;
+    ourCurrentZone = status.your_zone || ourCurrentZone;
     const ourZoneNum = zoneDirMap[ourCurrentZone] ?? 0;
 
-    // Advance to engaged if enemy is in inner/mid and we're not there yet
-    if (enemyZoneNum >= 1 && ourZoneNum < 3) {
-      ctx.log("combat", `⚔️ Advancing to engaged (enemy in ${enemyZone})`);
-      await bot.exec("battle", { action: "advance" });
+    if (targetParticipant && targetParticipant.zone) {
+      if (targetParticipant.zone !== lastKnownEnemyZone) {
+        const prevDir = zoneDirMap[lastKnownEnemyZone] ?? 0;
+        const newDir = zoneDirMap[targetParticipant.zone] ?? 0;
+        if (newDir > prevDir) {
+          ctx.log("combat", `⚠️ ${target.name} advancing: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+        } else if (newDir < prevDir) {
+          ctx.log("combat", `${target.name} retreating: ${lastKnownEnemyZone} → ${targetParticipant.zone}`);
+        }
+        lastKnownEnemyZone = targetParticipant.zone;
+      }
+    }
+
+    if (hullPct <= fleeThreshold) {
+      ctx.log("combat", `💀 Hull critical (${hullPct}%) — FLEEING!`);
+      await emergencyFleeSpam(ctx, "hull critical during combat");
+      return false;
+    }
+
+    // Stay within 1 zone of enemy to maintain firing range
+    const zoneDiff = ourZoneNum - enemyZoneNum;
+
+    if (zoneDiff > 1) {
+      ctx.log("combat", `↩️ Retreating from ${ourCurrentZone} to match enemy at ${enemyZone}`);
+      const retResp = await bot.exec("battle", { action: "retreat" });
+      if (retResp.error) {
+        const errMsg = retResp.error.message.toLowerCase();
+        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+          ctx.log("combat", `✅ Battle ended (retreat failed: not in battle) - victory!`);
+          return true;
+        }
+        ctx.log("error", `Retreat failed: ${retResp.error.message}`);
+      }
       await ctx.sleep(10000);
-      ourCurrentZone = "engaged";
+    } else if (zoneDiff < -1) {
+      ctx.log("combat", `⚔️ Advancing from ${ourCurrentZone} to match enemy at ${enemyZone}`);
+      const advResp = await bot.exec("battle", { action: "advance" });
+      if (advResp.error) {
+        const errMsg = advResp.error.message.toLowerCase();
+        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+          ctx.log("combat", `✅ Battle ended (advance failed: not in battle) - victory!`);
+          return true;
+        }
+        ctx.log("error", `Advance failed: ${advResp.error.message}`);
+      }
+      await ctx.sleep(10000);
     } else {
       await bot.exec("battle", { action: "stance", stance: "fire" });
       await ctx.sleep(10000);
@@ -1116,9 +1142,28 @@ export async function fightJoinedBattle(
     const enemyStance = targetParticipant?.stance || "unknown";
     ctx.log("combat", `Tick ${tickCount}: Enemy=${enemyStance}/${enemyZone} | Hull=${hullPct}% | Shields=${shieldPct}%`);
 
-    // Advance to engaged if enemy is in inner/mid and we're not there yet
-    if (enemyZoneNum >= 1 && ourZoneNum < 3) {
-      ctx.log("combat", `⚔️ Advancing to engaged (enemy in ${enemyZone})`);
+    // Stay within 1 zone of enemy to maintain firing range
+    // Zones: outer(0) ↔ mid(1) ↔ inner(2) ↔ engaged(3)
+    // We can hit if |enemyZoneNum - ourZoneNum| <= 1
+    const zoneDiff = ourZoneNum - enemyZoneNum;
+
+    if (zoneDiff > 1) {
+      // Enemy is behind us (e.g., we're at engaged(3), enemy at mid(1)) - retreat
+      ctx.log("combat", `↩️ Retreating from ${ourZone} to match enemy at ${enemyZone}`);
+      const retResp = await bot.exec("battle", { action: "retreat" });
+      if (retResp.error) {
+        const errMsg = retResp.error.message.toLowerCase();
+        if (errMsg.includes("no active battle") || errMsg.includes("not in battle")) {
+          ctx.log("combat", `✅ Battle ended (retreat failed: not in battle) - victory!`);
+          await checkAndPraiseMorgThar(ctx, true);
+          return true;
+        }
+        ctx.log("error", `Retreat failed: ${retResp.error.message}`);
+      }
+      await ctx.sleep(10000);
+    } else if (zoneDiff < -1) {
+      // Enemy is ahead of us (e.g., we're at outer(0), enemy at inner(2)) - advance
+      ctx.log("combat", `⚔️ Advancing from ${ourZone} to match enemy at ${enemyZone}`);
       const advResp = await bot.exec("battle", { action: "advance" });
       if (advResp.error) {
         const errMsg = advResp.error.message.toLowerCase();
@@ -1131,6 +1176,7 @@ export async function fightJoinedBattle(
       }
       await ctx.sleep(10000);
     } else {
+      // Within range - set fire stance
       const stanceResp = await bot.exec("battle", { action: "stance", stance: "fire" });
       if (stanceResp.error) {
         const errMsg = stanceResp.error.message.toLowerCase();

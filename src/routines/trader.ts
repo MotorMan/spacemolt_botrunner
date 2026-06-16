@@ -1596,7 +1596,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     await bot.refreshShip();
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelPct < settings.refuelThreshold) {
-      const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+      const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem });
       if (!fueled) {
         ctx.log("error", "Fuel low and cannot refuel — going home");
         const ok = await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
@@ -1609,7 +1609,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
             const dResp = await bot.exec("dock");
             if (!dResp.error || dResp.error.message.includes("already")) {
               bot.docked = true;
-              await ensureFueled(ctx, settings.refuelThreshold);
+              await ensureFueled(ctx, settings.refuelThreshold, { homeSystem });
               await ctx.sleep(30000);
               continue;
             }
@@ -1972,7 +1972,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
       if (bot.system !== candidate.sourceSystem) {
         await ensureUndocked(ctx);
-        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+        const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct, { homeSystem });
         if (!fueled) {
           ctx.log("error", "Cannot refuel for trade run — waiting 30s");
           releaseTradeLock(bot.username, candidate.itemId, "aborted:cannot_refuel");

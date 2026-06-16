@@ -1185,7 +1185,7 @@ export async function safetyCheck(
 export async function ensureFueled(
   ctx: RoutineContext,
   thresholdPct: number,
-  opts?: { noJettison?: boolean; skipBlacklist?: boolean },
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; homeSystem?: string },
 ): Promise<boolean> {
   const { bot } = ctx;
   await bot.refreshShip();
@@ -1256,10 +1256,49 @@ export async function ensureFueled(
   }
 
   const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
-  if (currentStation && (opts?.skipBlacklist || isApprovedFuelStation(currentStation.id, readSettings(), bot.system))) {
+  const isCurrentStationApproved = currentStation && (opts?.skipBlacklist || isApprovedFuelStation(currentStation.id, readSettings(), bot.system));
+  if (isCurrentStationApproved) {
     ctx.log("system", `Cargo fuel cells empty — attempting station refuel at ${currentStation.name}...`);
     const ok = await refuelAtStation(ctx, currentStation, thresholdPct, { skipApprovedCheck: opts?.skipBlacklist });
     if (ok) return true;
+  } else if (currentStation) {
+    ctx.log("system", `Station ${currentStation.name} is not on approved fuel list — checking if can reach home...`);
+    const homeSystem = opts?.homeSystem || readSettings().homeSystem;
+    if (homeSystem && typeof homeSystem === "string") {
+      try {
+        const routeResp = await bot.exec("find_route", { target_system: homeSystem });
+        const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; fuel_per_jump?: number; fuel_available?: number; estimated_fuel?: number } | null;
+        if (routeData?.found && routeData?.fuel_available !== undefined && routeData?.estimated_fuel !== undefined) {
+          const canMakeItHome = routeData.fuel_available >= routeData.estimated_fuel;
+          ctx.log("system", `Route to home: ${routeData.total_jumps} jumps, need ${routeData.estimated_fuel} fuel, have ${routeData.fuel_available}`);
+          if (canMakeItHome) {
+            ctx.log("system", `Can reach home (${routeData.fuel_available} fuel >= ${routeData.estimated_fuel} needed) — navigating home to refuel`);
+            await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: thresholdPct, hullThresholdPct: 50, noJettison: true });
+            await bot.refreshLocation();
+            const { pois: homePois } = await getSystemInfo(ctx);
+            const homeStation = findStation(homePois);
+            if (homeStation) {
+              await bot.exec("travel", { target_poi: homeStation.id });
+              await bot.exec("dock");
+              bot.docked = true;
+              await tryRefuel(ctx);
+              await bot.refreshShip();
+              const newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+              if (newFuel >= thresholdPct) {
+                ctx.log("system", `Refueled at home — fuel now ${newFuel}%`);
+                return true;
+              }
+            }
+            return false;
+          } else {
+            ctx.log("system", `Cannot reach home (${routeData.fuel_available} fuel < ${routeData.estimated_fuel} needed) — stranded`);
+            return false;
+          }
+        }
+      } catch (e) {
+        ctx.log("system", `Could not check route home: ${e}`);
+      }
+    }
   }
 
   // ── STEP 4: Scavenge wrecks as last resort ──────────────────────────────

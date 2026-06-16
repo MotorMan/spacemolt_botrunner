@@ -468,25 +468,44 @@ interface EmpireStation {
 
 const EMPIRE_STATIONS: Record<string, EmpireStation[]> = {
   solarian: [
+    { systemId: "sol", poiId: "sol_central", poiName: "Confederacy Central Command" },
     { systemId: "alpha_centauri", poiId: "alpha_centauri_colonial_station", poiName: "Alpha Centauri Colonial Station" },
-    { systemId: "eta_cassiopeiae", poiId: "eta_cassiopeiae_station", poiName: "Eta Cassiopeiae Station" },
-    { systemId: "civil_war_system", poiId: "civil_war_station", poiName: "Civil War Station" },
-    { systemId: "tau_ceti", poiId: "tau_ceti_station", poiName: "Tau Ceti Station" },
+    { systemId: "sirius", poiId: "sirius_observatory_station", poiName: "Sirius Observatory Station" },
+    { systemId: "nova_terra", poiId: "nova_terra_central", poiName: "Nova Terra Central" },
+    { systemId: "procyon", poiId: "procyon_colonial_station", poiName: "Procyon Colonial Station" },
   ],
   voidborn: [
-    { systemId: "kessik", poiId: "kessik_station", poiName: "Kessik Station" },
-    { systemId: "tukun", poiId: "tukun_station", poiName: "Tukun Station" },
+    { systemId: "nexus_prime", poiId: "the_core", poiName: "Central Nexus" },
+    { systemId: "node_alpha", poiId: "node_alpha_processing_station", poiName: "Node Alpha Processing Station" },
+    { systemId: "node_beta", poiId: "node_beta_industrial_station", poiName: "Node Beta Industrial Station" },
+    { systemId: "synchrony", poiId: "synchrony_hub", poiName: "Synchrony Hub" },
+    { systemId: "the_experiment", poiId: "the_experiment_research_station", poiName: "The Experiment Research Station" },
+    { systemId: "node_gamma", poiId: "node_gamma_relay_station", poiName: "Node Gamma Relay Station" },
   ],
   nebula: [
-    { systemId: "node_alpha", poiId: "node_alpha_processing_station", poiName: "Node Alpha Processing Station" },
-    { systemId: "node_beta", poiId: "node_beta_station", poiName: "Node Beta Station" },
+    { systemId: "gold_run", poiId: "gold_run_extraction_hub", poiName: "Gold Run Extraction Hub" },
+    { systemId: "haven", poiId: "grand_exchange", poiName: "Grand Exchange Station" },
+    { systemId: "cargo_lanes", poiId: "cargo_lanes_freight_depot", poiName: "Cargo Lanes Freight Depot" },
+    { systemId: "traders_rest", poiId: "traders_rest_resort_station", poiName: "Trader's Rest Resort Station" },
+    { systemId: "the_levy", poiId: "the_levy_customs_station", poiName: "The Levy Customs Station" },
+    { systemId: "market_prime", poiId: "market_prime_exchange", poiName: "Market Prime Exchange" },
+    { systemId: "treasure_cache", poiId: "treasure_cache_trading_post", poiName: "Treasure Cache Trading Post" },
   ],
   crimson: [
+    { systemId: "the_rampart", poiId: "the_rampart_checkpoint", poiName: "The Rampart Checkpoint" },
+    { systemId: "the_crucible", poiId: "the_crucible_garrison", poiName: "The Crucible Garrison" },
+    { systemId: "iron_reach", poiId: "iron_reach_mining_colony", poiName: "Iron Reach Mining Colony" },
+    { systemId: "krynn", poiId: "war_citadel", poiName: "Crimson War Citadel" },
+    { systemId: "blood_forge", poiId: "blood_forge_smelting_works", poiName: "Blood Forge Smelting Works" },
+    { systemId: "ironhearth", poiId: "ironhearth_station", poiName: "Ironhearth Station" },
     { systemId: "the_anvil", poiId: "the_anvil_arsenal", poiName: "The Anvil Arsenal" },
-    { systemId: "caecus", poiId: "caecus_station", poiName: "Caecus Station" },
   ],
-  collective: [
-    { systemId: "cargo_lanes", poiId: "cargo_lanes_freight_depot", poiName: "Cargo Lanes Freight Depot" },
+  outerrim: [
+    { systemId: "last_light", poiId: "ramens_rest", poiName: "Ramen's Rest" },
+    { systemId: "unknown_edge", poiId: "unknown_edge_waystation", poiName: "Unknown Edge Waystation" },
+    { systemId: "starfall", poiId: "starfall_salvage_station", poiName: "Starfall Salvage Station" },
+    { systemId: "void_gate", poiId: "void_gate_outpost", poiName: "Void Gate Outpost" },
+    { systemId: "deep_range", poiId: "deep_range_outpost", poiName: "Deep Range Outpost" },
   ],
 };
 
@@ -970,7 +989,24 @@ async function selectNextPickupStation(
   settings: CivilianTransportSettings,
 ): Promise<{ system: string; poi: string; poiName: string } | null> {
   const { bot } = ctx;
-  const empire = bot.getEmpire();
+  
+  let empire = bot.getEmpire();
+  
+  if (!empire && bot.poi && bot.system) {
+    const stationRef = loadStationRef();
+    const stationInfo = stationRef.by_underline_name[bot.poi.toLowerCase()] || 
+                         stationRef.by_station_id[bot.poi.toLowerCase()];
+    if (stationInfo) {
+      const systemId = stationInfo.system_id.toLowerCase();
+      for (const [emp, stations] of Object.entries(EMPIRE_STATIONS)) {
+        if (stations.some(s => s.systemId.toLowerCase() === systemId || s.poiId.toLowerCase() === bot.poi.toLowerCase())) {
+          empire = emp;
+          ctx.log("transport", `Derived empire '${emp}' from current station ${bot.poi}`);
+          break;
+        }
+      }
+    }
+  }
   
   if (!empire) {
     ctx.log("transport", "Cannot determine bot's empire, falling back to nearest station search");
@@ -1445,39 +1481,8 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           if (data && data.count > 0) {
             state.pickupStation = bot.poi;
             state.pickupSystem = bot.system;
-            state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
-            ctx.log("transport", `No passengers loaded at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);
-            if (state.roundsWithoutPassengers >= settings.roundsBeforeMoving) {
-              ctx.log("transport", `Threshold reached (${settings.roundsBeforeMoving} rounds without passengers). Moving to next station.`);
-              const nextPickup = await selectNextPickupStation(ctx, state, settings);
-              if (!nextPickup) {
-                if (settings.homeSystem) {
-                  ctx.log("transport", `No next pickup found, returning home to ${settings.homeSystem}`);
-                  state.pickupStation = settings.homeStation || null;
-                  state.pickupSystem = settings.homeSystem || null;
-                  state.roundsWithoutPassengers = 0;
-                } else {
-                  await ctx.sleep(60000);
-                  continue;
-                }
-              } else {
-                const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
-                if (isSameStation) {
-                  ctx.log("transport", `Next pickup is same station, resetting counter and checking for different passengers`);
-                  state.roundsWithoutPassengers = 0;
-                  state.pickupStation = nextPickup.poi;
-                  state.pickupSystem = nextPickup.system;
-                  await ctx.sleep(5000);
-                  continue;
-                }
-                state.roundsWithoutPassengers = 0;
-                state.pickupStation = nextPickup.poi;
-                state.pickupSystem = nextPickup.system;
-              }
-            } else {
-              await ctx.sleep(60000);
-              continue;
-            }
+            state.roundsWithoutPassengers = 0;
+            ctx.log("transport", `Found ${data.count} passengers at ${bot.poi}`);
           } else {
             state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
             ctx.log("transport", `No passengers at ${bot.poi}. Round ${state.roundsWithoutPassengers}/${settings.roundsBeforeMoving}`);

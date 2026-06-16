@@ -3938,6 +3938,10 @@
         nearbyPlayersCache = [];
         window._profileActionsOpen = false;
 
+        // Clear any pending fresh data to prevent stale data from showing
+        _pendingFreshCargo = null;
+        _pendingFreshStorage = null;
+
         // Clear any existing storage refresh interval
         if (profileStorageInterval) {
           clearInterval(profileStorageInterval);
@@ -4003,7 +4007,7 @@
 
         // Run get_status immediately to populate full info
         sendExec(username, "get_status", {}, (result) => {
-          if (result.ok && result.data) {
+          if (result.ok && result.data && profileBot === username) {
             const status = result.data.player || result.data;
             const bot = bots.find((b) => b.username === username);
             if (bot && status) {
@@ -4020,8 +4024,7 @@
 
         // Start 30-second interval for cargo and storage refresh
         profileStorageInterval = setInterval(() => {
-          const currentBot = bots.find((b) => b.username === profileBot);
-          if (!currentBot || !profileBot) return;
+          if (!profileBot) return;
 
           // Always refresh cargo
           sendExec(profileBot, "get_cargo", {}, (cargoResult) => {
@@ -4042,7 +4045,8 @@
           });
 
           // Only refresh station storage when docked
-          if (currentBot.docked) {
+          const currentBot = bots.find((b) => b.username === profileBot);
+          if (currentBot && currentBot.docked) {
             sendExec(profileBot, "view_storage", {}, (storageResult) => {
               if (storageResult.ok && storageResult.data && profileBot === username) {
                 const items = (storageResult.data.items || storageResult.data.storage || []).map(

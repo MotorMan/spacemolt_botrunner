@@ -14050,6 +14050,7 @@
         const creditTopOffBot = r.creditTopOffBot || "";
         const fleetRescueBot = r.fleetRescueBot || "";
         const maydayRescueBot = r.maydayRescueBot || "";
+        const ignoreBlacklist = r.ignoreBlacklist === true;
 
         // Build system options from mapData
         const systems = Object.keys(mapData || {}).sort();
@@ -14240,6 +14241,13 @@
       <small style="color:var(--dim)">Only top off bots that have LESS than this amount (prevents constant top-offs, default: 10000)</small>
     </div>
 
+    <hr style="border-color:var(--dim);opacity:0.3;margin:16px 0">
+
+    <div class="settings-group">
+      <label><input type="checkbox" id="set-rescue-ignoreBlacklist" ${ignoreBlacklist ? "checked" : ""}> Ignore system blacklist</label>
+      <small style="color:var(--dim)">Allow fleet rescue bots to enter blacklisted systems when needed</small>
+    </div>
+
     <button class="btn" onclick="saveRescueSettings()">Save</button>
   `;
       }
@@ -14305,6 +14313,9 @@
             document.getElementById("set-rescue-fleetRescueBot").value || "",
           maydayRescueBot:
             document.getElementById("set-rescue-maydayRescueBot").value || "",
+          ignoreBlacklist: document.getElementById(
+            "set-rescue-ignoreBlacklist",
+          ).checked,
         };
         send({ type: "saveSettings", routine: "rescue", settings: s });
         alert("FuelRescue settings saved!");

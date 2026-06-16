@@ -116,6 +116,7 @@ function getRescueSettings(): {
   maydayRescueBot: string;
   premiumFuelReserve: number;
   maxFuelDelivery: number;
+  ignoreBlacklist: boolean;
 } {
   const all = readSettings();
   const r = all.rescue || {};
@@ -143,6 +144,7 @@ function getRescueSettings(): {
     maydayRescueBot: (r.maydayRescueBot as string) || '',
     premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
     maxFuelDelivery: (r.maxFuelDelivery as number) || 1000,
+    ignoreBlacklist: (r.ignoreBlacklist as boolean) ?? false,
   };
 }
 
@@ -1989,13 +1991,13 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             }
           }
 
-          // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
+// ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ─-
           const { getSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
-          const blacklist = getSystemBlacklist();
+          const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           
-          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          const isBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
           if (isBlacklisted) {
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
@@ -2087,7 +2089,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           }
 
           maydayTarget = {
-username: mayday.sender,
+            username: mayday.sender,
             system: mayday.system,
             poi: mayday.poi,
             fuelPct: mayday.fuelPct,
@@ -2521,11 +2523,12 @@ username: mayday.sender,
 
         // ── PIRATE BASE PROXIMITY CHECK: Block navigation to systems near pirate bases ──
         // This is a HARD BLOCK - do not attempt to navigate to blacklisted systems
+        // (unless ignoreBlacklist is enabled)
         const { getSystemBlacklist } = await import("../web/server.js");
-        const blacklist = getSystemBlacklist();
+        const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
         const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
         
-        const isTargetBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
+        const isTargetBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
         if (isTargetBlacklisted) {
           ctx.log("rescue", `🚫 BLOCKED: Target system ${target.system} is BLACKLISTED (likely near pirate base)`);
           ctx.log("rescue", `🚫 ABORTING RESCUE - cannot navigate to blacklisted system`);
@@ -2693,6 +2696,7 @@ username: mayday.sender,
         const safetyOpts = {
           fuelThresholdPct: settings.refuelThreshold,
           hullThresholdPct: 30,
+          skipBlacklist: settings.ignoreBlacklist,
           onJump: async (jumpNumber: number) => {
             // Check if target still needs rescue on every jump
             const statusCheck = await checkTargetStillNeedsRescue(
@@ -5086,13 +5090,13 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             }
           }
 
-          // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
+// ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
           const { getSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
-          const blacklist = getSystemBlacklist();
+          const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           
-          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          const isBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
           if (isBlacklisted) {
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
@@ -5178,7 +5182,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                   continue;
                 }
               }
-} catch (e) {
+            } catch (e) {
               ctx.log("warn", `Could not calculate route to ${mayday.system}: ${e}`);
             }
           }

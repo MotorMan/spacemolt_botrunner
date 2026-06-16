@@ -1171,6 +1171,28 @@ async function main(): Promise<void> {
     }, periodicRefreshSec * 1000));
   }
 
+  // Periodic get_status for running bots - every 2 minutes to keep credit data fresh
+  // This ensures the web UI has current credit information for manual control pages
+  intervals.push(setInterval(async () => {
+    try {
+      const statusPromises = [];
+      let statusCount = 0;
+      for (const [, bot] of bots) {
+        if (bot.state === "running" && bot.api.getSession()) {
+          statusPromises.push(bot.refreshStatus().catch(() => {}));
+          statusCount++;
+        }
+      }
+      if (statusCount > 0) {
+        debugLogForBot("SYSTEM", "periodic:status", `Getting fresh status for ${statusCount} running bot(s)`);
+      }
+      await Promise.allSettled(statusPromises);
+      refreshStatusTable();
+    } catch (err) {
+      console.error('Error in periodic status refresh:', err);
+    }
+  }, 120 * 1000));
+
   // Low-bandwidth session keep-alive: get_notifications every 40s for idle bots
   // This keeps sessions alive and fetches notifications without heavy API calls
   intervals.push(setInterval(async () => {

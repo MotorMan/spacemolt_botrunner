@@ -1170,7 +1170,6 @@ if (Object.keys(ship).length > 0) {
       const location = r.location as Record<string, unknown> | undefined;
       const player = r.player as Record<string, unknown> | undefined;
       const p = location || player || r;
-      this.credits = (player?.credits as number) ?? (p.credits as number) ?? this.credits;
       this.system = (location?.system_id as string) || (location?.system_name as string) || (p.current_system as string) || this.system;
       this.poi = (location?.poi_id as string) || (location?.poi_name as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
       this.docked = location?.docked_at != null

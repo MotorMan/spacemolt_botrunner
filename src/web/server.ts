@@ -1330,6 +1330,24 @@ constructor(port: number = 3000) {
           }
         }
 
+        // Per-bot achievements endpoint
+        if (url.pathname.startsWith("/api/bot/") && url.pathname.endsWith("/achievements") && req.method === "GET") {
+          const botName = decodeURIComponent(url.pathname.slice("/api/bot/".length, -"/achievements".length));
+          const bot = getBot(botName);
+          if (!bot) {
+            return Response.json({ error: { code: "not_found", message: `Bot ${botName} not found` } });
+          }
+          try {
+            const result = await bot.exec("get_achievements");
+            if (result.error) {
+              return Response.json({ error: result.error });
+            }
+            return Response.json(result);
+          } catch (err) {
+            return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
+          }
+        }
+
         // Per-bot action endpoint (for battle commands)
         if (url.pathname.startsWith("/api/bot/") && url.pathname.endsWith("/action") && req.method === "POST") {
           const botName = decodeURIComponent(url.pathname.slice("/api/bot/".length, -"/action".length));
@@ -1878,6 +1896,17 @@ constructor(port: number = 3000) {
         if (url.pathname === "/stats.html") {
           const statsPath = join(import.meta.dir, "stats.html");
           return new Response(readFileSync(statsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
+        // Serve achievements.html for achievements route
+        if (url.pathname === "/achievements.html") {
+          const achievementsPath = join(import.meta.dir, "achievements.html");
+          return new Response(readFileSync(achievementsPath, "utf-8"), {
             headers: {
               "Content-Type": "text/html; charset=utf-8",
               "Cache-Control": "no-store",

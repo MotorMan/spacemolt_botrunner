@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Achievements - SpaceMolt Commander</title>
+  <link rel="stylesheet" href="/index.css">
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:var(--bg); color:var(--text); }
+    body { padding:16px; display:flex; flex-direction:column; overflow:hidden; }
+    .achievements-layout { flex:1; min-height:0; display:flex; flex-direction:column; }
+    .achievements-header { display:flex; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+    .achievements-header h3 { margin:0; color:var(--text-bright); }
+    .bot-selector { display:flex; align-items:center; gap:8px; }
+    .bot-selector select { padding:6px 12px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+    .bot-selector button { padding:6px 12px; font-size:12px; }
+    .summary-cards { display:flex; gap:12px; flex-wrap:wrap; margin-bottom:16px; }
+    .summary-card { background:var(--card-bg); border:1px solid var(--border); border-radius:6px; padding:12px; min-width:120px; }
+    .summary-card-label { font-size:11px; color:var(--text-dim); }
+    .summary-card-value { font-size:20px; font-weight:700; color:var(--text-bright); }
+    .categories-tabs { display:flex; gap:0; border-bottom:1px solid var(--border); margin-bottom:12px; flex-wrap:wrap; }
+    .category-tab { padding:8px 16px; cursor:pointer; border-bottom:2px solid transparent; color:var(--text-dim); font-size:13px; }
+    .category-tab:hover { color:var(--text); }
+    .category-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
+    .achievements-content { flex:1; min-height:0; overflow:auto; }
+    .achievements-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:12px; }
+    .achievement-card { background:var(--card-bg); border:1px solid var(--border); border-radius:6px; padding:12px; }
+    .achievement-card.earned { border-left:3px solid var(--green); }
+    .achievement-card.unearned { border-left:3px solid var(--text-dim); }
+    .achievement-card.hidden { opacity:0.6; }
+    .achievement-name { font-weight:600; color:var(--text-bright); margin-bottom:4px; }
+    .achievement-card.earned .achievement-name { color:var(--green); }
+    .achievement-card.hidden .achievement-name { color:var(--text-dim); }
+    .achievement-description { font-size:12px; color:var(--text-dim); margin-bottom:6px; }
+    .achievement-meta { display:flex; justify-content:space-between; align-items:center; font-size:11px; }
+    .achievement-category { background:var(--card-bg); padding:2px 6px; border-radius:3px; }
+    .achievement-points { font-weight:600; }
+    .achievement-progress { margin-top:6px; font-size:11px; }
+    .progress-bar { height:4px; background:var(--card-bg); border-radius:2px; overflow:hidden; margin-top:4px; }
+    .progress-fill { height:100%; background:var(--accent); }
+    .loading-state { text-align:center; padding:40px; color:var(--text-dim); }
+    .empty-state { text-align:center; padding:20px; color:var(--text-dim); }
+    .filter-row { display:flex; align-items:center; gap:8px; margin-bottom:12px; flex-wrap:wrap; }
+    .filter-row label { font-size:12px; color:var(--text-dim); }
+    .filter-row select, .filter-row input { padding:4px 8px; border:1px solid var(--border); border-radius:4px; background:var(--bg-input); color:var(--text); font-size:12px; }
+  </style>
+</head>
+<body>
+  <div class="achievements-layout">
+    <div class="achievements-header">
+      <h3>Player Achievements</h3>
+      <div class="bot-selector">
+        <select id="achievementsBotSelect">
+          <option value="">Select a bot...</option>
+        </select>
+        <button class="primary" onclick="fetchAchievements()">Load Achievements</button>
+      </div>
+      <span style="color:var(--text-dim);font-size:12px;margin-left:auto" id="lastUpdated"></span>
+    </div>
+
+    <div class="filter-row">
+      <label>Filter:</label>
+      <input type="text" id="achievementSearch" placeholder="Search achievements..." oninput="filterAchievements()">
+      <select id="categoryFilter" onchange="filterAchievements()">
+        <option value="all">All Categories</option>
+        <option value="earned">Earned Only</option>
+        <option value="unearned">Unearned Only</option>
+        <option value="hidden">Show Hidden</option>
+      </select>
+    </div>
+
+    <div class="summary-cards" id="summaryCards" style="display:none">
+      <div class="summary-card">
+        <div class="summary-card-label">Earned</div>
+        <div class="summary-card-value" id="summaryEarned">0</div>
+      </div>
+      <div class="summary-card">
+        <div class="summary-card-label">Total</div>
+        <div class="summary-card-value" id="summaryTotal">0</div>
+      </div>
+      <div class="summary-card">
+        <div class="summary-card-label">Points</div>
+        <div class="summary-card-value" id="summaryPoints">0</div>
+      </div>
+    </div>
+
+    <div class="categories-tabs" id="categoriesTabs" style="display:none">
+      <div class="category-tab active" data-category="all" onclick="switchCategory('all')">All</div>
+    </div>
+
+    <div class="achievements-content" id="achievementsContent">
+      <div class="loading-state">Select a bot and click "Load Achievements" to begin.</div>
+    </div>
+  </div>
+
+  <script>
+    let bots = [];
+    let currentAchievements = null;
+    let currentCategory = 'all';
+
+    async function loadBotList() {
+      try {
+        const res = await fetch('/api/bots/discovered');
+        const data = await res.json();
+        bots = data.usernames ? data.usernames.map(u => ({ username: u, state: 'idle' })) : [];
+      } catch {
+        const res = await fetch('/api/bots');
+        const data = await res.json();
+        bots = (data || []).map(b => ({ username: b.username, state: b.state }));
+      }
+      updateBotSelector();
+    }
+
+    function updateBotSelector() {
+      const selector = document.getElementById('achievementsBotSelect');
+      const currentValue = selector.value;
+      selector.innerHTML = '<option value="">Select a bot...</option>' +
+        bots.map(b => `<option value="${esc(b.username)}">${esc(b.username)}</option>`).join('');
+      if (currentValue && bots.find(b => b.username === currentValue)) {
+        selector.value = currentValue;
+      }
+    }
+
+    async function fetchAchievements() {
+      const botName = document.getElementById('achievementsBotSelect').value;
+      if (!botName) {
+        alert('Please select a bot first.');
+        return;
+      }
+
+      const btn = event.target;
+      btn.disabled = true;
+      btn.textContent = 'Loading...';
+
+      try {
+        const res = await fetch(`/api/bot/${encodeURIComponent(botName)}/achievements`);
+        const result = await res.json();
+
+        btn.disabled = false;
+        btn.textContent = 'Load Achievements';
+
+        if (result.ok === false) {
+          alert(result.error || 'Failed to fetch achievements.');
+          return;
+        }
+
+        currentAchievements = result.data || result;
+        renderAchievements();
+        document.getElementById('lastUpdated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
+      } catch (e) {
+        btn.disabled = false;
+        btn.textContent = 'Load Achievements';
+        alert('Failed to fetch achievements: ' + (e.message || e));
+      }
+    }
+
+    function renderAchievements() {
+      if (!currentAchievements) return;
+
+      const data = currentAchievements;
+      const summary = data.summary || {};
+      const achievements = data.achievements || [];
+
+      document.getElementById('summaryCards').style.display = 'flex';
+      document.getElementById('summaryEarned').textContent = summary.earned || 0;
+      document.getElementById('summaryTotal').textContent = summary.total || 0;
+      document.getElementById('summaryPoints').textContent = summary.points || 0;
+
+      const categoriesTabs = document.getElementById('categoriesTabs');
+      const categories = [...new Set(achievements.map(a => a.category).filter(Boolean))];
+      const categoryCounts = {};
+      achievements.forEach(a => {
+        categoryCounts[a.category] = (categoryCounts[a.category] || 0) + 1;
+      });
+
+      let tabsHtml = '<div class="category-tab active" data-category="all" onclick="switchCategory(\'all\')">All (' + achievements.length + ')</div>';
+      tabsHtml += categories.map(cat => {
+        const count = categoryCounts[cat] || 0;
+        const earnedCount = achievements.filter(a => a.category === cat && a.earned).length;
+        return `<div class="category-tab" data-category="${esc(cat)}" onclick="switchCategory('${esc(cat)}')">${esc(cat)} (${earnedCount}/${count})</div>`;
+      }).join('');
+      categoriesTabs.innerHTML = tabsHtml;
+      categoriesTabs.style.display = 'flex';
+
+      filterAchievements();
+    }
+
+    function filterAchievements() {
+      if (!currentAchievements) return;
+
+      const achievements = currentAchievements.achievements || [];
+      const search = document.getElementById('achievementSearch').value.toLowerCase();
+      const filterType = document.getElementById('categoryFilter').value;
+      const category = currentCategory;
+
+      let filtered = achievements.filter(a => {
+        if (search) {
+          const name = (a.name || '').toLowerCase();
+          const desc = (a.description || '').toLowerCase();
+          if (!name.includes(search) && !desc.includes(search) && !(a.id || '').includes(search)) {
+            return false;
+          }
+        }
+        if (filterType === 'earned') return a.earned;
+        if (filterType === 'unearned') return !a.earned;
+        if (filterType === 'hidden' && !a.hidden) return false;
+        return true;
+      });
+
+      if (category !== 'all') {
+        filtered = filtered.filter(a => a.category === category);
+      }
+
+      if (filtered.length === 0) {
+        document.getElementById('achievementsContent').innerHTML = '<div class="empty-state">No achievements match your filters.</div>';
+        return;
+      }
+
+      const earnedCount = filtered.filter(a => a.earned).length;
+      const html = `
+        <div style="margin-bottom:12px;font-size:13px;color:var(--text-dim)">
+          Showing ${filtered.length} achievements (${earnedCount} earned)
+        </div>
+        <div class="achievements-grid">
+          ${filtered.map(a => renderAchievementCard(a)).join('')}
+        </div>
+      `;
+      document.getElementById('achievementsContent').innerHTML = html;
+    }
+
+    function renderAchievementCard(a) {
+      const earned = a.earned || false;
+      const hidden = a.hidden || false;
+      const progress = a.progress;
+
+      const cardClass = ['achievement-card', earned ? 'earned' : 'unearned', hidden ? 'hidden' : ''].filter(c => c).join(' ');
+
+      let progressHtml = '';
+      if (!earned && progress) {
+        progressHtml = `
+          <div class="achievement-progress">
+            Progress: ${progress.current || 0} / ${progress.target || 0}
+            <div class="progress-bar">
+              <div class="progress-fill" style="width: ${Math.min(100, ((progress.current || 0) / (progress.target || 1)) * 100)}%"></div>
+            </div>
+          </div>
+        `;
+      }
+
+      const name = hidden && !earned ? '???' : (a.name || a.id);
+      const description = hidden && !earned ? '???' : (a.description || '');
+
+      return `
+        <div class="${cardClass}">
+          <div class="achievement-name">${esc(name)}</div>
+          <div class="achievement-description">${esc(description)}</div>
+          <div class="achievement-meta">
+            <span class="achievement-category">${esc(a.category || '')}</span>
+            <span class="achievement-points">${a.points || 0} pts</span>
+          </div>
+          ${progressHtml}
+          ${earned && a.earned_at ? `<div style="font-size:11px;color:var(--text-dim);margin-top:4px">Earned: ${formatDate(a.earned_at)}</div>` : ''}
+        </div>
+      `;
+    }
+
+    function switchCategory(cat) {
+      currentCategory = cat;
+      document.querySelectorAll('.category-tab').forEach(t => t.classList.remove('active'));
+      document.querySelector(`.category-tab[data-category="${cat}"]`)?.classList.add('active');
+      filterAchievements();
+    }
+
+    function formatDate(dateStr) {
+      if (!dateStr) return '';
+      return new Date(dateStr).toLocaleDateString();
+    }
+
+    function esc(s) {
+      if (!s) return '';
+      const d = document.createElement('div');
+      d.textContent = String(s);
+      return d.innerHTML;
+    }
+
+    loadBotList();
+  </script>
+</body>
+</html>

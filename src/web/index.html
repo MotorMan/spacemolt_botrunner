@@ -84,14 +84,21 @@
             Settings
           </div>
           <div class="top-tab" data-tab="fa" onclick="switchTab('fa')">FA</div>
-          <div
-            class="top-tab"
-            data-tab="catalog"
-            onclick="switchTab('catalog')"
-          >
-            Catalog
-          </div>
-        </div>
+<div
+             class="top-tab"
+             data-tab="catalog"
+             onclick="switchTab('catalog')"
+           >
+             Catalog
+           </div>
+           <div
+             class="top-tab"
+             data-tab="achievements"
+             onclick="switchTab('achievements')"
+           >
+             Achievements
+           </div>
+         </div>
       </div>
       <div class="header-right">
         <div class="conn-status">
@@ -1230,6 +1237,11 @@
             <div class="catalog-empty">Select a category to browse items.</div>
           </div>
         </div>
+      </div>
+
+      <!-- ══ Achievements Tab ══ -->
+      <div class="tab-page" id="page-achievements">
+        <iframe id="achievementsFrame" src="/achievements.html"></iframe>
       </div>
 
       <!-- ══ Bot Profile Page (hidden by default) ══ -->

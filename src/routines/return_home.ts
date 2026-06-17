@@ -56,7 +56,7 @@ export const returnHomeRoutine: Routine = async function* (ctx: RoutineContext) 
   const { bot } = ctx;
 
   const routineParams = (bot as unknown as Record<string, unknown>).routineParams as Record<string, unknown> | undefined;
-  const ignoreBlacklist = routineParams?.ignoreBlacklist === true;
+  const ignoreBlacklist = routineParams?.ignoreBlacklist !== false;
 
   // Wait for any pending action from previous routine to clear
   // This is especially important for emergency return home scenarios

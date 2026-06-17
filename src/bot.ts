@@ -1216,7 +1216,8 @@ if (Object.keys(ship).length > 0) {
         this.location;
       this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
       this.isCloaked = !!(p.is_cloaked || p.cloaked);
-      if (typeof r.credits === "number") this.credits = r.credits;
+      const creditsValue = r.credits ?? player?.credits;
+      if (typeof creditsValue === "number") this.credits = creditsValue;
     }
     return resp;
   }
@@ -1226,6 +1227,7 @@ if (Object.keys(ship).length > 0) {
     if (!resp.error && resp.result) {
       const r = resp.result as Record<string, unknown>;
       const ship = (r.ship as Record<string, unknown>) || r;
+      const player = r.player as Record<string, unknown> | undefined;
       if (ship) {
         this.fuel = (ship.fuel as number) ?? this.fuel;
         this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
@@ -1247,7 +1249,8 @@ if (Object.keys(ship).length > 0) {
         this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
         this.installedMods = modulesArray.map(m => (m.name as string) || (m.type_id as string) || "").filter(Boolean);
       }
-      if (typeof r.credits === "number") this.credits = r.credits;
+      const creditsValue = r.credits ?? player?.credits;
+      if (typeof creditsValue === "number") this.credits = creditsValue;
     }
     return resp;
   }
@@ -1257,7 +1260,9 @@ if (Object.keys(ship).length > 0) {
     if (!cargoResp.error && cargoResp.result) {
       this.inventory = this.parseItemList(cargoResp.result, 'cargo');
       const r = cargoResp.result as Record<string, unknown>;
-      if (typeof r.credits === "number") this.credits = r.credits;
+      const player = r.player as Record<string, unknown> | undefined;
+      const creditsValue = r.credits ?? player?.credits;
+      if (typeof creditsValue === "number") this.credits = creditsValue;
     }
     if (this.docked) {
       await this.refreshStorage();
@@ -1381,14 +1386,25 @@ async refreshSkills(): Promise<ApiResponse> {
   /** Fetch cargo contents and cache them. */
   async refreshCargo(): Promise<void> {
     const resp = await this.exec("get_cargo");
-    // Always update inventory — even if response is empty/null, clear stale data
     this.inventory = this.parseItemList(resp.result, 'cargo');
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      const player = r.player as Record<string, unknown> | undefined;
+      const creditsValue = r.credits ?? player?.credits;
+      if (typeof creditsValue === "number") this.credits = creditsValue;
+    }
   }
 
   /** Fetch station storage contents and cache them. Pass station_id to check remotely. */
   async refreshStorage(stationId?: string): Promise<void> {
     const resp = await this.exec("view_storage", stationId ? { station_id: stationId } : undefined);
     this.storage = this.parseItemList(resp.result, 'storage');
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      const player = r.player as Record<string, unknown> | undefined;
+      const creditsValue = r.credits ?? player?.credits;
+      if (typeof creditsValue === "number") this.credits = creditsValue;
+    }
   }
 
   /**

@@ -1216,6 +1216,7 @@ if (Object.keys(ship).length > 0) {
         this.location;
       this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
       this.isCloaked = !!(p.is_cloaked || p.cloaked);
+      if (typeof r.credits === "number") this.credits = r.credits;
     }
     return resp;
   }
@@ -1246,6 +1247,7 @@ if (Object.keys(ship).length > 0) {
         this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
         this.installedMods = modulesArray.map(m => (m.name as string) || (m.type_id as string) || "").filter(Boolean);
       }
+      if (typeof r.credits === "number") this.credits = r.credits;
     }
     return resp;
   }
@@ -1254,6 +1256,8 @@ if (Object.keys(ship).length > 0) {
     const cargoResp = await this.api.execute("get_cargo");
     if (!cargoResp.error && cargoResp.result) {
       this.inventory = this.parseItemList(cargoResp.result, 'cargo');
+      const r = cargoResp.result as Record<string, unknown>;
+      if (typeof r.credits === "number") this.credits = r.credits;
     }
     if (this.docked) {
       await this.refreshStorage();

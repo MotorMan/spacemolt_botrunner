@@ -1547,6 +1547,10 @@
         if (name === "catalog") {
           renderCatalog();
         }
+        if (name === "achievements") {
+          const frame = document.getElementById("achievementsFrame");
+          if (frame) frame.src = frame.src;
+        }
       }
 
       // ── Catalog Browser ─────────────────────────────────────────────

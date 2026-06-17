@@ -1342,7 +1342,7 @@ constructor(port: number = 3000) {
             if (result.error) {
               return Response.json({ error: result.error });
             }
-            return Response.json(result);
+            return Response.json({ data: result.result });
           } catch (err) {
             return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
           }

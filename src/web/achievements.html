@@ -7,7 +7,7 @@
   <link rel="stylesheet" href="/index.css">
   <style>
     html, body { margin:0; padding:0; height:100%; background:var(--bg); color:var(--text); }
-    body { padding:16px; display:flex; flex-direction:column; overflow:hidden; }
+    body { padding:16px; display:flex; flex-direction:column; overflow:hidden; box-sizing:border-box; }
     .achievements-layout { flex:1; min-height:0; display:flex; flex-direction:column; }
     .achievements-header { display:flex; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
     .achievements-header h3 { margin:0; color:var(--text-bright); }
@@ -22,7 +22,7 @@
     .category-tab { padding:8px 16px; cursor:pointer; border-bottom:2px solid transparent; color:var(--text-dim); font-size:13px; }
     .category-tab:hover { color:var(--text); }
     .category-tab.active { color:var(--accent); border-bottom-color:var(--accent); }
-    .achievements-content { flex:1; min-height:0; overflow:auto; }
+    .achievements-content { flex:1; min-height:0; overflow:auto; width:100%; }
     .achievements-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(300px, 1fr)); gap:12px; }
     .achievement-card { background:var(--card-bg); border:1px solid var(--border); border-radius:6px; padding:12px; }
     .achievement-card.earned { border-left:3px solid var(--green); }
@@ -103,10 +103,17 @@
         const res = await fetch('/api/bots/discovered');
         const data = await res.json();
         bots = data.usernames ? data.usernames.map(u => ({ username: u, state: 'idle' })) : [];
-      } catch {
-        const res = await fetch('/api/bots');
-        const data = await res.json();
-        bots = (data || []).map(b => ({ username: b.username, state: b.state }));
+        console.log('Loaded discovered bots:', bots.length);
+      } catch (e) {
+        console.error('Failed to load discovered bots:', e);
+        try {
+          const res = await fetch('/api/bots');
+          const data = await res.json();
+          bots = (data || []).map(b => ({ username: b.username, state: b.state }));
+          console.log('Loaded bots from status:', bots.length);
+        } catch (e2) {
+          console.error('Failed to load bots:', e2);
+        }
       }
       updateBotSelector();
     }
@@ -133,23 +140,29 @@
       btn.textContent = 'Loading...';
 
       try {
+        console.log('Fetching achievements for:', botName);
         const res = await fetch(`/api/bot/${encodeURIComponent(botName)}/achievements`);
+        console.log('Response status:', res.status);
         const result = await res.json();
+        console.log('Result:', result);
 
         btn.disabled = false;
         btn.textContent = 'Load Achievements';
 
-        if (result.ok === false) {
-          alert(result.error || 'Failed to fetch achievements.');
+        if (result.error) {
+          alert('Error: ' + (result.error.message || JSON.stringify(result.error)));
           return;
         }
 
+        // The response is { data: { summary, achievements } }
         currentAchievements = result.data || result;
+        console.log('Current achievements:', currentAchievements);
         renderAchievements();
         document.getElementById('lastUpdated').textContent = 'Last updated: ' + new Date().toLocaleTimeString();
       } catch (e) {
         btn.disabled = false;
         btn.textContent = 'Load Achievements';
+        console.error('Fetch error:', e);
         alert('Failed to fetch achievements: ' + (e.message || e));
       }
     }

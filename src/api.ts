@@ -158,6 +158,7 @@ const COMMAND_TOOL_MAP: Record<string, string> = {
   'repair': 'spacemolt',
   'repair_module': 'spacemolt',
   'refuel': 'spacemolt',
+  'get_achievements': 'spacemolt',
   'accept_mission': 'spacemolt',
   'complete_mission': 'spacemolt',
   'abandon_mission': 'spacemolt',

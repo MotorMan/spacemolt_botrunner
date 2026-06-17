@@ -470,7 +470,6 @@ async function callLlm(
 
 export class AiChatService {
   private chatMessageQueue: ChatMessage[] = [];
-  private globalChatLock: BotLockInfo | null = null;
   private running = false;
   private logFn: (category: string, message: string) => void;
   private empireAlertFn: ((sender: string, content: string, botUsername: string) => void) | null = null;
@@ -500,6 +499,9 @@ export class AiChatService {
   private factionChatRounds = 0;
   private factionChatRoundResetTime = 0;
   private readonly FACTION_CHAT_ROUND_RESET_MS = 5 * 60 * 1000; // Reset counter after 5 minutes of no faction chat
+
+  // Per-conversation locks (keyed by channel:sender)
+  private botLocks = new Map<string, BotLockInfo>();
 
   // Chat log file
   private readonly CHAT_LOG_FILE = join(process.cwd(), "data", "chat.log");
@@ -785,7 +787,8 @@ export class AiChatService {
    * Get lock info (for debugging).
    */
   getLockInfo(): BotLockInfo | null {
-    return this.globalChatLock;
+    const first = this.botLocks.values().next().value;
+    return first ?? null;
   }
 
   private async runLoop(): Promise<void> {
@@ -1023,8 +1026,8 @@ export class AiChatService {
     }
 
     // Check global lock
-    const channelId = `${msg.channel}:${responder.system || "unknown"}`;
-    if (!this.canRespond(responder.username, humanSender, channelId, settings.lockDurationSec)) {
+    const lockCheckKey = `${msg.channel}:${humanSender}`;
+    if (!this.canRespond(responder.username, humanSender, lockCheckKey, settings.lockDurationSec)) {
       this.logFn("ai_chat", `Lock held, skipping`);
       return "failed";
     }
@@ -1055,7 +1058,8 @@ export class AiChatService {
     }
 
     // Try to acquire lock
-    if (!this.tryAcquireLock(responder.username, humanSender, channelId, settings.lockDurationSec)) {
+    const lockAcquireKey = `${msg.channel}:${humanSender}`;
+    if (!this.tryAcquireLock(responder.username, humanSender, lockAcquireKey, settings.lockDurationSec)) {
       this.logFn("ai_chat", `Failed to acquire lock`);
       return "failed";
     }
@@ -1184,22 +1188,29 @@ export class AiChatService {
     }
 
     // Priority 4: Any available bot (idle or running with active session)
-    // Prefer bots that aren't currently locked
+    // For faction chat, just add to pool (will be shuffled later)
+    // For other channels, add to candidates
     for (const bot of bots) {
       if (addedBots.has(bot.username)) continue;
       if ((bot.state !== "running" && bot.state !== "idle") || !bot.api.getSession()) continue;
-      if (this.globalChatLock && this.globalChatLock.botName === bot.username) {
-        this.logFn("ai_chat_debug", `Skipping locked bot: ${bot.username}`);
-        continue;
+      if (msg.channel === "faction") {
+        addedBots.add(bot.username);
+      } else {
+        candidates.push(bot);
+        addedBots.add(bot.username);
       }
-      addedBots.add(bot.username);
     }
 
     // Fallback: Any bot with session (even if state is unusual)
     for (const bot of bots) {
       if (addedBots.has(bot.username)) continue;
       if (bot.api.getSession()) {
-        addedBots.add(bot.username);
+        if (msg.channel === "faction") {
+          addedBots.add(bot.username);
+        } else {
+          candidates.push(bot);
+          addedBots.add(bot.username);
+        }
       }
     }
 
@@ -1219,13 +1230,6 @@ export class AiChatService {
       }
       candidates.push(...allAvailableBots);
       this.logFn("ai_chat_debug", `Faction chat: shuffled ${allAvailableBots.length} candidates for randomness`);
-    } else {
-      // For other channels, add remaining bots in order (Priority 4 + Fallback)
-      for (const bot of bots) {
-        if (addedBots.has(bot.username) && !candidates.includes(bot)) {
-          candidates.push(bot);
-        }
-      }
     }
 
     this.logFn("ai_chat_debug", `Returning ${candidates.length} candidate(s): ${candidates.map(b => b.username).join(", ")}`);
@@ -1244,43 +1248,41 @@ export class AiChatService {
 
   private canRespond(botName: string, sender: string, channel: string, lockDurationSec: number): boolean {
     const now = Date.now();
+    const lockKey = `${channel}:${sender}`;
     
-    if (this.globalChatLock && this.globalChatLock.lockedUntil < now) {
-      this.globalChatLock = null;
+    const lock = this.botLocks.get(lockKey);
+    if (lock && lock.lockedUntil < now) {
+      this.botLocks.delete(lockKey);
     }
     
-    if (!this.globalChatLock) return true;
+    if (!this.botLocks.has(lockKey)) return true;
     
-    if (this.globalChatLock.botName === botName && 
-        this.globalChatLock.lastSender === sender && 
-        this.globalChatLock.channelId === channel) {
-      return true;
-    }
-    
-    return false;
+    const existingLock = this.botLocks.get(lockKey)!;
+    return existingLock.botName === botName && existingLock.lastSender === sender;
   }
 
   private tryAcquireLock(botName: string, sender: string, channel: string, lockDurationSec: number): boolean {
     const now = Date.now();
+    const lockKey = `${channel}:${sender}`;
     
-    if (this.globalChatLock && this.globalChatLock.lockedUntil < now) {
-      this.globalChatLock = null;
+    const existingLock = this.botLocks.get(lockKey);
+    if (existingLock && existingLock.lockedUntil < now) {
+      this.botLocks.delete(lockKey);
     }
     
-    if (!this.globalChatLock) {
-      this.globalChatLock = {
+    if (!this.botLocks.has(lockKey)) {
+      this.botLocks.set(lockKey, {
         botName,
         lockedUntil: now + (lockDurationSec * 1000),
         lastSender: sender,
         channelId: channel,
-      };
+      });
       return true;
     }
     
-    if (this.globalChatLock.botName === botName && 
-        this.globalChatLock.lastSender === sender && 
-        this.globalChatLock.channelId === channel) {
-      this.globalChatLock.lockedUntil = now + (lockDurationSec * 1000);
+    const lock = this.botLocks.get(lockKey)!;
+    if (lock.botName === botName && lock.lastSender === sender) {
+      lock.lockedUntil = now + (lockDurationSec * 1000);
       return true;
     }
     

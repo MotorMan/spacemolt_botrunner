@@ -802,7 +802,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
 // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { skipBlacklist: true });
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true });
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await ctx.sleep(30000);
@@ -1370,9 +1370,9 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     yield "get_poi";
     if (bot.poi) await bot.exec("get_poi", { poi_id: bot.poi });
 
-    // ── Fuel check ──
+// ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true });
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await ctx.sleep(30000);
@@ -1784,7 +1784,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true });
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await ctx.sleep(30000);

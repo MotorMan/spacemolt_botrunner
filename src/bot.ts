@@ -1030,8 +1030,37 @@ if (Object.keys(ship).length > 0) {
      return true;
   }
 
-  /** Fetch current game state and cache it. */
+  /** Fetch current game state and cache it. Overwrites all cached state with fresh data. */
   async refreshStatus(): Promise<ApiResponse> {
+    // Reset cached state first - new get_status will overwrite stale data
+    this.credits = 0;
+    this.fuel = 0;
+    this.maxFuel = 0;
+    this.cargo = 0;
+    this.cargoMax = 0;
+    this.location = "unknown";
+    this.system = "unknown";
+    this.poi = "";
+    this.docked = false;
+    this.shipName = "";
+    this.shipId = "";
+    this.shipClass = "";
+    this.tier = null;
+    this.hull = 0;
+    this.maxHull = 0;
+    this.shield = 0;
+    this.maxShield = 0;
+    this.ammo = 0;
+    this.shipSpeed = 1;
+    this.isCloaked = false;
+    this.isDead = false;
+    this.towingWreck = false;
+    this.faction = null;
+    this.factionFuelReserve = 0;
+    this.factionFuelCapacity = 0;
+    this.inventory = [];
+    this.storage = [];
+    
     const resp = await this.exec("get_status");
     debugLogForBot(this.username, "bot:refreshStatus", `${this.username} get_status response`, resp.result);
     if (resp.result && typeof resp.result === "object") {

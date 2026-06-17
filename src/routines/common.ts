@@ -1220,6 +1220,29 @@ export async function ensureFueled(
     return true;
   }
 
+  // Hunters (skipBlacklist=true) with homeSystem configured should go directly home to refuel
+  if (opts?.skipBlacklist && opts?.homeSystem) {
+    const homeSystem = opts.homeSystem;
+    ctx.log("system", `Hunter mode: navigating to home system ${homeSystem} for refueling...`);
+    const navResult = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 50, noJettison: true, skipBlacklist: true });
+    if (navResult) {
+      await bot.refreshLocation();
+      await getSystemInfo(ctx);
+      const homeStation = findStation(pois);
+      if (homeStation) {
+        await ensureDocked(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+        await bot.refreshShip();
+        const newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        if (newFuel >= thresholdPct) {
+          ctx.log("system", `Refueled at home — fuel now ${newFuel}%`);
+          return true;
+        }
+      }
+    }
+    // If we couldn't reach home or refuel there, continue to other options
+  }
+
   // Check for approved fuel stations FIRST
   const approvedFuelStations = (readSettings()?.general as any)?.approvedFuelStations as string[] | undefined;
 

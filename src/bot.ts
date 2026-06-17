@@ -1073,8 +1073,10 @@ if (Object.keys(ship).length > 0) {
       // Use location data first, then player, then root level
       const p = location || player || r;
 
-      this.credits = (player?.credits as number) ?? (p.credits as number) ?? this.credits;
-      debugLogForBot(this.username, "bot:credits", `${this.username} credits=${this.credits} raw=${player?.credits ?? p.credits}`);
+      // Credits are in player object if it exists, or at root level or in p
+      // Check all possible locations to ensure we get the credits
+      this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
+      debugLogForBot(this.username, "bot:credits", `${this.username} credits=${this.credits} raw=player:${player?.credits ?? 'missing'}, r:${r.credits ?? 'missing'}, p:${p.credits ?? 'missing'}`);
 
       // System and POI are now inside `location` object in v2
       // location.system_id, location.system_name, location.poi_id, location.poi_name

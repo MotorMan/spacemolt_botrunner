@@ -1475,8 +1475,8 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
         return;
       }
 
-      // Refresh bot status to get current docked state and system
-      await bot.refreshLocation();
+      // Refresh bot status to get current docked state, system, AND credits
+      await bot.refreshStatus();
 
       ctx.log("rescue", `💰 Background credit check - docked: ${bot.docked}, system: ${bot.system}, credits: ${bot.credits}`);
 

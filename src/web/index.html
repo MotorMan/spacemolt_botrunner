@@ -12204,6 +12204,31 @@
        </div>
      </div>
 
+     <!-- Multi-Ship Loadout Mode Section -->
+     <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
+       <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🚢 Multi-Ship Loadout Mode</div>
+       <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
+         Add multiple ships to build all at once. Materials are combined automatically.
+       </div>
+       <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px">
+         <select id="ship-select-multi" onchange="onMultiShipSelect()" style="flex:1;min-width:150px">
+           <option value="">-- Select Ship --</option>
+         </select>
+         <button class="sm primary" onclick="addShipToMultiLoadout()" id="ship-add-multi-btn" disabled>+ Add Ship</button>
+         <button class="sm" onclick="loadMultiShipLoadout()" id="ship-load-multi-btn" disabled>🔄 Load All to Crafting</button>
+       </div>
+       <div id="multi-ship-list" style="margin-top:8px;max-height:150px;overflow-y:auto;border:1px solid var(--border);border-radius:4px;background:var(--bg-input);padding:8px">
+         <div style="color:var(--dim);font-size:11px">No ships added. Select ships above to build them together.</div>
+       </div>
+       <div style="margin-top:8px;display:flex;gap:8px;align-items:center">
+         <span style="font-size:11px;color:var(--text)">Total Ships:</span>
+         <span style="font-size:11px;color:var(--text-bright)" id="multi-ship-count">0</span>
+         <span style="font-size:11px;color:var(--dim);margin-left:8px">Multiplier:</span>
+         <input type="number" id="set-crafter-shipCommissionMultiplier" min="1" max="99" value="${crafter.shipCommissionMultiplier || 1}" style="width:70px;padding:4px 8px;font-size:12px;margin-left:4px">
+         <button class="sm danger" onclick="clearMultiShipLoadout()" style="margin-left:auto">Clear All</button>
+       </div>
+     </div>
+
      <div style="margin-top:12px;padding:10px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
        <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🚢 Ship Commission Multiplier</div>
        <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
@@ -12211,7 +12236,7 @@
        </div>
        <div style="display:flex;gap:8px;align-items:center">
          <label style="font-size:12px;color:var(--text)">Ships to Commission:</label>
-         <input type="number" id="set-crafter-shipCommissionMultiplier" min="1" max="99" value="${crafter.shipCommissionMultiplier || 1}" style="width:70px;padding:4px 8px;font-size:12px">
+         <input type="number" id="set-crafter-shipCommissionMultiplier-single" min="1" max="99" value="${crafter.shipCommissionMultiplier || 1}" style="width:70px;padding:4px 8px;font-size:12px">
          <span style="font-size:11px;color:var(--dim)">x multiplier</span>
        </div>
      </div>
@@ -12338,7 +12363,9 @@
 
         // Populate ship dropdown and load ship loadouts
         populateShipDropdown();
+        populateMultiShipDropdown();
         updateShipLoadoutSelect();
+        renderMultiShipList();
       }
 
       function updateCraftItemSelect() {
@@ -12985,6 +13012,28 @@
       // Initialize ship dropdown from catalog
       function populateShipDropdown() {
         const shipSelect = document.getElementById("ship-select");
+        if (!shipSelect || !catalog.ships) return;
+
+        const ships = Object.values(catalog.ships).sort((a, b) =>
+          (a.name || a.id || "").localeCompare(b.name || b.id || ""),
+        );
+        shipSelect.innerHTML =
+          '<option value="">-- Select Ship --</option>' +
+          ships
+            .map((ship) => {
+              const id = ship.id || "";
+              const name = ship.name || id;
+              const faction = ship.faction ? ` [${ship.faction}]` : "";
+              const category = ship.category ? ` - ${ship.category}` : "";
+              const shipClass = ship.class ? ` (${ship.class})` : "";
+              return `<option value="${esc(id)}">${esc(name)}${esc(faction)}${esc(category)}${esc(shipClass)}</option>`;
+            })
+            .join("");
+      }
+
+      // Initialize multi-ship dropdown from catalog
+      function populateMultiShipDropdown() {
+        const shipSelect = document.getElementById("ship-select-multi");
         if (!shipSelect || !catalog.ships) return;
 
         const ships = Object.values(catalog.ships).sort((a, b) =>
@@ -13688,7 +13737,7 @@
         // Get the ship commission multiplier (default to 1)
         const multiplier =
           parseInt(
-            document.getElementById("set-crafter-shipCommissionMultiplier")
+            document.getElementById("set-crafter-shipCommissionMultiplier-single")
               ?.value,
           ) || 1;
         const clampedMultiplier = Math.max(1, Math.min(99, multiplier));
@@ -13766,7 +13815,7 @@
         // Get the ship commission multiplier (default to 1)
         const multiplier =
           parseInt(
-            document.getElementById("set-crafter-shipCommissionMultiplier")
+            document.getElementById("set-crafter-shipCommissionMultiplier-single")
               ?.value,
           ) || 1;
         const clampedMultiplier = Math.max(1, Math.min(99, multiplier));
@@ -13855,6 +13904,169 @@
           alert(`Ship loadout "${name}" deleted.`);
         } else {
           alert("Failed to delete ship loadout.");
+        }
+      }
+
+      // ── Multi-Ship Loadout Mode ───────────────────────────────────────
+
+      // State for multi-ship loadout mode
+      let multiShipLoadoutState = {
+        ships: [], // Array of { shipId, shipName, buildMaterials: [], defaultModules: [] }
+      };
+
+      function onMultiShipSelect() {
+        const shipSelect = document.getElementById("ship-select-multi");
+        const addBtn = document.getElementById("ship-add-multi-btn");
+        if (!shipSelect || !addBtn) return;
+        addBtn.disabled = !shipSelect.value;
+      }
+
+      function addShipToMultiLoadout() {
+        const shipSelect = document.getElementById("ship-select-multi");
+        const shipId = shipSelect?.value;
+        if (!shipId || !catalog.ships?.[shipId]) {
+          alert("Please select a ship first.");
+          return;
+        }
+
+        const ship = catalog.ships[shipId];
+
+        // Check if ship already in list
+        if (multiShipLoadoutState.ships.some(s => s.shipId === shipId)) {
+          alert(`"${ship.name || shipId}" is already in the loadout list.`);
+          return;
+        }
+
+        // Add ship to the list
+        multiShipLoadoutState.ships.push({
+          shipId: shipId,
+          shipName: ship.name || shipId,
+          buildMaterials: ship.build_materials || [],
+          defaultModules: ship.default_modules || [],
+        });
+
+        renderMultiShipList();
+        shipSelect.value = "";
+        document.getElementById("ship-add-multi-btn").disabled = true;
+      }
+
+      function renderMultiShipList() {
+        const listEl = document.getElementById("multi-ship-list");
+        const countEl = document.getElementById("multi-ship-count");
+        if (!listEl || !countEl) return;
+
+        if (multiShipLoadoutState.ships.length === 0) {
+          listEl.innerHTML = '<div style="color:var(--dim);font-size:11px">No ships added. Select ships above to build them together.</div>';
+          countEl.textContent = "0";
+          return;
+        }
+
+        countEl.textContent = String(multiShipLoadoutState.ships.length);
+
+        listEl.innerHTML = multiShipLoadoutState.ships
+          .map((ship, index) => {
+            const materialsCount = ship.buildMaterials?.length || 0;
+            const modulesCount = ship.defaultModules?.length || 0;
+            return `
+              <div style="display:flex;justify-content:space-between;align-items:center;padding:6px 8px;border-bottom:1px solid var(--border)">
+                <div style="flex:1;min-width:0">
+                  <span style="color:var(--text-bright)">${esc(ship.shipName)}</span>
+                  <span style="color:var(--dim);font-size:11px;margin-left:6px">(${materialsCount}m, ${modulesCount}mod)</span>
+                </div>
+                <button class="sm" style="background:#d32f2f;border:none;color:#fff;padding:2px 8px;cursor:pointer;border-radius:4px" onclick="removeMultiShip(${index})">✕</button>
+              </div>
+            `;
+          })
+          .join("");
+      }
+
+      function removeMultiShip(index) {
+        multiShipLoadoutState.ships.splice(index, 1);
+        renderMultiShipList();
+      }
+
+      function clearMultiShipLoadout() {
+        if (multiShipLoadoutState.ships.length === 0) return;
+        if (!confirm("Clear all ships from the loadout list?")) return;
+        multiShipLoadoutState.ships = [];
+        renderMultiShipList();
+      }
+
+      function loadMultiShipLoadout() {
+        if (multiShipLoadoutState.ships.length === 0) {
+          alert("No ships in the loadout list. Add ships first.");
+          return;
+        }
+
+        // Get the ship commission multiplier
+        const multiplier =
+          parseInt(
+            document.getElementById("set-crafter-shipCommissionMultiplier")
+              ?.value,
+          ) || 1;
+        const clampedMultiplier = Math.max(1, Math.min(99, multiplier));
+
+        // Get current crafter profile
+        const currentCrafterName = window._currentCrafterProfile;
+        if (!settings.crafter) settings.crafter = {};
+        if (!settings.crafter.crafters) settings.crafter.crafters = [];
+        let crafters = settings.crafter.crafters;
+        if (crafters.length === 0) {
+          crafters = [{ name: "Default Crafter", craftLimits: {} }];
+          settings.crafter.crafters = crafters;
+        }
+
+        const currentProfile =
+          crafters.find((c) => c.name === currentCrafterName) || crafters[0];
+        if (!currentProfile.craftLimits) currentProfile.craftLimits = {};
+
+        // Aggregate all materials from all ships
+        const aggregatedMaterials = new Map();
+        const aggregatedModules = new Map();
+
+        for (const ship of multiShipLoadoutState.ships) {
+          // Aggregate build materials
+          for (const mat of ship.buildMaterials || []) {
+            const itemId = mat.item_id;
+            const quantity = mat.quantity * clampedMultiplier;
+            if (itemId && quantity > 0) {
+              aggregatedMaterials.set(itemId, (aggregatedMaterials.get(itemId) || 0) + quantity);
+            }
+          }
+
+          // Aggregate default modules (count occurrences)
+          for (const mod of ship.defaultModules || []) {
+            const count = (aggregatedModules.get(mod) || 0) + 1;
+            aggregatedModules.set(mod, count);
+          }
+        }
+
+        // Add aggregated materials to craftLimits
+        let addedCount = 0;
+        for (const [itemId, quantity] of aggregatedMaterials) {
+          currentProfile.craftLimits[itemId] = quantity;
+          addedCount++;
+        }
+
+        // Add aggregated modules to craftLimits (multiplied)
+        for (const [mod, count] of aggregatedModules) {
+          const item = catalog.items?.[mod];
+          if (item) {
+            currentProfile.craftLimits[mod] = count * clampedMultiplier;
+            addedCount++;
+          }
+        }
+
+        // Re-render the crafter settings to show the new recipes
+        renderCrafterSettings(document.getElementById("settingsContent"));
+
+        const shipCount = multiShipLoadoutState.ships.length;
+        if (addedCount > 0) {
+          alert(
+            `Added ${shipCount} ships x${clampedMultiplier} to crafting list:\n${addedCount} items total (materials + modules).\nClick "Save Settings" to persist.`,
+          );
+        } else {
+          alert("No items were added to the crafting list.");
         }
       }
 

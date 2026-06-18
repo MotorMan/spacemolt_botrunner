@@ -7591,7 +7591,7 @@
           }
         } else if (mode === "station_to_cargo") {
           // Withdraw all items from station storage to cargo
-          // Command: storage action=withdraw target=self item_id=X quantity=Y source=storage
+          // Command: storage action=withdraw target=<player> item_id=X quantity=Y source=storage
           for (const item of storage) {
             const itemId = item.itemId || item.item_id;
             const qty = item.quantity || item.count || 1;
@@ -7599,7 +7599,6 @@
               items.push({
                 item_id: itemId,
                 quantity: qty,
-                target: "self",
                 source: "storage",
                 action: "withdraw",
               });
@@ -7681,7 +7680,12 @@
         if (item.action === "withdraw") {
           // Withdraw from storage to cargo
           command = "withdraw_items";
-          params.source = item.source; // 'storage' or 'cargo'
+          // For station->cargo, just use item_id + quantity (no source/target needed)
+          // For faction->cargo, use source="faction" target="self"
+          if (item.source === "faction") {
+            params.source = "faction";
+            params.target = "self";
+          }
         } else {
           // Deposit (default action)
           if (item.target === "faction") {

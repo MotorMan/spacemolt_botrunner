@@ -1479,6 +1479,73 @@ async function* scanResourcePoi(
   mapStore.markExplored(systemId, poi.id);
 }
 
+/** Check if a station has the faction_trade_intel facility. */
+async function hasFactionTradeIntelFacility(ctx: RoutineContext, stationId: string): Promise<boolean> {
+  const { bot } = ctx;
+  const poiResp = await bot.exec("get_poi", { poi_id: stationId });
+  if (poiResp.error || !poiResp.result) return false;
+  
+  const result = poiResp.result as Record<string, unknown>;
+  const base = (result.base as Record<string, unknown>) || {};
+  const facilities = (base.facilities as string[]) || [];
+  
+  return facilities.includes("faction_trade_intel");
+}
+
+/** Submit market price observations to the faction's trade ledger. */
+async function submitTradeIntel(
+  ctx: RoutineContext,
+  systemId: string,
+  stationPoiId: string,
+  stationName: string,
+  items: Array<Record<string, unknown>>,
+): Promise<void> {
+  const { bot } = ctx;
+  
+  const stationsPayload = [{
+    base_id: stationPoiId,
+    station_name: stationName,
+    items: items.map(item => {
+      const buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map((order: Record<string, unknown>) => ({
+        price: (order.price_each as number) || (order.price as number) || 0,
+        quantity: (order.quantity as number) || 0,
+      })).filter((order: { price: number; quantity: number }) => order.price > 0 && order.quantity > 0);
+
+      const sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map((order: Record<string, unknown>) => ({
+        price: (order.price_each as number) || (order.price as number) || 0,
+        quantity: (order.quantity as number) || 0,
+      })).filter((order: { price: number; quantity: number }) => order.price > 0 && order.quantity > 0);
+
+      const bestBuy = buyOrders.length > 0 ? Math.max(...buyOrders.map(o => o.price)) : 0;
+      const bestSell = sellOrders.length > 0 ? Math.min(...sellOrders.map(o => o.price)) : 0;
+      const buyVolume = buyOrders.reduce((sum, o) => sum + o.quantity, 0);
+      const sellVolume = sellOrders.reduce((sum, o) => sum + o.quantity, 0);
+
+      return {
+        item_id: (item.item_id as string) || (item.id as string) || "",
+        item_name: (item.name as string) || (item.item_name as string) || "",
+        best_buy: bestBuy,
+        best_sell: bestSell,
+        buy_volume: buyVolume,
+        sell_volume: sellVolume,
+      };
+    }).filter((item: { item_id: string; best_buy: number; best_sell: number }) => item.item_id && (item.best_buy > 0 || item.best_sell > 0))
+  }];
+
+  if (stationsPayload[0].items.length === 0) {
+    ctx.log("info", "No valid market items to submit as trade intel");
+    return;
+  }
+
+  const submitResp = await bot.exec("faction_submit_trade_intel", { stations: stationsPayload });
+  
+  if (submitResp.error) {
+    ctx.log("warn", `Failed to submit trade intel: ${submitResp.error.message}`);
+  } else {
+    ctx.log("info", `Submitted trade intel for ${stationsPayload[0].items.length} items to faction`);
+  }
+}
+
 /** Dock at station, scan market/orders/missions, refuel. */
 async function* scanStation(
   ctx: RoutineContext,
@@ -1486,7 +1553,6 @@ async function* scanStation(
   poi: SystemPOI,
 ): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
-  const stationPoi = poi;
 
   try {
     yield `dock_${poi.id}`;
@@ -1600,6 +1666,13 @@ async function* scanStation(
         if (detailsUpdated) {
           saveMarketDetails(marketDetails);
           ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
+          
+          // Submit trade intel to faction if station has the facility
+          const hasTradeIntel = await hasFactionTradeIntelFacility(ctx, poi.id);
+          if (hasTradeIntel) {
+            yield "submit_trade_intel";
+            await submitTradeIntel(ctx, systemId, poi.id, poi.name, items);
+          }
         }
       }
     }
@@ -2529,6 +2602,13 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
               if (detailsUpdated) {
                 saveMarketDetails(marketDetails);
                 ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
+                
+                // Submit trade intel to faction if station has the facility
+                const hasTradeIntel = await hasFactionTradeIntelFacility(ctx, target.stationPoi);
+                if (hasTradeIntel) {
+                  yield "submit_trade_intel";
+                  await submitTradeIntel(ctx, target.systemId, target.stationPoi, target.stationName, items);
+                }
               }
             }
           }

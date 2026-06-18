@@ -1481,7 +1481,6 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           if (data && data.count > 0) {
             state.pickupStation = bot.poi;
             state.pickupSystem = bot.system;
-            state.roundsWithoutPassengers = 0;
             ctx.log("transport", `Found ${data.count} passengers at ${bot.poi}`);
           } else {
             state.roundsWithoutPassengers = (state.roundsWithoutPassengers || 0) + 1;
@@ -1531,7 +1530,6 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
             ctx.log("transport", `No passengers found, returning home from ${bot.system}`);
             state.pickupStation = settings.homeStation || null;
             state.pickupSystem = settings.homeSystem || null;
-            state.roundsWithoutPassengers = 0;
           } else {
             await ctx.sleep(60000);
             continue;
@@ -1539,7 +1537,6 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         } else {
           state.pickupStation = pickup.poi;
           state.pickupSystem = pickup.system;
-          state.roundsWithoutPassengers = 0;
         }
       }
 

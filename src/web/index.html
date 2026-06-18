@@ -24897,6 +24897,21 @@ When responding:
       let cmFactionItems = []; // Cached faction storage items from source station
       let cmPersonalItems = []; // Cached personal storage items from selected bot
 
+      // Helper function to get station label from system|station format
+      function getStationLabel(stationValue) {
+        if (!stationValue || !stationValue.includes("|")) return stationValue;
+        const [sysId, poiId] = stationValue.split("|");
+        const sys = mapData[sysId];
+        if (!sys) return stationValue;
+        const poi = (sys.pois || []).find(p => p.id === poiId || p.base_id === poiId);
+        if (poi) {
+          const label = poi.base_name || poi.name || poiId;
+          const sysName = sys.name || sysId;
+          return `${label} (${sysName})`;
+        }
+        return stationValue;
+      }
+
       function renderCargoMoverSettings(panel) {
         const cm = settings.cargo_mover || {};
         const sourceStation = cm.sourceStation || "";
@@ -24975,11 +24990,18 @@ When responding:
                     target > 0
                       ? `<div class="craft-limit-detail" style="color:var(--green)">Delivered: ${delivered}/${target}</div>`
                       : `<div class="craft-limit-detail" style="color:var(--dim)">Delivered: ${delivered} (no target set)</div>`;
+                  
+                  // Show destination info for ship loadout items
+                  const destInfo = item.shipLoadoutDestination
+                    ? `<div class="craft-limit-detail" style="color:var(--blue)">Destination: ${esc(getStationLabel(item.shipLoadoutDestination))}</div>`
+                    : "";
+                  
                   return `
         <div class="craft-limit-row">
           <div class="craft-limit-info">
             <div class="craft-limit-name">${esc(item.itemName || item.itemId)}${cat}</div>
             <div class="craft-limit-detail">Move ${item.quantity > 0 ? item.quantity + " units" : "all"} from Faction Storage</div>
+            ${destInfo}
             ${progressDisplay}
           </div>
           <div style="display:flex;gap:4px;align-items:center">
@@ -25153,13 +25175,18 @@ When responding:
     <div style="margin-top:20px;padding:12px;border:1px solid var(--border);border-radius:6px;background:var(--card-bg)">
       <div style="font-weight:600;margin-bottom:8px;color:var(--text-bright)">🚢 Ship Loadout Loader</div>
       <div style="font-size:11px;color:var(--dim);margin-bottom:8px">
-        Load materials for building ships into the cargo mover items list. Select a ship loadout and multiplier.
+        Load materials for building ships into the cargo mover items list. Select a ship loadout, destination station, and multiplier.
       </div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
         <select id="cm-ship-loadout-select" style="flex:1;min-width:150px;max-width:250px">
           <option value="">-- Select Ship Loadout --</option>
         </select>
         <button class="sm primary" onclick="loadShipLoadoutToCargoMover()" id="cm-ship-load-load-btn" disabled>Load to Cargo Mover</button>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <select id="cm-ship-loadout-destination" style="flex:1;min-width:150px;max-width:250px">
+          <option value="">-- Select Destination Station --</option>
+        </select>
       </div>
       <div style="display:flex;gap:8px;align-items:center">
         <label style="font-size:12px;color:var(--text)">Ships to Build:</label>
@@ -25449,6 +25476,7 @@ When responding:
       // Populate ship loadout dropdown in cargo mover settings
       async function populateCargoMoverShipLoadouts() {
         const select = document.getElementById("cm-ship-loadout-select");
+        const destSelect = document.getElementById("cm-ship-loadout-destination");
         const countEl = document.getElementById("cm-ship-loadout-count");
         const loadBtn = document.getElementById("cm-ship-load-load-btn");
 
@@ -25467,6 +25495,12 @@ When responding:
             select.appendChild(option);
           }
 
+          // Also populate destination station dropdown
+          if (destSelect) {
+            const stationOptions = buildStationOptionsForLoadout();
+            destSelect.innerHTML = stationOptions;
+          }
+
           loadBtn.disabled = loadoutNames.length === 0;
 
           countEl.textContent =
@@ -25481,15 +25515,46 @@ When responding:
         }
       }
 
+      // Build station options for ship loadout destination selector
+      function buildStationOptionsForLoadout() {
+        const destSelect = document.getElementById("cm-ship-loadout-destination");
+        const currentValue = destSelect?.value || "";
+        
+        let options = '<option value="">-- Select Destination Station --</option>';
+        
+        for (const [sysId, sys] of Object.entries(mapData)) {
+          const sysName = sys.name || sysId;
+          for (const poi of [...(sys.pois || [])].sort((a, b) =>
+            (a.base_name || a.name || a.id || "").localeCompare(
+              b.base_name || b.name || b.id || "",
+            ),
+          )) {
+            if (!(poi.has_base || poi.base_id)) continue;
+            const val = sysId + "|" + poi.id;
+            const label = poi.base_name || poi.name || poi.id;
+            const sel = val === currentValue ? " selected" : "";
+            options += '<option value="' + esc(val) + '"' + sel + '>' + esc(label) + ' (' + esc(sysName) + ')</option>';
+          }
+        }
+        return options;
+      }
+
       // Load ship loadout materials into cargo mover items list
       async function loadShipLoadoutToCargoMover() {
         const select = document.getElementById("cm-ship-loadout-select");
+        const destSelect = document.getElementById("cm-ship-loadout-destination");
         const multiplierEl = document.getElementById(
           "cm-ship-loadout-multiplier",
         );
         const name = select?.value;
+        const destinationStation = destSelect?.value;
         if (!name) {
           alert("Please select a ship loadout to load.");
+          return;
+        }
+
+        if (!destinationStation) {
+          alert("Please select a destination station for the ship loadout.");
           return;
         }
 
@@ -25513,21 +25578,22 @@ When responding:
           const itemId = mat.item_id;
           const quantity = mat.quantity * clampedMultiplier;
           if (itemId && quantity > 0) {
-            // Check if this item is already in the list
+            // Check if this item is already in the list with same destination
             const existing = settings.cargo_mover.items.find(
-              (i) => i.itemId === itemId && i.storageType === "faction",
+              (i) => i.itemId === itemId && i.storageType === "faction" && i.shipLoadoutDestination === destinationStation,
             );
             if (existing) {
               // Add to existing quantity
               existing.quantity = (existing.quantity || 0) + quantity;
             } else {
-              // Add new item
+              // Add new item with destination station
               settings.cargo_mover.items.push({
                 itemId,
                 itemName: mat.name || itemId,
                 quantity,
                 storageType: "faction",
                 category: "Ship Building",
+                shipLoadoutDestination: destinationStation,
               });
             }
             addedCount++;
@@ -25545,7 +25611,7 @@ When responding:
           if (item) {
             const quantity = count * clampedMultiplier;
             const existing = settings.cargo_mover.items.find(
-              (i) => i.itemId === mod && i.storageType === "faction",
+              (i) => i.itemId === mod && i.storageType === "faction" && i.shipLoadoutDestination === destinationStation,
             );
             if (existing) {
               existing.quantity = (existing.quantity || 0) + quantity;
@@ -25556,6 +25622,7 @@ When responding:
                 quantity,
                 storageType: "faction",
                 category: "Ship Modules",
+                shipLoadoutDestination: destinationStation,
               });
             }
             addedCount++;
@@ -25567,7 +25634,7 @@ When responding:
 
         if (addedCount > 0) {
           alert(
-            `Loaded "${name}" x${clampedMultiplier}: Added ${addedCount} items to cargo mover list (${loadout.buildMaterials.length} materials, ${loadout.defaultModules.length} modules). Click "Save Settings" to persist.`,
+            `Loaded "${name}" x${clampedMultiplier}: Added ${addedCount} items to cargo mover list (${loadout.buildMaterials.length} materials, ${loadout.defaultModules.length} modules). Destination: ${destinationStation}. Click "Save Settings" to persist.`,
           );
         } else {
           alert(`Loaded "${name}" but no items were added.`);

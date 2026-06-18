@@ -869,20 +869,23 @@ async function selectPickupStation(
   berths: { economy: number; business: number; first: number },
   maxJumps: number,
   blockPirateStations: boolean,
+  excludeCurrentStation: boolean = false,
 ): Promise<{ system: string; poi: string; poiName: string; count: number } | null> {
   const { bot } = ctx;
   const stations: Array<{ system: string; poi: string; poiName: string; count: number; hops: number }> = [];
+  const currentPoi = bot.poi || "";
+  const currentSystem = bot.system || "";
 
-  // Check current station first if docked
-  if (bot.docked && bot.poi && bot.system) {
-    if (!blockPirateStations || !isPirateStation(bot.poi)) {
+  // Check current station first if docked (unless excluded)
+  if (!excludeCurrentStation && bot.docked && currentPoi && currentSystem) {
+    if (!blockPirateStations || !isPirateStation(currentPoi)) {
       const resp = await bot.exec("list_station_passengers");
       if (!resp.error && resp.result) {
         const data = parseStationPassengers(resp.result);
         if (data && data.count > 0) {
           stations.push({
-            system: bot.system,
-            poi: bot.poi,
+            system: currentSystem,
+            poi: currentPoi,
             poiName: data.station,
             count: data.count,
             hops: 0,
@@ -895,7 +898,6 @@ async function selectPickupStation(
   // Scan nearby known systems via mapStore
   const blacklist = getSystemBlacklist();
   const knownSystems = mapStore.getAllSystems();
-  const currentSystem = bot.system || "";
 
   // Collect candidate systems within maxJumps
   const candidates = new Map<string, { hops: number; systemId: string }>();
@@ -1010,7 +1012,7 @@ async function selectNextPickupStation(
   
   if (!empire) {
     ctx.log("transport", "Cannot determine bot's empire, falling back to nearest station search");
-    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
+    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations, true);
     if (!pickup) return null;
     return { system: pickup.system, poi: pickup.poi, poiName: pickup.poiName };
   }
@@ -1020,7 +1022,7 @@ async function selectNextPickupStation(
   
   if (empireStations.length === 0) {
     ctx.log("transport", `No known stations for empire ${empire}, falling back to nearest station search`);
-    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations);
+    const pickup = await selectPickupStation(ctx, state.berths, settings.maxJumps, settings.blockPirateStations, true);
     if (!pickup) return null;
     return { system: pickup.system, poi: pickup.poi, poiName: pickup.poiName };
   }
@@ -1669,6 +1671,31 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         ctx.log("transport", `  Unresolved destination: ${d.poiName} (origDest: ${d.origDest})`);
       }
       const outsideJumpLimit = destDrafts.filter(d => !d.system);
+
+      if (waiting.length > 0 && byDest.size === 0 && destDrafts.length === 0) {
+        ctx.log("transport", `All ${waiting.length} passengers filtered out (likely pirates). Moving to next station.`);
+        state.roundsWithoutPassengers = 0;
+        const nextPickup = await selectNextPickupStation(ctx, state, settings);
+        if (nextPickup) {
+          const isSameStation = nextPickup.poi.toLowerCase() === bot.poi.toLowerCase() && nextPickup.system.toLowerCase() === bot.system.toLowerCase();
+          if (!isSameStation) {
+            state.pickupStation = nextPickup.poi;
+            state.pickupSystem = nextPickup.system;
+            state.status = "idle";
+            saveTransportState(state);
+            await ctx.sleep(5000);
+            continue;
+          }
+        }
+        if (settings.homeSystem) {
+          state.pickupStation = settings.homeStation || null;
+          state.pickupSystem = settings.homeSystem || null;
+        }
+        state.status = "idle";
+        saveTransportState(state);
+        await ctx.sleep(5000);
+        continue;
+      }
 
       // Now load in route order, one destination per loop, berth tally.
       const loadedNames = new Set<string>();

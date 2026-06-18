@@ -2205,31 +2205,36 @@
               const _blockStatusUpdate =
                 window._refreshingStorage ||
                 Date.now() - _storageRefreshTime < 30000;
+              
+              // Preserve fresh cargo/storage data if available (from recent storage commands) BEFORE overwriting bots
+              // The status message may contain stale inventory/storage from bot.status()
+              const freshCargo = _pendingFreshCargo;
+              const freshStorage = _pendingFreshStorage;
+              const freshFactionStorage = _pendingFreshFactionStorage;
+
               if (!_blockStatusUpdate) {
-                // Preserve fresh cargo/storage data if available (from recent storage commands)
-                // The status message may contain stale inventory/storage from bot.status()
-                const freshCargo = _pendingFreshCargo;
-                const freshStorage = _pendingFreshStorage;
-                const freshFactionStorage = _pendingFreshFactionStorage;
-
                 bots = msg.bots || [];
+              }
 
-                // Restore fresh data to the bot that matches the profile bot
-                if (
-                  profileBot &&
-                  (freshCargo || freshStorage || freshFactionStorage)
-                ) {
-                  const profileBotIndex = bots.findIndex(
-                    (b) => b.username === profileBot,
-                  );
-                  if (profileBotIndex >= 0) {
-                    if (freshCargo)
-                      bots[profileBotIndex].inventory = freshCargo;
-                    if (freshStorage)
-                      bots[profileBotIndex].storage = freshStorage;
-                    // Note: faction storage is tracked separately in profileFactionStorage
-                  }
+              // Restore fresh data to the bot that matches the profile bot (for both blocked and unblocked status updates)
+              if (
+                profileBot &&
+                (_blockStatusUpdate || freshCargo || freshStorage || freshFactionStorage) &&
+                (freshCargo || freshStorage || freshFactionStorage)
+              ) {
+                const profileBotIndex = bots.findIndex(
+                  (b) => b.username === profileBot,
+                );
+                if (profileBotIndex >= 0) {
+                  if (freshCargo)
+                    bots[profileBotIndex].inventory = freshCargo;
+                  if (freshStorage)
+                    bots[profileBotIndex].storage = freshStorage;
+                  // Note: faction storage is tracked separately in profileFactionStorage
                 }
+              }
+
+              if (!_blockStatusUpdate) {
                 renderBots();
                 renderStats();
                 updateChatBotSelect();

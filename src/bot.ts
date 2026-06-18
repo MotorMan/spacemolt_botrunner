@@ -727,8 +727,6 @@ docked = false;
         // This is the PROACTIVE check - wait 2 seconds minimum for customs to respond
         // Only applies to customs empires (Voidborn, Nebula, Crimson, Solarian) in non-lawless systems
         if (!resp.error && (command === "jump" || command === "travel")) {
-          await this.refreshStatus();
-          // Check if we're in an empire system with customs (not Frontier, not Outer Rim, not pirate, not lawless)
           const sysData = mapStore.getSystem(this.system);
           if (isEmpireSystem(this.system, this.getEmpire(), sysData?.security_level)) {
             this.log("customs", `⏱️ Post-jump customs wait @ ${this.system} - 2 second delay...`);
@@ -744,15 +742,12 @@ docked = false;
             debugLogForBot(this.username, "bot:exec", `${this.username} > ${command}: action pending, waiting 10s...`);
             this.log("system", "Action pending — waiting for server to process...");
             await sleep(10_000);
-            // Refresh status before retry to ensure we're in a valid state
-            await this.refreshStatus();
             resp = await this.api.execute(command, payload);
 
             // If still pending, wait a bit longer and try one more time
             if (resp.error && (resp.error.code === "action_pending" || resp.error.message?.includes("action is already pending") || resp.error.message?.includes("Another action is already in progress"))) {
               this.log("system", "Action still pending — waiting additional 5s...");
               await sleep(5_000);
-              await this.refreshStatus();
               resp = await this.api.execute(command, payload);
             }
           }
@@ -798,59 +793,181 @@ docked = false;
           }
         }
 
-        if (resp.error) {
-          // Suppress noisy expected errors — callers handle these gracefully
-          const code = resp.error.code || "";
-          const quiet =
-            code === "mission_incomplete" ||
-            code === "not_in_battle" ||
-            (command === "view_storage" && code !== "session_invalid") ||
-            (command === "get_missions" && code !== "session_invalid") ||
-            (command === "complete_mission" && code === "mission_incomplete") ||
-            (command === "get_insurance_quote" && code !== "session_invalid") ||
-            (command === "survey_system" && code === "no_scanner") ||
-            ((command === "deposit_items" || command === "view_storage") && code === "no_faction_storage") ||
-            (command === "withdraw_items" && code === "cargo_full");
-          if (!quiet) {
-            this.log("error", `${command}: ${resp.error.message}`);
-          }
-        }
+        if (!resp.error && resp.result) {
+          const r = resp.result as Record<string, unknown>;
+          const ship = (r.ship as Record<string, unknown>) || {};
+          const location = (r.location as Record<string, unknown>) || {};
+          const player = (r.player as Record<string, unknown>) || {};
+          const p = location || player || r;
 
-          // Auto-scan nearby players after navigation commands (travel, jump, dock, undock)
-          // This helps collect player names faster as we move through the galaxy
-          if (!resp.error) {
-            const navigationCommands = ["travel", "jump", "dock", "undock"];
-            if (navigationCommands.includes(command)) {
-              // Small delay to let the navigation complete
-              await sleep(500);
-              const nearbyResp = await this.api.execute("get_nearby");
-              if (!nearbyResp.error && nearbyResp.result) {
-                this.trackNearbyPlayers(nearbyResp.result);
+          if (command === "get_status") {
+            this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
+            this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+            this.docked = location?.docked_at != null
+              ? !!(location.docked_at)
+              : (p.docked_at_base != null
+                ? !!(p.docked_at_base)
+                : (p.docked as boolean) ?? (p.status === "docked"));
+            this.location =
+              (location?.system_name as string) ||
+              (location?.system_id as string) ||
+              (p.current_system as string) ||
+              (p.location as string) ||
+              this.location;
+
+            this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
+            this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+
+            if (ship) {
+              this.fuel = (ship.fuel as number) ?? this.fuel;
+              this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
+              this.cargo = (ship.cargo_used as number) ?? this.cargo;
+              this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
+              this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+              this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
+              this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
+              this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
+              this.shipSpeed = (ship.speed as number) || 1;
+              this.shipId = (ship.id as string) || "";
+            }
+          } else if (command === "mine") {
+            // Mine response is nested under 'details' per OpenAPI spec
+            const details = (r.details as Record<string, unknown>) || r;
+            const qty = (details.quantity as number) || (details.count as number) || 0;
+            if (qty) this.cargo = Math.max(0, this.cargo + qty);
+            const xpGained = details.xp_gained as Record<string, number> | undefined;
+            if (xpGained) {
+              for (const [skill, gained] of Object.entries(xpGained)) {
+                this.skillXP.set(skill, (this.skillXP.get(skill) || 0) + gained);
               }
-              // For jump commands, also scan the entire system for players
-              if (command === "jump") {
-                const systemResp = await this.api.execute("get_system_agents");
-                if (!systemResp.error && systemResp.result) {
-                  this.trackSystemAgents(systemResp.result);
-                }
+            }
+          } else if (command === "jump" || command === "travel") {
+            const sysId = (r.system_id as string) || (r.system as string) || (location.system_id as string);
+            const poiId = (r.poi as string) || (r.poi_id as string) || (location.poi_id as string);
+            if (sysId) this.system = sysId;
+            if (poiId) this.poi = poiId;
+            if (r.auto_docked || location.docked_at) this.docked = true;
+            if (r.auto_undocked) this.docked = false;
+            if (typeof r.fuel === "number") this.fuel = r.fuel;
+          } else if (command === "dock") {
+            this.docked = true;
+            if (location.docked_at) this.poi = (location.docked_at as string);
+          } else if (command === "undock") {
+            this.docked = false;
+          } else if (command === "sell" || command === "create_sell_order") {
+            const creditsEarned = (r.credits_earned as number) || (r.credits as number) || 0;
+            if (creditsEarned) this.credits += creditsEarned;
+            const qty = (r.quantity as number) || 0;
+            if (qty) this.cargo = Math.max(0, this.cargo - qty);
+          } else if (command === "buy" || command === "create_buy_order") {
+            const creditsSpent = (r.credits_spent as number) || (r.credits as number) || 0;
+            if (creditsSpent) this.credits = Math.max(0, this.credits - creditsSpent);
+            const qty = (r.quantity as number) || 0;
+            if (qty) this.cargo += qty;
+          } else if (command === "refuel") {
+            const fuelAdded = (r.fuel_added as number) || (r.quantity as number) || 0;
+            if (fuelAdded) this.fuel = Math.min(this.maxFuel, this.fuel + fuelAdded);
+            if (typeof ship.fuel === "number") this.fuel = ship.fuel;
+          } else if (command === "repair") {
+            const hullRepaired = (r.hull_repaired as number) || (r.hull as number) || 0;
+            if (hullRepaired) this.hull = Math.min(this.maxHull, this.hull + hullRepaired);
+            const shieldRepaired = (r.shield_repaired as number) || (r.shield as number) || 0;
+            if (shieldRepaired) this.shield = Math.min(this.maxShield, this.shield + shieldRepaired);
+          } else if (command === "jettison") {
+            const qty = (r.quantity as number) || 0;
+            if (qty) this.cargo = Math.max(0, this.cargo - qty);
+          } else if (command === "craft") {
+            const qty = (r.quantity as number) || (r.count as number) || 0;
+            if (qty) this.cargo += qty;
+          }
+
+if (Object.keys(ship).length > 0) {
+            if (typeof ship.fuel === "number") this.fuel = ship.fuel;
+            if (typeof ship.max_fuel === "number") this.maxFuel = ship.max_fuel;
+            this.cargo = (ship.cargo_used as number) ?? this.cargo;
+            this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
+            this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+            this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
+            this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
+            this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
+            // Cache ship speed (1-6, where 1=slowest at 120s/jump, 6=fastest at 30s/jump)
+            this.shipSpeed = (ship.speed as number) || 1;
+            
+            // Ship ID
+            this.shipId = (ship.id as string) || "";
+            
+            // Ammo is stored per-weapon-module, not at ship level.
+            // get_status may return modules as full objects or just IDs.
+            // Check both the ship.modules array and root-level modules array.
+            const modulesArray = (
+              Array.isArray(r.modules) ? r.modules :
+              Array.isArray(ship.modules) ? ship.modules :
+              []
+            ) as Array<Record<string, unknown>>;
+            
+            let totalAmmo = 0;
+            for (const mod of modulesArray) {
+              if (mod && typeof mod === "object" && mod.current_ammo != null && typeof mod.current_ammo === "number") {
+                totalAmmo += mod.current_ammo as number;
               }
+            }
+            // Update ammo count: prefer calculated from modules, fall back to ship.ammo if it exists
+            if (totalAmmo > 0) {
+              this.ammo = totalAmmo;
+            } else if (ship.ammo != null) {
+              this.ammo = ship.ammo as number;
+            }
+            this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
+          }
+
+          // Cloak detection
+          this.isCloaked = !!(p.is_cloaked || p.cloaked);
+
+          // Tow detection - check for towing_wreck flag or tow_attached status
+          const towingField = (p.towing_wreck as boolean) ?? (p.towing as boolean) ?? (p.has_tow as boolean);
+          if (towingField != null) {
+            this.towingWreck = towingField;
+          }
+          // Also check ship-level tow status
+          if (ship) {
+            const shipTowing = (ship.towing_wreck as boolean) ?? (ship.towing as boolean) ?? (ship.has_tow as boolean);
+            if (shipTowing != null) {
+              this.towingWreck = shipTowing;
             }
           }
 
-          // Track piloting XP after ship-based actions that grant exp
-          const PILOTING_EXP_COMMANDS = new Set([
-            'jump', 'travel', 'mine', 'attack', 'salvage_wreck', 'loot_wreck',
-            'refuel', 'repair', 'dock', 'undock', 'survey_system'
-          ]);
-          if (!resp.error && PILOTING_EXP_COMMANDS.has(command)) {
-             try {
-                await this.logSkillGains(command);
-             } catch (e) {
-                // ignore tracking errors
-             }
+          // Add this bot to the player tracking so it appears in the web UI players tab
+          playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
+
+          // Debug: log tow-related fields from status
+          if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
+              (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
+            this.log("debug", `Tow fields in status: p.towing_wreck=${p.towing_wreck}, p.towing=${p.towing}, p.has_tow=${p.has_tow}, ship.towing_wreck=${ship?.towing_wreck}, ship.towing=${ship?.towing}, ship.has_tow=${ship?.has_tow}, this.towingWreck=${this.towingWreck}`);
           }
 
-          return resp;
+          // Death detection
+          if (this.hull <= 0 && this.maxHull > 0) {
+            this.isDead = true;
+          } else if (this.hull > 0 && this.isDead) {
+            this.isDead = false; // respawned
+          }
+
+          // Fallback: fuel at top level
+          if (typeof r.fuel === "number") this.fuel = r.fuel;
+
+          // Skills are now tracked incrementally from mutation responses via exec()
+          // Use refreshSkills() for a dedicated skill refresh when needed
+        }
+
+// Log position change if system or poi updated
+        if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
+          this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
+          this.logPosition();
+          this.lastSystem = this.system;
+          this.lastPoi = this.poi;
+        }
+
+        return resp;
       } catch (err) {
         // Handle abort
         if (err instanceof Error && err.name === "AbortError" && this.currentBattle.inBattle) {
@@ -943,27 +1060,20 @@ docked = false;
      return true;
   }
 
-  /** Fetch current game state and cache it. */
+  /** Fetch current game state and cache it. Overwrites all cached state with fresh data. */
   async refreshStatus(): Promise<ApiResponse> {
-    const resp = await this.exec("get_status");
+    const resp = await this.api.execute("get_status", undefined, { bypassCache: true });
     debugLogForBot(this.username, "bot:refreshStatus", `${this.username} get_status response`, resp.result);
-    if (resp.result && typeof resp.result === "object") {
+    if (!resp.error && resp.result && typeof resp.result === "object") {
       const r = resp.result as Record<string, unknown>;
       debugLogForBot(this.username, "bot:refreshStatus", `${this.username} top-level keys`, Object.keys(r));
 
-      // Location is now nested under `location` object in v2
       const location = r.location as Record<string, unknown> | undefined;
       const player = r.player as Record<string, unknown> | undefined;
-      // Use location data first, then player, then root level
       const p = location || player || r;
 
-      this.credits = (player?.credits as number) ?? (p.credits as number) ?? this.credits;
-      debugLogForBot(this.username, "bot:credits", `${this.username} credits=${this.credits} raw=${player?.credits ?? p.credits}`);
-
-      // System and POI are now inside `location` object in v2
-      // location.system_id, location.system_name, location.poi_id, location.poi_name
-      this.system = (location?.system_id as string) || (location?.system_name as string) || (p.current_system as string) || this.system;
-      this.poi = (location?.poi_id as string) || (location?.poi_name as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+      this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
+      this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
       this.docked = location?.docked_at != null
         ? !!(location.docked_at)
         : (p.docked_at_base != null
@@ -976,10 +1086,9 @@ docked = false;
         (p.location as string) ||
         this.location;
 
-      // Faction membership
+      this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
       this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
 
-       // Ship fields
       const ship = r.ship as Record<string, unknown> | undefined;
       debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
       if (ship) {
@@ -996,15 +1105,9 @@ docked = false;
         this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
         this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
         this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
-        // Cache ship speed (1-6, where 1=slowest at 120s/jump, 6=fastest at 30s/jump)
         this.shipSpeed = (ship.speed as number) || 1;
-        
-        // Ship ID
         this.shipId = (ship.id as string) || "";
         
-        // Ammo is stored per-weapon-module, not at ship level.
-        // get_status may return modules as full objects or just IDs.
-        // Check both the ship.modules array and root-level modules array.
         const modulesArray = (
           Array.isArray(r.modules) ? r.modules :
           Array.isArray(ship.modules) ? ship.modules :
@@ -1017,7 +1120,6 @@ docked = false;
             totalAmmo += mod.current_ammo as number;
           }
         }
-        // Update ammo count: prefer calculated from modules, fall back to ship.ammo if it exists
         if (totalAmmo > 0) {
           this.ammo = totalAmmo;
         } else if (ship.ammo != null) {
@@ -1026,15 +1128,12 @@ docked = false;
         this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
       }
 
-      // Cloak detection
       this.isCloaked = !!(p.is_cloaked || p.cloaked);
 
-      // Tow detection - check for towing_wreck flag or tow_attached status
       const towingField = (p.towing_wreck as boolean) ?? (p.towing as boolean) ?? (p.has_tow as boolean);
       if (towingField != null) {
         this.towingWreck = towingField;
       }
-      // Also check ship-level tow status
       if (ship) {
         const shipTowing = (ship.towing_wreck as boolean) ?? (ship.towing as boolean) ?? (ship.has_tow as boolean);
         if (shipTowing != null) {
@@ -1042,50 +1141,22 @@ docked = false;
         }
       }
 
-      // Add this bot to the player tracking so it appears in the web UI players tab
       playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
 
-      // Debug: log tow-related fields from status
       if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
           (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
         this.log("debug", `Tow fields in status: p.towing_wreck=${p.towing_wreck}, p.towing=${p.towing}, p.has_tow=${p.has_tow}, ship.towing_wreck=${ship?.towing_wreck}, ship.towing=${ship?.towing}, ship.has_tow=${ship?.has_tow}, this.towingWreck=${this.towingWreck}`);
       }
 
-      // Death detection
       if (this.hull <= 0 && this.maxHull > 0) {
         this.isDead = true;
       } else if (this.hull > 0 && this.isDead) {
-        this.isDead = false; // respawned
+        this.isDead = false;
       }
 
-      // Fallback: fuel at top level
       if (typeof r.fuel === "number") this.fuel = r.fuel;
-
-      // Extract skills from get_status response (v2 API includes skills)
-      const skillsData = r.skills as Record<string, unknown> | undefined;
-      if (skillsData && typeof skillsData === "object") {
-        this.skillLevels.clear();
-        this.skillXP.clear();
-        this.skillTotalXP.clear();
-        this.skillXpToNext.clear();
-        for (const [skillId, skillVal] of Object.entries(skillsData)) {
-          if (skillVal && typeof skillVal === "object") {
-            const s = skillVal as Record<string, unknown>;
-            const level = (s.level as number) ?? (s.current_level as number) ?? 0;
-            const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
-            const xp = typeof rawXP === "number" ? rawXP : 0;
-            const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number) ?? (s.xp_remaining as number) ?? (s.next_level_xp as number);
-            const totalXP = (s.total_xp as number) ?? (s.total_experience as number) ?? (s.cumulative_xp as number);
-            this.skillLevels.set(skillId, level);
-            this.skillXP.set(skillId, xp);
-            if (xpToNext !== undefined) this.skillXpToNext.set(skillId, xpToNext);
-            if (totalXP !== undefined) this.skillTotalXP.set(skillId, totalXP);
-          }
-        }
-      }
     }
 
-    // Log position change if system or poi updated
     if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
       this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
       this.logPosition();
@@ -1093,17 +1164,148 @@ docked = false;
       this.lastPoi = this.poi;
     }
 
-    // Also refresh cargo inventory (and storage only if docked)
-    await this.refreshCargo();
-    if (this.docked) {
-      await this.refreshStorage();
-    }
-
     return resp;
   }
 
+  async refreshLocation(): Promise<ApiResponse> {
+    const resp = await this.api.execute("get_location");
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      const location = r.location as Record<string, unknown> | undefined;
+      const player = r.player as Record<string, unknown> | undefined;
+      const p = location || player || r;
+      this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
+      this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+      this.docked = location?.docked_at != null
+        ? !!(location.docked_at)
+        : (p.docked_at_base != null
+          ? !!(p.docked_at_base)
+          : (p.docked as boolean) ?? (p.status === "docked"));
+      this.location =
+        (location?.system_name as string) ||
+        (location?.system_id as string) ||
+        (p.current_system as string) ||
+        (p.location as string) ||
+        this.location;
+      this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+      this.isCloaked = !!(p.is_cloaked || p.cloaked);
+      const creditsValue = r.credits ?? player?.credits;
+      if (typeof creditsValue === "number") this.credits = creditsValue;
+    }
+    return resp;
+  }
+
+  async refreshShip(): Promise<ApiResponse> {
+    const resp = await this.api.execute("get_ship");
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      const ship = (r.ship as Record<string, unknown>) || r;
+      const player = r.player as Record<string, unknown> | undefined;
+      if (ship) {
+        this.fuel = (ship.fuel as number) ?? this.fuel;
+        this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
+        this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+        this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
+        this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
+        this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
+        this.shipSpeed = (ship.speed as number) || this.shipSpeed;
+        this.cargo = (ship.cargo_used as number) ?? this.cargo;
+        this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
+        this.shipId = (ship.id as string) || this.shipId;
+        const modulesArray = Array.isArray(ship.modules) ? ship.modules as Array<Record<string, unknown>> : [];
+        let totalAmmo = 0;
+        for (const mod of modulesArray) {
+          if (mod && typeof mod === "object" && mod.current_ammo != null) totalAmmo += mod.current_ammo as number;
+        }
+        if (totalAmmo > 0) this.ammo = totalAmmo;
+        else if (ship.ammo != null) this.ammo = ship.ammo as number;
+        this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
+        this.installedMods = modulesArray.map(m => (m.name as string) || (m.type_id as string) || "").filter(Boolean);
+      }
+      const creditsValue = r.credits ?? player?.credits;
+      if (typeof creditsValue === "number") this.credits = creditsValue;
+    }
+    return resp;
+  }
+
+  async refreshCargoAndStorage(): Promise<ApiResponse> {
+    const cargoResp = await this.api.execute("get_cargo");
+    if (!cargoResp.error && cargoResp.result) {
+      this.inventory = this.parseItemList(cargoResp.result, 'cargo');
+      const r = cargoResp.result as Record<string, unknown>;
+      const player = r.player as Record<string, unknown> | undefined;
+      const creditsValue = r.credits ?? player?.credits;
+      if (typeof creditsValue === "number") this.credits = creditsValue;
+    }
+    if (this.docked) {
+      await this.refreshStorage();
+    }
+    return cargoResp;
+  }
+
+  async refreshPOI(): Promise<ApiResponse> {
+    const resp = await this.api.execute("get_poi");
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      const poi = (r.poi as Record<string, unknown>) || {};
+      this.system = (poi.system_id as string) || (poi.system as string) || this.system;
+      this.poi = (poi.id as string) || (poi.poi_id as string) || this.poi;
+      this.docked = poi.docked != null ? !!(poi.docked as boolean) : this.docked;
+    }
+    return resp;
+  }
+
+  async refreshMissions(): Promise<ApiResponse> {
+    return this.api.execute("get_missions");
+  }
+
+  async refreshQueue(): Promise<ApiResponse> {
+    return this.api.execute("get_queue");
+  }
+
+  async refreshNearby(): Promise<ApiResponse> {
+    return this.api.execute("get_nearby");
+  }
+
+async refreshSkills(): Promise<ApiResponse> {
+     const resp = await this.api.execute("get_skills");
+     if (!resp.error && resp.result) {
+       const r = resp.result as Record<string, unknown>;
+       // Handle various response formats: skills.skills, skills.data, or top-level
+       let skillsData: Record<string, unknown> | null = null;
+       if (r.skills && typeof r.skills === "object") {
+         skillsData = r.skills as Record<string, unknown>;
+       } else if (r.data && typeof r.data === "object") {
+         skillsData = r.data as Record<string, unknown>;
+       } else {
+         skillsData = r;
+       }
+       
+       this.skillLevels.clear();
+       this.skillXP.clear();
+       this.skillTotalXP.clear();
+       this.skillXpToNext.clear();
+       for (const [skillId, skillVal] of Object.entries(skillsData)) {
+         if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
+         if (skillVal && typeof skillVal === "object") {
+           const s = skillVal as Record<string, unknown>;
+           const level = (s.level as number) ?? (s.current_level as number) ?? 0;
+           const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
+           const xp = typeof rawXP === "number" ? rawXP : 0;
+           const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number) ?? (s.xp_remaining as number);
+           const totalXP = (s.total_xp as number) ?? (s.total_experience as number) ?? (s.cumulative_xp as number);
+           this.skillLevels.set(skillId, level);
+           this.skillXP.set(skillId, xp);
+           if (xpToNext !== undefined) this.skillXpToNext.set(skillId, xpToNext);
+           if (totalXP !== undefined) this.skillTotalXP.set(skillId, totalXP);
+         }
+       }
+     }
+     return resp;
+   }
+
   /** Parse an item list from API response, handling both item_id and resource_id formats. */
-  private parseItemList(result: unknown): CargoItem[] {
+  private parseItemList(result: unknown, preferField?: string): CargoItem[] {
     if (!result || typeof result !== "object") return [];
 
     let r = result as Record<string, unknown>;
@@ -1121,17 +1323,25 @@ docked = false;
       }
     }
 
-    const items = (
-      Array.isArray(r) ? r :
-      Array.isArray(r.items) ? r.items :
-      Array.isArray(r.cargo) ? r.cargo :
-      Array.isArray(r.storage) ? r.storage :
-      Array.isArray(r.stored_items) ? r.stored_items :
-      Array.isArray(r.faction_items) ? r.faction_items :
-      Array.isArray(r.faction_storage) ? r.faction_storage :
-      Array.isArray(r.data) ? r.data :
-      []
-    ) as Array<Record<string, unknown>>;
+    // Determine which field to use based on preferField or auto-detect
+    // preferField is used to prioritize a specific field (e.g., 'cargo' for get_cargo, 'storage' for view_storage)
+    let items: Array<Record<string, unknown>>;
+    if (preferField && Array.isArray(r[preferField])) {
+      items = r[preferField] as Array<Record<string, unknown>>;
+    } else {
+      // Auto-detect: check multiple fields in order of priority
+      items = (
+        Array.isArray(r) ? r :
+        Array.isArray(r.cargo) ? r.cargo :
+        Array.isArray(r.storage) ? r.storage :
+        Array.isArray(r.items) ? r.items :
+        Array.isArray(r.stored_items) ? r.stored_items :
+        Array.isArray(r.faction_items) ? r.faction_items :
+        Array.isArray(r.faction_storage) ? r.faction_storage :
+        Array.isArray(r.data) ? r.data :
+        []
+      ) as Array<Record<string, unknown>>;
+    }
 
     return items
       .map((item) => {
@@ -1149,14 +1359,25 @@ docked = false;
   /** Fetch cargo contents and cache them. */
   async refreshCargo(): Promise<void> {
     const resp = await this.exec("get_cargo");
-    // Always update inventory — even if response is empty/null, clear stale data
-    this.inventory = this.parseItemList(resp.result);
+    this.inventory = this.parseItemList(resp.result, 'cargo');
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      const player = r.player as Record<string, unknown> | undefined;
+      const creditsValue = r.credits ?? player?.credits;
+      if (typeof creditsValue === "number") this.credits = creditsValue;
+    }
   }
 
   /** Fetch station storage contents and cache them. Pass station_id to check remotely. */
   async refreshStorage(stationId?: string): Promise<void> {
     const resp = await this.exec("view_storage", stationId ? { station_id: stationId } : undefined);
-    this.storage = this.parseItemList(resp.result);
+    this.storage = this.parseItemList(resp.result, 'storage');
+    if (!resp.error && resp.result) {
+      const r = resp.result as Record<string, unknown>;
+      const player = r.player as Record<string, unknown> | undefined;
+      const creditsValue = r.credits ?? player?.credits;
+      if (typeof creditsValue === "number") this.credits = creditsValue;
+    }
   }
 
   /**
@@ -1701,39 +1922,70 @@ docked = false;
 
     return { success: arrived, arrivedTick: (await this.pollCurrentTick()) ?? undefined, landing: { systemId: landingSystemId, ticks: landingTicks } };
   }
-  getSkillLevel(skillId: string): number {
-    return this.skillLevels.get(skillId) ?? 0;
-  }
+getSkillLevel(skillId: string): number {
+     const lowerId = skillId.toLowerCase();
+     for (const [id, level] of this.skillLevels.entries()) {
+       if (id.toLowerCase() === lowerId) return level;
+     }
+     return 0;
+   }
 
    /** Fetch skills and log any level-ups since the last check. */
     async checkSkills(): Promise<void> {
-      const fresh = await this.fetchAllSkills();
-      for (const [id, data] of fresh.entries()) {
-        const prev = this.skillLevels.get(id);
-        if (prev !== undefined && data.level > prev) {
-          this.log("skill", `LEVEL UP! ${id}: ${prev} -> ${data.level}`);
+      const resp = await this.refreshSkills();
+      if (resp.error || !resp.result) return;
+      
+      const r = resp.result as Record<string, unknown>;
+      // Handle various response formats: skills.skills, skills.data, or top-level
+      let skillsData: Record<string, unknown> | null = null;
+      if (r.skills && typeof r.skills === "object") {
+        skillsData = r.skills as Record<string, unknown>;
+      } else if (r.data && typeof r.data === "object") {
+        skillsData = r.data as Record<string, unknown>;
+      } else {
+        skillsData = r;
+      }
+      
+      for (const [skillId, skillVal] of Object.entries(skillsData)) {
+        if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
+        if (skillVal && typeof skillVal === "object") {
+          const s = skillVal as Record<string, unknown>;
+          const level = (s.level as number) ?? (s.current_level as number) ?? 0;
+          const prev = this.skillLevels.get(skillId);
+          if (prev !== undefined && level > prev) {
+            this.log("skill", `LEVEL UP! ${skillId}: ${prev} -> ${level}`);
+          }
         }
-        this.skillLevels.set(id, data.level);
-        this.skillXP.set(id, data.xp);
-        this.skillTotalXP.set(id, data.totalXP ?? 0);
-        this.skillXpToNext.set(id, data.xpToNext ?? 0);
       }
     }
 
-     /** Fetch all skills as a Map<skillId, {level, xp, xpToNext, totalXP?}>.
-     * Uses cached skills from get_status (skills are included in get_status response). */
+     /** Fetch all skills as a Map (calls get_skills API). */
      private async fetchAllSkills(): Promise<Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>> {
        const map = new Map<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>();
-       for (const [id, level] of this.skillLevels.entries()) {
-         const entry: { level: number; xp: number; xpToNext?: number; totalXP?: number } = {
-           level,
-           xp: this.skillXP.get(id) ?? 0,
-         };
-         const xpToNext = this.skillXpToNext.get(id);
-         if (xpToNext !== undefined) entry.xpToNext = xpToNext;
-         const totalXP = this.skillTotalXP.get(id);
-         if (totalXP !== undefined) entry.totalXP = totalXP;
-         map.set(id, entry);
+       const resp = await this.api.execute("get_skills");
+       if (resp.error || !resp.result) return map;
+       
+       const r = resp.result as Record<string, unknown>;
+       let skillsData: Record<string, unknown> | null = null;
+       if (r.skills && typeof r.skills === "object") {
+         skillsData = r.skills as Record<string, unknown>;
+       } else if (r.data && typeof r.data === "object") {
+         skillsData = r.data as Record<string, unknown>;
+       } else {
+         skillsData = r;
+       }
+       
+       for (const [id, skillVal] of Object.entries(skillsData)) {
+         if (id === 'message' || id === 'status' || id === 'error') continue;
+         if (skillVal && typeof skillVal === "object") {
+           const s = skillVal as Record<string, unknown>;
+           const level = (s.level as number) ?? (s.current_level as number) ?? 0;
+           const rawXP = (s.xp as number) ?? (s.experience as number) ?? (s.current_xp as number) ?? 0;
+           const xp = typeof rawXP === "number" ? rawXP : 0;
+           const xpToNext = (s.xp_to_next_level as number) ?? (s.xp_to_next as number) ?? (s.xp_needed as number) ?? (s.xp_remaining as number);
+           const totalXP = (s.total_xp as number) ?? (s.total_experience as number) ?? (s.cumulative_xp as number);
+           map.set(id, { level, xp, xpToNext, totalXP });
+         }
        }
        return map;
      }
@@ -1753,10 +2005,10 @@ docked = false;
       );
     }
 
-    /** Compare skills after a command and log any gains. */
+/** Compare skills after a command and log any gains. */
      private async logSkillGains(command: string): Promise<void> {
        const fresh = await this.fetchAllSkills();
-       if (fresh.size === 0) return; // failed to fetch, keep old snapshot
+       if (fresh.size === 0) return;
        const gains: Array<{
          id: string;
          name: string;
@@ -1773,11 +2025,9 @@ docked = false;
          const old = this.skillSnapshot.get(id);
          if (!old) continue;
          let xpGained: number;
-         // Prefer using total cumulative XP if available for exact gain
          if (old.totalXP !== undefined && data.totalXP !== undefined) {
            xpGained = data.totalXP - old.totalXP;
          } else if (data.level > old.level) {
-           // Level-up: remaining XP to finish old level + XP in new level
            const oldRemaining = (old.xpToNext !== undefined) ? (old.xpToNext - old.xp) : 0;
            xpGained = oldRemaining + data.xp;
          } else {
@@ -1799,32 +2049,30 @@ docked = false;
            });
          }
        }
-      if (gains.length > 0) {
-        const parts = gains.map(g => {
-          if (g.levelAfter > g.levelBefore && g.xpGained > 0) return `+${g.xpGained} ${g.id} (lvl ${g.levelAfter - g.levelBefore})`;
-          if (g.xpGained > 0) return `+${g.xpGained} ${g.id}`;
-          return `+${g.levelAfter - g.levelBefore} ${g.id}`;
-        }).join(", ");
-        this.log("skills", `Skill gains: ${parts}`);
-        recordSkillGains(this, command, this.shipName, gains);
-        // Also update piloting-specific aggregated stats if piloting was among gains
-        const pilotGain = gains.find(g => g.id.toLowerCase().includes('pilot'));
-        if (pilotGain) {
-          recordPilotingActivity(this, command, pilotGain.xpGained, pilotGain.levelAfter, pilotGain.xpAfter, this.shipName);
-        }
-      }
-      // Update in-memory skill maps to the fresh snapshot for next command
-      this.skillLevels.clear();
-      this.skillXP.clear();
-      this.skillTotalXP.clear();
-      this.skillXpToNext.clear();
-      for (const [id, data] of fresh.entries()) {
-        this.skillLevels.set(id, data.level);
-        this.skillXP.set(id, data.xp);
-        this.skillTotalXP.set(id, data.totalXP ?? 0);
-        this.skillXpToNext.set(id, data.xpToNext ?? 0);
-      }
-    }
+       if (gains.length > 0) {
+         const parts = gains.map(g => {
+           if (g.levelAfter > g.levelBefore && g.xpGained > 0) return `+${g.xpGained} ${g.id} (lvl ${g.levelAfter - g.levelBefore})`;
+           if (g.xpGained > 0) return `+${g.xpGained} ${g.id}`;
+           return `+${g.levelAfter - g.levelBefore} ${g.id}`;
+         }).join(", ");
+         this.log("skills", `Skill gains: ${parts}`);
+         recordSkillGains(this, command, this.shipName, gains);
+         const pilotGain = gains.find(g => g.id.toLowerCase().includes('pilot'));
+         if (pilotGain) {
+           recordPilotingActivity(this, command, pilotGain.xpGained, pilotGain.levelAfter, pilotGain.xpAfter, this.shipName);
+         }
+       }
+       this.skillLevels.clear();
+       this.skillXP.clear();
+       this.skillTotalXP.clear();
+       this.skillXpToNext.clear();
+       for (const [id, data] of fresh.entries()) {
+         this.skillLevels.set(id, data.level);
+         this.skillXP.set(id, data.xp);
+         if (data.xpToNext !== undefined) this.skillXpToNext.set(id, data.xpToNext);
+         if (data.totalXP !== undefined) this.skillTotalXP.set(id, data.totalXP);
+       }
+     }
 
     /**
      * Start a customs hold - blocks travel/jump actions until cleared.

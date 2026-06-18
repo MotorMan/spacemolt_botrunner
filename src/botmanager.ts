@@ -730,7 +730,38 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
     bot.trackNearbyPlayers(resp.result);
   }
 
-  // Refresh cached state after mutating commands
+// Broadcast skills update for get_skills command
+  if (!resp.error && resp.result && command === "get_skills") {
+    // The API returns skills directly in resp.result (normalized from structuredContent)
+    const r = resp.result as Record<string, unknown>;
+    const skillsObj: Record<string, unknown> | null = 
+      (r.skills && typeof r.skills === "object") 
+        ? r.skills as Record<string, unknown>
+        : r;
+    
+    if (skillsObj) {
+      const skillData: Record<string, { level: number; xp: number; nextLevelXp: number }> = {};
+      for (const [skillId, s] of Object.entries(skillsObj)) {
+        // Skip non-skill keys
+        if (skillId === 'message' || skillId === 'status' || skillId === 'error') continue;
+        
+        if (s && typeof s === "object") {
+          const skillObj = s as Record<string, unknown>;
+          const level = (skillObj.level as number) ?? (skillObj.current_level as number) ?? 0;
+          const xp = (skillObj.xp as number) ?? (skillObj.experience as number) ?? (skillObj.current_xp as number) ?? 0;
+          const xpToNext = (skillObj.xp_to_next_level as number) ?? (skillObj.next_level_xp as number) ?? (skillObj.xp_to_next as number) ?? (skillObj.xp_needed as number) ?? (skillObj.xp_remaining as number) ?? 0;
+          skillData[skillId] = {
+            level: level || 0,
+            xp: xp || 0,
+            nextLevelXp: xpToNext || 0
+          };
+        }
+      }
+      server.broadcastSkillsUpdate(botName, skillData);
+    }
+  }
+
+// Refresh cached state after mutating commands
   const refreshCommands = new Set([
     "mine", "sell", "buy", "dock", "undock", "travel", "jump",
     "refuel", "repair", "deposit_items", "withdraw_items", "jettison",
@@ -738,6 +769,8 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
     "accept_mission", "complete_mission", "abandon_mission",
     "buy_ship", "sell_ship", "switch_ship", "install_mod", "uninstall_mod", "set_colors",
   ]);
+  const stateRefreshCommands = new Set(["get_cargo", "get_ship", "get_location", "view_storage", "view_faction_storage"]);
+  
   if (refreshCommands.has(command)) {
     await bot.refreshStatus();
 
@@ -762,6 +795,19 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
       }
     }
 
+    refreshStatusTable();
+  }
+
+  if (stateRefreshCommands.has(command)) {
+    if (command === "get_cargo") {
+      await bot.refreshCargoAndStorage();
+    } else if (command === "get_ship") {
+      await bot.refreshShip();
+    } else if (command === "get_location") {
+      await bot.refreshLocation();
+    } else if (command === "view_storage" || command === "view_faction_storage") {
+      await bot.refreshStorage();
+    }
     refreshStatusTable();
   }
 
@@ -1106,22 +1152,88 @@ async function main(): Promise<void> {
     }
   }, 2000));
 
-  // Periodic live refresh (hit API for all logged-in bots)
+  // Periodic live refresh (hit API for bots that are running routines only)
+  // Set periodicRefreshSec to 0 to disable
+  const periodicRefreshSec = (settings.general as Record<string, unknown>)?.periodicRefreshSec as number || 30;
+  if (periodicRefreshSec > 0) {
+    intervals.push(setInterval(async () => {
+      try {
+        const refreshPromises = [];
+        let refreshCount = 0;
+        for (const [, bot] of bots) {
+          // Only refresh bots that are actively running a routine
+          if (bot.state === "running" && bot.api.getSession()) {
+            refreshPromises.push(bot.refreshShip().catch(() => {}));
+            refreshPromises.push(bot.refreshLocation().catch(() => {}));
+            // Also do a lightweight notification check to keep session alive
+            // Use bot.exec() instead of api.execute() to process notifications properly
+            refreshPromises.push(bot.exec("get_notifications", { limit: 1, clear: true }).then((resp) => {
+              if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
+                debugLogForBot(bot.username, "periodic:notifications", `Received ${resp.notifications.length} notification(s) during refresh`);
+              }
+            }).catch(() => {}));
+            refreshCount++;
+          }
+        }
+        if (refreshCount > 0) {
+          debugLogForBot("SYSTEM", "periodic:refresh", `Refreshing ${refreshCount} running bot(s)`);
+        }
+        await Promise.allSettled(refreshPromises);
+        refreshStatusTable();
+      } catch (err) {
+        console.error('Error in periodic live refresh:', err);
+      }
+    }, periodicRefreshSec * 1000));
+  }
+
+  // Periodic get_status for running bots - every 2 minutes to keep credit data fresh
+  // This ensures the web UI has current credit information for manual control pages
   intervals.push(setInterval(async () => {
     try {
-      // Run all refreshStatus calls in parallel to avoid blocking the event loop
-      const refreshPromises = [];
+      const statusPromises = [];
+      let statusCount = 0;
       for (const [, bot] of bots) {
-        if (bot.api.getSession()) {
-          refreshPromises.push(bot.refreshStatus().catch(() => {}));
+        if (bot.state === "running" && bot.api.getSession()) {
+          statusPromises.push(bot.refreshStatus().catch(() => {}));
+          statusCount++;
         }
       }
-      await Promise.allSettled(refreshPromises);
+      if (statusCount > 0) {
+        debugLogForBot("SYSTEM", "periodic:status", `Getting fresh status for ${statusCount} running bot(s)`);
+      }
+      await Promise.allSettled(statusPromises);
       refreshStatusTable();
     } catch (err) {
-      console.error('Error in periodic live refresh:', err);
+      console.error('Error in periodic status refresh:', err);
     }
-  }, 30000));
+  }, 120 * 1000));
+
+  // Low-bandwidth session keep-alive: get_notifications every 40s for idle bots
+  // This keeps sessions alive and fetches notifications without heavy API calls
+  intervals.push(setInterval(async () => {
+    try {
+      const keepAlivePromises = [];
+      let keepAliveCount = 0;
+      for (const [name, bot] of bots) {
+        // Only hit API for idle bots (not already doing heavy refresh)
+        if (bot.state === "idle" && bot.api.getSession()) {
+          // Use bot.exec() instead of api.execute() to process notifications properly
+          keepAlivePromises.push(bot.exec("get_notifications", { limit: 1, clear: true }).then((resp) => {
+            if (resp.notifications && Array.isArray(resp.notifications) && resp.notifications.length > 0) {
+              debugLogForBot(name, "keepalive:notifications", `Received ${resp.notifications.length} notification(s) for idle bot`);
+            }
+          }).catch(() => {}));
+          keepAliveCount++;
+        }
+      }
+      if (keepAliveCount > 0) {
+        debugLogForBot("SYSTEM", "periodic:keepalive", `Session keep-alive for ${keepAliveCount} idle bot(s)`);
+      }
+      await Promise.allSettled(keepAlivePromises);
+    } catch (err) {
+      console.error('Error in periodic session keep-alive:', err);
+    }
+  }, 40 * 1000));
 
   // Periodic map data push (every 15s so dashboard stays current)
   intervals.push(setInterval(() => {

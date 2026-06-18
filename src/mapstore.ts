@@ -1173,7 +1173,7 @@ class MapStore {
   findNearestStation(systemId: string): StoredPOI | null {
     const sys = this.data.systems[systemId];
     if (!sys) return null;
-    return sys.pois.find((p) => p.has_base || !!p.base_id) ?? null;
+    return sys.pois.find((p) => (p.has_base || !!p.base_id) && p.market && p.market.length > 0) ?? null;
   }
 
   /** BFS to find the nearest known system that has a station (excluding pirate and blacklisted systems).

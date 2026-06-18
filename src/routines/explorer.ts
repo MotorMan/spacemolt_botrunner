@@ -290,7 +290,7 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
     if (!completeResp.error) {
       const reward = (mission.reward as number) || (mission.reward_credits as number) || 0;
       ctx.log("trade", `Mission complete: ${(mission.name as string) || missionId}${reward > 0 ? ` (+${reward} credits)` : ""}`);
-      await bot.refreshStatus();
+      await bot.refreshLocation();
     }
   }
 }
@@ -584,7 +584,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       // Refuel
       yield "startup_refuel";
       await tryRefuel(ctx);
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const startFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       ctx.log("system", `Startup complete — Fuel: ${startFuel}% | Cargo: ${bot.cargo}/${bot.cargoMax}`);
     }
@@ -681,7 +681,8 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Get current system data ──
     yield "scan_system";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
+    await bot.refreshShip();
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Exploring ${bot.system} — ${bot.credits} cr, ${fuelPct}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
 
@@ -736,7 +737,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
 
           // CRITICAL: Verify actual current system before fleeing
           // During cascade emergency jumps, lastSystem can get out of sync
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           const actualSystemId = bot.system;
           ctx.log("combat", `Verified actual position before flee: system=${actualSystemId}, lastSystem=${lastSystem}`);
 
@@ -904,14 +905,14 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("info", `${bot.system}: ${toVisit.length} to visit, ${skippedCount} already explored`);
     }
 
-    // ── Hull check — repair if <= 40% ──
-    await bot.refreshStatus();
+// ── Hull check — repair if <= 40% ──
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= 40) {
       ctx.log("system", `Hull critical (${hullPct}%) — finding station for repair`);
       const docked = await ensureDocked(ctx);
       if (docked) {
-        await repairShip(ctx);
+         await repairShip(ctx);
       }
     }
 
@@ -925,7 +926,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // If hull repair or refueling moved us to a different system, restart the loop
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     if (bot.system !== systemId) {
       ctx.log("info", `Moved to ${bot.system} during repair/refuel — restarting system scan`);
       continue;
@@ -952,7 +953,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         break;
       }
       // If refueling moved us to a different system, break out to restart
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       if (bot.system !== systemId) {
         ctx.log("info", `Moved to ${bot.system} during refuel — restarting system scan`);
         break;
@@ -1004,8 +1005,8 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
             if (destSystemId) mapStore.markExplored(destSystemId, exitPoi);
           }
         }
-        // Refresh status after wormhole jump
-        await bot.refreshStatus();
+        // Refresh location after wormhole jump
+        await bot.refreshLocation();
         continue; // Skip normal POI visit, restart loop in new system
       }
 
@@ -1030,7 +1031,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // ── Check cargo — if full with non-fuel-cell items, return to Sol Central to deposit ──
-      await bot.refreshStatus();
+      await bot.refreshCargoAndStorage();
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
         // Check if cargo is full of only fuel cells (intentional for exploration)
         const cargoResp = await bot.exec("get_cargo");
@@ -1056,10 +1057,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
 
         if (!isOnlyFuelCells) {
-          yield "deposit_cargo";
-          await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
-          // After depositing, we're likely in Sol — break to restart system scan
-          await bot.refreshStatus();
+yield "deposit_cargo";
+           await depositCargoAtHome(ctx, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+           // After depositing, we're likely in Sol — break to restart system scan
+           await bot.refreshLocation();
           if (bot.system !== systemId) {
             ctx.log("info", `Moved to ${bot.system} after deposit — restarting system scan`);
             break;
@@ -1089,7 +1090,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         yield "return_to_home_fuel_cells";
         const returned = await returnToHomeBaseForFuelCells(ctx);
         if (returned) {
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           ctx.log("info", `Returned to home base — continuing exploration`);
           continue;
         }
@@ -1318,7 +1319,7 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // Final fuel verify before jumping
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const preJumpFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (preJumpFuel < 25) {
       ctx.log("system", `Fuel too low for jump (${preJumpFuel}%) — refueling first...`);
@@ -1487,338 +1488,341 @@ async function* scanStation(
   const { bot } = ctx;
   const stationPoi = poi;
 
-  yield `dock_${poi.id}`;
-  const dockResp = await bot.exec("dock");
+  try {
+    yield `dock_${poi.id}`;
+    const dockResp = await bot.exec("dock");
 
-  // Check for battle after dock (unlikely at station, but possible if interrupted)
-  if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
-    ctx.log("combat", "Battle detected during docking - fleeing!");
-    await ctx.sleep(3000);
-    return;
-  }
-
-  if (dockResp.error && !dockResp.error.message.includes("already")) {
-    ctx.log("error", `Dock failed at ${poi.name}: ${dockResp.error.message}`);
-    return;
-  }
-  bot.docked = true;
-
-  await collectFromStorage(ctx);
-
-  // Complete active missions (while cargo still intact from exploration)
-  const stationSettings = getExplorerSettings(bot.username);
-  if (stationSettings.acceptMissions) {
-    yield `complete_missions_${poi.id}`;
-    await completeActiveMissions(ctx);
-  }
-
-  // Scan market, orders, missions — collect stats for summary
-  yield `scan_${poi.id}`;
-  let marketCount = 0;
-  let missionCount = 0;
-
-  const marketResp = await bot.exec("view_market");
-
-  // Check for battle after view_market
-  if (await checkBattleAfterCommand(ctx, marketResp.notifications, "view_market")) {
-    ctx.log("combat", "Battle detected during market scan - fleeing!");
-    await ctx.sleep(5000);
-    return;
-  }
-
-  if (marketResp.result && typeof marketResp.result === "object") {
-    mapStore.updateMarket(systemId, poi.id, marketResp.result as Record<string, unknown>);
-    const result = marketResp.result as Record<string, unknown>;
-    const items = (
-      Array.isArray(result) ? result :
-      Array.isArray(result.items) ? result.items :
-      Array.isArray(result.market) ? result.market :
-      []
-    ) as Array<Record<string, unknown>>;
-    marketCount = items.length;
-
-    // Extract detailed order book data from view_market response and save to marketDetails.json
-    if (items.length > 0) {
-      const marketDetails = loadMarketDetails();
-      let detailsUpdated = false;
-
-      ctx.log("info", `Saving detailed market data for ${items.length} items...`);
-
-      for (const item of items) {
-        const itemId = (item.item_id as string) || (item.id as string) || "";
-        const itemName = (item.name as string) || (item.item_name as string) || itemId;
-
-        if (!itemId) continue;
-
-        let buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map(order => ({
-          price: (order.price_each as number) || (order.price as number) || 0,
-          quantity: (order.quantity as number) || 0,
-        })).filter(order => order.price > 0 && order.quantity > 0);
-
-        let sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map(order => ({
-          price: (order.price_each as number) || (order.price as number) || 0,
-          quantity: (order.quantity as number) || 0,
-        })).filter(order => order.price > 0 && order.quantity > 0);
-
-        // Stricter check: if buy orders and sell orders appear swapped (max buy < min sell), correct it
-        if (buyOrders.length > 0 && sellOrders.length > 0) {
-          const maxBuy = Math.max(...buyOrders.map(o => o.price));
-          const minSell = Math.min(...sellOrders.map(o => o.price));
-          if (maxBuy < minSell) {
-            ctx.log("warn", `Detected potentially swapped buy/sell orders for ${itemName} at ${poi.name} — correcting`);
-            [buyOrders, sellOrders] = [sellOrders, buyOrders];
-          }
-        }
-
-        // Update or add to market details
-        const existingIndex = marketDetails.items.findIndex(
-          m => m.systemId === systemId && m.stationPoiId === poi.id && m.itemId === itemId
-        );
-
-        const marketItemDetail: MarketItemDetails = {
-          systemId,
-          stationPoiId: poi.id,
-          stationName: poi.name,
-          itemId,
-          itemName,
-          buyOrders,
-          sellOrders,
-          lastUpdated: now(),
-        };
-
-        if (existingIndex >= 0) {
-          marketDetails.items[existingIndex] = marketItemDetail;
-        } else {
-          marketDetails.items.push(marketItemDetail);
-        }
-
-        detailsUpdated = true;
-      }
-
-      if (detailsUpdated) {
-        saveMarketDetails(marketDetails);
-        ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
-      }
+    // Check for battle after dock (unlikely at station, but possible if interrupted)
+    if (await checkBattleAfterCommand(ctx, dockResp.notifications, "dock")) {
+      ctx.log("combat", "Battle detected during docking - fleeing!");
+      await ctx.sleep(3000);
+      return;
     }
-  }
 
-  const missionsResp = await bot.exec("get_missions");
+    if (dockResp.error && !dockResp.error.message.includes("already")) {
+      ctx.log("error", `Dock failed at ${poi.name}: ${dockResp.error.message}`);
+      return;
+    }
+    bot.docked = true;
 
-  // Check for battle after get_missions
-  if (await checkBattleAfterCommand(ctx, missionsResp.notifications, "get_missions")) {
-    ctx.log("combat", "Battle detected during mission scan - fleeing!");
-    await ctx.sleep(5000);
-    return;
-  }
+    await collectFromStorage(ctx);
 
-  if (missionsResp.result && typeof missionsResp.result === "object") {
-    const mData = missionsResp.result as Record<string, unknown>;
-    const missions = (
-      Array.isArray(mData) ? mData :
-      Array.isArray(mData.missions) ? mData.missions :
-      Array.isArray(mData.available) ? mData.available :
-      Array.isArray(mData.available_missions) ? mData.available_missions :
-      []
-    ) as Array<Record<string, unknown>>;
-    if (missions.length > 0) {
-      mapStore.updateMissions(systemId, poi.id, missions);
-      missionCount = missions.length;
+    // Complete active missions (while cargo still intact from exploration)
+    const stationSettings = getExplorerSettings(bot.username);
+    if (stationSettings.acceptMissions) {
+      yield `complete_missions_${poi.id}`;
+      await completeActiveMissions(ctx);
+    }
 
-      // Save raw mission data for collection with deduplication
-      const rawMissions = loadRawMissions();
-      let newMissions = 0;
-      let updatedMissions = 0;
+    // Scan market, orders, missions — collect stats for summary
+    yield `scan_${poi.id}`;
+    let marketCount = 0;
+    let missionCount = 0;
 
-      for (const mission of missions) {
-        const missionId = (mission.mission_id as string) || (mission.id as string) || "";
-        if (!missionId) continue;
+    const marketResp = await bot.exec("view_market");
 
-        const stationInfo = {
-          systemId,
-          stationPoiId: poi.id,
-          stationName: poi.name,
-          lastSeen: now(),
-        };
+    // Check for battle after view_market
+    if (await checkBattleAfterCommand(ctx, marketResp.notifications, "view_market")) {
+      ctx.log("combat", "Battle detected during market scan - fleeing!");
+      await ctx.sleep(5000);
+      return;
+    }
 
-        if (rawMissions.missions[missionId]) {
-          // Mission already exists, check if this station is already recorded
-          const existing = rawMissions.missions[missionId];
-          const stationExists = existing.stations.some(s =>
-            s.systemId === systemId && s.stationPoiId === poi.id
+    if (marketResp.result && typeof marketResp.result === "object") {
+      mapStore.updateMarket(systemId, poi.id, marketResp.result as Record<string, unknown>);
+      const result = marketResp.result as Record<string, unknown>;
+      const items = (
+        Array.isArray(result) ? result :
+        Array.isArray(result.items) ? result.items :
+        Array.isArray(result.market) ? result.market :
+        []
+      ) as Array<Record<string, unknown>>;
+      marketCount = items.length;
+
+      // Extract detailed order book data from view_market response and save to marketDetails.json
+      if (items.length > 0) {
+        const marketDetails = loadMarketDetails();
+        let detailsUpdated = false;
+
+        ctx.log("info", `Saving detailed market data for ${items.length} items...`);
+
+        for (const item of items) {
+          const itemId = (item.item_id as string) || (item.id as string) || "";
+          const itemName = (item.name as string) || (item.item_name as string) || itemId;
+
+          if (!itemId) continue;
+
+          let buyOrders = ((item.buy_orders as Array<Record<string, unknown>>) || []).map(order => ({
+            price: (order.price_each as number) || (order.price as number) || 0,
+            quantity: (order.quantity as number) || 0,
+          })).filter(order => order.price > 0 && order.quantity > 0);
+
+          let sellOrders = ((item.sell_orders as Array<Record<string, unknown>>) || []).map(order => ({
+            price: (order.price_each as number) || (order.price as number) || 0,
+            quantity: (order.quantity as number) || 0,
+          })).filter(order => order.price > 0 && order.quantity > 0);
+
+          // Stricter check: if buy orders and sell orders appear swapped (max buy < min sell), correct it
+          if (buyOrders.length > 0 && sellOrders.length > 0) {
+            const maxBuy = Math.max(...buyOrders.map(o => o.price));
+            const minSell = Math.min(...sellOrders.map(o => o.price));
+            if (maxBuy < minSell) {
+              ctx.log("warn", `Detected potentially swapped buy/sell orders for ${itemName} at ${poi.name} — correcting`);
+              [buyOrders, sellOrders] = [sellOrders, buyOrders];
+            }
+          }
+
+          // Update or add to market details
+          const existingIndex = marketDetails.items.findIndex(
+            m => m.systemId === systemId && m.stationPoiId === poi.id && m.itemId === itemId
           );
 
-          if (!stationExists) {
-            existing.stations.push(stationInfo);
-            updatedMissions++;
+          const marketItemDetail: MarketItemDetails = {
+            systemId,
+            stationPoiId: poi.id,
+            stationName: poi.name,
+            itemId,
+            itemName,
+            buyOrders,
+            sellOrders,
+            lastUpdated: now(),
+          };
+
+          if (existingIndex >= 0) {
+            marketDetails.items[existingIndex] = marketItemDetail;
+          } else {
+            marketDetails.items.push(marketItemDetail);
           }
 
-          // Update last seen globally
-          existing.lastSeen = now();
-        } else {
-          // New mission
-          rawMissions.missions[missionId] = {
-            missionId,
-            data: mission,
-            stations: [stationInfo],
-            firstSeen: now(),
+          detailsUpdated = true;
+        }
+
+        if (detailsUpdated) {
+          saveMarketDetails(marketDetails);
+          ctx.log("info", `Saved detailed market data for ${items.length} items to marketDetails.json`);
+        }
+      }
+    }
+
+    const missionsResp = await bot.exec("get_missions");
+
+    // Check for battle after get_missions
+    if (await checkBattleAfterCommand(ctx, missionsResp.notifications, "get_missions")) {
+      ctx.log("combat", "Battle detected during mission scan - fleeing!");
+      await ctx.sleep(5000);
+      return;
+    }
+
+    if (missionsResp.result && typeof missionsResp.result === "object") {
+      const mData = missionsResp.result as Record<string, unknown>;
+      const missions = (
+        Array.isArray(mData) ? mData :
+        Array.isArray(mData.missions) ? mData.missions :
+        Array.isArray(mData.available) ? mData.available :
+        Array.isArray(mData.available_missions) ? mData.available_missions :
+        []
+      ) as Array<Record<string, unknown>>;
+      if (missions.length > 0) {
+        mapStore.updateMissions(systemId, poi.id, missions);
+        missionCount = missions.length;
+
+        // Save raw mission data for collection with deduplication
+        const rawMissions = loadRawMissions();
+        let newMissions = 0;
+        let updatedMissions = 0;
+
+        for (const mission of missions) {
+          const missionId = (mission.mission_id as string) || (mission.id as string) || "";
+          if (!missionId) continue;
+
+          const stationInfo = {
+            systemId,
+            stationPoiId: poi.id,
+            stationName: poi.name,
             lastSeen: now(),
           };
-          newMissions++;
+
+          if (rawMissions.missions[missionId]) {
+            // Mission already exists, check if this station is already recorded
+            const existing = rawMissions.missions[missionId];
+            const stationExists = existing.stations.some(s =>
+              s.systemId === systemId && s.stationPoiId === poi.id
+            );
+
+            if (!stationExists) {
+              existing.stations.push(stationInfo);
+              updatedMissions++;
+            }
+
+            // Update last seen globally
+            existing.lastSeen = now();
+          } else {
+            // New mission
+            rawMissions.missions[missionId] = {
+              missionId,
+              data: mission,
+              stations: [stationInfo],
+              firstSeen: now(),
+              lastSeen: now(),
+            };
+            newMissions++;
+          }
+        }
+
+        if (newMissions > 0 || updatedMissions > 0) {
+          saveRawMissions(rawMissions);
+          const updateMsg = [];
+          if (newMissions > 0) updateMsg.push(`${newMissions} new`);
+          if (updatedMissions > 0) updateMsg.push(`${updatedMissions} updated`);
+          ctx.log("info", `Collected raw mission data: ${updateMsg.join(", ")} at ${poi.name} (${missions.length} total available)`);
         }
       }
+    }
 
-      if (newMissions > 0 || updatedMissions > 0) {
-        saveRawMissions(rawMissions);
-        const updateMsg = [];
-        if (newMissions > 0) updateMsg.push(`${newMissions} new`);
-        if (updatedMissions > 0) updateMsg.push(`${updatedMissions} updated`);
-        ctx.log("info", `Collected raw mission data: ${updateMsg.join(", ")} at ${poi.name} (${missions.length} total available)`);
+    // Station scan summary
+    const scanParts: string[] = [];
+    if (marketCount > 0) scanParts.push(`${marketCount} market items`);
+    if (missionCount > 0) scanParts.push(`${missionCount} missions`);
+    ctx.log("info", `Scanned ${poi.name}: ${scanParts.length > 0 ? scanParts.join(", ") : "empty station"}`);
+
+    // Refuel
+    yield `refuel_${poi.id}`;
+    await bot.refreshShip();
+    const stationFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (stationFuel < 90) {
+      await tryRefuel(ctx);
+    }
+
+    // Deposit non-fuel cargo to station storage
+    yield `deposit_${poi.id}`;
+    const depositedItems: string[] = [];
+    const cargoResp = await bot.exec("get_cargo");
+    if (cargoResp.result && typeof cargoResp.result === "object") {
+      const cResult = cargoResp.result as Record<string, unknown>;
+      const cargoItems = (
+        Array.isArray(cResult) ? cResult :
+        Array.isArray(cResult.items) ? cResult.items :
+        Array.isArray(cResult.cargo) ? cResult.cargo :
+        []
+      ) as Array<Record<string, unknown>>;
+
+      for (const item of cargoItems) {
+        const itemId = (item.item_id as string) || "";
+        const quantity = (item.quantity as number) || 0;
+        if (!itemId || quantity <= 0) continue;
+        const lower = itemId.toLowerCase();
+        if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+
+        const displayName = (item.name as string) || itemId;
+        await bot.exec("deposit_items", { item_id: itemId, quantity });
+        depositedItems.push(`${quantity}x ${displayName}`);
+        yield "depositing";
       }
     }
-  }
-
-  // Station scan summary
-  const scanParts: string[] = [];
-  if (marketCount > 0) scanParts.push(`${marketCount} market items`);
-  if (missionCount > 0) scanParts.push(`${missionCount} missions`);
-  ctx.log("info", `Scanned ${poi.name}: ${scanParts.length > 0 ? scanParts.join(", ") : "empty station"}`);
-
-  // Refuel
-  yield `refuel_${poi.id}`;
-  await bot.refreshStatus();
-  const stationFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-  if (stationFuel < 90) {
-    await tryRefuel(ctx);
-  }
-
-  // Deposit non-fuel cargo to station storage
-  yield `deposit_${poi.id}`;
-  const depositedItems: string[] = [];
-  const cargoResp = await bot.exec("get_cargo");
-  if (cargoResp.result && typeof cargoResp.result === "object") {
-    const cResult = cargoResp.result as Record<string, unknown>;
-    const cargoItems = (
-      Array.isArray(cResult) ? cResult :
-      Array.isArray(cResult.items) ? cResult.items :
-      Array.isArray(cResult.cargo) ? cResult.cargo :
-      []
-    ) as Array<Record<string, unknown>>;
-
-    for (const item of cargoItems) {
-      const itemId = (item.item_id as string) || "";
-      const quantity = (item.quantity as number) || 0;
-      if (!itemId || quantity <= 0) continue;
-      const lower = itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-
-      const displayName = (item.name as string) || itemId;
-      await bot.exec("deposit_items", { item_id: itemId, quantity });
-      depositedItems.push(`${quantity}x ${displayName}`);
-      yield "depositing";
+    if (depositedItems.length > 0) {
+      ctx.log("trade", `Deposited ${depositedItems.join(", ")} to storage`);
     }
-  }
-  if (depositedItems.length > 0) {
-    ctx.log("trade", `Deposited ${depositedItems.join(", ")} to storage`);
-  }
 
-  // Accept new exploration missions before leaving
-  if (stationSettings.acceptMissions) {
-    yield `accept_missions_${poi.id}`;
-    await checkAndAcceptMissions(ctx);
-  }
+    // Accept new exploration missions before leaving
+    if (stationSettings.acceptMissions) {
+      yield `accept_missions_${poi.id}`;
+      await checkAndAcceptMissions(ctx);
+    }
 
-  // Browse ships for sale while docked
-  yield `browse_ships_${poi.id}`;
-  const browseResp = await bot.exec("browse_ships");
+    // Browse ships for sale while docked
+    yield `browse_ships_${poi.id}`;
+    const browseResp = await bot.exec("browse_ships");
 
-  // Check for battle after browse_ships
-  if (await checkBattleAfterCommand(ctx, browseResp.notifications, "browse_ships")) {
-    ctx.log("combat", "Battle detected during ship browsing - fleeing!");
-    await ctx.sleep(5000);
-    return;
-  }
+    // Check for battle after browse_ships
+    if (await checkBattleAfterCommand(ctx, browseResp.notifications, "browse_ships")) {
+      ctx.log("combat", "Battle detected during ship browsing - fleeing!");
+      await ctx.sleep(5000);
+      return;
+    }
 
-  if (browseResp.error) {
-    ctx.log("error", `browse_ships failed: ${browseResp.error.message}`);
-  } else if (browseResp.result && typeof browseResp.result === "object") {
-    const result = browseResp.result as Record<string, unknown>;
-    const listings = (
-      Array.isArray(result.listings) ? result.listings : []
-    ) as Array<Record<string, unknown>>;
+    if (browseResp.error) {
+      ctx.log("error", `browse_ships failed: ${browseResp.error.message}`);
+    } else if (browseResp.result && typeof browseResp.result === "object") {
+      const result = browseResp.result as Record<string, unknown>;
+      const listings = (
+        Array.isArray(result.listings) ? result.listings : []
+      ) as Array<Record<string, unknown>>;
 
-    if (listings.length > 0) {
-      ctx.log("info", `Saving ${listings.length} ship listings from ${poi.name}...`);
-      const shipsData = loadShipsForSale(ctx.log);
-      let updated = 0;
-      const expiredRemoved = cleanupExpiredShipListings(shipsData);
+      if (listings.length > 0) {
+        ctx.log("info", `Saving ${listings.length} ship listings from ${poi.name}...`);
+        const shipsData = loadShipsForSale(ctx.log);
+        let updated = 0;
+        const expiredRemoved = cleanupExpiredShipListings(shipsData);
 
-      const currentListingIds = new Set<string>();
+        const currentListingIds = new Set<string>();
 
-      for (const listing of listings) {
-        const listing_id = (listing.listing_id as string) || "";
-        if (!listing_id) continue;
-        currentListingIds.add(listing_id);
+        for (const listing of listings) {
+          const listing_id = (listing.listing_id as string) || "";
+          if (!listing_id) continue;
+          currentListingIds.add(listing_id);
 
-        const shipListing: ShipListing = {
-          systemId: systemId,
-          stationPoiId: poi.id,
-          stationName: poi.name,
-          listing_id,
-          ship_id: (listing.ship_id as string) || "",
-          class_id: (listing.class_id as string) || "",
-          price: (listing.price as number) || 0,
-          listed_at: (listing.listed_at as string) || "",
-          seller: (listing.seller as string) || "",
-          ship_name: (listing.ship_name as string) || "",
-          tier: (listing.tier as number) || 0,
-          hull: (listing.hull as number) || 0,
-          max_hull: (listing.max_hull as number) || 0,
-          shield: (listing.shield as number) || 0,
-          modules_count: (listing.modules_count as number) || 0,
-          scale: (listing.scale as number) || 0,
-          category: (listing.category as string) || "",
-          custom_name: listing.custom_name as string,
-          last_updated: now(),
-        };
+          const shipListing: ShipListing = {
+            systemId: systemId,
+            stationPoiId: poi.id,
+            stationName: poi.name,
+            listing_id,
+            ship_id: (listing.ship_id as string) || "",
+            class_id: (listing.class_id as string) || "",
+            price: (listing.price as number) || 0,
+            listed_at: (listing.listed_at as string) || "",
+            seller: (listing.seller as string) || "",
+            ship_name: (listing.ship_name as string) || "",
+            tier: (listing.tier as number) || 0,
+            hull: (listing.hull as number) || 0,
+            max_hull: (listing.max_hull as number) || 0,
+            shield: (listing.shield as number) || 0,
+            modules_count: (listing.modules_count as number) || 0,
+            scale: (listing.scale as number) || 0,
+            category: (listing.category as string) || "",
+            custom_name: listing.custom_name as string,
+            last_updated: now(),
+          };
 
-        shipsData.listings[listing_id] = shipListing;
-        updated++;
-      }
+          shipsData.listings[listing_id] = shipListing;
+          updated++;
+        }
 
-      let soldRemoved = 0;
-      for (const listingId of Object.keys(shipsData.listings)) {
-        const listing = shipsData.listings[listingId];
-        if (!currentListingIds.has(listingId) && listing.systemId === systemId && listing.stationPoiId === poi.id) {
-          delete shipsData.listings[listingId];
-          soldRemoved++;
+        let soldRemoved = 0;
+        for (const listingId of Object.keys(shipsData.listings)) {
+          const listing = shipsData.listings[listingId];
+          if (!currentListingIds.has(listingId) && listing.systemId === systemId && listing.stationPoiId === poi.id) {
+            delete shipsData.listings[listingId];
+            soldRemoved++;
+          }
+        }
+
+        if (updated > 0 || soldRemoved > 0 || expiredRemoved > 0) {
+          saveShipsForSale(shipsData);
+          const msgs: string[] = [];
+          if (updated > 0) msgs.push(`${updated} added/updated`);
+          if (soldRemoved > 0) msgs.push(`${soldRemoved} sold/removed`);
+          if (expiredRemoved > 0) msgs.push(`${expiredRemoved} expired`);
+          ctx.log("info", `Saved ship listings to shipsForSale.json (${msgs.join(", ")})`);
         }
       }
-
-      if (updated > 0 || soldRemoved > 0 || expiredRemoved > 0) {
-        saveShipsForSale(shipsData);
-        const msgs: string[] = [];
-        if (updated > 0) msgs.push(`${updated} added/updated`);
-        if (soldRemoved > 0) msgs.push(`${soldRemoved} sold/removed`);
-        if (expiredRemoved > 0) msgs.push(`${expiredRemoved} expired`);
-        ctx.log("info", `Saved ship listings to shipsForSale.json (${msgs.join(", ")})`);
-      }
     }
+
+    // Undock
+    yield `undock_${poi.id}`;
+    const undockResp = await bot.exec("undock");
+
+    // Check for battle after undock
+    if (await checkBattleAfterCommand(ctx, undockResp.notifications, "undock")) {
+      ctx.log("combat", "Battle detected during undock - fleeing!");
+      await ctx.sleep(5000);
+      return;
+    }
+
+    bot.docked = false;
+
+  } finally {
+    mapStore.markExplored(systemId, poi.id);
   }
-
-  // Undock
-  yield `undock_${poi.id}`;
-  const undockResp = await bot.exec("undock");
-
-  // Check for battle after undock
-  if (await checkBattleAfterCommand(ctx, undockResp.notifications, "undock")) {
-    ctx.log("combat", "Battle detected during undock - fleeing!");
-    await ctx.sleep(5000);
-    return;
-  }
-
-  bot.docked = false;
-
-  mapStore.markExplored(systemId, poi.id);
 }
 
 /** Visit a non-minable, non-station POI — check what's nearby. */
@@ -1889,14 +1893,14 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
   ctx.log("system", "Deep Core Scan mode — refreshing known hidden POIs...");
 
   // Initialize path with current system
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   if (path.length === 0 && bot.system) {
     path.push(bot.system);
   }
 
   // ── Startup: dock at local station to clear cargo & refuel ──
   yield "startup_prep";
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const { pois: startPois } = await getSystemInfo(ctx);
   const startStation = findStation(startPois);
   if (startStation) {
@@ -1921,7 +1925,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
       await collectFromStorage(ctx);
       yield "startup_refuel";
       await tryRefuel(ctx);
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const startFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       ctx.log("system", `Startup complete — Fuel: ${startFuel}% | Cargo: ${bot.cargo}/${bot.cargoMax}`);
     }
@@ -2100,7 +2104,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
       mapStore.markExplored(hiddenPoi.systemId, hiddenPoi.poiId);
 
       // ── Check cargo — if full with non-fuel-cell items, return home to deposit ──
-      await bot.refreshStatus();
+      await bot.refreshCargo();
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
         // Check if cargo is full of only fuel cells (intentional for exploration)
         const cargoResp = await bot.exec("get_cargo");
@@ -2142,7 +2146,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
           yield "return_to_home_fuel_cells";
           const returned = await returnToHomeBaseForFuelCells(ctx);
           if (returned) {
-            await bot.refreshStatus();
+            await bot.refreshLocation();
             ctx.log("info", `Returned to home base — continuing deep core scan`);
             break; // Break to restart the while loop
           }
@@ -2155,7 +2159,7 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
     await bot.checkSkills();
 
     // ── Cycle complete — restart ──
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const cycleFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Deep core scan cycle done — visited ${visitedHiddenPois.size} POI(s), ${bot.credits} cr, ${cycleFuel}% fuel`);
     visitedHiddenPois.clear(); // Reset for next cycle
@@ -2281,7 +2285,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     await ensureDocked(ctx);
     await collectFromStorage(ctx);
     await tryRefuel(ctx);
-    await bot.refreshStatus();
+    await bot.refreshLocation();
   }
 
   while (bot.state === "running") {
@@ -2656,7 +2660,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       }
 
       // ── Check cargo — if full with non-fuel-cell items, return home to deposit ──
-      await bot.refreshStatus();
+      await bot.refreshCargo();
       if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
         // Check if cargo is full of only fuel cells (intentional for exploration)
         const cargoResp = await bot.exec("get_cargo");
@@ -2698,7 +2702,7 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           yield "return_to_home_fuel_cells";
           const returned = await returnToHomeBaseForFuelCells(ctx);
           if (returned) {
-            await bot.refreshStatus();
+            await bot.refreshLocation();
             ctx.log("info", `Returned to home base — continuing exploration`);
             continue;
           }
@@ -2710,10 +2714,10 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       yield "check_skills";
       await bot.checkSkills();
 
-      await bot.refreshStatus();
+      await bot.refreshShip();
     }
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const cycleFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Trade update cycle done — ${stationSystems.length} stations, ${bot.credits} cr, ${cycleFuel}% fuel`);
     await ctx.sleep(5000);
@@ -2738,7 +2742,7 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
 
   // Get initial system info
   yield "startup";
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   let { systemId } = await getSystemInfo(ctx);
   if (!systemId) {
     ctx.log("error", "Could not determine current system — waiting 30s");
@@ -2758,7 +2762,7 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     // Refresh settings
     const settings = getExplorerSettings(bot.username);
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Visit All ${bot.system} — ${bot.credits} cr, ${fuelPct}% fuel`);
 
@@ -3309,7 +3313,7 @@ async function loadFuelCellsToMax(ctx: RoutineContext): Promise<boolean> {
     }
 
     if (!withdrawCreditsResp.error) {
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       ctx.log("trade", `Withdrew credits — now ${bot.credits} credits, retrying military fuel cell purchase...`);
       const retryResp = await bot.exec("buy", { item_id: "military_fuel_cell", quantity: milToWithdraw });
 

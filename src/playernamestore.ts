@@ -223,6 +223,26 @@ export class PlayerNameStore {
   }
 
   /**
+   * Faction alias map - normalizes corrupt or non-standard faction values to their canonical 4-letter tags.
+   * Keys are lowercase for case-insensitive matching.
+   */
+  private static readonly FACTION_ALIASES: Record<string, string> = {
+    busy: "BUSY",
+    "busy being dead": "BUSY",
+    "1582cf587c7967d97a0ab2d2e256d233": "BUSY",
+  };
+
+  /**
+   * Normalize a faction tag to its canonical 4-letter form.
+   * Returns the canonical faction tag or the original value if no alias exists.
+   */
+  private normalizeFaction(faction: string): string {
+    if (!faction) return "";
+    const lower = faction.trim().toLowerCase();
+    return PlayerNameStore.FACTION_ALIASES[lower] || faction.trim().toUpperCase();
+  }
+
+  /**
    * Update an entity's ship, tracking history without duplicates.
    * Only adds to history if the ship actually changed and isn't already logged.
    * Returns true if the ship was changed.
@@ -292,7 +312,7 @@ export class PlayerNameStore {
       const entity = this.fullPlayerInfo.players[normalized];
       shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
       shipNameChanged = this.updateShipNameWithHistory(entity, shipName, entity.lastSeen);
-      entity.faction = faction || entity.faction;
+      entity.faction = this.normalizeFaction(faction) || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
       if (id) entity.id = id;
@@ -304,7 +324,7 @@ export class PlayerNameStore {
         name: name,
         type: "player",
         id: id || undefined,
-        faction: faction,
+        faction: this.normalizeFaction(faction),
         ship: ship,
         shipName: shipName || undefined,
         firstSeen: firstSeen,
@@ -360,7 +380,7 @@ export class PlayerNameStore {
       const entity = this.fullPlayerInfo.pirates[normalized];
       shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
       shipNameChanged = this.updateShipNameWithHistory(entity, shipName, entity.lastSeen);
-      entity.faction = faction || entity.faction;
+      entity.faction = this.normalizeFaction(faction) || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
       if (id) entity.id = id;
@@ -372,7 +392,7 @@ export class PlayerNameStore {
         name: name,
         type: "pirate",
         id: id || undefined,
-        faction: faction,
+        faction: this.normalizeFaction(faction),
         ship: ship,
         shipName: shipName || undefined,
         firstSeen: firstSeen,
@@ -427,7 +447,7 @@ export class PlayerNameStore {
       const entity = this.fullPlayerInfo.empire_npcs[normalized];
       shipChanged = this.updateShipWithHistory(entity, ship, entity.lastSeen);
       shipNameChanged = this.updateShipNameWithHistory(entity, shipName, entity.lastSeen);
-      entity.faction = faction || entity.faction;
+      entity.faction = this.normalizeFaction(faction) || entity.faction;
       entity.system = system || entity.system;
       entity.poi = poi || entity.poi;
       if (id) entity.id = id;
@@ -439,7 +459,7 @@ export class PlayerNameStore {
         name: name,
         type: "empire_npc",
         id: id || undefined,
-        faction: faction,
+        faction: this.normalizeFaction(faction),
         ship: ship,
         shipName: shipName || undefined,
         firstSeen: firstSeen,
@@ -627,7 +647,7 @@ export class PlayerNameStore {
     for (const category of ["players", "pirates", "empire_npcs"] as const) {
       const entity = this.fullPlayerInfo[category][normalized];
       if (entity) {
-        entity.faction = updates.faction || entity.faction;
+        if (updates.faction !== undefined) entity.faction = this.normalizeFaction(updates.faction);
         if (updates.id) entity.id = updates.id;
         if (updates.ship !== undefined && updates.ship !== entity.ship) {
           this.updateShipWithHistory(entity, updates.ship, entity.lastSeen);

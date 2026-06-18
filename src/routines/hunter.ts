@@ -1,6 +1,14 @@
 /**
  * Hunter routine — patrols a system hunting pirate NPCs for bounties and loot.
  *
+ * Modes:
+ *   - roam_systems: Navigate to configured patrol system, or find nearest huntable system
+ *   - roam_system: Stay in current system and patrol POIs
+ *   - stationary: Stay in one POI, wait for targets
+ *   - patrol_systems: Cycle through a configured list of systems
+ *   - cycle_patrols: Cycle through named patrol profiles
+ *   - patrol_radius: Patrol all systems within X jumps of a pirate base system
+ *
  * Loop:
  *   1. Navigate to configured patrol system
  *   2. Visit each non-station POI looking for pirate targets
@@ -27,6 +35,8 @@
  *   onlyNPCs        — only attack NPC pirates, never players (default: true)
  *   ammoReloadAbsoluteThreshold — ammo count to reload when weapon has ≤50 total ammo (default: 1)
  *   ammoReloadPercentThreshold — % of max ammo to reload when weapon has >50 total ammo (default: 25)
+ *   pirateBaseSystem — system ID for patrol_radius mode (default: "" - currently configured base)
+ *   patrolRadius    — max jumps from pirate base for patrol_radius mode (default: 5)
  */
 
 import type { Routine, RoutineContext } from "../bot.js";
@@ -117,24 +127,36 @@ async function handleUnexpectedBattle(ctx: RoutineContext, maxAttackTier: Pirate
 }
 
 async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<boolean> {
-  // First check WebSocket state (works even when HTTP is hanging)
-  if (ctx.bot.isInBattle()) {
-    ctx.log("combat", `⚠️ Already in battle (ID: ${ctx.bot.currentBattle.battleId}) - engaging instead of navigating`);
-    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
-    return true;
-  }
-  
-  // Also check via API in case WebSocket state is stale/missing
+  // Check via API first to validate/clear stale WebSocket state
+  let apiChecked = false;
   try {
     const battleStatus = await getBattleStatus(ctx);
+    apiChecked = true;
     if (battleStatus) {
       ctx.log("combat", `⚠️ Battle detected via API (ID: ${battleStatus.battle_id}) - engaging instead of navigating`);
       await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
       return true;
     }
+    // API returned no battle - clear stale WebSocket state if present
+    if (ctx.bot.isInBattle()) {
+      ctx.log("combat", `Clearing stale WebSocket battle state (API reports no battle)`);
+      ctx.bot.currentBattle.inBattle = false;
+      ctx.bot.currentBattle.battleId = null;
+      ctx.bot.currentBattle.participants = [];
+    }
   } catch (e) {
     // API check failed - rely on WebSocket state
     ctx.log("combat", `API battle check failed, relying on WebSocket state`);
+  }
+  
+  // If API check succeeded and returned no battle, we're done
+  if (apiChecked) return false;
+  
+  // API failed, check WebSocket state as fallback
+  if (ctx.bot.isInBattle()) {
+    ctx.log("combat", `⚠️ WebSocket battle state detected (ID: ${ctx.bot.currentBattle.battleId}) - engaging instead of navigating`);
+    await handleUnexpectedBattle(ctx, settings.maxAttackTier, settings.minPiratesToFlee, settings.fleeThreshold, settings.fleeFromTier, settings.repairThreshold, settings.onlyNPCs);
+    return true;
   }
   
   return false;
@@ -142,7 +164,7 @@ async function checkAndHandleExistingBattle(ctx: RoutineContext, settings: Retur
 
 // ── Settings ─────────────────────────────────────────────────
 
-export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols";
+export type HunterMode = "roam_systems" | "roam_system" | "stationary" | "patrol_systems" | "cycle_patrols" | "patrol_radius";
 
 export type PatrolCycleMode = "random" | "sequential";
 
@@ -185,6 +207,8 @@ function getHunterSettings(username?: string): {
   homeStation: string;
   desiredShieldCharges: number;
   desiredRepairKits: number;
+  pirateBaseSystem: string;
+  patrolRadius: number;
 } {
   const all = readSettings();
   const h = all.hunter || {};
@@ -231,6 +255,8 @@ function getHunterSettings(username?: string): {
     homeStation: (botOverrides.homeStation as string) || (botOverrides.hunterHomeStation as string) || (h.homeStation as string) || (all.return_home?.homeStation as string) || "",
     desiredShieldCharges: (h.desiredShieldCharges as number) ?? 20,
     desiredRepairKits: (h.desiredRepairKits as number) ?? 12,
+    pirateBaseSystem: (botOverrides.pirateBaseSystem as string) || (h.pirateBaseSystem as string) || "",
+    patrolRadius: (botOverrides.patrolRadius as number) || (h.patrolRadius as number) || 5,
   };
 }
 
@@ -255,6 +281,13 @@ export function setPatrolCycleMode(username: string, mode: PatrolCycleMode): voi
   });
 }
 
+/** Persist patrol radius settings for a specific bot. */
+export function setPatrolRadius(username: string, pirateBaseSystem: string, patrolRadius: number): void {
+  writeSettings({
+    [username]: { pirateBaseSystem, patrolRadius },
+  });
+}
+
 /** Assign a bot to a named hunter patrol profile (new multi-bot system) */
 export function assignBotToHunterPatrol(username: string, patrolProfileName: string): void {
   const all = readSettings();
@@ -276,18 +309,36 @@ function isLowOnFieldConsumables(inventory: any[] | undefined, minRepairKits = 5
 }
 
 async function handleNavigationBattleInterrupt(ctx: RoutineContext, settings: ReturnType<typeof getHunterSettings>): Promise<void> {
-  // First check WebSocket state (works even when HTTP is hanging)
+  // Check via API first to validate/clear stale WebSocket state
   let battleStatus: Awaited<ReturnType<typeof getBattleStatus>> = null;
+  let apiChecked = false;
   
-  if (ctx.bot.isInBattle()) {
+  try {
+    battleStatus = await getBattleStatus(ctx);
+    apiChecked = true;
+    if (!battleStatus && ctx.bot.isInBattle()) {
+      // API says no battle, but WebSocket says there is one - clear stale state
+      ctx.log("combat", `Clearing stale WebSocket battle state (API reports no battle)`);
+      ctx.bot.currentBattle.inBattle = false;
+      ctx.bot.currentBattle.battleId = null;
+      ctx.bot.currentBattle.participants = [];
+      return;
+    }
+  } catch (e) {
+    // API check failed - fall back to WebSocket state
+    ctx.log("combat", `API battle check failed, relying on WebSocket state`);
+  }
+  
+  // If API check succeeded and returned no battle, we're done
+  if (apiChecked && !battleStatus) return;
+  
+  // API failed, check WebSocket state as fallback
+  if (!battleStatus && ctx.bot.isInBattle()) {
     battleStatus = {
       battle_id: ctx.bot.currentBattle.battleId || "",
       participants: ctx.bot.currentBattle.participants as any,
       is_participant: true,
     } as any;
-  } else {
-    // Fall back to API check
-    battleStatus = await getBattleStatus(ctx);
   }
   
   if (!battleStatus) return;
@@ -478,7 +529,7 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
     if (!completeResp.error) {
       const reward = (mission.reward as number) || (mission.reward_credits as number) || 0;
       ctx.log("trade", `Mission complete: ${(mission.name as string) || missionId}${reward > 0 ? ` (+${reward} credits)` : ""}`);
-      await bot.refreshStatus();
+      await bot.refreshLocation();
     }
   }
 }
@@ -494,7 +545,7 @@ async function navigateToSafeStation(ctx: RoutineContext, safetyOpts: { fuelThre
     if (safeSystem) {
       const sys = mapStore.getSystem(safeSystem);
       ctx.log("travel", `Heading to safe system ${sys?.name || safeSystem} (${sys?.security_level}) for repairs...`);
-      const arrived = await navigateToSystem(ctx, safeSystem, safetyOpts);
+      const arrived = await navigateToSystem(ctx, safeSystem, { ...safetyOpts, skipBlacklist: true });
       if (!arrived) {
         ctx.log("error", "Could not reach safe system — attempting local dock");
       }
@@ -548,6 +599,54 @@ function findNextHuntSystem(fromSystemId: string): string | null {
   if (unmapped) return unmapped.system_id;
 
   return null;
+}
+
+function findSystemsWithinRadius(fromSystemId: string, maxJumps: number): string[] {
+  const normalizedFrom = fromSystemId.toLowerCase().replace(/_/g, ' ');
+  let resolvedSystemId: string | null = null;
+  
+  if (mapStore.getSystem(fromSystemId)) {
+    resolvedSystemId = fromSystemId;
+  } else {
+    for (const sysId of mapStore.getAllSystemIds()) {
+      const sys = mapStore.getSystem(sysId);
+      if (!sys) continue;
+      const sysName = (sys.name || sysId).toLowerCase().replace(/_/g, ' ');
+      const connNames = (sys.connections || []).map(c => 
+        ((c.system_name || c.system_id) || "").toLowerCase().replace(/_/g, ' ')
+      );
+      if (sysName === normalizedFrom || connNames.includes(normalizedFrom)) {
+        resolvedSystemId = sysId;
+        break;
+      }
+    }
+  }
+  
+  if (!resolvedSystemId) {
+    return [];
+  }
+  
+  const result: string[] = [];
+  const visited = new Set<string>([resolvedSystemId]);
+  const queue: Array<{ id: string; hops: number }> = [{ id: resolvedSystemId, hops: 0 }];
+  
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    result.push(current.id);
+    
+    if (current.hops >= maxJumps) continue;
+    
+    const conns = mapStore.getConnections(current.id);
+    for (const conn of conns) {
+      const nextId = conn.system_id;
+      if (!nextId || visited.has(nextId)) continue;
+      
+      visited.add(nextId);
+      queue.push({ id: nextId, hops: current.hops + 1 });
+    }
+  }
+  
+  return result;
 }
 
 // ── Ammo management ──────────────────────────────────────────
@@ -635,7 +734,7 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   // If we started the routine while docked at home base, refuel, repair, then restock
   if (bot.docked) {
     await repairShip(ctx);
-    await tryRefuel(ctx);
+    await tryRefuel(ctx, { skipApprovedCheck: true });
     await ensureHunterResupply(ctx);
   }
 
@@ -656,6 +755,10 @@ export const hunterRoutine: Routine = async function* (ctx: RoutineContext) {
   }
   if (initialSettings.mode === "cycle_patrols") {
     yield* cyclePatrolsRoutine(ctx);
+    return;
+  }
+  if (initialSettings.mode === "patrol_radius") {
+    yield* patrolRadiusRoutine(ctx);
     return;
   }
 
@@ -688,7 +791,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // ── Status ──
     yield "get_status";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // ── Position update for visual display ──
@@ -697,9 +800,9 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     yield "get_poi";
     if (bot.poi) await bot.exec("get_poi", { poi_id: bot.poi });
 
-    // ── Fuel check ──
+// ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true });
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await ctx.sleep(30000);
@@ -707,7 +810,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     }
 
     // ── Hull check — retreat to a high-security system to repair ──
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= settings.repairThreshold) {
       ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
@@ -716,7 +819,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       if (docked) {
         await completeActiveMissions(ctx);
         await repairShip(ctx);
-        await tryRefuel(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
         await checkAndAcceptMissions(ctx);
         await ensureInsured(ctx);
         await bot.checkSkills();
@@ -847,7 +950,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         await bot.exec("travel", { target_poi: station.id });
         await bot.exec("dock");
         bot.docked = true;
-        await tryRefuel(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
         await ensureUndocked(ctx);
       }
       continue;
@@ -862,7 +965,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     for (const poi of patrolPois) {
       if (bot.state !== "running" || abortPatrol) break;
 
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (midHull <= settings.repairThreshold) {
@@ -983,7 +1086,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       for (const target of targets) {
         if (bot.state !== "running") break;
 
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
         if (preHull <= settings.repairThreshold) {
           ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
@@ -1085,7 +1188,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
             ctx.log("combat", "Low on repair kits or shield charges — aborting patrol to resupply");
             abortPatrol = true;
           }
-          await bot.refreshStatus();
+          await bot.refreshShip();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
         } else {
           ctx.log("combat", "Retreated — aborting patrol to dock and repair");
@@ -1098,7 +1201,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     // ── Post-patrol decision ──
     yield "post_patrol";
     await bot.refreshCargo();
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
 
@@ -1117,56 +1220,102 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       const reason = needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`;
       ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Returning to safe system (${reason})...`);
 
-      yield "dock";
-      const docked = await navigateToSafeStation(ctx, safetyOpts);
-      if (!docked) {
-        ctx.log("error", "Could not dock anywhere — retrying next cycle");
-        continue;
-      }
-
-      await collectFromStorage(ctx);
-
-      yield "complete_missions";
-      await completeActiveMissions(ctx);
-
-      await bot.refreshStatus();
-
-      yield "check_missions";
-      await checkAndAcceptMissions(ctx);
-
-      yield "ensure_insured";
-      await ensureInsured(ctx);
-
-      yield "refuel";
-      await tryRefuel(ctx);
-
-      yield "repair";
-      await repairShip(ctx);
-
-      yield "reload";
-      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-
-      yield "fit_mods";
-      const modProfile = getModProfile("hunter");
-      if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
-
-      yield "check_skills";
-      await bot.checkSkills();
-
-      ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
-
-      if (settings.singleLoop) {
-        ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+      // When needsFuel is true, go directly to home base for full resupply
+      if (needsFuel && settings.homeSystem) {
+        ctx.log("system", "Returning to home base for full resupply...");
+        await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
         const hs = settings.homeStation || "";
         const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
         if (hsys && hpoi) {
-          await navigateToSystem(ctx, hsys, safetyOpts);
-          const t = await bot.exec("travel", { target_poi: hpoi });
-          if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+          await bot.exec("travel", { target_poi: hpoi });
+          await bot.exec("dock");
+          bot.docked = true;
         } else {
-          await navigateToSafeStation(ctx, safetyOpts);
+          await ensureDocked(ctx);
         }
+        await collectFromStorage(ctx);
+
+        yield "complete_missions";
+        await completeActiveMissions(ctx);
+
+        await bot.refreshLocation();
+
+        yield "check_missions";
+        await checkAndAcceptMissions(ctx);
+
+        yield "ensure_insured";
+        await ensureInsured(ctx);
+
+        yield "refuel";
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+
+        yield "repair";
+        await repairShip(ctx);
+
+        yield "reload";
+        await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+
+        yield "fit_mods";
+        const modProfile = getModProfile("hunter");
+        if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+
+        yield "check_skills";
+        await bot.checkSkills();
+
+        ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
         await ensureHunterResupply(ctx);
+      } else {
+        yield "dock";
+        const docked = await navigateToSafeStation(ctx, safetyOpts);
+        if (!docked) {
+          ctx.log("error", "Could not dock anywhere — retrying next cycle");
+          continue;
+        }
+
+        await collectFromStorage(ctx);
+
+        yield "complete_missions";
+        await completeActiveMissions(ctx);
+
+        await bot.refreshLocation();
+
+        yield "check_missions";
+        await checkAndAcceptMissions(ctx);
+
+        yield "ensure_insured";
+        await ensureInsured(ctx);
+
+        yield "refuel";
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+
+        yield "repair";
+        await repairShip(ctx);
+
+        yield "reload";
+        await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+
+        yield "fit_mods";
+        const modProfile = getModProfile("hunter");
+        if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+
+        yield "check_skills";
+        await bot.checkSkills();
+
+        ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
+
+        if (settings.singleLoop) {
+          ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+          const hs = settings.homeStation || "";
+          const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+          if (hsys && hpoi) {
+            await navigateToSystem(ctx, hsys, safetyOpts);
+            const t = await bot.exec("travel", { target_poi: hpoi });
+            if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+          } else {
+            await navigateToSafeStation(ctx, safetyOpts);
+          }
+          await ensureHunterResupply(ctx);
+        }
       }
 
     } else {
@@ -1193,7 +1342,7 @@ async function* roamSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   let totalKills = 0;
 
   while (bot.state === "running") {
@@ -1212,7 +1361,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // ── Status ──
     yield "get_status";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // ── Position update for visual display ──
@@ -1221,9 +1370,9 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     yield "get_poi";
     if (bot.poi) await bot.exec("get_poi", { poi_id: bot.poi });
 
-    // ── Fuel check ──
+// ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true });
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await ctx.sleep(30000);
@@ -1231,7 +1380,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     }
 
     // ── Hull check — retreat to a high-security system to repair ──
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= settings.repairThreshold) {
       ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
@@ -1240,7 +1389,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       if (docked) {
         await completeActiveMissions(ctx);
         await repairShip(ctx);
-        await tryRefuel(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
         await checkAndAcceptMissions(ctx);
         await ensureInsured(ctx);
         await bot.checkSkills();
@@ -1282,7 +1431,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
         await bot.exec("travel", { target_poi: station.id });
         await bot.exec("dock");
         bot.docked = true;
-        await tryRefuel(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
         await ensureUndocked(ctx);
       }
       continue;
@@ -1297,7 +1446,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     for (const poi of patrolPois) {
       if (bot.state !== "running" || abortPatrol) break;
 
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       const midFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (midHull <= settings.repairThreshold) {
@@ -1385,7 +1534,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       for (const target of targets) {
         if (bot.state !== "running") break;
 
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
         if (preHull <= settings.repairThreshold) {
           ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
@@ -1466,7 +1615,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             ctx.log("combat", "Low on repair kits or shield charges — aborting patrol to resupply");
             abortPatrol = true;
           }
-          await bot.refreshStatus();
+          await bot.refreshShip();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
         } else {
           ctx.log("combat", "Retreated — aborting patrol to dock and repair");
@@ -1479,7 +1628,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     // ── Post-patrol decision ──
     yield "post_patrol";
     await bot.refreshCargo();
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
 
@@ -1498,43 +1647,89 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       const reason = needsRepair ? `hull ${postHull}%` : `fuel ${postFuel}%`;
       ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Returning to safe system (${reason})...`);
 
-      yield "dock";
-      const docked = await navigateToSafeStation(ctx, safetyOpts);
-      if (!docked) {
-        ctx.log("error", "Could not dock anywhere — retrying next cycle");
-        continue;
+      // When needsFuel is true, go directly to home base for full resupply
+      if (needsFuel && settings.homeSystem) {
+        ctx.log("system", "Returning to home base for full resupply...");
+        await navigateToSystem(ctx, settings.homeSystem, safetyOpts);
+        const hs = settings.homeStation || "";
+        const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+        if (hsys && hpoi) {
+          await bot.exec("travel", { target_poi: hpoi });
+          await bot.exec("dock");
+          bot.docked = true;
+        } else {
+          await ensureDocked(ctx);
+        }
+        await collectFromStorage(ctx);
+
+        yield "complete_missions";
+        await completeActiveMissions(ctx);
+
+        await bot.refreshLocation();
+
+        yield "check_missions";
+        await checkAndAcceptMissions(ctx);
+
+        yield "ensure_insured";
+        await ensureInsured(ctx);
+
+        yield "refuel";
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+
+        yield "repair";
+        await repairShip(ctx);
+
+        yield "reload";
+        await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+
+        yield "fit_mods";
+        const modProfile = getModProfile("hunter");
+        if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+
+        yield "check_skills";
+        await bot.checkSkills();
+
+        ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
+        await ensureHunterResupply(ctx);
+      } else {
+        yield "dock";
+        const docked = await navigateToSafeStation(ctx, safetyOpts);
+        if (!docked) {
+          ctx.log("error", "Could not dock anywhere — retrying next cycle");
+          continue;
+        }
+
+        await collectFromStorage(ctx);
+
+        yield "complete_missions";
+        await completeActiveMissions(ctx);
+
+        await bot.refreshLocation();
+
+        yield "check_missions";
+        await checkAndAcceptMissions(ctx);
+
+        yield "ensure_insured";
+        await ensureInsured(ctx);
+
+        yield "refuel";
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+
+        yield "repair";
+        await repairShip(ctx);
+
+        yield "reload";
+        await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
+
+        yield "fit_mods";
+        const modProfile = getModProfile("hunter");
+        if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
+
+        yield "check_skills";
+        await bot.checkSkills();
+
+        ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
       }
-
-      await collectFromStorage(ctx);
-
-      yield "complete_missions";
-      await completeActiveMissions(ctx);
-
-      await bot.refreshStatus();
-
-      yield "check_missions";
-      await checkAndAcceptMissions(ctx);
-
-      yield "ensure_insured";
-      await ensureInsured(ctx);
-
-      yield "refuel";
-      await tryRefuel(ctx);
-
-      yield "repair";
-      await repairShip(ctx);
-
-      yield "reload";
-      await ensureAmmoLoaded(ctx, settings.ammoThreshold, settings.maxReloadAttempts, settings.ammoReloadAbsoluteThreshold, settings.ammoReloadPercentThreshold);
-
-      yield "fit_mods";
-      const modProfile = getModProfile("hunter");
-      if (modProfile.length > 0) await ensureModsFitted(ctx, modProfile);
-
-      yield "check_skills";
-      await bot.checkSkills();
-
-      ctx.log("info", `=== Patrol complete. Total kills: ${totalKills} | Credits: ${bot.credits} ===`);
 
     } else {
       ctx.log("system", `Patrol sweep done — ${patrolKills} kill(s). Hull: ${postHull}% | Fuel: ${postFuel}% — continuing hunt in system...`);
@@ -1548,7 +1743,7 @@ async function* roamSystemRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   let totalKills = 0;
 
   // Store the original position to stay in
@@ -1578,7 +1773,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // ── Status ──
     yield "get_status";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // ── Position update for visual display ──
@@ -1589,7 +1784,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     // ── Fuel check ──
     yield "fuel_check";
-    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold, { homeSystem: settings.homeSystem, skipBlacklist: true });
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel — waiting 30s...");
       await ctx.sleep(30000);
@@ -1597,7 +1792,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
     }
 
     // ── Hull check — retreat to a high-security system to repair ──
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= settings.repairThreshold) {
       ctx.log("system", `Hull at ${hullPct}% — retreating to high-security system for repairs`);
@@ -1606,7 +1801,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
       if (docked) {
         await completeActiveMissions(ctx);
         await repairShip(ctx);
-        await tryRefuel(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
         await checkAndAcceptMissions(ctx);
         await ensureInsured(ctx);
         await bot.checkSkills();
@@ -1692,12 +1887,12 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 
     ctx.log("combat", `Found ${targets.length} target(s) at ${originalPoi}: ${targets.map(t => t.name).join(", ")}`);
 
-    // Engage each target
-    for (const target of targets) {
-      if (bot.state !== "running") break;
+// Engage each target
+      for (const target of targets) {
+        if (bot.state !== "running") break;
 
-      await bot.refreshStatus();
-      const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+        await bot.refreshShip();
+        const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       if (preHull <= settings.repairThreshold) {
         ctx.log("system", `Hull at ${preHull}% — too low for another fight`);
         break;
@@ -1768,7 +1963,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
             ctx.log("combat", "Low on repair kits or shield charges — stopping to resupply");
             break;
           }
-          await bot.refreshStatus();
+          await bot.refreshShip();
           ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
 
       } else {
@@ -1788,7 +1983,7 @@ async function* stationaryRoutine(ctx: RoutineContext): AsyncGenerator<string, v
 async function* patrolSystemsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   let totalKills = 0;
   let systemIndex = 0;
 
@@ -1905,12 +2100,12 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
   const allowBuying = false;
 
   // Always try to refuel when docked at home base (free fuel)
-  await tryRefuel(ctx);
+  await tryRefuel(ctx, { skipApprovedCheck: true });
 
   // Repair hull if damaged
   await repairShip(ctx);
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   await bot.refreshCargo();
 
   // Deposit any extra loot (everything except ammo, fuel cells, repair kits) so user can see what was brought home
@@ -2015,26 +2210,30 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
       continue;
     }
 
-    // Try to withdraw the chosen ammo
-    const ammoSize = getItemSize(chosenAmmoId);
-    const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
-    if (actualQty <= 0) {
-      ctx.log("trade", `Not enough cargo space for ${ammoType} ammo — skipping`);
-      continue;
-    }
+    const ammoOrder = chosenAmmoId && possibleAmmo.includes(chosenAmmoId)
+      ? [chosenAmmoId, ...possibleAmmo.filter(a => a !== chosenAmmoId)]
+      : possibleAmmo;
+    for (const ammoId of ammoOrder) {
+      const ammoSize = getItemSize(ammoId);
+      const actualQty = Math.min(ammoToGet, Math.floor(freeSpace / ammoSize));
+      if (actualQty <= 0) {
+        continue;
+      }
 
-    const wResp = await bot.exec("storage", {
-      action: "withdraw",
-      target: "faction",
-      item_id: chosenAmmoId,
-      quantity: actualQty
-    });
-    if (!wResp.error) {
-      ctx.log("trade", `Withdrew ${actualQty} ${chosenAmmoId} from faction storage`);
-      freeSpace -= actualQty * ammoSize;
-      gotAnyAmmo = true;
-    } else {
-      ctx.log("trade", `Failed to withdraw ${chosenAmmoId} for ${ammoType}: ${wResp.error.message}`);
+      const wResp = await bot.exec("storage", {
+        action: "withdraw",
+        target: "faction",
+        item_id: ammoId,
+        quantity: actualQty
+      });
+      if (!wResp.error) {
+        ctx.log("trade", `Withdrew ${actualQty} ${ammoId} from faction storage`);
+        freeSpace -= actualQty * ammoSize;
+        gotAnyAmmo = true;
+        break;
+      } else {
+        ctx.log("trade", `Failed to withdraw ${ammoId} for ${ammoType}: ${wResp.error.message}`);
+      }
     }
   }
 
@@ -2128,7 +2327,7 @@ export async function ensureHunterResupply(ctx: RoutineContext): Promise<void> {
 async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   let totalKills = 0;
 
   const all = readSettings();
@@ -2255,6 +2454,153 @@ async function* cyclePatrolsRoutine(ctx: RoutineContext): AsyncGenerator<string,
       }
       await ensureHunterResupply(ctx);
       profileIndex = 0;
+    }
+  }
+}
+
+async function* patrolRadiusRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  await bot.refreshLocation();
+  let totalKills = 0;
+
+  const settings = getHunterSettings(bot.username);
+  const pirateBase = settings.pirateBaseSystem;
+  const maxJumps = settings.patrolRadius;
+
+  if (!pirateBase) {
+    ctx.log("error", "patrol_radius mode requires pirateBaseSystem to be configured — falling back to roam_systems");
+    yield* roamSystemsRoutine(ctx);
+    return;
+  }
+
+  const normalizedPirateBase = pirateBase.toLowerCase().replace(/_/g, ' ');
+  let pirateBaseSystemId: string | null = null;
+  
+  if (mapStore.getSystem(pirateBase)) {
+    pirateBaseSystemId = pirateBase;
+  } else {
+    for (const sysId of mapStore.getAllSystemIds()) {
+      const sys = mapStore.getSystem(sysId);
+      if (!sys) continue;
+      const sysName = (sys.name || sysId).toLowerCase().replace(/_/g, ' ');
+      if (sysName === normalizedPirateBase) {
+        pirateBaseSystemId = sysId;
+        break;
+      }
+    }
+  }
+  
+  if (!pirateBaseSystemId) {
+    ctx.log("info", `Navigating to pirate base ${pirateBase} to map it...`);
+    const safetyOpts = {
+      fuelThresholdPct: settings.refuelThreshold,
+      hullThresholdPct: settings.repairThreshold,
+      autoCloak: settings.autoCloak,
+      skipBlacklist: true,
+      isCombatBot: true,
+    };
+    const arrived = await navigateToSystem(ctx, pirateBase, safetyOpts);
+    if (!arrived) {
+      ctx.log("error", `Could not reach pirate base ${pirateBase} — falling back to roam_systems`);
+      yield* roamSystemsRoutine(ctx);
+      return;
+    }
+    await getSystemInfo(ctx);
+    pirateBaseSystemId = bot.system;
+  }
+
+  const patrolList = findSystemsWithinRadius(pirateBaseSystemId, maxJumps);
+  if (patrolList.length === 0) {
+    ctx.log("error", `patrol_radius mode: no systems found within ${maxJumps} jumps of ${pirateBaseSystemId} — falling back to roam_systems`);
+    yield* roamSystemsRoutine(ctx);
+    return;
+  }
+
+  ctx.log("info", `Patrol radius mode: ${patrolList.length} systems within ${maxJumps} jumps of ${pirateBaseSystemId}`);
+  let systemIndex = 0;
+
+  while (bot.state === "running") {
+    const currentSettings = getHunterSettings(bot.username);
+    const currentSafetyOpts = {
+      fuelThresholdPct: currentSettings.refuelThreshold,
+      hullThresholdPct: currentSettings.repairThreshold,
+      autoCloak: currentSettings.autoCloak,
+      skipBlacklist: true,
+      isCombatBot: true,
+    };
+
+    const targetSystem = patrolList[systemIndex % patrolList.length];
+    systemIndex++;
+
+    if (bot.system !== targetSystem) {
+      ctx.log("travel", `Patrol radius: heading to ${targetSystem}...`);
+      const arrived = await navigateToSystem(ctx, targetSystem, currentSafetyOpts);
+      if (!arrived) {
+        const battleAfterNav = await getBattleStatus(ctx);
+        if (battleAfterNav) {
+          ctx.log("combat", `Battle detected after navigation - hunter fights, not flees!`);
+          await handleNavigationBattleInterrupt(ctx, currentSettings);
+        } else {
+          ctx.log("error", `Could not reach ${targetSystem} — skipping`);
+          await ctx.sleep(5000);
+          continue;
+        }
+      }
+    }
+
+    ctx.log("info", `Starting patrol sweep in ${targetSystem}`);
+    yield* (async function* singleSystemPatrol() {
+      await fetchSecurityLevel(ctx, bot.system);
+      const { pois } = await getSystemInfo(ctx);
+      const patrolPois = pois.filter(p => !isStationPoi(p));
+      if (patrolPois.length === 0) {
+        ctx.log("info", "No POIs — moving to next system");
+        return;
+      }
+      for (const poi of patrolPois) {
+        if (bot.state !== "running") break;
+        await bot.exec("travel", { target_poi: poi.id });
+        bot.poi = poi.id;
+        await ctx.sleep(500);
+        const nearbyResp = await bot.exec("get_nearby");
+        if (nearbyResp.error) continue;
+        bot.trackNearbyPlayers(nearbyResp.result);
+        const entities = parseNearby(nearbyResp.result);
+        const targets = entities.filter(e => isPirateTarget(e, currentSettings.onlyNPCs, currentSettings.maxAttackTier));
+        for (const target of targets) {
+          await useRepairKits(ctx);
+          await ensureAmmoLoaded(ctx, currentSettings.ammoThreshold, currentSettings.maxReloadAttempts, currentSettings.ammoReloadAbsoluteThreshold, currentSettings.ammoReloadPercentThreshold);
+          const won = await engageTarget(ctx, target, currentSettings.fleeThreshold, currentSettings.fleeFromTier, currentSettings.minPiratesToFlee, currentSettings.maxAttackTier, undefined, currentSettings.disableScanCommandForPirates, currentSettings.repairThreshold);
+          if (won) {
+            totalKills++;
+            await scavengeWrecks(ctx);
+            const csettings = getHunterSettings(bot.username);
+            await topUpShields(ctx, (csettings.shieldRechargePct ?? 80) / 100);
+            await useRepairKits(ctx);
+            await bot.refreshCargo();
+            if (isLowOnFieldConsumables(bot.inventory)) {
+              ctx.log("combat", "Low on repair kits or shield charges — stopping to resupply");
+              break;
+            }
+          }
+        }
+      }
+    })();
+
+    if (currentSettings.singleLoop && systemIndex >= patrolList.length) {
+      ctx.log("system", "Single loop mode — returning to faction home base for resupply...");
+      const hs = currentSettings.homeStation || "";
+      const [hsys, hpoi] = hs.includes("|") ? hs.split("|") : ["", ""];
+      if (hsys && hpoi) {
+        await navigateToSystem(ctx, hsys, currentSafetyOpts);
+        const t = await bot.exec("travel", { target_poi: hpoi });
+        if (!t.error) { bot.poi = hpoi; await bot.exec("dock"); bot.docked = true; }
+      } else {
+        await navigateToSafeStation(ctx, currentSafetyOpts);
+      }
+      await ensureHunterResupply(ctx);
+      systemIndex = 0;
     }
   }
 }

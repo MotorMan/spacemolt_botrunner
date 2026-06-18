@@ -392,6 +392,11 @@ constructor(port: number = 3000) {
       this.settings.clientSync.apiKey = generatedKey;
       saveSettings(this.settings);
     }
+    // Initialize periodic refresh setting in general
+    if ((this.settings.general as Record<string, unknown>)?.periodicRefreshSec === undefined) {
+      (this.settings.general as Record<string, unknown>).periodicRefreshSec = 30;
+      saveSettings(this.settings);
+    }
     this.statsData = loadStats();
     const mainLogs = loadMainLogs();
     this.activityLog = mainLogs.activity.slice(-MAX_LOG_BUFFER);
@@ -919,7 +924,6 @@ constructor(port: number = 3000) {
         }
 
         if (url.pathname === "/api/faction-fuel-stations" && req.method === "GET") {
-          // Get faction fuel for all approved refueling stations
           const settings = this.settings;
           const approvedStations = (settings.general as Record<string, unknown>)?.approvedFuelStations as string[] || [];
           const CACHE_DIR = join(process.cwd(), "data", "factionStorage");
@@ -930,18 +934,26 @@ constructor(port: number = 3000) {
             const [systemId, stationId] = stationKey.split("|");
             if (!stationId) continue;
 
-            const factionStoragePath = join(CACHE_DIR, `Busy Being Dead--${stationId}.json`);
-            if (!existsSync(factionStoragePath)) continue;
-
             try {
-              const raw = readFileSync(factionStoragePath, "utf-8");
-              const data = JSON.parse(raw);
-              stationsData.push({
-                stationId,
-                systemId,
-                fuelReserve: data.factionFuelReserve || 0,
-                fuelCapacity: data.factionFuelCapacity || 0,
-              });
+              const files = readdirSync(CACHE_DIR);
+              for (const file of files) {
+                if (!file.endsWith(".json")) continue;
+                const match = file.match(/^(.+)--(.+)\.json$/) || file.match(/^(.+)::(.+)\.json$/);
+                if (!match) continue;
+                const [, , fileStationId] = match;
+                if (fileStationId === stationId) {
+                  const factionStoragePath = join(CACHE_DIR, file);
+                  const raw = readFileSync(factionStoragePath, "utf-8");
+                  const data = JSON.parse(raw);
+                  stationsData.push({
+                    stationId,
+                    systemId,
+                    fuelReserve: data.factionFuelReserve || 0,
+                    fuelCapacity: data.factionFuelCapacity || 0,
+                  });
+                  break;
+                }
+              }
             } catch {
               // Ignore errors for individual stations
             }
@@ -1313,6 +1325,24 @@ constructor(port: number = 3000) {
               ammo_item_id: body.ammo_item_id
             });
             return Response.json(result);
+          } catch (err) {
+            return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
+          }
+        }
+
+        // Per-bot achievements endpoint
+        if (url.pathname.startsWith("/api/bot/") && url.pathname.endsWith("/achievements") && req.method === "GET") {
+          const botName = decodeURIComponent(url.pathname.slice("/api/bot/".length, -"/achievements".length));
+          const bot = getBot(botName);
+          if (!bot) {
+            return Response.json({ error: { code: "not_found", message: `Bot ${botName} not found` } });
+          }
+          try {
+            const result = await bot.exec("get_achievements");
+            if (result.error) {
+              return Response.json({ error: result.error });
+            }
+            return Response.json({ data: result.result });
           } catch (err) {
             return Response.json({ error: { code: "exec_failed", message: err instanceof Error ? err.message : String(err) } });
           }
@@ -1873,6 +1903,17 @@ constructor(port: number = 3000) {
           });
         }
 
+        // Serve achievements.html for achievements route
+        if (url.pathname === "/achievements.html") {
+          const achievementsPath = join(import.meta.dir, "achievements.html");
+          return new Response(readFileSync(achievementsPath, "utf-8"), {
+            headers: {
+              "Content-Type": "text/html; charset=utf-8",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+
         // Serve index.html for all other routes (read fresh for dev, no cache)
         return new Response(readFileSync(indexPath, "utf-8"), {
           headers: {
@@ -1961,12 +2002,18 @@ constructor(port: number = 3000) {
             if (this.onAction) {
               const result = await this.onAction(data);
               const resType = isExec ? "execResult" : "actionResult";
-              ws.send(JSON.stringify({ type: resType, _seq: seq, ...result }));
+              // Include bot, command, and params fields in execResult for processing in frontend
+              const responseData = { type: resType, _seq: seq, bot: data.bot, command: data.command, params: data.params, ...result };
+              ws.send(JSON.stringify(responseData));
             }
           } catch (err) {
+            const rawData = JSON.parse(typeof msg === "string" ? msg : msg.toString());
             ws.send(JSON.stringify({
               type: isExec ? "execResult" : "actionResult",
               _seq: seq,
+              bot: rawData.bot,
+              command: rawData.command,
+              params: rawData.params,
               ok: false,
               error: err instanceof Error ? err.message : String(err),
             }));
@@ -2141,5 +2188,9 @@ constructor(port: number = 3000) {
 
   sendEmpireAlert(sender: string, content: string, botUsername: string): void {
     this.broadcast({ type: "empireAlert", sender, content, botUsername });
+  }
+
+  broadcastSkillsUpdate(bot: string, skills: Record<string, { level: number; xp: number; nextLevelXp: number }>): void {
+    this.broadcast({ type: "skillsUpdate", bot, skills });
   }
 }

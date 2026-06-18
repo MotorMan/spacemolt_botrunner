@@ -487,7 +487,7 @@ export const escortFlockRoutine: Routine = async function* (ctx: RoutineContext)
     lastFleeTime: undefined,
   };
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
 
   if (bot.docked) {
     await repairShip(ctx);
@@ -533,7 +533,7 @@ export const escortFlockRoutine: Routine = async function* (ctx: RoutineContext)
     }
 
     yield "get_status";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     yield "position_check";
@@ -624,7 +624,7 @@ export const escortFlockRoutine: Routine = async function* (ctx: RoutineContext)
           for (const target of pirateTargets) {
             if (bot.state !== "running") break;
 
-            await bot.refreshStatus();
+            await bot.refreshShip();
             const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
             if (preHull <= settings.repairThreshold) {
               ctx.log("system", `Hull at ${preHull}% — docking...`);
@@ -656,7 +656,7 @@ export const escortFlockRoutine: Routine = async function* (ctx: RoutineContext)
 
               await topUpShields(ctx, settings.shieldRechargePct / 100);
               await useRepairKits(ctx);
-              await bot.refreshStatus();
+              await bot.refreshShip();
               ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
             } else {
               battleRef.state.inBattle = false;
@@ -682,7 +682,7 @@ export const escortFlockRoutine: Routine = async function* (ctx: RoutineContext)
     }
 
     yield "post_cycle";
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
 

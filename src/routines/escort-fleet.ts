@@ -757,7 +757,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     lastFleeTime: undefined,
   };
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
 
   if (bot.docked) {
     await repairShip(ctx);
@@ -809,7 +809,8 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Status ──
     yield "get_status";
-    await bot.refreshStatus();
+    await bot.refreshShip();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // ── Fleet status check ──
@@ -879,12 +880,12 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
           } else {
             ctx.log("combat", `Found ${targets.length} hostile(s) in system: ${targets.map(t => t.name).join(", ")}`);
 
-            for (const target of targets) {
-              if (bot.state !== "running") break;
+for (const target of targets) {
+            if (bot.state !== "running") break;
 
-              await bot.refreshStatus();
-              const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
-              if (preHull <= settings.repairThreshold) {
+            await bot.refreshShip();
+            const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
+            if (preHull <= settings.repairThreshold) {
                 ctx.log("system", `Hull at ${preHull}% — too low for combat, waiting in fleet...`);
                 break;
               }
@@ -915,7 +916,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
                 await topUpShields(ctx, settings.shieldRechargePct / 100);
                 await useRepairKits(ctx);
 
-                await bot.refreshStatus();
+                await bot.refreshShip();
                 ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
               } else {
                 battleRef.state.inBattle = false;
@@ -972,7 +973,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
         const preFuel = bot.fuel;
         for (let i = 0; i < 30; i++) {
           if (bot.state !== "running") break;
-          await bot.refreshStatus();
+          await bot.refreshShip();
           const currentPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
           if (currentPct >= settings.refuelThreshold) break;
           const refuelResp = await bot.exec("refuel");
@@ -986,7 +987,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
             break;
           }
         }
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const fuelGained = bot.fuel - preFuel;
         const newPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         ctx.log("escort", `Refuel complete: ${newPct}% (gained ${fuelGained})`);
@@ -1094,7 +1095,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // ── Hull check ──
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= settings.repairThreshold) {
       ctx.log("system", `Hull at ${hullPct}% — retreating to safe system for repairs`);
@@ -1222,7 +1223,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
           for (const target of targets) {
             if (bot.state !== "running") break;
 
-            await bot.refreshStatus();
+            await bot.refreshShip();
             const preHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
             if (preHull <= settings.repairThreshold) {
               ctx.log("system", `Hull at ${preHull}% — too low for combat, docking...`);
@@ -1256,7 +1257,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
               await topUpShields(ctx, settings.shieldRechargePct / 100);
               await useRepairKits(ctx);
 
-              await bot.refreshStatus();
+              await bot.refreshShip();
               ctx.log("combat", `Post-fight: hull ${bot.hull}/${bot.maxHull} | ammo ${bot.ammo} | credits ${bot.credits}`);
             } else {
               battleRef.state.inBattle = false;
@@ -1302,7 +1303,7 @@ export const escortRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Post-cycle decision ──
     yield "post_cycle";
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const postHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     const postFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
 

@@ -1,8 +1,9 @@
-import { log, logError } from "./ui.js";
+import { log } from "./ui.js";
 import { reconnectQueue } from "./reconnectqueue.js";
 import { debugLogForBot } from "./debug.js";
 import { SessionManager } from "./session.js";
 import { massDisconnectDetector } from "./massdisconnect.js";
+
 
 interface QueuedRequest {
   command: string;
@@ -88,10 +89,11 @@ export interface ApiResponse {
   notifications?: unknown[];
   session?: ApiSession;
   error?: { code: string; message: string; wait_seconds?: number } | null;
+  details?: unknown;
 }
 
 const DEFAULT_BASE_URL = "https://game.spacemolt.com/api/v2";
-const USER_AGENT = "SM-BotRunner-LT1428-V2-Only-6-5-26-flood-protected-Version";
+const USER_AGENT = "SM-BotRunner-LT1428-V2-6-17-26-BW-Opt-PUBLIC-Ver";
 
 // Session management
 const MAX_RECONNECT_ATTEMPTS = 6;
@@ -156,6 +158,7 @@ const COMMAND_TOOL_MAP: Record<string, string> = {
   'repair': 'spacemolt',
   'repair_module': 'spacemolt',
   'refuel': 'spacemolt',
+  'get_achievements': 'spacemolt',
   'accept_mission': 'spacemolt',
   'complete_mission': 'spacemolt',
   'abandon_mission': 'spacemolt',
@@ -407,11 +410,13 @@ class ResponseCache {
 }
 
 const COMMAND_TTL: Record<string, number> = {
-  get_status: 10_000, //doesn't need to be 15s.
+  get_status: 120_000, //doesn't need to be 15s.
+  get_skills: 60_000,
   get_system: 30_000,
   get_ship: 60_000,
   get_cargo: 10_000,
   get_nearby: 10_000, //1 tick! must always know who is nearby!
+  get_location: 10_000,
   get_poi: 10_000, //doesn't need to be 30s
   get_base: 120_000,
   get_missions: 60_000,
@@ -430,21 +435,22 @@ const COMMAND_TTL: Record<string, number> = {
 };
 
 const INV_STATUS   = ["get_status", "get_player", "get_queue"];
-const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey_system", "find_route"];
+const INV_LOCATION = ["get_system", "get_nearby", "get_poi", "get_base", "survey_system", "find_route", "get_location"];
 const INV_CARGO    = ["get_cargo"];
 const INV_SHIP     = ["get_ship"];
 const INV_MISSIONS = ["get_missions"];
+const INV_SKILLS   = ["get_skills"];
 const INV_STORAGE  = ["view_storage"];
 const INV_MARKET   = ["view_market", "view_orders"];
 
 const MUTATION_INVALIDATIONS: Record<string, string[]> = {
-  travel: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
-  jump: [...INV_STATUS, ...INV_LOCATION],
+  travel: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION, ...INV_SKILLS],
+  jump: [...INV_STATUS, ...INV_LOCATION, ...INV_SKILLS],
   dock: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION],
   switch_ship: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION, ...INV_CARGO, ...INV_SHIP],
   reload: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION, ...INV_CARGO, ...INV_SHIP],
   undock: INV_STATUS,
-  mine: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
+  mine: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION, ...INV_SKILLS],
   sell: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET, ...INV_STORAGE, ...INV_MISSIONS],
   buy: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET, ...INV_STORAGE, ...INV_MISSIONS],
   jettison: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION, ...INV_STORAGE],
@@ -453,8 +459,11 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   salvage: [...INV_STATUS, ...INV_CARGO, ...INV_LOCATION],
   withdraw_items: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
   deposit_items: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
-  faction_deposit_credits: INV_STATUS,
-  faction_withdraw_credits: INV_STATUS,
+  storage: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
+  faction_deposit_credits: [...INV_STATUS, ...INV_STORAGE],
+  faction_withdraw_credits: [...INV_STATUS, ...INV_STORAGE],
+  faction_deposit_items: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
+  faction_withdraw_items: [...INV_STATUS, ...INV_CARGO, ...INV_STORAGE],
   send_gift: [...INV_STATUS, ...INV_STORAGE, ...INV_MARKET, ...INV_LOCATION, ...INV_CARGO, ...INV_SHIP],
   create_sell_order: [...INV_STATUS, ...INV_CARGO, ...INV_MARKET, ...INV_STORAGE],
   create_buy_order: [...INV_STATUS, ...INV_MARKET, ...INV_STORAGE],
@@ -468,8 +477,8 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   abandon_mission: [...INV_STATUS, ...INV_MISSIONS, ...INV_CARGO, ...INV_STORAGE],
   decline_mission: [...INV_STATUS, ...INV_MISSIONS, ...INV_CARGO, ...INV_STORAGE],
   cloak: INV_STATUS,
-  attack: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
-  battle: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION],
+  attack: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_SKILLS],
+  battle: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_SKILLS],
   catalog: [],
   get_map: [],
 };
@@ -486,9 +495,8 @@ export class SpaceMoltAPI {
   private _recoveryCount = 0;
   private _recoveryInProgress = false;
   private _forceFullLogin = false;
-  private _totalBytesIn = 0;
-  private _totalBytesOut = 0;
-  private _bandwidthStartTime = Date.now();
+  private _bytesHistory: { in: number; out: number; timestamp: number }[] = [];
+  private _rollingWindowMs = 60_000;
   private _rateLimiter = new SessionRateLimiter();
   private _isGameServer: boolean;
   private _rateLimitingDisabled = false;
@@ -552,13 +560,29 @@ export class SpaceMoltAPI {
     this._recoveryCount = 0;
   }
 
-  /** Get current bandwidth usage in KB/s (kilobytes per second) */
+  /** Get current bandwidth usage in KB/s (1-minute rolling average) */
+  private recordBytes(inBytes: number, outBytes: number): void {
+    const now = Date.now();
+    this._bytesHistory.push({ in: inBytes, out: outBytes, timestamp: now });
+  }
+
   getBandwidthUsage(): { inKBps: number; outKBps: number } {
-    const elapsed = (Date.now() - this._bandwidthStartTime) / 1000;
-    if (elapsed <= 0) return { inKBps: 0, outKBps: 0 };
-    const inKBps = this._totalBytesIn / 1024 / elapsed;
-    const outKBps = this._totalBytesOut / 1024 / elapsed;
-    return { inKBps, outKBps };
+    const now = Date.now();
+    const cutoff = now - this._rollingWindowMs;
+    this._bytesHistory = this._bytesHistory.filter(h => h.timestamp > cutoff);
+    
+    const totalIn = this._bytesHistory.reduce((sum, h) => sum + h.in, 0);
+    const totalOut = this._bytesHistory.reduce((sum, h) => sum + h.out, 0);
+    
+    const elapsedS = this._rollingWindowMs / 1000;
+    return { inKBps: totalIn / 1024 / elapsedS, outKBps: totalOut / 1024 / elapsedS };
+  }
+
+  /** Clear old history entries to prevent memory growth */
+  clearBandwidthHistory(): void {
+    const now = Date.now();
+    const cutoff = now - this._rollingWindowMs;
+    this._bytesHistory = this._bytesHistory.filter(h => h.timestamp > cutoff);
   }
 
   getCachedResponse(cacheKey: string): ApiResponse | null {
@@ -585,9 +609,17 @@ export class SpaceMoltAPI {
     }
   }
 
-  async execute(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
+  async execute(command: string, payload?: Record<string, unknown>, options?: { abortSignal?: AbortSignal; bypassCache?: boolean } | AbortSignal): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
-    debugLogForBot(botName, "api:execute", `${botName} > ${command}`, payload);
+    // Handle both old-style (AbortSignal) and new-style (options object) calls
+    let abortSignal: AbortSignal | undefined;
+    let bypassCache = false;
+    if (options instanceof AbortSignal) {
+      abortSignal = options;
+    } else if (options) {
+      abortSignal = options.abortSignal;
+      bypassCache = options.bypassCache ?? false;
+    }
 
     const cacheTtl = COMMAND_TTL[command];
     let cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
@@ -595,10 +627,14 @@ export class SpaceMoltAPI {
       const version = this._serverVersion || await this.getServerVersion();
       cacheKey = `${command}:${version}:${JSON.stringify(payload ?? {})}`;
     }
-    if (cacheTtl !== undefined) {
+    if (cacheTtl !== undefined && !bypassCache) {
       const cached = this._cache.get(cacheKey);
-      if (cached) return cached;
+      if (cached) {
+        debugLogForBot(botName, "api:execute", `${botName} > ${command} [Cached]`, payload);
+        return cached;
+      }
     }
+    debugLogForBot(botName, "api:execute", `${botName} > ${command}`, payload);
 
     try {
       await this.ensureSession();
@@ -806,7 +842,7 @@ export class SpaceMoltAPI {
         }
 
         const text = await resp.text();
-        this._totalBytesIn += Buffer.byteLength(text, 'utf8');
+        this.recordBytes(Buffer.byteLength(text, 'utf8'), 0);
         const data = JSON.parse(text) as ApiResponse;
         if (data.session) {
           this.session = data.session;
@@ -968,21 +1004,18 @@ export class SpaceMoltAPI {
     const headers: Record<string, string> = {
       "Content-Type": "application/json",
       "User-Agent": USER_AGENT,
+      "Accept-Encoding": "zstd",
     };
     if (this.session) {
       headers["X-Session-Id"] = this.session.id;
     }
 
-    let requestBody: string | undefined;
-    if (body) {
-      requestBody = JSON.stringify(body);
-      this._totalBytesOut += Buffer.byteLength(requestBody, 'utf8');
-    }
+    const outBytes = outgoingBody ? Buffer.byteLength(outgoingBody, 'utf8') : 0;
 
     const resp = await fetch(url, {
       method: "POST",
       headers,
-      body: requestBody,
+      body: outgoingBody,
       signal: abortSignal,
     });
 
@@ -993,8 +1026,33 @@ export class SpaceMoltAPI {
     }
 
     try {
-      const text = await resp.text();
-      this._totalBytesIn += Buffer.byteLength(text, 'utf8');
+      const contentType = resp.headers.get("content-encoding");
+      let text: string;
+      
+      if (contentType === "zstd") {
+        const compressed = await resp.arrayBuffer();
+        let decompressed: Uint8Array | null = null;
+        
+        if (!decompressed) {
+          try {
+            decompressed = (Bun as any).zstd.decompress(new Uint8Array(compressed));
+          } catch {}
+        }
+        
+        if (!decompressed) {
+          try {
+            const zlibMod = await import("zlib");
+            decompressed = Uint8Array.from(zlibMod.gunzipSync(Buffer.from(compressed)));
+          } catch {}
+        }
+        
+        text = decompressed ? Buffer.from(decompressed).toString("utf8") : Buffer.from(compressed).toString("utf8");
+      } else {
+        text = await resp.text();
+      }
+      
+      const inBytes = Buffer.byteLength(text, 'utf8');
+      this.recordBytes(inBytes, outBytes);
       
       if (text.trim() === "undefined" || text.trim() === "") {
         return {
@@ -1006,6 +1064,9 @@ export class SpaceMoltAPI {
       if (data.structuredContent !== undefined) {
         data.result = data.structuredContent;
       }
+      if (data.details === undefined && (data as Record<string, unknown>).details !== undefined) {
+        data.details = (data as Record<string, unknown>).details;
+      }
       if (data.session) {
         const s = data.session as unknown as Record<string, unknown>;
         if (s.created_at && !s.createdAt) {
@@ -1016,9 +1077,12 @@ export class SpaceMoltAPI {
         this.session = data.session;
       }
       return data as ApiResponse;
-    } catch {
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      const detailMsg = `HTTP ${resp.status}: ${resp.statusText} - ${errMsg}`;
+      log("error", `decode error: ${detailMsg}`);
       return {
-        error: { code: "http_error", message: `HTTP ${resp.status}: ${resp.statusText}` },
+        error: { code: "http_error", message: detailMsg },
       };
     }
   }

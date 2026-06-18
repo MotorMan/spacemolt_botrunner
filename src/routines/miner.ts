@@ -284,7 +284,7 @@ async function completeActiveMissions(ctx: RoutineContext): Promise<void> {
     if (!completeResp.error) {
       const reward = (mission.reward as number) || (mission.reward_credits as number) || 0;
       ctx.log("trade", `Mission complete: ${(mission.name as string) || missionId}${reward > 0 ? ` (+${reward} credits)` : ""}`);
-      await bot.refreshStatus();
+      await bot.refreshLocation();
     }
   }
 }
@@ -2405,7 +2405,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Status + fuel/hull checks ──
     yield "get_status";
-    await bot.refreshStatus();
+    await bot.refreshShip();
 
     yield "fuel_check";
     const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
@@ -2415,7 +2415,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       continue;
     }
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (hullPct <= 40) {
       ctx.log("system", `Hull critical (${hullPct}%) — returning to station for repair`);
@@ -2993,7 +2993,7 @@ if (effectiveTarget) {
       
       // CRITICAL FIX: Check cargo after traveling to target system (both success and failure cases)
       // If cargo is full, return home to deposit before traveling to POI
-      await bot.refreshStatus();
+      await bot.refreshCargoAndStorage();
       const postTravelFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
       if (postTravelFillRatio >= cargoThresholdRatio) {
         ctx.log("mining", `Cargo full (${Math.round(postTravelFillRatio * 100)}%) after arriving at ${targetSystemId} — returning home to deposit before continuing`);
@@ -3283,9 +3283,9 @@ if (effectiveTarget) {
             ctx.log("debug", `[sort] Chosen for ${effectiveTarget}: ${chosen.poiName} in ${chosen.systemName} — remaining=${chosen.remaining} max=${chosen.maxRemaining} rich=${chosen.richness} depPct=${chosen.depletionPercent} jumps=${chosen.jumps}`);
             ctx.log("mining", `Found ${effectiveTarget} at ${chosen.poiName} in ${chosen.systemName} (${chosen.jumps} jumps) — navigating there`);
             
-            // CRITICAL FIX: Check cargo before traveling to alternative POI after depletion
-            await bot.refreshStatus();
-            const altFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+             // CRITICAL FIX: Check cargo before traveling to alternative POI after depletion
+             await bot.refreshCargoAndStorage();
+             const altFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
             if (altFillRatio >= cargoThresholdRatio) {
               ctx.log("mining", `Cargo full (${Math.round(altFillRatio * 100)}%) — returning home to deposit before traveling to alternative POI`);
               yield "return_home";
@@ -3398,7 +3398,7 @@ if (effectiveTarget) {
     
     // CRITICAL FIX: Check cargo capacity BEFORE traveling to POI
     // If cargo is full, return home to deposit first
-    await bot.refreshStatus();
+    await bot.refreshCargoAndStorage();
     const travelFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
     if (travelFillRatio >= cargoThresholdRatio) {
       ctx.log("mining", `Cargo full (${Math.round(travelFillRatio * 100)}%) — returning home to deposit before traveling to POI`);
@@ -3455,9 +3455,16 @@ if (effectiveTarget) {
       ctx.log("mining", `Hidden POI ${miningPoi.name} detected — MUST travel to verify actual location`);
     }
 
+    // CRITICAL: For DEEP CORE hidden POIs, we MUST use travel command to get there
+    // get_poi alone is NOT sufficient - it may return data from wherever we actually are
+    // Always try travel first for hidden POIs to ensure we're actually at the right location
+    if (isHiddenPoi) {
+      ctx.log("mining", `Hidden POI ${miningPoi.name} detected — MUST travel to verify actual location`);
+    }
+
     // For hidden POIs: ALWAYS use travel command (not just get_poi) to confirm we're actually at the location
-    // CRITICAL: Refresh status FIRST to get actual current location - don't trust cached bot.poi
-    await bot.refreshStatus();
+    // CRITICAL: Refresh location FIRST to get actual current location - don't trust cached bot.poi
+    await bot.refreshLocation();
     const actualPoi = bot.poi || "";
     ctx.log("mining", `Current actual location before travel: ${actualPoi || "(none)"}`);
     if (!bot.poi || bot.poi !== miningPoi.id) {
@@ -3488,22 +3495,20 @@ if (effectiveTarget) {
         // it may require a directional jump. Try leaving and coming back.
         if (isHiddenPoi) {
           ctx.log("mining", `Hidden POI may require directional access — trying to leave and re-enter system`);
-          const homeSys = bot.system; // Save current system before traveling out
-          // Get connected systems to try
+          const homeSys = bot.system;
           const currentSysData = mapStore.getSystem(homeSys);
           const connections = currentSysData?.connections || [];
           if (connections.length > 0) {
-            // Try traveling to first connected system and back
             const firstConn = connections[0];
             const targetSysName = firstConn.system_name || firstConn.system_id || "unknown";
-            ctx.log("mining", `Traveling to connected system ${targetSysName} then back...`);
-            const outResp = await bot.exec("travel", { target_system: firstConn.system_id });
+            ctx.log("mining", `Jumping to connected system ${targetSysName} then back...`);
+            const outResp = await bot.exec("jump", { target_system: firstConn.system_id });
             if (!outResp.error) {
-              ctx.log("mining", `Traveled to ${targetSysName} — returning to ${homeSys}`);
+              ctx.log("mining", `Jumped to ${targetSysName} — returning to ${homeSys}`);
               await ctx.sleep(3000);
-              const backResp = await bot.exec("travel", { target_system: homeSys });
+              const backResp = await bot.exec("jump", { target_system: homeSys });
               if (!backResp.error) {
-                bot.system = homeSys;
+                await bot.refreshLocation();
                 ctx.log("mining", `Returned to ${homeSys} — retrying POI discovery`);
                 await ctx.sleep(3000);
                 // Try get_poi again after re-entering
@@ -3628,8 +3633,8 @@ if (effectiveTarget) {
       const intendedPoi = targetPoiId;
       
       // CRITICAL: This check runs BEFORE mining - verify actual location, not trust cached bot.poi
-      // We MUST refresh status to get the ACTUAL current POI from the server
-      await bot.refreshStatus();
+      // We MUST refresh location to get the ACTUAL current POI from the server
+      await bot.refreshLocation();
       const realCurrentPoi = bot.poi || "";
       
       if (realCurrentPoi !== intendedPoi) {
@@ -3638,8 +3643,8 @@ if (effectiveTarget) {
         // MUST travel to the correct hidden POI
         const verifyTravel = await travelToPoiWithSurvey(ctx, intendedPoi, targetPoiName || intendedPoi, true);
         
-        // Verify AGAIN after travel - refresh status to get actual location
-        await bot.refreshStatus();
+        // Verify AGAIN after travel - refresh location to get actual location
+        await bot.refreshLocation();
         const afterTravelPoi = bot.poi || "";
         
         if (afterTravelPoi !== intendedPoi) {
@@ -3647,7 +3652,7 @@ if (effectiveTarget) {
           
           // Try one more travel as last resort
           const lastTravel = await bot.exec("travel", { target_poi: intendedPoi });
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           const finalPoi = bot.poi || "";
           
           if (finalPoi === intendedPoi) {
@@ -3857,7 +3862,7 @@ if (effectiveTarget) {
         ctx.log("flock", `Leader heartbeat: target=${effectiveTarget || "none"}, phase=${flockPhase}`);
       }
 
-      await bot.refreshStatus();
+      await bot.refreshShip();
 
       const midHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
       if (midHull <= 40) { stopReason = `hull critical (${midHull}%)`; break; }
@@ -4066,9 +4071,9 @@ if (effectiveTarget) {
                 if (bestLoc.systemId !== bot.system) {
                   ctx.log("mining", `Traveling to ${bestLoc.systemName} for better POI...`);
                   
-                  // CRITICAL FIX: Check cargo before traveling to new POI
-                  await bot.refreshStatus();
-                  const upgradeFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
+             // CRITICAL FIX: Check cargo before traveling to new POI
+             await bot.refreshCargoAndStorage();
+             const upgradeFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
                   if (upgradeFillRatio >= cargoThresholdRatio) {
                     ctx.log("mining", `Cargo full (${Math.round(upgradeFillRatio * 100)}%) — returning home to deposit before richness upgrade`);
                     yield "return_home";
@@ -4286,7 +4291,7 @@ if (effectiveTarget) {
                         ctx.log("mining", `Found next target: ${effectiveTarget} @ ${chosen.poiName} in ${chosen.systemId} (${chosen.jumps} jumps)`);
                         
                         // CRITICAL FIX: Check cargo before traveling to next POI when stayOutUntilFull is enabled
-                        await bot.refreshStatus();
+                        await bot.refreshCargoAndStorage();
                         const nextPoiFillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
                         if (nextPoiFillRatio >= cargoThresholdRatio) {
                           ctx.log("mining", `Cargo full (${Math.round(nextPoiFillRatio * 100)}%) — returning home to deposit before switching POIs`);
@@ -5346,12 +5351,14 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
       const { oreId, oreName } = parseOreFromMineResult(mineResp.result);
       
       // MINING RESULT SUMMARY: Log exactly what was mined for visibility
+      // The mine response may be nested under 'details' field per OpenAPI spec
       if (mineResp.result && typeof mineResp.result === "object") {
         const result = mineResp.result as Record<string, unknown>;
-        const quantity = (result.quantity as number) ?? (result.amount as number) ?? 1;
-        const richness = (result.richness as number) ?? 0;
-        const resourceType = (result.resource_type as string) ?? (result.type as string) ?? "";
-        const poiName = (result.poi_name as string) ?? (result.location as string) ?? miningPoi?.name ?? "";
+        const responseData = (result.details as Record<string, unknown>) || result;
+        const quantity = (responseData.quantity as number) ?? (responseData.amount as number) ?? 1;
+        const richness = (responseData.richness as number) ?? 0;
+        const resourceType = (responseData.resource_type as string) ?? (responseData.type as string) ?? "";
+        const poiName = (responseData.poi_name as string) ?? (responseData.location as string) ?? miningPoi?.name ?? "";
         
         // Build a detailed summary of what was mined
         const summaryParts = [`Mined ${quantity}x ${oreName || "unknown"}`];
@@ -5362,6 +5369,15 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
         
         const dcTag = isDeepCoreMining ? " [DEEP CORE]" : "";
         ctx.log("mining", `${summaryParts.join(" ")}${dcTag}`);
+        
+        // SKILL XP DISPLAY: Show skill gains from the mine response
+        const xpGained = responseData.xp_gained as Record<string, number> | undefined;
+        if (xpGained && Object.keys(xpGained).length > 0) {
+          const xpParts = Object.entries(xpGained)
+            .map(([skill, amount]) => `${skill}: +${amount}`)
+            .join(", ");
+          ctx.log("mining", `Skill XP gained: ${xpParts}`);
+        }
       } else if (oreId) {
         // Fallback if result structure is unexpected
         const dcTag = isDeepCoreMining ? " [deep core]" : "";
@@ -5427,7 +5443,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
         }
       }
 
-      await bot.refreshStatus();
+      await bot.refreshCargo();
       const fillRatio = bot.cargoMax > 0 ? bot.cargo / bot.cargoMax : 0;
       if (fillRatio >= cargoThresholdRatio) {
         stopReason = `cargo at ${Math.round(fillRatio * 100)}%`; break;
@@ -5714,7 +5730,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
       }
     } catch {}
 
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     await bot.refreshStorage();
 
     const earnings = bot.credits - creditsBefore;
@@ -5750,7 +5766,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     yield "check_skills";
     await bot.checkSkills();
 
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     const endFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("info", `Cycle done — ${bot.credits} credits, ${endFuel}% fuel, ${bot.cargo}/${bot.cargoMax} cargo`);
   }

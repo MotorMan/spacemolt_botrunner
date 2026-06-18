@@ -116,6 +116,7 @@ function getRescueSettings(): {
   maydayRescueBot: string;
   premiumFuelReserve: number;
   maxFuelDelivery: number;
+  ignoreBlacklist: boolean;
 } {
   const all = readSettings();
   const r = all.rescue || {};
@@ -143,6 +144,7 @@ function getRescueSettings(): {
     maydayRescueBot: (r.maydayRescueBot as string) || '',
     premiumFuelReserve: (r.premiumFuelReserve as number) || 1,
     maxFuelDelivery: (r.maxFuelDelivery as number) || 1000,
+    ignoreBlacklist: (r.ignoreBlacklist as boolean) ?? false,
   };
 }
 
@@ -605,8 +607,8 @@ async function emergencyFleeFromPirates(
 
   ctx.log("combat", `🏃 Emergency flee initiated - ${pirateResult.pirateCount} pirate(s) detected`);
 
-  // CRITICAL: Verify actual current system via get_status before selecting jump target
-  await bot.refreshStatus();
+  // CRITICAL: Verify actual current system via get_location before selecting jump target
+  await bot.refreshLocation();
   const actualCurrentSystem = bot.system;
   ctx.log("combat", `Verified actual position: system=${actualCurrentSystem}`);
 
@@ -693,7 +695,7 @@ async function emergencyFleeFromPirates(
         }
         
         // Also verify we're still in the same system
-        await bot.refreshStatus();
+        await bot.refreshLocation();
         if (bot.system !== actualCurrentSystem) {
           ctx.log("combat", `[EMERGENCY] System changed during poll - jump succeeded to ${bot.system}`);
           jumpCompleted = true;
@@ -1377,7 +1379,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 
   // Top off self if needed
   ctx.log("rescue", `💰 No other bots need topping off, checking self...`);
-  await bot.refreshStatus();
+  await bot.refreshLocation();
 
   // Track consecutive 0 credits for self
   if (bot.credits === 0) {
@@ -1437,6 +1439,7 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
 
 // ── Background credit top-off state ──────────────────────────────────────────
 let creditTopOffIntervalId: NodeJS.Timeout | null = null;
+let creditTopOffRoutineActive = false;
 const consecutiveZeroCredits = new Map<string, number>(); // botUsername -> consecutive 0 credit count
 const ownBotRescueCooldown = new Map<string, number>(); // botUsername -> cooldown expiry timestamp (ms) for unreachable own fleet bots
 
@@ -1456,6 +1459,7 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
     return;
   }
 
+  creditTopOffRoutineActive = true;
   ctx.log("rescue", `💰 Credit top-off background loop started (target: ${targetAmount}cr, interval: 60s)`);
 
   const intervalMs = 60 * 1000; // 1 minute
@@ -1464,14 +1468,14 @@ function startCreditTopOffBackground(ctx: RoutineContext, targetAmount: number):
     try {
       const { bot } = ctx;
 
-      // Stop if routine is no longer running
-      if (bot.state !== "running" && bot.state !== "idle") {
-        ctx.log("rescue", "💰 Stopping credit top-off background loop — routine is no longer running");
+      // Stop if routine is no longer active
+      if (!creditTopOffRoutineActive) {
+        ctx.log("rescue", "💰 Stopping credit top-off background loop — routine is no longer active");
         stopCreditTopOffBackground();
         return;
       }
 
-      // Refresh bot status to get current docked state and system
+      // Refresh bot status to get current docked state, system, AND credits
       await bot.refreshStatus();
 
       ctx.log("rescue", `💰 Background credit check - docked: ${bot.docked}, system: ${bot.system}, credits: ${bot.credits}`);
@@ -1517,8 +1521,9 @@ function stopCreditTopOffBackground(): void {
   if (creditTopOffIntervalId !== null) {
     clearInterval(creditTopOffIntervalId);
     creditTopOffIntervalId = null;
-    console.log("[rescue] 💰 Credit top-off background loop stopped");
   }
+  creditTopOffRoutineActive = false;
+  console.log("[rescue] 💰 Credit top-off background loop stopped");
 }
 
 // ── FuelTransfer routine (using refuel command) ─────────────────
@@ -1536,7 +1541,7 @@ function stopCreditTopOffBackground(): void {
 export const fuelTransferRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
 
@@ -1816,7 +1821,7 @@ skipToReturnHome = true;
       }
 
       let maydayTarget: RescueTarget | null = null;
-      if (targets.length === 0) {
+if (targets.length === 0) {
         if (!isMaydayRescuePrimary) {
           const ignoredMayday = getNextMayday();
           if (ignoredMayday) {
@@ -1830,15 +1835,7 @@ skipToReturnHome = true;
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
 
-          // ── ESTABLISH 1-HOUR COOLDOWN IMMEDIATELY ──
-          // Mark as received BEFORE any checks to establish the cooldown upfront
-          // This prevents the MAYDAY from re-triggering even if accepted or declined
-          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
-          ctx.log("mayday_debug", `📝 MAYDAY from ${mayday.sender} marked as received (1-hour cooldown active)`);
-
           // ── DECLINED MAYDAY CHECK: Prevent spam for already-declined rescues ──
-          // This prevents the bot from sending multiple decline messages for the same MAYDAY
-          // Check this FIRST, before the duplicate check, to catch declined MAYDAYS immediately
           if (isMaydayDeclined(mayday.sender, mayday.system, mayday.poi)) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - previously declined (1-hour cooldown)`);
             markMaydayHandled(mayday);
@@ -1846,7 +1843,6 @@ skipToReturnHome = true;
           }
           
           // ── IMMEDIATE DUPLICATE CHECK: Prevent rapid-fire spam ──
-          // This uses a 5-second grace period for newly received MAYDAYs
           if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
             ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (1-hour cooldown)`);
             markMaydayHandled(mayday);
@@ -1998,13 +1994,13 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             }
           }
 
-          // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
+// ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ─-
           const { getSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
-          const blacklist = getSystemBlacklist();
+          const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           
-          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          const isBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
           if (isBlacklisted) {
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
@@ -2102,10 +2098,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             fuelPct: mayday.fuelPct,
             docked: false,
           };
+          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
           
-          // ── RESCUE COOPERATION: Send claim to partner bot ──
+          // ── RESCUE COOPERATION: Send claim to partner bot ─-
           if (isCooperationEnabled()) {
             const myClaim: RescueClaim = {
               type: "RESCUE_CLAIM",
@@ -2179,7 +2176,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
             } else {
               // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-              await bot.refreshStatus();
+              await bot.refreshLocation();
               ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
               // If home station is configured, travel there and dock
@@ -2213,7 +2210,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                       if (refuelResp.error) {
                         ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
                       } else {
-                        await bot.refreshStatus();
+                        await bot.refreshLocation();
                         ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                       }
                     }
@@ -2244,7 +2241,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("error", `Failed to return to home system ${homeSystem}`);
           } else {
             // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-            await bot.refreshStatus();
+            await bot.refreshLocation();
             ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
             // If home station is configured, travel there and dock
@@ -2278,7 +2275,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     if (refuelResp.error) {
                       ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
                     } else {
-                      await bot.refreshStatus();
+                      await bot.refreshLocation();
                       ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                     }
                   }
@@ -2441,7 +2438,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     // ── Ensure we have enough fuel to share ──
     yield "self_check";
-    await bot.refreshStatus();
+    await bot.refreshShip();
     logStatus(ctx);
 
     if (hasPumpNow) {
@@ -2529,11 +2526,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
         // ── PIRATE BASE PROXIMITY CHECK: Block navigation to systems near pirate bases ──
         // This is a HARD BLOCK - do not attempt to navigate to blacklisted systems
+        // (unless ignoreBlacklist is enabled)
         const { getSystemBlacklist } = await import("../web/server.js");
-        const blacklist = getSystemBlacklist();
+        const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
         const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
         
-        const isTargetBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
+        const isTargetBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
         if (isTargetBlacklisted) {
           ctx.log("rescue", `🚫 BLOCKED: Target system ${target.system} is BLACKLISTED (likely near pirate base)`);
           ctx.log("rescue", `🚫 ABORTING RESCUE - cannot navigate to blacklisted system`);
@@ -2701,6 +2699,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         const safetyOpts = {
           fuelThresholdPct: settings.refuelThreshold,
           hullThresholdPct: 30,
+          skipBlacklist: settings.ignoreBlacklist,
           onJump: async (jumpNumber: number) => {
             // Check if target still needs rescue on every jump
             const statusCheck = await checkTargetStillNeedsRescue(
@@ -2755,7 +2754,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
           continue;
         }
         // CRITICAL: Refresh status to update bot.system after navigation
-        await bot.refreshStatus();
+        await bot.refreshLocation();
         ctx.log("travel", `Arrived in ${bot.system}`);
 
         // ── PIRATE AWARENESS: Scan for pirates immediately after arrival ──
@@ -3176,7 +3175,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
         } else {
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           ctx.log(logCategory, `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
         }
       } else {
@@ -3218,7 +3217,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             if (refuelResp.error) {
               ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
             } else {
-              await bot.refreshStatus();
+              await bot.refreshLocation();
               ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
             }
             ctx.log("rescue", `⛽ Filling cargo with premium fuel cells...`);
@@ -3247,7 +3246,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
     // ── Refuel self (fallback if not already refueled at station) ──
     ctx.log("rescue_debug", `=== Starting refuel self section ===`);
     yield "self_refuel";
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const fuelAfterRescue = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     ctx.log("rescue_debug", `Fuel after rescue: ${fuelAfterRescue}%, threshold: ${settings.refuelThreshold}%`);
     if (fuelAfterRescue < settings.refuelThreshold) {
@@ -3258,7 +3257,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
       ctx.log(logCategory,
         `Fuel at ${fuelAfterRescue}% — above threshold (${settings.refuelThreshold}%), no need to refuel`);
     }
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // ── Calculate and send rescue bill (after refuel, before returning home) ──
@@ -3433,9 +3432,9 @@ interface ManualRescueParams {
  * 6. Return home, dock, and refuel
  */
 export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineContext, params?: ManualRescueParams) {
-  const { bot } = ctx;
+   const { bot } = ctx;
 
-  await bot.refreshStatus();
+   await bot.refreshLocation();
   const homeSystem = bot.system;
 
   // Get parameters (passed from botmanager via action.params)
@@ -3530,7 +3529,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 
     // ── Ensure we have enough fuel ──
     yield "self_check";
-    await bot.refreshStatus();
+    await bot.refreshShip();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     if (hasPump) {
@@ -3777,7 +3777,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
         } else {
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
         }
       } else {
@@ -3815,7 +3815,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
             if (refuelResp.error) {
               ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
             } else {
-              await bot.refreshStatus();
+              await bot.refreshShip();
               ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
             }
           }
@@ -3840,7 +3840,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
     await ensureDocked(ctx);
 
     // Refuel after mission - but only if below threshold
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const fuelAfterMission = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelAfterMission < settings.refuelThreshold) {
       ctx.log("rescue", `Fuel at ${fuelAfterMission}% — refueling to threshold (${settings.refuelThreshold}%)...`);
@@ -3849,7 +3849,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
         ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
         await ensureFueled(ctx, settings.refuelThreshold);
       } else {
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         ctx.log("rescue", `Fuel: ${fuelPct}% (${bot.fuel}/${bot.maxFuel})`);
       }
@@ -3857,7 +3857,8 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
       ctx.log("rescue", `Fuel at ${fuelAfterMission}% — above threshold, no need to refuel`);
     }
 
-    await bot.refreshStatus();
+    await bot.refreshLocation();
+    await bot.refreshShip();
     logStatus(ctx);
 
     ctx.log("rescue", `✓ Bot is docked and ready for next mission`);
@@ -3887,7 +3888,7 @@ export const manualPlayerRescueRoutine: Routine = async function* (ctx: RoutineC
 export const maydayRescueRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
 
@@ -4110,7 +4111,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     // ── Ensure we have enough fuel ──
     yield "self_check";
-    await bot.refreshStatus();
+    await bot.refreshShip();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     if (hasPump) {
@@ -4424,7 +4426,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
     ctx.log("mayday", `=== MAYDAY response complete for ${mayday.sender} ===`);
 
     // Refresh status before returning home
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     ctx.log("mayday", `Current location: ${bot.system}, Home: ${homeSystem || "not set"}`);
 
     // ── Return home ──
@@ -4444,7 +4446,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
         if (!arrived) {
           ctx.log("error", `Failed to return to home system ${homeSystem}`);
         } else {
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           ctx.log("mayday", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
         }
       } else {
@@ -4486,7 +4488,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
             if (refuelResp.error) {
               ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
             } else {
-              await bot.refreshStatus();
+              await bot.refreshShip();
               ctx.log("mayday", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
             }
           }
@@ -4530,7 +4532,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
       }
     }
 
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const fuelAfterMission = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelAfterMission < settings.refuelThreshold) {
       ctx.log("mayday", `Fuel at ${fuelAfterMission}% — refueling to threshold (${settings.refuelThreshold}%)...`);
@@ -4539,7 +4541,7 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
         ctx.log("error", `Refuel failed: ${refuelResp.error.message}`);
         await ensureFueled(ctx, settings.refuelThreshold);
       } else {
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         ctx.log("mayday", `Fuel: ${fuelPct}% (${bot.fuel}/${bot.maxFuel})`);
       }
@@ -4547,7 +4549,8 @@ IMPORTANT: You ARE coming to rescue them. This is a rescue confirmation, not a d
       ctx.log("mayday", `Fuel at ${fuelAfterMission}% — above threshold, no need to refuel`);
     }
 
-    await bot.refreshStatus();
+    await bot.refreshLocation();
+    await bot.refreshShip();
     logStatus(ctx);
     ctx.log("mayday", "✓ Bot is docked and ready for next MAYDAY");
 
@@ -4649,7 +4652,7 @@ async function findPlayerId(ctx: RoutineContext, username: string): Promise<stri
 export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const settings = getRescueSettings();
   const homeSystem = settings.homeSystem || bot.system;
 
@@ -4707,16 +4710,50 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
     ctx.log("rescue", `✓ Bot started at home base (${homeSystem})`);
   }
 
-  // ── Start background credit top-off loop (non-blocking) ──
-  // Only the primary credit top-off bot should run this background loop
-  if (isPrimaryCreditTopOffBot(bot.username)) {
-    startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
-  } else {
-    ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
-  }
+// ── Start background credit top-off loop (non-blocking) ──
+    // Only the primary credit top-off bot should run this background loop
+    if (isPrimaryCreditTopOffBot(bot.username)) {
+      startCreditTopOffBackground(ctx, settings.creditTopOffAmount);
+    } else {
+      ctx.log("rescue", `💰 Not primary credit top-off bot - waiting for ${settings.creditTopOffBot || 'primary bot'} to handle credit distribution`);
+    }
 
-  // Log category - determined when target is selected
-  let logCategory: string = "rescue";
+    // ── Start background faction storage update loop (non-blocking) ──
+    // Cycles through approved fuel stations to update faction storage data
+    let currentFuelStationIndex = 0;
+    const general = readSettings().general || {};
+    const approvedFuelStations: string[] = (general as any).approvedFuelStations as string[] || [];
+    
+    if (approvedFuelStations.length > 0) {
+      ctx.log("rescue", `📡 Starting faction storage update cycle for ${approvedFuelStations.length} approved fuel stations`);
+      
+      // Start background update loop
+      (async () => {
+        while (bot.state === "running") {
+          try {
+            const stationKey = approvedFuelStations[currentFuelStationIndex];
+            const stationId = stationKey.split("|")[1];
+            if (stationId && bot.docked && bot.poi === stationId) {
+              ctx.log("rescue", `📡 Updating faction storage at ${stationId}...`);
+              const storageResp = await bot.exec("view_storage", { target: "faction", station_id: stationId });
+              if (!storageResp.error && storageResp.result) {
+                const result = storageResp.result as Record<string, unknown>;
+                const items = (result.items as any[]) || [];
+                ctx.log("rescue", `📡 Faction storage updated: ${items.length} items`);
+              }
+            }
+            currentFuelStationIndex = (currentFuelStationIndex + 1) % approvedFuelStations.length;
+          } catch (e) {
+            ctx.log("warn", `Failed to update faction storage: ${e}`);
+          }
+          // Wait 1 minute before next station update
+          await new Promise(resolve => setTimeout(resolve, 60000));
+        }
+      })();
+    }
+
+    // Log category - determined when target is selected
+    let logCategory: string = "rescue";
 
   while (bot.state === "running") {
     // ── Death recovery ──
@@ -4952,6 +4989,20 @@ export const rescueRoutine: Routine = async function* (ctx: RoutineContext) {
         if (mayday) {
           ctx.log("mayday", `🚨 MAYDAY received: ${mayday.sender} at ${mayday.system}/${mayday.poi} (${mayday.fuelPct}% fuel)`);
 
+          // ── DECLINED MAYDAY CHECK: Prevent spam for already-declined rescues ──
+          if (isMaydayDeclined(mayday.sender, mayday.system, mayday.poi)) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - previously declined (1-hour cooldown)`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+          
+          // ── IMMEDIATE DUPLICATE CHECK: Prevent rapid-fire spam ──
+          if (isMaydayDuplicate(bot.username, mayday.sender, mayday.system, mayday.poi)) {
+            ctx.log("mayday", `⚠️ Ignoring MAYDAY from ${mayday.sender} - duplicate detected (1-hour cooldown)`);
+            markMaydayHandled(mayday);
+            continue;
+          }
+
           // Check if sender is a known player (from playerNames.json)
           const knownPlayer = isKnownPlayer(mayday.sender);
 
@@ -5042,13 +5093,13 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             }
           }
 
-          // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
+// ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
           const { getSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
-          const blacklist = getSystemBlacklist();
+          const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           
-          const isBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
+          const isBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
           if (isBlacklisted) {
             ctx.log("mayday", `⚠️ Declining MAYDAY from ${mayday.sender} - target system ${mayday.system} is BLACKLISTED`);
             const lockoutMinutes = settings.maydayPirateLockoutMinutes;
@@ -5146,10 +5197,11 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             fuelPct: mayday.fuelPct,
             docked: false,
           };
+          markMaydayReceived(mayday.sender, mayday.system, mayday.poi);
           markMaydayHandled(mayday);
           ctx.log("mayday", `✓ MAYDAY validated (${jumpsAway} jumps) - launching rescue mission for ${mayday.sender}`);
           
-          // ── RESCUE COOPERATION: Send claim to partner bot ──
+          // ── RESCUE COOPERATION: Send claim to partner bot ─-
           if (isCooperationEnabled()) {
             const myClaim: RescueClaim = {
               type: "RESCUE_CLAIM",
@@ -5221,7 +5273,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               ctx.log("error", `Failed to return to home system ${homeSystem}`);
             } else {
               // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-              await bot.refreshStatus();
+              await bot.refreshLocation();
               ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
               // If home station is configured, travel there and dock
@@ -5255,7 +5307,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                       if (refuelResp.error) {
                         ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
                       } else {
-                        await bot.refreshStatus();
+                        await bot.refreshLocation();
                         ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                       }
                     }
@@ -5286,7 +5338,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
             ctx.log("error", `Failed to return to home system ${homeSystem}`);
           } else {
             // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-            await bot.refreshStatus();
+            await bot.refreshLocation();
             ctx.log("rescue", `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
             // If home station is configured, travel there and dock
@@ -5320,7 +5372,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                     if (refuelResp.error) {
                       ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
                     } else {
-                      await bot.refreshStatus();
+                      await bot.refreshShip();
                       ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                     }
                   }
@@ -5607,7 +5659,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     // ── Ensure we have fuel ourselves ──
     yield "self_check";
-    await bot.refreshStatus();
+    await bot.refreshShip();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // Only refuel if below threshold - don't waste time refueling when already well-fueled
@@ -5822,11 +5875,12 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
       // ── PIRATE BASE PROXIMITY CHECK: Block navigation to systems near pirate bases ──
       // This is a HARD BLOCK - do not attempt to navigate to blacklisted systems
+      // (unless ignoreBlacklist is enabled)
       const { getSystemBlacklist } = await import("../web/server.js");
-      const blacklist = getSystemBlacklist();
+      const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
       const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
       
-      const isTargetBlacklisted = blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
+      const isTargetBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(target.system));
       if (isTargetBlacklisted) {
         ctx.log("rescue", `🚫 BLOCKED: Target system ${target.system} is BLACKLISTED (likely near pirate base)`);
         ctx.log("rescue", `🚫 ABORTING RESCUE - cannot navigate to blacklisted system`);
@@ -6589,7 +6643,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                       ctx.log("rescue", `⛽ Refueling at home station...`);
                       const refuelResp = await bot.exec("refuel");
                       if (!refuelResp.error) {
-                        await bot.refreshStatus();
+                        await bot.refreshShip();
                         ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                       }
                     }
@@ -6875,7 +6929,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
         ctx.log("error", `Failed to return to home system ${homeSystem}`);
       } else {
         // CRITICAL: Refresh status after navigation to ensure bot.system is updated
-        await bot.refreshStatus();
+        await bot.refreshLocation();
         ctx.log(logCategory, `✓ Arrived at home system ${homeSystem} (confirmed: ${bot.system})`);
 
         // If home station is configured, travel there and dock
@@ -6907,7 +6961,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 if (refuelResp.error) {
                   ctx.log("error", `❌ Failed to refuel at home station: ${refuelResp.error.message}`);
                 } else {
-                  await bot.refreshStatus();
+                  await bot.refreshShip();
                   ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
                 }
               }
@@ -6949,7 +7003,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
               ctx.log("rescue", `⛽ Refueling at home station...`);
               const refuelResp = await bot.exec("refuel");
               if (!refuelResp.error) {
-                await bot.refreshStatus();
+                await bot.refreshShip();
                 ctx.log("rescue", `✓ Refueled to ${bot.fuel}/${bot.maxFuel} fuel`);
               }
             }
@@ -6960,17 +7014,17 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 
     // ── Refuel self ──
     yield "self_refuel";
-    await bot.refreshStatus();
-    const fuelAfterRescue2 = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
-    if (fuelAfterRescue2 < settings.refuelThreshold) {
-      ctx.log(logCategory,
-        `Fuel at ${fuelAfterRescue2}% after rescue — refueling to threshold (${settings.refuelThreshold}%)...`);
+await bot.refreshShip();
+    const fuelAfterRescue = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("rescue_debug", `Fuel after rescue: ${fuelAfterRescue}%, threshold: ${settings.refuelThreshold}%`);
+    if (fuelAfterRescue < settings.refuelThreshold) {
+      ctx.log("rescue_debug", `Fuel after rescue: ${fuelAfterRescue}%, threshold: ${settings.refuelThreshold}%`);
       await ensureFueled(ctx, settings.refuelThreshold);
     } else {
       ctx.log(logCategory,
-        `Fuel at ${fuelAfterRescue2}% — above threshold, no need to refuel`);
+        `Fuel at ${fuelAfterRescue}% — above threshold (${settings.refuelThreshold}%), no need to refuel`);
     }
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     logStatus(ctx);
 
     // ── Ensure premium fuel reserve for emergency self-rescue ──

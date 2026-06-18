@@ -884,7 +884,7 @@ async function craftPrerequisites(
       }
     }
     await bot.refreshCargo();
-    await bot.refreshStatus();
+    await bot.refreshLocation();
 
     await withdrawFactionMaterials(ctx, prereqRecipe, 1, personalMode);
     await withdrawStorageMaterials(ctx, prereqRecipe);
@@ -1047,7 +1047,7 @@ async function craftFromCategories(
     }
   }
   await bot.refreshCargo();
-  await bot.refreshStatus();
+  await bot.refreshLocation();
 
   // Craft up to 10 batches total, iterating through available recipes
   const MAX_CRAFTS = 10;
@@ -1537,7 +1537,7 @@ async function craftRecipeWithPrereqs(
 export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
 
   while (bot.state === "running") {
     // Clear facility cache at start of each cycle
@@ -1555,7 +1555,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Dock at station ──
     yield "dock";
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     await ensureDocked(ctx);
 
     // ── Fetch recipes via catalog ──
@@ -1601,7 +1601,7 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
       await bot.refreshCargo();
-      await bot.refreshStatus();
+      await bot.refreshLocation();
     }
 
     // ── Refresh inventory (cargo + personal storage + faction storage) ──

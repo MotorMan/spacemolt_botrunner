@@ -31,6 +31,20 @@ export function shouldStopForEmergency(ctx: RoutineContext): boolean {
   return ctx.bot.state !== "running";
 }
 
+/**
+ * Low-bandwidth notification refresh for idle bots.
+ * Calls get_notifications with limit=1, clear=false to keep sessions alive
+ * without heavy API traffic. Returns the notifications for processing.
+ */
+export async function refreshNotifications(ctx: RoutineContext): Promise<unknown> {
+  const resp = await ctx.bot.api.execute("get_notifications", { limit: 1, clear: false });
+  if (resp.error) {
+    ctx.log("system", `Notification refresh failed: ${resp.error.message}`);
+    return { notifications: [] };
+  }
+  return resp.result || { notifications: [] };
+}
+
 // ── Types ────────────────────────────────────────────────────
 
 export interface BaseServices {
@@ -350,7 +364,12 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
   if (!result || typeof result !== "object") return { oreId: "", oreName: "" };
 
   const mr = result as Record<string, unknown>;
-  const ore = mr.item ?? mr.ore ?? mr.mined;
+  
+  // The mine response may be nested under 'details' field per OpenAPI spec
+  // structuredContent: V2GameState post-mutation delta; command result is under `details` (MineResponse)
+  const responseData = (mr.details as Record<string, unknown>) || mr;
+  
+  const ore = responseData.item ?? responseData.ore ?? responseData.mined;
   let oreId = "";
   let oreName = "";
 
@@ -359,8 +378,8 @@ export function parseOreFromMineResult(result: unknown): { oreId: string; oreNam
     oreId = (oreObj.item_id as string) || (oreObj.id as string) || (oreObj.name as string) || "";
     oreName = (oreObj.name as string) || oreId;
   } else {
-    oreId = (mr.resource_id as string) || (mr.item_id as string) || (mr.ore_id as string) || "";
-    oreName = (mr.resource_name as string) || (mr.item_name as string) || (mr.ore_name as string) || (mr.name as string) || oreId;
+    oreId = (responseData.resource_id as string) || (responseData.item_id as string) || (responseData.ore_id as string) || "";
+    oreName = (responseData.resource_name as string) || (responseData.item_name as string) || (responseData.ore_name as string) || (responseData.name as string) || oreId;
   }
 
   return { oreId, oreName };
@@ -378,8 +397,8 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
   const { bot } = ctx;
   if (bot.docked) return true;
 
-  // Refresh status first to ensure we have the latest docked state
-  await bot.refreshStatus();
+  // Refresh location first to ensure we have the latest docked state
+  await bot.refreshLocation();
   if (bot.docked) return true;
 
   const { pois } = await getSystemInfo(ctx);
@@ -394,8 +413,8 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
         // Fall through to search for nearest station
       } else {
         bot.poi = station.id;
-        // Refresh status after travel to update position
-        await bot.refreshStatus();
+        // Refresh location after travel to update position
+        await bot.refreshLocation();
       }
     }
     // Only attempt dock if we're at a station POI
@@ -445,7 +464,7 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
         if (jumpResp.error) {
           ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
           // Check if we actually made the jump despite the error
-          await bot.refreshStatus();
+          await bot.refreshLocation();
           if (bot.system.toLowerCase() !== route[i].toLowerCase()) {
             return false; // Jump truly failed
           }
@@ -457,15 +476,15 @@ export async function ensureDocked(ctx: RoutineContext, skipStorageCollection: b
       if (jumpResp.error) {
         ctx.log("error", `Jump failed: ${jumpResp.error.message}`);
         // Check if we actually made the jump despite the error
-        await bot.refreshStatus();
+        await bot.refreshLocation();
         if (bot.system.toLowerCase() !== nearest.systemId.toLowerCase()) {
           return false; // Jump truly failed
         }
         ctx.log("travel", `Jump succeeded despite error (server confirmed position)`);
       }
     }
-    // Refresh status after navigation
-    await bot.refreshStatus();
+    // Refresh location after navigation
+    await bot.refreshLocation();
   }
 
   // Travel to station POI and dock
@@ -571,7 +590,7 @@ export async function collectFromStorage(ctx: RoutineContext, minBalance: number
       const wResp = await bot.exec("storage", { action: "withdraw", item_id: "credits", quantity: amountToWithdraw, target: "self", source: "storage" });
       if (!wResp.error) {
         ctx.log("trade", `Collected ${amountToWithdraw} credits from storage`);
-        await bot.refreshStatus();
+        await bot.refreshLocation();
       }
     }
   }
@@ -616,7 +635,7 @@ export async function sellAllCargo(ctx: RoutineContext): Promise<number> {
  */
 export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
-  await bot.refreshStatus();
+  await bot.refreshLocation();
 
   ctx.log("error", "EMERGENCY: Fuel target not met — attempting recovery...");
 
@@ -629,7 +648,7 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
       ctx.log("system", "Found items — attempting refuel from cargo...");
       const refuelResp = await bot.exec("refuel");
       if (!refuelResp.error) {
-        await bot.refreshStatus();
+        await bot.refreshShip();
         const newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
         ctx.log("system", `Recovery via scavenge successful! Fuel: ${newFuel}%`);
         return true;
@@ -669,7 +688,7 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
     ctx.log("system", "Cannot refuel — staying docked and waiting for help...");
     for (let w = 0; w < REFUEL_WAIT_RETRIES && bot.state === "running"; w++) {
       await sleep(REFUEL_WAIT_INTERVAL);
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const fuelNow = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (fuelNow >= 30) {
         ctx.log("system", `Fuel recovered to ${fuelNow}% — resuming`);
@@ -678,7 +697,7 @@ export async function emergencyFuelRecovery(ctx: RoutineContext): Promise<boolea
       // Try selling + refueling each cycle
       await sellAllCargo(ctx);
       await tryRefuel(ctx);
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const afterPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : bot.fuel;
       if (afterPct >= 30) {
         ctx.log("system", `Refuel succeeded after wait! Fuel: ${bot.fuel}/${bot.maxFuel} (${afterPct}%)`);
@@ -700,47 +719,49 @@ const REFUEL_WAIT_INTERVAL = 30_000;
 
 /** Attempt to refuel to full. Calls refuel repeatedly until tank is full.
  *  If broke, sells cargo. If still can't refuel, waits at station and retries.
- *  Assumes docked. */
-export async function tryRefuel(ctx: RoutineContext): Promise<void> {
+ *  Assumes docked.
+ *  @param opts.skipApprovedCheck If true, bypass the approved fuel station check (for hunters). */
+export async function tryRefuel(ctx: RoutineContext, opts?: { skipApprovedCheck?: boolean }): Promise<void> {
   const { bot } = ctx;
-  await bot.refreshStatus();
+  await bot.refreshShip();
+  await bot.refreshCargo();
 
   let fuelPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : bot.fuel;
   if (fuelPct >= 95) return;
 
   const startFuel = Math.round(fuelPct);
-
+  
   // Check if current station has refuel service
   const { pois } = await getSystemInfo(ctx);
   const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
   if (currentStation) {
-    if (!isApprovedFuelStation(currentStation.id, readSettings(), bot.system)) {
+    if (!opts?.skipApprovedCheck && !isApprovedFuelStation(currentStation.id, readSettings(), bot.system)) {
       ctx.log("system", `Station ${currentStation.name} is not on approved fuel list — skipping refuel here`);
       return;
     }
   }
   if (currentStation?.services && currentStation.services.refuel === false) {
-    const refuelStation = findStation(pois, "refuel");
-    if (refuelStation && refuelStation.id !== currentStation.id) {
-      if (!isApprovedFuelStation(refuelStation.id, readSettings(), bot.system)) {
-        ctx.log("system", `Refuel station ${refuelStation.name} is not in approved fuel list — skipping`);
-        return;
-      }
-      await bot.exec("undock");
-      bot.docked = false;
-      await bot.exec("travel", { target_poi: refuelStation.id });
-      bot.poi = refuelStation.id;
-      const dResp = await bot.exec("dock");
-      if (!dResp.error || dResp.error.message.includes("already")) {
-        bot.docked = true;
-        await collectFromStorage(ctx);
-        await ensureInsured(ctx);
-      } else {
-        ctx.log("error", `Dock at ${refuelStation.name} failed: ${dResp.error.message}`);
-        return;
+      const refuelStation = findStation(pois, "refuel");
+      if (refuelStation && refuelStation.id !== currentStation.id) {
+        if (!opts?.skipApprovedCheck && !isApprovedFuelStation(refuelStation.id, readSettings(), bot.system)) {
+          ctx.log("system", `Refuel station ${refuelStation.name} is not in approved fuel list — skipping`);
+          return;
+        }
+        await bot.exec("undock");
+        bot.docked = false;
+        await bot.exec("travel", { target_poi: refuelStation.id });
+        bot.poi = refuelStation.id;
+        const dResp = await bot.exec("dock");
+        if (!dResp.error || dResp.error.message.includes("already")) {
+          bot.docked = true;
+          await collectFromStorage(ctx);
+          await ensureInsured(ctx);
+        } else {
+          ctx.log("error", `Dock at ${refuelStation.name} failed: ${dResp.error.message}`);
+          return;
+        }
       }
     }
-  }
 
   // Call refuel repeatedly until full or until it fails
   let consecutiveErrors = 0;
@@ -761,7 +782,7 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
       if (msg.includes("credit") || msg.includes("fuel_source") || msg.includes("insufficient")) {
         const sold = await sellAllCargo(ctx);
         if (sold > 0) {
-          await bot.refreshStatus();
+          await bot.refreshShip();
           continue;
         }
       }
@@ -770,12 +791,12 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
     }
 
     consecutiveErrors = 0;
-    await bot.refreshStatus();
+    await bot.refreshShip();
     fuelPct = bot.maxFuel > 0 ? (bot.fuel / bot.maxFuel) * 100 : bot.fuel;
     if (fuelPct >= 95) break;
   }
 
-  await bot.refreshStatus();
+  await bot.refreshShip();
   fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (fuelPct >= 50) {
     if (fuelPct > startFuel) ctx.log("system", `Refueled ${startFuel}% → ${fuelPct}%`);
@@ -798,7 +819,7 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
         break;
       }
     }
-    await bot.refreshStatus();
+    await bot.refreshShip();
     fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelPct >= 50) {
       ctx.log("system", `Fuel recovered to ${fuelPct}% — continuing`);
@@ -806,7 +827,7 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
     }
   }
 
-  await bot.refreshStatus();
+  await bot.refreshShip();
   ctx.log("error", `Could not refuel after ${REFUEL_WAIT_RETRIES} waits — fuel: ${bot.fuel}/${bot.maxFuel}`);
 }
 
@@ -815,7 +836,7 @@ export async function tryRefuel(ctx: RoutineContext): Promise<void> {
 /** Repair the ship if damaged. Assumes docked. */
 export async function repairShip(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
-  await bot.refreshStatus();
+  await bot.refreshShip();
   const hullPct = bot.maxHull > 0 ? (bot.hull / bot.maxHull) * 100 : 100;
   if (hullPct < 100) {
     const startHull = Math.round(hullPct);
@@ -843,7 +864,7 @@ export async function repairShip(ctx: RoutineContext): Promise<void> {
     }
 
     await bot.exec("repair");
-    await bot.refreshStatus();
+    await bot.refreshShip();
     const endHull = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
     if (endHull > startHull) ctx.log("system", `Repaired hull ${startHull}% → ${endHull}%`);
   }
@@ -855,7 +876,7 @@ export async function topUpShields(ctx: RoutineContext, targetPct: number = 0.8)
     ctx.log("combat", `Shield recharge skipped: maxShield=${bot.maxShield}`);
     return false;
   }
-  await bot.refreshStatus();
+  await bot.refreshShip();
   await bot.refreshCargo();
   const target = Math.floor(bot.maxShield * targetPct);
   if (bot.shield >= target) {
@@ -878,7 +899,7 @@ export async function topUpShields(ctx: RoutineContext, targetPct: number = 0.8)
   const resp = await bot.exec("use_item", { id: shieldItem!.itemId, quantity: qty });
   if (!resp.error) {
     ctx.log("combat", `Used ${qty}x shield_charge (+${qty * 100} shields to ~${Math.round(targetPct * 100)}%)`);
-    await bot.refreshStatus();
+    await bot.refreshShip();
     return true;
   } else {
     ctx.log("combat", `Shield recharge failed: ${resp.error.message}`);
@@ -888,7 +909,7 @@ export async function topUpShields(ctx: RoutineContext, targetPct: number = 0.8)
 
 export async function useRepairKits(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
-  await bot.refreshStatus(); // ensure docked flag is fresh
+  await bot.refreshShip(); // ensure docked flag is fresh
   if (bot.docked) {
     return false; // never burn expensive repair kits at a station — repairShip() uses the station's repair command instead
   }
@@ -916,7 +937,7 @@ export async function useRepairKits(ctx: RoutineContext): Promise<boolean> {
   const resp = await bot.exec("use_item", { id: kitItem!.itemId, quantity: qty });
   if (!resp.error) {
     ctx.log("combat", `Used ${qty}x ${kitItem!.itemId} (+~${qty * hpPer} hull)`);
-    await bot.refreshStatus();
+    await bot.refreshShip();
     return true;
   } else {
     ctx.log("combat", `Repair kit use failed: ${resp.error.message}`);
@@ -1072,7 +1093,7 @@ export async function monitorAndHandleBattleFlee(ctx: RoutineContext): Promise<v
       }
 
       // Check our hull
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
 
       if (hullPct <= hullFleeThreshold) {
@@ -1115,7 +1136,8 @@ export async function safetyCheck(
   opts: { fuelThresholdPct: number; hullThresholdPct: number },
 ): Promise<boolean> {
   const { bot } = ctx;
-  await bot.refreshStatus();
+  await bot.refreshShip();
+  await bot.refreshLocation();
 
   const hullPct = bot.maxHull > 0 ? Math.round((bot.hull / bot.maxHull) * 100) : 100;
   if (hullPct <= 40) {
@@ -1148,10 +1170,11 @@ export async function safetyCheck(
 export async function ensureFueled(
   ctx: RoutineContext,
   thresholdPct: number,
-  opts?: { noJettison?: boolean },
+  opts?: { noJettison?: boolean; skipBlacklist?: boolean; homeSystem?: string },
 ): Promise<boolean> {
   const { bot } = ctx;
-  await bot.refreshStatus();
+  await bot.refreshShip();
+  await bot.refreshLocation();
   let fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (fuelPct >= thresholdPct) return true;
 
@@ -1160,7 +1183,7 @@ export async function ensureFueled(
   // ── STEP 1: Convert all cargo fuel cells to fuel ────────────────────────
   // premium_fuel_cell, military_fuel_cell, x_fuel_cell, fuel_cell are consumed
   // via the refuel command even while docked at a station.
-  await bot.refreshStatus();
+  await bot.refreshShip();
   const wasDocked = bot.docked;
   const { pois } = await getSystemInfo(ctx);
   const dockingStation = wasDocked ? pois.find(p => isStationPoi(p) && p.id === bot.poi) : undefined;
@@ -1185,7 +1208,7 @@ export async function ensureFueled(
       break;
     }
     cargoFuelAttempts++;
-    await bot.refreshStatus();
+    await bot.refreshShip();
     fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
     if (fuelPct >= thresholdPct) {
       ctx.log("system", `Refueled from cargo fuel cells — fuel now ${fuelPct}%`);
@@ -1195,6 +1218,29 @@ export async function ensureFueled(
 
   if (fuelPct >= thresholdPct) {
     return true;
+  }
+
+  // Hunters (skipBlacklist=true) with homeSystem configured should go directly home to refuel
+  if (opts?.skipBlacklist && opts?.homeSystem) {
+    const homeSystem = opts.homeSystem;
+    ctx.log("system", `Hunter mode: navigating to home system ${homeSystem} for refueling...`);
+    const navResult = await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: 10, hullThresholdPct: 50, noJettison: true, skipBlacklist: true });
+    if (navResult) {
+      await bot.refreshLocation();
+      await getSystemInfo(ctx);
+      const homeStation = findStation(pois);
+      if (homeStation) {
+        await ensureDocked(ctx);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+        await bot.refreshShip();
+        const newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+        if (newFuel >= thresholdPct) {
+          ctx.log("system", `Refueled at home — fuel now ${newFuel}%`);
+          return true;
+        }
+      }
+    }
+    // If we couldn't reach home or refuel there, continue to other options
   }
 
   // Check for approved fuel stations FIRST
@@ -1218,21 +1264,60 @@ export async function ensureFueled(
   }
 
   const currentStation = pois.find(p => isStationPoi(p) && p.id === bot.poi);
-  if (currentStation && isApprovedFuelStation(currentStation.id, readSettings(), bot.system)) {
+  const isCurrentStationApproved = currentStation && (opts?.skipBlacklist || isApprovedFuelStation(currentStation.id, readSettings(), bot.system));
+  if (isCurrentStationApproved) {
     ctx.log("system", `Cargo fuel cells empty — attempting station refuel at ${currentStation.name}...`);
-    const ok = await refuelAtStation(ctx, currentStation, thresholdPct);
+    const ok = await refuelAtStation(ctx, currentStation, thresholdPct, { skipApprovedCheck: opts?.skipBlacklist });
     if (ok) return true;
+  } else if (currentStation) {
+    ctx.log("system", `Station ${currentStation.name} is not on approved fuel list — checking if can reach home...`);
+    const homeSystem = opts?.homeSystem || readSettings().homeSystem;
+    if (homeSystem && typeof homeSystem === "string") {
+      try {
+        const routeResp = await bot.exec("find_route", { target_system: homeSystem });
+        const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; fuel_per_jump?: number; fuel_available?: number; estimated_fuel?: number } | null;
+        if (routeData?.found && routeData?.fuel_available !== undefined && routeData?.estimated_fuel !== undefined) {
+          const canMakeItHome = routeData.fuel_available >= routeData.estimated_fuel;
+          ctx.log("system", `Route to home: ${routeData.total_jumps} jumps, need ${routeData.estimated_fuel} fuel, have ${routeData.fuel_available}`);
+          if (canMakeItHome) {
+            ctx.log("system", `Can reach home (${routeData.fuel_available} fuel >= ${routeData.estimated_fuel} needed) — navigating home to refuel`);
+            await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: thresholdPct, hullThresholdPct: 50, noJettison: true });
+            await bot.refreshLocation();
+            const { pois: homePois } = await getSystemInfo(ctx);
+            const homeStation = findStation(homePois);
+            if (homeStation) {
+              await bot.exec("travel", { target_poi: homeStation.id });
+              await bot.exec("dock");
+              bot.docked = true;
+              await tryRefuel(ctx);
+              await bot.refreshShip();
+              const newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+              if (newFuel >= thresholdPct) {
+                ctx.log("system", `Refueled at home — fuel now ${newFuel}%`);
+                return true;
+              }
+            }
+            return false;
+          } else {
+            ctx.log("system", `Cannot reach home (${routeData.fuel_available} fuel < ${routeData.estimated_fuel} needed) — stranded`);
+            return false;
+          }
+        }
+      } catch (e) {
+        ctx.log("system", `Could not check route home: ${e}`);
+      }
+    }
   }
 
   // ── STEP 4: Scavenge wrecks as last resort ──────────────────────────────
   if (bot.fuel <= 1) {
     ctx.log("system", "Nearly out of fuel — scavenging for fuel cells...");
     const looted = await scavengeWrecks(ctx, { fuelOnly: true });
-    if (looted > 0) {
-      const scavRefuel = await bot.exec("refuel");
-      if (!scavRefuel.error) {
-        await bot.refreshStatus();
-        fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+if (looted > 0) {
+        const scavRefuel = await bot.exec("refuel");
+        if (!scavRefuel.error) {
+          await bot.refreshShip();
+          fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         if (fuelPct >= thresholdPct) {
           ctx.log("system", `Scavenged fuel cells — fuel now ${fuelPct}%`);
           return true;
@@ -1243,7 +1328,7 @@ export async function ensureFueled(
 
   // ── STEP 5: Find nearest known station with fuel ────────────────────────
   ctx.log("system", "No station in current system — searching known map for nearest station...");
-  const blacklist = getSystemBlacklist();
+  const blacklist = opts?.skipBlacklist ? [] : getSystemBlacklist();
   const approvedSet = new Set<string>();
   for (const entry of approvedFuelStations) {
     approvedSet.add(entry);
@@ -1278,7 +1363,7 @@ export async function ensureFueled(
     if (route && route.length > 1) {
       for (let i = 1; i < route.length; i++) {
         if (bot.state !== "running") return false;
-        await bot.refreshStatus();
+        await bot.refreshLocation();
         const preFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
         if (preFuel < 10) {
           ctx.log("error", `Fuel too low (${preFuel}%) to reach station — emergency recovery...`);
@@ -1301,7 +1386,7 @@ export async function ensureFueled(
     }
   }
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   await ensureUndocked(ctx);
   ctx.log("travel", `Traveling to ${nearest.poiName}...`);
   const tResp = await bot.exec("travel", { target_poi: nearest.poiId });
@@ -1321,8 +1406,8 @@ export async function ensureFueled(
     return await emergencyFuelRecovery(ctx);
   }
 
-  await tryRefuel(ctx);
-  await bot.refreshStatus();
+  await tryRefuel(ctx, { skipApprovedCheck: opts?.skipBlacklist });
+  await bot.refreshShip();
   let newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   ctx.log("system", `Refueled at ${nearest.poiName} — Fuel: ${newFuel}%`);
 
@@ -1330,7 +1415,7 @@ export async function ensureFueled(
     ctx.log("system", `Fuel still below threshold (${newFuel}% < ${thresholdPct}%) — staying docked and waiting...`);
     for (let w = 0; w < REFUEL_WAIT_RETRIES && bot.state === "running"; w++) {
       await sleep(REFUEL_WAIT_INTERVAL);
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const refuelResp = await bot.exec("refuel");
       if (refuelResp.error) {
         const msg = refuelResp.error.message.toLowerCase();
@@ -1339,7 +1424,7 @@ export async function ensureFueled(
           return false;
         }
       }
-      await bot.refreshStatus();
+      await bot.refreshShip();
       newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (newFuel >= thresholdPct) {
         ctx.log("system", `Fuel recovered to ${newFuel}% — resuming`);
@@ -1349,7 +1434,7 @@ export async function ensureFueled(
     }
   }
 
-  await bot.refreshStatus();
+  await bot.refreshShip();
   newFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   ctx.log("system", "Undocking...");
   await bot.exec("undock");
@@ -1371,7 +1456,7 @@ const HOME_STATION_NAME = "Sol Central";
  */
 export async function travelToHomeStation(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   if (bot.poi === HOME_STATION_POI) return true;
 
   // Resolve POI id (live local first, fallback to stored map data)
@@ -1398,7 +1483,7 @@ export async function travelToHomeStation(ctx: RoutineContext): Promise<boolean>
   if (unknown) {
     ctx.log("warn", `${HOME_STATION_NAME} not in local travel list from ${bot.poi} — settling position and retry...`);
     await ctx.sleep(1500);
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     ({ resp, unknown } = await attemptTravel(stationPoi));
   }
   if (unknown) {
@@ -1426,7 +1511,7 @@ export async function depositCargoAtHome(
   opts: { fuelThresholdPct: number; hullThresholdPct: number } = { fuelThresholdPct: 40, hullThresholdPct: 30 },
 ): Promise<boolean> {
   const { bot } = ctx;
-  await bot.refreshStatus();
+  await bot.refreshCargoAndStorage();
 
   ctx.log("trade", `Cargo full (${bot.cargo}/${bot.cargoMax}) — returning to ${HOME_STATION_NAME} to deposit...`);
 
@@ -1534,7 +1619,7 @@ export async function navigateToSystem(
   const normalizeSystemName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
 
   for (let attempt = 0; attempt < MAX_JUMPS; attempt++) {
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     // Case-insensitive comparison for system names (handle underscore vs space)
     if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
       ctx.log("travel", `Already at ${targetSystemId} (normalized: "${normalizeSystemName(bot.system)}" === "${normalizeSystemName(targetSystemId)}")`);
@@ -1591,7 +1676,7 @@ export async function navigateToSystem(
         // Server returned no route - check if we might already be at the target
         // This can happen due to case mismatch or if we're already there
         ctx.log("warn", `Server returned no route to ${targetSystemId} — checking if already arrived...`);
-        await bot.refreshStatus();
+        await bot.refreshLocation();
         if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
           ctx.log("travel", `Confirmed at ${targetSystemId} after failed route lookup (normalized comparison)`);
           return true;
@@ -1631,14 +1716,14 @@ export async function navigateToSystem(
     }
 
     // Fuel check — MUST have adequate fuel before jumping
-    const fueled = await ensureFueled(ctx, Math.max(opts.fuelThresholdPct, 1), { noJettison: opts.noJettison }); //changed to 1.
+    const fueled = await ensureFueled(ctx, Math.max(opts.fuelThresholdPct, 1), { noJettison: opts.noJettison, skipBlacklist: opts.skipBlacklist }); //changed to 1.
     if (!fueled) {
       ctx.log("error", "Cannot secure fuel for jump — aborting navigation");
       return false;
     }
 
     // CRITICAL: Re-check position after ensureFueled — it may have moved us to a different system!
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) return true;
 
     // Recalculate route from CURRENT position (ensureFueled may have moved us, use blacklist)
@@ -1835,8 +1920,8 @@ export async function navigateToSystem(
 
       // Special case: "already in" means we're already at the target system
       if (errorMsg.includes("you are already in")) {
-        ctx.log("travel", `Server says already in system — refreshing status to verify position...`);
-        await bot.refreshStatus();
+        ctx.log("travel", `Server says already in system — refreshing location to verify position...`);
+        await bot.refreshLocation();
         // Check if we're actually at the target system
         if (normalizeSystemName(bot.system) === normalizeSystemName(targetSystemId)) {
           ctx.log("travel", `Confirmed: already at target ${targetSystemId}`);
@@ -1854,8 +1939,8 @@ export async function navigateToSystem(
         ctx.log("travel", `Waiting ${waitTime/1000}s before retry...`);
         await sleep(waitTime);
 
-        // CRITICAL: Refresh status and recalculate route after wait
-        await bot.refreshStatus();
+        // CRITICAL: Refresh location and recalculate route after wait
+        await bot.refreshLocation();
         if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) return true;
 
         // Recalculate route from CURRENT position (may have changed during wait, use blacklist)
@@ -1889,7 +1974,7 @@ export async function navigateToSystem(
       return false;
     }
 
-    await bot.refreshStatus();
+    await bot.refreshLocation();
 
     // Check for customs inspection after entering new system
     await checkCustomsInspection(ctx, nextSystem);
@@ -1941,7 +2026,7 @@ export async function navigateToSystem(
     ctx.log("travel", `Arrived in ${bot.system}`);
     if (bot.system.toLowerCase() === targetSystemId.toLowerCase()) {
       await sleep(1000);
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       return true;
     }
     if (bot.state !== "running") return false;
@@ -1952,16 +2037,18 @@ export async function navigateToSystem(
 }
 
 /** Refuel at a specific station POI if fuel is below threshold. Handles travel/dock/undock.
- *  Returns true if successfully refueled, false if stranded. */
+ *  Returns true if successfully refueled, false if stranded.
+ *  @param opts.skipApprovedCheck If true, bypass the approved fuel station check. */
 export async function refuelAtStation(
   ctx: RoutineContext,
   station: { id: string; name: string },
   thresholdPct: number,
+  opts?: { skipApprovedCheck?: boolean },
 ): Promise<boolean> {
   const { bot } = ctx;
-  await bot.refreshStatus();
+  await bot.refreshLocation();
 
-  if (!isApprovedFuelStation(station.id, readSettings(), bot.system)) {
+  if (!opts?.skipApprovedCheck && !isApprovedFuelStation(station.id, readSettings(), bot.system)) {
     ctx.log("system", `Refuel skipped at ${station.name} — not on approved fuel list`);
     return false;
   }
@@ -2010,13 +2097,13 @@ export async function refuelAtStation(
   await tryRefuel(ctx);
 
   // Verify refuel actually worked — do NOT undock if fuel is dangerously low
-  await bot.refreshStatus();
+  await bot.refreshShip();
   let newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (newFuelPct < thresholdPct) {
     ctx.log("system", `Fuel still at ${newFuelPct}% after refuel — waiting at ${station.name}...`);
     for (let w = 0; w < REFUEL_WAIT_RETRIES && bot.state === "running"; w++) {
       await sleep(REFUEL_WAIT_INTERVAL);
-      await bot.refreshStatus();
+      await bot.refreshShip();
       const refuelResp = await bot.exec("refuel");
       if (refuelResp.error) {
         const msg = refuelResp.error.message.toLowerCase();
@@ -2026,7 +2113,7 @@ export async function refuelAtStation(
           break;
         }
       }
-      await bot.refreshStatus();
+      await bot.refreshShip();
       newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
       if (newFuelPct >= thresholdPct) {
         ctx.log("system", `Fuel recovered to ${newFuelPct}% — resuming`);
@@ -2036,7 +2123,7 @@ export async function refuelAtStation(
     }
   }
 
-  await bot.refreshStatus();
+  await bot.refreshShip();
   newFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
   if (newFuelPct < thresholdPct) {
     ctx.log("error", `Could not refuel at ${station.name} — fuel still at ${newFuelPct}% (threshold: ${thresholdPct}%)`);
@@ -2157,7 +2244,7 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
   }
 
   // Skip if cargo is already full or nearly full (less than 5 free)
-  await bot.refreshStatus();
+  await bot.refreshCargo();
   if (bot.cargoMax > 0 && bot.cargoMax - bot.cargo < 5) return 0;
 
   const fuelOnly = opts?.fuelOnly ?? false;
@@ -2173,7 +2260,7 @@ export async function scavengeWrecks(ctx: RoutineContext, opts?: { fuelOnly?: bo
     if (bot.state !== "running") break;
 
     // Check cargo space
-    await bot.refreshStatus();
+    await bot.refreshCargo();
     if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
       ctx.log("scavenge", "Cargo full — stopping scavenge");
       break;
@@ -2292,7 +2379,7 @@ export async function fullSalvageWrecks(
   for (const wreck of wrecks) {
     if (bot.state !== "running") break;
 
-    await bot.refreshStatus();
+    await bot.refreshCargo();
     if (bot.cargoMax > 0 && bot.cargo >= bot.cargoMax) {
       ctx.log("scavenge", "Cargo full — stopping salvage");
       break;
@@ -2372,7 +2459,7 @@ export async function fullSalvageWrecks(
       }
 
       // Check if we already have a tow attached
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       if (bot.towingWreck) {
         ctx.log("scavenge", "Already towing a wreck — stopping salvage and heading to salvage yard");
         break; // Exit the wrecks loop entirely
@@ -2462,8 +2549,8 @@ export async function fullSalvageWrecks(
     ctx.log("scavenge", `Towing ${towedWrecks.length} wreck(s) to salvage yard: ${towedWrecks.map(w => w.name).join(", ")}`);
   }
 
-  // Refresh status to get latest towing state
-  await bot.refreshStatus();
+  // Refresh location to get latest towing state
+  await bot.refreshLocation();
   ctx.log("debug", `fullSalvageWrecks returning: itemsLooted=${totalLooted}, towedWrecks=${towedWrecks.length}, bot.towingWreck=${bot.towingWreck}`);
   return { itemsLooted: totalLooted, isTowing: bot.towingWreck };
 }
@@ -2490,7 +2577,7 @@ export async function processTowedWrecks(
   const preferScrap = opts?.preferScrap ?? false;
 
   // Check if we're towing a wreck
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   if (!bot.towingWreck) {
     return 0; // No towed wreck to process
   }
@@ -2526,7 +2613,7 @@ export async function processTowedWrecks(
 
     // Loot ALL modules and cargo from the wreck (no item_id specified = loots everything to cargo hold)
     // Check cargo space first
-    await bot.refreshStatus();
+    await bot.refreshCargo();
     const moduleCargoCost = towedWreck.modules.length * 10; // Typical module size is 10 each
     if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
       ctx.log("scavenge", `Cargo full while looting modules (${bot.cargo}/${bot.cargoMax}) — depositing items to make space...`);
@@ -2549,7 +2636,7 @@ export async function processTowedWrecks(
         ctx.log("warn", "No items to deposit — cannot make space for modules");
       } else {
         // Re-check cargo after deposit
-        await bot.refreshStatus();
+        await bot.refreshCargo();
         if (bot.cargoMax > 0 && (bot.cargo + moduleCargoCost) > bot.cargoMax) {
           ctx.log("warn", "Still no cargo space after deposit — skipping module loot");
         }
@@ -2740,7 +2827,7 @@ export async function processTowedWrecks(
     bot.towingWreckId = null;
   }
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   return processed;
 }
 
@@ -2893,7 +2980,7 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
     const r = insureResp.result as Record<string, unknown> | undefined;
     const msg = (r?.message as string) || `Insurance purchased for ${cost}cr`;
     ctx.log("info", msg);
-    await bot.refreshStatus();
+    await bot.refreshLocation();
   } else if (insureResp.error.message.toLowerCase().includes("already")) {
     // silently skip
   }
@@ -2901,6 +2988,10 @@ export async function ensureInsured(ctx: RoutineContext): Promise<void> {
 
 export async function buyInsurance(ctx: RoutineContext): Promise<void> {
   const { bot } = ctx;
+  if (!bot.docked) {
+    ctx.log("insurance", "Cannot buy insurance - not docked");
+    return;
+  }
   ctx.log("insurance", "Buying insurance for 7 days...");
   const insureResp = await bot.exec("buy_insurance", { ticks: 9999 });
   if (!insureResp.error && insureResp.result) {
@@ -2908,7 +2999,7 @@ export async function buyInsurance(ctx: RoutineContext): Promise<void> {
     const msg = (r?.message as string) || `Insurance purchased for 7 days`;
     ctx.log("insurance", msg);
     logFactionActivity(ctx, "insurance", `Bought insurance: ${msg}`);
-    await bot.refreshStatus();
+    await bot.refreshLocation();
   } else {
     const errMsg = insureResp.error?.message || "Unknown error";
     if (errMsg.toLowerCase().includes("already_insured")) {
@@ -2927,7 +3018,7 @@ export async function buyInsurance(ctx: RoutineContext): Promise<void> {
  */
 export async function detectAndRecoverFromDeath(ctx: RoutineContext): Promise<boolean> {
   const { bot } = ctx;
-  await bot.refreshStatus();
+  await bot.refreshShip();
 
   if (bot.hull > 0 && !bot.isDead) return true; // alive
 
@@ -2942,14 +3033,14 @@ export async function detectAndRecoverFromDeath(ctx: RoutineContext): Promise<bo
   }
 
   // Refresh — we may have respawned
-  await bot.refreshStatus();
+  await bot.refreshShip();
 
   if (bot.hull <= 0 && bot.maxHull > 0) {
     ctx.log("error", "Still dead after insurance claim — waiting for respawn...");
     // Wait up to 60s for respawn
     for (let i = 0; i < 6; i++) {
       await sleep(10_000);
-      await bot.refreshStatus();
+      await bot.refreshShip();
       if (bot.hull > 0) break;
     }
     if (bot.hull <= 0 && bot.maxHull > 0) {
@@ -2975,7 +3066,7 @@ export async function detectAndRecoverFromDeath(ctx: RoutineContext): Promise<bo
     }
   }
 
-  await bot.refreshStatus();
+  await bot.refreshShip();
   ctx.log("system", `Recovery complete — hull: ${bot.hull}/${bot.maxHull}, credits: ${bot.credits}`);
   return true;
 }
@@ -3930,9 +4021,9 @@ export async function emergencyFleeFromPirates(
   // We have 20 seconds (2 ticks) to leave before they attack
   ctx.log("combat", "Not in battle - attempting emergency jump!");
 
-  // CRITICAL: Verify actual current system via get_status before selecting jump target
+  // CRITICAL: Verify actual current system via get_location before selecting jump target
   // This prevents jumping to non-connected systems when tracking gets mixed up
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   const actualCurrentSystem = bot.system;
   const actualCurrentPoi = bot.poi;
   ctx.log("travel", `Verified actual position: system=${actualCurrentSystem}, poi=${actualCurrentPoi}`);
@@ -4016,7 +4107,7 @@ export async function emergencyFleeFromPirates(
       }
 
       // Also verify we're still in the same system (jump hasn't silently succeeded)
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       if (bot.system !== actualCurrentSystem) {
         ctx.log("travel", `[EMERGENCY] System changed during poll - jump succeeded to ${bot.system}`);
         jumpCompleted = true;
@@ -4044,7 +4135,7 @@ export async function emergencyFleeFromPirates(
   // If battle was detected during polling and flee was already issued, check if we survived
   if (fleeIssued) {
     // Flee was already issued - check if we're still alive and in battle
-    await bot.refreshStatus();
+    await bot.refreshLocation();
     if (bot.isInBattle()) {
       // Still in battle after flee - try again
       ctx.log("combat", "Still in battle after emergency flee - retrying flee stance!");
@@ -4069,7 +4160,7 @@ export async function emergencyFleeFromPirates(
   }
 
   // Verify jump succeeded by checking system
-  await bot.refreshStatus();
+  await bot.refreshLocation();
   if (bot.system === actualCurrentSystem) {
     ctx.log("error", `Jump reported success but still in ${actualCurrentSystem} - jump may have silently failed!`);
     
@@ -4289,7 +4380,6 @@ export async function smartTravel(
   ctx: RoutineContext,
   stationId: string,
   opts?: {
-    target_system?: string;
     fuelThresholdPct?: number;
     hullThresholdPct?: number;
     noJettison?: boolean;
@@ -4298,13 +4388,12 @@ export async function smartTravel(
 ): Promise<{ success: boolean; usedHint: boolean; hintSystem?: string }> {
   const { bot } = ctx;
   const maxRetries = 3;
-  let currentTargetSystemId = opts?.target_system ?? getMobileCapitolSystem();
   let hintSystem: string | null = null;
   let usedHint = false;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    ctx.log("travel", `Traveling to ${stationId}${currentTargetSystemId ? ` in ${currentTargetSystemId}` : ""}... (attempt ${attempt + 1}/${maxRetries})`);
-    const travelResp = await bot.exec("travel", { target_poi: stationId, target_system: currentTargetSystemId });
+    ctx.log("travel", `Traveling to ${stationId}... (attempt ${attempt + 1}/${maxRetries})`);
+    const travelResp = await bot.exec("travel", { target_poi: stationId });
 
     if (!travelResp.error) {
       ctx.log("travel", `Arrived at ${stationId}`);
@@ -4344,7 +4433,6 @@ export async function smartTravel(
       }
 
       ctx.log("travel", `Jumped to ${hintSystem}, retrying travel to ${stationId}...`);
-      currentTargetSystemId = hintSystem;
       hintSystem = null;
     }
   }
@@ -4372,8 +4460,8 @@ export async function travelToStationWithHint(
   let usedHint = false;
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
-    ctx.log("travel", `Traveling to ${stationName || stationId} in ${targetSystemId}... (attempt ${attempt + 1}/${maxRetries})`);
-    const travelResp = await bot.exec("travel", { target_poi: stationId, target_system: targetSystemId });
+    ctx.log("travel", `Traveling to ${stationName || stationId}... (attempt ${attempt + 1}/${maxRetries})`);
+    const travelResp = await bot.exec("travel", { target_poi: stationId });
 
     if (!travelResp.error) {
       ctx.log("travel", `Arrived at ${stationName || stationId}`);

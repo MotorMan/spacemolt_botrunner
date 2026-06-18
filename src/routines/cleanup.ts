@@ -700,7 +700,7 @@ async function cleanHomeStationStorage(ctx: RoutineContext, settings: ReturnType
 export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
   const { bot } = ctx;
 
-  await bot.refreshStatus();
+  await bot.refreshLocation();
 
   let emptyScanCount = 0;
 
@@ -1083,7 +1083,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
         // CRITICAL FIX: Check cargo after travel attempt (success or failure)
         // If travel failed but we still have full cargo, return home to deposit first
         // This prevents the "full cargo at remote station" bug
-        await bot.refreshStatus();
+        await bot.refreshCargo();
         const postTravelCargoPct = bot.cargoMax > 0 ? (bot.cargo / bot.cargoMax) : 0;
         
         if (postTravelCargoPct >= 0.95) {
@@ -1114,8 +1114,8 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       await ensureUndocked(ctx);
       
       // Force refresh status to get accurate poi after undocking
-      await bot.refreshStatus();
-      
+      await bot.refreshLocation();
+
       ctx.log("travel", `At ${bot.poi}, target is ${station.poiId} - traveling...`);
       if (bot.poi !== station.poiId) {
         const tResp = await bot.exec("travel", { target_poi: station.poiId });
@@ -1145,7 +1145,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       
       // CRITICAL FIX: After intra-system travel (travel to station POI), check cargo
       // If cargo is now full, return home to deposit before attempting dock/collection
-      await bot.refreshStatus();
+      await bot.refreshCargo();
       const afterTravelCargoPct = bot.cargoMax > 0 ? (bot.cargo / bot.cargoMax) : 0;
       if (afterTravelCargoPct >= 0.95) {
         ctx.log("warn", `Cargo full (${Math.round(afterTravelCargoPct * 100)}%) after travel to ${station.poiName} — returning home to deposit first`);
@@ -1157,7 +1157,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       }
 
       // Explicit dock attempt - don't use ensureDocked's complex logic
-      await bot.refreshStatus();
+      await bot.refreshLocation();
       if (!bot.docked) {
         ctx.log("system", `Docking at ${station.poiName}...`);
         const dockResp = await bot.exec("dock");
@@ -1169,7 +1169,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
             const travelResp = await bot.exec("travel", { target_poi: station.poiId });
             if (!travelResp.error || travelResp.error.message.toLowerCase().includes("already")) {
               bot.poi = station.poiId;
-              await bot.refreshStatus();
+              await bot.refreshLocation();
               const retryDock = await bot.exec("dock");
               if (retryDock.error) {
                 ctx.log("error", `Retry dock failed: ${retryDock.error.message}`);
@@ -1178,7 +1178,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
             }
           }
         }
-        await bot.refreshStatus();
+        await bot.refreshLocation();
         if (!bot.docked) {
           ctx.log("error", `Still not docked after attempt — skipping`);
           continue;
@@ -1249,7 +1249,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
           Array.isArray(orders.buy_orders) ? [...(orders.buy_orders as unknown[]), ...(orders.sell_orders as unknown[] || [])] :
           []
         ) as Array<Record<string, unknown>>;
-        for (const order of orderList) {
+for (const order of orderList) {
           const orderId = (order.order_id as string) || (order.id as string) || "";
           if (orderId) {
             const cResp = await bot.exec("cancel_order", { order_id: orderId });
@@ -1264,7 +1264,7 @@ export const cleanupRoutine: Routine = async function* (ctx: RoutineContext) {
       await tryRefuel(ctx);
 
       // If cargo >= 80% full, deposit at home before continuing
-      await bot.refreshStatus();
+      await bot.refreshCargo();
       const usedPct = bot.cargoMax > 0 ? (bot.cargo / bot.cargoMax) * 100 : 0;
       if (usedPct >= 80) {
         yield "deposit_home";

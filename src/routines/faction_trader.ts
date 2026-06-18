@@ -81,6 +81,7 @@ function getFactionTraderSettings(username?: string): {
   tradeItems: TradeItemConfig[];
   stationPriority: boolean;
   categoryTrade: CategoryTradeConfig[];
+  sellAllItems: boolean;
 } {
   const all = readSettings();
   const general = all.general || {};
@@ -131,6 +132,7 @@ function getFactionTraderSettings(username?: string): {
     tradeItems,
     stationPriority: (botOverrides.stationPriority as boolean) || false,
     categoryTrade,
+    sellAllItems: (t.sellAllItems as boolean) || false,
   };
 }
 
@@ -163,7 +165,8 @@ function isValidDestination(ctx: RoutineContext, systemId: string, poiId: string
     ctx.log("error", `Destination POI ${poiId} not found in system ${systemId}`);
     return false;
   }
-  if (!poi.has_base) {
+  // Check for either has_base OR base_id (some stations have base_id but not has_base)
+  if (!poi.has_base && !poi.base_id) {
     ctx.log("error", `Destination ${poi.name} (${poiId}) in ${systemId} is not a valid station (no dock)`);
     return false;
   }
@@ -351,6 +354,15 @@ function getItemMarketCost(itemId: string): number {
   return cheapest === Infinity ? 0 : cheapest;
 }
 
+/** Check if an item is a high-value item (potential profit > threshold). */
+function isHighValueItem(itemId: string, minProfitThreshold: number = 1000000): boolean {
+  const bestBuy = findBestBuyForItem(itemId);
+  if (!bestBuy || bestBuy.price <= 0) return false;
+  const marketCost = getItemMarketCost(itemId);
+  const potentialProfit = bestBuy.price - (marketCost > 0 ? marketCost : 0);
+  return potentialProfit >= minProfitThreshold;
+}
+
 /**
  * Calculate optimal sell quantity based on actual buy orders at destination.
  * Calls view_market to get real buy orders with quantities.
@@ -528,7 +540,7 @@ function findFactionSellRoutes(
   const costPerJump = settings.fuelCostPerJump;
 
   // Collect items to process: explicit trade items + category-based items
-  const itemsToProcess: Array<{ item: typeof storage[0]; source: 'explicit' | 'category'; categoryConfig?: CategoryTradeConfig }> = [];
+  const itemsToProcess: Array<{ item: typeof storage[0]; source: 'explicit' | 'category' | 'all'; categoryConfig?: CategoryTradeConfig }> = [];
   const processedItemIds = new Set<string>();
 
   // First, add explicit trade items
@@ -568,6 +580,31 @@ function findFactionSellRoutes(
     }
   }
 
+  // Finally, if sellAllItems is enabled, add remaining storage items
+  if (settings.sellAllItems) {
+    for (const item of storage) {
+      const lower = item.itemId.toLowerCase();
+      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+      if (item.quantity <= 0) continue;
+      if (processedItemIds.has(item.itemId)) continue;
+
+      itemsToProcess.push({ item, source: 'all' });
+      processedItemIds.add(item.itemId);
+    }
+  }
+
+  // Sort items by potential profit (highest first) to prioritize valuable items
+  // This ensures we process high-value items first, even before category items
+  itemsToProcess.sort((a, b) => {
+    const bestBuyA = findBestBuyForItem(a.item.itemId);
+    const bestBuyB = findBestBuyForItem(b.item.itemId);
+    const priceA = bestBuyA?.price || 0;
+    const priceB = bestBuyB?.price || 0;
+    return priceB - priceA;
+  });
+  
+  ctx.log("trade", `Processing ${itemsToProcess.length} items (global min: ${settings.minSellPrice})`);
+
   // Now process all collected items
   for (const { item, source, categoryConfig } of itemsToProcess) {
     // Get per-item settings (case-insensitive match)
@@ -591,12 +628,10 @@ function findFactionSellRoutes(
       
       // Calculate min sell price from best buy price
       itemMinSellPrice = calculateCategoryMinSellPrice(item.itemId, categoryConfig.pricePercentOfBestBuy);
-      
-      ctx.log("trade", `Category ${categoryConfig.category}: ${item.quantity}x ${item.name}, selling ${itemMaxSellQty} (${sellPercent}%), min price ${itemMinSellPrice}cr`);
     } else {
-      // Fallback to defaults
+      // 'all' source - use global minSellPrice
       itemMinSellPrice = settings.minSellPrice;
-      itemMaxSellQty = 0;
+      itemMaxSellQty = 0; // 0 = sell all
       itemSoldQty = 0;
     }
     
@@ -610,22 +645,27 @@ function findFactionSellRoutes(
       .filter(b => b.itemId === item.itemId && b.price > 0)
       .sort((a, b) => b.price - a.price);
 
-    // Material cost = cheapest known market price (what this item is worth)
-    const materialCost = getItemMarketCost(item.itemId);
+    if (buyers.length === 0) {
+      ctx.log("trade", `No buyers for ${item.name} - skipping`);
+      continue;
+    }
+
+    // Material cost = 0 for faction items (we already own them)
+    const materialCost = 0;
 
     for (const buy of buyers) {
-      if (itemMinSellPrice > 0 && buy.price < itemMinSellPrice) continue;
-
-      // Verify destination is a valid station with a market
-      if (!isValidDestination(ctx, buy.systemId, buy.poiId)) {
-        ctx.log("error", `Skipping corrupt destination: ${buy.poiName} (${buy.systemId})`);
+      if (itemMinSellPrice > 0 && buy.price < itemMinSellPrice) {
         continue;
       }
 
-      // Check if this buy order is locked by another bot
+      // Verify destination is still valid
+      if (!isValidDestination(ctx, buy.systemId, buy.poiId)) {
+        continue;
+      }
+
       const existingLock = getBuyOrderLock(item.itemId, buy.poiId, buy.price);
+
       if (existingLock) {
-        ctx.log("trade", `Skipping buy order at ${buy.poiName} (${buy.price}cr) — locked by ${existingLock.lockedBy}`);
         continue;
       }
 
@@ -667,6 +707,7 @@ function findFactionSellRoutes(
 
   // Sort by profit (not raw revenue) to pick the most profitable after fuel
   routes.sort((a, b) => b.totalProfit - a.totalProfit);
+  
   return routes;
 }
 
@@ -1118,11 +1159,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
     const foundRoutes = findFactionSellRoutes(ctx, settings, bot.system, cargoCapacity, personalMode);
 
     // Station priority: put routes whose destination is the home station first
+    // BUT maintain profit ordering within each group
     if (settings.stationPriority && settings.homeSystem) {
-      const homeStation = mapStore.findNearestStation(settings.homeSystem);
-      if (homeStation) {
-        const homeRoutes = foundRoutes.filter(r => r.destSystem === settings.homeSystem && r.destPoi === homeStation.id);
-        const otherRoutes = foundRoutes.filter(r => !(r.destSystem === settings.homeSystem && r.destPoi === homeStation.id));
+      const homeStationId = settings.homeStation;
+      if (homeStationId) {
+        const homeRoutes = foundRoutes.filter(r => r.destSystem === settings.homeSystem && r.destPoi === homeStationId);
+        const otherRoutes = foundRoutes.filter(r => !(r.destSystem === settings.homeSystem && r.destPoi === homeStationId));
         if (homeRoutes.length > 0) {
           foundRoutes.length = 0;
           foundRoutes.push(...homeRoutes, ...otherRoutes);
@@ -1168,7 +1210,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
           // Verify destination is a valid station with a market
           if (!isValidDestination(ctx, bestBuyer.systemId, bestBuyer.poiId)) {
-            ctx.log("error", `Skipping corrupt destination: ${bestBuyer.poiName} (${bestBuyer.systemId})`);
+            ctx.log("trade", `Skipping ${bestBuyer.poiName} (${bestBuyer.poiId}) in ${bestBuyer.systemId}: invalid destination`);
             continue;
           }
 
@@ -1259,6 +1301,8 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
 
     // Use existing route if recovered session is being handled, otherwise pick the best found route
     if (!recoveredSessionHandled) {
+      ctx.log("trade", `Found ${foundRoutes.length} routes, selecting best available`);
+      
       // Iterate through found routes to find one with an available lock
       for (const candidateRoute of foundRoutes) {
         // Verify destination is still valid
@@ -1276,6 +1320,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         }
 
         route = candidateRoute;
+        ctx.log("trade", `Selected route: ${route.itemName} (${Math.round(route.totalProfit)}cr profit)`);
         break;
       }
       

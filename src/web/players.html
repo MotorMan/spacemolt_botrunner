@@ -116,6 +116,18 @@
     let filteredPlayers = [];
     let shipTierMap = {};
 
+    const FACTION_ALIASES = {
+      busy: 'BUSY',
+      'busy being dead': 'BUSY',
+      '1582cf587c7967d97a0ab2d2e256d233': 'BUSY',
+    };
+
+    function normalizeFaction(faction) {
+      if (!faction) return '';
+      const lower = faction.trim().toLowerCase();
+      return FACTION_ALIASES[lower] || faction.trim().toUpperCase();
+    }
+
     // ── WebSocket Connection ──────────────────────────────
     function connect() {
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -180,12 +192,11 @@
     // ── Populate Filters ─────────────────────────────────
     function populateFilters() {
       const players = Object.values(playerData.players || {});
-      const factions = new Set(players.map(p => p.faction).filter(f => f));
+      const factions = new Set(players.map(p => normalizeFaction(p.faction)).filter(f => f));
       const factionSelect = document.getElementById('factionFilter');
       
-      // Keep "All Factions" option
       factionSelect.innerHTML = '<option value="">All Factions</option>' +
-        [...factions].sort().map(f => `<option value="${f}">${f} (${players.filter(p => p.faction === f).length})</option>`).join('');
+        [...factions].sort().map(f => `<option value="${f}">${f} (${players.filter(p => normalizeFaction(p.faction) === f).length})</option>`).join('');
     }
 
     // ── Filter Players ────────────────────────────────────
@@ -198,11 +209,11 @@
       
       filteredPlayers = players.filter(([key, p]) => {
         if (type && p.type !== type) return false;
-        if (faction && p.faction !== faction) return false;
+        if (faction && normalizeFaction(p.faction) !== faction) return false;
         if (search) {
           const searchLower = search.toLowerCase();
           return (p.name || '').toLowerCase().includes(searchLower) ||
-                 (p.faction || '').toLowerCase().includes(searchLower) ||
+                 normalizeFaction(p.faction).toLowerCase().includes(searchLower) ||
                  (p.ship || '').toLowerCase().includes(searchLower) ||
                  (p.system || '').toLowerCase().includes(searchLower);
         }
@@ -255,11 +266,12 @@
       const rows = filteredPlayers.map(([key, p]) => {
         const lastSeen = new Date(p.lastSeen);
         const timeAgo = getTimeAgo(lastSeen);
-        const factionClass = (p.faction || 'none').replace(/\s/g, '');
+        const faction = normalizeFaction(p.faction);
+        const factionClass = faction.replace(/\s/g, '');
         
         return `<tr>
           <td><strong>${esc(p.name || key)}</strong></td>
-          <td><span class="faction-badge faction-${factionClass}">${esc(p.faction || 'None')}</span></td>
+          <td><span class="faction-badge faction-${factionClass}">${esc(faction || 'None')}</span></td>
           <td><span class="ship-badge">${esc(p.ship || 'Unknown')}</span></td>
           <td>${esc(p.type || 'player')}</td>
           <td>${esc(p.system || '-')}</td>
@@ -282,12 +294,13 @@
       const cards = filteredPlayers.map(([key, p]) => {
         const lastSeen = new Date(p.lastSeen);
         const timeAgo = getTimeAgo(lastSeen);
-        const factionClass = (p.faction || 'none').replace(/\s/g, '');
+        const faction = normalizeFaction(p.faction);
+        const factionClass = faction.replace(/\s/g, '');
         
         return `<div class="player-card">
           <div class="player-card-header">
             <span class="player-card-name">${esc(p.name || key)}</span>
-            <span class="faction-badge faction-${factionClass}">${esc(p.faction || 'None')}</span>
+            <span class="faction-badge faction-${factionClass}">${esc(faction || 'None')}</span>
           </div>
           <div class="player-card-info">
             <div>🚀 ${esc(p.ship || 'Unknown')}</div>
@@ -308,7 +321,7 @@
       const factions = {};
       
       players.forEach(p => {
-        const f = p.faction || 'No Faction';
+        const f = normalizeFaction(p.faction) || 'No Faction';
         if (!factions[f]) factions[f] = [];
         factions[f].push(p);
       });
@@ -351,7 +364,7 @@
         if (!ships[ship]) ships[ship] = { count: 0, players: [], factions: new Set() };
         ships[ship].count++;
         ships[ship].players.push(p.name);
-        if (p.faction) ships[ship].factions.add(p.faction);
+        if (p.faction) ships[ship].factions.add(normalizeFaction(p.faction));
       });
 
       const maxCount = Math.max(...Object.values(ships).map(s => s.count));
@@ -442,13 +455,14 @@
         let statusColor = '#4caf50';
         if (minsAgo > 60) statusColor = '#ff9800';
         if (minsAgo > 1440) statusColor = '#f44336';
+        const faction = normalizeFaction(p.faction);
         
         return `<div class="timeline-item">
           <div style="display:flex;justify-content:space-between;align-items:center">
             <div>
               <strong>${esc(p.name)}</strong>
               <span class="ship-badge" style="margin-left:8px">${esc(p.ship)}</span>
-              <span class="faction-badge faction-${(p.faction || 'none').replace(/\s/g, '')}" style="margin-left:8px">${esc(p.faction || 'None')}</span>
+              <span class="faction-badge faction-${faction.replace(/\s/g, '')}" style="margin-left:8px">${esc(faction || 'None')}</span>
             </div>
             <div style="text-align:right">
               <div style="font-size:12px">${p.system} / ${p.poi}</div>
@@ -466,14 +480,13 @@
     function renderMatrixView() {
       const content = document.getElementById('viewContent');
       const allPlayers = Object.values(playerData.players || {});
-      const factions = [...new Set(allPlayers.map(p => p.faction || 'None').filter(f => f))].sort();
+      const factions = [...new Set(allPlayers.map(p => normalizeFaction(p.faction) || 'None').filter(f => f))].sort();
       const ships = [...new Set(allPlayers.map(p => p.ship || 'Unknown'))].sort();
       
-      // Build matrix
       const matrix = {};
       factions.forEach(f => { matrix[f] = {}; ships.forEach(s => { matrix[f][s] = 0; }); });
       allPlayers.forEach(p => {
-        const f = p.faction || 'None';
+        const f = normalizeFaction(p.faction) || 'None';
         const s = p.ship || 'Unknown';
         if (matrix[f]) matrix[f][s] = (matrix[f][s] || 0) + 1;
       });
@@ -540,7 +553,7 @@
       // Group by faction and count
       const factions = {};
       players.forEach(p => {
-        const f = p.faction || 'None';
+        const f = normalizeFaction(p.faction) || 'None';
         if (!factions[f]) factions[f] = { count: 0, ships: new Set(), systems: new Set() };
         factions[f].count++;
         if (p.ship) factions[f].ships.add(p.ship);

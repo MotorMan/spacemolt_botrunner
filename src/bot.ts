@@ -800,7 +800,37 @@ docked = false;
           const player = (r.player as Record<string, unknown>) || {};
           const p = location || player || r;
 
-          if (command === "mine") {
+          if (command === "get_status") {
+            this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
+            this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+            this.docked = location?.docked_at != null
+              ? !!(location.docked_at)
+              : (p.docked_at_base != null
+                ? !!(p.docked_at_base)
+                : (p.docked as boolean) ?? (p.status === "docked"));
+            this.location =
+              (location?.system_name as string) ||
+              (location?.system_id as string) ||
+              (p.current_system as string) ||
+              (p.location as string) ||
+              this.location;
+
+            this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
+            this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+
+            if (ship) {
+              this.fuel = (ship.fuel as number) ?? this.fuel;
+              this.maxFuel = (ship.max_fuel as number) ?? this.maxFuel;
+              this.cargo = (ship.cargo_used as number) ?? this.cargo;
+              this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
+              this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
+              this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
+              this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
+              this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
+              this.shipSpeed = (ship.speed as number) || 1;
+              this.shipId = (ship.id as string) || "";
+            }
+          } else if (command === "mine") {
             // Mine response is nested under 'details' per OpenAPI spec
             const details = (r.details as Record<string, unknown>) || r;
             const qty = (details.quantity as number) || (details.count as number) || 0;
@@ -812,8 +842,8 @@ docked = false;
               }
             }
           } else if (command === "jump" || command === "travel") {
-            const sysId = (r.system_id as string) || (r.system as string) || (location.system_id as string) || (location.system_name as string);
-            const poiId = (r.poi as string) || (r.poi_id as string) || (location.poi_id as string) || (location.poi_name as string);
+            const sysId = (r.system_id as string) || (r.system as string) || (location.system_id as string);
+            const poiId = (r.poi as string) || (r.poi_id as string) || (location.poi_id as string);
             if (sysId) this.system = sysId;
             if (poiId) this.poi = poiId;
             if (r.auto_docked || location.docked_at) this.docked = true;
@@ -1032,56 +1062,18 @@ if (Object.keys(ship).length > 0) {
 
   /** Fetch current game state and cache it. Overwrites all cached state with fresh data. */
   async refreshStatus(): Promise<ApiResponse> {
-    // Reset cached state first - new get_status will overwrite stale data
-    this.credits = 0;
-    this.fuel = 0;
-    this.maxFuel = 0;
-    this.cargo = 0;
-    this.cargoMax = 0;
-    this.location = "unknown";
-    this.system = "unknown";
-    this.poi = "";
-    this.docked = false;
-    this.shipName = "";
-    this.shipId = "";
-    this.shipClass = "";
-    this.tier = null;
-    this.hull = 0;
-    this.maxHull = 0;
-    this.shield = 0;
-    this.maxShield = 0;
-    this.ammo = 0;
-    this.shipSpeed = 1;
-    this.isCloaked = false;
-    this.isDead = false;
-    this.towingWreck = false;
-    this.faction = null;
-    this.factionFuelReserve = 0;
-    this.factionFuelCapacity = 0;
-    this.inventory = [];
-    this.storage = [];
-    
-    const resp = await this.exec("get_status");
+    const resp = await this.api.execute("get_status", undefined, { bypassCache: true });
     debugLogForBot(this.username, "bot:refreshStatus", `${this.username} get_status response`, resp.result);
-    if (resp.result && typeof resp.result === "object") {
+    if (!resp.error && resp.result && typeof resp.result === "object") {
       const r = resp.result as Record<string, unknown>;
       debugLogForBot(this.username, "bot:refreshStatus", `${this.username} top-level keys`, Object.keys(r));
 
-      // Location is now nested under `location` object in v2
       const location = r.location as Record<string, unknown> | undefined;
       const player = r.player as Record<string, unknown> | undefined;
-      // Use location data first, then player, then root level
       const p = location || player || r;
 
-      // Credits are in player object if it exists, or at root level or in p
-      // Check all possible locations to ensure we get the credits
-      this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
-      debugLogForBot(this.username, "bot:credits", `${this.username} credits=${this.credits} raw=player:${player?.credits ?? 'missing'}, r:${r.credits ?? 'missing'}, p:${p.credits ?? 'missing'}`);
-
-      // System and POI are now inside `location` object in v2
-      // location.system_id, location.system_name, location.poi_id, location.poi_name
-      this.system = (location?.system_id as string) || (location?.system_name as string) || (p.current_system as string) || this.system;
-      this.poi = (location?.poi_id as string) || (location?.poi_name as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+      this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
+      this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
       this.docked = location?.docked_at != null
         ? !!(location.docked_at)
         : (p.docked_at_base != null
@@ -1094,10 +1086,9 @@ if (Object.keys(ship).length > 0) {
         (p.location as string) ||
         this.location;
 
-      // Faction membership
+      this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
       this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
 
-       // Ship fields
       const ship = r.ship as Record<string, unknown> | undefined;
       debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
       if (ship) {
@@ -1114,15 +1105,9 @@ if (Object.keys(ship).length > 0) {
         this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
         this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
         this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
-        // Cache ship speed (1-6, where 1=slowest at 120s/jump, 6=fastest at 30s/jump)
         this.shipSpeed = (ship.speed as number) || 1;
-        
-        // Ship ID
         this.shipId = (ship.id as string) || "";
         
-        // Ammo is stored per-weapon-module, not at ship level.
-        // get_status may return modules as full objects or just IDs.
-        // Check both the ship.modules array and root-level modules array.
         const modulesArray = (
           Array.isArray(r.modules) ? r.modules :
           Array.isArray(ship.modules) ? ship.modules :
@@ -1135,7 +1120,6 @@ if (Object.keys(ship).length > 0) {
             totalAmmo += mod.current_ammo as number;
           }
         }
-        // Update ammo count: prefer calculated from modules, fall back to ship.ammo if it exists
         if (totalAmmo > 0) {
           this.ammo = totalAmmo;
         } else if (ship.ammo != null) {
@@ -1144,15 +1128,12 @@ if (Object.keys(ship).length > 0) {
         this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
       }
 
-      // Cloak detection
       this.isCloaked = !!(p.is_cloaked || p.cloaked);
 
-      // Tow detection - check for towing_wreck flag or tow_attached status
       const towingField = (p.towing_wreck as boolean) ?? (p.towing as boolean) ?? (p.has_tow as boolean);
       if (towingField != null) {
         this.towingWreck = towingField;
       }
-      // Also check ship-level tow status
       if (ship) {
         const shipTowing = (ship.towing_wreck as boolean) ?? (ship.towing as boolean) ?? (ship.has_tow as boolean);
         if (shipTowing != null) {
@@ -1160,39 +1141,31 @@ if (Object.keys(ship).length > 0) {
         }
       }
 
-      // Add this bot to the player tracking so it appears in the web UI players tab
       playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
 
-      // Debug: log tow-related fields from status
       if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
           (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
         this.log("debug", `Tow fields in status: p.towing_wreck=${p.towing_wreck}, p.towing=${p.towing}, p.has_tow=${p.has_tow}, ship.towing_wreck=${ship?.towing_wreck}, ship.towing=${ship?.towing}, ship.has_tow=${ship?.has_tow}, this.towingWreck=${this.towingWreck}`);
       }
 
-      // Death detection
       if (this.hull <= 0 && this.maxHull > 0) {
         this.isDead = true;
       } else if (this.hull > 0 && this.isDead) {
-        this.isDead = false; // respawned
+        this.isDead = false;
       }
 
-      // Fallback: fuel at top level
       if (typeof r.fuel === "number") this.fuel = r.fuel;
-
-      // Skills are now tracked incrementally from mutation responses via exec()
-      // Use refreshSkills() for a dedicated skill refresh when needed
     }
 
-// Log position change if system or poi updated
-        if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
-          this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
-          this.logPosition();
-          this.lastSystem = this.system;
-          this.lastPoi = this.poi;
-        }
+    if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
+      this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
+      this.logPosition();
+      this.lastSystem = this.system;
+      this.lastPoi = this.poi;
+    }
 
-        return resp;
-      }
+    return resp;
+  }
 
   async refreshLocation(): Promise<ApiResponse> {
     const resp = await this.api.execute("get_location");
@@ -1201,8 +1174,8 @@ if (Object.keys(ship).length > 0) {
       const location = r.location as Record<string, unknown> | undefined;
       const player = r.player as Record<string, unknown> | undefined;
       const p = location || player || r;
-      this.system = (location?.system_id as string) || (location?.system_name as string) || (p.current_system as string) || this.system;
-      this.poi = (location?.poi_id as string) || (location?.poi_name as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
+      this.system = (location?.system_id as string) || (p.current_system as string) || this.system;
+      this.poi = (location?.poi_id as string) || (p.current_poi as string) || (p.poi_id as string) || this.poi;
       this.docked = location?.docked_at != null
         ? !!(location.docked_at)
         : (p.docked_at_base != null
@@ -1276,7 +1249,7 @@ if (Object.keys(ship).length > 0) {
       const r = resp.result as Record<string, unknown>;
       const poi = (r.poi as Record<string, unknown>) || {};
       this.system = (poi.system_id as string) || (poi.system as string) || this.system;
-      this.poi = (poi.id as string) || (poi.poi_id as string) || (poi.name as string) || this.poi;
+      this.poi = (poi.id as string) || (poi.poi_id as string) || this.poi;
       this.docked = poi.docked != null ? !!(poi.docked as boolean) : this.docked;
     }
     return resp;

@@ -761,7 +761,7 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
     }
   }
 
-  // Refresh cached state after mutating commands
+// Refresh cached state after mutating commands
   const refreshCommands = new Set([
     "mine", "sell", "buy", "dock", "undock", "travel", "jump",
     "refuel", "repair", "deposit_items", "withdraw_items", "jettison",
@@ -769,6 +769,8 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
     "accept_mission", "complete_mission", "abandon_mission",
     "buy_ship", "sell_ship", "switch_ship", "install_mod", "uninstall_mod", "set_colors",
   ]);
+  const stateRefreshCommands = new Set(["get_cargo", "get_ship", "get_location", "view_storage", "view_faction_storage"]);
+  
   if (refreshCommands.has(command)) {
     await bot.refreshStatus();
 
@@ -793,6 +795,19 @@ async function handleExec(action: WebAction): Promise<WebActionResult> {
       }
     }
 
+    refreshStatusTable();
+  }
+
+  if (stateRefreshCommands.has(command)) {
+    if (command === "get_cargo") {
+      await bot.refreshCargoAndStorage();
+    } else if (command === "get_ship") {
+      await bot.refreshShip();
+    } else if (command === "get_location") {
+      await bot.refreshLocation();
+    } else if (command === "view_storage" || command === "view_faction_storage") {
+      await bot.refreshStorage();
+    }
     refreshStatusTable();
   }
 

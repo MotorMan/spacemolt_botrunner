@@ -609,8 +609,17 @@ export class SpaceMoltAPI {
     }
   }
 
-  async execute(command: string, payload?: Record<string, unknown>, abortSignal?: AbortSignal): Promise<ApiResponse> {
+  async execute(command: string, payload?: Record<string, unknown>, options?: { abortSignal?: AbortSignal; bypassCache?: boolean } | AbortSignal): Promise<ApiResponse> {
     const botName = this._botName || this.credentials?.username || "unknown";
+    // Handle both old-style (AbortSignal) and new-style (options object) calls
+    let abortSignal: AbortSignal | undefined;
+    let bypassCache = false;
+    if (options instanceof AbortSignal) {
+      abortSignal = options;
+    } else if (options) {
+      abortSignal = options.abortSignal;
+      bypassCache = options.bypassCache ?? false;
+    }
 
     const cacheTtl = COMMAND_TTL[command];
     let cacheKey = `${command}:${JSON.stringify(payload ?? {})}`;
@@ -618,7 +627,7 @@ export class SpaceMoltAPI {
       const version = this._serverVersion || await this.getServerVersion();
       cacheKey = `${command}:${version}:${JSON.stringify(payload ?? {})}`;
     }
-    if (cacheTtl !== undefined) {
+    if (cacheTtl !== undefined && !bypassCache) {
       const cached = this._cache.get(cacheKey);
       if (cached) {
         debugLogForBot(botName, "api:execute", `${botName} > ${command} [Cached]`, payload);

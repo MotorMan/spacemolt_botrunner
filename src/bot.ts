@@ -72,6 +72,8 @@ export interface RoutineContext {
   sleep: (ms: number) => Promise<void>;
   /** Optional: get status of all bots in the fleet (used by rescue routine). */
   getFleetStatus?: () => BotStatus[];
+  /** Optional: get fresh status for a specific bot by name (used by rescue routine for credit checks). */
+  getBotFreshStatus?: (botName: string) => Promise<BotStatus | null>;
   /** Optional: send a chat message to other bots. */
   sendBotChat?: (
     content: string,
@@ -1500,6 +1502,7 @@ async refreshSkills(): Promise<ApiResponse> {
     routine: Routine,
     opts?: {
       getFleetStatus?: () => BotStatus[];
+      getBotFreshStatus?: (botName: string) => Promise<BotStatus | null>;
       sendBotChat?: (content: string, channel: string, recipients?: string[], metadata?: Record<string, unknown>) => void;
       getAllBotNames?: () => string[];
     },
@@ -1578,6 +1581,7 @@ async refreshSkills(): Promise<ApiResponse> {
         });
       },
       getFleetStatus: opts?.getFleetStatus,
+      getBotFreshStatus: opts?.getBotFreshStatus,
       sendBotChat: opts?.sendBotChat,
       getAllBotNames: opts?.getAllBotNames,
     };

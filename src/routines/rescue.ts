@@ -1296,7 +1296,14 @@ async function topOffOneBot(ctx: RoutineContext, targetAmount: number, minThresh
     if (member.username === bot.username) continue;
     if (member.state !== "running" && member.state !== "idle") continue;
 
-    const currentCredits = member.credits;
+    // Fetch fresh credits for this bot using get_location if available
+    let currentCredits = member.credits;
+    if (ctx.getBotFreshStatus) {
+      const freshStatus = await ctx.getBotFreshStatus(member.username);
+      if (freshStatus) {
+        currentCredits = freshStatus.credits;
+      }
+    }
 
     // Track consecutive 0 credit readings
     if (currentCredits === 0) {

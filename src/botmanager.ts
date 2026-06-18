@@ -449,6 +449,12 @@ async function handleStart(action: WebAction): Promise<WebActionResult> {
     getAllBotNames: () => [...bots.keys()],
     getBotAssignments: () => server.getBotAssignments(),
     log: (category: string, message: string) => server.logBot(botName, `[${category}] ${message}`),
+    getBotFreshStatus: async (targetBotName: string): Promise<import("./bot.js").BotStatus | null> => {
+      const targetBot = bots.get(targetBotName);
+      if (!targetBot || !targetBot.api.getSession()) return null;
+      await targetBot.refreshLocation();
+      return targetBot.status();
+    },
   };
 
   bot.start(routineKey, routine.fn, chatStartOpts).then(() => {

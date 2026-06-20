@@ -10,10 +10,7 @@ import {
   formatCraftingPlan,
   isRecipeCraftable as isRecipeCraftableNew,
 } from "./craft-goals.js";
-import { CraftQueueTracker } from "./craftQueueTracker.js";
-import {
-  updateFactionStorageCache,
-} from "../factionStorageCache.js";
+import { CraftQueueTracker, ServerJobInfo } from "./craftQueueTracker.js";
 
 // ── Settings ─────────────────────────────────────────────────
 
@@ -45,7 +42,7 @@ async function getCrafterSettings(): Promise<{
   blacklistedRecipes: string[];
   useQueuedCrafting: boolean;
 }> {
-  const text = await Bun.file(`${import.meta.dir}/../../../data/settings.json`).text();
+  const text = await Bun.file(`${import.meta.dir}/../../data/settings.json`).text();
   const raw = JSON.parse(text || "{}");
   const c = (raw.crafter as Record<string, unknown>) || {};
 
@@ -212,12 +209,16 @@ async function fetchAllRecipes(ctx: RoutineContext): Promise<Recipe[]> {
 
 // ── Queue-focused crafting logic ──────────────────────────────
 
-async function checkCraftingQueue(bot: any): Promise<string[]> {
+async function checkCraftingQueue(bot: any): Promise<ServerJobInfo[]> {
   const resp = await bot.exec("craft", { action: "queue" });
   if (resp.error) return [];
   const result = resp.result as Record<string, unknown> | undefined;
   const jobs = (result?.jobs as Array<Record<string, unknown>>) || [];
-  return jobs.map((job: Record<string, unknown>) => (job.job_id as string) || "");
+  return jobs.map((job: Record<string, unknown>) => ({
+    jobId: (job.job_id as string) || "",
+    recipeId: (job.recipe as string) || "",
+    quantity: (job.runs_total as number) || 0,
+  })).filter(j => j.jobId && j.recipeId);
 }
 
 async function getEstimatedCraftingTime(recipeId: string, recipes: Recipe[]): Promise<number> {
@@ -253,8 +254,8 @@ async function dryRunCraftCost(
 
 async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker): Promise<void> {
   const { bot } = ctx;
-  const jobIds = await checkCraftingQueue(bot);
-  tracker.syncWithServer(jobIds);
+  const serverJobs = await checkCraftingQueue(bot);
+  tracker.syncWithServer(serverJobs);
   tracker.save();
 }
 
@@ -526,35 +527,8 @@ export const newCrafterRoutine: Routine = async function* (ctx: RoutineContext) 
     const tracker = bot.craftQueueTracker!;
     await syncCraftingQueue(ctx, tracker);
 
-    yield "plan_crafting";
-    let personalMode = false;
-    if (bot.docked) {
-      const factionResp = await bot.exec("view_storage", { target: "faction" });
-      personalMode = !!factionResp.error;
-    } else {
-      personalMode = true;
-    }
-
-    if (bot.docked) {
-      await bot.refreshStorage();
-      if (!personalMode) {
-        const factionResp = await bot.exec("view_storage", { target: "faction" });
-        if (!factionResp.error && factionResp.result && typeof factionResp.result === "object") {
-          const result = factionResp.result as Record<string, unknown>;
-          const items = (result.items || result.storage || result.faction_storage || []) as Array<Record<string, unknown>> || [];
-          const entries = items.map(item => ({
-            itemId: (item.item_id as string) || "",
-            name: (item.name as string) || "",
-            quantity: (item.quantity as number) || 0,
-          })).filter(i => i.itemId && i.quantity > 0);
-          const factionName = (result.faction_name as string) || (result.faction_id as string) || bot.faction || "";
-          if (factionName) {
-            updateFactionStorageCache(factionName, entries, bot.poi);
-            if (bot.faction !== factionName) bot.faction = factionName;
-          }
-        }
-      }
-    }
+    yield "refresh_storage";
+    await bot.refreshFactionStorage();
 
     const recipeIndex = new Map<string, Recipe>();
     for (const r of recipes) {

@@ -11,6 +11,12 @@ export interface QueuedJob {
   lastUpdate: number;
 }
 
+export interface ServerJobInfo {
+  jobId: string;
+  recipeId: string;
+  quantity: number;
+}
+
 export class CraftQueueTracker {
   private jobs: Map<string, QueuedJob> = new Map();
   private recipeIndex: Map<string, string[]> = new Map();
@@ -90,12 +96,32 @@ export class CraftQueueTracker {
     return false;
   }
 
-  syncWithServer(serverJobIds: string[]): void {
-    const currentIds = new Set(serverJobIds);
+  syncWithServer(serverJobs: ServerJobInfo[]): void {
+    const currentIds = new Set(serverJobs.map(j => j.jobId));
     for (const [jobId, job] of Array.from(this.jobs.entries())) {
       if (!currentIds.has(jobId)) {
         this.jobs.delete(jobId);
         this.cleanupIndex(jobId);
+      }
+    }
+    for (const serverJob of serverJobs) {
+      if (!this.jobs.has(serverJob.jobId)) {
+        const job: QueuedJob = {
+          jobId: serverJob.jobId,
+          recipeId: serverJob.recipeId,
+          quantity: serverJob.quantity,
+          completed: 0,
+          deposited: 0,
+          runsRemaining: serverJob.quantity,
+          startedAt: Date.now(),
+          lastUpdate: Date.now(),
+        };
+        this.jobs.set(serverJob.jobId, job);
+        const existing = this.recipeIndex.get(serverJob.recipeId) || [];
+        if (!existing.includes(serverJob.jobId)) {
+          existing.push(serverJob.jobId);
+          this.recipeIndex.set(serverJob.recipeId, existing);
+        }
       }
     }
   }
@@ -151,7 +177,7 @@ export class CraftQueueTracker {
 
   private async load(): Promise<void> {
     try {
-      const path = `${import.meta.dir}/../../../${CraftQueueTracker.CRAFTING_STATE_FILE}`;
+      const path = `${import.meta.dir}/../../${CraftQueueTracker.CRAFTING_STATE_FILE}`;
       const exists = await Bun.file(path).exists();
       if (!exists) return;
       const raw = await Bun.file(path).text();
@@ -183,7 +209,7 @@ const loaded = (data.jobs as Array<{ jobId: string; recipeId: string; quantity: 
   save(): void {
     try {
       const payload = JSON.stringify(this.toJSON(), null, 2);
-      const path = `${import.meta.dir}/../../../${CraftQueueTracker.CRAFTING_STATE_FILE}`;
+      const path = `${import.meta.dir}/../../${CraftQueueTracker.CRAFTING_STATE_FILE}`;
       Bun.write(path, payload);
     } catch {
       // ignore write failures

@@ -206,6 +206,9 @@ docked = false;
   /** Set of queued crafting job IDs to prevent duplicate submissions. */
   private queuedCraftingJobs: Set<string> = new Set();
 
+  /** Tracks active crafting queue jobs with server-assigned job IDs. */
+  craftQueueTracker: import("./routines/craftQueueTracker.js").CraftQueueTracker | null = null;
+
   /**
    * Generate a unique job ID for a crafting job.
    * Uses recipe_id (as returned in notifications) to prevent duplicates.
@@ -307,6 +310,16 @@ docked = false;
 
     // Initialize player name tracking
     playerNameStore.setBotName(username);
+  }
+
+  async initCraftQueueTracker(): Promise<void> {
+    const { CraftQueueTracker } = await import("./routines/craftQueueTracker.js");
+    this.craftQueueTracker = await CraftQueueTracker.create(this);
+  }
+
+  getCraftQueueTracker(): import("./routines/craftQueueTracker.js").CraftQueueTracker {
+    if (!this.craftQueueTracker) throw new Error("CraftQueueTracker not initialized");
+    return this.craftQueueTracker;
   }
 
   private logPosition(): void {
@@ -2440,37 +2453,35 @@ this.currentBattle.lastUpdate = Date.now();
         } else if ((msgType === "crafting_update" || type === "crafting_update") && data && typeof data === "object") {
           const d = data as Record<string, unknown>;
           const jobs = (d.jobs as Array<Record<string, unknown>>) || [];
-          
+
           for (const job of jobs) {
-            // Handle both 'recipe' and 'recipe_id' field names
-            // Server may return either the recipe name or ID
+            const jobId = (job.job_id as string) || "";
             const recipeId = (job.recipe_id as string) || (job.recipe as string) || "";
-            // Handle both 'deposited' and 'produces' field names
-            const produced = (job.deposited as Array<Record<string, unknown>>) || 
-                             (job.produces as Array<Record<string, unknown>>) || [];
+            const deposited = (job.deposited as Array<Record<string, unknown>>) || [];
             const completed = (job.completed as boolean) ?? false;
-            
-            // Calculate total quantity from produced items
-            let totalQuantity = 0;
-            let outputName = "";
-            for (const item of produced) {
-              totalQuantity += (item.quantity as number) || 0;
-              if (!outputName) {
-                outputName = (item.name as string) || (item.item_name as string) || (item.item_id as string) || "";
-              }
-            }
-            
-            if (recipeId && totalQuantity > 0) {
+
+if (this.craftQueueTracker && jobId && recipeId) {
+               if (completed) {
+                 this.craftQueueTracker.markCompleted(jobId);
+                 this.craftQueueTracker.save();
+               } else if (deposited.length > 0) {
+                 const depositedQty = deposited.reduce((sum, item) => sum + ((item.quantity as number) || 0), 0);
+                 const runsRemaining = (job.runs_remaining as number) || 0;
+                 this.craftQueueTracker.updateDeposited(jobId, depositedQty, runsRemaining);
+                 this.craftQueueTracker.save();
+               }
+             }
+
+            if (recipeId && deposited.length > 0) {
+              const totalQuantity = deposited.reduce((sum, item) => sum + ((item.quantity as number) || 0), 0);
+              const outputName = deposited[0]?.name as string || deposited[0]?.item_id as string || recipeId;
               if (completed) {
-                this.log("craft", `Crafting completed: ${totalQuantity}x ${outputName || recipeId}`);
-                // Clear the job from queue - we don't know the exact quantity queued, so clear by recipe_id prefix
+                this.log("craft", `Crafting completed: ${totalQuantity}x ${outputName}`);
                 this.clearCraftingJobByRecipe(recipeId);
               } else {
                 const runsRemaining = (job.runs_remaining as number) || 0;
-                this.log("craft", `Crafting progress: ${totalQuantity}x ${outputName || recipeId} - ${runsRemaining} runs remaining`);
+                this.log("craft", `Crafting progress: ${totalQuantity}x ${outputName} - ${runsRemaining} runs remaining`);
               }
-            } else if (recipeId) {
-              this.log("craft", `Crafting job ${recipeId}: completed=${completed}, produced=${totalQuantity}`);
             }
           }
         }

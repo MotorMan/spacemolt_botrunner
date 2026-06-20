@@ -22,9 +22,9 @@ interface Recipe {
 
 interface CraftingNode {
   recipe: Recipe;
-  quantityNeeded: number;        // Total quantity needed for parent goals
+  quantityNeeded: number;        // Total quantity needed for parent goals (in items)
   quantityHave: number;          // Current inventory count
-  quantityToCraft: number;       // Net quantity to craft (needed - have)
+  quantityToCraft: number;       // Net quantity to craft (needed - have) - in ITEMS
   children: CraftingNode[];      // Prerequisite recipes
   depth: number;
 }
@@ -203,12 +203,9 @@ function buildCraftingTree(
     return null;
   }
 
-  // Convert items needed to recipe batches
-  const outputQty = goalRecipe.output_quantity || 1;
-  const batchesToCraft = Math.ceil(quantityToCraftInItems / outputQty);
-
-  // If we don't need to craft any batches, skip this branch
-  if (batchesToCraft <= 0) {
+  // quantityToCraftInItems is already the deficit in items
+  // If we don't need to craft any items, skip this branch
+  if (quantityToCraftInItems <= 0) {
     return null;
   }
 
@@ -217,16 +214,16 @@ function buildCraftingTree(
   const node: CraftingNode = {
     recipe: goalRecipe,
     quantityNeeded: quantityToCraftInItems,
-    quantityHave: 0,
-    quantityToCraft: batchesToCraft,
+    quantityHave: countItemFn(goalRecipe.output_item_id),
+    quantityToCraft: quantityToCraftInItems,
     children: [],
     depth,
   };
 
   // Find prerequisites for each component
-  // Calculate total components needed for all batches
+  // Calculate total components needed for all items
   for (const comp of goalRecipe.components) {
-    const totalCompNeeded = comp.quantity * batchesToCraft;
+    const totalCompNeeded = comp.quantity * quantityToCraftInItems;
     const compHave = countItemFn(comp.item_id);
     const compToCraft = Math.max(0, totalCompNeeded - compHave);
 
@@ -277,7 +274,7 @@ function flattenTree(node: CraftingNode, result: CraftingPlanItem[] = []): Craft
     quantityToCraft: node.quantityToCraft,
     reason: node.depth === 0 
       ? `Goal item` 
-      : `Need ${node.quantityToCraft * (node.recipe.output_quantity || 1)}x ${node.recipe.output_name} for ${parentNames}`,
+      : `Need ${node.quantityToCraft}x ${node.recipe.output_name} for ${parentNames}`,
     depth: node.depth,
   });
 

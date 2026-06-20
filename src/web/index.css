@@ -288,6 +288,9 @@ table.bot-table tbody td:nth-child(8) {
   font-weight: 600;
 }
 .bot-name-cell:hover { text-decoration: underline; }
+.bot-name-cell.cloaked {
+  color: var(--green);
+}
 
 .state-badge {
   display: inline-block;
@@ -426,6 +429,9 @@ table.bot-table.compact-mode .row-actions button {
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 130px;
+}
+.grid-bot-name.cloaked {
+  color: var(--green);
 }
 .grid-bot-ship {
   font-size: 10px;

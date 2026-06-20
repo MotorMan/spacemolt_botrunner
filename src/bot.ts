@@ -62,6 +62,7 @@ export interface BotStatus {
   skills?: Record<string, { level: number; xp: number; xpToNext?: number; totalXP?: number }>;
   factionFuelReserve?: number;
   factionFuelCapacity?: number;
+  isCloaked: boolean;
 }
 
 export interface RoutineContext {
@@ -201,6 +202,46 @@ docked = false;
     lastUpdate: number; // Timestamp of last battle update
     participants: Array<Record<string, unknown>>;
   } = { inBattle: false, battleId: null, lastUpdate: 0, participants: [] };
+
+  /** Set of queued crafting job IDs to prevent duplicate submissions. */
+  private queuedCraftingJobs: Set<string> = new Set();
+
+  /**
+   * Generate a unique job ID for a crafting job.
+   * Uses recipe_id (as returned in notifications) to prevent duplicates.
+   */
+  makeCraftingJobId(recipeId: string, quantity: number): string {
+    return `${recipeId}:${quantity}`;
+  }
+
+  /** Check if a crafting job is already queued. */
+  isCraftingJobQueued(recipeId: string, quantity: number): boolean {
+    return this.queuedCraftingJobs.has(this.makeCraftingJobId(recipeId, quantity));
+  }
+
+  /** Mark a crafting job as queued. */
+  queueCraftingJob(recipeId: string, quantity: number): void {
+    this.queuedCraftingJobs.add(this.makeCraftingJobId(recipeId, quantity));
+  }
+
+  /** Remove a crafting job from the queue (when completed or cancelled). */
+  unqueueCraftingJob(recipeId: string, quantity: number): void {
+    this.queuedCraftingJobs.delete(this.makeCraftingJobId(recipeId, quantity));
+  }
+
+  /** Clear all queued crafting jobs. */
+  clearCraftingQueue(): void {
+    this.queuedCraftingJobs.clear();
+  }
+
+  /** Clear crafting jobs by recipe_id prefix (for server notifications that don't include quantity). */
+  clearCraftingJobByRecipe(recipeId: string): void {
+    for (const key of [...this.queuedCraftingJobs]) {
+      if (key.startsWith(`${recipeId}:`)) {
+        this.queuedCraftingJobs.delete(key);
+      }
+    }
+  }
 
   /** Timestamp when customs hold was last cleared (prevents rapid re-triggering). */
   private customsClearedAt: number = 0;
@@ -819,6 +860,9 @@ docked = false;
 
             this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
             this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+            if (player?.is_cloaked !== undefined || ship?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined || ship?.cloaked !== undefined) {
+              this.isCloaked = !!(player?.is_cloaked || ship?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked || ship?.cloaked);
+            }
 
             if (ship) {
               this.fuel = (ship.fuel as number) ?? this.fuel;
@@ -882,86 +926,8 @@ docked = false;
             const qty = (r.quantity as number) || (r.count as number) || 0;
             if (qty) this.cargo += qty;
           }
-
-if (Object.keys(ship).length > 0) {
-            if (typeof ship.fuel === "number") this.fuel = ship.fuel;
-            if (typeof ship.max_fuel === "number") this.maxFuel = ship.max_fuel;
-            this.cargo = (ship.cargo_used as number) ?? this.cargo;
-            this.cargoMax = (ship.cargo_capacity as number) ?? (ship.max_cargo as number) ?? this.cargoMax;
-            this.hull = (ship.hull as number) ?? (ship.hp as number) ?? this.hull;
-            this.maxHull = (ship.max_hull as number) ?? (ship.max_hp as number) ?? this.maxHull;
-            this.shield = (ship.shield as number) ?? (ship.shields as number) ?? this.shield;
-            this.maxShield = (ship.max_shield as number) ?? (ship.max_shields as number) ?? this.maxShield;
-            // Cache ship speed (1-6, where 1=slowest at 120s/jump, 6=fastest at 30s/jump)
-            this.shipSpeed = (ship.speed as number) || 1;
-            
-            // Ship ID
-            this.shipId = (ship.id as string) || "";
-            
-            // Ammo is stored per-weapon-module, not at ship level.
-            // get_status may return modules as full objects or just IDs.
-            // Check both the ship.modules array and root-level modules array.
-            const modulesArray = (
-              Array.isArray(r.modules) ? r.modules :
-              Array.isArray(ship.modules) ? ship.modules :
-              []
-            ) as Array<Record<string, unknown>>;
-            
-            let totalAmmo = 0;
-            for (const mod of modulesArray) {
-              if (mod && typeof mod === "object" && mod.current_ammo != null && typeof mod.current_ammo === "number") {
-                totalAmmo += mod.current_ammo as number;
-              }
-            }
-            // Update ammo count: prefer calculated from modules, fall back to ship.ammo if it exists
-            if (totalAmmo > 0) {
-              this.ammo = totalAmmo;
-            } else if (ship.ammo != null) {
-              this.ammo = ship.ammo as number;
-            }
-            this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
-          }
-
-          // Cloak detection
-          this.isCloaked = !!(p.is_cloaked || p.cloaked);
-
-          // Tow detection - check for towing_wreck flag or tow_attached status
-          const towingField = (p.towing_wreck as boolean) ?? (p.towing as boolean) ?? (p.has_tow as boolean);
-          if (towingField != null) {
-            this.towingWreck = towingField;
-          }
-          // Also check ship-level tow status
-          if (ship) {
-            const shipTowing = (ship.towing_wreck as boolean) ?? (ship.towing as boolean) ?? (ship.has_tow as boolean);
-            if (shipTowing != null) {
-              this.towingWreck = shipTowing;
-            }
-          }
-
-          // Add this bot to the player tracking so it appears in the web UI players tab
-          playerNameStore.add(this.username, this.faction || "", this.shipClass, "", this.system, this.poi);
-
-          // Debug: log tow-related fields from status
-          if (p.towing_wreck !== undefined || p.towing !== undefined || p.has_tow !== undefined || 
-              (ship && (ship.towing_wreck !== undefined || ship.towing !== undefined || ship.has_tow !== undefined))) {
-            this.log("debug", `Tow fields in status: p.towing_wreck=${p.towing_wreck}, p.towing=${p.towing}, p.has_tow=${p.has_tow}, ship.towing_wreck=${ship?.towing_wreck}, ship.towing=${ship?.towing}, ship.has_tow=${ship?.has_tow}, this.towingWreck=${this.towingWreck}`);
-          }
-
-          // Death detection
-          if (this.hull <= 0 && this.maxHull > 0) {
-            this.isDead = true;
-          } else if (this.hull > 0 && this.isDead) {
-            this.isDead = false; // respawned
-          }
-
-          // Fallback: fuel at top level
-          if (typeof r.fuel === "number") this.fuel = r.fuel;
-
-          // Skills are now tracked incrementally from mutation responses via exec()
-          // Use refreshSkills() for a dedicated skill refresh when needed
         }
 
-// Log position change if system or poi updated
         if (this.system !== this.lastSystem || this.poi !== this.lastPoi) {
           this.log("debug", `Position changed: ${this.lastSystem}/${this.lastPoi} -> ${this.system}/${this.poi}`);
           this.logPosition();
@@ -970,7 +936,7 @@ if (Object.keys(ship).length > 0) {
         }
 
         return resp;
-      } catch (err) {
+        } catch (err) {
         // Handle abort
         if (err instanceof Error && err.name === "AbortError" && this.currentBattle.inBattle) {
           this.log("combat", `${command} aborted due to battle detection`);
@@ -1090,6 +1056,9 @@ if (Object.keys(ship).length > 0) {
 
       this.credits = (player?.credits as number) ?? (r.credits as number) ?? (p.credits as number) ?? this.credits;
       this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
+      if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
+        this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
+      }
 
       const ship = r.ship as Record<string, unknown> | undefined;
       debugLogForBot(this.username, "bot:ship", `${this.username} ship object`, ship);
@@ -1130,7 +1099,9 @@ if (Object.keys(ship).length > 0) {
         this.hasPathfinderDrive = this.hasPathfinderModule(modulesArray);
       }
 
-      this.isCloaked = !!(p.is_cloaked || p.cloaked);
+      if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
+        this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
+      }
 
       const towingField = (p.towing_wreck as boolean) ?? (p.towing as boolean) ?? (p.has_tow as boolean);
       if (towingField != null) {
@@ -1190,7 +1161,9 @@ if (Object.keys(ship).length > 0) {
         (p.location as string) ||
         this.location;
       this.faction = (p.faction_id as string) ?? (p.faction as string) ?? this.faction ?? null;
-      this.isCloaked = !!(p.is_cloaked || p.cloaked);
+      if (player?.is_cloaked !== undefined || p.is_cloaked !== undefined || p.cloaked !== undefined || player?.cloaked !== undefined) {
+        this.isCloaked = !!(player?.is_cloaked || p.is_cloaked || p.cloaked || player?.cloaked);
+      }
       const creditsValue = r.credits ?? player?.credits;
       if (typeof creditsValue === "number") this.credits = creditsValue;
     }
@@ -2450,10 +2423,10 @@ getSkillLevel(skillId: string): number {
            if (battleId) {
              this.currentBattle.battleId = battleId;
            }
-           this.currentBattle.lastUpdate = Date.now();
-         }
+this.currentBattle.lastUpdate = Date.now();
+          }
 
-         debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
+          debugLogForBot(this.username, "bot:battle", `${this.username} battle_damage: ${attackerName} -> ${targetName} (${totalDamage} dmg)`);
 
           // Check if we should send a battle response to AI chat
           const now = Date.now();
@@ -2462,68 +2435,51 @@ getSkillLevel(skillId: string): number {
             if ((totalDamage > 0 && targetName === this.username) || !this.currentBattle.inBattle) {
               this.lastBattleResponseMs = now;
               await this.sendBattleResponseToAI(attackerName, totalDamage);
+}
+          }
+        } else if ((msgType === "crafting_update" || type === "crafting_update") && data && typeof data === "object") {
+          const d = data as Record<string, unknown>;
+          const jobs = (d.jobs as Array<Record<string, unknown>>) || [];
+          
+          for (const job of jobs) {
+            // Handle both 'recipe' and 'recipe_id' field names
+            // Server may return either the recipe name or ID
+            const recipeId = (job.recipe_id as string) || (job.recipe as string) || "";
+            // Handle both 'deposited' and 'produces' field names
+            const produced = (job.deposited as Array<Record<string, unknown>>) || 
+                             (job.produces as Array<Record<string, unknown>>) || [];
+            const completed = (job.completed as boolean) ?? false;
+            
+            // Calculate total quantity from produced items
+            let totalQuantity = 0;
+            let outputName = "";
+            for (const item of produced) {
+              totalQuantity += (item.quantity as number) || 0;
+              if (!outputName) {
+                outputName = (item.name as string) || (item.item_name as string) || (item.item_id as string) || "";
+              }
+            }
+            
+            if (recipeId && totalQuantity > 0) {
+              if (completed) {
+                this.log("craft", `Crafting completed: ${totalQuantity}x ${outputName || recipeId}`);
+                // Clear the job from queue - we don't know the exact quantity queued, so clear by recipe_id prefix
+                this.clearCraftingJobByRecipe(recipeId);
+              } else {
+                const runsRemaining = (job.runs_remaining as number) || 0;
+                this.log("craft", `Crafting progress: ${totalQuantity}x ${outputName || recipeId} - ${runsRemaining} runs remaining`);
+              }
+            } else if (recipeId) {
+              this.log("craft", `Crafting job ${recipeId}: completed=${completed}, produced=${totalQuantity}`);
             }
           }
-       } else if (msgType === "battle_update" && data && typeof data === "object") {
-         const battleId = (data.battle_id as string) || "";
-         const tick = (data.tick as number) || 0;
-         const participants = Array.isArray(data.participants) ? data.participants : [];
-         
-         if (battleId) {
-           // We're in battle - update global state
-           this.currentBattle.inBattle = true;
-           this.currentBattle.battleId = battleId;
-           this.currentBattle.lastUpdate = Date.now();
-           this.currentBattle.participants = participants as Array<Record<string, unknown>>;
- 
-           debugLogForBot(this.username, "bot:battle", `${this.username} battle_update: ${battleId} tick:${tick} participants:${participants.length}`);
-         }
-         
-         // Check if we should send a battle response to AI chat (when we just entered battle)
-         const now = Date.now();
-         if (now - this.lastBattleResponseMs > Bot.BATTLE_RESPONSE_COOLDOWN_MS) {
-           // Only respond when we just entered battle (not already in battle)
-           if (!this.currentBattle.inBattle) {
-             this.lastBattleResponseMs = now;
-             await this.sendBattleResponseToAI("", 0);
-           }
-         }
-       } else if (type === "system" && data && typeof data === "object") {
-        const message = (data.message as string) || "";
-        const msgLower = message.toLowerCase();
-
-        // Check for disengage/battle end messages
-        if (msgLower.includes("disengaged from battle") || msgLower.includes("battle ended")) {
-          this.currentBattle.inBattle = false;
-          this.currentBattle.battleId = null;
-          this.currentBattle.participants = [];
-          debugLogForBot(this.username, "bot:battle", `${this.username} battle ended`);
         }
-        
-        // CRITICAL: Detect battle interruption messages
-        // These come when a jump/travel action is interrupted by combat
-        if (msgLower.includes("interrupted by combat") || msgLower.includes("attacking you")) {
-          this.currentBattle.inBattle = true;
-          this.currentBattle.lastUpdate = Date.now();
-          // Try to extract battle ID if present in the message
-          const battleIdMatch = message.match(/Battle ID:\s*([a-f0-9]+)/i);
-          if (battleIdMatch && !this.currentBattle.battleId) {
-            this.currentBattle.battleId = battleIdMatch[1];
-          }
-          debugLogForBot(this.username, "bot:battle", `${this.username} battle detected via system message: ${message}`);
 
-          // Abort any pending mutation commands since we're now in battle
-          for (const controller of this.pendingCommands.values()) {
-            controller.abort();
-          }
-          this.pendingCommands.clear();
-        }
-      }
+        // Handle system messages
+        if (type === "system" && data && typeof data === "object") {
+          const d = data as Record<string, unknown>;
 
-      if (type === "system" && data && typeof data === "object") {
-        const d = data as Record<string, unknown>;
-
-        if (d.damage !== undefined) {
+          if (d.damage !== undefined) {
           const pirateName = (d.pirate_name as string) || "Unknown";
           const pirateT    = (d.pirate_tier as string) || "";
           const damage     = (d.damage as number) ?? 0;
@@ -2583,8 +2539,9 @@ getSkillLevel(skillId: string): number {
             // }
           }
         }
+      }
 
-      } else if (type === "combat" && data && typeof data === "object") {
+      if (type === "combat" && data && typeof data === "object") {
         const d = data as Record<string, unknown>;
         const message = (d.message as string) || "";
         if (message) this.log("combat", `[COMBAT] ${message}`);
@@ -3155,6 +3112,7 @@ getSkillLevel(skillId: string): number {
       skills: this.getSkillsSnapshot(),
       factionFuelReserve: this.factionFuelReserve,
       factionFuelCapacity: this.factionFuelCapacity,
+      isCloaked: this.isCloaked,
     };
   }
 

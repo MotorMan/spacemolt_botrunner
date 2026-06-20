@@ -56,7 +56,13 @@ export function hasTaxEstimateChanged(
     return true;
   }
   const last = botData.lastTaxEstimate;
-  return last.last_assessed_at !== newEstimate.last_assessed_at;
+  return (
+    last.last_assessed_at !== newEstimate.last_assessed_at ||
+    last.taxable_income_to_date !== newEstimate.taxable_income_to_date ||
+    last.income_tax_total !== newEstimate.income_tax_total ||
+    last.property_tax_total !== newEstimate.property_tax_total ||
+    last.assessed_property_value !== newEstimate.assessed_property_value
+  );
 }
 
 export function saveTaxEstimate(botUsername: string, estimate: TaxEstimate): void {

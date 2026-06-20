@@ -2702,7 +2702,7 @@
                   : `<button class="danger sm" onclick="event.stopPropagation();stopBot('${esc(bot.username)}')">Stop</button>`;
             }
             return `<tr data-bot="${esc(bot.username)}">
-      <td class="bot-name-cell" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}</td>
+      <td class="bot-name-cell ${bot.isCloaked ? 'cloaked' : ''}" onclick="openProfile('${esc(bot.username)}')">${esc(bot.username)}</td>
       <td class="ship-cell">${esc(bot.shipName || "-")}</td>
       <td><span class="state-badge state-${bot.state}" data-bot="${esc(bot.username)}">${esc(stateLabel)}</span></td>
       <td>${num(bot.credits)}cr</td>
@@ -2943,7 +2943,7 @@
         return `
     <div class="grid-bot-card" onclick="openProfile('${esc(bot.username)}')">
       <div class="grid-bot-header">
-        <span class="grid-bot-name">${esc(bot.username)}</span>
+        <span class="grid-bot-name ${bot.isCloaked ? 'cloaked' : ''}">${esc(bot.username)}</span>
         <span class="state-badge state-${bot.state}">${esc(stateLabel)}</span>
       </div>
       <div class="grid-bot-ship">${esc(bot.shipName || "-")}</div>
@@ -3191,7 +3191,7 @@
       <div class="bot-card-header">
         <div class="bot-card-name">
           <span class="bot-card-name-icon"></span>
-          <span class="bot-card-name-text" title="${esc(bot.username)}">${esc(bot.username)}</span>
+          <span class="bot-card-name-text ${bot.isCloaked ? 'cloaked' : ''}" title="${esc(bot.username)}">${esc(bot.username)}</span>
           <span class="bot-card-ship" title="${esc(bot.shipName || "")}">${esc(bot.shipName || "-")}</span>
         </div>
         <div class="bot-card-status">
@@ -18421,6 +18421,7 @@ When responding:
           <div style="display:flex;justify-content:space-between;align-items:center">
             <div>
               <span class="fc-name">${esc(name)}${esc(levelStr)}</span>
+              <span style="margin-left:6px;font-size:11px;color:var(--text-dim);font-family:monospace;cursor:pointer" onclick="navigator.clipboard.writeText('${esc(facId)}')" title="Click to copy facility_id">${esc(facId)}</span>
               <span style="margin-left:8px;font-size:10px">${status}</span>
             </div>
             <div style="display:flex;gap:4px">
@@ -18809,59 +18810,16 @@ When responding:
         container.innerHTML = types
           .map((t) => {
             const typeId = t.facility_type || t.type || t.id || "";
-            // Use cached details if available
             const detail = personalFacilityDetails[typeId] || t;
-            return `<div id="fac-type-${esc(typeId)}" class="faction-card" style="opacity:0.5">
+            return `<div id="fac-type-${esc(typeId)}" class="faction-card" style="opacity: 1">
       <div class="fc-name">${esc(detail.name || typeId)}</div>
-      <div class="fc-detail">Loading details...</div>
+      <div class="fc-detail">${esc(detail.description || "")}</div>
+      <div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; font-size: 11px">
+        <span style="color: var(--text-dim)">Click for build options</span>
+      </div>
     </div>`;
           })
           .join("");
-
-        for (const t of types) {
-          const typeId = t.facility_type || t.type || t.id || "";
-          if (!typeId) continue;
-
-          // Check if we have cached details
-          if (personalFacilityDetails[typeId]) {
-            const el = document.getElementById(`fac-type-${typeId}`);
-            if (el) {
-              el.style.opacity = "1";
-              el.innerHTML = renderFacilityTypeCard(
-                personalFacilityDetails[typeId],
-                username,
-              );
-            }
-            continue;
-          }
-
-          sendExec(
-            username,
-            "facility",
-            { action: "types", facility_type: typeId },
-            (detailResult) => {
-              const el = document.getElementById(`fac-type-${typeId}`);
-              if (!el) return;
-              el.style.opacity = "1";
-              if (!detailResult.ok || !detailResult.data) {
-                el.innerHTML = renderFacilityTypeCard(t, username);
-                return;
-              }
-              const dd = detailResult.data;
-              const detail = Array.isArray(dd)
-                ? dd[0]
-                : dd.type || dd.facility || dd;
-              if (detail) {
-                personalFacilityDetails[typeId] = detail;
-                // Save to cache
-                if (personalFacilityVersion) {
-                  saveFacilitiesCache();
-                }
-              }
-              el.innerHTML = renderFacilityTypeCard(detail || t, username);
-            },
-          );
-        }
       }
 
       function renderFacilityTypeCard(t, username) {

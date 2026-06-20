@@ -542,17 +542,24 @@ constructor(port: number = 3000) {
           return Response.json({ bots: discovered });
         }
         if (url.pathname === "/api/channels" && req.method === "GET") {
-          const bot = url.searchParams.get("bot") || "";
-          let channels = bot ? chatBuffer.getChannels(bot) : [];
+          const bot = url.searchParams.get("bot") || undefined;
+          let channels = bot ? chatBuffer.getChannels(bot) : chatBuffer.getChannels();
+          const defaultChannels = [{ name: "local", displayName: "Local" }, { name: "faction", displayName: "Faction" }, { name: "system", displayName: "System" }, { name: "private", displayName: "Private" }];
           if (channels.length === 0) {
-            channels = [{ name: "local", displayName: "Local" }, { name: "faction", displayName: "Faction" }, { name: "system", displayName: "System" }];
+            channels = defaultChannels;
+          } else {
+            for (const dc of defaultChannels) {
+              if (!channels.some(c => c.name === dc.name)) {
+                channels.push(dc);
+              }
+            }
           }
           return Response.json({ channels }, { headers: { "Access-Control-Allow-Origin": "*" } });
         }
         if (url.pathname === "/api/messages" && req.method === "GET") {
-          const bot = url.searchParams.get("bot") || "";
-          const channel = url.searchParams.get("channel") || "";
-          const limit = parseInt(url.searchParams.get("limit") || "200", 10);
+          const bot = url.searchParams.get("bot") || undefined;
+          const channel = url.searchParams.get("channel") || undefined;
+          const limit = parseInt(url.searchParams.get("limit") || "500", 10);
           const after = url.searchParams.get("after");
           const messages = chatBuffer.getMessages({ bot, channel, limit, after: after ? parseInt(after, 10) : undefined });
           return Response.json({ messages, count: chatBuffer.getMessageCount({ bot, channel }) }, { headers: { "Access-Control-Allow-Origin": "*" } });

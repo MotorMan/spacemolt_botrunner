@@ -162,6 +162,7 @@ export function getCrafterSettings(): {
   goalProcessingMode: GoalProcessingMode;
   autoBuy: AutoBuySettings;
   blacklistedRecipes: string[];
+  useQueuedCrafting: boolean;
 } {
   const all = readSettings();
   const c = all.crafter || {};
@@ -173,6 +174,8 @@ export function getCrafterSettings(): {
     "synthesize_xenon_power_cell",
     "chlorine_circuit_etching",
   ];
+
+  const useQueuedCrafting: boolean = (c.useQueuedCrafting as boolean) ?? true;
 
 
 
@@ -279,6 +282,7 @@ export function getCrafterSettings(): {
     goalProcessingMode,
     autoBuy,
     blacklistedRecipes,
+    useQueuedCrafting,
   };
 }
 
@@ -544,6 +548,121 @@ function getMissingMaterial(ctx: RoutineContext, recipe: Recipe, batchSize: numb
     }
   }
   return null;
+}
+
+/**
+ * Check the current crafting queue status.
+ * Returns an array of active job IDs.
+ */
+async function checkCraftingQueue(bot: any): Promise<string[]> {
+  const resp = await bot.exec("craft", { action: "queue" });
+  
+  if (resp.error) {
+    return [];
+  }
+  
+  const result = resp.result as Record<string, unknown> | undefined;
+  const jobs = (result?.jobs as Array<Record<string, unknown>>) || [];
+  
+  return jobs.map((job: Record<string, unknown>) => {
+    // Handle both 'recipe' and 'recipe_id' field names
+    const recipeId = (job.recipe_id as string) || (job.recipe as string) || "";
+    const qty = (job.quantity as number) || 0;
+    return `${recipeId}:${qty}`;
+  });
+}
+
+/**
+ * Queue a bulk crafting job.
+ * Returns { success: true } or { success: false, error: string }.
+ * Uses preset="workshop" to force hand-crafting and avoid facility rental fees.
+ * Generates local job IDs since the server may not return them.
+ */
+async function queueBulkCraftJob(
+  ctx: RoutineContext,
+  jobs: Array<{ recipe_id: string; quantity: number; recipe_name?: string }>,
+  bot: any,
+): Promise<{ success: boolean; error?: string; jobIds?: string[] }> {
+  const { log } = ctx;
+  
+  if (jobs.length === 0) {
+    return { success: true };
+  }
+
+  if (jobs.length > 50) {
+    log("craft", `Bulk job truncated: ${jobs.length} > 50 max`);
+    jobs = jobs.slice(0, 50);
+  }
+
+  log("craft", `Queueing bulk craft: ${jobs.map(j => `${j.quantity}x ${j.recipe_id}`).join(", ")}`);
+
+  const craftResp = await bot.exec("craft", {
+    jobs: jobs.map(j => ({
+      recipe_id: j.recipe_id,
+      quantity: j.quantity,
+      preset: "workshop",
+    })),
+  });
+
+  if (craftResp.error) {
+    log("error", `Failed to queue bulk craft: ${craftResp.error.message}`);
+    return { success: false, error: craftResp.error.message };
+  }
+
+  const result = craftResp.result as Record<string, unknown> | undefined;
+  const serverJobIds = (result?.job_ids as string[]) || [];
+  
+  // Generate local job IDs if server didn't return them
+  const jobIds: string[] = [];
+  for (const j of jobs) {
+    // Use recipe_name if available, otherwise fall back to recipe_id
+    const recipeName = j.recipe_name || j.recipe_id;
+    const localId = `${recipeName}:${j.quantity}`;
+    jobIds.push(localId);
+    bot.queuedCraftingJobs?.add(localId);
+  }
+  
+  if (serverJobIds.length > 0) {
+    log("craft", `Queued ${serverJobIds.length} crafting job(s) from server`);
+  } else {
+    log("craft", `Queued ${jobIds.length} crafting job(s) (local IDs)`);
+  }
+
+  return { success: true, jobIds };
+}
+
+/**
+ * Perform a dry run to check costs before queuing a craft job.
+ * Returns { affordable: boolean, cost?: number, error?: string }.
+ */
+async function dryRunCraftCost(
+  ctx: RoutineContext,
+  recipeId: string,
+  quantity: number,
+  bot: any,
+): Promise<{ affordable: boolean; cost?: number; error?: string }> {
+  const { log } = ctx;
+
+  const resp = await bot.exec("craft", {
+    id: recipeId,
+    quantity: quantity,
+    preset: "workshop",
+    dry_run: true,
+  });
+
+  if (resp.error) {
+    const msg = resp.error.message.toLowerCase();
+    if (msg.includes("afford") || msg.includes("cost") || msg.includes("insufficient")) {
+      return { affordable: false, error: resp.error.message };
+    }
+    return { affordable: false, error: resp.error.message };
+  }
+
+  const result = resp.result as Record<string, unknown> | undefined;
+  const cost = (result?.cost as number) || (result?.total_cost as number) || 0;
+  const canAfford = (result?.can_afford as boolean) ?? (bot.credits >= cost);
+
+  return { affordable: canAfford, cost };
 }
 
 /** Check if materials exist in cargo + personal storage (accessible by craft command). */
@@ -849,8 +968,9 @@ async function craftPrerequisites(
     const deficit = comp.quantity - totalAvailable;
     const prereqRecipe = bestRecipe;
 
-    // How many batches do we need? (each batch produces output_quantity)
-    const batchesNeeded = Math.ceil(deficit / (prereqRecipe.output_quantity || 1));
+    // Deficit is in items, need to convert to batches for the plan
+    const outputQty = prereqRecipe.output_quantity || 1;
+    const batchesNeeded = Math.ceil(deficit / outputQty);
 
     // Recursively craft sub-prerequisites first
     const subCrafted = await craftPrerequisites(ctx, prereqRecipe, recipes, depth + 1, personalMode);
@@ -869,79 +989,21 @@ async function craftPrerequisites(
       continue;
     }
 
-    // Withdraw materials for the prerequisite
-    // First deposit any crafted items in cargo to make space
-    for (const item of [...bot.inventory]) {
-      if (item.quantity <= 0) continue;
-      const lower = item.itemId.toLowerCase();
-      if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
-      // Don't deposit items we need as components for this prereq
-      if (prereqRecipe.components.some(c => c.item_id === item.itemId)) continue;
-      const dResp = await bot.exec("storage", { action: "deposit", target: "faction", item_id: item.itemId, quantity: item.quantity, source: "cargo" });
-      if (dResp.error) {
-        // Fallback: deposit to personal storage
-        await bot.exec("deposit_items", { storage_unit_id: bot.poi, item_id: item.itemId, quantity: item.quantity, source: "cargo" });
-      }
-    }
-    await bot.refreshCargo();
-    await bot.refreshLocation();
+    const totalItemsNeeded = batchesNeeded * outputQty;
 
-    await withdrawFactionMaterials(ctx, prereqRecipe, 1, personalMode);
-    await withdrawStorageMaterials(ctx, prereqRecipe);
+    // Queue the prerequisite craft job
+    const queueResult = await queueBulkCraftJob(ctx, [
+      { recipe_id: prereqRecipe.recipe_id, quantity: totalItemsNeeded },
+    ], bot);
 
-    const stillMissing = getMissingMaterial(ctx, prereqRecipe, 1, personalMode);
-    if (stillMissing) {
-      continue; // can't get all materials into cargo
+    if (!queueResult.success) {
+      ctx.log("craft", `Failed to queue prerequisite ${prereqRecipe.name}: ${queueResult.error}`);
+      continue;
     }
 
-    // Craft the prerequisite
-    for (let batch = 0; batch < batchesNeeded && bot.state === "running"; batch++) {
-      const craftResp = await bot.exec("craft", { recipe_id: prereqRecipe.recipe_id, count: 1 });
-      if (craftResp.error) {
-        break;
-      }
-
-      const result = craftResp.result as Record<string, unknown> | undefined;
-      let qty = 0;
-      if (result) {
-        qty = (result.count as number) || (result.quantity as number) || 0;
-        if (qty === 0) {
-          const items = (result.items as Array<Record<string, unknown>>) ||
-                       (result.output as Array<Record<string, unknown>>) ||
-                       (result.produced as Array<Record<string, unknown>>);
-          if (items && items.length > 0) {
-            for (const item of items) {
-              qty += (item.quantity as number) || (item.count as number) || 0;
-            }
-          }
-        }
-      }
-      if (qty === 0) qty = prereqRecipe.output_quantity || 1;
-
-      ctx.log("craft", `Crafted ${qty}x ${prereqRecipe.output_name || prereqRecipe.name}`);
-      crafted.push(`${qty}x ${prereqRecipe.output_name || prereqRecipe.name}`);
-      bot.stats.totalCrafted += qty;
-
-      // Refresh after each craft to update inventory counts
-      await bot.refreshCargo();
-      if (bot.docked) {
-        await bot.refreshStorage();
-        await refreshFactionStorageDirectly(ctx, bot);
-      }
-
-      // Re-check if we still need more
-      const newTotal = countItem(ctx, comp.item_id, personalMode);
-      if (newTotal >= comp.quantity) break;
-
-      // Check if we still have materials for another batch
-      const prereqMissing = getMissingMaterial(ctx, prereqRecipe, 1, personalMode);
-      if (prereqMissing) {
-        // Try to withdraw more materials
-        await withdrawFactionMaterials(ctx, prereqRecipe, 1, personalMode);
-        await withdrawStorageMaterials(ctx, prereqRecipe);
-        if (getMissingMaterial(ctx, prereqRecipe, 1, personalMode)) break;
-      }
-    }
+    ctx.log("craft", `Queued prerequisite ${totalItemsNeeded}x ${prereqRecipe.name}`);
+    crafted.push(`${totalItemsNeeded}x ${prereqRecipe.output_name || prereqRecipe.name}`);
+    bot.stats.totalCrafted += totalItemsNeeded;
   }
 
   return crafted;
@@ -1094,93 +1156,27 @@ async function craftFromCategories(
       break;
     }
 
-    ctx.log("craft", `Crafting from ${target.category}: ${target.name} (${target.components.map(c => `${c.quantity}x ${c.name}`).join(", ")})...`);
+    ctx.log("craft", `Queueing craft for ${target.category}: ${target.name} (${target.components.map(c => `${c.quantity}x ${c.name}`).join(", ")})...`);
 
-    // Calculate max craftable including faction storage (total available across all locations)
-    let maxCraftable = Infinity;
-    for (const comp of target.components) {
-      let totalAvailable = 0;
-      for (const i of bot.inventory) {
-        if (i.itemId === comp.item_id) totalAvailable += i.quantity;
-      }
-      for (const i of bot.storage) {
-        if (i.itemId === comp.item_id) totalAvailable += i.quantity;
-      }
-      if (!personalMode) {
-        const inFaction = bot.factionStorage.find(i => i.itemId === comp.item_id);
-        if (inFaction) totalAvailable += inFaction.quantity;
-      }
+    // Queue 1 item at a time in categories mode
+    const actualItems = 1;
 
-      const maxFromThisComp = Math.floor(totalAvailable / comp.quantity);
-      if (maxFromThisComp < maxCraftable) {
-        maxCraftable = maxFromThisComp;
-      }
-    }
-    if (maxCraftable === Infinity) maxCraftable = 0;
+    // Queue the craft job
+    const queueResult = await queueBulkCraftJob(ctx, [
+      { recipe_id: target.recipe_id, quantity: actualItems },
+    ], bot);
 
-    // Determine batch size: limited by skill level and available materials
-    // Note: craftingSkillLevel of 0 still allows crafting 1 at a time
-    const maxBatchFromSkill = Math.max(1, craftingSkillLevel);
-    const actualBatchSize = Math.min(maxBatchFromSkill, maxCraftable);
-
-    if (actualBatchSize <= 0) {
-      ctx.log("warn", `No materials available for ${target.name}, skipping`);
+    if (!queueResult.success) {
+      ctx.log("error", `Failed to queue ${target.name}: ${queueResult.error}`);
       const idx = candidates.findIndex(c => c.recipe === target);
       if (idx !== -1) candidates.splice(idx, 1);
       if (candidates.length === 0) break;
       continue;
     }
 
-    ctx.log("craft", `Crafting ${actualBatchSize}x ${target.name} (skill: ${craftingSkillLevel}, maxCraftable: ${maxCraftable})...`);
-    ctx.log("craft", `Recipe requires: ${target.components.map(c => `${c.quantity}x ${c.name || c.item_id}`).join(', ')}`);
-
-    // Withdraw ALL materials needed for the full batch upfront
-    await withdrawFactionMaterials(ctx, target, actualBatchSize, personalMode);
-    await bot.refreshStorage();
-    await refreshFactionStorageDirectly(ctx, bot);
-
-    // Verify we have materials after withdrawal
-    const missing = getMissingMaterial(ctx, target, actualBatchSize, personalMode);
-    if (missing) {
-      ctx.log("warn", `Missing ${missing.need}x ${missing.name} after withdrawal for ${target.name} (batch: ${actualBatchSize}), skipping`);
-      const idx = candidates.findIndex(c => c.recipe === target);
-      if (idx !== -1) candidates.splice(idx, 1);
-      if (candidates.length === 0) break;
-      continue;
-    }
-
-    // Craft the full batch
-    const craftResp = await bot.exec("craft", { recipe_id: target.recipe_id, count: actualBatchSize });
-
-    if (craftResp.error) {
-      ctx.log("error", `craft: ${craftResp.error.message}`);
-      // Remove this recipe from candidates and try next
-      const idx = candidates.findIndex(c => c.recipe === target);
-      if (idx !== -1) candidates.splice(idx, 1);
-      if (candidates.length === 0) break;
-      continue;
-    }
-
-    const result = craftResp.result as Record<string, unknown> | undefined;
-    let qty = 0;
-    if (result) {
-      qty = (result.count as number) || (result.quantity as number) || 0;
-      if (qty === 0) {
-        const items = (result.items as Array<Record<string, unknown>>) ||
-                     (result.output as Array<Record<string, unknown>>) ||
-                     (result.produced as Array<Record<string, unknown>>);
-        if (items && items.length > 0) {
-          for (const item of items) {
-            qty += (item.quantity as number) || (item.count as number) || 0;
-          }
-        }
-      }
-    }
-    if (qty === 0) qty = target.output_quantity || 1;
-
-    ctx.log("craft", `Crafted ${qty}x ${target.output_name || target.name}`);
-    crafted.push(`${qty}x ${target.output_name || target.name}`);
-    bot.stats.totalCrafted += qty;
+    ctx.log("craft", `Queued ${actualItems}x ${target.name}`);
+    crafted.push(`${actualItems}x ${target.output_name || target.name}`);
+    bot.stats.totalCrafted += actualItems;
     totalCrafted++;
 
     // Refresh inventories after craft to update material counts
@@ -1236,85 +1232,28 @@ async function executeCraftingPlan(
   // Log the plan
   for (const item of planItems) {
     const indent = "  ".repeat(item.depth);
-    const itemCount = item.quantityToCraft * (item.recipe.output_quantity || 1);
-    ctx.log("craft", `${indent}→ ${item.quantityToCraft}x batches (${itemCount} items): ${item.recipe.name} (${item.reason})`);
+    ctx.log("craft", `${indent}→ ${item.quantityToCraft}x ${item.recipe.name} (${item.reason})`);
   }
 
-  if (processingMode === "batch") {
-    // Craft each recipe completely before moving to the next
-    for (const planItem of planItems) {
-      if (bot.state !== "running") break;
+  // Process each recipe in order (prerequisites first due to flattenTree ordering)
+  // Queue full quantities - server will process one-by-one and notify on completion
+  for (const planItem of planItems) {
+    if (bot.state !== "running") break;
 
-      const result = await craftRecipeWithPrereqs(
-        ctx,
-        planItem.recipe,
-        planItem.quantityToCraft,
-        craftingSkillLevel,
-        personalMode,
-        autoBuySettings,
-      );
+    const result = await craftRecipeWithPrereqs(
+      ctx,
+      planItem.recipe,
+      planItem.quantityToCraft,
+      craftingSkillLevel,
+      personalMode,
+      autoBuySettings,
+    );
 
-      if (result.crafted > 0) {
-        crafted.push(`${result.crafted}x ${planItem.recipe.output_name}`);
-      }
-      if (result.prereqsCrafted.length > 0) {
-        prereqs.push(...result.prereqsCrafted);
-      }
+    if (result.crafted > 0) {
+      crafted.push(`${result.crafted}x ${planItem.recipe.output_name}`);
     }
-  } else {
-    // ── Round-robin: craft in rotation, using full skill-based batches ──
-    let iterations = 0;
-    const MAX_ITERATIONS = 100; // Safety limit
-    const failedThisIteration = new Set<string>(); // Track recipes that failed materials check
-
-    while (planItems.some(item => item.quantityToCraft > 0) && iterations < MAX_ITERATIONS && bot.state === "running") {
-      iterations++;
-      failedThisIteration.clear();
-
-      for (const planItem of planItems) {
-        if (bot.state !== "running") break;
-
-        if (planItem.quantityToCraft <= 0) continue;
-
-        // Skip recipes that already failed materials check this iteration
-        if (failedThisIteration.has(planItem.recipe.recipe_id)) continue;
-
-        // Calculate batch size: limited by remaining batches and skill level
-        const itemsPerBatch = planItem.recipe.output_quantity || 1;
-        const maxBatchesByRemaining = planItem.quantityToCraft; // remaining batches
-        const maxBatchesBySkill = Math.max(1, Math.floor(craftingSkillLevel || 1));
-
-        const batchSize = Math.min(maxBatchesByRemaining, maxBatchesBySkill);
-
-        const result = await craftRecipeWithPrereqs(
-          ctx,
-          planItem.recipe,
-          batchSize,
-          craftingSkillLevel,
-          personalMode,
-          autoBuySettings,
-        );
-
-        if (result.crafted > 0) {
-          // Subtract batches crafted from our goal
-          const itemsCrafted = result.crafted;
-          const batchesCompleted = Math.floor(itemsCrafted / itemsPerBatch);
-          planItem.quantityToCraft = Math.max(0, planItem.quantityToCraft - batchesCompleted);
-          crafted.push(`${itemsCrafted}x ${planItem.recipe.output_name}`);
-        } else {
-          // Mark as permanently failed for this cycle — no materials available
-          failedThisIteration.add(planItem.recipe.recipe_id);
-          planItem.quantityToCraft = 0;
-        }
-        if (result.prereqsCrafted.length > 0) {
-          prereqs.push(...result.prereqsCrafted);
-        }
-
-        // Small delay between crafts in round-robin mode
-        if (result.crafted > 0) {
-          await ctx.sleep(500);
-        }
-      }
+    if (result.prereqsCrafted.length > 0) {
+      prereqs.push(...result.prereqsCrafted);
     }
   }
 
@@ -1324,7 +1263,7 @@ async function executeCraftingPlan(
 
 /**
  * Craft a specific quantity of a recipe, handling prerequisites and material withdrawal.
- * Optionally tries to buy missing materials if auto-buy is enabled.
+ * Uses the new queued crafting system with bulk mode and preset="workshop".
  */
 async function craftRecipeWithPrereqs(
   ctx: RoutineContext,
@@ -1341,184 +1280,43 @@ async function craftRecipeWithPrereqs(
     return { crafted: 0, prereqsCrafted: [] };
   }
 
-  // quantityToCraft is in BATCHES (from craft-goals.ts planning)
-  // targetBatches tracks how many batches we still need to craft
-  const targetBatches = quantityToCraft;
-  const outputPerBatch = recipe.output_quantity || 1;
-  const targetItems = targetBatches * outputPerBatch;
+  // quantityToCraft is in ITEMS (from craft-goals.ts planning)
+  const totalItemsToCraft = quantityToCraft;
 
-  ctx.log("craft", `Crafting ${targetBatches}x batches (${targetItems} items): ${recipe.name}...`);
+  ctx.log("craft", `Queueing ${totalItemsToCraft}x ${recipe.name}...`);
 
-  let totalBatchesCrafted = 0;
-  let totalItemsCrafted = 0;
-  let failedWithdrawals = 0;
-  const MAX_FAILED_WITHDRAWALS = 3;
-  let totalSpentOnBuys = 0;
-
-  while (totalBatchesCrafted < targetBatches && bot.state === "running" && failedWithdrawals < MAX_FAILED_WITHDRAWALS) {
-    // Refresh inventories
-    await bot.refreshCargo();
-    if (bot.docked) {
-      await bot.refreshStorage();
-      await refreshFactionStorageDirectly(ctx, bot);
-    }
-
-    // Calculate remaining batches and how many we can craft with current materials
-    const remainingBatches = targetBatches - totalBatchesCrafted;
-    const maxCraftableNow = calculateMaxCraftable(ctx, recipe, personalMode);
-
-    if (maxCraftableNow <= 0) {
-      ctx.log("craft", `${recipe.name}: no materials available`);
-
-      // Try auto-buy if enabled and we're docked
-      if (autoBuySettings?.enabled && bot.docked && totalSpentOnBuys < autoBuySettings.maxCreditsPerCycle) {
-        ctx.log("trade", `${recipe.name}: attempting to buy missing materials...`);
-        const boughtSomething = await tryBuyMissingMaterials(ctx, recipe, autoBuySettings);
-        if (boughtSomething) {
-          ctx.log("trade", `${recipe.name}: successfully bought materials, retrying craft`);
-          totalSpentOnBuys += boughtSomething;
-          await bot.refreshCargo();
-          await bot.refreshStorage();
-          continue;
-        }
-      }
-
-      break;
-    }
-
-    // Determine batch size: limited by remaining batches needed, skill level, and available materials
-    const maxBatchesByRemaining = remainingBatches;
-    const maxBatchesBySkill = Math.max(1, Math.floor(craftingSkillLevel || 1));
-    const maxBatchesByMaterials = Math.max(1, Math.floor(maxCraftableNow));
-
-    // Use the minimum of remaining needed, skill level, and available materials
-    let batchSize = Math.min(maxBatchesByRemaining, maxBatchesBySkill, maxBatchesByMaterials);
-    batchSize = Math.max(1, batchSize);
-
-    ctx.log("craft", `  Batch: ${batchSize}x (skill: ${craftingSkillLevel}, remaining: ${remainingBatches} batches, canCraft: ${maxCraftableNow} batches)`);
-
-    // Withdraw materials for this batch
-    await withdrawFactionMaterials(ctx, recipe, batchSize, personalMode);
-    await withdrawStorageMaterials(ctx, recipe, batchSize);
-    await bot.refreshStorage();
-
-    // Check if we have materials in cargo/storage after withdrawal
-    const missingAfterWithdraw = getMissingMaterial(ctx, recipe, batchSize, personalMode);
-    if (missingAfterWithdraw) {
-      ctx.log("warn", `${recipe.name}: missing ${missingAfterWithdraw.need}x ${missingAfterWithdraw.name} after withdrawal`);
-
-      // Try auto-buy for the missing component if enabled
-      if (autoBuySettings?.enabled && bot.docked && totalSpentOnBuys < autoBuySettings.maxCreditsPerCycle) {
-        const maxPrice = calculateMaxBuyPrice(missingAfterWithdraw.name, autoBuySettings.maxPricePercentOverBase);
-        if (maxPrice > 0) {
-          const remainingBudget = autoBuySettings.maxCreditsPerCycle - totalSpentOnBuys;
-          const purchased = await buyMissingItem(
-            ctx,
-            missingAfterWithdraw.name,
-            missingAfterWithdraw.need,
-            maxPrice,
-            remainingBudget,
-          );
-          if (purchased > 0) {
-            totalSpentOnBuys += purchased * maxPrice;
-            ctx.log("trade", `Bought ${purchased}x ${missingAfterWithdraw.name}, retrying craft`);
-            await bot.refreshCargo();
-            await bot.refreshStorage();
-            continue;
-          }
-        }
-      }
-
-      failedWithdrawals++;
-      if (batchSize === 1) break;
-      continue;
-    }
-
-    // Small delay after withdrawal
-    if (batchSize > 1) {
-      await ctx.sleep(300);
-    }
-
-    // Execute the craft command
-    const craftResp = await bot.exec("craft", { recipe_id: recipe.recipe_id, count: batchSize });
-
-    if (craftResp.error) {
-      const msg = craftResp.error.message.toLowerCase();
-      if (msg.includes("material") || msg.includes("component") || msg.includes("insufficient")) {
-        ctx.log("craft", `${recipe.name}: ran out of materials during craft`);
-        failedWithdrawals++;
-        continue;
-      } else {
-        ctx.log("error", `Craft ${recipe.name}: ${craftResp.error.message}`);
-        break;
-      }
-    }
-
-    // Server guarantees at least output_quantity items per batch.
-    // Trust batchSize: we crafted exactly batchSize batches, producing at least batchSize * outputPerBatch items.
-    let batchesActuallyCrafted = batchSize;
-    let itemsActuallyCrafted = batchesActuallyCrafted * outputPerBatch;
-
-    // Log successful craft
-    ctx.log("craft", `Crafted ${itemsActuallyCrafted}x ${recipe.output_name || recipe.name}`);
-
-    // Parse actual output for logging (optional) - may include skill bonuses
-    const result = craftResp.result as Record<string, unknown> | undefined;
-    if (result) {
-      const parsedCount = (result.count as number) || (result.quantity as number) || 0;
-      if (parsedCount > itemsActuallyCrafted) {
-        // Bonus items detected
-        itemsActuallyCrafted = parsedCount;
-        batchesActuallyCrafted = Math.floor(itemsActuallyCrafted / outputPerBatch);
-        ctx.log("craft", `Bonus items: crafted ${itemsActuallyCrafted}x (expected ${batchSize * outputPerBatch}x)`);
-      } else if (parsedCount > 0 && parsedCount < itemsActuallyCrafted) {
-        // This shouldn't happen per server guarantee, but log if it does
-        ctx.log("warn", `Unexpected low output: ${parsedCount}x (expected at least ${itemsActuallyCrafted}x)`);
-      } else {
-        // Try to parse from items array
-        const items = (result.items as Array<Record<string, unknown>>) ||
-                     (result.output as Array<Record<string, unknown>>) ||
-                     (result.produced as Array<Record<string, unknown>>);
-        if (items && items.length > 0) {
-          let totalFromArray = 0;
-          for (const item of items) {
-            totalFromArray += (item.quantity as number) || (item.count as number) || 0;
-          }
-          if (totalFromArray > itemsActuallyCrafted) {
-            itemsActuallyCrafted = totalFromArray;
-            batchesActuallyCrafted = Math.floor(itemsActuallyCrafted / outputPerBatch);
-            ctx.log("craft", `Bonus items from array: ${itemsActuallyCrafted}x`);
-          }
-        }
-      }
-    }
-
-    // Cap at targetBatches to avoid exceeding the goal
-    const overshootBatches = (totalBatchesCrafted + batchesActuallyCrafted) - targetBatches;
-    if (overshootBatches > 0) {
-      batchesActuallyCrafted -= overshootBatches;
-      itemsActuallyCrafted = batchesActuallyCrafted * outputPerBatch;
-      ctx.log("craft", `Capped output to target: ${batchesActuallyCrafted} batches (${itemsActuallyCrafted} items)`);
-    }
-
-    totalBatchesCrafted += batchesActuallyCrafted;
-    totalItemsCrafted += itemsActuallyCrafted;
-    bot.stats.totalCrafted += itemsActuallyCrafted;
-
-    // Progress logging - show both batches and items
-    const batchPct = Math.round((totalBatchesCrafted / targetBatches) * 100);
-    const itemPct = Math.round((totalItemsCrafted / targetItems) * 100);
-    ctx.log("craft", `${recipe.name}: ${totalItemsCrafted}/${targetItems} items (${itemPct}%) - produced ${itemsActuallyCrafted}x (${totalBatchesCrafted}/${targetBatches} batches, ${batchPct}%)`);
-
-    // Refresh after craft
-    await bot.refreshCargo();
-    if (bot.docked) {
-      await bot.refreshStorage();
-      await refreshFactionStorageDirectly(ctx, bot);
-    }
+  // Check if already queued (use recipe_id since that's what notifications return)
+  if (bot.isCraftingJobQueued(recipe.recipe_id, totalItemsToCraft)) {
+    ctx.log("craft", `Job already queued for ${recipe.name}, skipping`);
+    return { crafted: 0, prereqsCrafted: [] };
   }
 
-  return { crafted: totalItemsCrafted, prereqsCrafted };
+  // Check materials (station storage is now the source for crafting)
+  const maxCraftable = calculateMaxCraftable(ctx, recipe, personalMode);
+  if (maxCraftable <= 0) {
+    ctx.log("craft", `${recipe.name}: no materials available in station storage`);
+    return { crafted: 0, prereqsCrafted: [] };
+  }
+
+  // Queue the full quantity in one job - server will process one by one
+  const actualItems = Math.min(totalItemsToCraft, maxCraftable);
+
+  // Queue the craft job using bulk mode with full quantity
+  const queueResult = await queueBulkCraftJob(ctx, [
+    { recipe_id: recipe.recipe_id, quantity: actualItems, recipe_name: recipe.name },
+  ], bot);
+
+  if (!queueResult.success) {
+    ctx.log("error", `Failed to queue ${recipe.name}: ${queueResult.error}`);
+    return { crafted: 0, prereqsCrafted: [] };
+  }
+
+  // Mark as queued using recipe_id (matches notification format)
+  bot.queueCraftingJob(recipe.recipe_id, actualItems);
+  ctx.log("craft", `Queued ${actualItems}x ${recipe.name}`);
+  bot.stats.totalCrafted += actualItems;
+
+  return { crafted: actualItems, prereqsCrafted };
 }
 
 // ── Crafter routine ──────────────────────────────────────────
@@ -1664,6 +1462,15 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
     if (bot.docked && !personalMode) {
       await refreshFactionStorageDirectly(ctx, bot);
 
+    }
+
+    // ── Check existing crafting queue to avoid duplicate submissions ──
+    const queuedJobs = bot.docked ? await checkCraftingQueue(bot) : [];
+    if (queuedJobs.length > 0) {
+      ctx.log("craft", `Found ${queuedJobs.length} jobs in queue`);
+      for (const jobId of queuedJobs) {
+        bot.queueCraftingJob(jobId.split(":")[0], parseInt(jobId.split(":")[1]) || 0);
+      }
     }
 
     // ── Build list of goal items to craft ──

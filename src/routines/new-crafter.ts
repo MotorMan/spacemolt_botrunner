@@ -568,10 +568,22 @@ export const newCrafterRoutine: Routine = async function* (ctx: RoutineContext) 
     const assignedCrafterName = (settings.botCrafterAssignments as Record<string, string>)[botName] || "Default Crafter";
     const assignedCrafter = settings.crafters.find(c => c.name === assignedCrafterName) || settings.crafters[0];
 
+    ctx.log("craft", `new_crafter bot=${botName} assignment=${assignedCrafterName} profileFound=${!!assignedCrafter} craftersCount=${settings.crafters.length}`);
+    ctx.log("craft", `new_crafter craftLimits_raw type=${typeof assignedCrafter.craftLimits} isArray=${Array.isArray(assignedCrafter.craftLimits)} length=${(assignedCrafter.craftLimits as any).length}`);
+
     const effectiveQuotas = new Map<string, number>();
-    for (const limit of assignedCrafter.craftLimits) {
-      if (limit.recipeId && typeof limit.limit === 'number' && limit.limit > 0) {
-        effectiveQuotas.set(limit.recipeId, limit.limit);
+    const rawLimits = assignedCrafter.craftLimits;
+    if (Array.isArray(rawLimits)) {
+      for (const limit of rawLimits) {
+        if (limit && typeof limit === 'object' && (limit as any).recipeId && typeof (limit as any).limit === 'number' && (limit as any).limit > 0) {
+          effectiveQuotas.set((limit as any).recipeId, (limit as any).limit);
+        }
+      }
+    } else if (typeof rawLimits === 'object' && rawLimits !== null) {
+      for (const [recipeId, limit] of Object.entries(rawLimits as Record<string, number>)) {
+        if (typeof limit === 'number' && limit > 0) {
+          effectiveQuotas.set(recipeId, limit);
+        }
       }
     }
     const botOverrides = (settings.botQuotaOverrides as Record<string, Record<string, number>>)[botName] || {};

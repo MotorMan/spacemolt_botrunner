@@ -468,7 +468,7 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     return compact(result);
   },
 
-  /** Look up game catalog data (items, ships, skills, recipes). */
+  /** Look up game catalog data (items, ships, skills, recipes, facilities). */
   catalog_lookup: async (args) => {
     const type = args.type as string;
     const id = args.id as string;
@@ -477,7 +477,8 @@ const TOOL_HANDLERS: Record<string, ToolHandler> = {
     else if (type === "ship") result = catalogStore.getShip(id);
     else if (type === "skill") result = catalogStore.getSkill(id);
     else if (type === "recipe") result = catalogStore.getRecipe(id);
-    else return compact({ error: `Unknown type '${type}' — use item, ship, skill, or recipe` });
+    else if (type === "facility") result = catalogStore.getFacility(id);
+    else return compact({ error: `Unknown type '${type}' — use item, ship, skill, recipe, or facility` });
     if (!result) return compact({ error: `${type} not found: '${id}'` });
     return compact(result);
   },

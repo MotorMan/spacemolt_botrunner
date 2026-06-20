@@ -77,7 +77,16 @@ class CatalogStore {
     if (existsSync(CATALOG_FILE)) {
       try {
         const raw = readFileSync(CATALOG_FILE, "utf-8");
-        return JSON.parse(raw) as CatalogData;
+        const parsed = JSON.parse(raw) as Partial<CatalogData>;
+        return {
+          version: parsed.version ?? null,
+          lastFetched: parsed.lastFetched ?? null,
+          items: parsed.items ?? {},
+          ships: parsed.ships ?? {},
+          skills: parsed.skills ?? {},
+          recipes: parsed.recipes ?? {},
+          facilities: parsed.facilities ?? {},
+        };
       } catch {
         // Corrupt file — start fresh
       }
@@ -210,7 +219,6 @@ class CatalogStore {
         for (const entry of entries) {
           const id = (entry.id as string) || (entry.item_id as string) || (entry.recipe_id as string) || (entry.skill_id as string) || (entry.ship_id as string) || (entry.facility_id as string) || "";
           if (id) {
-            // Normalize: ensure id field is set
             entry.id = id;
             results[type][id] = entry;
           }

@@ -5,7 +5,6 @@ import { SessionManager } from "./session.js";
 import { minerRoutine } from "./routines/miner.js";
 import { explorerRoutine } from "./routines/explorer.js";
 import { crafterRoutine } from "./routines/crafter.js";
-import { newCrafterRoutine } from "./routines/new-crafter.js";
 import { rescueRoutine } from "./routines/rescue.js";
 import { coordinatorRoutine } from "./routines/coordinator.js";
 import { traderRoutine } from "./routines/trader.js";
@@ -110,7 +109,6 @@ const ROUTINES: Record<string, { name: string; fn: Routine }> = {
   miner: { name: "Miner", fn: minerRoutine },
   explorer: { name: "Explorer", fn: explorerRoutine },
   crafter: { name: "Crafter", fn: crafterRoutine },
-  new_crafter: { name: "Queue Crafter", fn: newCrafterRoutine },
   rescue: { name: "FuelRescue", fn: rescueRoutine },
   coordinator: { name: "Coordinator", fn: coordinatorRoutine },
   trader: { name: "Trader", fn: traderRoutine },

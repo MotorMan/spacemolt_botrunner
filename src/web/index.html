@@ -4522,10 +4522,10 @@
 
         // Per-bot crafter profile selector (visible when crafter is selected or running)
         const isCrafter =
-          (bot.state === "running" && (bot.routine === "crafter" || bot.routine === "new_crafter")) ||
+          (bot.state === "running" && bot.routine === "crafter") ||
           (bot.state !== "running" &&
             bot.state !== "stopping" &&
-            (getProfileSelectedRoutine() === "crafter" || getProfileSelectedRoutine() === "new_crafter"));
+            getProfileSelectedRoutine() === "crafter");
         if (isCrafter) {
           const crafterSettings = settings.crafter || {};
           const crafters = crafterSettings.crafters || [];

@@ -34,6 +34,13 @@ export interface CatalogRecipe {
   [key: string]: unknown;
 }
 
+export interface CatalogFacility {
+  id: string;
+  name: string;
+  category?: string;
+  [key: string]: unknown;
+}
+
 export interface CatalogData {
   version: string | null;
   lastFetched: string | null;
@@ -41,6 +48,7 @@ export interface CatalogData {
   ships: Record<string, CatalogShip>;
   skills: Record<string, CatalogSkill>;
   recipes: Record<string, CatalogRecipe>;
+  facilities: Record<string, CatalogFacility>;
 }
 
 // ── CatalogStore singleton ──────────────────────────────────
@@ -74,7 +82,7 @@ class CatalogStore {
         // Corrupt file — start fresh
       }
     }
-    return { version: null, lastFetched: null, items: {}, ships: {}, skills: {}, recipes: {} };
+    return { version: null, lastFetched: null, items: {}, ships: {}, skills: {}, recipes: {}, facilities: {} };
   }
 
   private scheduleSave(): void {
@@ -139,7 +147,7 @@ class CatalogStore {
 
   // ── Fetch from API ────────────────────────────────────────
 
-  /** Paginate all 4 catalog types and store results. */
+  /** Paginate all 5 catalog types and store results. */
   async fetchAll(api: SpaceMoltAPI): Promise<void> {
     // If a fetch is already in progress, wait for it rather than running a
     // concurrent fetch that would partially overwrite results.
@@ -165,12 +173,13 @@ class CatalogStore {
       debugLog("catalog", `Failed to fetch server version: ${err}`);
     }
 
-    const types = ["items", "ships", "skills", "recipes"] as const;
+    const types = ["items", "ships", "skills", "recipes", "facilities"] as const;
     const results: Record<string, Record<string, unknown>> = {
       items: {},
       ships: {},
       skills: {},
       recipes: {},
+      facilities: {},
     };
 
     for (const type of types) {
@@ -199,7 +208,7 @@ class CatalogStore {
         debugLog("catalog", `Extracted ${entries.length} entries for ${type} page ${page}`);
 
         for (const entry of entries) {
-          const id = (entry.id as string) || (entry.item_id as string) || (entry.recipe_id as string) || (entry.skill_id as string) || (entry.ship_id as string) || "";
+          const id = (entry.id as string) || (entry.item_id as string) || (entry.recipe_id as string) || (entry.skill_id as string) || (entry.ship_id as string) || (entry.facility_id as string) || "";
           if (id) {
             // Normalize: ensure id field is set
             entry.id = id;
@@ -209,6 +218,11 @@ class CatalogStore {
 
         totalPages = (data.total_pages as number) || (data.totalPages as number) || 1;
         page++;
+
+        // Delay between pages to avoid rate limiting
+        if (page <= totalPages) {
+          await new Promise(resolve => setTimeout(resolve, 500));
+        }
       }
       debugLog("catalog", `Finished ${type}: ${Object.keys(results[type]).length} total entries`);
     }
@@ -217,6 +231,7 @@ class CatalogStore {
     this.data.ships = results.ships as Record<string, CatalogShip>;
     this.data.skills = results.skills as Record<string, CatalogSkill>;
     this.data.recipes = results.recipes as Record<string, CatalogRecipe>;
+    this.data.facilities = results.facilities as Record<string, CatalogFacility>;
     this.data.version = serverVersion;
     this.data.lastFetched = new Date().toISOString();
 
@@ -228,6 +243,7 @@ class CatalogStore {
       `${Object.keys(this.data.ships).length} ships`,
       `${Object.keys(this.data.skills).length} skills`,
       `${Object.keys(this.data.recipes).length} recipes`,
+      `${Object.keys(this.data.facilities).length} facilities`,
     ];
     debugLog("catalog", `Fetch complete: ${counts.join(", ")}`);
     return void counts; // logged by caller
@@ -251,21 +267,26 @@ class CatalogStore {
     return this.data.recipes[id];
   }
 
+  getFacility(id: string): CatalogFacility | undefined {
+    return this.data.facilities[id];
+  }
+
   /** Resolve a human-readable name for any catalog ID. Falls back to formatted ID. */
   resolveItemName(id: string): string {
-    const entry = this.data.items[id] || this.data.ships[id] || this.data.skills[id] || this.data.recipes[id];
+    const entry = this.data.items[id] || this.data.ships[id] || this.data.skills[id] || this.data.recipes[id] || this.data.facilities[id];
     if (entry?.name) return entry.name as string;
     return id.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
   }
 
   /** Return full catalog data for WS broadcast / REST endpoint. */
-  getAll(): { version: string | null; items: Record<string, CatalogItem>; ships: Record<string, CatalogShip>; skills: Record<string, CatalogSkill>; recipes: Record<string, CatalogRecipe>; lastFetched: string | null } {
+  getAll(): { version: string | null; items: Record<string, CatalogItem>; ships: Record<string, CatalogShip>; skills: Record<string, CatalogSkill>; recipes: Record<string, CatalogRecipe>; facilities: Record<string, CatalogFacility>; lastFetched: string | null } {
     return {
       version: this.data.version,
       items: this.data.items,
       ships: this.data.ships,
       skills: this.data.skills,
       recipes: this.data.recipes,
+      facilities: this.data.facilities,
       lastFetched: this.data.lastFetched,
     };
   }
@@ -275,7 +296,8 @@ class CatalogStore {
     return Object.keys(this.data.items).length === 0
       && Object.keys(this.data.ships).length === 0
       && Object.keys(this.data.skills).length === 0
-      && Object.keys(this.data.recipes).length === 0;
+      && Object.keys(this.data.recipes).length === 0
+      && Object.keys(this.data.facilities).length === 0;
   }
 
   /** Check if an item appears as a component in any crafting recipe. */
@@ -336,7 +358,7 @@ class CatalogStore {
 
   /** Summary string for logging. */
   getSummary(): string {
-    return `${Object.keys(this.data.items).length} items, ${Object.keys(this.data.ships).length} ships, ${Object.keys(this.data.skills).length} skills, ${Object.keys(this.data.recipes).length} recipes`;
+    return `${Object.keys(this.data.items).length} items, ${Object.keys(this.data.ships).length} ships, ${Object.keys(this.data.skills).length} skills, ${Object.keys(this.data.recipes).length} recipes, ${Object.keys(this.data.facilities).length} facilities`;
   }
 }
 

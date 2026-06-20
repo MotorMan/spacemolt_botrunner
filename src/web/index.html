@@ -9772,6 +9772,13 @@
       }
 
       function fetchRecipes(username) {
+        // Use cached catalog data if available, avoid API call
+        if (catalog && Object.keys(catalog.recipes || {}).length > 0) {
+          profileRecipes = Object.values(catalog.recipes);
+          renderManualControls();
+          return;
+        }
+        // Fallback: fetch from bot's API if catalog is empty
         profileRecipes = [];
         fetchRecipesPage(username, 1);
       }

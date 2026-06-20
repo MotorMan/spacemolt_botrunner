@@ -757,7 +757,7 @@ constructor(port: number = 3000) {
             const raw = readFileSync(taxesPath, "utf-8");
             const taxes = JSON.parse(raw);
             const bots: Record<string, { lastTaxEstimate?: any; history: any[] }> = {};
-            let totalIncome = 0, totalIncomeTax = 0, totalPropertyTax = 0, totalAssessedValue = 0;
+            let totalIncome = 0, totalIncomeTax = 0, totalPropertyTax = 0, totalAssessedValue = 0, totalTaxPrepaid = 0;
             for (const [botName, data] of Object.entries(taxes)) {
               const botData = data as { lastTaxEstimate?: any; history: any[] };
               bots[botName] = botData;
@@ -766,6 +766,7 @@ constructor(port: number = 3000) {
                 totalIncomeTax += botData.lastTaxEstimate.income_tax_total || 0;
                 totalPropertyTax += botData.lastTaxEstimate.property_tax_total || 0;
                 totalAssessedValue += botData.lastTaxEstimate.assessed_property_value || 0;
+                totalTaxPrepaid += botData.lastTaxEstimate.tax_prepaid || 0;
               }
             }
             return Response.json({
@@ -775,11 +776,25 @@ constructor(port: number = 3000) {
                 totalIncomeTax,
                 totalPropertyTax,
                 totalAssessedValue,
+                totalTaxPrepaid,
                 botCount: Object.keys(taxes).length
               }
             });
           } catch {
             return Response.json({ bots: {}, fleetTotals: {} });
+          }
+        }
+        if (url.pathname === "/api/faction-tax-estimate") {
+          const factionTaxesFile = join(DATA_DIR, "faction_taxes.json");
+          if (!existsSync(factionTaxesFile)) {
+            return Response.json({ factionTaxEstimate: null });
+          }
+          try {
+            const raw = readFileSync(factionTaxesFile, "utf-8");
+            const data = JSON.parse(raw);
+            return Response.json({ factionTaxEstimate: data.lastFactionTaxEstimate || null });
+          } catch {
+            return Response.json({ factionTaxEstimate: null });
           }
         }
         if (url.pathname === "/api/catalog") {

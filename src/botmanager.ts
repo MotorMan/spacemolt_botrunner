@@ -1021,6 +1021,7 @@ async function main(): Promise<void> {
             server.logSystem(`${name} session resumed (no login delay)`);
             try {
               await bot.updateTaxEstimate();
+              await bot.updateFactionTaxEstimate();
             } catch (err) {
               server.logSystem(`Tax collection failed for ${name}: ${err}`);
             }
@@ -1062,6 +1063,7 @@ async function main(): Promise<void> {
               }
               try {
                 await bot.updateTaxEstimate();
+                await bot.updateFactionTaxEstimate();
               } catch (err) {
                 server.logSystem(`Tax collection failed for ${name}: ${err}`);
               }
@@ -1102,6 +1104,7 @@ async function main(): Promise<void> {
                 }
                 try {
                   await bot.updateTaxEstimate();
+                  await bot.updateFactionTaxEstimate();
                 } catch (err) {
                   server.logSystem(`Tax collection failed for ${name}: ${err}`);
                 }

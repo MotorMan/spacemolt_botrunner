@@ -1039,6 +1039,14 @@
               ><span class="stat-label">Property Tax</span>
             </div>
             <div class="stat-item">
+              <span class="stat-value" id="pStatAssessed">0</span
+              ><span class="stat-label">Assessed Value</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-value" id="pStatTaxPrepaid">0</span
+              ><span class="stat-label">Tax Prepaid</span>
+            </div>
+            <div class="stat-item">
               <span class="stat-value" id="pStatTaxableIncome">0</span
               ><span class="stat-label">Taxable Income</span>
             </div>
@@ -1135,6 +1143,34 @@
 
         <!-- Taxes View (hidden by default) -->
         <div id="statsTaxesView" style="display: none">
+          <!-- Faction Tax Estimate Section -->
+          <div class="stats-bar" id="factionTaxBar" style="margin-bottom: 8px; display: none">
+            <span class="stats-title">Faction Tax</span>
+            <div class="stat-item">
+              <span class="stat-value" id="factionTaxName" style="font-size: 14px">-</span>
+              <span class="stat-label" style="font-size: 12px">Faction</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-value" id="factionTaxDomicile">-</span>
+              <span class="stat-label">Domicile</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-value" id="factionTaxableIncome">0</span>
+              <span class="stat-label">Taxable Income</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-value" id="factionTaxTotal">0</span>
+              <span class="stat-label">Income Tax</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-value" id="factionTaxPrepaid">0</span>
+              <span class="stat-label">Tax Prepaid</span>
+            </div>
+            <div class="stat-item">
+              <span class="stat-value" id="factionTaxNote" style="font-size: 12px; max-width: 300px">-</span>
+              <span class="stat-label">Note</span>
+            </div>
+          </div>
           <div class="stats-bar">
             <span class="stats-title">Fleet Tax Summary</span>
             <div class="stat-item">
@@ -1146,12 +1182,16 @@
               ><span class="stat-label">Total Income Tax</span>
             </div>
             <div class="stat-item">
+              <span class="stat-value" id="taxTotalAssessed">0</span
+              ><span class="stat-label">Total Assessed Value</span>
+            </div>
+            <div class="stat-item">
               <span class="stat-value" id="taxTotalPropertyTax">0</span
               ><span class="stat-label">Total Property Tax</span>
             </div>
             <div class="stat-item">
-              <span class="stat-value" id="taxTotalAssessed">0</span
-              ><span class="stat-label">Total Assessed Value</span>
+              <span class="stat-value" id="taxTotalPrepaid">0</span
+              ><span class="stat-label">Total Tax Prepaid</span>
             </div>
           </div>
           <div class="bot-table-wrap" style="flex: 1; overflow: auto">
@@ -1179,10 +1219,13 @@
                       Income Tax
                     </th>
                     <th style="text-align: right; padding: 6px 12px">
+                      Assessed Value
+                    </th>
+                    <th style="text-align: right; padding: 6px 12px">
                       Property Tax
                     </th>
                     <th style="text-align: right; padding: 6px 12px">
-                      Assessed Value
+                      Tax Prepaid
                     </th>
                     <th style="text-align: right; padding: 6px 12px">
                       Last Updated
@@ -3537,6 +3580,19 @@
         }
       }
 
+      async function loadFactionTaxEstimate() {
+        try {
+          const res = await fetch("/api/faction-tax-estimate");
+          if (res.ok) {
+            const data = await res.json();
+            return data.factionTaxEstimate;
+          }
+        } catch (err) {
+          console.warn("Failed to load faction tax estimate:", err);
+        }
+        return null;
+      }
+
       async function switchStatsView(view) {
         statsTaxesView = view;
         document
@@ -3579,6 +3635,12 @@
         document.getElementById("pStatPropertyTax").textContent = num(
           fleetTotals.totalPropertyTax || 0,
         );
+        document.getElementById("pStatAssessed").textContent = num(
+          fleetTotals.totalAssessedValue || 0,
+        );
+        document.getElementById("pStatTaxPrepaid").textContent = num(
+          fleetTotals.totalTaxPrepaid || 0,
+        );
         document.getElementById("pStatTaxableIncome").textContent = num(
           fleetTotals.totalIncome || 0,
         );
@@ -3597,6 +3659,22 @@
         return value.toLocaleString();
       }
 
+      function renderFactionTaxBar(factionTax) {
+        const bar = document.getElementById("factionTaxBar");
+        if (!bar) return;
+        if (!factionTax) {
+          bar.style.display = "none";
+          return;
+        }
+        bar.style.display = "flex";
+        document.getElementById("factionTaxName").textContent = factionTax.faction_name || "-";
+        document.getElementById("factionTaxDomicile").textContent = factionTax.domicile || "-";
+        document.getElementById("factionTaxableIncome").textContent = num(factionTax.taxable_income_to_date || 0);
+        document.getElementById("factionTaxTotal").textContent = num(factionTax.income_tax_total || 0);
+        document.getElementById("factionTaxPrepaid").textContent = num(factionTax.tax_prepaid || 0);
+        document.getElementById("factionTaxNote").textContent = factionTax.note || "-";
+      }
+
       function renderTaxesTab() {
         const data = taxesData || {};
         const fleetTotals = data.fleetTotals || {};
@@ -3606,11 +3684,14 @@
         document.getElementById("taxTotalIncomeTax").textContent = num(
           fleetTotals.totalIncomeTax || 0,
         );
+        document.getElementById("taxTotalAssessed").textContent = num(
+          fleetTotals.totalAssessedValue || 0,
+        );
         document.getElementById("taxTotalPropertyTax").textContent = num(
           fleetTotals.totalPropertyTax || 0,
         );
-        document.getElementById("taxTotalAssessed").textContent = num(
-          fleetTotals.totalAssessedValue || 0,
+        document.getElementById("taxTotalPrepaid").textContent = num(
+          fleetTotals.totalTaxPrepaid || 0,
         );
 
         const bots = data.bots || {};
@@ -3619,7 +3700,7 @@
 
         if (entries.length === 0) {
           tbody.innerHTML =
-            '<tr><td colspan="6" style="padding:24px;text-align:center;color:var(--text-dim)">No tax data yet. Start bots and let them collect taxes on restart.</td></tr>';
+            '<tr><td colspan="7" style="padding:24px;text-align:center;color:var(--text-dim)">No tax data yet. Start bots and let them collect taxes on restart.</td></tr>';
           return;
         }
 
@@ -3633,8 +3714,9 @@
       <td style="padding:6px 12px;font-weight:500;color:var(--text-bright)">${esc(botName)}</td>
       <td style="padding:6px 12px;text-align:right">${num(estimate.taxable_income_to_date || 0)}</td>
       <td style="padding:6px 12px;text-align:right">${num(estimate.income_tax_total || 0)}</td>
-      <td style="padding:6px 12px;text-align:right">${num(estimate.property_tax_total || 0)}</td>
       <td style="padding:6px 12px;text-align:right">${num(estimate.assessed_property_value || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(estimate.property_tax_total || 0)}</td>
+      <td style="padding:6px 12px;text-align:right">${num(estimate.tax_prepaid || 0)}</td>
       <td style="padding:6px 12px;text-align:right">${esc(lastUpdated)}</td>
     </tr>`;
           })
@@ -3807,6 +3889,8 @@
       async function loadTaxesDataAndRender() {
         await loadTaxesData();
         loadTaxesBar();
+        const factionTax = await loadFactionTaxEstimate();
+        renderFactionTaxBar(factionTax);
         renderTaxesTab();
       }
 
@@ -21677,6 +21761,7 @@ When responding:
         const loadFuelCellsAtHome = explorer.loadFuelCellsAtHome ?? true;
         const returnToHomeOnFuelCellDepletion =
           explorer.returnToHomeOnFuelCellDepletion ?? false;
+        const autoCloak = explorer.autoCloak ?? false;
 
         // Per-bot focus area overrides for trade_update mode
         const explorerBots = bots.filter((b) => {
@@ -21829,11 +21914,22 @@ When responding:
     <div class="setting-row">
       <div>
         <div class="setting-label">Return to Home on Fuel Cell Depletion</div>
-        <div class="setting-hint">Automatically return to Sol Central to reload fuel cells when they run out. Allows longer exploration sessions without manual intervention.</div>
+        <div class="setting-hint">Automatically return to Sol Central to reload fuel cells when they run out.</div>
       </div>
       <select id="set-explorer-returnToHomeOnFuelCellDepletion">
         <option value="false"${!returnToHomeOnFuelCellDepletion ? " selected" : ""}>No</option>
         <option value="true"${returnToHomeOnFuelCellDepletion ? " selected" : ""}>Yes (auto-return)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Auto Cloak</div>
+        <div class="setting-hint">Enable full-time cloaking. Bot stays cloaked at all times (drains 1 fuel/tick). While cloaked, the bot cannot be attacked. Perfect for safe exploration without fear of combat.</div>
+      </div>
+      <select id="set-explorer-autoCloak">
+        <option value="false"${!autoCloak ? " selected" : ""}>No (manual cloak)</option>
+        <option value="true"${autoCloak ? " selected" : ""}>Yes (always cloaked)</option>
       </select>
     </div>
 
@@ -21880,6 +21976,7 @@ When responding:
             document.getElementById(
               "set-explorer-returnToHomeOnFuelCellDepletion",
             ).value === "true",
+          autoCloak: document.getElementById("set-explorer-autoCloak").value === "true",
         };
         send({ type: "saveSettings", routine: "explorer", settings: s });
         settings.explorer = s;

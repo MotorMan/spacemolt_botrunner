@@ -11,7 +11,7 @@ import { detectCustomsMessage, logCustomsStop, getBotCustomsStats, sendCustomsCh
 import { getFactionStorageCache, getFactionStorageCacheByStationOnly, updateFactionStorageCache, isFactionStorageCacheStale } from "./factionStorageCache.js";
 import { recordPilotingActivity, recordSkillGains } from "./pilotSkillTracker.js";
 import { setPathfinderTravelState, updatePathfinderTravelTick, recordPathfinderCorrection, clearPathfinderTravel, getActivePathfinderTravel, type PathfinderTravelRecord, getDirectPathfinderJump, getCorrectionPathfinderJump, getCorrectionBearingAtTick, isPathfinderLandingAtVoid, type CorrectionPathfinderJump, getMccWindowInfo, type MccWindowInfo } from "./pathfinder.js";
-import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate } from "./taxData.js";
+import { saveTaxEstimate, hasTaxEstimateChanged, type TaxEstimate, saveFactionTaxEstimate, type FactionTaxEstimate } from "./taxData.js";
 import { chatBuffer } from "./chatbuffer.js";
 import { loadSettings, saveStoppedState } from "./web/server.js";
 import { buyInsurance } from "./routines/common.js";
@@ -1397,6 +1397,41 @@ async refreshSkills(): Promise<ApiResponse> {
       this.log("system", "Tax estimate unchanged, skipping save");
     }
 
+    return estimate;
+  }
+
+  /**
+   * Fetch faction tax estimate and save to data/faction_taxes.json.
+   */
+  async updateFactionTaxEstimate(): Promise<FactionTaxEstimate | null> {
+    const resp = await this.exec("get_faction_tax_estimate");
+    if (resp.error || !resp.result) {
+      this.log("warn", `get_faction_tax_estimate failed: ${resp.error?.message}`);
+      return null;
+    }
+
+    const result = resp.result as Record<string, unknown>;
+    const estimate: FactionTaxEstimate = {
+      action: "get_faction_tax_estimate",
+      faction_id: (result.faction_id as string) || "",
+      faction_name: (result.faction_name as string) || "",
+      domicile: (result.domicile as string) || "",
+      taxable_income_to_date: (result.taxable_income_to_date as number) || 0,
+      deductible_expenses_to_date: (result.deductible_expenses_to_date as number) || 0,
+      net_taxable_profit: (result.net_taxable_profit as number) || 0,
+      income_tax: (result.income_tax as Array<any>) || [],
+      income_tax_total: (result.income_tax_total as number) || 0,
+      carried_debt: (result.carried_debt as Array<any>) || [],
+      carried_debt_total: (result.carried_debt_total as number) || 0,
+      tax_prepaid: (result.tax_prepaid as number) || 0,
+      next_assessment_approx_seconds: (result.next_assessment_approx_seconds as number) || 0,
+      tax_collection_active: (result.tax_collection_active as boolean) ?? true,
+      last_assessed_at: (result.last_assessed_at as number) || Date.now(),
+      note: (result.note as string) || "",
+    };
+
+    saveFactionTaxEstimate(estimate);
+    this.log("system", `Faction tax estimate updated: income=${estimate.taxable_income_to_date}, tax=${estimate.income_tax_total}, prepaid=${estimate.tax_prepaid}`);
     return estimate;
   }
 

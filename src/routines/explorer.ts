@@ -317,6 +317,7 @@ function getExplorerSettings(username?: string): {
   scavengeEnabled: boolean;
   loadFuelCellsAtHome: boolean;
   returnToHomeOnFuelCellDepletion: boolean;
+  autoCloak: boolean;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -382,6 +383,13 @@ function getExplorerSettings(username?: string): {
       ? Boolean(e.returnToHomeOnFuelCellDepletion)
       : false;
 
+  // Auto cloak: per-bot > global explorer > default false
+  const autoCloak = botOverrides.autoCloak !== undefined
+    ? Boolean(botOverrides.autoCloak)
+    : e.autoCloak !== undefined
+      ? Boolean(e.autoCloak)
+      : false;
+
   return {
     mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : "explore") as ExplorerMode,
     acceptMissions,
@@ -395,6 +403,7 @@ function getExplorerSettings(username?: string): {
     scavengeEnabled,
     loadFuelCellsAtHome,
     returnToHomeOnFuelCellDepletion,
+    autoCloak,
   };
 }
 
@@ -465,6 +474,13 @@ export function setExplorerLoadFuelCellsAtHome(username: string, loadFuelCellsAt
 export function setExplorerReturnToHomeOnFuelCellDepletion(username: string, returnToHomeOnFuelCellDepletion: boolean): void {
   writeSettings({
     [username]: { returnToHomeOnFuelCellDepletion },
+  });
+}
+
+/** Persist auto cloak setting for a specific bot. */
+export function setExplorerAutoCloak(username: string, autoCloak: boolean): void {
+  writeSettings({
+    [username]: { autoCloak },
   });
 }
 
@@ -602,10 +618,32 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     lastFleeTime: undefined,
   };
 
+  // Track if we've already enabled cloak (mutation command - don't re-issue)
+  let cloakEnabled = false;
+
   while (bot.state === "running") {
     // ── Death recovery ──
     const alive = await detectAndRecoverFromDeath(ctx);
     if (!alive) { await ctx.sleep(30000); continue; }
+
+    // ── Enable cloak if autoCloak is enabled and not already cloaked ──
+    const cloakSettings = getExplorerSettings(bot.username);
+    if (cloakSettings.autoCloak && !bot.isCloaked && !cloakEnabled) {
+      ctx.log("system", "Auto-cloak enabled - activating cloak for full-time stealth mode");
+      const cloakResp = await bot.exec("cloak", { enable: true });
+      if (!cloakResp.error) {
+        cloakEnabled = true;
+        ctx.log("info", "Cloak activated successfully - bot is now stealthed");
+      } else {
+        const msg = cloakResp.error.message.toLowerCase();
+        if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+          cloakEnabled = true;
+          ctx.log("info", "Cloak already active");
+        } else {
+          ctx.log("warn", `Cloak command failed: ${cloakResp.error.message}`);
+        }
+      }
+    }
 
     // ── Clean up expired temporary blacklists ──
     cleanupTemporaryBlacklist();

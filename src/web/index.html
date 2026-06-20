@@ -6077,6 +6077,24 @@
       <span id="mc-module-preset-status" style="font-size:11px;color:var(--text-dim);margin-left:8px"></span>
     </div>
 
+    <!-- Crafting Loadout Section -->
+    <div class="cmd-group" style="border-top:1px solid var(--border);padding-top:10px;margin-top:10px">
+      <label style="color:var(--text-bright);font-weight:600">Crafter Loadout</label>
+    </div>
+    <div class="cmd-group">
+      <label>Loadout</label>
+      <select id="mc-craft-loadout-select" style="min-width:150px">
+        <option value="">-- Select Loadout --</option>
+      </select>
+      <button class="primary sm" onclick="mcLoadCraftingLoadout()">Load Loadout</button>
+      <button class="sm" onclick="mcStartCraftingFromLoadout()">Start Crafting</button>
+    </div>
+    <div class="cmd-group">
+      <label>Status</label>
+      <span id="mc-craft-loadout-status" style="font-size:11px;color:var(--text-dim)">Idle</span>
+      <button class="sm" onclick="mcRefreshCraftingLoadouts()" title="Refresh loadouts">Refresh</button>
+    </div>
+
     <div class="cmd-group">
       <label>Gift Item</label>
       <select id="mc-gift-source">
@@ -6129,14 +6147,16 @@
     </div>
   `;
 
-        // Show details for initially selected recipe
+// Show details for initially selected recipe
         if (profileRecipes && profileRecipes.length > 0) showRecipeDetails();
         // Populate ship loadout dropdown
         mcPopulateLoadoutSelect();
+        // Populate crafting loadout dropdown
+        mcPopulateCraftingLoadoutSelect();
 
         // Populate module preset dropdown (Phase 1)
         populateModulePresetSelect();
-      }
+        }
 
       function showRecipeDetails() {
         const sel = document.getElementById("mc-craft-recipe");
@@ -13335,6 +13355,118 @@
 
         if (loadBtn) loadBtn.disabled = loadoutNames.length === 0;
         if (deleteBtn) deleteBtn.disabled = loadoutNames.length === 0;
+      }
+
+      // ── Crafting Loadout Functions ─────────────────────────────────────────────
+
+      async function loadCraftingLoadoutsForManual() {
+        try {
+          const response = await fetch("/api/crafting-loadouts");
+          if (!response.ok) {
+            console.warn("Failed to fetch crafting loadouts:", response.status);
+            return {};
+          }
+          const data = await response.json();
+          return data.loadouts || {};
+        } catch (e) {
+          console.warn("Failed to load crafting loadouts:", e);
+          return {};
+        }
+      }
+
+      async function mcPopulateCraftingLoadoutSelect() {
+        const select = document.getElementById("mc-craft-loadout-select");
+        if (!select) return;
+
+        const loadouts = await loadCraftingLoadoutsForManual();
+        const loadoutNames = Object.keys(loadouts).sort();
+
+        select.innerHTML =
+          '<option value="">-- Select Loadout --</option>' +
+          loadoutNames.map((name) => `<option value="${esc(name)}">${esc(name)}</option>`).join("");
+      }
+
+      async function mcLoadCraftingLoadout() {
+        const select = document.getElementById("mc-craft-loadout-select");
+        const statusEl = document.getElementById("mc-craft-loadout-status");
+        if (!select || !select.value) {
+          if (statusEl) statusEl.textContent = "Select a loadout first";
+          return;
+        }
+
+        const loadoutName = select.value;
+        const loadouts = await loadCraftingLoadoutsForManual();
+        const loadout = loadouts[loadoutName];
+        if (!loadout) {
+          if (statusEl) statusEl.textContent = "Loadout not found";
+          return;
+        }
+
+        // Store the selected loadout in global state
+        if (!window._selectedCraftingLoadout) window._selectedCraftingLoadout = {};
+        window._selectedCraftingLoadout[loadoutName] = loadout;
+
+        if (statusEl) {
+          statusEl.textContent = `Loaded: ${loadoutName}`;
+          statusEl.style.color = "var(--green)";
+          setTimeout(() => {
+            if (statusEl) statusEl.style.color = "var(--text-dim)";
+          }, 2000);
+        }
+
+        logResponse(`<span class="resp-cmd">Crafting loadout "${loadoutName}" loaded</span>`);
+      }
+
+      async function mcStartCraftingFromLoadout() {
+        const select = document.getElementById("mc-craft-loadout-select");
+        const statusEl = document.getElementById("mc-craft-loadout-status");
+        if (!select || !select.value) {
+          if (statusEl) statusEl.textContent = "Select a loadout first";
+          return;
+        }
+
+        const loadoutName = select.value;
+        const loadouts = await loadCraftingLoadoutsForManual();
+        const loadout = loadouts[loadoutName];
+        if (!loadout) {
+          if (statusEl) statusEl.textContent = "Loadout not found";
+          return;
+        }
+
+        const bot = getProfileBot();
+        if (!bot) {
+          if (statusEl) statusEl.textContent = "No bot selected";
+          return;
+        }
+
+        // Queue each recipe in the loadout
+        const recipeEntries = Object.entries(loadout);
+        let queuedCount = 0;
+
+        for (const [recipeId, quantity] of recipeEntries) {
+          if (quantity > 0) {
+            mcExec("craft", { id: recipeId, quantity: quantity, preset: "workshop" });
+            queuedCount++;
+          }
+        }
+
+        if (statusEl) {
+          statusEl.textContent = `Queued ${queuedCount} recipes from ${loadoutName}`;
+          statusEl.style.color = "var(--green)";
+        }
+        logResponse(`<span class="resp-cmd">Started crafting from loadout "${loadoutName}" (${queuedCount} recipes)</span>`);
+      }
+
+      async function mcRefreshCraftingLoadouts() {
+        await mcPopulateCraftingLoadoutSelect();
+        const statusEl = document.getElementById("mc-craft-loadout-status");
+        if (statusEl) {
+          statusEl.textContent = "Loadouts refreshed";
+          statusEl.style.color = "var(--green)";
+          setTimeout(() => {
+            if (statusEl) statusEl.style.color = "var(--text-dim)";
+          }, 1000);
+        }
       }
 
       // ── Module Loadout Presets (Phase 1) ─────────────────────────────

@@ -318,6 +318,8 @@ function getExplorerSettings(username?: string): {
   loadFuelCellsAtHome: boolean;
   returnToHomeOnFuelCellDepletion: boolean;
   autoCloak: boolean;
+  ignoreBlacklistWhenCloaked: boolean;
+  ignorePirateFleeWhenCloaked: boolean;
 } {
   const all = readSettings();
   const botOverrides = username ? (all[username] || {}) : {};
@@ -390,6 +392,20 @@ function getExplorerSettings(username?: string): {
       ? Boolean(e.autoCloak)
       : false;
 
+  // Ignore blacklist when cloaked: per-bot > global explorer > default true (safe when cloaked)
+  const ignoreBlacklistWhenCloaked = botOverrides.ignoreBlacklistWhenCloaked !== undefined
+    ? Boolean(botOverrides.ignoreBlacklistWhenCloaked)
+    : e.ignoreBlacklistWhenCloaked !== undefined
+      ? Boolean(e.ignoreBlacklistWhenCloaked)
+      : true;
+
+  // Ignore pirate flee when cloaked: per-bot > global explorer > default true (safe when cloaked)
+  const ignorePirateFleeWhenCloaked = botOverrides.ignorePirateFleeWhenCloaked !== undefined
+    ? Boolean(botOverrides.ignorePirateFleeWhenCloaked)
+    : e.ignorePirateFleeWhenCloaked !== undefined
+      ? Boolean(e.ignorePirateFleeWhenCloaked)
+      : true;
+
   return {
     mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : "explore") as ExplorerMode,
     acceptMissions,
@@ -404,6 +420,8 @@ function getExplorerSettings(username?: string): {
     loadFuelCellsAtHome,
     returnToHomeOnFuelCellDepletion,
     autoCloak,
+    ignoreBlacklistWhenCloaked,
+    ignorePirateFleeWhenCloaked,
   };
 }
 
@@ -481,6 +499,20 @@ export function setExplorerReturnToHomeOnFuelCellDepletion(username: string, ret
 export function setExplorerAutoCloak(username: string, autoCloak: boolean): void {
   writeSettings({
     [username]: { autoCloak },
+  });
+}
+
+/** Persist ignore blacklist when cloaked setting for a specific bot. */
+export function setExplorerIgnoreBlacklistWhenCloaked(username: string, ignoreBlacklistWhenCloaked: boolean): void {
+  writeSettings({
+    [username]: { ignoreBlacklistWhenCloaked },
+  });
+}
+
+/** Persist ignore pirate flee when cloaked setting for a specific bot. */
+export function setExplorerIgnorePirateFleeWhenCloaked(username: string, ignorePirateFleeWhenCloaked: boolean): void {
+  writeSettings({
+    [username]: { ignorePirateFleeWhenCloaked },
   });
 }
 
@@ -1141,7 +1173,7 @@ yield "deposit_cargo";
     // ── Direct to Unknown mode: jump directly to nearest unknown or stale system ──
     if (currentSettings.directToUnknown) {
       const blacklist = getSystemBlacklist();
-      const unknowns = findUnknownSystems(ctx, systemId, blacklist, fledFromSystems);
+      const unknowns = findUnknownSystems(ctx, systemId, blacklist, fledFromSystems, currentSettings.ignoreBlacklistWhenCloaked, bot.isCloaked);
 
       if (unknowns.length > 0) {
         // Pick the nearest high-priority target (unknown first, then stale)
@@ -1210,12 +1242,15 @@ yield "deposit_cargo";
           continue;
         }
         if (nearbyResp.result && typeof nearbyResp.result === "object") {
-          const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-          if (fled) {
-            ctx.log("error", "Pirates detected - fled, will retry");
-            fledFromSystems.add(systemId);
-            await ctx.sleep(30000);
-            continue;
+          // Skip pirate flee if cloaked and ignorePirateFleeWhenCloaked is enabled
+          if (!bot.isCloaked || !currentSettings.ignorePirateFleeWhenCloaked) {
+            const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+            if (fled) {
+              ctx.log("error", "Pirates detected - fled, will retry");
+              fledFromSystems.add(systemId);
+              await ctx.sleep(30000);
+              continue;
+            }
           }
         }
         lastSystem = systemId;
@@ -1243,7 +1278,7 @@ yield "deposit_cargo";
       ctx.log("warning", `Found ${blacklistedInConnections.length} blacklisted systems in current connections: ${blacklistedInConnections.map(c => c.id).join(', ')}`);
     }
 
-    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems, path);
+    const nextSystem = pickNextSystem(ctx, validConns, visitedSystems, visitedSystemTimes, lastSystem, fledFromSystems, path, bot.isCloaked, currentSettings.ignoreBlacklistWhenCloaked);
     if (!nextSystem) {
       ctx.log("info", "All connected systems explored! Picking a random connection...");
       if (validConns.length > 0) {
@@ -1255,7 +1290,7 @@ yield "deposit_cargo";
           continue;
         }
         // Smart selection: avoid dead-ends and pirate systems
-        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems, path);
+        const random = pickSmartConnection(ctx, validConns, lastSystem, visitedSystems, visitedSystemTimes, fledFromSystems, path, bot.isCloaked, currentSettings.ignoreBlacklistWhenCloaked);
         if (!random) {
           ctx.log("error", "No valid non-blacklisted connections available! Explorer is trapped. Attempting to backtrack...");
           if (path.length >= 2) {
@@ -1319,12 +1354,15 @@ yield "deposit_cargo";
         // Check for pirates
         const nearbyResp = await bot.exec("get_nearby");
         if (nearbyResp.result && typeof nearbyResp.result === "object") {
-          const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-          if (fled) {
-            ctx.log("error", "Pirates detected - fled, will retry");
-            fledFromSystems.add(systemId); // Mark this system as hostile
-            await ctx.sleep(30000);
-            continue;
+          // Skip pirate flee if cloaked and ignorePirateFleeWhenCloaked is enabled
+          if (!bot.isCloaked || !currentSettings.ignorePirateFleeWhenCloaked) {
+            const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+            if (fled) {
+              ctx.log("error", "Pirates detected - fled, will retry");
+              fledFromSystems.add(systemId); // Mark this system as hostile
+              await ctx.sleep(30000);
+              continue;
+            }
           }
         }
         lastSystem = systemId;
@@ -1414,12 +1452,15 @@ yield "deposit_cargo";
     // Check for pirates
     const nearbyResp = await bot.exec("get_nearby");
     if (nearbyResp.result && typeof nearbyResp.result === "object") {
-      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-      if (fled) {
-        ctx.log("error", "Pirates detected - fled, will retry");
-        fledFromSystems.add(systemId); // Mark this system as hostile
-        await ctx.sleep(30000);
-        continue;
+      // Skip pirate flee if cloaked and ignorePirateFleeWhenCloaked is enabled
+      if (!bot.isCloaked || !currentSettings.ignorePirateFleeWhenCloaked) {
+        const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+        if (fled) {
+          ctx.log("error", "Pirates detected - fled, will retry");
+          fledFromSystems.add(systemId); // Mark this system as hostile
+          await ctx.sleep(30000);
+          continue;
+        }
       }
     }
 
@@ -3001,7 +3042,7 @@ const STALE_POI_DAYS = 7;
  *
  * Within each tier, systems are sorted by jump distance ascending (nearest first).
  */
-function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklist: string[], fledFromSystems: Set<string>): Array<{
+function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklist: string[], fledFromSystems: Set<string>, ignoreBlacklistWhenCloaked: boolean = false, isCloaked: boolean = false): Array<{
   id: string;
   name: string;
   distance: number;
@@ -3037,9 +3078,12 @@ function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklis
       if (!connId) continue;
       if (visited.has(connId)) continue;
       // Skip blacklisted systems, temporarily blacklisted systems, and systems we've fled from
-      if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
-      if (isTemporarilyBlacklisted(connId)) continue;
-      if (fledFromSystems.has(connId)) continue;
+      // Unless cloaked and ignoreBlacklistWhenCloaked is enabled
+      if (!isCloaked || !ignoreBlacklistWhenCloaked) {
+        if (blacklist.some(b => b.toLowerCase() === connId.toLowerCase())) continue;
+        if (isTemporarilyBlacklisted(connId)) continue;
+        if (fledFromSystems.has(connId)) continue;
+      }
 
       visited.add(connId);
       const newRoute = [...route, connId];
@@ -3787,9 +3831,10 @@ async function loadFuelCells(ctx: RoutineContext): Promise<boolean> {
  * 1. Systems not in map.json at all (completely unexplored)
  * 2. Systems in map.json but not yet visited this session
  * 3. Among unvisited, prefer systems with fewer POIs (less explored)
- * Always avoids pirate systems, blacklisted systems, and systems we've fled from.
+ * Skips pirate systems, blacklisted systems, and systems we've fled from.
+ * When cloaked and ignoreBlacklistWhenCloaked is enabled, skips blacklist/flee filtering.
  */
-function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>, path: string[] = []): Connection | null {
+function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited: Set<string>, visitedTimes: Map<string, number>, lastSystem: string | null, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
@@ -3815,6 +3860,11 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
     }
     if (isTempBlacklisted) {
       ctx.log("debug", `Filtering out temporarily blacklisted system: ${c.id}`);
+    }
+
+    // Skip blacklist/flee filtering if cloaked and ignoreBlacklistWhenCloaked is enabled
+    if (isCloaked && ignoreBlacklistWhenCloaked) {
+      return true;
     }
 
     return !isBlacklisted && !hasFledFrom && !isTempBlacklisted;
@@ -3899,7 +3949,7 @@ function pickNextSystem(ctx: RoutineContext, connections: Connection[], visited:
  * 5. Systems with more connections (not a dead-end)
  * 6. Unexplored systems (not in map.json) over explored ones
  */
-function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>, path: string[] = []): Connection | null {
+function pickSmartConnection(ctx: RoutineContext, connections: Connection[], lastSystem: string | null, visited: Set<string>, visitedTimes: Map<string, number>, fledFromSystems: Set<string>, path: string[] = [], isCloaked: boolean = false, ignoreBlacklistWhenCloaked: boolean = false): Connection | null {
   const blacklist = getSystemBlacklist();
   const ONE_HOUR_MS = 60 * 60 * 1000;
   const now = Date.now();
@@ -3929,6 +3979,11 @@ function pickSmartConnection(ctx: RoutineContext, connections: Connection[], las
     }
     if (isTempBlacklisted) {
       ctx.log("debug", `Smart connection picker - Filtering out temporarily blacklisted system: ${c.id}`);
+    }
+
+    // Skip blacklist/flee filtering if cloaked and ignoreBlacklistWhenCloaked is enabled
+    if (isCloaked && ignoreBlacklistWhenCloaked) {
+      return true;
     }
 
     return !isBlacklisted && !hasFledFrom && !isTempBlacklisted;

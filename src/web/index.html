@@ -21762,6 +21762,8 @@ When responding:
         const returnToHomeOnFuelCellDepletion =
           explorer.returnToHomeOnFuelCellDepletion ?? false;
         const autoCloak = explorer.autoCloak ?? false;
+        const ignoreBlacklistWhenCloaked = explorer.ignoreBlacklistWhenCloaked ?? true;
+        const ignorePirateFleeWhenCloaked = explorer.ignorePirateFleeWhenCloaked ?? true;
 
         // Per-bot focus area overrides for trade_update mode
         const explorerBots = bots.filter((b) => {
@@ -21933,6 +21935,28 @@ When responding:
       </select>
     </div>
 
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ignore Blacklist When Cloaked</div>
+        <div class="setting-hint">When cloaked, ignore blacklisted systems. Safe because cloaked ships cannot be attacked.</div>
+      </div>
+      <select id="set-explorer-ignoreBlacklistWhenCloaked">
+        <option value="false"${!ignoreBlacklistWhenCloaked ? " selected" : ""}>No</option>
+        <option value="true"${ignoreBlacklistWhenCloaked ? " selected" : ""}>Yes (ignore blacklist)</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Ignore Pirate Flee When Cloaked</div>
+        <div class="setting-hint">When cloaked, do not flee from pirate systems. Safe because cloaked ships cannot be attacked.</div>
+      </div>
+      <select id="set-explorer-ignorePirateFleeWhenCloaked">
+        <option value="false"${!ignorePirateFleeWhenCloaked ? " selected" : ""}>No</option>
+        <option value="true"${ignorePirateFleeWhenCloaked ? " selected" : ""}>Yes (ignore pirate flee)</option>
+      </select>
+    </div>
+
     ${perBotHtml}
 
     <div class="settings-save-bar">
@@ -21977,6 +22001,8 @@ When responding:
               "set-explorer-returnToHomeOnFuelCellDepletion",
             ).value === "true",
           autoCloak: document.getElementById("set-explorer-autoCloak").value === "true",
+          ignoreBlacklistWhenCloaked: document.getElementById("set-explorer-ignoreBlacklistWhenCloaked").value === "true",
+          ignorePirateFleeWhenCloaked: document.getElementById("set-explorer-ignorePirateFleeWhenCloaked").value === "true",
         };
         send({ type: "saveSettings", routine: "explorer", settings: s });
         settings.explorer = s;

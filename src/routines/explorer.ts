@@ -3109,6 +3109,78 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
   const blacklist = getSystemBlacklist();
   const settings = getExplorerSettings(bot.username);
 
+  // ── Startup: dock at local station to clear cargo & refuel ──
+  yield "startup_prep";
+  await bot.refreshLocation();
+  const { pois: startPois } = await getSystemInfo(ctx);
+  const startStation = findStation(startPois);
+  if (startStation) {
+    ctx.log("system", `Startup: docking at ${startStation.name} to clear cargo & refuel...`);
+
+    // Travel to station if not already there
+    if (bot.poi !== startStation.id) {
+      await ensureUndocked(ctx);
+      const tResp = await bot.exec("travel", { target_poi: startStation.id });
+      if (!tResp.error || tResp.error.message.includes("already")) {
+        bot.poi = startStation.id;
+      }
+    }
+
+    // Dock
+    if (!bot.docked) {
+      const dResp = await bot.exec("dock");
+      if (!dResp.error || dResp.error.message.includes("already")) {
+        bot.docked = true;
+      }
+    }
+
+    if (bot.docked) {
+      // Collect gifted credits/items from storage
+      await collectFromStorage(ctx);
+
+      // Deposit non-fuel cargo
+      yield "startup_deposit";
+      const cargoResp = await bot.exec("get_cargo");
+      if (cargoResp.result && typeof cargoResp.result === "object") {
+        const cResult = cargoResp.result as Record<string, unknown>;
+        const cargoItems = (
+          Array.isArray(cResult) ? cResult :
+          Array.isArray(cResult.items) ? (cResult.items as Array<Record<string, unknown>>) :
+          Array.isArray(cResult.cargo) ? (cResult.cargo as Array<Record<string, unknown>>) :
+          []
+        );
+        let deposited = 0;
+        for (const item of cargoItems) {
+          const itemId = (item.item_id as string) || "";
+          const quantity = (item.quantity as number) || 0;
+          if (!itemId || quantity <= 0) continue;
+          const lower = itemId.toLowerCase();
+          if (lower.includes("fuel") || lower.includes("energy_cell")) continue;
+          const displayName = (item.name as string) || itemId;
+          ctx.log("trade", `Depositing ${quantity}x ${displayName}...`);
+          await bot.exec("deposit_items", { item_id: itemId, quantity });
+          deposited += quantity;
+        }
+        if (deposited > 0) ctx.log("trade", `Deposited ${deposited} items to storage`);
+      }
+
+      // Load fuel cells to max cargo (achievement mode needs full fuel cells for long trips)
+      if (settings.loadFuelCellsAtHome) {
+        yield "startup_load_fuel_cells";
+        await loadFuelCellsToMax(ctx);
+      }
+
+      // Refuel
+      yield "startup_refuel";
+      await tryRefuel(ctx);
+      await bot.refreshShip();
+      const startFuel = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      ctx.log("system", `Startup complete — Fuel: ${startFuel}% | Cargo: ${bot.cargo}/${bot.cargoMax}`);
+    }
+  } else {
+    ctx.log("system", "No station in current system — skipping startup prep");
+  }
+
   // Fetch initial map data to get visited status for all systems
   yield "fetch_map";
   ctx.log("system", "Fetching galaxy map with visited status...");
@@ -3175,7 +3247,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     // Find all unvisited systems and build optimized path
     yield "plan_achievement_route";
 
-    const unvisitedSystems = await findAllUnvisitedSystems(ctx, blacklist, fledFromSystems);
+    const unvisitedSystems = await findAllUnvisitedSystems(ctx, blacklist, fledFromSystems, visitedSystems);
 
     if (unvisitedSystems.length === 0) {
       ctx.log("info", "No unvisited systems found in map — refreshing map data...");
@@ -3247,6 +3319,7 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
  */
 async function findNearestUnvisitedSystem(
   ctx: RoutineContext,
+  visitedSystems?: Set<string>,
 ): Promise<{
   id: string;
   name: string;
@@ -3263,6 +3336,8 @@ async function findNearestUnvisitedSystem(
   for (const sys of allSystems) {
     if (isPirateSystem(sys.id)) continue;
     if (sys.visited === true) continue;
+    // Also skip systems we've visited in this session
+    if (visitedSystems?.has(sys.id)) continue;
     unvisited.push({ id: sys.id, name: sys.name || sys.id });
   }
 
@@ -3300,7 +3375,8 @@ async function findNearestUnvisitedSystem(
 async function findAllUnvisitedSystems(
   ctx: RoutineContext,
   blacklist: string[],
-  fledFromSystems: Set<string>
+  fledFromSystems: Set<string>,
+  visitedSystems: Set<string>
 ): Promise<Array<{
   id: string;
   name: string;
@@ -3328,8 +3404,8 @@ async function findAllUnvisitedSystems(
   const currentSys = mapStore.getSystem(currentSystem);
   if (!currentSys || !currentSys.connections || currentSys.connections.length === 0) {
     ctx.log("debug", `MapStore has no connection data for ${currentSystem} — using server fallback`);
-    const nearest = await findNearestUnvisitedSystem(ctx);
-    if (nearest) {
+    const nearest = await findNearestUnvisitedSystem(ctx, visitedSystems);
+    if (nearest && !visitedSystems.has(nearest.id)) {
       return [nearest];
     }
     return [];
@@ -3352,6 +3428,8 @@ async function findAllUnvisitedSystems(
       const connId = conn.system_id;
       if (!connId) continue;
       if (visited.has(connId)) continue;
+      // Skip systems we've already visited in this session
+      if (visitedSystems.has(connId)) continue;
 
       // Skip pirate systems only (achievement mode traverses blacklisted systems)
       if (isPirateSystem(connId)) continue;
@@ -3359,15 +3437,17 @@ async function findAllUnvisitedSystems(
       visited.add(connId);
 
       const targetSys = mapStore.getSystem(connId);
-      if (targetSys && targetSys.visited === false) {
+      // If system not in mapStore, treat as unvisited (we don't know its status)
+      // Also check local visitedSystems set to avoid re-visiting systems we just visited
+      if (!targetSys || targetSys.visited === false) {
         unvisited.push({
           id: connId,
-          name: targetSys.name || connId,
+          name: targetSys?.name || connId,
           distance: distance + 1,
-          position: targetSys.position ?? null,
+          position: targetSys?.position ?? null,
         });
         queue.push({ systemId: connId, distance: distance + 1 });
-      } else if (targetSys) {
+      } else if (targetSys && targetSys.visited === true) {
         queue.push({ systemId: connId, distance: distance + 1 });
       }
     }
@@ -3377,8 +3457,8 @@ async function findAllUnvisitedSystems(
 
   if (unvisited.length === 0) {
     ctx.log("debug", "BFS found no unvisited systems — using server fallback");
-    const nearest = await findNearestUnvisitedSystem(ctx);
-    if (nearest) {
+    const nearest = await findNearestUnvisitedSystem(ctx, visitedSystems);
+    if (nearest && !visitedSystems.has(nearest.id)) {
       return [nearest];
     }
   }

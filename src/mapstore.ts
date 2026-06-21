@@ -5,6 +5,16 @@ import { log } from "./ui.js";
 import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
 import { onPoiUpdate } from "./client_sync_hooks.js";
 
+// ── POI type helpers ────────────────────────────────────────────
+
+/** Check if a POI type is a minable resource location (asteroid belt, gas cloud, ice field, etc.) */
+function isMinablePoiType(type: string): boolean {
+  const t = (type || "").toLowerCase();
+  return t.includes("asteroid") || t.includes("gas") || t.includes("cloud")
+    || t.includes("nebula") || t.includes("field") || t.includes("ring")
+    || t.includes("belt") || t.includes("resource");
+}
+
 // ── Data model ──────────────────────────────────────────────
 
 export interface StoredConnection {
@@ -1337,23 +1347,18 @@ findOreLocations(oreId: string): Array<{
         const ore = poi.ores_found.find((o) => o.item_id === oreId);
         const resource = poi.resources?.find((r) => r.resource_id === oreId);
 
-        // CRITICAL FIX: For ore mining, we want to include ore belt POIs even if they've been
-        // surveyed for other resources. The bot can mine there and discover the ore.
-        // Only skip POIs where:
-        // 1. The specific ore is confirmed depleted (has depletion record), OR
-        // 2. The POI has been surveyed and definitely doesn't have this ore (not an ore belt type)
+        // CRITICAL FIX: If the specific ore/resource is NOT found in this POI,
+        // skip it unless the POI is unsurveyed AND is a valid mining location type.
+        // This prevents returning POIs that don't contain the target resource
+        // (like wormhole exits, stations, etc.)
         if (!ore && !resource) {
-          const poiType = (poi.type || "").toLowerCase();
-          const isOreBelt = poiType.includes("asteroid") || poiType.includes("belt") || 
-                           poiType.includes("ring") || poiType.includes("field") || 
-                           poiType.includes("nebula") || poiType.includes("resource") ||
-                           poiType.includes("ore");
-          
-          // For ore belts, include them even if unsurveyed for this specific ore
-          // The bot can mine there and discover the ore
-          // For other POI types, only include if completely unsurveyed
-          if (!isOreBelt && poi.resources && poi.resources.length > 0) {
-            // Non-ore belt POI that has been surveyed but doesn't have this ore - skip it
+          // Check if this is an unsurveyed POI that could potentially have this resource
+          const isUnsurveyed = (!poi.ores_found || poi.ores_found.length === 0) &&
+                               (!poi.resources || poi.resources.length === 0);
+          // Only include unsurveyed POIs that are valid mining location types
+          if (!isUnsurveyed || !isMinablePoiType(poi.type)) {
+            // Surveyed POIs that don't have this resource, OR non-mining POIs
+            // should be skipped
             continue;
           }
         }

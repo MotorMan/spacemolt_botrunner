@@ -24,6 +24,60 @@ import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { onCivilianTransportUpdate } from "../client_sync_hooks.js";
 
+// ── Cloaking module detection and enablement ────────────────────────────────
+
+async function hasCloakingModule(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+  let modules: unknown[];
+
+  if (cachedModules && cachedModules.length > 0) {
+    modules = cachedModules;
+  } else {
+    const shipResp = await bot.exec("get_ship");
+    if (shipResp.error || !shipResp.result) return false;
+    const shipData = shipResp.result as Record<string, unknown>;
+    modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  }
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
+    const modName = ((modObj?.name as string) || "").toLowerCase();
+    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`;
+    if (checkStr.includes("cloak")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+
+  if (bot.isCloaked) {
+    ctx.log("transport", "Bot is already cloaked - no action needed");
+    return true;
+  }
+
+  const hasCloak = await hasCloakingModule(ctx, cachedModules);
+  if (!hasCloak) {
+    ctx.log("transport", "No cloaking module detected - cannot enable cloak");
+    return false;
+  }
+
+  ctx.log("transport", "Enabling cloaking module...");
+  const resp = await bot.exec("cloak", { enable: true });
+  if (resp.error) {
+    ctx.log("error", `Failed to enable cloak: ${resp.error.message}`);
+    return false;
+  }
+
+  ctx.log("transport", "Cloaking enabled successfully");
+  return true;
+}
+
 let stationRefCache: StationRef | null = null;
 
 function loadStationRef(): StationRef {
@@ -427,6 +481,7 @@ interface CivilianTransportSettings {
   allowEconomyClass: boolean;
   announceDestination: boolean;
   disableFactionMessage: boolean;
+  enableCloak: boolean;
 }
 
 // ── Settings ─────────────────────────────────────────────────
@@ -455,6 +510,7 @@ function getCivilianTransportSettings(username?: string): CivilianTransportSetti
     allowEconomyClass: (t.allowEconomyClass as boolean) !== false,
     announceDestination: (t.announceDestination as boolean) !== false,
     disableFactionMessage: (t.disableFactionMessage as boolean) ?? false,
+    enableCloak: (t.enableCloak as boolean) ?? false,
   };
 }
 
@@ -1067,13 +1123,10 @@ async function selectNextPickupStation(
     return { system: randomStation.systemId, poi: randomStation.poiId, poiName: randomStation.poiName };
   }
 
-  const blacklist = getSystemBlacklist();
-  const knownSystems = mapStore.getAllSystems();
-  
-const stationsWithHops = availableStations.map(s => {
-    const hops = hopsBetweenSync(currentSystem, s.systemId);
+  const stationsWithHops = availableStations.map(s => {
+    const hops = hopsToStation(currentSystem, s.systemId);
     return { ...s, hops };
-  }).filter(s => s.hops <= settings.maxJumps && !blacklist.includes(s.systemId));
+  }).filter(s => s.hops <= settings.maxJumps);
   
   ctx.log("transport", `Found ${stationsWithHops.length} reachable stations out of ${availableStations.length}`);
   
@@ -1081,7 +1134,7 @@ const stationsWithHops = availableStations.map(s => {
     let nearest: EmpireStation & { dist: number } = { ...availableStations[0], dist: 9999 };
     for (const s of availableStations) {
       if (s.poiId === currentPoi && s.systemId === currentSystem) continue;
-      const dist = hopsBetweenSync(currentSystem, s.systemId);
+      const dist = hopsToStation(currentSystem, s.systemId);
       if (dist < nearest.dist) {
         nearest = { ...s, dist };
       }
@@ -1186,6 +1239,13 @@ function hopsBetweenSync(a: string, b: string): number {
   return route.length - 1;
 }
 
+function hopsToStation(a: string, b: string): number {
+  if (a.toLowerCase() === b.toLowerCase()) return 0;
+  const route = mapStore.findRoute(a, b);
+  if (!route) return 9999;
+  return route.length - 1;
+}
+
 function makeNewState(bot: Bot, shipId: string, shipName: string, customName: string | undefined, tier: number | null, berths: { economy: number; business: number; first: number }): TransportState {
   return {
     botUsername: bot.username,
@@ -1265,6 +1325,11 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
   }
 
 ctx.log("transport", `Civilian transport started. Ship: ${state.customName || state.shipName}. Status: ${state.status}`);
+
+  // Enable cloaking if configured and module is available
+  if (settings.enableCloak) {
+    await enableCloakingIfPossible(ctx);
+  }
 
   // Collect fuel cells at home base on startup
   if (settings.homeStation && bot.docked && bot.poi && bot.poi.toLowerCase() === settings.homeStation.toLowerCase()) {
@@ -1558,7 +1623,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
         state.status = "traveling_to_ship";
         saveTransportState(state);
         if (state.pickupSystem !== bot.system) {
-          const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
+          const ok = await navigateToSystem(ctx, state.pickupSystem, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
           if (!ok) {
             state.status = "idle";
             saveTransportState(state);
@@ -2100,7 +2165,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
 
       if (waypoint.system !== bot.system) {
         ctx.log("transport", `Navigating to system ${waypoint.system}`);
-        const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold });
+        const ok = await navigateToSystem(ctx, waypoint.system, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: settings.repairThreshold, skipBlacklist: true });
         await bot.refreshStatus();
         if (!ok) {
           ctx.log("transport", `FAILED to navigate to system ${waypoint.system}`);

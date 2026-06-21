@@ -302,7 +302,7 @@ const RESOURCE_REFRESH_MINS = 120;
 
 // ── Per-bot settings ─────────────────────────────────────────
 
-export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all";
+export type ExplorerMode = "explore" | "trade_update" | "deep_core_scan" | "visit_all" | "achievement";
 
 function getExplorerSettings(username?: string): {
   mode: ExplorerMode;
@@ -407,7 +407,7 @@ function getExplorerSettings(username?: string): {
       : true;
 
   return {
-    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : "explore") as ExplorerMode,
+    mode: (mode === "trade_update" ? "trade_update" : mode === "deep_core_scan" ? "deep_core_scan" : mode === "visit_all" ? "visit_all" : mode === "achievement" ? "achievement" : "explore") as ExplorerMode,
     acceptMissions,
     focusAreaSystem,
     maxJumps,
@@ -443,6 +443,13 @@ export function setExplorerDeepCoreScan(username: string, enabled: boolean): voi
 export function setExplorerVisitAll(username: string, enabled: boolean): void {
   writeSettings({
     [username]: { explorerMode: enabled ? "visit_all" : "explore" },
+  });
+}
+
+/** Persist achievement mode setting for a specific bot. */
+export function setExplorerAchievement(username: string, enabled: boolean): void {
+  writeSettings({
+    [username]: { explorerMode: enabled ? "achievement" : "explore" },
   });
 }
 
@@ -546,6 +553,10 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   }
   if (initialSettings.mode === "visit_all") {
     yield* visitAllRoutine(ctx);
+    return;
+  }
+  if (initialSettings.mode === "achievement") {
+    yield* achievementRoutine(ctx);
     return;
   }
 
@@ -765,6 +776,11 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
     if (modeCheck.mode === "visit_all") {
       ctx.log("system", "Mode changed to visit_all — switching routines...");
       yield* visitAllRoutine(ctx);
+      return;
+    }
+    if (modeCheck.mode === "achievement") {
+      ctx.log("system", "Mode changed to achievement — switching routines...");
+      yield* achievementRoutine(ctx);
       return;
     }
 
@@ -3060,6 +3076,216 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     path.push(target.id);
     lastSystem = systemId;
   }
+}
+
+// ── Achievement Routine ───────────────────────────────────────────
+
+/**
+ * Achievement mode — systematically visits all 505 systems in the galaxy
+ * to achieve 100% exploration and update the visited flags from get_map.
+ * Uses galactic coordinates to create an optimized path that minimizes
+ * fuel consumption and travel time.
+ */
+async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
+  const { bot } = ctx;
+
+  ctx.log("system", "Achievement mode — systematically visiting all unvisited systems...");
+
+  const visitedSystems = new Set<string>();
+  const fledFromSystems = new Set<string>();
+  const path: string[] = [];
+  let lastSystem: string | null = null;
+
+  // Get initial system info
+  yield "startup";
+  await bot.refreshLocation();
+  let { systemId } = await getSystemInfo(ctx);
+  if (!systemId) {
+    ctx.log("error", "Could not determine current system — waiting 30s");
+    await ctx.sleep(30000);
+    return;
+  }
+
+  const blacklist = getSystemBlacklist();
+  const settings = getExplorerSettings(bot.username);
+
+  // Fetch initial map data to get visited status for all systems
+  yield "fetch_map";
+  ctx.log("system", "Fetching galaxy map with visited status...");
+  const mapResp = await bot.exec("get_map");
+  if (mapResp.result && typeof mapResp.result === "object") {
+    const mapData = mapResp.result as Record<string, unknown>;
+    const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+    for (const sys of systems) {
+      const sysId = (sys.system_id as string) || (sys.id as string);
+      if (sysId) {
+        mapStore.updateSystem(sys);
+      }
+    }
+    const visitedCount = systems.filter((s: Record<string, unknown>) => s.visited === true).length;
+    ctx.log("exploration", `Map loaded: ${systems.length} systems, ${visitedCount} visited by this bot`);
+  } else {
+    ctx.log("warn", "Could not fetch map data — visited status may be incomplete");
+  }
+
+  // Initialize path with current system
+  if (path.length === 0 && bot.system) {
+    path.push(bot.system);
+  }
+
+  while (bot.state === "running") {
+    // Check for battle
+    if (await checkAndFleeFromBattle(ctx, "achievement")) {
+      await ctx.sleep(5000);
+      continue;
+    }
+
+    // Re-check mode after recovery
+    const modeCheck = getExplorerSettings(bot.username);
+    if (modeCheck.mode !== "achievement") {
+      ctx.log("system", "Mode changed from achievement — switching to new mode");
+      return;
+    }
+
+    await bot.refreshShip();
+    const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    ctx.log("info", `Achievement ${bot.system} — ${bot.credits} cr, ${fuelPct}% fuel`);
+
+    let { pois, connections, systemId } = await getSystemInfo(ctx);
+    if (!systemId) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    // Mark this system as visited locally
+    visitedSystems.add(systemId);
+    mapStore.markSystemVisited(systemId);
+
+    // Get visit stats from mapStore
+    const stats = mapStore.getVisitStats();
+    ctx.log("exploration", `Progress: ${stats.visited}/${stats.total} systems visited (${Math.round(stats.visited/stats.total*100)}%)`);
+
+    // Check if we've completed all systems (auto-disable achievement mode)
+    if (stats.unvisited === 0) {
+      ctx.log("info", "All systems visited! Auto-disabling achievement mode.");
+      setExplorerMode(bot.username, "explore");
+      return;
+    }
+
+    // Find all unvisited systems and build optimized path
+    yield "plan_achievement_route";
+    const unvisitedSystems = findAllUnvisitedSystems(ctx, blacklist, fledFromSystems);
+
+    if (unvisitedSystems.length === 0) {
+      ctx.log("info", "No unvisited systems found in map — refreshing map data...");
+      yield "refresh_map";
+      const mapResp = await bot.exec("get_map");
+      if (mapResp.result && typeof mapResp.result === "object") {
+        const mapData = mapResp.result as Record<string, unknown>;
+        const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+        for (const sys of systems) {
+          const sysId = (sys.system_id as string) || (sys.id as string);
+          if (sysId) {
+            mapStore.updateSystem(sys);
+          }
+        }
+      }
+      await ctx.sleep(10000);
+      continue;
+    }
+
+    // Sort by distance from current position (nearest first)
+    unvisitedSystems.sort((a, b) => a.distance - b.distance);
+
+    const target = unvisitedSystems[0];
+    ctx.log("travel", `Navigating to ${target.name} (${target.id}) - ${target.distance} jumps away, ${unvisitedSystems.length} systems remaining`);
+
+    // Ensure fueled
+    const fueled = await ensureFueled(ctx, settings.refuelThreshold);
+    if (!fueled) {
+      await ctx.sleep(30000);
+      continue;
+    }
+
+    await ensureUndocked(ctx);
+
+    // Navigate to target system
+    const arrived = await navigateToSystem(ctx, target.id, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 });
+    if (!arrived) {
+      ctx.log("error", `Could not reach ${target.name} — will retry next loop`);
+      await ctx.sleep(10000);
+      continue;
+    }
+
+    ctx.log("travel", `Arrived at ${target.name}`);
+    bot.stats.totalSystems++;
+    path.push(target.id);
+    lastSystem = systemId;
+  }
+}
+
+/**
+ * Find all unvisited systems in the galaxy using the server's visited flag.
+ * Returns systems sorted by distance from current position.
+ */
+function findAllUnvisitedSystems(
+  ctx: RoutineContext,
+  blacklist: string[],
+  fledFromSystems: Set<string>
+): Array<{
+  id: string;
+  name: string;
+  distance: number;
+  position: { x: number; y: number } | null;
+}> {
+  const unvisited: Array<{
+    id: string;
+    name: string;
+    distance: number;
+    position: { x: number; y: number } | null;
+  }> = [];
+
+  // Get all systems from mapStore
+  const allSystems = mapStore.getSystems();
+  const currentSystem = ctx.bot.system;
+
+  // Get current position
+  let currentPos: { x: number; y: number } | null = null;
+  if (currentSystem) {
+    const sys = mapStore.getSystem(currentSystem);
+    currentPos = sys?.position ?? null;
+  }
+
+  for (const sys of allSystems) {
+    // Skip pirate systems
+    if (isPirateSystem(sys.id)) continue;
+    // Skip blacklisted systems
+    if (blacklist.some(b => b.toLowerCase() === sys.id.toLowerCase())) continue;
+    if (isTemporarilyBlacklisted(sys.id)) continue;
+    if (fledFromSystems.has(sys.id)) continue;
+
+    // Check visited flag from get_map - false means never visited by this bot
+    if (sys.visited === false) {
+      unvisited.push({
+        id: sys.id,
+        name: sys.name || sys.id,
+        distance: 0, // Will be calculated below
+        position: sys.position ?? null,
+      });
+    }
+  }
+
+  // Calculate distances from current position using galactic coordinates
+  if (currentPos) {
+    unvisited.sort((a, b) => {
+      if (!a.position || !b.position) return 0;
+      const aDist = Math.sqrt(Math.pow(a.position.x - currentPos.x, 2) + Math.pow(a.position.y - currentPos.y, 2));
+      const bDist = Math.sqrt(Math.pow(b.position.x - currentPos.x, 2) + Math.pow(b.position.y - currentPos.y, 2));
+      return aDist - bDist;
+    });
+  }
+
+  return unvisited;
 }
 
 // ── Helpers ──────────────────────────────────────────────────

@@ -4334,6 +4334,7 @@
         <option value="trade_update"${explorerMode === "trade_update" ? " selected" : ""}>Update trade data</option>
         <option value="deep_core_scan"${explorerMode === "deep_core_scan" ? " selected" : ""}>Scan hidden POIs</option>
         <option value="visit_all"${explorerMode === "visit_all" ? " selected" : ""}>Visit all systems</option>
+        <option value="achievement"${explorerMode === "achievement" ? " selected" : ""}>Achievement (visit all 505)</option>
       </select>
       <span class="profile-ore-label" style="margin-left:8px">Direct to Unknown:</span>
       <select id="profile-directToUnknown" onchange="saveProfileDirectToUnknown()" style="width:auto;padding:2px 6px;font-size:11px">
@@ -26368,6 +26369,11 @@ async function fetchPersonalFacilityTypes(username) {
       <label><input type="checkbox" id="set-civilian_transport-disableFactionMessage" ${ct.disableFactionMessage ? "checked" : ""}> Disable faction message when transport cycle completes</label>
     </div>
 
+    <div style="margin-top:12px">
+      <label><input type="checkbox" id="set-civilian_transport-enableCloak" ${ct.enableCloak ? "checked" : ""}> Enable full-time cloaking (ship cannot be attacked by players/pirates)</label>
+      <div class="setting-hint" style="margin-top:4px">Requires a cloaking module. Drains 1 fuel per tick.</div>
+    </div>
+
     <div style="margin-top:18px">
       <button class="primary" onclick="saveCivilianTransportSettings()">Save Settings</button>
     </div>
@@ -26431,6 +26437,9 @@ async function fetchPersonalFacilityTypes(username) {
         const disableFactionMessage =
           document.getElementById("set-civilian_transport-disableFactionMessage")
             ?.checked ?? false;
+        const enableCloak =
+          document.getElementById("set-civilian_transport-enableCloak")
+            ?.checked ?? false;
 
         const s = {};
         if (homeStation && homeStation.includes("|")) {
@@ -26454,6 +26463,7 @@ async function fetchPersonalFacilityTypes(username) {
         s.allowEconomyClass = allowEconomyClass;
         s.announceDestination = announceDestination;
         s.disableFactionMessage = disableFactionMessage;
+        s.enableCloak = enableCloak;
 
         send({
           type: "saveSettings",

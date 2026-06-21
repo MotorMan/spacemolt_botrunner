@@ -62,10 +62,75 @@ import {
   type FlockState,
 } from "./flock.js";
 
-// ── Deep core mining constants ───────────────────────────────────────────
+// ── Cloaking module detection and enablement ────────────────────────────────
 
 /**
- * Ores that require deep core equipment (survey scanner + extractor) to mine.
+ * Check if the ship has a cloaking module installed.
+ * Cloaking modules have "cloak" in their name, id, or special fields.
+ * Returns true if a cloaking module is detected.
+ */
+async function hasCloakingModule(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+  let modules: unknown[];
+
+  if (cachedModules && cachedModules.length > 0) {
+    modules = cachedModules;
+  } else {
+    const shipResp = await bot.exec("get_ship");
+    if (shipResp.error || !shipResp.result) return false;
+    const shipData = shipResp.result as Record<string, unknown>;
+    modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+  }
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
+    const modName = ((modObj?.name as string) || "").toLowerCase();
+    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`;
+    if (checkStr.includes("cloak")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Enable cloaking on the bot if not already cloaked.
+ * This is a one-time command - once enabled, it stays on until fuel runs out.
+ * Returns true if cloaking was enabled (or already was), false if no cloak module.
+ */
+async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unknown[]): Promise<boolean> {
+  const { bot } = ctx;
+
+  // First check if already cloaked (from get_status)
+  if (bot.isCloaked) {
+    ctx.log("mining", "Bot is already cloaked - no action needed");
+    return true;
+  }
+
+  // Check if we have a cloaking module
+  const hasCloak = await hasCloakingModule(ctx, cachedModules);
+  if (!hasCloak) {
+    ctx.log("mining", "No cloaking module detected - cannot enable cloak");
+    return false;
+  }
+
+  // Enable cloaking
+  ctx.log("mining", "Enabling cloaking module...");
+  const resp = await bot.exec("cloak", { enable: true });
+  if (resp.error) {
+    ctx.log("error", `Failed to enable cloak: ${resp.error.message}`);
+    return false;
+  }
+
+  ctx.log("mining", "Cloaking enabled successfully");
+  return true;
+}
+
+/**
+ * List of ores that require deep core equipment (survey scanner + extractor) to mine.
  * These are typically found in hidden POIs with extreme high density.
  */
 const DEEP_CORE_ORES = new Set([
@@ -340,9 +405,10 @@ async function getMinerSettings(username?: string): Promise<{
   depletionTimeoutHours: number;
   ignoreDepletion: boolean;
   stayOutUntilFull: boolean;
-    maxJumps: number;
-    minimumFuelCells: number;
-    noMidMiningRetarget: boolean;
+  maxJumps: number;
+  minimumFuelCells: number;
+  noMidMiningRetarget: boolean;
+  enableCloak: boolean;
 
   // Flock mining settings
   flockEnabled: boolean;
@@ -434,6 +500,7 @@ async function getMinerSettings(username?: string): Promise<{
     maxJumps: (m.maxJumps as number) ?? 10,
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
     noMidMiningRetarget: (m.noMidMiningRetarget as boolean) ?? false,
+    enableCloak: (m.enableCloak as boolean) ?? false,
 
     // Flock mining settings
     flockEnabled: (botOverrides.flockEnabled === true || botOverrides.flockEnabled === "true"),
@@ -1549,65 +1616,73 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("error", "Session invalid: no target resource - abandoning");
       await failMiningSession(bot.username, "No target resource");
     }
-  }
+}
 
-   // ── Startup: accept missions ──
-   await completeActiveMissions(ctx);
-   await checkAndAcceptMinerMissions(ctx);
+    // ── Startup: accept missions ──
+    await completeActiveMissions(ctx);
+    await checkAndAcceptMinerMissions(ctx);
 
-   // ── Startup: unload cargo if docked at home with existing cargo ──
-   if (bot.docked && bot.system === homeSystem) {
-     await bot.refreshCargo();
-     const nonFuelCargo = bot.inventory.filter(
-       i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell")
-     );
-     if (nonFuelCargo.length > 0) {
-       ctx.log("mining", `Startup: found ${nonFuelCargo.length} cargo items docked at home — unloading`);
-       await dumpCargo(ctx, settings0);
-     }
-   }
-
-  while (bot.state === "running") {
-    // ── Death recovery ──
-    const alive = await detectAndRecoverFromDeath(ctx);
-    if (!alive) { await ctx.sleep(30000); continue; }
-
-    // ── Refresh cached ship modules after death recovery ──
-    // (modules could change if ship was destroyed and replaced)
-    cachedModules = await cacheShipModules(ctx);
-    
-    // CRITICAL FIX: If modules are empty after death recovery, wait and retry
-    if (!cachedModules || cachedModules.length === 0) {
-      ctx.log("warn", "Ship modules empty after death recovery — waiting for server...");
-      let retryCount = 0;
-      while ((!cachedModules || cachedModules.length === 0) && retryCount < 3) {
-        await ctx.sleep(2000);
-        cachedModules = await cacheShipModules(ctx);
-        retryCount++;
-      }
-      if (!cachedModules || cachedModules.length === 0) {
-        ctx.log("error", "Failed to get ship modules after death recovery — skipping cycle");
-        await ctx.sleep(30000);
-        continue;
+    // ── Startup: unload cargo if docked at home with existing cargo ──
+    if (bot.docked && bot.system === homeSystem) {
+      await bot.refreshCargo();
+      const nonFuelCargo = bot.inventory.filter(
+        i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell")
+      );
+      if (nonFuelCargo.length > 0) {
+        ctx.log("mining", `Startup: found ${nonFuelCargo.length} cargo items docked at home — unloading`);
+        await dumpCargo(ctx, settings0);
       }
     }
 
-    // ── Battle state tracking (per-cycle initialization) ──
-    const battleState: BattleState = {
-      inBattle: false,
-      battleId: null,
-      battleStartTick: null,
-      lastHitTick: null,
-      isFleeing: false,
-    };
+// ── Startup: Enable cloaking if configured and module available ──
+    if (settings0.enableCloak) {
+      const cloaked = await enableCloakingIfPossible(ctx, cachedModules);
+      if (cloaked) {
+        ctx.log("mining", "Cloaking enabled - bot is now invulnerable to attacks");
+      }
+    }
 
-    const settings = await getMinerSettings(bot.username);
-    const cargoThresholdRatio = settings.cargoThreshold / 100;
-    const safetyOpts = {
-      fuelThresholdPct: settings.refuelThreshold,
-      hullThresholdPct: settings.repairThreshold,
-    };
-    const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
+    while (bot.state === "running") {
+      // ── Death recovery ──
+      const alive = await detectAndRecoverFromDeath(ctx);
+      if (!alive) { await ctx.sleep(30000); continue; }
+
+      // ── Refresh cached ship modules after death recovery ──
+      // (modules could change if ship was destroyed and replaced)
+      cachedModules = await cacheShipModules(ctx);
+
+      // CRITICAL FIX: If modules are empty after death recovery, wait and retry
+      if (!cachedModules || cachedModules.length === 0) {
+        ctx.log("warn", "Ship modules empty after death recovery — waiting for server...");
+        let retryCount = 0;
+        while ((!cachedModules || cachedModules.length === 0) && retryCount < 3) {
+          await ctx.sleep(2000);
+          cachedModules = await cacheShipModules(ctx);
+          retryCount++;
+        }
+        if (!cachedModules || cachedModules.length === 0) {
+          ctx.log("error", "Failed to get ship modules after death recovery — skipping cycle");
+          await ctx.sleep(30000);
+          continue;
+        }
+      }
+
+      // ── Battle state tracking (per-cycle initialization) ──
+      const battleState: BattleState = {
+        inBattle: false,
+        battleId: null,
+        battleStartTick: null,
+        lastHitTick: null,
+        isFleeing: false,
+      };
+
+      const settings = await getMinerSettings(bot.username);
+      const cargoThresholdRatio = settings.cargoThreshold / 100;
+      const safetyOpts = {
+        fuelThresholdPct: settings.refuelThreshold,
+        hullThresholdPct: settings.repairThreshold,
+      };
+      const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
 
     // ── Flock state heartbeat for leader ──
     // Update flock state file immediately at cycle start if we're the leader

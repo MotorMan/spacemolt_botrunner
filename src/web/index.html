@@ -22263,6 +22263,17 @@ async function fetchPersonalFacilityTypes(username) {
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Enable Cloak</div>
+          <div class="setting-hint">When enabled, the miner will automatically cloak on startup. Cloaking makes the bot invulnerable to attacks but drains 1 fuel per tick. Since miners never attack, this is safe and provides complete protection.</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="set-miner-enableCloak"${m.enableCloak ? " checked" : ""} />
+          <span>Enable cloaking</span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Harvesting System</div>
           <div class="setting-hint">Override system to harvest in. Bot will jump there on start.</div>
         </div>
@@ -22605,6 +22616,9 @@ async function fetchPersonalFacilityTypes(username) {
             .checked,
           noMidMiningRetarget: document.getElementById(
             "set-miner-noMidMiningRetarget",
+          ).checked,
+          enableCloak: document.getElementById(
+            "set-miner-enableCloak",
           ).checked,
           stayOutUntilFull: document.getElementById(
             "set-miner-stayOutUntilFull",

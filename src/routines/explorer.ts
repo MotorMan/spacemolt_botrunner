@@ -555,6 +555,25 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
   const path: string[] = []; // Track the path of systems visited to enable reverse fleeing
   let lastSystem: string | null = null;
 
+  // ── Startup: fetch map with visited status ──
+  yield "fetch_map";
+  ctx.log("system", "Fetching galaxy map with visited status...");
+  const mapResp = await bot.exec("get_map");
+  if (mapResp.result && typeof mapResp.result === "object") {
+    const mapData = mapResp.result as Record<string, unknown>;
+    const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+    for (const sys of systems) {
+      const sysId = (sys.system_id as string) || (sys.id as string);
+      if (sysId) {
+        mapStore.updateSystem(sys);
+      }
+    }
+    const visitedCount = systems.filter((s: Record<string, unknown>) => s.visited === true).length;
+    ctx.log("exploration", `Map loaded: ${systems.length} systems, ${visitedCount} visited by this bot`);
+  } else {
+    ctx.log("warn", "Could not fetch map data — visited status may be incomplete");
+  }
+
   // ── Startup: dock at local station to clear cargo & refuel ──
   yield "startup_prep";
   await bot.refreshStatus();
@@ -1232,6 +1251,21 @@ yield "deposit_cargo";
         ctx.log("travel", `Arrived at ${target.name || target.id}`);
         bot.stats.totalSystems++;
         path.push(target.id); // Track the arrived system in path
+        
+        // Update visited status from server after arrival
+        yield "update_visited_status";
+        const updateMapResp = await bot.exec("get_map");
+        if (updateMapResp.result && typeof updateMapResp.result === "object") {
+          const mapData = updateMapResp.result as Record<string, unknown>;
+          const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+          for (const sys of systems) {
+            const sysId = (sys.system_id as string) || (sys.id as string);
+            if (sysId) {
+              mapStore.updateSystem(sys);
+            }
+          }
+        }
+        
         await checkCustomsInspection(ctx, systemId);
 
         // Check for pirates and battle
@@ -3037,7 +3071,7 @@ const STALE_POI_DAYS = 7;
  * Find systems that need exploration, sorted by priority then distance (nearest first).
  *
  * Priority tiers:
- *   1. Systems with 0 POIs (completely unknown / never explored)
+ *   1. Systems with visited=false from get_map (never visited by this bot)
  *   2. Systems where all POIs are stale (last_updated > 7 days ago)
  *
  * Within each tier, systems are sorted by jump distance ascending (nearest first).
@@ -3091,11 +3125,27 @@ function findUnknownSystems(ctx: RoutineContext, currentSystem: string, blacklis
 
       const targetSys = mapStore.getSystem(connId);
       if (targetSys) {
-        // System is in map.json — check POI status
+        // System is in map.json — check visited status from get_map
+        // visited=false means the bot has never visited this system
+        if (targetSys.visited === false) {
+          unknowns.push({
+            id: connId,
+            name: conn.system_name || connId,
+            distance: newDistance,
+            route: newRoute,
+            priority: "unknown",
+            oldestPoiUpdate: targetSys.visited_at ?? null,
+          });
+          // Continue BFS through this system (we want to explore it)
+          queue.push({ systemId: connId, distance: newDistance, route: newRoute });
+          continue;
+        }
+        
+        // System is visited by this bot — check if POIs need refreshing
         const poiCount = targetSys.pois?.length ?? 0;
 
         if (poiCount === 0) {
-          // Completely unknown — never explored
+          // No POIs yet — unknown
           unknowns.push({
             id: connId,
             name: conn.system_name || connId,
@@ -3196,6 +3246,13 @@ function findNearbyUnknowns(ctx: RoutineContext, targetSystem: string, maxJumps:
 
       const targetSys = mapStore.getSystem(connId);
       if (targetSys) {
+        // Check visited flag first - if not visited by this bot, include it
+        if (targetSys.visited === false) {
+          nearby.push(connId);
+          queue.push({ systemId: connId, distance: distance + 1 });
+          continue;
+        }
+        
         const poiCount = targetSys.pois?.length ?? 0;
         if (poiCount === 0) {
           nearby.push(connId);
@@ -3264,8 +3321,8 @@ function findUnvisitedSystemsByServerFlag(ctx: RoutineContext, currentSystem: st
 
       const targetSys = mapStore.getSystem(connId);
       if (targetSys) {
-        // Check server's visited flag
-        if (!targetSys.visited) {
+        // Check server's visited flag - false means never visited by this bot
+        if (targetSys.visited === false) {
           unvisited.push({
             id: connId,
             name: conn.system_name || connId,

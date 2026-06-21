@@ -95,24 +95,40 @@ export function isMinablePoi(type: string): boolean {
     || t.includes("belt") || t.includes("resource");
 }
 
-/** Check if a POI is an ore belt (asteroid belt/field/ring/nebula — NOT gas clouds or ice fields). */
+/** Check if a POI is an ore belt (asteroid belt/field/ring — NOT gas clouds, ice fields, or hidden POIs). */
 export function isOreBeltPoi(type: string): boolean {
   const t = type.toLowerCase();
-  if (t.includes("gas") || t.includes("cloud") || t.includes("ice")) return false;
+  if (t.includes("gas") || t.includes("cloud") || t.includes("ice") || t.includes("residue") || t.includes("shimmer") || t.includes("nexus")) return false;
   return t.includes("asteroid") || t.includes("belt") || t.includes("ring")
-    || t.includes("field") ||  t.includes("nebula") || t.includes("resource");
+    || t.includes("field") || t.includes("resource");
 }
 
 /** Check if a POI is a gas cloud. */
 export function isGasCloudPoi(type: string): boolean {
   const t = type.toLowerCase();
-  return t.includes("gas") || t.includes("cloud") || t.includes("nebula");
+  return t.includes("gas") || t.includes("cloud") || t.includes("nebula") ||
+         t.includes("residue") || t.includes("shimmer") || t.includes("nexus") ||
+         t.includes("hydrogen") || t.includes("helium") || t.includes("argon") ||
+         t.includes("neon") || t.includes("chlorine") || t.includes("nitrogen") ||
+         t.includes("oxygen") || t.includes("compressed");
+}
+
+/** Check if a POI is a gas cloud by name (fallback when type is not recognized). */
+export function isGasCloudByName(name: string): boolean {
+  const n = name.toLowerCase();
+  return n.includes("cloud") || n.includes("gas") || n.includes("residue") ||
+         n.includes("shimmer") || n.includes("nexus") || n.includes("nebula");
+}
+
+/** Check if a POI is a gas cloud (by type or name). */
+export function isGasCloudPoiOrName(typeOrName: string): boolean {
+  return isGasCloudPoi(typeOrName) || isGasCloudByName(typeOrName);
 }
 
 /** Check if a POI is an ice field. */
 export function isIceFieldPoi(type: string): boolean {
   const t = type.toLowerCase();
-  return t.includes("ice");
+  return t.includes("ice") || t.includes("frost") || t.includes("cryo") || t.includes("water_ice");
 }
 
 /** Check if a POI type is purely scenic (only needs one visit). */

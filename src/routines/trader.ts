@@ -50,6 +50,64 @@ import {
   cleanupStaleLocks,
 } from "./traderCoordination.js";
 
+// ── Cloaking module detection and enablement ────────────────────────────────
+
+/**
+ * Check if the ship has a cloaking module installed.
+ * Cloaking modules have "cloak" in their name, id, or special fields.
+ * Returns true if a cloaking module is detected.
+ */
+async function hasCloakingModule(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+  const shipResp = await bot.exec("get_ship");
+  if (shipResp.error || !shipResp.result) return false;
+  const shipData = shipResp.result as Record<string, unknown>;
+  const modules = Array.isArray(shipData.modules) ? shipData.modules : [];
+
+  for (const mod of modules) {
+    const modObj = typeof mod === "object" && mod !== null ? mod as Record<string, unknown> : null;
+    const modId = ((modObj?.id as string) || (modObj?.type_id as string) || "").toLowerCase();
+    const modName = ((modObj?.name as string) || "").toLowerCase();
+    const modSpecial = ((modObj?.special as string) || "").toLowerCase();
+
+    const checkStr = `${modId} ${modName} ${modSpecial}`;
+    if (checkStr.includes("cloak")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Enable cloaking on the bot if not already cloaked.
+ * This is a one-time command - once enabled, it stays on until fuel runs out.
+ * Returns true if cloaking was enabled (or already was), false if no cloak module.
+ */
+async function enableCloakingIfPossible(ctx: RoutineContext): Promise<boolean> {
+  const { bot } = ctx;
+
+  if (bot.isCloaked) {
+    ctx.log("trade", "Bot is already cloaked - no action needed");
+    return true;
+  }
+
+  const hasCloak = await hasCloakingModule(ctx);
+  if (!hasCloak) {
+    ctx.log("trade", "No cloaking module detected - cannot enable cloak");
+    return false;
+  }
+
+  ctx.log("trade", "Enabling cloaking module...");
+  const resp = await bot.exec("cloak", { enable: true });
+  if (resp.error) {
+    ctx.log("error", `Failed to enable cloak: ${resp.error.message}`);
+    return false;
+  }
+
+  ctx.log("trade", "Cloaking enabled successfully");
+  return true;
+}
+
 /** Free cargo weight (not item count — callers must divide by item size). */
 function getFreeSpace(bot: Bot): number {
   if (bot.cargoMax <= 0) return 999;
@@ -1149,6 +1207,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
   await bot.refreshLocation();
   const startSystem = bot.system;
 
+  // ── Cloaking setup (one-time at routine start) ──
+  const settings = getTraderSettings(bot.username);
+  if (settings.autoCloak) {
+    await enableCloakingIfPossible(ctx);
+  }
+
   // Battle state tracking for continuous flee re-issuing
   const battleState: BattleState = {
     inBattle: false,
@@ -1236,14 +1300,12 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     const activeSession = getActiveSession(bot.username);
     let recoveredSession: TradeSession | null = null;
     if (activeSession) {
-      const settings = getTraderSettings(bot.username);
       recoveredSession = await recoverTradeSession(ctx, activeSession, settings);
       if (recoveredSession) {
         ctx.log("trade", `Resuming trade session: ${recoveredSession.itemName} (${recoveredSession.state})`);
       }
     }
 
-    const settings = getTraderSettings(bot.username);
     const homeSystem = settings.homeSystem || startSystem;
     const safetyOpts = {
       fuelThresholdPct: settings.refuelThreshold,

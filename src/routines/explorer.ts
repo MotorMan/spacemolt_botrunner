@@ -3041,7 +3041,7 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
       }
       bot.stats.totalSystems++;
       path.push(target.systemId);
-      lastSystem = systemId;
+      lastSystem = target.systemId;
       continue;
     }
 
@@ -3074,7 +3074,7 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
     ctx.log("travel", `Jumped to ${target.name}`);
     bot.stats.totalSystems++;
     path.push(target.id);
-    lastSystem = systemId;
+    lastSystem = target.id;
   }
 }
 
@@ -3222,7 +3222,21 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     ctx.log("travel", `Arrived at ${target.name}`);
     bot.stats.totalSystems++;
     path.push(target.id);
-    lastSystem = systemId;
+    lastSystem = target.id;
+
+    // Update map with visited status and refresh from server
+    mapStore.markSystemVisited(target.id);
+    const mapRefreshResp = await bot.exec("get_map");
+    if (mapRefreshResp.result && typeof mapRefreshResp.result === "object") {
+      const mapData = mapRefreshResp.result as Record<string, unknown>;
+      const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+      for (const sys of systems) {
+        const sysId = (sys.system_id as string) || (sys.id as string);
+        if (sysId) {
+          mapStore.updateSystem(sys);
+        }
+      }
+    }
   }
 }
 
@@ -3248,7 +3262,7 @@ async function findNearestUnvisitedSystem(
 
   for (const sys of allSystems) {
     if (isPirateSystem(sys.id)) continue;
-    if (sys.visited !== false) continue;
+    if (sys.visited === true) continue;
     unvisited.push({ id: sys.id, name: sys.name || sys.id });
   }
 

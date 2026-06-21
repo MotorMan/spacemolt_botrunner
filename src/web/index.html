@@ -14891,6 +14891,7 @@
         const repairThreshold = t.repairThreshold ?? 40;
         const homeSystem = t.homeSystem ?? "";
         const maxFactionCreditsToUse = t.maxFactionCreditsToUse ?? 0;
+        const autoCloak = t.autoCloak ?? false;
 
         panel.innerHTML = `
     <h3>Trader Settings</h3>
@@ -14904,6 +14905,17 @@
       <select id="set-trader-enableMissions">
         <option value="true" ${t.enableMissions !== false ? "selected" : ""}>Enabled</option>
         <option value="false" ${t.enableMissions === false ? "selected" : ""}>Disabled</option>
+      </select>
+    </div>
+
+    <div class="setting-row">
+      <div>
+        <div class="setting-label">Auto Cloak</div>
+        <div class="setting-hint">Enable full-time cloaking for the bot. When enabled, the bot will automatically cloak on startup and remain cloaked (draining 1 fuel per tick). This provides maximum protection from attacks. The bot cannot attack while cloaked. Default: disabled.</div>
+      </div>
+      <select id="set-trader-autoCloak">
+        <option value="false" ${autoCloak === true ? "" : "selected"}>Disabled</option>
+        <option value="true" ${autoCloak === true ? "selected" : ""}>Enabled</option>
       </select>
     </div>
 
@@ -15013,6 +15025,8 @@
           enableMissions:
             document.getElementById("set-trader-enableMissions").value ===
             "true",
+          autoCloak:
+            document.getElementById("set-trader-autoCloak").value === "true",
           debugLogging:
             document.getElementById("set-trader-debugLogging").value === "true",
         };

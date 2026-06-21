@@ -22289,6 +22289,17 @@ async function fetchPersonalFacilityTypes(username) {
 
       <div class="setting-row">
         <div>
+          <div class="setting-label">Cloak Ignore Blacklist</div>
+          <div class="setting-hint">When enabled with cloaking, miners can enter blacklisted systems (pirate zones, hot zones). Cloaked miners are invulnerable to attacks, making this safe for high-risk mining operations.</div>
+        </div>
+        <label style="display:flex;align-items:center;gap:8px">
+          <input type="checkbox" id="set-miner-cloakIgnoreBlacklist"${m.cloakIgnoreBlacklist ? " checked" : ""} />
+          <span>Ignore blacklist while cloaked</span>
+        </label>
+      </div>
+
+      <div class="setting-row">
+        <div>
           <div class="setting-label">Harvesting System</div>
           <div class="setting-hint">Override system to harvest in. Bot will jump there on start.</div>
         </div>
@@ -22634,6 +22645,9 @@ async function fetchPersonalFacilityTypes(username) {
           ).checked,
           enableCloak: document.getElementById(
             "set-miner-enableCloak",
+          ).checked,
+          cloakIgnoreBlacklist: document.getElementById(
+            "set-miner-cloakIgnoreBlacklist",
           ).checked,
           stayOutUntilFull: document.getElementById(
             "set-miner-stayOutUntilFull",

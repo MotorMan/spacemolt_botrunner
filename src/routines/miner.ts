@@ -130,6 +130,20 @@ async function enableCloakingIfPossible(ctx: RoutineContext, cachedModules?: unk
 }
 
 /**
+ * Get the system blacklist to use for mining navigation.
+ * When the bot is cloaked and cloakIgnoreBlacklist is enabled, returns an empty array
+ * to allow mining in pirate/hot zones that would otherwise be blacklisted.
+ */
+function getMiningBlacklist(settings: Awaited<ReturnType<typeof getMinerSettings>>, isCloaked: boolean): string[] {
+  const baseBlacklist = getSystemBlacklist();
+  if (isCloaked && settings.cloakIgnoreBlacklist) {
+    // Logging is done by the caller since ctx is not available here
+    return [];
+  }
+  return baseBlacklist;
+}
+
+/**
  * List of ores that require deep core equipment (survey scanner + extractor) to mine.
  * These are typically found in hidden POIs with extreme high density.
  */
@@ -409,6 +423,7 @@ async function getMinerSettings(username?: string): Promise<{
   minimumFuelCells: number;
   noMidMiningRetarget: boolean;
   enableCloak: boolean;
+  cloakIgnoreBlacklist: boolean;
 
   // Flock mining settings
   flockEnabled: boolean;
@@ -501,6 +516,7 @@ async function getMinerSettings(username?: string): Promise<{
     minimumFuelCells: (m.minimumFuelCells as number) ?? 20,
     noMidMiningRetarget: (m.noMidMiningRetarget as boolean) ?? false,
     enableCloak: (m.enableCloak as boolean) ?? false,
+    cloakIgnoreBlacklist: (m.cloakIgnoreBlacklist as boolean) ?? false,
 
     // Flock mining settings
     flockEnabled: (botOverrides.flockEnabled === true || botOverrides.flockEnabled === "true"),
@@ -1410,6 +1426,7 @@ function findBestHiddenPoiForOre(
   ignoreDepletion: boolean,
   depletionTimeoutMs: number,
   minRichness: number = 50, // Only consider POIs with richness >= this
+  blacklist: string[] = [], // Systems to exclude (can be empty for cloaked miners)
 ): { poiId: string; poiName: string; systemId: string; systemName: string; richness: number; remaining: number; jumps: number; isHidden: boolean } | null {
   const locations = mapStore.findOreLocations(oreId).filter(loc => {
     // Skip current POI
@@ -1440,7 +1457,6 @@ function findBestHiddenPoiForOre(
   if (locations.length === 0) return null;
 
   // Score and sort by distance and richness
-  const blacklist = getSystemBlacklist();
   const scored = locations
     .map(loc => {
       const route = mapStore.findRoute(currentSystem, loc.systemId, blacklist);
@@ -1683,6 +1699,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         hullThresholdPct: settings.repairThreshold,
       };
       const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
+      
+      // Get blacklist - use empty if cloaked and cloakIgnoreBlacklist enabled
+      const blacklist = getMiningBlacklist(settings, bot.isCloaked);
 
     // ── Flock state heartbeat for leader ──
     // Update flock state file immediately at cycle start if we're the leader
@@ -2293,7 +2312,6 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           effectiveTarget = settings.targetDeepCore;
         } else {
           ctx.log("mining", "Searching for available deep core ore targets...");
-          const blacklist = getSystemBlacklist();
           let foundDeepCoreTarget = false;
 
           // CRITICAL FIX: When quotas are configured for deep core ores, use quota priority
@@ -2669,7 +2687,6 @@ if (effectiveTarget) {
           targetSystemId = bot.system;
         }
       } else {
-        const blacklist = getSystemBlacklist();
         let scoredLocations: Array<{
           systemId: string;
           systemName: string;
@@ -3329,7 +3346,6 @@ if (effectiveTarget) {
 
         if (broaderLocations.length > 0) {
           // Prefer configured system, then closest by jumps
-          const blacklist = getSystemBlacklist();
           const scored = broaderLocations
             .map(loc => {
               const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
@@ -4038,7 +4054,6 @@ if (effectiveTarget) {
         // ── RICHNESS UPGRADE CHECK ──
         // Check if there's a significantly better POI available (not just depleted check)
         // This prevents miners from staying at very low richness POIs indefinitely
-        const blacklist = getSystemBlacklist();
         const currentSys = mapStore.getSystem(bot.system);
         const currentPoi = currentSys?.pois.find(p => p.id === bot.poi);
         
@@ -4348,7 +4363,6 @@ if (effectiveTarget) {
                     });
 
                     if (newLocs.length > 0) {
-                      const blacklist = getSystemBlacklist();
                       const locsWithDist = newLocs
                         .map(loc => {
                           const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
@@ -4668,7 +4682,8 @@ if (effectiveTarget) {
               maxJumps,
               settings.ignoreDepletion,
               depletionTimeoutMs,
-              50
+              50,
+              blacklist
             );
             
             if (hiddenPoi) {
@@ -4707,60 +4722,63 @@ if (effectiveTarget) {
                     return a.deficit - b.deficit;
                   });
 
-                for (const quotaEntry of sortedOres) {
-                  if (quotaEntry.oreId === effectiveTarget) continue;
-                  
-                  const nextHiddenPoi = findBestHiddenPoiForOre(
-                    quotaEntry.oreId,
-                    bot.system,
-                    bot.poi || "",
-                    maxJumps,
-                    settings.ignoreDepletion,
-                    depletionTimeoutMs,
-                    50
-                  );
-                  
-                  if (nextHiddenPoi) {
-                    newTarget = quotaEntry.oreId;
-                    newPoiId = nextHiddenPoi.poiId;
-                    newPoiName = nextHiddenPoi.poiName;
-                    newSystemId = nextHiddenPoi.systemId;
-                    ctx.log("mining", `Switched to next quota ore: ${quotaEntry.oreId} @ ${nextHiddenPoi.poiName} in ${nextHiddenPoi.systemName} (${nextHiddenPoi.jumps} jumps, richness: ${nextHiddenPoi.richness}, deficit: ${quotaEntry.deficit})`);
-                    break;
-                  }
-                }
-                
-                if (!newTarget) {
-                  let anyHiddenAvailable = false;
-                  for (const oreEntry of sortedOres) {
-                    const anyPoi = findBestHiddenPoiForOre(
-                      oreEntry.oreId,
+for (const quotaEntry of sortedOres) {
+                    if (quotaEntry.oreId === effectiveTarget) continue;
+                    
+                    const nextHiddenPoi = findBestHiddenPoiForOre(
+                      quotaEntry.oreId,
                       bot.system,
                       bot.poi || "",
                       maxJumps,
                       settings.ignoreDepletion,
                       depletionTimeoutMs,
-                      30
+                      50,
+                      blacklist
                     );
-                    if (anyPoi) {
-                      anyHiddenAvailable = true;
+                    
+                    if (nextHiddenPoi) {
+                      newTarget = quotaEntry.oreId;
+                      newPoiId = nextHiddenPoi.poiId;
+                      newPoiName = nextHiddenPoi.poiName;
+                      newSystemId = nextHiddenPoi.systemId;
+                      ctx.log("mining", `Switched to next quota ore: ${quotaEntry.oreId} @ ${nextHiddenPoi.poiName} in ${nextHiddenPoi.systemName} (${nextHiddenPoi.jumps} jumps, richness: ${nextHiddenPoi.richness}, deficit: ${quotaEntry.deficit})`);
                       break;
                     }
                   }
-
-                  if (!anyHiddenAvailable) {
-                    ctx.log("mining", "All hidden POIs depleted across all quota ores — falling back to low richness mining");
-
+                  
+                  if (!newTarget) {
+                    let anyHiddenAvailable = false;
                     for (const oreEntry of sortedOres) {
-                      const anyPoiResult = findBestHiddenPoiForOre(
+                      const anyPoi = findBestHiddenPoiForOre(
                         oreEntry.oreId,
                         bot.system,
                         bot.poi || "",
                         maxJumps,
                         settings.ignoreDepletion,
                         depletionTimeoutMs,
-                        0
+                        30,
+                        blacklist
                       );
+                      if (anyPoi) {
+                        anyHiddenAvailable = true;
+                        break;
+                      }
+                    }
+
+                    if (!anyHiddenAvailable) {
+                      ctx.log("mining", "All hidden POIs depleted across all quota ores — falling back to low richness mining");
+
+                      for (const oreEntry of sortedOres) {
+                        const anyPoiResult = findBestHiddenPoiForOre(
+                          oreEntry.oreId,
+                          bot.system,
+                          bot.poi || "",
+                          maxJumps,
+                          settings.ignoreDepletion,
+                          depletionTimeoutMs,
+                          0,
+                          blacklist
+                        );
 
                       if (anyPoiResult) {
                         newTarget = oreEntry.oreId;
@@ -4808,7 +4826,8 @@ if (effectiveTarget) {
                     maxJumps,
                     settings.ignoreDepletion,
                     depletionTimeoutMs,
-                    50
+                    50,
+                    blacklist
                   );
                   
                   if (nextHiddenPoi) {
@@ -4860,15 +4879,16 @@ if (effectiveTarget) {
 
             // Search for any available deep core ore with hidden POIs
             for (const deepCoreOre of oresToSearch) {
-              const hiddenPoiResult = findBestHiddenPoiForOre(
-                deepCoreOre,
-                bot.system,
-                bot.poi || "",
-                maxJumps,
-                settings.ignoreDepletion,
-                depletionTimeoutMs,
-                50
-              );
+const hiddenPoiResult = findBestHiddenPoiForOre(
+                  deepCoreOre,
+                  bot.system,
+                  bot.poi || "",
+                  maxJumps,
+                  settings.ignoreDepletion,
+                  depletionTimeoutMs,
+                  50,
+                  blacklist
+                );
 
               if (hiddenPoiResult) {
                 newTarget = deepCoreOre;
@@ -4891,7 +4911,8 @@ if (effectiveTarget) {
                   maxJumps,
                   settings.ignoreDepletion,
                   depletionTimeoutMs,
-                  0
+                  0,
+                  blacklist
                 );
 
                 if (anyPoiResult) {
@@ -4945,7 +4966,8 @@ if (effectiveTarget) {
                 maxJumps,
                 settings.ignoreDepletion,
                 depletionTimeoutMs,
-                canMineHiddenRadioactive ? 50 : 0
+                canMineHiddenRadioactive ? 50 : 0,
+                blacklist
               );
 
               if (hiddenPoiResult) {
@@ -4992,7 +5014,6 @@ if (effectiveTarget) {
             });
 
             if (globalTargetLocs.length > 0) {
-              const blacklist = getSystemBlacklist();
               const locsWithDist = globalTargetLocs
                 .map(loc => {
                   const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
@@ -5054,7 +5075,6 @@ if (effectiveTarget) {
               if (newLocs.length > 0) {
                 newTarget = newQuotaTarget;
                 // Prefer current system, then closest by jumps (use blacklist)
-                const blacklist = getSystemBlacklist();
                 const locsWithDist = newLocs
                 .map(loc => {
                   const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
@@ -5125,7 +5145,6 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
               if (fillRatio < cargoThresholdRatio) {
                 ctx.log("mining", "stayOutUntilFull enabled and cargo not full — searching other systems using resource scan data...");
                 // Use the new scoring system to find best available location
-                const blacklist = getSystemBlacklist();
                 const bestLocations = mapStore.findBestMiningLocation(effectiveTarget || (miningType === "ore" ? "iron_ore" : miningType === "gas" ? "argon_gas" : miningType === "radioactive" ? "uranium_ore" : "water_ice"), bot.system, blacklist);
 
                 for (const loc of bestLocations) {

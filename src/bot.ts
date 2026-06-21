@@ -1454,67 +1454,43 @@ async refreshSkills(): Promise<ApiResponse> {
     return resp.result as Record<string, unknown>;
   }
 
-  /** Fetch faction storage contents and cache them. Silently returns empty on error. */
+  /** Fetch faction storage contents and cache them. Uses view_faction_storage with station_id for remote access. */
   async refreshFactionStorage(): Promise<void> {
-    let factionName = this.faction;
-    const station = this.poi;
-    if (!factionName) {
-      // Try to load from cache to get faction name and storage
-      try {
-        const cached = getFactionStorageCacheByStationOnly(station);
-        if (cached && cached.entries.length > 0) {
-          this.faction = cached.factionName;
-          this.factionStorage = cached.entries.map(e => ({ itemId: e.itemId, name: e.name || e.itemId, quantity: e.quantity }));
-          this.factionFuelReserve = cached.factionFuelReserve || 0;
-          this.factionFuelCapacity = cached.factionFuelCapacity || 0;
-          this.log("info", `Loaded faction storage from cache: ${cached.factionName} at ${station} (${cached.entries.length} items)`);
-          return;
-        }
-      } catch (e) {
-        this.log("warn", "Failed to load faction storage from cache");
-      }
-      this.log("warn", "No faction name set and no cache, skipping faction storage refresh");
+    const settings = loadSettings();
+    const generalSettings = (settings.general as Record<string, unknown>) || {};
+    const homeStationId = (generalSettings.factionStorageStation as string) || "";
+    
+    if (!homeStationId) {
+      this.log("warn", "No factionStorageStation configured in settings.general - cannot refresh faction storage remotely");
       this.factionStorage = [];
       return;
     }
 
-    // CRITICAL: view_storage with target: "faction" requires being docked at a station
-    // If not docked, skip the API call and keep cached data
-    if (!this.docked) {
-      return;
-    }
-
-    const resp = await this.exec("view_storage", { target: "faction" });
+    const resp = await this.exec("view_faction_storage", { station_id: homeStationId });
     if (resp.error) {
-      // Don't log error if we're not docked - this is expected behavior
-      if (this.docked) {
-        this.log("error", `Error refreshing faction storage: ${resp.error.message}`);
-      }
-      // Don't reset factionStorage to empty on error - keep cached data
+      this.log("error", `Error refreshing faction storage from ${homeStationId}: ${resp.error.message}`);
       return;
     }
+    
     const result = resp.result as Record<string, unknown>;
-    const entries = this.parseItemList(result);
+    const items = (result.items as Array<Record<string, unknown>>) || [];
+    const entries: CargoItem[] = items.map((i) => ({
+      itemId: (i.item_id as string) || (i.itemId as string) || "",
+      name: (i.name as string) || (i.item_id as string) || (i.itemId as string) || "",
+      quantity: (i.quantity as number) || 0,
+    }));
+    
     if (entries.length === 0) {
       this.log("warn", "Faction storage refresh returned 0 items");
     }
-    // Try to get faction name from response, then from existing cache, then fall back to this.faction
-    let respFactionName = (result.faction_name as string) || (result.faction_id as string);
-    if (!respFactionName && station) {
-      const cached = getFactionStorageCacheByStationOnly(station);
-      if (cached) {
-        respFactionName = cached.factionName;
-      }
-    }
-    if (!respFactionName) {
-      respFactionName = factionName;
-    }
+    
     this.factionStorage = entries;
     this.factionFuelReserve = (result.faction_fuel_reserve as number) || 0;
     this.factionFuelCapacity = (result.faction_fuel_capacity as number) || 0;
-    if (respFactionName) {
-      updateFactionStorageCache(respFactionName, entries, station, this.factionFuelReserve, this.factionFuelCapacity);
-    }
+    
+    const factionName = this.faction || "unknown";
+    updateFactionStorageCache(factionName, entries, homeStationId, this.factionFuelReserve, this.factionFuelCapacity);
+    this.log("info", `Refreshed faction storage from ${homeStationId}: ${entries.length} items`);
   }
 
   /** Start running a routine. */

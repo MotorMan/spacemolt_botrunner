@@ -318,14 +318,30 @@ export function parseSystemData(resp: Record<string, unknown>): SystemInfo {
   const connections: Connection[] = [];
   if (Array.isArray(rawConns)) {
     for (const c of rawConns) {
-      const id = (c.system_id as string) || (c.id as string)
-        || (c.target_system as string) || (c.target as string)
-        || (c.destination as string) || "";
+      // Handle both string format (just system ID) and object format ({system_id: "...", ...})
+      let id: string;
+      let name: string;
+      let jumpCost: number | null = null;
+      
+      if (typeof c === "string") {
+        id = c;
+        name = c;
+      } else if (typeof c === "object" && c !== null) {
+        const connObj = c as Record<string, unknown>;
+        id = (connObj.system_id as string) || (connObj.id as string)
+          || (connObj.target_system as string) || (connObj.target as string)
+          || (connObj.destination as string) || "";
+        name = (connObj.system_name as string) || (connObj.name as string) || id;
+        jumpCost = (connObj.jump_cost as number) ?? null;
+      } else {
+        continue;
+      }
+      
       if (!id) continue;
       connections.push({
         id,
-        name: (c.system_name as string) || (c.name as string) || id,
-        jump_cost: (c.jump_cost as number) ?? null,
+        name,
+        jump_cost: jumpCost,
       });
     }
   }
@@ -1275,8 +1291,9 @@ export async function ensureFueled(
     if (homeSystem && typeof homeSystem === "string") {
       try {
         const routeResp = await bot.exec("find_route", { target_system: homeSystem });
-        const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; fuel_per_jump?: number; fuel_available?: number; estimated_fuel?: number } | null;
-        if (routeData?.found && routeData?.fuel_available !== undefined && routeData?.estimated_fuel !== undefined) {
+        const routeData = routeResp.result as { found?: boolean; route?: RouteSegment[]; total_jumps?: number; fuel_per_jump?: number; fuel_available?: number; estimated_fuel?: number } | null;
+        const hasWormhole = routeHasWormhole(routeData?.route);
+        if (routeData?.found && routeData?.fuel_available !== undefined && routeData?.estimated_fuel !== undefined && !hasWormhole) {
           const canMakeItHome = routeData.fuel_available >= routeData.estimated_fuel;
           ctx.log("system", `Route to home: ${routeData.total_jumps} jumps, need ${routeData.estimated_fuel} fuel, have ${routeData.fuel_available}`);
           if (canMakeItHome) {
@@ -1302,6 +1319,9 @@ export async function ensureFueled(
             ctx.log("system", `Cannot reach home (${routeData.fuel_available} fuel < ${routeData.estimated_fuel} needed) — stranded`);
             return false;
           }
+        } else if (hasWormhole) {
+          ctx.log("system", `Route to home uses wormhole — cannot navigate (bot has not unlocked wormhole POI)`);
+          ctx.log("debug", `Route contained wormhole segment(s) - forcing reroute to avoid POI the bot cannot access`);
         }
       } catch (e) {
         ctx.log("system", `Could not check route home: ${e}`);
@@ -1603,6 +1623,21 @@ export async function depositNonFuelCargo(ctx: RoutineContext): Promise<boolean>
 
 // ── Navigation ───────────────────────────────────────────────
 
+/** Route segment from find_route API response */
+export interface RouteSegment {
+  system_id: string;
+  name: string;
+  jumps?: number;
+  via_wormhole?: boolean;
+  entrance_poi?: string;
+}
+
+/** Check if a route contains wormhole segments that the bot cannot traverse. */
+export function routeHasWormhole(route: RouteSegment[] | undefined): boolean {
+  if (!route) return false;
+  return route.some(seg => seg.via_wormhole === true);
+}
+
 /** Navigate to a target system via jump chain. Returns true if arrived. */
 export async function navigateToSystem(
   ctx: RoutineContext,
@@ -1636,7 +1671,7 @@ export async function navigateToSystem(
     } else {
       ctx.log("travel", `No mapped route — querying server for route to ${targetSystemId}`);
       const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
-      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
+      const routeData = routeResp.result as { found?: boolean; route?: RouteSegment[]; total_jumps?: number; message?: string } | null;
 
       // Check if server says we're already at target (message field or 0 jumps)
       const alreadyAtTarget = routeData?.found && (
@@ -1659,10 +1694,15 @@ export async function navigateToSystem(
         // Also validate that the route actually starts from our current system
         const routeStartsHere = serverRouteSystemIds[0] && 
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
+        // Check for wormhole segments that we cannot traverse
+        const hasWormhole = routeHasWormhole(routeData.route);
         if (blacklistedOnRoute) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route`);
         } else if (!routeStartsHere) {
           ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route`);
+        } else if (hasWormhole) {
+          ctx.log("warn", `Server route uses wormhole — rejecting route (bot has not unlocked wormhole POI)`);
+          ctx.log("debug", `Route contained wormhole segment(s) - forcing reroute to avoid POI the bot cannot access`);
         } else {
           nextSystem = routeData.route[1].system_id;
           const fullRoute = routeData.route.map(r => r.system_id).join(" → ");
@@ -1735,7 +1775,7 @@ export async function navigateToSystem(
       // No mapped route — query server
       ctx.log("travel", `No mapped route from ${bot.system} — querying server for route to ${targetSystemId}`);
       const routeResp = await bot.exec("find_route", { target_system: targetSystemId });
-      const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string }>; total_jumps?: number; message?: string } | null;
+      const routeData = routeResp.result as { found?: boolean; route?: RouteSegment[]; total_jumps?: number; message?: string } | null;
 
       // Check if server says we're already at target
       const alreadyAtTarget = routeData?.found && (
@@ -1758,10 +1798,15 @@ export async function navigateToSystem(
         // Also validate that the route actually starts from our current system
         const routeStartsHere = serverRouteSystemIds[0] && 
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
+        // Check for wormhole segments that we cannot traverse
+        const hasWormhole = routeHasWormhole(routeData.route);
         if (blacklistedOnRoute) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route (post-fuel)`);
         } else if (!routeStartsHere) {
           ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route (post-fuel)`);
+        } else if (hasWormhole) {
+          ctx.log("warn", `Server route uses wormhole — rejecting route (bot has not unlocked wormhole POI) (post-fuel)`);
+          ctx.log("debug", `Route contained wormhole segment(s) - forcing reroute to avoid POI the bot cannot access (post-fuel)`);
         } else {
           nextSystem = routeData.route[1].system_id;
           const fullRoute = routeData.route.map(r => r.system_id).join(" → ");

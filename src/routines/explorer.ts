@@ -3229,6 +3229,20 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       continue;
     }
 
+    // Check if we're at a pirate system and stuck - return home
+    if (isPirateSystem(bot.system)) {
+      const stats = mapStore.getVisitStats();
+      if (stats.unvisited === 0 || connections.length === 0) {
+        ctx.log("warn", `At pirate system ${bot.system} with no viable route - returning home`);
+        const homeArrived = await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true });
+        if (homeArrived) {
+          ctx.log("system", "Returned to Sol from pirate system - continuing achievement mode");
+          await ctx.sleep(5000);
+        }
+        continue;
+      }
+    }
+
     // Mark this system as visited locally
     visitedSystems.add(systemId);
     mapStore.markSystemVisited(systemId);
@@ -3239,9 +3253,28 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // Check if we've completed all systems (auto-disable achievement mode)
     if (stats.unvisited === 0) {
-      ctx.log("info", "All systems visited! Auto-disabling achievement mode.");
+      ctx.log("info", "All systems visited! Returning home and auto-disabling achievement mode.");
+      // Return home first
+      const homeSystem = "sol";
+      if (bot.system.toLowerCase() !== homeSystem) {
+        await navigateToSystem(ctx, homeSystem, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true });
+      }
       setExplorerMode(bot.username, "explore");
       return;
+    }
+
+    // Refresh map data from server to get latest visited status
+    yield "refresh_map_before_planning";
+    const refreshMapResp = await bot.exec("get_map");
+    if (refreshMapResp.result && typeof refreshMapResp.result === "object") {
+      const mapData = refreshMapResp.result as Record<string, unknown>;
+      const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+      for (const sys of systems) {
+        const sysId = (sys.system_id as string) || (sys.id as string);
+        if (sysId) {
+          mapStore.updateSystem(sys);
+        }
+      }
     }
 
     // Find all unvisited systems and build optimized path
@@ -3263,7 +3296,19 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
           }
         }
       }
-      await ctx.sleep(10000);
+      // Check again after refresh
+      const retryUnvisited = await findAllUnvisitedSystems(ctx, blacklist, fledFromSystems, visitedSystems);
+      if (retryUnvisited.length === 0) {
+        ctx.log("warn", "Still no unvisited systems after map refresh — may need to return home");
+        // Check if we're in a pirate system and need to return
+        if (isPirateSystem(bot.system)) {
+          ctx.log("warn", "In pirate system with no route to unvisited - returning home");
+          await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true });
+          await ctx.sleep(5000);
+        } else {
+          await ctx.sleep(30000);
+        }
+      }
       continue;
     }
 
@@ -3334,7 +3379,7 @@ async function findNearestUnvisitedSystem(
   const unvisited: Array<{ id: string; name: string }> = [];
 
   for (const sys of allSystems) {
-    if (isPirateSystem(sys.id)) continue;
+    // Achievement mode visits ALL systems including pirate systems
     if (sys.visited === true) continue;
     // Also skip systems we've visited in this session
     if (visitedSystems?.has(sys.id)) continue;
@@ -3431,8 +3476,7 @@ async function findAllUnvisitedSystems(
       // Skip systems we've already visited in this session
       if (visitedSystems.has(connId)) continue;
 
-      // Skip pirate systems only (achievement mode traverses blacklisted systems)
-      if (isPirateSystem(connId)) continue;
+      // Achievement mode visits ALL systems including pirate systems
 
       visited.add(connId);
 

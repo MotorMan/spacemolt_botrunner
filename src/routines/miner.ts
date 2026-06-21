@@ -40,6 +40,8 @@ import {
   completeMiningSession,
   failMiningSession,
   createMiningSession,
+  recordFailedTarget,
+  isTargetFailedInSystem,
   type MiningSession,
 } from "./minerActivity.js";
 import {
@@ -1142,10 +1144,15 @@ export function findFirstAvailableQuotaTarget(
     const depletionFiltered = poiFiltered.filter((loc: any) => {
       // Skip depleted ores (unless depletion has expired or ignoreDepletion is enabled)
       if (settings.ignoreDepletion) {
-        // Even with ignoreDepletion, skip completely exhausted POIs (0 remaining)
+        // Even with ignoreDepletion, skip completely exhausted POIs (0 remaining with maxRemaining > 0)
+        // But if maxRemaining is 0, it means the POI was never surveyed - include it
         if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
           return false;
         }
+        return true;
+      }
+      // For unsurveyed POIs (remaining=0, maxRemaining=0), include them - bot can mine and discover
+      if (loc.remaining === 0 && loc.maxRemaining === 0) {
         return true;
       }
       const sys = mapStore.getSystem(loc.systemId);
@@ -1711,18 +1718,8 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── CRITICAL FIX: Always refresh faction storage at cycle start ──
     // This ensures quota decisions are based on fresh data, not stale cached state
-    // Works from anywhere (doesn't require being docked)
-    // BUT: Skip if we're in the middle of navigation (not docked, traveling to ore)
-    const isTravelingToOre = recoveredSession?.state === "traveling_to_ore";
-    if (bot.docked) {
-      await bot.refreshFactionStorage();
-    } else if (isTravelingToOre) {
-      ctx.log("mining", "Skipping faction storage refresh - in travel phase, will refresh after reaching target");
-    } else if (bot.system === homeSystem) {
-      // At home system but not docked - might be refueling or just passed through
-      await bot.refreshFactionStorage();
-    }
-    // If not docked and not at home and not traveling - use cached data (safe for quota decisions)
+    // Works from anywhere using view_faction_storage with station_id
+    await bot.refreshFactionStorage();
 
     // Top up fuel cells from faction storage when at home (runs every cycle)
     // CRITICAL: Only attempt storage operations when DOCKED at home system
@@ -2065,15 +2062,24 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     }
 
     // CRITICAL FIX: Always refresh faction storage before quota evaluation
-    // (also refreshed above when docked at home, but ensure it's fresh here too)
+    // Works from anywhere using view_faction_storage with station_id
     let quotaTargetResource = "";
     let quotaHasDeficit = false;
     if (!hasGlobalTarget && Object.keys(quotas).length > 0) {
       await bot.refreshFactionStorage();
-      
-      // CRITICAL FIX: Always refresh faction storage before quota evaluation
-      // (also refreshed above when docked at home, but ensure it's fresh here too)
-      await bot.refreshFactionStorage();
+
+      // Determine which targets to exclude from quota selection
+      // Exclude the recovered session's target if it's depleted
+      let excludeTarget = "";
+      if (recoveredSession && recoveredSession.targetResourceId) {
+        const sessionTarget = recoveredSession.targetResourceId;
+        const sessionCurrent = bot.factionStorage.find(i => i.itemId === sessionTarget)?.quantity || 0;
+        const sessionQuota = quotas[sessionTarget];
+        // If the session target's quota is met OR the POI is depleted, exclude it
+        if (sessionQuota !== undefined && sessionCurrent >= sessionQuota) {
+          excludeTarget = sessionTarget;
+        }
+      }
 
       // When docked at home, use enhanced selection that always picks a target
       // This ensures the miner keeps cycling through ores even when all quotas are met
@@ -2082,10 +2088,16 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         quotaTargetResource = quotaResult.target;
         quotaHasDeficit = quotaResult.hasDeficit;
         if (quotaTargetResource) {
-          if (quotaHasDeficit) {
-            ctx.log("mining", `Quota pick: ${quotaTargetResource} (has deficit)`);
-          } else {
-            ctx.log("mining", `Quota cycling: ${quotaTargetResource} (all met, smallest surplus)`);
+          // If the picked target is the same as the excluded one, try to find another
+          if (quotaTargetResource === excludeTarget && excludeTarget) {
+            const filteredQuotas = { ...quotas };
+            delete filteredQuotas[excludeTarget];
+            const altResult = pickTargetFromQuotasOrClosest(filteredQuotas, bot.factionStorage, miningType);
+            if (altResult.target) {
+              quotaTargetResource = altResult.target;
+              quotaHasDeficit = altResult.hasDeficit;
+              ctx.log("mining", `Switched quota target from excluded ${excludeTarget} to ${quotaTargetResource}`);
+            }
           }
           const pickLocations = mapStore.findOreLocations(quotaTargetResource);
           if (pickLocations.length === 0) {
@@ -2094,17 +2106,33 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
       } else {
-        // Original behavior when not at home
-        quotaTargetResource = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
+        // Original behavior when not at home - use findFirstAvailableQuotaTarget to find a target with available locations
+        const depletionTimeoutMs = settings.depletionTimeoutHours * 60 * 60 * 1000;
+        quotaTargetResource = findFirstAvailableQuotaTarget(
+          quotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
+          canMineHiddenRadioactive, canMineHiddenIce
+        );
+        
         if (quotaTargetResource) {
-          ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
-          const pickLocations = mapStore.findOreLocations(quotaTargetResource);
-          if (pickLocations.length === 0) {
-            ctx.log("warn", `Quota pick "${quotaTargetResource}" has no recorded locations in map — clearing quota target`);
-            quotaTargetResource = "";
+          // If the picked target is the same as the excluded one, try to find another
+          if (quotaTargetResource === excludeTarget && excludeTarget) {
+            const filteredQuotas = { ...quotas };
+            delete filteredQuotas[excludeTarget];
+            const altTarget = findFirstAvailableQuotaTarget(
+              filteredQuotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
+              canMineHiddenRadioactive, canMineHiddenIce
+            );
+            if (altTarget) {
+              quotaTargetResource = altTarget;
+              ctx.log("mining", `Switched quota target from excluded ${excludeTarget} to ${quotaTargetResource}`);
+            }
+          }
+          
+          if (quotaTargetResource) {
+            ctx.log("mining", `Quota pick: ${quotaTargetResource} (biggest deficit)`);
           }
         } else {
-          ctx.log("mining", "All quotas met — no quota target selected");
+          ctx.log("mining", "All quotas met or no available locations — no quota target selected");
         }
       }
     }
@@ -2148,6 +2176,10 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
 
         if (shouldAbandon) {
           ctx.log("mining", `Abandoning recovered session: ${reason}`);
+          // Record the failed target if it was due to depletion
+          if (reason.includes("depleted") || reason.includes("depletion") || reason.includes("no locations") || reason.includes("quota met")) {
+            recordFailedTarget(bot.username, sessionTarget, recoveredSession.targetSystemId, recoveredSession.targetPoiId, reason);
+          }
           await failMiningSession(bot.username, reason);
           recoveredSession = null;
         } else {
@@ -2176,8 +2208,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
             } else if (bot.system === recoveredSession.targetSystemId) {
               recoveredSession.state = "mining";
             } else {
-              // traveling_to_ore or returning_home
-              recoveredSession.state = recoveredSession.state as any;
+              // Bot is NOT at the target system - update state to traveling_to_ore
+              ctx.log("mining", `Bot at ${bot.system} but session target is ${recoveredSession.targetSystemId} — updating state to traveling_to_ore`);
+              recoveredSession.state = "traveling_to_ore";
             }
             await updateMiningSession(bot.username, { state: recoveredSession.state });
           }
@@ -2209,7 +2242,7 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
       }
-      const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const homeArrived = await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
       if (!homeArrived) {
         ctx.log("error", "Failed to return to home system — will retry next cycle");
         await ctx.sleep(30000);
@@ -2238,6 +2271,24 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       await completeMiningSession(bot.username);
       recoveredSession = null;
       continue;
+    }
+
+    // CRITICAL FIX: If session is in traveling_to_ore state, navigate to the target system
+    if (recoveredSession && recoveredSession.state === "traveling_to_ore") {
+      const sessionTargetSystem = recoveredSession.targetSystemId;
+      if (sessionTargetSystem && bot.system !== sessionTargetSystem) {
+        ctx.log("mining", `Session state is traveling_to_ore — navigating to ${sessionTargetSystem}`);
+        const arrived = await navigateToSystem(ctx, sessionTargetSystem, safetyOpts);
+        if (!arrived) {
+          ctx.log("error", `Failed to reach ${sessionTargetSystem} — will retry next cycle`);
+          await ctx.sleep(30000);
+          continue;
+        }
+        // Successfully arrived - update session state to mining
+        await updateMiningSession(bot.username, { state: "mining" });
+        ctx.log("mining", `Arrived at ${sessionTargetSystem} - resuming mining`);
+        continue;
+      }
     }
 
     // Initialize target location variables (may be set by deep core search below)
@@ -2531,6 +2582,9 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       ctx.log("mining", `Configured harvesting system for ${miningType}: ${configuredSystem}`);
     }
 
+    // Store session target system for later use (before recoveredSession may be set to null)
+    const sessionTargetSystem = recoveredSession?.targetSystemId;
+
 if (effectiveTarget) {
   // Get current system POIs for local mining
   const { pois: currentPois } = await getSystemInfo(ctx);
@@ -2579,6 +2633,8 @@ if (effectiveTarget) {
 
       if (locations.length === 0) {
         ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in map — searching for alternative target`);
+        // Record failed target
+        recordFailedTarget(bot.username, effectiveTarget, bot.system, bot.poi || "", `Target not found in map`);
         // Clear session if target not found
         if (recoveredSession) {
           await failMiningSession(bot.username, "Target resource not found in map");
@@ -2664,9 +2720,18 @@ if (effectiveTarget) {
             ctx.log("warn", `No quota targets have available locations — mining locally without specific target`);
           }
         }
-        // If still no locations, target locally (either no quotas configured or no available quota targets)
+        // If still no locations, check if we're at the target system
+        // If we're NOT at the target system, we need to navigate there
         if (locations.length === 0) {
-          targetSystemId = bot.system;
+          // Check if we have a recovered session and we're not at the target system
+          // Use the sessionTargetSystem stored earlier (before recoveredSession was set to null)
+          if (sessionTargetSystem && bot.system !== sessionTargetSystem) {
+            // We need to navigate to the target system - don't set targetSystemId = bot.system
+            ctx.log("mining", `Session target ${sessionTargetSystem} requires navigation - will travel to target`);
+          } else {
+            // No session or already at target - mine locally
+            targetSystemId = bot.system;
+          }
         }
       } else {
         const blacklist = getSystemBlacklist();
@@ -2706,7 +2771,10 @@ if (effectiveTarget) {
           } else {
             ctx.log("warn", `Configured system ${configuredSystem} has no valid ${effectiveTarget} POIs — mining locally instead`);
             scoredLocations = [];
-            targetSystemId = bot.system;
+            // Only set to local if we don't have a session target or we're already at the target
+            if (!sessionTargetSystem || bot.system === sessionTargetSystem) {
+              targetSystemId = bot.system;
+            }
           }
         } else {
           const scoredLocationsLocal = mapStore.findBestMiningLocation(effectiveTarget, bot.system, blacklist)
@@ -2722,7 +2790,10 @@ if (effectiveTarget) {
 
         if (scoredLocations.length === 0 && !configuredSystem) {
           ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
-          targetSystemId = bot.system;
+          // Only set to local if we don't have a session target or we're already at the target
+          if (!sessionTargetSystem || bot.system === sessionTargetSystem) {
+            targetSystemId = bot.system;
+          }
 
           // Try to switch to another quota ore that has accessible locations within range
           if (effectiveTarget && Object.keys(quotas).length > 0) {
@@ -2864,9 +2935,13 @@ if (effectiveTarget) {
 
         const chosenLoc = scoredLocations.length > 0 ? scoredLocations[0] : undefined;
 
+          // Only set to local mining if we don't have a session target or we're already at the target
           if (!chosenLoc && !configuredSystem) {
             ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
-            targetSystemId = bot.system;
+            // Preserve session target system for navigation
+            if (!sessionTargetSystem || bot.system === sessionTargetSystem) {
+              targetSystemId = bot.system;
+            }
           }
 
           if (chosenLoc) {
@@ -3093,7 +3168,7 @@ if (effectiveTarget) {
           }
         }
         
-        const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+        const homeArrived = await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
         if (!homeArrived) {
           ctx.log("error", "Failed to return to home system — will retry next cycle");
         }
@@ -3187,6 +3262,14 @@ if (effectiveTarget) {
     if (systemId) bot.system = systemId;
     let scanResources: Array<any> = [];
 
+    // Scan the current POI to get resource data
+    if (bot.poi && bot.poi !== "") {
+      const poiScanResp = await bot.exec("get_poi", { poi_id: bot.poi });
+      if (!poiScanResp.error && poiScanResp.result && typeof poiScanResp.result === "object") {
+        scanResources = ((poiScanResp.result as Record<string, unknown>).resources as Array<any>) || [];
+      }
+    }
+
     // CRITICAL MAP UPDATE: Record system visit and update POI data
     // Miners are excellent map data sources since they visit systems frequently
     if (systemId && initialPois.length > 0) {
@@ -3234,7 +3317,12 @@ if (effectiveTarget) {
         })();
 
         const knownTarget = currentOres.some((o: any) => o.item_id === effectiveTarget);
-        if ((knownTarget && canMineHere) || scanResources.length > 0) {
+        const isOrePoi = miningType === "ore" && isOreBeltPoi(currentPoi.type);
+        // Allow mining if:
+        // 1. Target is known in ores_found AND bot can mine there, OR
+        // 2. Scan found resources, OR
+        // 3. It's an ore belt POI and we're mining ore (can mine even if unsurveyed for this specific ore)
+        if ((knownTarget && canMineHere) || scanResources.length > 0 || isOrePoi) {
           miningPoi = { id: bot.poi, name: currentPoi.name };
         }
 
@@ -3255,6 +3343,10 @@ if (effectiveTarget) {
         const maxRemaining = (targetResource?.max_remaining as number) ?? 0;
         ctx.log("mining", `Pre-scan: ${effectiveTarget} — scanResources=${scanResources.length}, remaining=${remaining}/${maxRemaining}, knownTarget=${knownTarget}, canMineHere=${canMineHere}, miningPoi=${miningPoi?.id}`);
         if (miningPoi) {
+          // Mark as depleted if:
+          // 1. remaining=0 AND maxRemaining>0 (confirmed surveyed and exhausted), OR
+          // 2. remaining=0 AND maxRemaining=0 AND not an ore belt (never had this ore)
+          const isOreBelt = isOreBeltPoi(currentPoi.type);
           if (remaining <= 0 && maxRemaining > 0) {
             const sysData = mapStore.getSystem(bot.system);
             const existingPoi = sysData?.pois.find(p => p.id === bot.poi);
@@ -3265,6 +3357,17 @@ if (effectiveTarget) {
               miningPoi = null;
             } else {
               ctx.log("warn", `Pre-scan: ${effectiveTarget} 0 remaining at ${currentPoi.name || bot.poi} but no prior history — not marking depleted`);
+            }
+          } else if (remaining <= 0 && maxRemaining === 0 && !isOreBelt) {
+            // For non-ore-belt POIs, if the target ore was never found in scan (remaining=0, maxRemaining=0),
+            // mark it as "never available here" to prevent repeated failed attempts
+            const sysData = mapStore.getSystem(bot.system);
+            const existingPoi = sysData?.pois.find(p => p.id === bot.poi);
+            const existingOreEntry = existingPoi?.ores_found.find(o => o.item_id === effectiveTarget);
+            if (existingOreEntry) {
+              ctx.log("mining", `Pre-scan: ${effectiveTarget} not available at ${currentPoi.name || bot.poi} (not surveyed for this ore) — marking as unavailable`);
+              mapStore.markOreDepleted(bot.system, bot.poi, effectiveTarget);
+              miningPoi = null;
             }
           }
         }
@@ -3285,7 +3388,13 @@ if (effectiveTarget) {
         const storedPoi = sysData?.pois.find(sp => sp.id === p.id);
         if (!storedPoi) return false;
         const oreEntry = storedPoi.ores_found?.find(o => o.item_id === effectiveTarget);
-        if (!oreEntry) return false;
+        // For ore mining, also allow unsurveyed ore belts (no oreEntry but valid POI type)
+        const isOrePoi = miningType === "ore" && isOreBeltPoi(p.type);
+        if (!oreEntry) {
+          // No ore entry found - allow for unsurveyed ore belts
+          if (isOrePoi) return true;
+          return false;
+        }
         if (oreEntry.depleted && !isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs)) return false;
         return true;
       });
@@ -3377,10 +3486,10 @@ if (effectiveTarget) {
                   continue;
                 }
               }
-              const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-              if (!homeArrived) {
-                ctx.log("error", "Failed to return to home system — will retry next cycle");
-              }
+const homeArrived = await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
+                            if (!homeArrived) {
+                              ctx.log("error", "Failed to return to home system — will retry next cycle");
+                            }
               const { pois: homePois } = await getSystemInfo(ctx);
               const homeStation = findStation(homePois);
               stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
@@ -3422,11 +3531,12 @@ if (effectiveTarget) {
               ctx.log("mining", `Will travel to ${chosenPoi.name} @ ${chosen.systemName}`);
             } else {
               ctx.log("error", `Chosen POI ${chosen.poiName} (${chosen.poiId}) in ${chosen.systemName} is not a valid ${resourceLabel} POI — clearing target and returning home to retry next cycle`);
-                 effectiveTarget = "";
-                 targetResource = "";
-                 await ensureUndocked(ctx);
+              recordFailedTarget(bot.username, effectiveTarget, bot.system, bot.poi || "", `Invalid POI type for target`);
+              effectiveTarget = "";
+              targetResource = "";
+              await ensureUndocked(ctx);
                 const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-                if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+                if (fueled) await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
                 await ensureDocked(ctx);
                 await dumpCargo(ctx, settings);
                 continue;
@@ -3435,29 +3545,31 @@ if (effectiveTarget) {
               ctx.log("error", "Failed to reach alternative system — returning home to retry next cycle");
               await ensureUndocked(ctx);
               const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-              if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+              if (fueled) await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
               await ensureDocked(ctx);
               await dumpCargo(ctx, settings);
               continue;
             }
-           } else {
-             ctx.log("error", `No alternative ${resourceLabel} within ${maxJumps} jumps — clearing target and returning home to retry next cycle`);
-             effectiveTarget = "";
-             targetResource = "";
-             await ensureUndocked(ctx);
+} else {
+              ctx.log("error", `No alternative ${resourceLabel} within ${maxJumps} jumps — clearing target and returning home to retry next cycle`);
+              recordFailedTarget(bot.username, effectiveTarget, bot.system, bot.poi || "", `No alternative within ${maxJumps} jumps`);
+              effectiveTarget = "";
+              targetResource = "";
+              await ensureUndocked(ctx);
             const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-            if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+            if (fueled) await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
             await ensureDocked(ctx);
             await dumpCargo(ctx, settings);
             continue;
           }
-         } else {
-           ctx.log("error", `No alternative ${resourceLabel} found anywhere — clearing target and returning home to retry next cycle`);
-           effectiveTarget = "";
-           targetResource = "";
-           await ensureUndocked(ctx);
+} else {
+            ctx.log("error", `No alternative ${resourceLabel} found anywhere — clearing target and returning home to retry next cycle`);
+            recordFailedTarget(bot.username, effectiveTarget, bot.system, bot.poi || "", `No alternative found anywhere`);
+            effectiveTarget = "";
+            targetResource = "";
+            await ensureUndocked(ctx);
           const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-          if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+          if (fueled) await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
           await ensureDocked(ctx);
           await dumpCargo(ctx, settings);
           continue;
@@ -3491,7 +3603,7 @@ if (effectiveTarget) {
           continue;
         }
       }
-      const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const homeArrived = await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
       if (!homeArrived) {
         ctx.log("error", "Failed to return to home system — will retry next cycle");
       }
@@ -4165,7 +4277,7 @@ if (effectiveTarget) {
                         continue;
                       }
                     }
-                    const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+const homeArrived = await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
                     if (!homeArrived) {
                       ctx.log("error", "Failed to return to home system — will retry next cycle");
                     }
@@ -4392,21 +4504,21 @@ if (effectiveTarget) {
           continue;
         }
       }
-      const homeArrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
-                          if (!homeArrived) {
-                            ctx.log("error", "Failed to return to home system — will retry next cycle");
-                          }
-                          const { pois: homePois } = await getSystemInfo(ctx);
-                          const homeStation = findStation(homePois);
-                          stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
-                          if (stationPoi) {
-                            yield "travel_to_station";
-                            await bot.exec("travel", { target_poi: stationPoi.id });
-                          }
-                          yield "deposit_cargo";
-                          await ensureDocked(ctx);
-                          await dumpCargo(ctx, settings);
-                          await bot.refreshCargo();
+const homeArrived = await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
+                            if (!homeArrived) {
+                              ctx.log("error", "Failed to return to home system — will retry next cycle");
+                            }
+                            const { pois: homePois } = await getSystemInfo(ctx);
+                            const homeStation = findStation(homePois);
+                            stationPoi = homeStation ? { id: homeStation.id, name: homeStation.name } : null;
+                            if (stationPoi) {
+                              yield "travel_to_station";
+                              await bot.exec("travel", { target_poi: stationPoi.id });
+                            }
+                            yield "deposit_cargo";
+                            await ensureDocked(ctx);
+                            await dumpCargo(ctx, settings);
+                            await bot.refreshCargo();
                           const remainingCargo = bot.inventory.filter(i => i.quantity > 0 && !i.itemId.toLowerCase().includes("fuel") && !i.itemId.toLowerCase().includes("energy_cell"));
                           if (remainingCargo.length > 0) {
                             const itemsLeft = remainingCargo.map(i => `${i.quantity}x ${i.name}`).join(", ");
@@ -5020,25 +5132,34 @@ if (effectiveTarget) {
           if (!newTarget) {
             ctx.log("mining", `Global target not available — checking quotas...`);
             await bot.refreshFactionStorage();
-            const newQuotaTarget = pickTargetFromQuotas(quotas, bot.factionStorage, miningType);
-
-            if (newQuotaTarget) {
+            const quotaEntries = Object.entries(quotas).filter(([oreId]) => oreId !== effectiveTarget);
+            const quotaEntriesWithDeficit = quotaEntries
+              .map(([oreId, target]) => {
+                const current = bot.factionStorage.find(i => i.itemId === oreId)?.quantity || 0;
+                return { oreId, deficit: target - current, current, target };
+              })
+              .filter(e => e.deficit > 0)
+              .sort((a, b) => b.deficit - a.deficit);
+            
+            if (quotaEntriesWithDeficit.length > 0) {
+              const newQuotaTarget = quotaEntriesWithDeficit[0].oreId;
+              ctx.log("mining", `Quota pick (excluding depleted ${effectiveTarget}): ${newQuotaTarget} (deficit: ${quotaEntriesWithDeficit[0].deficit})`);
+              
               // Find locations for the new quota target
               const newLocs = mapStore.findOreLocations(newQuotaTarget).filter(loc => {
                 const sys = mapStore.getSystem(loc.systemId);
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
                 if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-            if (miningType === "radioactive") return canMineBasicRadioactive && (
-              isOreBeltPoi(poi?.type || "") ||
-              (!poi?.hidden && canMineDeepCoreRadioactive) ||
-              (poi?.hidden && canMineHiddenRadioactive)
-            );
+                if (miningType === "radioactive") return canMineBasicRadioactive && (
+                  isOreBeltPoi(poi?.type || "") ||
+                  (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                  (poi?.hidden && canMineHiddenRadioactive)
+                );
                 if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                 if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                 return true;
               }).filter(loc => {
                 if (settings.ignoreDepletion) {
-                  // Even with ignoreDepletion, skip completely exhausted POIs
                   if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
                     return false;
                   }
@@ -5053,30 +5174,29 @@ if (effectiveTarget) {
 
               if (newLocs.length > 0) {
                 newTarget = newQuotaTarget;
-                // Prefer current system, then closest by jumps (use blacklist)
                 const blacklist = getSystemBlacklist();
                 const locsWithDist = newLocs
-                .map(loc => {
-                  const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-                  return { ...loc, jumps: route ? route.length - 1 : 999 };
-                })
-                .filter(loc => loc.jumps <= maxJumps)
-                .sort((a, b) => {
-                  if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
-                  if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
-                  return a.jumps - b.jumps;
-                });
+                  .map(loc => {
+                    const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                    return { ...loc, jumps: route ? route.length - 1 : 999 };
+                  })
+                  .filter(loc => loc.jumps <= maxJumps)
+                  .sort((a, b) => {
+                    if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+                    if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+                    return a.jumps - b.jumps;
+                  });
 
-              if (locsWithDist.length > 0) {
-                const chosen = locsWithDist[0];
-                newPoiId = chosen.poiId;
-                newPoiName = chosen.poiName;
-                newSystemId = chosen.systemId;
-                ctx.log("mining", `Quota pick: ${newQuotaTarget} @ ${chosen.poiName} (${chosen.jumps} jumps${chosen.systemId !== bot.system ? ` in ${chosen.systemId}` : ''})`);
-              }
+                if (locsWithDist.length > 0) {
+                  const chosen = locsWithDist[0];
+                  newPoiId = chosen.poiId;
+                  newPoiName = chosen.poiName;
+                  newSystemId = chosen.systemId;
+                  ctx.log("mining", `Quota pick: ${newQuotaTarget} @ ${chosen.poiName} (${chosen.jumps} jumps${chosen.systemId !== bot.system ? ` in ${chosen.systemId}` : ''})`);
+                }
               }
             }
-          }
+}
 
           // If still no target found and we're set for "any", find any nearby ore
           // DEEP CORE FIX: Don't fall back to regular ores for deep core miners
@@ -5597,7 +5717,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
         await refuelAtStation(ctx, stationPoi, safetyOpts.fuelThresholdPct);
       }
 
-      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const arrived = await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
       if (!arrived) {
         ctx.log("error", "Failed to return to home system — docking at nearest station");
       }
@@ -5652,7 +5772,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
     
     if (!isAtHome) {
       ctx.log("mining", `Not at home system (${bot.system}) — will navigate home before depositing cargo`);
-      const arrived = await navigateToSystem(ctx, homeSystem, safetyOpts);
+      const arrived = await navigateToSystem(ctx, homeSystem, { ...safetyOpts, skipBlacklist: true });
       if (!arrived) {
         ctx.log("error", "Failed to reach home system — keeping cargo, will retry next cycle");
         // Don't deposit - keep cargo and restart mining loop

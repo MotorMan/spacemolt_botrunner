@@ -408,13 +408,35 @@ class MapStore {
     // Merge connections
     const conns = systemData.connections as Array<Record<string, unknown>> | undefined;
     if (Array.isArray(conns)) {
-      sys.connections = conns.map((c) => ({
-        system_id: (c.system_id as string) || (c.id as string) || "",
-        system_name: (c.system_name as string) || (c.name as string) || "",
-        security_level: (c.security_level as string) || (c.security_status as string) || (c.lawfulness as string) || (c.security as string) || undefined,
-        jump_cost: c.jump_cost as number | undefined,
-        distance: c.distance as number | undefined,
-      }));
+      sys.connections = conns.map((c) => {
+        // Handle both string format and object format for connections
+        let id: string;
+        let name: string;
+        let jumpCost: number | undefined;
+        
+        if (typeof c === "string") {
+          id = c;
+          name = c;
+          jumpCost = undefined;
+        } else if (typeof c === "object" && c !== null) {
+          const connObj = c as Record<string, unknown>;
+          id = (connObj.system_id as string) || (connObj.id as string) || "";
+          name = (connObj.system_name as string) || (connObj.name as string) || id;
+          jumpCost = connObj.jump_cost as number | undefined;
+        } else {
+          id = "";
+          name = "";
+          jumpCost = undefined;
+        }
+        
+        return {
+          system_id: id,
+          system_name: name,
+          security_level: (c && typeof c === "object" ? ((c as Record<string, unknown>).security_level as string) || (c as Record<string, unknown>).security_status as string || (c as Record<string, unknown>).lawfulness as string || (c as Record<string, unknown>).security as string : undefined),
+          jump_cost: jumpCost,
+          distance: c && typeof c === "object" ? (c as Record<string, unknown>).distance as number | undefined : undefined,
+        };
+      }).filter(conn => conn.system_id !== ""); // Filter out connections with empty IDs
     }
 
     // Merge POIs — preserve existing ore & market data AND hidden POIs
@@ -1315,8 +1337,26 @@ findOreLocations(oreId: string): Array<{
         const ore = poi.ores_found.find((o) => o.item_id === oreId);
         const resource = poi.resources?.find((r) => r.resource_id === oreId);
 
-        // Skip if resource not found in either source
-        if (!ore && !resource) continue;
+        // CRITICAL FIX: For ore mining, we want to include ore belt POIs even if they've been
+        // surveyed for other resources. The bot can mine there and discover the ore.
+        // Only skip POIs where:
+        // 1. The specific ore is confirmed depleted (has depletion record), OR
+        // 2. The POI has been surveyed and definitely doesn't have this ore (not an ore belt type)
+        if (!ore && !resource) {
+          const poiType = (poi.type || "").toLowerCase();
+          const isOreBelt = poiType.includes("asteroid") || poiType.includes("belt") || 
+                           poiType.includes("ring") || poiType.includes("field") || 
+                           poiType.includes("nebula") || poiType.includes("resource") ||
+                           poiType.includes("ore");
+          
+          // For ore belts, include them even if unsurveyed for this specific ore
+          // The bot can mine there and discover the ore
+          // For other POI types, only include if completely unsurveyed
+          if (!isOreBelt && poi.resources && poi.resources.length > 0) {
+            // Non-ore belt POI that has been surveyed but doesn't have this ore - skip it
+            continue;
+          }
+        }
 
         const remaining = resource?.remaining ?? 0;
         const maxRemaining = resource?.max_remaining ?? 0;
@@ -1988,13 +2028,32 @@ findOreLocations(oreId: string): Array<{
           seeded++;
         }
 
-        // Transform connection ID array → StoredConnection objects
+        // Transform connection data → StoredConnection objects
+        // Handle both string array format (["system_id", ...]) and object format ({system_id: "...", ...})
         const rawConns = sys.connections;
         const connections: Array<Record<string, unknown>> = Array.isArray(rawConns)
-          ? (rawConns as string[]).map((connId) => ({
-              system_id: connId,
-              system_name: nameById.get(connId) || connId,
-            }))
+          ? rawConns.map((conn) => {
+              if (typeof conn === "string") {
+                // String format: just the system ID
+                return {
+                  system_id: conn,
+                  system_name: nameById.get(conn) || conn,
+                };
+              } else if (typeof conn === "object" && conn !== null) {
+                // Object format: already has system_id/system_name
+                const connObj = conn as Record<string, unknown>;
+                const connId = (connObj.system_id as string) || (connObj.id as string) || "";
+                const connName = (connObj.system_name as string) || (connObj.name as string) || connId;
+                return {
+                  system_id: connId,
+                  system_name: connName,
+                  security_level: connObj.security_level ?? connObj.security_status ?? connObj.lawfulness ?? connObj.security ?? undefined,
+                  jump_cost: connObj.jump_cost as number | undefined,
+                  distance: connObj.distance as number | undefined,
+                };
+              }
+              return null;
+            }).filter(Boolean) as Array<Record<string, unknown>>
           : [];
 
         this.updateSystem({ ...sys, connections });

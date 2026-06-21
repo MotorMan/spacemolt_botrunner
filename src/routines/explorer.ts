@@ -3174,7 +3174,8 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 
     // Find all unvisited systems and build optimized path
     yield "plan_achievement_route";
-    const unvisitedSystems = findAllUnvisitedSystems(ctx, blacklist, fledFromSystems);
+
+    const unvisitedSystems = await findAllUnvisitedSystems(ctx, blacklist, fledFromSystems);
 
     if (unvisitedSystems.length === 0) {
       ctx.log("info", "No unvisited systems found in map — refreshing map data...");
@@ -3210,7 +3211,8 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     await ensureUndocked(ctx);
 
     // Navigate to target system
-    const arrived = await navigateToSystem(ctx, target.id, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 });
+    // Use skipBlacklist: true for achievement mode - we need to visit ALL systems
+    const arrived = await navigateToSystem(ctx, target.id, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: true });
     if (!arrived) {
       ctx.log("error", `Could not reach ${target.name} — will retry next loop`);
       await ctx.sleep(10000);
@@ -3225,64 +3227,146 @@ async function* achievementRoutine(ctx: RoutineContext): AsyncGenerator<string, 
 }
 
 /**
- * Find all unvisited systems in the galaxy using the server's visited flag.
- * Returns systems sorted by distance from current position.
+ * Find the nearest unvisited system using server's find_route API.
+ * This is a simplified version that just finds any unvisited system.
+ * For achievement mode, we accept routes through blacklisted systems.
  */
-function findAllUnvisitedSystems(
+async function findNearestUnvisitedSystem(
   ctx: RoutineContext,
-  blacklist: string[],
-  fledFromSystems: Set<string>
-): Array<{
+): Promise<{
   id: string;
   name: string;
   distance: number;
   position: { x: number; y: number } | null;
-}> {
-  const unvisited: Array<{
-    id: string;
-    name: string;
-    distance: number;
-    position: { x: number; y: number } | null;
-  }> = [];
-
-  // Get all systems from mapStore
-  const allSystems = mapStore.getSystems();
+} | null> {
   const currentSystem = ctx.bot.system;
+  if (!currentSystem) return null;
 
-  // Get current position
-  let currentPos: { x: number; y: number } | null = null;
-  if (currentSystem) {
-    const sys = mapStore.getSystem(currentSystem);
-    currentPos = sys?.position ?? null;
-  }
+  // Get all unvisited systems from mapStore
+  const allSystems = mapStore.getSystems();
+  const unvisited: Array<{ id: string; name: string }> = [];
 
   for (const sys of allSystems) {
-    // Skip pirate systems
     if (isPirateSystem(sys.id)) continue;
-    // Skip blacklisted systems
-    if (blacklist.some(b => b.toLowerCase() === sys.id.toLowerCase())) continue;
-    if (isTemporarilyBlacklisted(sys.id)) continue;
-    if (fledFromSystems.has(sys.id)) continue;
+    if (sys.visited !== false) continue;
+    unvisited.push({ id: sys.id, name: sys.name || sys.id });
+  }
 
-    // Check visited flag from get_map - false means never visited by this bot
-    if (sys.visited === false) {
-      unvisited.push({
-        id: sys.id,
-        name: sys.name || sys.id,
-        distance: 0, // Will be calculated below
-        position: sys.position ?? null,
-      });
+  if (unvisited.length === 0) return null;
+
+  // Try find_route for each unvisited system and pick the shortest
+  let nearest: { id: string; name: string; distance: number; position: { x: number; y: number } | null } | null = null;
+
+  for (const sys of unvisited.slice(0, 5)) {
+    const routeResp = await ctx.bot.exec("find_route", { target_system: sys.id });
+    const routeData = routeResp.result as { found?: boolean; route?: Array<{ system_id: string; name: string; jumps?: number }>; total_jumps?: number } | null;
+
+    if (routeData?.found && routeData.route && routeData.route.length > 1) {
+      // Use total_jumps if available, otherwise calculate from route length
+      const distance = routeData.total_jumps ?? (routeData.route.length - 1);
+      if (!nearest || distance < nearest.distance) {
+        nearest = {
+          id: sys.id,
+          name: sys.name || sys.id,
+          distance,
+          position: null,
+        };
+      }
     }
   }
 
-  // Calculate distances from current position using galactic coordinates
-  if (currentPos) {
-    unvisited.sort((a, b) => {
-      if (!a.position || !b.position) return 0;
-      const aDist = Math.sqrt(Math.pow(a.position.x - currentPos.x, 2) + Math.pow(a.position.y - currentPos.y, 2));
-      const bDist = Math.sqrt(Math.pow(b.position.x - currentPos.x, 2) + Math.pow(b.position.y - currentPos.y, 2));
-      return aDist - bDist;
-    });
+  return nearest;
+}
+
+/**
+ * Find all unvisited systems reachable from current position using BFS.
+ * Returns systems sorted by jump distance (nearest first).
+ * Falls back to server API if mapStore lacks connection data.
+ */
+async function findAllUnvisitedSystems(
+  ctx: RoutineContext,
+  blacklist: string[],
+  fledFromSystems: Set<string>
+): Promise<Array<{
+  id: string;
+  name: string;
+  distance: number;
+  position: { x: number; y: number } | null;
+}>
+> {
+  const currentSystem = ctx.bot.system;
+  if (!currentSystem) return [];
+
+  // Refresh map data first
+  const mapResp = await ctx.bot.exec("get_map");
+  if (mapResp.result && typeof mapResp.result === "object") {
+    const mapData = mapResp.result as Record<string, unknown>;
+    const systems = (mapData.systems as Array<Record<string, unknown>>) || [];
+    for (const sys of systems) {
+      const sysId = (sys.system_id as string) || (sys.id as string);
+      if (sysId) {
+        mapStore.updateSystem(sys);
+      }
+    }
+  }
+
+  // Check if mapStore has connection data for current system
+  const currentSys = mapStore.getSystem(currentSystem);
+  if (!currentSys || !currentSys.connections || currentSys.connections.length === 0) {
+    ctx.log("debug", `MapStore has no connection data for ${currentSystem} — using server fallback`);
+    const nearest = await findNearestUnvisitedSystem(ctx);
+    if (nearest) {
+      return [nearest];
+    }
+    return [];
+  }
+
+  // BFS to find reachable unvisited systems
+  const unvisited: Array<{ id: string; name: string; distance: number; position: { x: number; y: number } | null; }> = [];
+  const visited = new Set<string>();
+  const queue: Array<{ systemId: string; distance: number }> = [
+    { systemId: currentSystem, distance: 0 }
+  ];
+  visited.add(currentSystem);
+
+  while (queue.length > 0) {
+    const { systemId, distance } = queue.shift()!;
+    const sys = mapStore.getSystem(systemId);
+    if (!sys) continue;
+
+    for (const conn of sys.connections) {
+      const connId = conn.system_id;
+      if (!connId) continue;
+      if (visited.has(connId)) continue;
+
+      // Skip pirate systems only (achievement mode traverses blacklisted systems)
+      if (isPirateSystem(connId)) continue;
+
+      visited.add(connId);
+
+      const targetSys = mapStore.getSystem(connId);
+      if (targetSys && targetSys.visited === false) {
+        unvisited.push({
+          id: connId,
+          name: targetSys.name || connId,
+          distance: distance + 1,
+          position: targetSys.position ?? null,
+        });
+        queue.push({ systemId: connId, distance: distance + 1 });
+      } else if (targetSys) {
+        queue.push({ systemId: connId, distance: distance + 1 });
+      }
+    }
+  }
+
+  unvisited.sort((a, b) => a.distance - b.distance);
+
+  if (unvisited.length === 0) {
+    ctx.log("debug", "BFS found no unvisited systems — using server fallback");
+    const nearest = await findNearestUnvisitedSystem(ctx);
+    if (nearest) {
+      return [nearest];
+    }
   }
 
   return unvisited;

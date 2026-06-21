@@ -1194,6 +1194,18 @@
               ><span class="stat-label">Total Tax Prepaid</span>
             </div>
           </div>
+          <div style="margin-top: 8px; padding: 8px; background: var(--bg-secondary); border-radius: 6px;">
+            <div style="font-size: 12px; color: var(--text-dim); margin-bottom: 4px">
+              <span>Faction funds: <span id="factionPrepayFunds">-</span></span>
+            </div>
+            <div style="display: flex; gap: 8px; align-items: center">
+              <input type="number" id="factionPrepayAmount" placeholder="Faction prepay amount" style="flex: 1; font-size: 12px; padding: 6px">
+              <button class="sm" onclick="execFactionPrepayTax()" id="factionPrepayBtn">Faction Prepay</button>
+            </div>
+            <div style="font-size: 10px; color: var(--text-dim); margin-top: 4px">
+              Requires docked bot with ManageTreasury permission
+            </div>
+          </div>
           <div class="bot-table-wrap" style="flex: 1; overflow: auto">
             <div class="bot-table-header">
               <span>Tax History by Bot</span>
@@ -1229,6 +1241,9 @@
                     </th>
                     <th style="text-align: right; padding: 6px 12px">
                       Last Updated
+                    </th>
+                    <th style="text-align: center; padding: 6px 12px">
+                      Actions
                     </th>
                   </tr>
                 </thead>
@@ -3577,6 +3592,8 @@
       let statsTaxesView = "main";
       let taxesData = null;
       let taxesLoaded = false;
+      let statsPeriod = "today";
+      let profileFactionStorage = null;
 
       async function loadTaxesData() {
         if (taxesLoaded) return;
@@ -3705,13 +3722,15 @@
           fleetTotals.totalTaxPrepaid || 0,
         );
 
-        const bots = data.bots || {};
+        updateFactionPrepayFunds();
+
+        const taxBots = data.bots || {};
         const tbody = document.getElementById("taxTableBody");
-        const entries = Object.entries(bots);
+        const entries = Object.entries(taxBots);
 
         if (entries.length === 0) {
           tbody.innerHTML =
-            '<tr><td colspan="7" style="padding:24px;text-align:center;color:var(--text-dim)">No tax data yet. Start bots and let them collect taxes on restart.</td></tr>';
+            '<tr><td colspan="8" style="padding:24px;text-align:center;color:var(--text-dim)">No tax data yet. Start bots and let them collect taxes on restart.</td></tr>';
           return;
         }
 
@@ -3721,6 +3740,7 @@
             const lastUpdated = estimate.timestamp
               ? formatTimestamp(estimate.timestamp)
               : "-";
+            const jsBotName = escJs(botName);
             return `<tr>
       <td style="padding:6px 12px;font-weight:500;color:var(--text-bright)">${esc(botName)}</td>
       <td style="padding:6px 12px;text-align:right">${num(estimate.taxable_income_to_date || 0)}</td>
@@ -3729,9 +3749,115 @@
       <td style="padding:6px 12px;text-align:right">${num(estimate.property_tax_total || 0)}</td>
       <td style="padding:6px 12px;text-align:right">${num(estimate.tax_prepaid || 0)}</td>
       <td style="padding:6px 12px;text-align:right">${esc(lastUpdated)}</td>
+      <td style="padding:6px 12px;text-align:center">
+        <input type="number" id="prepay-${botName}" placeholder="Amount" style="width:80px;font-size:11px;padding:2px">
+        <button class="sm" onclick="prepayBotTax('${jsBotName}')" style="margin-left:4px">Prepay</button>
+      </td>
     </tr>`;
           })
           .join("");
+      }
+
+      function prepayBotTax(botName) {
+        const amount = parseInt(document.getElementById("prepay-" + botName).value) || 0;
+        if (amount <= 0) {
+          alert("Please enter a valid amount");
+          return;
+        }
+        sendExec(botName, "faction_withdraw_credits", { amount }, (withdrawResult) => {
+          if (!withdrawResult.ok) {
+            appendLine("system", `[Prepay Tax Error] ${botName} failed to withdraw credits: ${withdrawResult.error || "Unknown error"}`);
+            return;
+          }
+          sendExec(botName, "prepay_tax", { amount }, (prepayResult) => {
+            if (prepayResult.ok) {
+              appendLine("system", `[Prepay Tax] ${botName} prepaid ${amount.toLocaleString()} credits`);
+              document.getElementById("prepay-" + botName).value = "";
+              setTimeout(() => triggerTaxRefresh(botName), 500);
+            } else {
+              appendLine("system", `[Prepay Tax Error] ${botName} prepay failed: ${prepayResult.error || "Unknown error"}`);
+            }
+          });
+        });
+      }
+
+      function execFactionPrepayTax() {
+        const amount = parseInt(document.getElementById("factionPrepayAmount").value) || 0;
+        if (amount <= 0) {
+          alert("Please enter a valid amount");
+          return;
+        }
+        const bot = bots.find((b) => b.state === "running" && b.docked);
+        if (!bot) {
+          alert("No docked running bot available (required for faction commands)");
+          return;
+        }
+        sendExec(bot.username, "faction_prepay_tax", { amount }, (result) => {
+          if (result.ok) {
+            appendLine("system", `[Faction Prepay Tax] ${bot.username} prepaid ${amount.toLocaleString()} credits from faction storage`);
+            document.getElementById("factionPrepayAmount").value = "";
+            setTimeout(updateFactionPrepayFunds, 1000);
+            setTimeout(() => refreshTaxesData(), 1000);
+          } else {
+            appendLine("system", `[Faction Prepay Tax Error] ${result.error || "Unknown error"}`);
+          }
+        });
+      }
+
+      function triggerTaxRefresh(botName) {
+        sendExec(botName, "get_tax_estimate", {}, (result) => {
+          if (result.ok && result.data) {
+            updateLocalTaxData(botName, result.data);
+          }
+          renderTaxesTab();
+        });
+      }
+
+      function updateLocalTaxData(botName, taxData) {
+        const data = taxesData || {};
+        const taxBots = data.bots || {};
+        if (!taxBots[botName]) {
+          taxBots[botName] = { history: [] };
+        }
+        const oldPrepaid = taxBots[botName].lastTaxEstimate?.tax_prepaid || 0;
+        taxBots[botName].lastTaxEstimate = {
+          botUsername: botName,
+          timestamp: Date.now(),
+          taxable_income_to_date: taxData.taxable_income_to_date || 0,
+          income_tax_total: taxData.income_tax_total || 0,
+          property_tax_total: taxData.property_tax_total || 0,
+          assessed_property_value: taxData.assessed_property_value || 0,
+          tax_prepaid: taxData.tax_prepaid || 0,
+          last_assessed_at: taxData.last_assessed_at || 0,
+        };
+        const newPrepaid = taxData.tax_prepaid || 0;
+        const deltaPrepaid = newPrepaid - oldPrepaid;
+        const fleetTotals = data.fleetTotals || {};
+        taxesData = {
+          ...data,
+          bots: taxBots,
+          fleetTotals: {
+            ...fleetTotals,
+            totalTaxPrepaid: (fleetTotals.totalTaxPrepaid || 0) + deltaPrepaid,
+          },
+        };
+      }
+
+      async function refreshTaxesData() {
+        taxesLoaded = false;
+        await loadTaxesData();
+        renderTaxesTab();
+      }
+
+      function updateFactionPrepayFunds() {
+        const factionItems = profileFactionStorage || globalFactionStorage || [];
+        const factionTotal = factionItems.reduce((sum, item) => {
+          if (item.item_id === "credits" || item.itemId === "credits") {
+            return sum + (item.quantity || item.count || 0);
+          }
+          return sum;
+        }, 0);
+        document.getElementById("factionPrepayFunds").textContent = num(factionTotal);
       }
 
       let skillsData = null;

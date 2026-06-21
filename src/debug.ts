@@ -8,7 +8,7 @@ const GLOBAL_LOG_FILE = join(LOGS_DIR, "debug.log");
 const OLD_LOGS_DIR = join(process.cwd(), "old-logs");
 const OLD_ACTIVITY_LOGS_DIR = join(OLD_LOGS_DIR, "activity");
 
-const LOG_ROTATION_SIZE = 50 * 1024 * 1024;  //changed to 50kb, since 200kb seems still too big and slows startup.
+const LOG_ROTATION_SIZE = 50 * 1024 * 1024;  // 50MB rotation threshold
 
 // Ensure directories exist once at module load
 if (!existsSync(DATA_DIR)) {
@@ -42,21 +42,12 @@ function shouldRotateLog(logPath: string): boolean {
 
 function rotateBotLog(botName: string): void {
   const botLogFile = join(LOGS_DIR, `${botName}_debug.log`);
-  const activityLogFile = join(ACTIVITY_LOGS_DIR, `${botName}_activity.log`);
   
   if (shouldRotateLog(botLogFile)) {
     const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
     const rotatedPath = join(OLD_LOGS_DIR, `${botName}_debug_${timestamp}.log`);
     try {
       renameSync(botLogFile, rotatedPath);
-    } catch { /* ignore */ }
-  }
-  
-  if (shouldRotateLog(activityLogFile)) {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
-    const rotatedPath = join(OLD_ACTIVITY_LOGS_DIR, `${botName}_activity_${timestamp}.log`);
-    try {
-      renameSync(activityLogFile, rotatedPath);
     } catch { /* ignore */ }
   }
 }
@@ -132,7 +123,9 @@ export function logBotActivity(botName: string, category: string, message: strin
     if (shouldRotateLog(botLogFile)) {
       const ts = new Date().toISOString().replace(/[:.]/g, "-");
       const rotatedPath = join(OLD_ACTIVITY_LOGS_DIR, `${botName}_activity_${ts}.log`);
-      renameSync(botLogFile, rotatedPath);
+      try {
+        renameSync(botLogFile, rotatedPath);
+      } catch { /* ignore rotation errors */ }
     }
   } catch {
     // ignore write errors

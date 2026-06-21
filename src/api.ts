@@ -207,6 +207,10 @@ const COMMAND_TOOL_MAP: Record<string, string> = {
   'create_faction': 'spacemolt_faction',
   'join_faction': 'spacemolt_faction',
   'leave_faction': 'spacemolt_faction',
+  'faction_prepay_tax': 'spacemolt_faction',
+
+  // Tax commands
+  'prepay_tax': 'spacemolt',
   'faction_info': 'spacemolt_faction',
   'faction_list': 'spacemolt_faction',
   'faction_invite': 'spacemolt_faction',
@@ -479,6 +483,8 @@ const MUTATION_INVALIDATIONS: Record<string, string[]> = {
   cloak: INV_STATUS,
   attack: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_SKILLS],
   battle: [...INV_STATUS, ...INV_SHIP, ...INV_LOCATION, ...INV_SKILLS],
+  prepay_tax: [...INV_STATUS, ...INV_STORAGE],
+  faction_prepay_tax: [...INV_STATUS, ...INV_STORAGE],
   catalog: [],
   get_map: [],
 };
@@ -935,6 +941,18 @@ export class SpaceMoltAPI {
       if (!body.source) {
         body.source = 'faction';
       }
+    }
+
+    // Translate amount -> quantity for prepay_tax (API uses 'quantity')
+    if (command === 'prepay_tax' && body.amount !== undefined) {
+      body.quantity = body.amount;
+      delete body.amount;
+    }
+
+    // Translate amount -> quantity for faction_prepay_tax (API uses 'quantity')
+    if (command === 'faction_prepay_tax' && body.amount !== undefined) {
+      body.quantity = body.amount;
+      delete body.amount;
     }
 
     // Auto-add item_id: 'credits' for send_gift

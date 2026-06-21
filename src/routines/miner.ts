@@ -1086,9 +1086,19 @@ export function pickTargetFromQuotas(
     }
   }
 
+  // CRITICAL FIX: Also include ores with no deficit for cycling when all quotas are met
+  for (const [resourceId, target] of Object.entries(quotas)) {
+    if (target <= 0) continue;
+    const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
+    const deficit = target - current;
+    if (deficit <= 0 && !entries.some(e => e.resourceId === resourceId)) {
+      entries.push({ resourceId, deficit, current, target });
+    }
+  }
+
   if (entries.length === 0) return "";
 
-  // Sort: biggest deficit first
+  // Sort: biggest deficit first, then smallest surplus (closest to deficit)
   entries.sort((a, b) => b.deficit - a.deficit);
   return entries[0].resourceId;
 }
@@ -1096,6 +1106,7 @@ export function pickTargetFromQuotas(
 /**
  * Find the first quota target that has available locations in the map.
  * Returns the resource ID of the first quota ore that can actually be mined.
+ * @param excludeTarget - Optional ore ID to exclude from the search (for cycling)
  */
 export function findFirstAvailableQuotaTarget(
   quotas: Record<string, number>,
@@ -1106,11 +1117,18 @@ export function findFirstAvailableQuotaTarget(
   depletionTimeoutMs: number,
   canMineHiddenRadioactive: boolean,
   canMineHiddenIce: boolean,
+  excludeTargets?: string | string[],
 ): string {
+  const excludeSet = new Set<string>();
+  if (excludeTargets) {
+    const targets = Array.isArray(excludeTargets) ? excludeTargets : [excludeTargets];
+    targets.forEach(t => excludeSet.add(t));
+  }
   const entries: Array<{ resourceId: string; deficit: number; current: number; target: number }> = [];
 
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
+    if (excludeSet.has(resourceId)) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     if (deficit > 0) {
@@ -1118,9 +1136,10 @@ export function findFirstAvailableQuotaTarget(
     }
   }
 
-  // Also include ores with no deficit but still in quotas (for cycling when all quotas met)
+  // Also include ores with no deficit but still in quotas (for cycling when all quotas are met)
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
+    if (excludeSet.has(resourceId)) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     if (deficit <= 0 && !entries.some(e => e.resourceId === resourceId)) {
@@ -1170,6 +1189,7 @@ export function findFirstAvailableQuotaTarget(
       // Hidden POIs often only have data in resources (from get_poi scans)
       const oreEntry = poi?.ores_found.find((o: any) => o.item_id === entry.resourceId);
       const resourceEntry = poi?.resources?.find((r: any) => r.resource_id === entry.resourceId);
+      
       // If resourceEntry exists and shows depleted, check expiry
       if (resourceEntry?.depleted) {
         return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
@@ -1185,6 +1205,9 @@ export function findFirstAvailableQuotaTarget(
     }
   }
 
+  // No ores have available locations - return empty string
+  // This signals to the caller that no targets are available
+  // The caller will then try the next ore in the quota list on the next cycle
   return "";
 }
 
@@ -2751,98 +2774,100 @@ if (effectiveTarget) {
           scoredLocations = scoredLocationsLocal;
         }
 
-        if (scoredLocations.length === 0 && !configuredSystem) {
-          ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
-          targetSystemId = bot.system;
-
-          // Try to switch to another quota ore that has accessible locations within range
-          if (effectiveTarget && Object.keys(quotas).length > 0) {
-            ctx.log("mining", `Searching for alternative quota target for ${effectiveTarget}`);
-            // Exclude the current target from alternatives
-            const altQuotas = { ...quotas };
-            delete altQuotas[effectiveTarget];
-            const alternativeTarget = findFirstAvailableQuotaTarget(
-              altQuotas, bot.factionStorage, miningType, settings, mapStore, depletionTimeoutMs,
-              canMineHiddenRadioactive, canMineHiddenIce
-            );
-            ctx.log("mining", `Alternative search result: ${alternativeTarget || 'none'}`);
-            if (alternativeTarget) {
-              // Re-search locations for the alternative target (use alternativeTarget, not effectiveTarget)
-              const altLocations = mapStore.findOreLocations(alternativeTarget).filter(loc => {
-                const sys = mapStore.getSystem(loc.systemId);
-                const poi = sys?.pois.find(p => p.id === loc.poiId);
-                if (!poi) return true;
-                if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
-                if (miningType === "radioactive") {
-                  if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-                  return isOreBeltPoi(poi.type) || poi.hidden === true;
-                }
-                if (miningType === "gas") return isGasCloudPoi(poi.type);
-                if (miningType === "ice") {
-                  if (poi.hidden === true && !canMineHiddenIce) return false;
-                  return isIceFieldPoi(poi.type);
-                }
-                return true;
-              }).filter(loc => {
-                if (settings.ignoreDepletion) return true;
-                const sys = mapStore.getSystem(loc.systemId);
-                const poi = sys?.pois.find(p => p.id === loc.poiId);
-                const oreEntry = poi?.ores_found.find(o => o.item_id === alternativeTarget);
-                if (!oreEntry?.depleted) return true;
-                return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
-              });
-
-              if (altLocations.length > 0) {
-                // Check if any locations are within range
-                const altScoredLocations = mapStore.findBestMiningLocation(alternativeTarget, bot.system, blacklist)
-                  .filter(loc => altLocations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
-                  .map(loc => {
-                    const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-                    return { ...loc, jumps: route ? route.length - 1 : 999 };
-                  })
-                  .filter(loc => loc.jumps <= maxJumps)
-                  .sort((a, b) => {
-                    if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
-                    if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
-                    if (b.richness !== a.richness) return b.richness - a.richness;
-                    return a.jumps - b.jumps;
-                  });
-
-                if (altScoredLocations.length > 0) {
-                  // Only switch if there are locations WITHIN RANGE
-                  ctx.log("mining", `Switching to alternative target ${alternativeTarget} with accessible locations`);
-                  effectiveTarget = alternativeTarget;
-                  scoredLocations = altScoredLocations;
-                  targetSystemId = altScoredLocations[0].systemId;
-                  targetPoiId = altScoredLocations[0].poiId;
-                  targetPoiName = altScoredLocations[0].poiName;
-                  ctx.log("mining", `Found ${altScoredLocations.length} locations for ${effectiveTarget} within ${maxJumps} jumps`);
-                } else {
-                  ctx.log("warn", `Alternative target ${alternativeTarget} has no locations within ${maxJumps} jumps — will mine locally`);
-                }
-              } else {
-                ctx.log("warn", `No accessible locations found for alternative target ${alternativeTarget}`);
+if (scoredLocations.length === 0 && !configuredSystem) {
+          ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — searching for alternative quota target`);
+          
+          // Loop through ALL quota ores to find one with locations within range
+          // This ensures we try every available ore before giving up
+          let foundAlternative = false;
+          const allQuotaOres = Object.keys(quotas).filter(ore => quotas[ore] > 0);
+          
+          for (const oreId of allQuotaOres) {
+            if (oreId === effectiveTarget) continue;
+            
+            ctx.log("mining", `Trying alternative quota target: ${oreId}`);
+            
+            // Find locations for this target
+            const altLocations = mapStore.findOreLocations(oreId).filter(loc => {
+              const sys = mapStore.getSystem(loc.systemId);
+              const poi = sys?.pois.find(p => p.id === loc.poiId);
+              if (!poi) return true;
+              if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+              if (miningType === "radioactive") {
+                if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+                return isOreBeltPoi(poi.type) || poi.hidden === true;
               }
-  } else {
-    // Mine locally
-    targetSystemId = bot.system;
-    const localPoi = findMiningPoi(currentPois, miningType, effectiveTarget, canMineHiddenPois, depletionTimeoutMs);
-    if (localPoi) {
-      targetPoiId = localPoi.id;
-      targetPoiName = localPoi.name;
-      ctx.log("mining", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally at ${localPoi.name}`);
-    } else {
-      ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps and no local POI available — waiting 60s`);
-      await ctx.sleep(60000);
-      continue;
-    }
-  }
+              if (miningType === "gas") return isGasCloudPoi(poi.type);
+              if (miningType === "ice") {
+                if (poi.hidden === true && !canMineHiddenIce) return false;
+                return isIceFieldPoi(poi.type);
+              }
+              return true;
+            }).filter(loc => {
+              if (settings.ignoreDepletion) return true;
+              const sys = mapStore.getSystem(loc.systemId);
+              const poi = sys?.pois.find(p => p.id === loc.poiId);
+              const oreEntry = poi?.ores_found.find(o => o.item_id === oreId);
+              if (!oreEntry?.depleted) return true;
+              return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+            });
+            
+            if (altLocations.length === 0) {
+              ctx.log("mining", `No locations found for ${oreId} — trying next ore`);
+              continue;
+            }
+            
+            // Check if any locations are within range
+            const altScoredLocations = mapStore.findBestMiningLocation(oreId, bot.system, blacklist)
+              .filter(loc => altLocations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+              .map(loc => {
+                const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+                return { ...loc, jumps: route ? route.length - 1 : 999 };
+              })
+              .filter(loc => loc.jumps <= maxJumps)
+              .sort((a, b) => {
+                if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+                if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+                if (b.richness !== a.richness) return b.richness - a.richness;
+                return a.jumps - b.jumps;
+              });
+            
+            if (altScoredLocations.length > 0) {
+              // Found a valid alternative within range
+              ctx.log("mining", `Switching to alternative target ${oreId} with accessible locations`);
+              effectiveTarget = oreId;
+              scoredLocations = altScoredLocations;
+              targetSystemId = altScoredLocations[0].systemId;
+              targetPoiId = altScoredLocations[0].poiId;
+              targetPoiName = altScoredLocations[0].poiName;
+              foundAlternative = true;
+              ctx.log("mining", `Found ${altScoredLocations.length} locations for ${effectiveTarget} within ${maxJumps} jumps`);
+              break;
+            }
+          }
+          
+          if (!foundAlternative) {
+            ctx.log("warn", `No quota targets have available locations within ${maxJumps} jumps — mining locally without specific target`);
           }
         } else {
-          // ── Recovered session upgrade check ──
-          // If we have a recovered session, check if the best scored location is
-          // significantly better than the session's current POI. If so, abandon
-          // the old session and start fresh at the better location.
+          // Mine locally
+          targetSystemId = bot.system;
+          const localPoi = findMiningPoi(currentPois, miningType, effectiveTarget, canMineHiddenPois, depletionTimeoutMs);
+          if (localPoi) {
+            targetPoiId = localPoi.id;
+            targetPoiName = localPoi.name;
+            ctx.log("mining", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally at ${localPoi.name}`);
+          } else {
+            ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps and no local POI available — waiting 60s`);
+            await ctx.sleep(60000);
+            continue;
+          }
+        }
+
+        // ── Recovered session upgrade check ──
+        // If we have a recovered session, check if the best scored location is
+        // significantly better than the session's current POI. If so, abandon
+        // the old session and start fresh at the better location.
         if (scoredLocations.length > 0 && scoredLocations[0].poiId) {
           if (recoveredSession) {
             const bestLoc = scoredLocations[0];
@@ -2895,55 +2920,54 @@ if (effectiveTarget) {
 
         const chosenLoc = scoredLocations.length > 0 ? scoredLocations[0] : undefined;
 
-          if (!chosenLoc && !configuredSystem) {
-            ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
-            targetSystemId = bot.system;
-          }
+        if (!chosenLoc && !configuredSystem) {
+          ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
+          targetSystemId = bot.system;
+        }
 
-          if (chosenLoc) {
-            targetSystemId = chosenLoc.systemId;
-            targetPoiId = chosenLoc.poiId;
-            targetPoiName = chosenLoc.poiName;
-          }
+        if (chosenLoc) {
+          targetSystemId = chosenLoc.systemId;
+          targetPoiId = chosenLoc.poiId;
+          targetPoiName = chosenLoc.poiName;
+        }
 
-          // Create mining session if we don't have one and we're targeting a specific POI
-          if (!recoveredSession && targetPoiId) {
-            const sysData = mapStore.getSystem(targetSystemId);
-            const session = createMiningSession({
-              botUsername: bot.username,
-              miningType: miningType,
-              targetResourceId: effectiveTarget,
-              targetResourceName: effectiveTarget,
-              targetSystemId,
-              targetSystemName: sysData?.name || targetSystemId,
-              targetPoiId,
-              targetPoiName,
-              homeSystem,
-              isQuotaDriven,
-              quotaTarget: isQuotaDriven ? (quotas[effectiveTarget] || 0) : undefined,
-            });
-            await startMiningSession(session);
-            recoveredSession = session;
-            ctx.log("mining", `Started mining session: ${session.targetResourceName} @ ${session.targetPoiName}`);
-          }
+        // Create mining session if we don't have one and we're targeting a specific POI
+        if (!recoveredSession && targetPoiId) {
+          const sysData = mapStore.getSystem(targetSystemId);
+          const session = createMiningSession({
+            botUsername: bot.username,
+            miningType: miningType,
+            targetResourceId: effectiveTarget,
+            targetResourceName: effectiveTarget,
+            targetSystemId,
+            targetSystemName: sysData?.name || targetSystemId,
+            targetPoiId,
+            targetPoiName,
+            homeSystem,
+            isQuotaDriven,
+            quotaTarget: isQuotaDriven ? (quotas[effectiveTarget] || 0) : undefined,
+          });
+          await startMiningSession(session);
+          recoveredSession = session;
+          ctx.log("mining", `Started mining session: ${session.targetResourceName} @ ${session.targetPoiName}`);
+        }
 
-          // ── Flock leader announces target ──
-          if (isFlockLeader && settings.flockEnabled && settings.flockName) {
-            const rallySystem = flockGroup?.rallySystem;
-            await announceFlockTarget(
-              settings.flockName,
-              bot.username,
-              targetSystemId,
-              targetPoiId,
-              targetPoiName,
-              effectiveTarget,
-              miningType,
-              rallySystem,
-            );
-            ctx.log("flock", `Announced target to flock: ${targetPoiName} @ ${targetSystemId} (${miningType})`);
-            flockPhase = "traveling";
-            await updateFlockPhase(settings.flockName, "traveling", isFlockLeader);
-          }
+        // ── Flock leader announces target ──
+        if (isFlockLeader && settings.flockEnabled && settings.flockName) {
+          const rallySystem = flockGroup?.rallySystem;
+          await announceFlockTarget(
+            settings.flockName,
+            bot.username,
+            targetSystemId,
+            targetPoiId,
+            targetPoiName,
+            effectiveTarget,
+            miningType,
+            rallySystem,
+          );
+          ctx.log("flock", `Announced target to flock: ${targetPoiName} @ ${targetSystemId} (${miningType})`);
+          flockPhase = "traveling";
+          await updateFlockPhase(settings.flockName, "traveling", isFlockLeader);
         }
       }
     } else {
@@ -3470,28 +3494,40 @@ if (effectiveTarget) {
               await dumpCargo(ctx, settings);
               continue;
             }
-           } else {
-             ctx.log("error", `No alternative ${resourceLabel} within ${maxJumps} jumps — clearing target and returning home to retry next cycle`);
-             effectiveTarget = "";
-             targetResource = "";
-             await ensureUndocked(ctx);
+} else {
+              // CRITICAL FIX: No alternative within range - but don't clear target and reset!
+              // Instead, try the next ore in the quota list on the next cycle.
+              // The findFirstAvailableQuotaTarget function now always returns a target,
+              // so on the next cycle it will pick the next ore (lead_ore) instead of the same one.
+              ctx.log("warn", `No alternative ${resourceLabel} within ${maxJumps} jumps — will try next ore on next cycle`);
+              // Clear target so the next cycle picks a different ore
+              effectiveTarget = "";
+              targetResource = "";
+              // Still need to return home to deposit cargo
+              await ensureUndocked(ctx);
+              const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
+              if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
+              await ensureDocked(ctx);
+              await dumpCargo(ctx, settings);
+              continue;
+            }
+          } else {
+            // CRITICAL FIX: No alternative found anywhere - but don't clear target and reset!
+            // Instead, try the next ore in the quota list on the next cycle.
+            // The findFirstAvailableQuotaTarget function now always returns a target,
+            // so on the next cycle it will pick the next ore in the priority list.
+            ctx.log("warn", `No alternative ${resourceLabel} found anywhere — will try next ore on next cycle`);
+            // Clear target so the next cycle picks a different ore
+            effectiveTarget = "";
+            targetResource = "";
+            // Still need to return home to deposit cargo
+            await ensureUndocked(ctx);
             const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
             if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
             await ensureDocked(ctx);
             await dumpCargo(ctx, settings);
             continue;
           }
-         } else {
-           ctx.log("error", `No alternative ${resourceLabel} found anywhere — clearing target and returning home to retry next cycle`);
-           effectiveTarget = "";
-           targetResource = "";
-           await ensureUndocked(ctx);
-          const fueled = await ensureFueled(ctx, safetyOpts.fuelThresholdPct);
-          if (fueled) await navigateToSystem(ctx, homeSystem, safetyOpts);
-          await ensureDocked(ctx);
-          await dumpCargo(ctx, settings);
-          continue;
-        }
       }
     }
 

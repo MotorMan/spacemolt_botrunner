@@ -5184,7 +5184,7 @@
         const routine =
           bot.routine ||
           (bot.state !== "running" ? getProfileSelectedRoutine() : null);
-        if (routine !== "miner") return "";
+        if (routine !== "miner" && routine !== "explorer") return "";
 
         const botSettings = settings[bot.username] || {};
         const globalMiner = settings.miner || {};

@@ -11,6 +11,7 @@ export interface TaxEstimate {
   income_tax_total: number;
   property_tax_total: number;
   assessed_property_value: number;
+  tax_prepaid: number;
   last_assessed_at: number;
 }
 
@@ -88,7 +89,8 @@ export function hasTaxEstimateChanged(
     last.taxable_income_to_date !== newEstimate.taxable_income_to_date ||
     last.income_tax_total !== newEstimate.income_tax_total ||
     last.property_tax_total !== newEstimate.property_tax_total ||
-    last.assessed_property_value !== newEstimate.assessed_property_value
+    last.assessed_property_value !== newEstimate.assessed_property_value ||
+    last.tax_prepaid !== newEstimate.tax_prepaid
   );
 }
 

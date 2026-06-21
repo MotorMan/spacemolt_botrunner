@@ -1387,12 +1387,13 @@ async refreshSkills(): Promise<ApiResponse> {
       income_tax_total: (result.income_tax_total as number) || 0,
       property_tax_total: (result.property_tax_total as number) || 0,
       assessed_property_value: (result.assessed_property_value as number) || 0,
+      tax_prepaid: (result.tax_prepaid as number) || 0,
       last_assessed_at: (result.last_assessed_at as number) || 0,
     };
 
     if (hasTaxEstimateChanged(this.username, estimate)) {
       saveTaxEstimate(this.username, estimate);
-      this.log("system", `Tax estimate updated: income=${estimate.taxable_income_to_date}, income_tax=${estimate.income_tax_total}, property_tax=${estimate.property_tax_total}`);
+      this.log("system", `Tax estimate updated: income=${estimate.taxable_income_to_date}, income_tax=${estimate.income_tax_total}, property_tax=${estimate.property_tax_total}, prepaid=${estimate.tax_prepaid}`);
     } else {
       this.log("system", "Tax estimate unchanged, skipping save");
     }

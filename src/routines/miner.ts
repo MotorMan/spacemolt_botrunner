@@ -1683,6 +1683,20 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
         }
       }
 
+      // ── CRITICAL FIX: Early fuel check at start of cycle ──
+      // This prevents the miner from starting routine operations with low fuel
+      await bot.refreshShip();
+      const earlyFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (earlyFuelPct < settings0.refuelThreshold) {
+        ctx.log("system", `Early fuel check: ${earlyFuelPct}% fuel — ensuring fueled before starting cycle`);
+        const earlyFueled = await ensureFueled(ctx, settings0.refuelThreshold);
+        if (!earlyFueled) {
+          ctx.log("error", "Cannot refuel at routine start — waiting 30s before retry");
+          await ctx.sleep(30000);
+          continue;
+        }
+      }
+
       // ── Battle state tracking (per-cycle initialization) ──
       const battleState: BattleState = {
         inBattle: false,

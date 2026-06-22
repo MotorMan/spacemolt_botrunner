@@ -1131,6 +1131,7 @@ export function findFirstAvailableQuotaTarget(
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
     if (excludeSet.has(resourceId)) continue;
+    if (miningType === "ore" && isRadioactiveOre(resourceId)) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     if (deficit > 0) {
@@ -1142,6 +1143,7 @@ export function findFirstAvailableQuotaTarget(
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
     if (excludeSet.has(resourceId)) continue;
+    if (miningType === "ore" && isRadioactiveOre(resourceId)) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     if (deficit <= 0 && !entries.some(e => e.resourceId === resourceId)) {
@@ -1164,7 +1166,10 @@ export function findFirstAvailableQuotaTarget(
       const sys = mapStore.getSystem(loc.systemId);
       const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
       if (!poi) return true;
-      if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+      if (miningType === "ore") {
+        if (isRadioactiveOre(entry.resourceId)) return false;
+        return isOreBeltPoi(poi.type) || poi.hidden === true;
+      }
       if (miningType === "radioactive") {
         if (poi.hidden === true && !canMineHiddenRadioactive) return false;
         const isOreBelt = isOreBeltPoi(poi.type) || 
@@ -1232,6 +1237,7 @@ function pickTargetFromQuotasOrClosest(
 
   for (const [resourceId, target] of Object.entries(quotas)) {
     if (target <= 0) continue;
+    if (miningType === "ore" && isRadioactiveOre(resourceId)) continue;
     const current = factionStorage.find(i => i.itemId === resourceId)?.quantity || 0;
     const deficit = target - current;
     entries.push({ resourceId, deficit, current, target });
@@ -2537,6 +2543,31 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
       }
     }
 
+    // ── Radioactive ore equipment validation ──
+    // If the target is a radioactive ore, verify we have the proper equipment
+    if (effectiveTarget && isRadioactiveOre(effectiveTarget)) {
+      const radioactiveCap = getRadioactiveCapabilityCached(cachedModules || []);
+      if (!radioactiveCap.canMineBasicRadioactive) {
+        ctx.log("error", `Target ${effectiveTarget} is a radioactive ore — requires lead-lined cargo + rad harvester`);
+        ctx.log("error", "  Skipping radioactive target — selecting alternative target");
+        // Clear the target so we fall back to non-radioactive mining
+        effectiveTarget = "";
+        if (recoveredSession) {
+          ctx.log("mining", "Abandoning recovered session due to equipment mismatch");
+          await failMiningSession(bot.username, "Radioactive ore — missing radioactive equipment");
+          recoveredSession = null;
+        }
+      } else {
+        if (radioactiveCap.canMineHiddenRadioactive) {
+          ctx.log("mining", `Radioactive target validated: ${effectiveTarget} (full capability - can access hidden POIs)`);
+        } else if (radioactiveCap.canMineDeepCoreRadioactive) {
+          ctx.log("mining", `Radioactive target validated: ${effectiveTarget} (limited capability - visible POIs only)`);
+        } else {
+          ctx.log("mining", `Radioactive target validated: ${effectiveTarget} (basic capability - public areas only)`);
+        }
+      }
+    }
+
     // ── Flock target override ──
     // If flock mode is enabled and we have a flock target, use it instead
     if (settings.flockEnabled && settings.flockName && flockTargetResource) {
@@ -2686,20 +2717,23 @@ if (configuredSystem) {
         ctx.log("debug", `DEBUG: Location ${loc.systemName}/${loc.poiName} - type="${poiType}" isOreBeltType=${isOreBeltType} isHidden=${isHidden} isOreBeltName=${isOreBeltName}`);
       }
       
-      // Filter to matching POI type only (skip depleted)
+// Filter to matching POI type only (skip depleted)
       const locations = allLocations.filter(loc => {
         const sys = mapStore.getSystem(loc.systemId);
         const poi = sys?.pois.find(p => p.id === loc.poiId);
         if (!poi) return true; // keep if type unknown
-        if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+        if (miningType === "ore") {
+          if (isRadioactiveOre(effectiveTarget)) return false;
+          return isOreBeltPoi(poi.type) || poi.hidden === true;
+        }
         if (miningType === "radioactive") {
           if (poi.hidden === true && !canMineHiddenRadioactive) {
             return false;
           }
           const isOreBelt = isOreBeltPoi(poi.type) || 
-                            loc.poiName.toLowerCase().includes('belt') || 
-                            loc.poiName.toLowerCase().includes('mineral field') ||
-                            loc.poiName.toLowerCase().includes('asteroid');
+                              loc.poiName.toLowerCase().includes('belt') || 
+                              loc.poiName.toLowerCase().includes('mineral field') ||
+                              loc.poiName.toLowerCase().includes('asteroid');
           return isOreBelt || poi.hidden === true;
         }
         if (miningType === "gas") return isGasCloudPoi(poi.type);
@@ -2731,7 +2765,10 @@ if (configuredSystem) {
         const sys = mapStore.getSystem(loc.systemId);
         const poi = sys?.pois.find(p => p.id === loc.poiId);
         if (!poi) return true;
-        if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+        if (miningType === "ore") {
+          if (isRadioactiveOre(effectiveTarget)) return false;
+          return isOreBeltPoi(poi.type) || poi.hidden === true;
+        }
         if (miningType === "radioactive") {
           if (poi.hidden === true && !canMineHiddenRadioactive) return false;
           const isOreBelt = isOreBeltPoi(poi.type) ||
@@ -2840,7 +2877,10 @@ if (configuredSystem) {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (!poi) return true;
-              if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+              if (miningType === "ore") {
+                if (isRadioactiveOre(effectiveTarget)) return false;
+                return isOreBeltPoi(poi.type) || poi.hidden === true;
+              }
               if (miningType === "radioactive") {
                 if (poi.hidden === true && !canMineHiddenRadioactive) return false;
                 return isOreBeltPoi(poi.type) || poi.hidden === true;
@@ -3048,7 +3088,10 @@ if (configuredSystem) {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (!poi) return true;
-              if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+              if (miningType === "ore") {
+                if (isRadioactiveOre(oreId)) return false;
+                return isOreBeltPoi(poi.type) || poi.hidden === true;
+              }
               if (miningType === "radioactive") {
                 if (poi.hidden === true && !canMineHiddenRadioactive) return false;
                 return isOreBeltPoi(poi.type) || poi.hidden === true;
@@ -3637,18 +3680,21 @@ if (configuredSystem) {
         const broaderLocations = broaderLocationsRaw.filter(loc => {
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
-          if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-                if (miningType === "radioactive") {
-                  const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+          if (miningType === "ore") {
+            if (isRadioactiveOre(effectiveTarget)) return false;
+            return isOreBeltPoi(poi?.type || "");
+          }
+          if (miningType === "radioactive") {
+            const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                                     (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
                                                      loc.poiName.toLowerCase().includes('mineral field') ||
                                                      loc.poiName.toLowerCase().includes('asteroid')));
-                  return canMineBasicRadioactive && (
-                    isOreBelt ||
-                    (!poi?.hidden && canMineDeepCoreRadioactive) ||
-                    (poi?.hidden && canMineHiddenRadioactive)
-                  );
-                }
+            return canMineBasicRadioactive && (
+              isOreBelt ||
+              (!poi?.hidden && canMineDeepCoreRadioactive) ||
+              (poi?.hidden && canMineHiddenRadioactive)
+            );
+          }
           if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
           return true;
@@ -4443,12 +4489,21 @@ if (configuredSystem) {
             if (loc.poiId === bot.poi && loc.systemId === bot.system) return false; // Skip current POI
             const sys = mapStore.getSystem(loc.systemId);
             const poi = sys?.pois.find(p => p.id === loc.poiId);
-            if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-              if (miningType === "radioactive") return canMineBasicRadioactive && (
-                isOreBeltPoi(poi?.type || "") ||
+            if (miningType === "ore") {
+              if (isRadioactiveOre(effectiveTarget)) return false;
+              return isOreBeltPoi(poi?.type || "");
+            }
+            if (miningType === "radioactive") {
+              const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                                    (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                                     loc.poiName.toLowerCase().includes('mineral field') ||
+                                                     loc.poiName.toLowerCase().includes('asteroid')));
+              return canMineBasicRadioactive && (
+                isOreBelt ||
                 (!poi?.hidden && canMineDeepCoreRadioactive) ||
                 (poi?.hidden && canMineHiddenRadioactive)
               );
+            }
             if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
             if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
             return true;
@@ -4690,16 +4745,19 @@ if (configuredSystem) {
                       if (loc.systemId !== searchSystem) return false; // HARD GATE: stay within configured system
                       const sys = mapStore.getSystem(loc.systemId);
                       const poi = sys?.pois.find(p => p.id === loc.poiId);
-if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-              if (miningType === "radioactive") {
-                const isOreBelt = isOreBeltPoi(poi?.type || "") ||
-                                  (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
-                                                   loc.poiName.toLowerCase().includes('mineral field') ||
-                                                   loc.poiName.toLowerCase().includes('asteroid')));
-                return canMineBasicRadioactive && (
-                  isOreBelt ||
-                  (!poi?.hidden && canMineDeepCoreRadioactive) ||
-                  (poi?.hidden && canMineHiddenRadioactive)
+                      if (miningType === "ore") {
+                        if (isRadioactiveOre(effectiveTarget)) return false;
+                        return isOreBeltPoi(poi?.type || "");
+                      }
+                      if (miningType === "radioactive") {
+                        const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                                    (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                                     loc.poiName.toLowerCase().includes('mineral field') ||
+                                                     loc.poiName.toLowerCase().includes('asteroid')));
+                        return canMineBasicRadioactive && (
+                          isOreBelt ||
+                          (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                          (poi?.hidden && canMineHiddenRadioactive)
                 );
               }
                       if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
@@ -5363,10 +5421,13 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
             const globalTargetLocs = mapStore.findOreLocations(searchTarget).filter(loc => {
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
-              if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-                      if (miningType === "radioactive") {
-                        const isOreBelt = isOreBeltPoi(poi?.type || "") ||
-                                          (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+              if (miningType === "ore") {
+                if (isRadioactiveOre(searchTarget)) return false;
+                return isOreBeltPoi(poi?.type || "");
+              }
+              if (miningType === "radioactive") {
+                const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                                  (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
                                                            loc.poiName.toLowerCase().includes('mineral field') ||
                                                            loc.poiName.toLowerCase().includes('asteroid')));
                         return canMineBasicRadioactive && (
@@ -5427,18 +5488,21 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
               const newLocs = mapStore.findOreLocations(newQuotaTarget).filter(loc => {
                 const sys = mapStore.getSystem(loc.systemId);
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
-                if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-              if (miningType === "radioactive") {
-                const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                if (miningType === "ore") {
+                  if (isRadioactiveOre(newQuotaTarget)) return false;
+                  return isOreBeltPoi(poi?.type || "");
+                }
+                if (miningType === "radioactive") {
+                  const isOreBelt = isOreBeltPoi(poi?.type || "") ||
                                   (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
                                                    loc.poiName.toLowerCase().includes('mineral field') ||
                                                    loc.poiName.toLowerCase().includes('asteroid')));
-                return canMineBasicRadioactive && (
-                  isOreBelt ||
-                  (!poi?.hidden && canMineDeepCoreRadioactive) ||
-                  (poi?.hidden && canMineHiddenRadioactive)
-                );
-              }
+                  return canMineBasicRadioactive && (
+                    isOreBelt ||
+                    (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                    (poi?.hidden && canMineHiddenRadioactive)
+                  );
+                }
                 if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                 if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                 return true;
@@ -5515,7 +5579,10 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
               const availableOres = storedPoi?.ores_found.filter(o => {
                 if (miningType === "ice" && !o.item_id.toLowerCase().includes("ice")) return false;
                 if (miningType === "gas" && !o.item_id.toLowerCase().includes("gas")) return false;
-                if (miningType === "ore" && (o.item_id.toLowerCase().includes("gas") || o.item_id.toLowerCase().includes("ice"))) return false;
+                if (miningType === "ore") {
+                  if (o.item_id.toLowerCase().includes("gas") || o.item_id.toLowerCase().includes("ice")) return false;
+                  if (isRadioactiveOre(o.item_id)) return false;
+                }
                 if (!o.depleted) return true;
                 return isDepletionExpired(o.depleted_at, depletionTimeoutMs);
               }) || [];
@@ -5762,18 +5829,21 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
             
             // Search for correct POI type in current system
             const altPoi = pois.find(p => {
-              if (miningType === "ore") return isOreBeltPoi(p.type);
-                if (miningType === "radioactive") {
-                  const isOreBelt = isOreBeltPoi(p.type) ||
-                                    (p.name && (p.name.toLowerCase().includes('belt') || 
-                                                p.name.toLowerCase().includes('mineral field') ||
-                                                p.name.toLowerCase().includes('asteroid')));
-                  return canMineBasicRadioactive && (
-                    isOreBelt ||
-                    (!p.hidden && canMineDeepCoreRadioactive) ||
-                    (p.hidden && canMineHiddenRadioactive)
-                  );
-                }
+              if (miningType === "ore") {
+                if (isRadioactiveOre(effectiveTarget)) return false;
+                return isOreBeltPoi(p.type);
+              }
+              if (miningType === "radioactive") {
+                const isOreBelt = isOreBeltPoi(p.type) ||
+                                  (p.name && (p.name.toLowerCase().includes('belt') || 
+                                              p.name.toLowerCase().includes('mineral field') ||
+                                              p.name.toLowerCase().includes('asteroid')));
+                return canMineBasicRadioactive && (
+                  isOreBelt ||
+                  (!p.hidden && canMineDeepCoreRadioactive) ||
+                  (p.hidden && canMineHiddenRadioactive)
+                );
+              }
               if (miningType === "gas") return isGasCloudPoi(p.type);
               if (miningType === "ice") return isIceFieldPoi(p.type);
               return false;
@@ -6186,6 +6256,20 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
       const lower = item.itemId.toLowerCase();
       if (lower.includes("fuel") || lower.includes("energy_cell")) fuelInCargo += item.quantity;
     }
+    
+    // CRITICAL FIX: Refuel if docked and not at 100% fuel
+    // This ensures miners top up fuel whenever they dock, not just when returning home
+    const currentFuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+    if (currentFuelPct < 100) {
+      ctx.log("system", `Refueling: ${currentFuelPct}% fuel — topping up to 100%`);
+      const refuelResp = await bot.exec("refuel");
+      if (!refuelResp.error) {
+        ctx.log("system", "Refueled successfully");
+      } else {
+        ctx.log("warn", `Refuel failed: ${refuelResp.error.message}`);
+      }
+    }
+    
     try {
       const r = (await bot.exec("find_route", { target_system: homeSystem })).result as any;
       if (r?.estimated_fuel && r?.fuel_available != null) {

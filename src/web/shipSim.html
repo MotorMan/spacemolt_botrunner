@@ -108,7 +108,7 @@
   </div>
 
   <script>
-    let catalog = { ships: {}, items: {} };
+    let catalog = { ships: {}, items: {}, facilities: {} };
     let selectedShip = null;
     let currentLoadout = { weapons: [], defense: [], utility: [] };
     let engineeringSkillLevel = 0;
@@ -117,7 +117,8 @@
     // ── Load Data ──────────────────────────────────────────
     async function loadData() {
       try {
-        const catalogRes = await fetch('/api/catalog');
+        // TEMPORARY: Use catalogHasModules.json which has ship modules
+        const catalogRes = await fetch('/api/catalog-with-modules');
         const catalogData = await catalogRes.json();
         catalog = catalogData;
         populateShipSelect();
@@ -249,7 +250,9 @@ function selectShip() {
       }
 
       // Get available modules from catalog
-      const modules = Object.values(catalog.items || {}).filter(item => {
+      // catalogHasModules.json has items as a keyed object
+      const itemsArray = Array.isArray(catalog.items) ? catalog.items : Object.values(catalog.items || {});
+      const modules = itemsArray.filter(item => {
         const category = item.category || item.type || '';
         return category.toLowerCase().includes('weapon') ||
                category.toLowerCase().includes('defense') ||
@@ -402,7 +405,8 @@ function selectShip() {
       if (!moduleId) return;
 
       // Find the module by ID (works for any category, including mining lasers, strip miners, etc.)
-      const allItems = Object.values(catalog.items || {});
+      // catalogHasModules.json has items as a keyed object
+      const allItems = Array.isArray(catalog.items) ? catalog.items : Object.values(catalog.items || {});
       let module = allItems.find(m => m.id === moduleId);
 
       // Fallback for any legacy hardcoded specials that might still be referenced
@@ -610,7 +614,8 @@ function selectShip() {
 
       // Clear and apply
       currentLoadout = { weapons: [], defense: [], utility: [] };
-      const allModules = Object.values(catalog.items || {});
+      // catalogHasModules.json has items as a keyed object
+      const allModules = Array.isArray(catalog.items) ? catalog.items : Object.values(catalog.items || {});
       const hiddenUtilityModules = {
         'onboard_hydrogen_refinery': { id: 'onboard_hydrogen_refinery', name: 'Onboard Hydrogen Refinery', category: 'utility', cpu_usage: 22, power_usage: 56, wear: 0, size: 10 }
       };

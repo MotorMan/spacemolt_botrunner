@@ -1636,6 +1636,7 @@
         { id: "ships", name: "Ships", icon: "🚢" },
         { id: "skills", name: "Skills", icon: "📜" },
         { id: "recipes", name: "Recipes", icon: "📝" },
+        { id: "facilities", name: "Facilities", icon: "🏭" },
       ];
 
       function getCatalogCategories(section) {
@@ -1664,6 +1665,13 @@
           const categories = new Set();
           for (const recipe of Object.values(catalog.recipes || {})) {
             if (recipe.category) categories.add(recipe.category);
+          }
+          return Array.from(categories).sort();
+        }
+        if (section === "facilities") {
+          const categories = new Set();
+          for (const facility of Object.values(catalog.facilities || {})) {
+            if (facility.category) categories.add(facility.category);
           }
           return Array.from(categories).sort();
         }
@@ -1725,8 +1733,13 @@
             items.push({ id, ...recipe, _section: "recipes" });
           }
         }
+        if (section === "facilities") {
+          for (const [id, facility] of Object.entries(catalog.facilities || {})) {
+            if (category && facility.category !== category) continue;
+            items.push({ id, ...facility, _section: "facilities" });
+          }
+        }
 
-        // Apply sorting
         if (catalogState.sortBy) {
           items.sort((a, b) => {
             let aVal =
@@ -2055,6 +2068,22 @@
           }
           if (item.crafting_time !== undefined)
             parts.push(`Time: ${item.crafting_time}s`);
+        }
+
+        if (catalogType === "facilities") {
+          if (item.level !== undefined) parts.push(`Level: ${item.level}`);
+          if (item.build_cost !== undefined) parts.push(`Cost: ${Number(item.build_cost).toLocaleString()}cr`);
+          if (item.build_time !== undefined) parts.push(`Build Time: ${item.build_time}s`);
+          if (item.labor_cost !== undefined) parts.push(`Labor: ${item.labor_cost}`);
+          if (item.power_draw !== undefined) parts.push(`Power: ${item.power_draw}`);
+          if (item.capacity !== undefined) parts.push(`Capacity: ${item.capacity}`);
+          if (item.recipe_id) parts.push(`Recipe: ${item.recipe_id}`);
+          if (item.upgrades_from) parts.push(`Upgrades from: ${item.upgrades_from}`);
+          if (item.build_materials && item.build_materials.length > 0) {
+            parts.push(
+              `Materials: ${item.build_materials.map((m) => `${m.quantity}x ${m.item_id}`).join(", ")}`,
+            );
+          }
         }
 
         const statLines = parts.join("<br>");

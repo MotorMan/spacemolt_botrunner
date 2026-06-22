@@ -1703,7 +1703,9 @@ export async function navigateToSystem(
 
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
         const serverRouteSystemIds = routeData.route.map(r => r.system_id);
-        const blacklistedOnRoute = serverRouteSystemIds.find(
+        // Exclude the first system (current position) from blacklist check - we're already there
+        const systemsToCheck = serverRouteSystemIds.slice(1);
+        const blacklistedOnRoute = systemsToCheck.find(
           sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
         );
         const routeStartsHere = serverRouteSystemIds[0] && 
@@ -1810,7 +1812,9 @@ export async function navigateToSystem(
 
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
         const serverRouteSystemIds = routeData.route.map(r => r.system_id);
-        const blacklistedOnRoute = serverRouteSystemIds.find(
+        // Exclude the first system (current position) from blacklist check - we're already there
+        const systemsToCheck = serverRouteSystemIds.slice(1);
+        const blacklistedOnRoute = systemsToCheck.find(
           sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
         );
         const routeStartsHere = serverRouteSystemIds[0] && 

@@ -65,9 +65,10 @@ function logTradeProfit(
   jumpsToSell: number,
   sellPrice: number,
   profit: number,
+  numItems: number,
 ): void {
-  const header = "botName,itemBought,buyPrice,jumpsToBuy,jumpsToSell,sellPrice,profit\n";
-  const line = `${botUsername},${itemName},${buyPrice},${jumpsToBuy},${jumpsToSell},${sellPrice},${profit}\n`;
+  const header = "botName,itemBought,buyPrice,jumpsToBuy,jumpsToSell,sellPrice,profit,numItems\n";
+  const line = `${botUsername},${itemName},${buyPrice},${jumpsToBuy},${jumpsToSell},${sellPrice},${profit},${numItems}\n`;
   
   try {
     const dir = dirname(PROFIT_LOG_PATH);
@@ -3191,7 +3192,7 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
     await factionDonateProfit(ctx, actualProfit);
 
     // ── Log profit to CSV ──
-    logTradeProfit(bot.username, route.itemName, route.buyPrice, route.jumpsToBuy, route.jumpsToSell, route.sellPrice, actualProfit);
+    logTradeProfit(bot.username, route.itemName, route.buyPrice, route.jumpsToBuy, route.jumpsToSell, route.sellPrice, actualProfit, totalSold);
 
     // ── Check for next trade before considering excess credit deposit ──
     yield "seek_next_trade";

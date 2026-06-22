@@ -528,6 +528,12 @@ export class AiChatService {
    * SEEN_EXPIRY_MS on the seenMessages map handles the time-based expiration.
    */
   private getMessageHash(msg: ChatMessage, isMention: boolean): string {
+    // For system/local chat, always use a hash without botUsername
+    // This prevents multiple bots from processing the same system/local message
+    if (msg.channel === "system" || msg.channel === "local") {
+      return `${msg.sender}|${msg.channel}|${msg.content}`;
+    }
+    
     // For mentions, include botUsername so different bots can respond to their own mentions
     // For non-mentions, exclude botUsername so only one bot responds to "respond to all"
     if (isMention) {
@@ -1025,15 +1031,9 @@ export class AiChatService {
       return "failed";
     }
 
-    // Check global lock
-    const lockCheckKey = `${msg.channel}:${humanSender}`;
-    if (!this.canRespond(responder.username, humanSender, lockCheckKey, settings.lockDurationSec)) {
-      this.logFn("ai_chat", `Lock held, skipping`);
-      return "failed";
-    }
-
     // For LOCAL chat: verify responder is at same location as receiving bot
     // Skip this check if the responder IS the receiving bot (it obviously can respond to messages it received)
+    // This check is done BEFORE acquiring the lock so bots at wrong locations don't block others
     if (msg.channel === "local" && responder.username !== msg.botUsername) {
       const locationMatch = this.checkLocationMatch(responder, msg);
       if (!locationMatch.matched) {
@@ -1047,6 +1047,7 @@ export class AiChatService {
 
     // For SYSTEM chat: verify responder is in the same system where the chat originated
     // Skip this check if the responder IS the receiving bot (it obviously can respond to messages it received)
+    // This check is done BEFORE acquiring the lock so bots in wrong systems don't block others
     if (msg.channel === "system" && responder.username !== msg.botUsername && msg.botSystem) {
       if (responder.system !== msg.botSystem) {
         this.logFn("ai_chat", `${responder.username} not in system where chat originated (${responder.system} vs ${msg.botSystem})`);
@@ -1057,10 +1058,11 @@ export class AiChatService {
       this.logFn("ai_chat_debug", `Skipping system check for ${responder.username} (is the receiving bot)`);
     }
 
-    // Try to acquire lock
-    const lockAcquireKey = `${msg.channel}:${humanSender}`;
-    if (!this.tryAcquireLock(responder.username, humanSender, lockAcquireKey, settings.lockDurationSec)) {
-      this.logFn("ai_chat", `Failed to acquire lock`);
+    // Try to acquire lock (this is the single source of truth for lock acquisition)
+    // This is atomic - it checks and sets the lock in one operation
+    const lockKey = `${msg.channel}:${humanSender}`;
+    if (!this.tryAcquireLock(responder.username, humanSender, lockKey, settings.lockDurationSec)) {
+      this.logFn("ai_chat", `Lock held, skipping`);
       return "failed";
     }
 
@@ -1068,8 +1070,9 @@ export class AiChatService {
     const result = await this.sendResponse(responder, msg, settings, humanSender, triedBots, isLastRound);
 
     if (result === "traveling" && msg.channel === "local") {
-      // Bot was traveling, return failed so caller tries next candidate
+      // Bot was traveling, release lock and return failed so caller tries next candidate
       this.logFn("ai_chat", `${responder.username} is traveling, will try next candidate...`);
+      this.releaseLock(responder.username, humanSender, lockKey);
       return "failed";
     }
 
@@ -1287,6 +1290,14 @@ export class AiChatService {
     }
     
     return false;
+  }
+
+  private releaseLock(botName: string, sender: string, channel: string): void {
+    const lockKey = `${channel}:${sender}`;
+    const lock = this.botLocks.get(lockKey);
+    if (lock && lock.botName === botName && lock.lastSender === sender) {
+      this.botLocks.delete(lockKey);
+    }
   }
 
   /**

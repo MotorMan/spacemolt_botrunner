@@ -85,34 +85,46 @@ class CatalogStore {
           facilities?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
         };
         
-        const itemsArray = Array.isArray(parsed.items) ? parsed.items : [];
-        const shipsArray = Array.isArray(parsed.ships) ? parsed.ships : [];
-        const skillsArray = Array.isArray(parsed.skills) ? parsed.skills : [];
-        const recipesArray = Array.isArray(parsed.recipes) ? parsed.recipes : [];
-        const facilitiesArray = Array.isArray(parsed.facilities) ? parsed.facilities : [];
+        const itemsData = parsed.items as { id: string; category?: string; [key: string]: unknown }[] | Record<string, { id: string; category?: string; [key: string]: unknown }> | undefined;
+        const shipsData = parsed.ships as { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }> | undefined;
+        const skillsData = parsed.skills as { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }> | undefined;
+        const recipesData = parsed.recipes as { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }> | undefined;
+        const facilitiesData = parsed.facilities as { id: string; category?: string; [key: string]: unknown }[] | Record<string, { id: string; category?: string; [key: string]: unknown }> | undefined;
         
         const items: Record<string, CatalogItem> = {};
-        for (const item of itemsArray) {
-          const id = (item as { id?: unknown })?.id;
-          if (typeof id === "string") items[id] = item as CatalogItem;
+        const facilities: Record<string, CatalogFacility> = {};
+        
+        const itemsEntries = Array.isArray(itemsData) ? itemsData : Object.values(itemsData ?? {});
+        for (const item of itemsEntries) {
+          const id = (item as { id?: unknown; category?: string })?.id;
+          const category = (item as { category?: string })?.category;
+          if (typeof id === "string") {
+            items[id] = item as CatalogItem;
+            if (category === "personal" || category === "production") {
+              facilities[id] = item as unknown as CatalogFacility;
+            }
+          }
         }
         const ships: Record<string, CatalogShip> = {};
-        for (const ship of shipsArray) {
+        const shipsEntries = Array.isArray(shipsData) ? shipsData : Object.values(shipsData ?? {});
+        for (const ship of shipsEntries) {
           const id = (ship as { id?: unknown })?.id;
           if (typeof id === "string") ships[id] = ship as CatalogShip;
         }
         const skills: Record<string, CatalogSkill> = {};
-        for (const skill of skillsArray) {
+        const skillsEntries = Array.isArray(skillsData) ? skillsData : Object.values(skillsData ?? {});
+        for (const skill of skillsEntries) {
           const id = (skill as { id?: unknown })?.id;
           if (typeof id === "string") skills[id] = skill as CatalogSkill;
         }
         const recipes: Record<string, CatalogRecipe> = {};
-        for (const recipe of recipesArray) {
+        const recipesEntries = Array.isArray(recipesData) ? recipesData : Object.values(recipesData ?? {});
+        for (const recipe of recipesEntries) {
           const id = (recipe as { id?: unknown })?.id;
           if (typeof id === "string") recipes[id] = recipe as CatalogRecipe;
         }
-        const facilities: Record<string, CatalogFacility> = {};
-        for (const facility of facilitiesArray) {
+        const facilitiesEntries = Array.isArray(facilitiesData) ? facilitiesData : Object.values(facilitiesData ?? {});
+        for (const facility of facilitiesEntries) {
           const id = (facility as { id?: unknown })?.id;
           if (typeof id === "string") facilities[id] = facility as CatalogFacility;
         }
@@ -235,34 +247,50 @@ class CatalogStore {
       const catalogData = await resp.json() as Record<string, unknown>;
       const versionFromCatalog = catalogData.version as string | null;
       
-      const itemsArray = catalogData.items as Record<string, { id: string; [key: string]: unknown }>[] ?? [];
-      const shipsArray = catalogData.ships as Record<string, { id: string; [key: string]: unknown }>[] ?? [];
-      const skillsArray = catalogData.skills as Record<string, { id: string; [key: string]: unknown }>[] ?? [];
-      const recipesArray = catalogData.recipes as Record<string, { id: string; [key: string]: unknown }>[] ?? [];
-      const facilitiesArray = catalogData.facilities as Record<string, { id: string; [key: string]: unknown }>[] ?? [];
+      // Handle both array format (from catalog.json file) and keyed format (from API)
+      const itemsData = catalogData.items as Record<string, { id: string; category?: string; [key: string]: unknown }> | { id: string; category?: string; [key: string]: unknown }[] | undefined;
+      const shipsData = catalogData.ships as Record<string, { id: string; [key: string]: unknown }> | { id: string; [key: string]: unknown }[] | undefined;
+      const skillsData = catalogData.skills as Record<string, { id: string; [key: string]: unknown }> | { id: string; [key: string]: unknown }[] | undefined;
+      const recipesData = catalogData.recipes as Record<string, { id: string; [key: string]: unknown }> | { id: string; [key: string]: unknown }[] | undefined;
+      const facilitiesData = catalogData.facilities as Record<string, { id: string; category?: string; [key: string]: unknown }> | { id: string; category?: string; [key: string]: unknown }[] | undefined;
       
       const items: Record<string, CatalogItem> = {};
-      for (const item of itemsArray) {
-        const id = (item as { id?: unknown })?.id;
-        if (typeof id === "string") items[id] = item as CatalogItem;
+      const facilities: Record<string, CatalogFacility> = {};
+      
+      // Extract items from either array or keyed format
+      const itemsEntries = Array.isArray(itemsData) ? itemsData : Object.values(itemsData ?? {});
+      for (const item of itemsEntries) {
+        const id = (item as { id?: unknown; category?: string })?.id;
+        const category = (item as { category?: string })?.category;
+        if (typeof id === "string") {
+          items[id] = item as CatalogItem;
+          if (category === "personal" || category === "production") {
+            facilities[id] = item as unknown as CatalogFacility;
+          }
+        }
       }
+      
       const ships: Record<string, CatalogShip> = {};
-      for (const ship of shipsArray) {
+      const shipsEntries = Array.isArray(shipsData) ? shipsData : Object.values(shipsData ?? {});
+      for (const ship of shipsEntries) {
         const id = (ship as { id?: unknown })?.id;
         if (typeof id === "string") ships[id] = ship as CatalogShip;
       }
       const skills: Record<string, CatalogSkill> = {};
-      for (const skill of skillsArray) {
+      const skillsEntries = Array.isArray(skillsData) ? skillsData : Object.values(skillsData ?? {});
+      for (const skill of skillsEntries) {
         const id = (skill as { id?: unknown })?.id;
         if (typeof id === "string") skills[id] = skill as CatalogSkill;
       }
       const recipes: Record<string, CatalogRecipe> = {};
-      for (const recipe of recipesArray) {
+      const recipesEntries = Array.isArray(recipesData) ? recipesData : Object.values(recipesData ?? {});
+      for (const recipe of recipesEntries) {
         const id = (recipe as { id?: unknown })?.id;
         if (typeof id === "string") recipes[id] = recipe as CatalogRecipe;
       }
-      const facilities: Record<string, CatalogFacility> = {};
-      for (const facility of facilitiesArray) {
+      
+      const facilitiesEntries = Array.isArray(facilitiesData) ? facilitiesData : Object.values(facilitiesData ?? {});
+      for (const facility of facilitiesEntries) {
         const id = (facility as { id?: unknown })?.id;
         if (typeof id === "string") facilities[id] = facility as CatalogFacility;
       }

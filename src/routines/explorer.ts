@@ -1257,7 +1257,7 @@ yield "deposit_cargo";
         // Navigate to target system via connected jumps (not a single direct jump)
         await ensureUndocked(ctx);
         ctx.log("travel", `Navigating to ${target.priority === "unknown" ? "unknown" : "stale"} system: ${target.name || target.id} (${target.distance} jumps via route)...`);
-        const arrived = await navigateToSystem(ctx, target.id, { fuelThresholdPct: currentSettings.refuelThreshold, hullThresholdPct: 30 });
+        const arrived = await navigateToSystem(ctx, target.id, { fuelThresholdPct: currentSettings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: currentSettings.ignoreBlacklistWhenCloaked && bot.isCloaked });
         if (!arrived) {
           ctx.log("error", `Could not reach ${target.name || target.id} — will retry next loop`);
           await ctx.sleep(10000);
@@ -2191,12 +2191,13 @@ async function* deepCoreScanRoutine(ctx: RoutineContext): AsyncGenerator<string,
         yield "navigate";
         await ensureUndocked(ctx);
         const blacklist = getSystemBlacklist();
-        // Skip blacklisted systems (persistent + temporary)
-        if (blacklist.some(b => b.toLowerCase() === hiddenPoi.systemId.toLowerCase()) || isTemporarilyBlacklisted(hiddenPoi.systemId)) {
+        // Skip blacklisted systems (persistent + temporary) unless cloaked
+        const settings = getExplorerSettings(bot.username);
+        if (!bot.isCloaked && (blacklist.some(b => b.toLowerCase() === hiddenPoi.systemId.toLowerCase()) || isTemporarilyBlacklisted(hiddenPoi.systemId))) {
           ctx.log("info", `Skipping blacklisted system: ${hiddenPoi.systemName}`);
           continue;
         }
-        const arrived = await navigateToSystem(ctx, hiddenPoi.systemId, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+        const arrived = await navigateToSystem(ctx, hiddenPoi.systemId, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked });
         if (!arrived) {
           ctx.log("error", `Could not reach ${hiddenPoi.systemName} — skipping POI`);
           continue;
@@ -2464,8 +2465,9 @@ async function hasDeepCoreSurveyScanner(ctx: RoutineContext): Promise<boolean> {
  */
 async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, void, void> {
   const { bot } = ctx;
-  const fledFromSystems = new Set<string>(); // Track systems we've fled from due to pirates
-  const path: string[] = []; // Track the path of systems visited
+  const fledFromSystems = new Set<string>();
+  const path: string[] = [];
+  let cloakEnabled = false;
 
   await bot.refreshStatus();
   const homeSystem = bot.system;
@@ -2501,11 +2503,30 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       continue;
     }
 
-    // ── Re-check mode after recovery — user might have changed it, or session was restarted ──
+    // ── Re-check mode after recovery ──
     const modeCheck = getExplorerSettings(bot.username);
     if (modeCheck.mode !== "trade_update") {
       ctx.log("system", "Mode changed to explore — restarting as explorer...");
       break;
+    }
+
+    // ── Enable cloak if autoCloak is enabled and not already cloaked ──
+    const cloakSettings = getExplorerSettings(bot.username);
+    if (cloakSettings.autoCloak && !bot.isCloaked && !cloakEnabled) {
+      ctx.log("system", "Auto-cloak enabled - activating cloak for full-time stealth mode");
+      const cloakResp = await bot.exec("cloak", { enable: true });
+      if (!cloakResp.error) {
+        cloakEnabled = true;
+        ctx.log("info", "Cloak activated successfully - bot is now stealthed");
+      } else {
+        const msg = cloakResp.error.message.toLowerCase();
+        if (msg.includes("already cloaked") || msg.includes("already_cloaked")) {
+          cloakEnabled = true;
+          ctx.log("info", "Cloak already active");
+        } else {
+          ctx.log("warn", `Cloak command failed: ${cloakResp.error.message}`);
+        }
+      }
     }
 
     // ── Build list of known systems with stations, sorted by stalest market data ──
@@ -2518,14 +2539,18 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
     const focusAreaSystem = focusSettings.focusAreaSystem;
     const maxJumps = focusSettings.maxJumps;
     const blacklist = getSystemBlacklist();
+    const isCloaked = bot.isCloaked;
 
     for (const [sysId, sys] of Object.entries(allSystems)) {
       // Skip pirate systems — they are hostile!
       if (isPirateSystem(sysId)) continue;
       // Skip blacklisted systems (persistent + temporary + fled from)
-      if (blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())) continue;
-      if (isTemporarilyBlacklisted(sysId)) continue;
-      if (fledFromSystems.has(sysId)) continue;
+      // Unless cloaked and ignoreBlacklistWhenCloaked is enabled
+      if (!isCloaked || !focusSettings.ignoreBlacklistWhenCloaked) {
+        if (blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())) continue;
+        if (isTemporarilyBlacklisted(sysId)) continue;
+        if (fledFromSystems.has(sysId)) continue;
+      }
 
       // If focus area is set, check if this system is within range
       if (focusAreaSystem) {
@@ -2599,12 +2624,12 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
       if (target.systemId !== bot.system) {
         yield "navigate";
         await ensureUndocked(ctx);
-        const arrived = await navigateToSystem(ctx, target.systemId, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+        const arrived = await navigateToSystem(ctx, target.systemId, { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: isCloaked && focusSettings.ignoreBlacklistWhenCloaked });
         if (!arrived) {
           ctx.log("error", `Could not reach ${target.systemName} — skipping`);
           continue;
         }
-        path.push(target.systemId); // Track the arrived system in path
+        path.push(target.systemId);
       }
 
       if (bot.state !== "running") break;
@@ -2626,6 +2651,21 @@ async function* tradeUpdateRoutine(ctx: RoutineContext): AsyncGenerator<string, 
         continue;
       }
       bot.poi = target.stationPoi;
+
+      // Check for pirates before docking
+      const nearbyResp = await bot.exec("get_nearby");
+      if (nearbyResp.result && typeof nearbyResp.result === "object") {
+        const tradeSettings = getExplorerSettings(bot.username);
+        if (!bot.isCloaked || !tradeSettings.ignorePirateFleeWhenCloaked) {
+          const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+          if (fled) {
+            ctx.log("error", "Pirates detected - fled, will retry");
+            fledFromSystems.add(target.systemId);
+            await ctx.sleep(30000);
+            continue;
+          }
+        }
+      }
 
       // ── Scavenge wrecks en route (only if enabled — unsafe near pirates) ──
       const tradeSettings = getExplorerSettings(bot.username);
@@ -3034,7 +3074,7 @@ async function* visitAllRoutine(ctx: RoutineContext): AsyncGenerator<string, voi
       }
 
       ctx.log("travel", `Navigating to ${target.systemName} (${target.systemId})...`);
-      const arrived = await navigateToSystem(ctx, target.systemId, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30 });
+      const arrived = await navigateToSystem(ctx, target.systemId, { fuelThresholdPct: settings.refuelThreshold, hullThresholdPct: 30, skipBlacklist: settings.ignoreBlacklistWhenCloaked && bot.isCloaked });
       if (!arrived) {
         await ctx.sleep(10000);
         continue;
@@ -4093,7 +4133,7 @@ async function returnToHomeBaseForFuelCells(ctx: RoutineContext): Promise<boolea
   // Navigate to Sol system
   if (bot.system !== "sol") {
     await ensureUndocked(ctx);
-    const arrived = await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30 });
+    const arrived = await navigateToSystem(ctx, "sol", { fuelThresholdPct: FUEL_SAFETY_PCT, hullThresholdPct: 30, skipBlacklist: true });
     if (!arrived) {
       ctx.log("error", "Could not reach Sol system — aborting fuel cell reload");
       return false;

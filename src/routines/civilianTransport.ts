@@ -358,12 +358,21 @@ function loadCatalog(): Record<string, CatalogShip> {
     if (fs.existsSync(catalogPath)) {
       const raw = fs.readFileSync(catalogPath, "utf-8");
       const data = JSON.parse(raw) as Record<string, unknown>;
-      const shipsArray = (data.ships as { id?: unknown }[]) || [];
       const ships: Record<string, CatalogShip> = {};
-      for (const ship of shipsArray) {
-        const id = ship?.id;
-        if (typeof id === "string") ships[id] = ship as CatalogShip;
+      
+      const shipsData = data.ships as Record<string, unknown> | unknown[] | undefined;
+      if (Array.isArray(shipsData)) {
+        for (const ship of shipsData) {
+          const id = (ship as { id?: unknown })?.id;
+          if (typeof id === "string") ships[id] = ship as CatalogShip;
+        }
+      } else if (shipsData && typeof shipsData === "object") {
+        for (const [, ship] of Object.entries(shipsData)) {
+          const id = (ship as { id?: unknown })?.id;
+          if (typeof id === "string") ships[id] = ship as CatalogShip;
+        }
       }
+      
       catalogCache = ships;
       return ships;
     }
@@ -371,6 +380,38 @@ function loadCatalog(): Record<string, CatalogShip> {
     // silent fail
   }
   return {};
+}
+
+let moduleCatalogCache: Record<string, Record<string, unknown>> | null = null;
+
+function loadModuleCatalog(): Record<string, Record<string, unknown>> | null {
+  if (moduleCatalogCache) return moduleCatalogCache;
+  try {
+    const catalogPath = path.join(process.cwd(), "data/catalogHasModules.json");
+    if (fs.existsSync(catalogPath)) {
+      const raw = fs.readFileSync(catalogPath, "utf-8");
+      const data = JSON.parse(raw) as Record<string, unknown>;
+      const itemsData = data.items as Record<string, Record<string, unknown>> | { id?: unknown }[] | undefined;
+      
+      const items: Record<string, Record<string, unknown>> = {};
+      if (Array.isArray(itemsData)) {
+        for (const item of itemsData) {
+          const id = item?.id;
+          if (typeof id === "string") items[id] = item as Record<string, unknown>;
+        }
+      } else if (itemsData && typeof itemsData === "object") {
+        for (const [id, item] of Object.entries(itemsData)) {
+          items[id] = item as Record<string, unknown>;
+        }
+      }
+      
+      moduleCatalogCache = items;
+      return items;
+    }
+  } catch {
+    // silent fail
+  }
+  return null;
 }
 
 // ── Types ────────────────────────────────────────────────────
@@ -808,7 +849,15 @@ function countPassengerModules(modules: unknown): { economy: number; business: n
     const typeName = ((mod.name as string) || (mod.type_name as string) || "") as string;
     const allText = (typeId + " " + typeName).toLowerCase();
     
-    if (allText.includes("passenger") || allText.includes("berth") || allText.includes("cabin")) {
+    const firstBerths = (mod.passenger_first_berths as number) || 0;
+    const businessBerths = (mod.passenger_business_berths as number) || 0;
+    const economyBerths = (mod.passenger_economy_berths as number) || 0;
+    
+    if (firstBerths > 0 || businessBerths > 0 || economyBerths > 0) {
+      first += firstBerths;
+      business += businessBerths;
+      economy += economyBerths;
+    } else if (allText.includes("passenger") || allText.includes("berth") || allText.includes("cabin")) {
       if (allText.includes("first")) first += 1;
       else if (allText.includes("business")) business += 1;
       else if (allText.includes("economy")) economy += 1;
@@ -905,13 +954,74 @@ async function getCurrentShipInfo(ctx: RoutineContext, shipId: string): Promise<
         berths = { economy: 1, business: 0, first: 0 };
       }
     }
+    if (totalBerths(berths) === 0 && cls) {
+      const caps = cls.inherent_capabilities;
+      const fromCaps = extractBerthsFromCapabilities(caps);
+      if (fromCaps) {
+        berths = fromCaps;
+      }
+    }
+    if (totalBerths(berths) === 0 && typeId === "midas") {
+      berths = { economy: 0, business: 0, first: 6 };
+    }
   }
   
-  const modules = (shipData.modules as unknown[]) || [];
-  if (totalBerths(berths) === 0 && Array.isArray(modules) && modules.length > 0) {
-    const fromMods = countPassengerModules(modules);
-    if (totalBerths(fromMods) > 0) {
-      berths = fromMods;
+  const shipModuleIds = (shipData.modules as unknown[]) || [];
+  const allModules = (result.modules as unknown[]) || [];
+  if (totalBerths(berths) === 0 && shipModuleIds.length > 0 && allModules.length > 0) {
+    const instanceIdToModule = new Map<string, Record<string, unknown>>();
+    for (const m of allModules) {
+      if (typeof m === "object" && m !== null) {
+        const modObj = m as Record<string, unknown>;
+        const instanceId = ((modObj.id as string) || "").toLowerCase();
+        if (instanceId) instanceIdToModule.set(instanceId, modObj);
+      }
+    }
+    const moduleObjects: unknown[] = [];
+    for (const id of shipModuleIds) {
+      const idStr = (typeof id === "string") ? id.toLowerCase() : "";
+      if (idStr && instanceIdToModule.has(idStr)) {
+        moduleObjects.push(instanceIdToModule.get(idStr));
+      } else if (typeof id === "object" && id !== null) {
+        moduleObjects.push(id);
+      }
+    }
+    if (moduleObjects.length > 0) {
+      const fromMods = countPassengerModules(moduleObjects);
+      if (totalBerths(fromMods) > 0) {
+        berths = fromMods;
+      }
+    }
+  }
+  
+  if (totalBerths(berths) === 0 && shipModuleIds.length > 0 && allModules.length > 0) {
+    const instanceIdToType = new Map<string, string>();
+    for (const m of allModules) {
+      if (typeof m === "object" && m !== null) {
+        const modObj = m as Record<string, unknown>;
+        const instanceId = ((modObj.id as string) || "").toLowerCase();
+        const typeId = ((modObj.type_id as string) || "").toLowerCase();
+        if (instanceId && typeId) instanceIdToType.set(instanceId, typeId);
+      }
+    }
+    const moduleCatalog = loadModuleCatalog();
+    if (moduleCatalog) {
+      const moduleObjects: unknown[] = [];
+      for (const id of shipModuleIds) {
+        const idStr = (typeof id === "string") ? id.toLowerCase() : "";
+        const typeId = instanceIdToType.get(idStr);
+        if (typeId && moduleCatalog[typeId]) {
+          moduleObjects.push(moduleCatalog[typeId]);
+        } else if (idStr && moduleCatalog[idStr]) {
+          moduleObjects.push(moduleCatalog[idStr]);
+        }
+      }
+      if (moduleObjects.length > 0) {
+        const fromMods = countPassengerModules(moduleObjects);
+        if (totalBerths(fromMods) > 0) {
+          berths = fromMods;
+        }
+      }
     }
   }
   
@@ -1292,6 +1402,21 @@ export const civilianTransportRoutine: Routine = async function* (ctx: RoutineCo
   if (!currentShipInfo || currentShipInfo.berths.economy + currentShipInfo.berths.business + currentShipInfo.berths.first === 0) {
     ctx.log("error", "Current ship has no passenger berths or cannot be verified. Routine cannot run.");
     return;
+  }
+
+  // ── Special handling for Midas yacht ───────────────────────────
+  const isMidas = currentShipInfo.shipName.toLowerCase() === "midas" || 
+                   currentShipInfo.customName?.toLowerCase() === "midas" ||
+                   currentShipInfo.berths.first > 0 && 
+                   currentShipInfo.berths.economy === 0 && 
+                   currentShipInfo.berths.business === 0;
+  if (isMidas) {
+    ctx.log("transport", "★ MIDAS YACHT DETECTED ★");
+    ctx.log("transport", "This is a unique, rare vessel - the Nebula billionaire's flagship.");
+    ctx.log("transport", `Only ${currentShipInfo.berths.first} first-class berth(s) available.`);
+    ctx.log("transport", "Unarmed luxury yacht built for status, not combat.");
+    ctx.log("transport", "NOTE: This ship cannot carry economy or business passengers.");
+    ctx.log("transport", "RECOMMENDATION: Set allowFirstClass=true, allowBusinessClass=false, allowEconomyClass=false");
   }
   
   // Initialize state if none or invalid
@@ -1710,12 +1835,25 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
 
       // Group passengers by destination
       const byDest = new Map<string, StationPassenger[]>();
+      const midasFilterLog = isMidas;
       for (const p of waiting) {
         const cls = p.class.toLowerCase();
-        if (settings.blockPirateStations && isPirateStation(p.destination)) continue;
-        if (cls === "first" && !settings.allowFirstClass) continue;
-        if (cls === "business" && !settings.allowBusinessClass) continue;
-        if (cls === "economy" && !settings.allowEconomyClass) continue;
+        if (settings.blockPirateStations && isPirateStation(p.destination)) {
+          if (midasFilterLog) ctx.log("transport", `Skipping pirate passenger: ${p.name}`);
+          continue;
+        }
+        if (cls === "first" && !settings.allowFirstClass) {
+          if (midasFilterLog) ctx.log("transport", `Skipping non-first passenger (first disabled): ${p.name}`);
+          continue;
+        }
+        if (cls === "business" && !settings.allowBusinessClass) {
+          if (midasFilterLog) ctx.log("transport", `Skipping non-first passenger (business disabled): ${p.name}`);
+          continue;
+        }
+        if (cls === "economy" && !settings.allowEconomyClass) {
+          if (midasFilterLog) ctx.log("transport", `Skipping non-first passenger (economy disabled): ${p.name}`);
+          continue;
+        }
         const arr = byDest.get(p.destination) || [];
         arr.push(p);
         byDest.set(p.destination, arr);
@@ -2067,6 +2205,9 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
       }
 
       ctx.log("transport", `${onboard.length} passengers. Route: ${planned.map(d => d.poiName).join(" → ")}`);
+      if (isMidas && onboard.length > 0) {
+        ctx.log("transport", `MIDAS: Carrying ${onboard.filter(p => p.accommodationClass === "first").length} first-class passengers.`);
+      }
       if (planned.length === 0 && onboard.length > 0) {
         ctx.log("transport", `WARNING: ${onboard.length} passengers but empty route!`);
         for (const p of onboard) {

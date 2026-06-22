@@ -77,15 +77,54 @@ class CatalogStore {
     if (existsSync(CATALOG_FILE)) {
       try {
         const raw = readFileSync(CATALOG_FILE, "utf-8");
-        const parsed = JSON.parse(raw) as Partial<CatalogData>;
+        const parsed = JSON.parse(raw) as Partial<CatalogData> & { 
+          items?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
+          ships?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
+          skills?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
+          recipes?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
+          facilities?: { id: string; [key: string]: unknown }[] | Record<string, { id: string; [key: string]: unknown }>;
+        };
+        
+        const itemsArray = Array.isArray(parsed.items) ? parsed.items : [];
+        const shipsArray = Array.isArray(parsed.ships) ? parsed.ships : [];
+        const skillsArray = Array.isArray(parsed.skills) ? parsed.skills : [];
+        const recipesArray = Array.isArray(parsed.recipes) ? parsed.recipes : [];
+        const facilitiesArray = Array.isArray(parsed.facilities) ? parsed.facilities : [];
+        
+        const items: Record<string, CatalogItem> = {};
+        for (const item of itemsArray) {
+          const id = (item as { id?: unknown })?.id;
+          if (typeof id === "string") items[id] = item as CatalogItem;
+        }
+        const ships: Record<string, CatalogShip> = {};
+        for (const ship of shipsArray) {
+          const id = (ship as { id?: unknown })?.id;
+          if (typeof id === "string") ships[id] = ship as CatalogShip;
+        }
+        const skills: Record<string, CatalogSkill> = {};
+        for (const skill of skillsArray) {
+          const id = (skill as { id?: unknown })?.id;
+          if (typeof id === "string") skills[id] = skill as CatalogSkill;
+        }
+        const recipes: Record<string, CatalogRecipe> = {};
+        for (const recipe of recipesArray) {
+          const id = (recipe as { id?: unknown })?.id;
+          if (typeof id === "string") recipes[id] = recipe as CatalogRecipe;
+        }
+        const facilities: Record<string, CatalogFacility> = {};
+        for (const facility of facilitiesArray) {
+          const id = (facility as { id?: unknown })?.id;
+          if (typeof id === "string") facilities[id] = facility as CatalogFacility;
+        }
+        
         return {
           version: parsed.version ?? null,
           lastFetched: parsed.lastFetched ?? null,
-          items: parsed.items ?? {},
-          ships: parsed.ships ?? {},
-          skills: parsed.skills ?? {},
-          recipes: parsed.recipes ?? {},
-          facilities: parsed.facilities ?? {},
+          items,
+          ships,
+          skills,
+          recipes,
+          facilities,
         };
       } catch {
         // Corrupt file — start fresh
@@ -195,11 +234,38 @@ class CatalogStore {
       }
       const catalogData = await resp.json() as Record<string, unknown>;
       const versionFromCatalog = catalogData.version as string | null;
-      const items = catalogData.items as Record<string, CatalogItem> ?? {};
-      const ships = catalogData.ships as Record<string, CatalogShip> ?? {};
-      const skills = catalogData.skills as Record<string, CatalogSkill> ?? {};
-      const recipes = catalogData.recipes as Record<string, CatalogRecipe> ?? {};
-      const facilities = catalogData.facilities as Record<string, CatalogFacility> ?? {};
+      
+      const itemsArray = catalogData.items as Record<string, { id: string; [key: string]: unknown }>[] ?? [];
+      const shipsArray = catalogData.ships as Record<string, { id: string; [key: string]: unknown }>[] ?? [];
+      const skillsArray = catalogData.skills as Record<string, { id: string; [key: string]: unknown }>[] ?? [];
+      const recipesArray = catalogData.recipes as Record<string, { id: string; [key: string]: unknown }>[] ?? [];
+      const facilitiesArray = catalogData.facilities as Record<string, { id: string; [key: string]: unknown }>[] ?? [];
+      
+      const items: Record<string, CatalogItem> = {};
+      for (const item of itemsArray) {
+        const id = (item as { id?: unknown })?.id;
+        if (typeof id === "string") items[id] = item as CatalogItem;
+      }
+      const ships: Record<string, CatalogShip> = {};
+      for (const ship of shipsArray) {
+        const id = (ship as { id?: unknown })?.id;
+        if (typeof id === "string") ships[id] = ship as CatalogShip;
+      }
+      const skills: Record<string, CatalogSkill> = {};
+      for (const skill of skillsArray) {
+        const id = (skill as { id?: unknown })?.id;
+        if (typeof id === "string") skills[id] = skill as CatalogSkill;
+      }
+      const recipes: Record<string, CatalogRecipe> = {};
+      for (const recipe of recipesArray) {
+        const id = (recipe as { id?: unknown })?.id;
+        if (typeof id === "string") recipes[id] = recipe as CatalogRecipe;
+      }
+      const facilities: Record<string, CatalogFacility> = {};
+      for (const facility of facilitiesArray) {
+        const id = (facility as { id?: unknown })?.id;
+        if (typeof id === "string") facilities[id] = facility as CatalogFacility;
+      }
 
       this.data.version = serverVersion;
       this.data.lastFetched = new Date().toISOString();

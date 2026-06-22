@@ -358,7 +358,12 @@ function loadCatalog(): Record<string, CatalogShip> {
     if (fs.existsSync(catalogPath)) {
       const raw = fs.readFileSync(catalogPath, "utf-8");
       const data = JSON.parse(raw) as Record<string, unknown>;
-      const ships = (data.ships as Record<string, CatalogShip>) || {};
+      const shipsArray = (data.ships as { id?: unknown }[]) || [];
+      const ships: Record<string, CatalogShip> = {};
+      for (const ship of shipsArray) {
+        const id = ship?.id;
+        if (typeof id === "string") ships[id] = ship as CatalogShip;
+      }
       catalogCache = ships;
       return ships;
     }

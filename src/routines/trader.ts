@@ -83,6 +83,31 @@ function logTradeProfit(
   }
 }
 
+/** Log CT passenger fare to CSV file for analysis. */
+function logCTFare(
+  botUsername: string,
+  passengerName: string,
+  fare: number,
+): void {
+  const header = "botName,passenger_name,buyPrice,jumpsToBuy,jumpsToSell,sellPrice,profit\n";
+  const line = `${botUsername},${passengerName},0,,,,$fare,${fare}\n`;
+  
+  try {
+    const dir = dirname(PROFIT_LOG_PATH);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+    if (!existsSync(PROFIT_LOG_PATH)) {
+      writeFileSync(PROFIT_LOG_PATH, header);
+    }
+    writeFileSync(PROFIT_LOG_PATH, line, { flag: "a" });
+  } catch (err) {
+    console.error(`[Trader] Failed to write profit log: ${err}`);
+  }
+}
+
+export { logCTFare };
+
 // ── Cloaking module detection and enablement ────────────────────────────────
 
 /**

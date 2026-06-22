@@ -19,6 +19,7 @@ import {
   isPirateSystem,
   getItemSize,
 } from "./common.js";
+import { logCTFare } from "./trader.js";
 import { getSystemBlacklist } from "../web/server.js";
 import { civilianStore, CivilianPassenger } from "../civilianstore.js";
 import { catalogStore } from "../catalogstore.js";
@@ -2255,6 +2256,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           loadedAt: p.loadedAt,
           status: "delivered",
         });
+        logCTFare(bot.username, p.name, farePerPassenger);
       }
 
       state.currentRouteIndex += 1;

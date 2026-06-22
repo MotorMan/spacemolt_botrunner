@@ -3,7 +3,7 @@ import { join } from "path";
 import type { SpaceMoltAPI } from "./api.js";
 import { debugLog } from "./debug.js";
 
-// ── Data model ──────────────────────────────────────────────
+const OPENAPI_BASE_URL = "https://game.spacemolt.com/api";
 
 export interface CatalogItem {
   id: string;
@@ -145,7 +145,7 @@ class CatalogStore {
       const versionResp = await api.execute("get_version");
       if (!versionResp.error && versionResp.result) {
         const v = versionResp.result as Record<string, unknown>;
-        const currentVersion = (v.version as string) || null;
+        const currentVersion = (v.version as string) || String(versionResp.result);
         return currentVersion !== this.data.version;
       }
     } catch {
@@ -156,20 +156,87 @@ class CatalogStore {
 
   // ── Fetch from API ────────────────────────────────────────
 
-  /** Paginate all 5 catalog types and store results. */
+  /**
+   * Fetch catalog from the API. Returns a promise that resolves when complete.
+   * Also fetches the OpenAPI spec if this was a version change.
+   */
   async fetchAll(api: SpaceMoltAPI): Promise<void> {
-    // If a fetch is already in progress, wait for it rather than running a
-    // concurrent fetch that would partially overwrite results.
     if (this._fetchPromise) return this._fetchPromise;
-
-    debugLog("catalog", `Starting catalog fetch (lastFetched: ${this.data.lastFetched})`);
-    this._fetchPromise = this._doFetchAll(api).finally(() => {
+    this._fetchPromise = this._doFetchAll(api).then(async () => {
+      if (this.data.version) {
+        await this.fetchOpenApi();
+      }
+    }).finally(() => {
       this._fetchPromise = null;
     });
     return this._fetchPromise;
   }
-
   private async _doFetchAll(api: SpaceMoltAPI): Promise<void> {
+    let serverVersion: string | null = null;
+    try {
+      const versionResp = await api.execute("get_version");
+      if (!versionResp.error && versionResp.result) {
+        const v = versionResp.result as Record<string, unknown>;
+        serverVersion = (v.version as string) || null;
+        debugLog("catalog", `Server version: ${serverVersion}`);
+      }
+    } catch (err) {
+      debugLog("catalog", `Failed to fetch server version: ${err}`);
+    }
+
+    debugLog("catalog", `Fetching catalog from /api/catalog.json`);
+    try {
+      const baseUrl = api.baseUrl.replace(/\/api\/v2$/, "/api");
+      const resp = await fetch(`${baseUrl}/catalog.json`, {
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const catalogData = await resp.json() as Record<string, unknown>;
+      const versionFromCatalog = catalogData.version as string | null;
+      const items = catalogData.items as Record<string, CatalogItem> ?? {};
+      const ships = catalogData.ships as Record<string, CatalogShip> ?? {};
+      const skills = catalogData.skills as Record<string, CatalogSkill> ?? {};
+      const recipes = catalogData.recipes as Record<string, CatalogRecipe> ?? {};
+      const facilities = catalogData.facilities as Record<string, CatalogFacility> ?? {};
+
+      this.data.version = serverVersion;
+      this.data.lastFetched = new Date().toISOString();
+      this.data.items = items;
+      this.data.ships = ships;
+      this.data.skills = skills;
+      this.data.recipes = recipes;
+      this.data.facilities = facilities;
+
+      this.dirty = true;
+      this.writeToDisk();
+
+      const counts = [
+        `${Object.keys(this.data.items).length} items`,
+        `${Object.keys(this.data.ships).length} ships`,
+        `${Object.keys(this.data.skills).length} skills`,
+        `${Object.keys(this.data.recipes).length} recipes`,
+        `${Object.keys(this.data.facilities).length} facilities`,
+      ];
+      debugLog("catalog", `Fetch complete: ${counts.join(", ")}`);
+
+      if (versionFromCatalog && versionFromCatalog !== serverVersion) {
+        debugLog("catalog", `Catalog version ${versionFromCatalog} differs from server version ${serverVersion}`);
+      }
+
+      return void counts;
+    } catch (err) {
+      debugLog("catalog", `Catalog fetch failed, falling back to paginated approach: ${err}`);
+      await this._doFetchAllPaginated(api);
+    }
+  }
+
+  /**
+   * Fallback: Paginate all 5 catalog types and store results.
+   * Used when the new /api/catalog.json endpoint is unavailable.
+   */
+  private async _doFetchAllPaginated(api: SpaceMoltAPI): Promise<void> {
     let serverVersion: string | null = null;
     try {
       const versionResp = await api.execute("get_version");
@@ -209,7 +276,6 @@ class CatalogStore {
           break;
         }
 
-        // Log the shape of the response for debugging
         const dataKeys = Object.keys(data);
         debugLog("catalog", `Response keys for ${type} page ${page}: ${dataKeys.join(", ")}`);
 
@@ -227,7 +293,6 @@ class CatalogStore {
         totalPages = (data.total_pages as number) || (data.totalPages as number) || 1;
         page++;
 
-        // Delay between pages to avoid rate limiting
         if (page <= totalPages) {
           await new Promise(resolve => setTimeout(resolve, 500));
         }
@@ -254,7 +319,43 @@ class CatalogStore {
       `${Object.keys(this.data.facilities).length} facilities`,
     ];
     debugLog("catalog", `Fetch complete: ${counts.join(", ")}`);
-    return void counts; // logged by caller
+    return void counts;
+  }
+
+  // ── OpenAPI fetch ──────────────────────────────────────────
+
+  /**
+   * Download openapi.json from the server and save as openapi-V2-{version}.json in the root.
+   * Only downloads if the version has changed since last save.
+   */
+  async fetchOpenApi(): Promise<void> {
+    const version = this.data.version;
+    if (!version) {
+      debugLog("catalog", "Cannot fetch OpenAPI: no version available");
+      return;
+    }
+
+    const openapiPath = join(process.cwd(), `openapi-V2-${version}.json`);
+
+    if (existsSync(openapiPath)) {
+      debugLog("catalog", `OpenAPI already exists at ${openapiPath}`);
+      return;
+    }
+
+    debugLog("catalog", `Fetching OpenAPI spec for version ${version}`);
+    try {
+      const resp = await fetch(`${OPENAPI_BASE_URL}/openapi.json`, {
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (!resp.ok) {
+        throw new Error(`HTTP ${resp.status}`);
+      }
+      const spec = await resp.text();
+      writeFileSync(openapiPath, spec, "utf-8");
+      debugLog("catalog", `OpenAPI spec saved to ${openapiPath} (${spec.length} bytes)`);
+    } catch (err) {
+      debugLog("catalog", `Failed to fetch OpenAPI: ${err}`);
+    }
   }
 
   // ── Lookup methods ────────────────────────────────────────

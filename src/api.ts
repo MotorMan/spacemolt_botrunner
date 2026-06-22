@@ -600,7 +600,8 @@ export class SpaceMoltAPI {
     try {
       const resp = await this.doRequest("get_version");
       if (!resp.error && resp.result) {
-        this._serverVersion = String(resp.result);
+        const v = resp.result as Record<string, unknown>;
+        this._serverVersion = (v.version as string) || String(resp.result);
         return this._serverVersion;
       }
     } catch {}
@@ -761,7 +762,8 @@ export class SpaceMoltAPI {
       const toInvalidate = MUTATION_INVALIDATIONS[command];
       if (toInvalidate) this._cache.invalidate(toInvalidate);
       if (command === "get_version" && resp.result) {
-        const newVersion = String(resp.result);
+        const v = resp.result as Record<string, unknown>;
+        const newVersion = (v.version as string) || String(resp.result);
         if (newVersion !== this._serverVersion) {
           this._serverVersion = newVersion;
           this._cache.invalidate(["catalog:", "get_map:"]);

@@ -7,9 +7,11 @@ export function logTransportProfit(
   botUsername: string,
   passengerName: string,
   fare: number,
+  fromStation: string,
+  toStation: string,
 ): void {
-  const header = "botName,passenger_name,fare\n";
-  const line = `${botUsername},${passengerName},${fare}\n`;
+  const header = "botName,passenger_name,fare,fromStation,toStation\n";
+  const line = `${botUsername},${passengerName},${fare},${fromStation},${toStation}\n`;
   
   try {
     const dir = dirname(PROFIT_LOG_PATH);

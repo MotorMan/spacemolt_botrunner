@@ -1275,13 +1275,8 @@ export async function ensureFueled(
     // If we couldn't reach home or refuel there, continue to other options
   }
 
-  // Check for approved fuel stations FIRST
+  // Check for approved fuel stations - if empty/undefined, allow all stations (handled by isApprovedFuelStation)
   const approvedFuelStations = (readSettings()?.general as any)?.approvedFuelStations as string[] | undefined;
-
-  if (!approvedFuelStations || approvedFuelStations.length === 0) {
-    ctx.log("warn", "No approved fuel stations configured — skipping refuel");
-    return false;
-  }
 
   // If we undocked and were previously docked, only return there if it's APPROVED
   if (wasDocked && dockingStation && isApprovedFuelStation(dockingStation.id, readSettings(), bot.system)) {
@@ -1366,10 +1361,12 @@ if (looted > 0) {
   ctx.log("system", "No station in current system — searching known map for nearest station...");
   const blacklist = opts?.skipBlacklist ? [] : getSystemBlacklist();
   const approvedSet = new Set<string>();
-  for (const entry of approvedFuelStations) {
-    approvedSet.add(entry);
-    const parts = entry.split("|");
-    if (parts.length === 2) approvedSet.add(parts[1]);
+  if (approvedFuelStations) {
+    for (const entry of approvedFuelStations) {
+      approvedSet.add(entry);
+      const parts = entry.split("|");
+      if (parts.length === 2) approvedSet.add(parts[1]);
+    }
   }
 
   let nearest = mapStore.findNearestStationSystem(bot.system, blacklist, approvedSet);

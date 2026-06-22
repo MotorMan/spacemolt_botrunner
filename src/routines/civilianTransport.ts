@@ -2402,7 +2402,7 @@ ctx.log("transport", `Civilian transport started. Ship: ${state.customName || st
           loadedAt: p.loadedAt,
           status: "delivered",
         });
-        logTransportProfit(bot.username, p.name, farePerPassenger);
+        logTransportProfit(bot.username, p.name, farePerPassenger, state.pickupStation || "", waypoint.poi);
       }
 
       state.currentRouteIndex += 1;

@@ -11717,7 +11717,10 @@
         const approvedSel = document.getElementById("set-general-approvedFuel");
         if (approvedSel) {
           for (const opt of approvedSel.options) {
-            if (approvedFuelStations.includes(opt.value)) opt.selected = true;
+            // Empty array means "any station" - preselect the "(any station)" option
+            const isSelected = (approvedFuelStations.length === 0 && opt.value === "") ||
+                               approvedFuelStations.includes(opt.value);
+            if (isSelected) opt.selected = true;
           }
         }
       }

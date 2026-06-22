@@ -1702,18 +1702,21 @@ export async function navigateToSystem(
       }
 
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
-        // Validate server route against blacklist — reject if it passes through blacklisted systems
         const serverRouteSystemIds = routeData.route.map(r => r.system_id);
         const blacklistedOnRoute = serverRouteSystemIds.find(
           sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
         );
-        // Also validate that the route actually starts from our current system
         const routeStartsHere = serverRouteSystemIds[0] && 
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
-        // Check for wormhole segments that we cannot traverse
         const hasWormhole = routeHasWormhole(routeData.route);
-        if (blacklistedOnRoute) {
+        
+        const isCloaked = bot.isCloaked && opts.skipBlacklist;
+        
+        if (blacklistedOnRoute && !isCloaked) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route`);
+        } else if (blacklistedOnRoute && isCloaked) {
+          ctx.log("travel", `Server route passes through blacklisted system ${blacklistedOnRoute} — cloaked, using route`);
+          nextSystem = routeData.route[1].system_id;
         } else if (!routeStartsHere) {
           ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route`);
         } else if (hasWormhole) {
@@ -1806,18 +1809,21 @@ export async function navigateToSystem(
       }
 
       if (!routeResp.error && routeData?.found && routeData.route && routeData.route.length > 1) {
-        // Validate server route against blacklist — reject if it passes through blacklisted systems
         const serverRouteSystemIds = routeData.route.map(r => r.system_id);
         const blacklistedOnRoute = serverRouteSystemIds.find(
           sysId => blacklist.some(b => b.toLowerCase() === sysId.toLowerCase())
         );
-        // Also validate that the route actually starts from our current system
         const routeStartsHere = serverRouteSystemIds[0] && 
           normalizeSystemName(serverRouteSystemIds[0]) === normalizeSystemName(bot.system);
-        // Check for wormhole segments that we cannot traverse
         const hasWormhole = routeHasWormhole(routeData.route);
-        if (blacklistedOnRoute) {
+        
+        const isCloaked = bot.isCloaked && opts.skipBlacklist;
+        
+        if (blacklistedOnRoute && !isCloaked) {
           ctx.log("warn", `Server route passes through blacklisted system ${blacklistedOnRoute} — rejecting server route (post-fuel)`);
+        } else if (blacklistedOnRoute && isCloaked) {
+          ctx.log("travel", `Server route passes through blacklisted system ${blacklistedOnRoute} — cloaked, using route (post-fuel)`);
+          nextSystem = routeData.route[1].system_id;
         } else if (!routeStartsHere) {
           ctx.log("warn", `Server route does not start from current system (${bot.system}) — rejecting stale route (post-fuel)`);
         } else if (hasWormhole) {

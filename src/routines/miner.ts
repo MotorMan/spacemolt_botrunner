@@ -593,13 +593,15 @@ async function detectMiningType(ctx: RoutineContext, cachedModules?: unknown[]):
   if (hasIceHarvester) detectedTypes.push("ice");
   if (hasRadioactiveEquipment) detectedTypes.push("radioactive");
 
-  if (detectedTypes.length > 1) {
-    ctx.log("info", `Multiple mining modules detected (${detectedTypes.join(", ")}) — using settings preference`);
-    return "ore"; // Default to ore if multiple present
-  }
+  // Radioactive equipment takes priority over other mining types
   if (hasRadioactiveEquipment) {
     ctx.log("info", "Radioactive mining equipment detected — radioactive mining mode");
     return "radioactive";
+  }
+
+  if (detectedTypes.length > 1) {
+    ctx.log("info", `Multiple mining modules detected (${detectedTypes.join(", ")}) — using settings preference`);
+    return "ore"; // Default to ore if multiple present (but not radioactive)
   }
   if (hasIceHarvester) {
     ctx.log("info", "Ice harvester detected — ice mining mode");
@@ -1161,11 +1163,15 @@ export function findFirstAvailableQuotaTarget(
     const poiFiltered = rawLocations.filter((loc: any) => {
       const sys = mapStore.getSystem(loc.systemId);
       const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
-      if (!poi) return true; // keep if type unknown
+      if (!poi) return true;
       if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
       if (miningType === "radioactive") {
         if (poi.hidden === true && !canMineHiddenRadioactive) return false;
-        return isOreBeltPoi(poi.type) || poi.hidden === true;
+        const isOreBelt = isOreBeltPoi(poi.type) || 
+                          loc.poiName.toLowerCase().includes('belt') || 
+                          loc.poiName.toLowerCase().includes('mineral field') ||
+                          loc.poiName.toLowerCase().includes('asteroid');
+        return isOreBelt || poi.hidden === true;
       }
       if (miningType === "gas") return isGasCloudPoi(poi.type);
       if (miningType === "ice") {
@@ -1201,6 +1207,7 @@ export function findFirstAvailableQuotaTarget(
     });
 
     if (depletionFiltered.length > 0) {
+      console.log(`[DEBUG] findFirstAvailableQuotaTarget: Selected ${entry.resourceId} with ${depletionFiltered.length} locations`);
       return entry.resourceId;
     }
   }
@@ -1256,8 +1263,18 @@ function findMiningPoi(
   const checkOreAvailable = (storedPoi: any, target: string) => {
     if (!target) return true;
     const oreEntry = storedPoi?.ores_found.find((o: any) => o.item_id === target);
+    const resourceEntry = storedPoi?.resources?.find((r: any) => r.resource_id === target);
+    
+    // Check resources first (from get_poi scans - includes undiscovered ores)
+    if (resourceEntry) {
+      if (!resourceEntry.depleted) return true;
+      if (!depletionTimeoutMs) return true;
+      return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
+    }
+    
+    // Fall back to ores_found (from mining history)
     if (!oreEntry) return false;
-    if (!depletionTimeoutMs) return true; // If no timeout provided, don't check depletion
+    if (!depletionTimeoutMs) return true;
     if (!oreEntry.depleted) return true;
     return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
   };
@@ -1283,7 +1300,11 @@ function findMiningPoi(
     // Radioactive mining - uses ore belts (and hidden POIs if has deep core extractor)
     if (targetResource) {
       for (const poi of pois) {
-        const isMatchingPoi = isOreBeltPoi(poi.type) || (allowHiddenPois && poi.hidden === true);
+        const isOreBelt = isOreBeltPoi(poi.type) || 
+                          (poi.name && (poi.name.toLowerCase().includes('belt') || 
+                                        poi.name.toLowerCase().includes('mineral field') ||
+                                        poi.name.toLowerCase().includes('asteroid')));
+        const isMatchingPoi = isOreBelt || (allowHiddenPois && poi.hidden === true);
         if (isMatchingPoi) {
           const sysData = mapStore.getSystem(poi.id.split("-")[0] || "");
           const storedPoi = sysData?.pois.find((p: any) => p.id === poi.id);
@@ -1295,7 +1316,13 @@ function findMiningPoi(
       return null; // No POI with target ore available
     }
     // Fallback: any ore belt (or hidden POI if available)
-    const oreBelt = pois.find(p => isOreBeltPoi(p.type) || (allowHiddenPois && p.hidden === true));
+    const oreBelt = pois.find(p => {
+      const isOreBelt = isOreBeltPoi(p.type) || 
+                        (p.name && (p.name.toLowerCase().includes('belt') || 
+                                    p.name.toLowerCase().includes('mineral field') ||
+                                    p.name.toLowerCase().includes('asteroid')));
+      return isOreBelt || (allowHiddenPois && p.hidden === true);
+    });
     return oreBelt ? { id: oreBelt.id, name: oreBelt.name } : null;
   } else if (miningType === "ore") {
     // Ore mining
@@ -1614,6 +1641,23 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
    // ── CRITICAL FIX: Refresh faction storage at startup for accurate quota checks ──
    ctx.log("miner", "Refreshing faction storage at startup...");
    await bot.refreshFactionStorage();
+
+   // ── Wait for map to be seeded if needed ──
+   // The galaxy map is seeded asynchronously from the public API.
+   // If the map is empty, we need to wait for it to be populated.
+   if (!mapStore.isMapSeeded()) {
+     ctx.log("mining", "Map not yet seeded - waiting for galaxy map data...");
+     let waitCount = 0;
+     while (!mapStore.isMapSeeded() && waitCount < 10) {
+       await ctx.sleep(2000);
+       waitCount++;
+     }
+     if (!mapStore.isMapSeeded()) {
+       ctx.log("warn", "Map still not seeded after waiting - will rely on exploration data");
+     } else {
+       ctx.log("mining", "Map seeded successfully - continuing with mining");
+     }
+   }
 
    // ── Mining session recovery ──
    const activeSession = getActiveMiningSession(bot.username);
@@ -2564,37 +2608,84 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
     // targetSystemId, targetPoiId, targetPoiName already declared above
 
     // Smart system selection: check the matching mining type first, but fall back
-    // to other fields or legacy `system` setting if not configured.
+    // to other fields for non-ice mining. Ice mining uses `system` as fallback for local mining.
     let configuredSystem = "";
     if (miningType === "ice") {
       configuredSystem = settings.systemIce || settings.systemOre || settings.systemGas || settings.system || "";
     } else if (miningType === "ore") {
       // Check if mining deep core ore - use systemDeepCore if set
       if (effectiveTarget && isDeepCoreOre(effectiveTarget)) {
-        configuredSystem = settings.systemDeepCore || settings.systemOre || settings.system || "";
+        configuredSystem = settings.systemDeepCore || settings.systemOre || settings.systemGas || "";
       } else {
-        configuredSystem = settings.systemOre || settings.systemGas || settings.systemIce || settings.system || "";
+        configuredSystem = settings.systemOre || settings.systemGas || settings.systemIce || "";
       }
     } else if (miningType === "radioactive") {
-      configuredSystem = settings.systemRadioactive || settings.systemOre || settings.systemGas || settings.system || "";
+      configuredSystem = settings.systemRadioactive || settings.systemOre || settings.systemGas || "";
     } else {
       // gas
-      configuredSystem = settings.systemGas || settings.systemOre || settings.systemIce || settings.system || "";
+      configuredSystem = settings.systemGas || settings.systemOre || settings.systemIce || "";
     }
 
-    if (configuredSystem) {
+if (configuredSystem) {
       ctx.log("mining", `Configured harvesting system for ${miningType}: ${configuredSystem}`);
     }
 
-if (effectiveTarget) {
-  // Get current system POIs for local mining
-  const { pois: currentPois } = await getSystemInfo(ctx);
-
+    if (effectiveTarget) {
+      // Get current system POIs for local mining
+  const { pois: currentPois, systemId: apiSystemId, connections: apiConnections } = await getSystemInfo(ctx);
+  ctx.log("debug", `DEBUG: getSystemInfo returned: systemId="${apiSystemId}", pois=${currentPois.length}, connections=${apiConnections?.length || 0}`);
+  
   // Survey system for hidden POIs if radioactive mining with hidden capability
   if (miningType === "radioactive" && canMineHiddenRadioactive) {
     await surveySystemForHiddenPois(ctx);
   }
       const allLocations = mapStore.findOreLocations(effectiveTarget);
+      const botSys = mapStore.getSystem(bot.system);
+      const mapSystemIds = mapStore.getAllSystems();
+      const mapDebug = mapStore.getDebugInfo();
+      ctx.log("debug", `DEBUG: Found ${allLocations.length} raw locations for "${effectiveTarget}"`);
+      ctx.log("debug", `DEBUG: current bot.system="${bot.system}", blacklist=${JSON.stringify(blacklist)}`);
+      ctx.log("debug", `DEBUG: Checking if bot.system exists in map: ${botSys ? 'YES' : 'NO'}`);
+      ctx.log("debug", `DEBUG: Map seeded: ${mapStore.isMapSeeded()}`);
+      ctx.log("debug", `DEBUG: Map debug: ${JSON.stringify(mapDebug)}`);
+      ctx.log("debug", `DEBUG: Sample systems in map: ${mapDebug.sampleSystems.join(", ")}`);
+      if (botSys) {
+        ctx.log("debug", `DEBUG: bot.system connections=${botSys.connections?.length || 0}`);
+        ctx.log("debug", `DEBUG: bot.system connection IDs: ${botSys.connections?.map(c => c.system_id).slice(0, 5).join(", ") || 'none'}`);
+      }
+      
+      // Check if the ore location systemIds match the map's system IDs
+      const uniqueSystemIds = allLocations.map(l => l.systemId).filter((v, i, a) => a.indexOf(v) === i);
+      ctx.log("debug", `DEBUG: Ore location systemIds: ${uniqueSystemIds.join(", ")}`);
+      ctx.log("debug", `DEBUG: Map systemIds (lowercase): ${Object.keys(mapSystemIds).map(s => s.toLowerCase()).slice(0, 10).join(", ")}`);
+      
+      // Check if the ore location systems exist in the map
+      for (const sysId of uniqueSystemIds) {
+        const exists = mapStore.getSystem(sysId);
+        ctx.log("debug", `DEBUG: Ore location system "${sysId}" exists in map: ${exists ? 'YES' : 'NO'}`);
+      }
+      
+      // Check if we can reach any of the ore locations
+      const reachableSystems = new Set<string>();
+      for (const loc of allLocations) {
+        const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+        if (route) {
+          reachableSystems.add(loc.systemId);
+        }
+      }
+      ctx.log("debug", `DEBUG: Reachable ore location systems: ${reachableSystems.size > 0 ? Array.from(reachableSystems).join(", ") : 'NONE'}`);
+      
+      // Debug: Log each location before filtering
+      for (const loc of allLocations) {
+        const sys = mapStore.getSystem(loc.systemId);
+        const poi = sys?.pois.find(p => p.id === loc.poiId);
+        const poiType = poi?.type || "unknown";
+        const isOreBeltType = isOreBeltPoi(poiType);
+        const isHidden = poi?.hidden ?? false;
+        const isOreBeltName = loc.poiName.toLowerCase().includes('belt') || loc.poiName.toLowerCase().includes('mineral field');
+        ctx.log("debug", `DEBUG: Location ${loc.systemName}/${loc.poiName} - type="${poiType}" isOreBeltType=${isOreBeltType} isHidden=${isHidden} isOreBeltName=${isOreBeltName}`);
+      }
+      
       // Filter to matching POI type only (skip depleted)
       const locations = allLocations.filter(loc => {
         const sys = mapStore.getSystem(loc.systemId);
@@ -2605,7 +2696,11 @@ if (effectiveTarget) {
           if (poi.hidden === true && !canMineHiddenRadioactive) {
             return false;
           }
-          return isOreBeltPoi(poi.type) || poi.hidden === true;
+          const isOreBelt = isOreBeltPoi(poi.type) || 
+                            loc.poiName.toLowerCase().includes('belt') || 
+                            loc.poiName.toLowerCase().includes('mineral field') ||
+                            loc.poiName.toLowerCase().includes('asteroid');
+          return isOreBelt || poi.hidden === true;
         }
         if (miningType === "gas") return isGasCloudPoi(poi.type);
         if (miningType === "ice") {
@@ -2632,8 +2727,75 @@ if (effectiveTarget) {
         return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
       });
 
+      const afterPoiFilter = allLocations.filter(loc => {
+        const sys = mapStore.getSystem(loc.systemId);
+        const poi = sys?.pois.find(p => p.id === loc.poiId);
+        if (!poi) return true;
+        if (miningType === "ore") return isOreBeltPoi(poi.type) || poi.hidden === true;
+        if (miningType === "radioactive") {
+          if (poi.hidden === true && !canMineHiddenRadioactive) return false;
+          const isOreBelt = isOreBeltPoi(poi.type) ||
+            loc.poiName.toLowerCase().includes('belt') ||
+            loc.poiName.toLowerCase().includes('mineral field') ||
+            loc.poiName.toLowerCase().includes('asteroid');
+          return isOreBelt || poi.hidden === true;
+        }
+        if (miningType === "gas") return isGasCloudPoi(poi.type);
+        if (miningType === "ice") {
+          if (poi.hidden === true && !canMineHiddenIce) return false;
+          return isIceFieldPoi(poi.type);
+        }
+        return true;
+      });
+      const afterDepletionFilter = afterPoiFilter.filter(loc => {
+        if (settings.ignoreDepletion) {
+          if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
+            return false;
+          }
+          return true;
+        }
+        const sys = mapStore.getSystem(loc.systemId);
+        const poi = sys?.pois.find(p => p.id === loc.poiId);
+        const oreEntry = poi?.ores_found.find(o => o.item_id === effectiveTarget);
+        if (!oreEntry?.depleted) return true;
+        return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+      });
+      ctx.log("debug", `[FILTER_STATS] allLocations=${allLocations.length} afterPoiType=${afterPoiFilter.length} afterDepletion=${afterDepletionFilter.length}`);
+
+      ctx.log("debug", `DEBUG: After all filters, locations.length = ${locations.length}`);
+      for (const loc of locations) {
+        ctx.log("debug", `DEBUG:   - ${loc.systemName}/${loc.poiName} rem=${loc.remaining} rich=${loc.richness}`);
+      }
+
       if (locations.length === 0) {
-        ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in map — searching for alternative target`);
+        ctx.log("error", `Target ${resourceLabel} "${effectiveTarget}" not found in map`);
+        
+        // Debug: Log why the target wasn't found
+        const debugLocations = mapStore.findOreLocations(effectiveTarget);
+        ctx.log("debug", `DEBUG: Found ${debugLocations.length} total locations for "${effectiveTarget}" in map`);
+        
+        // Check if the ore exists at all in the map
+        const allOres = mapStore.getAllKnownOres();
+        const oreExists = allOres.some(o => o.item_id === effectiveTarget);
+        ctx.log("debug", `DEBUG: Ore "${effectiveTarget}" ${oreExists ? "EXISTS" : "DOES NOT EXIST"} in known ores`);
+        
+        // Check map data
+        const totalSystems = mapStore.getKnownSystems().length;
+        const totalPOIs = Object.values(mapStore.getAllSystems()).reduce((sum, s) => sum + s.pois.length, 0);
+        ctx.log("debug", `DEBUG: Map has ${totalSystems} systems with ${totalPOIs} total POIs`);
+        
+        // Check if any hidden POIs exist for this ore
+        const hiddenLocations = debugLocations.filter(l => {
+          const sys = mapStore.getSystem(l.systemId);
+          const poi = sys?.pois.find(p => p.id === l.poiId);
+          return poi?.hidden;
+        });
+        ctx.log("debug", `DEBUG: ${hiddenLocations.length} hidden POIs found for this ore`);
+        
+        // Check if we're in a cloaked state and blacklist is being ignored
+        const isCloaked = bot.isCloaked;
+        ctx.log("debug", `DEBUG: Bot isCloaked=${isCloaked}, cloakIgnoreBlacklist=${settings.cloakIgnoreBlacklist}`);
+        
         // Clear session if target not found
         if (recoveredSession) {
           await failMiningSession(bot.username, "Target resource not found in map");
@@ -2745,15 +2907,28 @@ if (effectiveTarget) {
 
         if (configuredSystem) {
           const isCommonOre = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
-          const systemLocations = (isCommonOre
-            ? mapStore.findClosestMiningLocationsInSystem(effectiveTarget, configuredSystem, bot.system, blacklist)
-            : mapStore.findBestMiningLocationInSystem(effectiveTarget, configuredSystem, bot.system, blacklist))
+          const allSystemLocations = isCommonOre
+            ? mapStore.findClosestMiningLocations(effectiveTarget, bot.system, blacklist)
+            : mapStore.findOreLocations(effectiveTarget);
+          ctx.log("debug", `DEBUG: allSystemLocations.length=${allSystemLocations.length}`);
+          const systemLocations = allSystemLocations
+            .filter(loc => {
+              const matches = loc.systemId === configuredSystem;
+              if (!matches) {
+                ctx.log("debug", `DEBUG: Filtering out ${loc.systemName}/${loc.poiName} - system mismatch (expected ${configuredSystem})`);
+              }
+              return matches;
+            })
             .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
             .map(loc => {
               const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
               const jumps = route ? route.length - 1 : 999;
-              return { ...loc, jumps };
+              if (jumps === 999) {
+                ctx.log("debug", `DEBUG: Route to ${loc.systemName} is NULL - jumps=999, will be filtered`);
+              }
+              return { ...loc, resourceId: effectiveTarget, jumpsAway: jumps, score: 0, jumps };
             });
+          ctx.log("debug", `DEBUG: systemLocations.length=${systemLocations.length}`);
 
           if (systemLocations.length > 0) {
             scoredLocations = systemLocations;
@@ -2763,24 +2938,105 @@ if (effectiveTarget) {
             targetSystemId = bot.system;
           }
         } else {
-          const scoredLocationsLocal = mapStore.findBestMiningLocation(effectiveTarget, bot.system, blacklist)
-            .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+          const allOreLocations = mapStore.findOreLocations(effectiveTarget);
+          ctx.log("debug", `DEBUG: Calculating scoredLocations from ${allOreLocations.length} allOreLocations`);
+          const scoredLocationsLocal = allOreLocations
+            .filter(loc => {
+              const matches = locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId);
+              if (!matches) {
+                 ctx.log("debug", `[LOC_MATCH] DROPPED ${loc.systemName}/${loc.poiName} — not present in filtered 'locations' array (length=${locations.length})`);
+              }
+              return matches;
+            })
             .map(loc => {
               const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-              const jumps = route ? route.length - 1 : 999;
-              return { ...loc, jumps };
+              const jumps = route ? route.length - 1 : -1;
+              const routeStr = route ? (route.length > 8 ? route.slice(0,4).join("->")+"->..."+route.slice(-2).join("->") : route.join("->")) : "NULL";
+              ctx.log("debug", `[ROUTE_MAP] ${loc.systemName}/${loc.poiName} -> route=${routeStr} jumps=${jumps}`);
+              return { ...loc, resourceId: effectiveTarget, jumpsAway: jumps, score: 0, jumps };
             })
-            .filter(loc => loc.jumps <= maxJumps);
+            .filter(loc => loc.jumps === -1 || loc.jumps <= maxJumps)
+            .sort((a, b) => {
+              if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
+              if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
+              const aRem = a.remaining ?? 0;
+              const bRem = b.remaining ?? 0;
+              if (aRem !== bRem) return bRem - aRem;
+              if (a.jumps !== b.jumps) return a.jumps - b.jumps;
+              const isCommon = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
+              if (isCommon) {
+                return (b.richness ?? 0) - (a.richness ?? 0);
+              }
+              return 0;
+            });
+          const droppedByJump = allOreLocations
+            .filter(loc => locations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
+            .filter(loc => {
+              const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+              const jumps = route ? route.length - 1 : -1;
+              return jumps !== -1 && jumps > maxJumps;
+            });
+          if (droppedByJump.length > 0) {
+            ctx.log("debug", `[JUMP_FILTER] Dropped ${droppedByJump.length} locations by jump limit: ${droppedByJump.map(l => `${l.systemName}/${l.poiName}`).join(", ")}`);
+          }
+          ctx.log("debug", `DEBUG: scoredLocationsLocal.length = ${scoredLocationsLocal.length} (after jump filter)`);
           scoredLocations = scoredLocationsLocal;
         }
 
-if (scoredLocations.length === 0 && !configuredSystem) {
-          ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — searching for alternative quota target`);
+        ctx.log("debug", `[FINAL_CHECK] scoredLocations.length=${scoredLocations.length} configuredSystem=${configuredSystem ?? "none"}`);
+        if (scoredLocations.length === 0 && !configuredSystem) {
+          ctx.log("debug", `[FINAL_CHECK] locations.length=${locations.length} allOreLocations.length=${mapStore.findOreLocations(effectiveTarget).length} blacklist=${JSON.stringify(blacklist)}`);
+          ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps`);
+          
+          // Debug: Explain why no locations were found
+          const allLocations = mapStore.findOreLocations(effectiveTarget);
+          ctx.log("debug", `DEBUG: ${allLocations.length} total locations in map for "${effectiveTarget}"`);
+          ctx.log("debug", `DEBUG: bot.system="${bot.system}", blacklist=${JSON.stringify(blacklist)}`);
+          
+          // Check why locations were filtered (depleted, blacklisted, etc.)
+          const debugFilteredReasons: string[] = [];
+          for (const loc of allLocations) {
+            const sys = mapStore.getSystem(loc.systemId);
+            const poi = sys?.pois.find(p => p.id === loc.poiId);
+            const isBlacklisted = blacklist.length > 0 && blacklist.some(b => b.toLowerCase() === loc.systemId.toLowerCase());
+            const isHidden = poi?.hidden ?? false;
+            const depletionInfo = loc.depletionPercent > 90 ? ` (${Math.round(loc.depletionPercent)}% depleted)` : "";
+            const hiddenInfo = isHidden ? " [HIDDEN]" : "";
+            const blacklistInfo = isBlacklisted ? " [BLACKLISTED]" : "";
+            debugFilteredReasons.push(`${loc.systemName}/${loc.poiName}${hiddenInfo}${blacklistInfo}${depletionInfo}`);
+          }
+          if (debugFilteredReasons.length > 0 && debugFilteredReasons.length <= 10) {
+            ctx.log("debug", `DEBUG: All locations: ${debugFilteredReasons.join(", ")}`);
+          } else if (debugFilteredReasons.length > 10) {
+            ctx.log("debug", `DEBUG: Top 10 locations: ${debugFilteredReasons.slice(0, 10).join(", ")}`);
+            ctx.log("debug", `DEBUG: ... and ${debugFilteredReasons.length - 10} more`);
+          }
+          
+          // Check if any locations exist but are beyond max jumps
+          const routeDebug = mapStore.getRouteDebugInfo(bot.system, allLocations[0]?.systemId || "", blacklist);
+          ctx.log("debug", `DEBUG: Route debug: ${routeDebug.message}`);
+          ctx.log("debug", `DEBUG: Route debug details: fromExists=${routeDebug.fromExists}, toExists=${routeDebug.toExists}, fromHasConnections=${routeDebug.fromHasConnections}`);
+          ctx.log("debug", `DEBUG: Blocked systems: ${routeDebug.blockedSystems.slice(0, 5).join(", ")}${routeDebug.blockedSystems.length > 5 ? '...' : ''}`);
+          ctx.log("debug", `DEBUG: Reachable systems (first 10): ${routeDebug.reachableSystems.slice(0, 10).join(", ")}`);
+          
+          // Debug: Check each location's route
+          for (const loc of allLocations.slice(0, 5)) {
+            const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
+            const jumps = route ? route.length - 1 : 999;
+            ctx.log("debug", `DEBUG: Route to ${loc.systemName} (${loc.systemId}): ${route ? route.join(" -> ") : "NO ROUTE"} (${jumps} jumps)`);
+            
+            // Check if systems exist in map
+            const fromSys = mapStore.getSystem(bot.system);
+            const toSys = mapStore.getSystem(loc.systemId);
+            ctx.log("debug", `DEBUG:   fromSys exists=${!!fromSys}, toSys exists=${!!toSys}`);
+            ctx.log("debug", `DEBUG:   fromSys.connections=${fromSys?.connections?.length || 0}, toSys.connections=${toSys?.connections?.length || 0}`);
+          }
           
           // Loop through ALL quota ores to find one with locations within range
           // This ensures we try every available ore before giving up
           let foundAlternative = false;
           const allQuotaOres = Object.keys(quotas).filter(ore => quotas[ore] > 0);
+          ctx.log("debug", `DEBUG: Checking ${allQuotaOres.length} quota ores for alternatives`);
           
           for (const oreId of allQuotaOres) {
             if (oreId === effectiveTarget) continue;
@@ -2813,23 +3069,36 @@ if (scoredLocations.length === 0 && !configuredSystem) {
             });
             
             if (altLocations.length === 0) {
+              // Debug: Why no locations for this ore
+              const oreLocations = mapStore.findOreLocations(oreId);
+              ctx.log("debug", `DEBUG: Ore ${oreId} has ${oreLocations.length} locations in map, 0 pass filters`);
               ctx.log("mining", `No locations found for ${oreId} — trying next ore`);
               continue;
             }
             
             // Check if any locations are within range
-            const altScoredLocations = mapStore.findBestMiningLocation(oreId, bot.system, blacklist)
+            const allAltLocations = mapStore.findOreLocations(oreId);
+            const altScoredLocations = allAltLocations
               .filter(loc => altLocations.some(l => l.poiId === loc.poiId && l.systemId === loc.systemId))
               .map(loc => {
                 const route = mapStore.findRoute(bot.system, loc.systemId, blacklist);
-                return { ...loc, jumps: route ? route.length - 1 : 999 };
+                const jumps = route ? route.length - 1 : 999;
+                return { ...loc, resourceId: oreId, jumpsAway: jumps, score: 0, jumps };
               })
               .filter(loc => loc.jumps <= maxJumps)
               .sort((a, b) => {
                 if (a.systemId === bot.system && b.systemId !== bot.system) return -1;
                 if (b.systemId === bot.system && a.systemId !== bot.system) return 1;
-                if (b.richness !== a.richness) return b.richness - a.richness;
-                return a.jumps - b.jumps;
+                const aRem = a.remaining ?? 0;
+                const bRem = b.remaining ?? 0;
+                if (aRem !== bRem) return bRem - aRem;
+                if (a.jumps !== b.jumps) return a.jumps - b.jumps;
+                const isCommonA = STRIP_MINER_ORES.has(a.resourceId.toLowerCase());
+                const isCommonB = STRIP_MINER_ORES.has(b.resourceId.toLowerCase());
+                if (isCommonA || isCommonB) {
+                  return (b.richness ?? 0) - (a.richness ?? 0);
+                }
+                return 0;
               });
             
             if (altScoredLocations.length > 0) {
@@ -2848,19 +3117,19 @@ if (scoredLocations.length === 0 && !configuredSystem) {
           
           if (!foundAlternative) {
             ctx.log("warn", `No quota targets have available locations within ${maxJumps} jumps — mining locally without specific target`);
-          }
-        } else {
-          // Mine locally
-          targetSystemId = bot.system;
-          const localPoi = findMiningPoi(currentPois, miningType, effectiveTarget, canMineHiddenPois, depletionTimeoutMs);
-          if (localPoi) {
-            targetPoiId = localPoi.id;
-            targetPoiName = localPoi.name;
-            ctx.log("mining", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally at ${localPoi.name}`);
-          } else {
-            ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps and no local POI available — waiting 60s`);
-            await ctx.sleep(60000);
-            continue;
+            targetSystemId = bot.system;
+            const localPoi = findMiningPoi(currentPois, miningType, effectiveTarget, canMineHiddenPois, depletionTimeoutMs);
+            ctx.log("debug", `[BROWSING] MiningType=${miningType} effectiveTarget=${effectiveTarget} localPoi=${localPoi?.id || 'null'} currentPois=${currentPois.length} bot.system=${bot.system}`);
+            if (localPoi) {
+              targetPoiId = localPoi.id;
+              targetPoiName = localPoi.name;
+              ctx.log("mining", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally at ${localPoi.name}`);
+            } else {
+              ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps and no local POI available — waiting 60s`);
+              ctx.log("debug", `[BROWSING] Why: localPoi=null, bot.system=${bot.system}, miningType=${miningType}, effectiveTarget=${effectiveTarget}`);
+              await ctx.sleep(60000);
+              continue;
+            }
           }
         }
 
@@ -2919,6 +3188,7 @@ if (scoredLocations.length === 0 && !configuredSystem) {
         }
 
         const chosenLoc = scoredLocations.length > 0 ? scoredLocations[0] : undefined;
+        ctx.log("debug", `[TARGET_SELECT] chosenLoc=${chosenLoc ? `${chosenLoc.systemName}/${chosenLoc.poiName}` : 'null'} configuredSystem=${configuredSystem || 'none'}`);
 
         if (!chosenLoc && !configuredSystem) {
           ctx.log("warn", `No ${effectiveTarget} locations within ${maxJumps} jumps — mining locally instead`);
@@ -3036,6 +3306,7 @@ if (scoredLocations.length === 0 && !configuredSystem) {
     }
 
     // ── Navigate to target system if needed ──
+    ctx.log("debug", `[NAV_GATE] targetSystemId="${targetSystemId}" bot.system="${bot.system}" willNavigate=${targetSystemId && targetSystemId !== bot.system}`);
     if (targetSystemId && targetSystemId !== bot.system) {
       yield "navigate_to_target";
       if (recoveredSession) {
@@ -3106,6 +3377,7 @@ if (scoredLocations.length === 0 && !configuredSystem) {
 
       const travelOpts = {
         ...safetyOpts,
+        skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
         onBeforeJump: async (nextSystem: string, jumpNumber: number) => {
           const chatChannel = getBotChatChannel();
           chatChannel.send({ sender: bot.username, recipients: [], channel: "escort", content: `Jumping to ${nextSystem}` });
@@ -3239,6 +3511,11 @@ if (scoredLocations.length === 0 && !configuredSystem) {
     }
     yield (miningType === "ice" ? "find_ice_field" : (miningType === "ore" || miningType === "radioactive" ? "find_ore_belt" : "find_gas_cloud"));
     const { pois: initialPois, systemId } = await getSystemInfo(ctx);
+    ctx.log("debug", `[ARRIVAL] Arrived at systemId=${systemId}, bot.system=${bot.system}, pois=${initialPois.length}, bot.poi="${bot.poi || ''}"`);
+    if (initialPois.length > 0) {
+      const poiTypeList = initialPois.map(p => `${p.id}=${p.type}`).join(", ");
+      ctx.log("debug", `[ARRIVAL] Server POIs in ${systemId}: ${poiTypeList}`);
+    }
     if (systemId) bot.system = systemId;
     let scanResources: Array<any> = [];
 
@@ -3284,7 +3561,13 @@ if (scoredLocations.length === 0 && !configuredSystem) {
           }
           if (miningType === "gas") return isGasCloudPoi(currentPoi.type);
           if (miningType === "ice") return isIceFieldPoi(currentPoi.type) || (isHidden && canMineHiddenIce);
-          if (miningType === "radioactive") return isOreBeltPoi(currentPoi.type) || (isHidden && canMineHiddenRadioactive);
+          if (miningType === "radioactive") {
+            const isOreBelt = isOreBeltPoi(currentPoi.type) || 
+                              (currentPoi.name && (currentPoi.name.toLowerCase().includes('belt') || 
+                                                   currentPoi.name.toLowerCase().includes('mineral field') ||
+                                                   currentPoi.name.toLowerCase().includes('asteroid')));
+            return isOreBelt || (isHidden && canMineHiddenRadioactive);
+          }
           return true;
         })();
 
@@ -3331,7 +3614,7 @@ if (scoredLocations.length === 0 && !configuredSystem) {
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
         const isMatchingPoi = (miningType === "ore" && (isOreBeltPoi(p.type) || p.hidden === true)) ||
-          (miningType === "radioactive" && isOreBeltPoi(p.type)) ||
+          (miningType === "radioactive" && (isOreBeltPoi(p.type) || p.hidden === true)) ||
           (miningType === "gas" && isGasCloudPoi(p.type)) ||
           (miningType === "ice" && isIceFieldPoi(p.type));
         if (!isMatchingPoi) return false;
@@ -3350,15 +3633,22 @@ if (scoredLocations.length === 0 && !configuredSystem) {
       } else {
         // No alternative in current system — search broader map for non-depleted locations
         ctx.log("mining", "No alternative in current system — searching map for non-depleted locations...");
-        const broaderLocations = mapStore.findOreLocations(effectiveTarget).filter(loc => {
+        const broaderLocationsRaw = mapStore.findOreLocations(effectiveTarget);
+        const broaderLocations = broaderLocationsRaw.filter(loc => {
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
           if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-                if (miningType === "radioactive") return canMineBasicRadioactive && (
-                  isOreBeltPoi(poi?.type || "") ||
-                  (!poi?.hidden && canMineDeepCoreRadioactive) ||
-                  (poi?.hidden && canMineHiddenRadioactive)
-                );
+                if (miningType === "radioactive") {
+                  const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                                    (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                                     loc.poiName.toLowerCase().includes('mineral field') ||
+                                                     loc.poiName.toLowerCase().includes('asteroid')));
+                  return canMineBasicRadioactive && (
+                    isOreBelt ||
+                    (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                    (poi?.hidden && canMineHiddenRadioactive)
+                  );
+                }
           if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
           return true;
@@ -3382,6 +3672,13 @@ if (scoredLocations.length === 0 && !configuredSystem) {
           return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
         });
 
+        ctx.log("debug", `[BROADER_SEARCH] raw=${broaderLocationsRaw.length} afterPOIType+depletion=${broaderLocations.length} effectiveTarget=${effectiveTarget} miningType=${miningType}`);
+
+        if (broaderLocations.length === 0 && broaderLocationsRaw.length > 0) {
+          const sampleRaw = broaderLocationsRaw.slice(0,3).map(l => `${l.systemName}/${l.poiName} type(map)=${mapStore.getSystem(l.systemId)?.pois.find(p=>p.id===l.poiId)?.type}`).join("; ");
+          ctx.log("debug", `[BROADER_SEARCH] All raw locations filtered out. Sample: ${sampleRaw}`);
+        }
+
         if (broaderLocations.length > 0) {
           // Prefer configured system, then closest by jumps
           const scored = broaderLocations
@@ -3399,8 +3696,23 @@ if (scoredLocations.length === 0 && !configuredSystem) {
               const aRem = a.remaining ?? 0;
               const bRem = b.remaining ?? 0;
               if (aRem !== bRem) return bRem - aRem;
-              return (a.richness ?? 0) - (b.richness ?? 0);
+              const isCommonA = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
+              const isCommonB = STRIP_MINER_ORES.has(effectiveTarget.toLowerCase());
+              if (isCommonA || isCommonB) {
+                return (a.richness ?? 0) - (b.richness ?? 0);
+              }
+              return 0;
             });
+
+          ctx.log("debug", `[BROADER_SEARCH] scored.length=${scored.length} bot.system=${bot.system}`);
+          if (scored.length === 0 && broaderLocations.length > 0) {
+            const noRouteLocs = broaderLocations.filter(l => {
+              const route = mapStore.findRoute(bot.system, l.systemId, blacklist);
+              const jumps = route ? route.length - 1 : 999;
+              return jumps > maxJumps;
+            });
+            ctx.log("debug", `[BROADER_SEARCH] scored=0 because ${noRouteLocs.length} locs exceed maxJumps=${maxJumps}: ${noRouteLocs.map(l => `${l.systemName}(${l.systemId})`).join(", ")}`);
+          }
 
           if (scored.length > 0) {
             const chosen = scored[0];
@@ -3467,6 +3779,9 @@ if (scoredLocations.length === 0 && !configuredSystem) {
             if (chosenPoi && ((miningType === "ore" && (isOreBeltPoi(chosenPoi.type) || chosenPoi.hidden === true)) ||
               (miningType === "radioactive" && canMineBasicRadioactive && (
                 isOreBeltPoi(chosenPoi.type) ||
+                (chosenPoi.name && (chosenPoi.name.toLowerCase().includes('belt') || 
+                                    chosenPoi.name.toLowerCase().includes('mineral field') ||
+                                    chosenPoi.name.toLowerCase().includes('asteroid'))) ||
                 (!chosenPoi.hidden && canMineDeepCoreRadioactive) ||
                 (chosenPoi.hidden && canMineHiddenRadioactive)
               )) ||
@@ -4258,6 +4573,7 @@ if (scoredLocations.length === 0 && !configuredSystem) {
 
                   const travelOpts = {
                     ...safetyOpts,
+                    skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
                     onJump: async (jumpNumber: number) => {
                       // Check if target POI is still available
                       const sys = mapStore.getSystem(bestLoc.systemId);
@@ -4374,12 +4690,18 @@ if (scoredLocations.length === 0 && !configuredSystem) {
                       if (loc.systemId !== searchSystem) return false; // HARD GATE: stay within configured system
                       const sys = mapStore.getSystem(loc.systemId);
                       const poi = sys?.pois.find(p => p.id === loc.poiId);
-                      if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-              if (miningType === "radioactive") return canMineBasicRadioactive && (
-                isOreBeltPoi(poi?.type || "") ||
-                (!poi?.hidden && canMineDeepCoreRadioactive) ||
-                (poi?.hidden && canMineHiddenRadioactive)
-              );
+if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
+              if (miningType === "radioactive") {
+                const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                                  (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                                   loc.poiName.toLowerCase().includes('mineral field') ||
+                                                   loc.poiName.toLowerCase().includes('asteroid')));
+                return canMineBasicRadioactive && (
+                  isOreBelt ||
+                  (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                  (poi?.hidden && canMineHiddenRadioactive)
+                );
+              }
                       if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                       if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                       return true;
@@ -4486,6 +4808,7 @@ if (scoredLocations.length === 0 && !configuredSystem) {
                         if (chosen.systemId !== bot.system) {
                           const travelOpts = {
                             ...safetyOpts,
+                            skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
                             onJump: async (jumpNumber: number) => {
                               // Check if target POI is still available
                               const sys = mapStore.getSystem(chosen.systemId);
@@ -5041,11 +5364,17 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
               const sys = mapStore.getSystem(loc.systemId);
               const poi = sys?.pois.find(p => p.id === loc.poiId);
               if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-                      if (miningType === "radioactive") return canMineBasicRadioactive && (
-                        isOreBeltPoi(poi?.type || "") ||
-                        (!poi?.hidden && canMineDeepCoreRadioactive) ||
-                        (poi?.hidden && canMineHiddenRadioactive)
-                      );
+                      if (miningType === "radioactive") {
+                        const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                                          (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                                           loc.poiName.toLowerCase().includes('mineral field') ||
+                                                           loc.poiName.toLowerCase().includes('asteroid')));
+                        return canMineBasicRadioactive && (
+                          isOreBelt ||
+                          (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                          (poi?.hidden && canMineHiddenRadioactive)
+                        );
+                      }
               if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
               if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
               return true;
@@ -5099,11 +5428,17 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
                 const sys = mapStore.getSystem(loc.systemId);
                 const poi = sys?.pois.find(p => p.id === loc.poiId);
                 if (miningType === "ore") return isOreBeltPoi(poi?.type || "");
-            if (miningType === "radioactive") return canMineBasicRadioactive && (
-              isOreBeltPoi(poi?.type || "") ||
-              (!poi?.hidden && canMineDeepCoreRadioactive) ||
-              (poi?.hidden && canMineHiddenRadioactive)
-            );
+              if (miningType === "radioactive") {
+                const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                                  (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                                   loc.poiName.toLowerCase().includes('mineral field') ||
+                                                   loc.poiName.toLowerCase().includes('asteroid')));
+                return canMineBasicRadioactive && (
+                  isOreBelt ||
+                  (!poi?.hidden && canMineDeepCoreRadioactive) ||
+                  (poi?.hidden && canMineHiddenRadioactive)
+                );
+              }
                 if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
                 if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
                 return true;
@@ -5161,11 +5496,17 @@ const hiddenPoiResult = findBestHiddenPoiForOre(
             // First try current system
             const allPois = miningType === "ice" ? pois.filter(p => isIceFieldPoi(p.type)) :
                            miningType === "ore" ? pois.filter(p => isOreBeltPoi(p.type) || p.hidden === true) :
-miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
-  isOreBeltPoi(p.type) ||
-  (!p.hidden && canMineDeepCoreRadioactive) ||
-  (p.hidden && canMineHiddenRadioactive)
-)) :
+            miningType === "radioactive" ? pois.filter(p => {
+              const isOreBelt = isOreBeltPoi(p.type) || 
+                                (p.name && (p.name.toLowerCase().includes('belt') || 
+                                            p.name.toLowerCase().includes('mineral field') ||
+                                            p.name.toLowerCase().includes('asteroid')));
+              return canMineBasicRadioactive && (
+                isOreBelt ||
+                (!p.hidden && canMineDeepCoreRadioactive) ||
+                (p.hidden && canMineHiddenRadioactive)
+              );
+            }) :
                             pois.filter(p => isGasCloudPoi(p.type));
 
             for (const poi of allPois) {
@@ -5270,6 +5611,7 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
               ctx.log("mining", `Traveling to ${newTarget} in ${newSystemId} (${newPoiName}) - stayOutUntilFull`);
               const travelOpts = {
                 ...safetyOpts,
+                skipBlacklist: bot.isCloaked && settings.cloakIgnoreBlacklist,
                 onJump: async (jumpNumber: number) => {
                   // Check if target POI is still available
                   const sys = mapStore.getSystem(newSystemId);
@@ -5421,11 +5763,17 @@ miningType === "radioactive" ? pois.filter(p => canMineBasicRadioactive && (
             // Search for correct POI type in current system
             const altPoi = pois.find(p => {
               if (miningType === "ore") return isOreBeltPoi(p.type);
-                if (miningType === "radioactive") return canMineBasicRadioactive && (
-                  isOreBeltPoi(p.type) ||
-                  (!p.hidden && canMineDeepCoreRadioactive) ||
-                  (p.hidden && canMineHiddenRadioactive)
-                );
+                if (miningType === "radioactive") {
+                  const isOreBelt = isOreBeltPoi(p.type) ||
+                                    (p.name && (p.name.toLowerCase().includes('belt') || 
+                                                p.name.toLowerCase().includes('mineral field') ||
+                                                p.name.toLowerCase().includes('asteroid')));
+                  return canMineBasicRadioactive && (
+                    isOreBelt ||
+                    (!p.hidden && canMineDeepCoreRadioactive) ||
+                    (p.hidden && canMineHiddenRadioactive)
+                  );
+                }
               if (miningType === "gas") return isGasCloudPoi(p.type);
               if (miningType === "ice") return isIceFieldPoi(p.type);
               return false;

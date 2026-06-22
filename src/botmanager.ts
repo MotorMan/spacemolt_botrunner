@@ -981,7 +981,10 @@ async function main(): Promise<void> {
     } else {
       server.logSystem(`Galaxy map seeded: ${seeded} new system(s), ${known} already known`);
     }
-  }).catch(() => {
+    console.log(`[MAP_SEED] Completed: seeded=${seeded}, known=${known}, failed=${failed}`);
+    console.log(`[MAP_SEED] Total systems in map: ${Object.keys(mapStore.getAllSystems()).length}`);
+  }).catch((err) => {
+    console.log(`[MAP_SEED] Failed: ${err}`);
     server.logSystem("Galaxy map seed failed — will rely on exploration data");
   });
 

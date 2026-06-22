@@ -2,6 +2,8 @@ import type { Bot, Routine, RoutineContext } from "../bot.js";
 import { mapStore } from "../mapstore.js";
 import { catalogStore } from "../catalogstore.js";
 import { getSystemBlacklist } from "../web/server.js";
+import { writeFileSync, existsSync, mkdirSync } from "fs";
+import { join, dirname } from "path";
 import {
   ensureDocked,
   ensureUndocked,
@@ -49,6 +51,37 @@ import {
   canChallengeLock,
   cleanupStaleLocks,
 } from "./traderCoordination.js";
+
+// ── CSV Logging ─────────────────────────────────────────────────
+
+const PROFIT_LOG_PATH = join(process.cwd(), "data", "traderProfitDebug.csv");
+
+/** Log trade profit to CSV file for analysis. */
+function logTradeProfit(
+  botUsername: string,
+  itemName: string,
+  buyPrice: number,
+  jumpsToBuy: number,
+  jumpsToSell: number,
+  sellPrice: number,
+  profit: number,
+): void {
+  const header = "botName,itemBought,buyPrice,jumpsToBuy,jumpsToSell,sellPrice,profit\n";
+  const line = `${botUsername},${itemName},${buyPrice},${jumpsToBuy},${jumpsToSell},${sellPrice},${profit}\n`;
+  
+  try {
+    const dir = dirname(PROFIT_LOG_PATH);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+    if (!existsSync(PROFIT_LOG_PATH)) {
+      writeFileSync(PROFIT_LOG_PATH, header);
+    }
+    writeFileSync(PROFIT_LOG_PATH, line, { flag: "a" });
+  } catch (err) {
+    console.error(`[Trader] Failed to write profit log: ${err}`);
+  }
+}
 
 // ── Cloaking module detection and enablement ────────────────────────────────
 
@@ -470,6 +503,8 @@ interface TradeRoute {
   sellPrice: number;
   sellQty: number;
   jumps: number;
+  jumpsToBuy: number;
+  jumpsToSell: number;
   profitPerUnit: number;
   totalProfit: number;
 }
@@ -581,6 +616,8 @@ function findTradeOpportunities(
       sellPrice: sp.sellAt,
       sellQty: tradeQty,
       jumps: totalJumps,
+      jumpsToBuy: toSource.jumps,
+      jumpsToSell: sourceToDest.jumps,
       profitPerUnit,
       totalProfit,
     });
@@ -718,6 +755,8 @@ function processMarketInsights(
               sellPrice: highPrice,
               sellQty: tradeQty,
               jumps: totalJumps,
+              jumpsToBuy: toSource.jumps,
+              jumpsToSell: sourceToDest.jumps,
               profitPerUnit,
               totalProfit: profitPerUnit * tradeQty,
             });
@@ -806,6 +845,8 @@ function processMarketInsights(
                   sellPrice: bestBuyPrice,
                   sellQty: tradeQty,
                   jumps: totalJumps,
+                  jumpsToBuy: toSource.jumps,
+                  jumpsToSell: sourceToDest.jumps,
                   profitPerUnit,
                   totalProfit: profitPerUnit * tradeQty,
                 });
@@ -868,6 +909,8 @@ function processMarketInsights(
                 sellPrice: price,
                 sellQty: tradeQty,
                 jumps: totalJumps,
+                jumpsToBuy: toSource.jumps,
+                jumpsToSell: sourceToDest.jumps,
                 profitPerUnit,
                 totalProfit: profitPerUnit * tradeQty,
               });
@@ -1097,6 +1140,8 @@ function findCargoSellRoutes(
         sellPrice: buy.price,
         sellQty: sellQty,
         jumps,
+        jumpsToBuy: 0,
+        jumpsToSell: jumps,
         profitPerUnit,
         totalProfit: profitPerUnit * sellQty,
       });
@@ -1344,6 +1389,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         sellPrice: recoveredSession.sellPricePerUnit,
         sellQty: recoveredSession.sellQuantity,
         jumps: recoveredSession.totalJumps - recoveredSession.jumpsCompleted,
+        jumpsToBuy: 0,
+        jumpsToSell: recoveredSession.totalJumps - recoveredSession.jumpsCompleted,
         profitPerUnit: recoveredSession.expectedProfit / recoveredSession.sellQuantity,
         totalProfit: recoveredSession.expectedProfit,
       };
@@ -1883,6 +1930,8 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
         sellPrice: recoveredSession.sellPricePerUnit,
         sellQty: recoveredSession.sellQuantity,
         jumps: recoveredSession.totalJumps - recoveredSession.jumpsCompleted,
+        jumpsToBuy: recoveredSession.jumpsCompleted,
+        jumpsToSell: recoveredSession.totalJumps - recoveredSession.jumpsCompleted,
         profitPerUnit: recoveredSession.expectedProfit / recoveredSession.sellQuantity,
         totalProfit: recoveredSession.expectedProfit,
       };
@@ -3115,6 +3164,9 @@ export const traderRoutine: Routine = async function* (ctx: RoutineContext) {
 
     // ── Faction donation (10% of profit) ──
     await factionDonateProfit(ctx, actualProfit);
+
+    // ── Log profit to CSV ──
+    logTradeProfit(bot.username, route.itemName, route.buyPrice, route.jumpsToBuy, route.jumpsToSell, route.sellPrice, actualProfit);
 
     // ── Check for next trade before considering excess credit deposit ──
     yield "seek_next_trade";

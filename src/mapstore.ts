@@ -5,16 +5,6 @@ import { log } from "./ui.js";
 import { calculatePathfinderBearing, computePathfinderBearingToTarget, simulatePathfinderLanding, reverseBearing, formatBearing, getPathfinderTravelTime, PATHFINDER_LANDING_MARGIN, PATHFINDER_SPEED, type SystemPosition, type PathfinderResult } from "./pathfinder.js";
 import { onPoiUpdate } from "./client_sync_hooks.js";
 
-// ── POI type helpers ────────────────────────────────────────────
-
-/** Check if a POI type is a minable resource location (asteroid belt, gas cloud, ice field, etc.) */
-function isMinablePoiType(type: string): boolean {
-  const t = (type || "").toLowerCase();
-  return t.includes("asteroid") || t.includes("gas") || t.includes("cloud")
-    || t.includes("nebula") || t.includes("field") || t.includes("ring")
-    || t.includes("belt") || t.includes("resource");
-}
-
 // ── Data model ──────────────────────────────────────────────
 
 export interface StoredConnection {
@@ -243,6 +233,8 @@ const SAVE_DEBOUNCE_MS = 5000;
 const BACKUP_DIR = join(DATA_DIR, "Backups");
 const BACKUP_FILES = [
   'map.json',
+  'preCalcMap.json',
+  'preCalcMap_noPirate.json',
   'customsStops.json',
   'factionTradeCoordination.json',
   'fcStations.json',
@@ -261,13 +253,37 @@ class MapStore {
   private dirty = false;
   private saveTimer: ReturnType<typeof setTimeout> | null = null;
   private backupTimer: ReturnType<typeof setInterval> | null = null;
+  private precalcRoutes: Record<string, Record<string, string[] | null>> = {};
+  private precalcNoPirateRoutes: Record<string, Record<string, string[] | null>> = {};
 
   constructor() {
     this.data = this.load();
+    this.loadPrecalcRoutes();
     if (!existsSync(BACKUP_DIR)) {
       mkdirSync(BACKUP_DIR, { recursive: true });
     }
     this.backupTimer = setInterval(() => this.performBackup(), 30 * 60 * 1000);
+  }
+
+  private loadPrecalcRoutes(): void {
+    const precalcFile = join(DATA_DIR, "preCalcMap.json");
+    const precalcNoPirateFile = join(DATA_DIR, "preCalcMap_noPirate.json");
+    
+    if (existsSync(precalcFile)) {
+      try {
+        const raw = readFileSync(precalcFile, "utf-8");
+        const parsed = JSON.parse(raw) as { routes: Record<string, Record<string, string[] | null>> };
+        this.precalcRoutes = parsed.routes || {};
+      } catch {}
+    }
+    
+    if (existsSync(precalcNoPirateFile)) {
+      try {
+        const raw = readFileSync(precalcNoPirateFile, "utf-8");
+        const parsed = JSON.parse(raw) as { routes: Record<string, Record<string, string[] | null>> };
+        this.precalcNoPirateRoutes = parsed.routes || {};
+      } catch {}
+    }
   }
 
   // ── Pirate System Check ─────────────────────────────────
@@ -1186,9 +1202,17 @@ class MapStore {
 
   // ── Query methods ───────────────────────────────────────
 
-  /** Get stored system data by ID. */
+  /** Get stored system data by ID (case-insensitive lookup). */
   getSystem(id: string): StoredSystem | null {
-    return this.data.systems[id] ?? null;
+    if (!id) return null;
+    // First try exact match (most common case)
+    if (this.data.systems[id]) return this.data.systems[id];
+    // Then try case-insensitive match
+    const lower = id.toLowerCase();
+    for (const sysId of Object.keys(this.data.systems)) {
+      if (sysId.toLowerCase() === lower) return this.data.systems[sysId];
+    }
+    return null;
   }
 
   /** Return all stored system IDs. */
@@ -1284,13 +1308,14 @@ class MapStore {
     return Object.keys(this.data.systems);
   }
 
-  /** Get connections for a system. */
+  /** Get connections for a system (case-insensitive lookup). */
   getConnections(systemId: string): StoredConnection[] {
-    return this.data.systems[systemId]?.connections ?? [];
+    const sys = this.getSystem(systemId);
+    return sys?.connections ?? [];
   }
 
-  /** Find all locations where a specific ore/resource has been mined or scanned. Checks both ores_found (mining history) and resources (scan data) so hidden POIs are included. */
-findOreLocations(oreId: string): Array<{
+/** Find all locations where a specific ore/resource has been mined or scanned. Checks both ores_found (mining history) and resources (scan data) so hidden POIs are included. */
+  findOreLocations(oreId: string): Array<{
     systemId: string;
     systemName: string;
     poiId: string;
@@ -1326,11 +1351,15 @@ findOreLocations(oreId: string): Array<{
     }> = [];
 
     for (const [sysId, sys] of Object.entries(this.data.systems)) {
-      if (this.isPirateSystem(sysId)) continue;
+      if (this.isPirateSystem(sysId)) {
+        continue;
+      }
       const hasStation = sys.pois.some((p) => p.has_base || !!p.base_id);
       for (const poi of sys.pois) {
         // Skip POIs with corrupted resource data
-        if (poi.resources && poi.resources.some((r) => r.remaining > r.max_remaining)) continue;
+        if (poi.resources && poi.resources.some((r) => r.remaining > r.max_remaining)) {
+          continue;
+        }
 
         // CRITICAL FIX: Only skip POIs where the SPECIFIC oreId being searched is exhausted.
         // Previously this skipped any POI with ANY exhausted resource, so a POI containing
@@ -1339,28 +1368,21 @@ findOreLocations(oreId: string): Array<{
         const targetResource = poi.resources?.find((r) => r.resource_id === oreId);
         const targetRemaining = targetResource?.remaining ?? 0;
         const targetMaxRemaining = targetResource?.max_remaining ?? 0;
-        if (targetRemaining <= 0 && targetMaxRemaining > 0) continue;
-        if (targetOre?.depleted && !isDepletionExpired(targetOre.depleted_at)) continue;
+        if (targetRemaining <= 0 && targetMaxRemaining > 0) {
+          continue;
+        }
+        if (targetOre?.depleted && !isDepletionExpired(targetOre.depleted_at)) {
+          continue;
+        }
 
         // Check both ores_found (mining history) AND resources (scan data)
         // Hidden POIs often only have data in resources (from get_poi scans)
         const ore = poi.ores_found.find((o) => o.item_id === oreId);
         const resource = poi.resources?.find((r) => r.resource_id === oreId);
 
-        // CRITICAL FIX: If the specific ore/resource is NOT found in this POI,
-        // skip it unless the POI is unsurveyed AND is a valid mining location type.
-        // This prevents returning POIs that don't contain the target resource
-        // (like wormhole exits, stations, etc.)
+        // Skip POIs that don't have this specific ore/resource
         if (!ore && !resource) {
-          // Check if this is an unsurveyed POI that could potentially have this resource
-          const isUnsurveyed = (!poi.ores_found || poi.ores_found.length === 0) &&
-                               (!poi.resources || poi.resources.length === 0);
-          // Only include unsurveyed POIs that are valid mining location types
-          if (!isUnsurveyed || !isMinablePoiType(poi.type)) {
-            // Surveyed POIs that don't have this resource, OR non-mining POIs
-            // should be skipped
-            continue;
-          }
+          continue;
         }
 
         const remaining = resource?.remaining ?? 0;
@@ -1390,6 +1412,10 @@ findOreLocations(oreId: string): Array<{
     }
 
     results.sort((a, b) => b.totalMined - a.totalMined);
+    console.log(`[FIND_ORE_LOCATIONS] oreId="${oreId}" found ${results.length} locations`);
+    if (results.length > 0) {
+      console.log(`[FIND_ORE_LOCATIONS] Sample systemIds: ${results.slice(0, 3).map(r => r.systemId).join(", ")}`);
+    }
     return results;
   }
 
@@ -1442,7 +1468,7 @@ findOreLocations(oreId: string): Array<{
     /** Composite score: higher = better. Factors in remaining, depletion, distance, scan freshness, hidden status */
     score: number;
   }> {
-    const locations = this.findOreLocations(oreId);
+const locations = this.findOreLocations(oreId);
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
     
@@ -1455,7 +1481,7 @@ findOreLocations(oreId: string): Array<{
     // Jump times lookup for later use
     const jumpTimes: Record<number, number> = { 1: 120, 2: 110, 3: 100, 4: 80, 5: 50, 6: 30 };
     const jumpTime = jumpTimes[speed] || 120;
-
+    
     const scored = locations
       .filter(loc => !blacklistSet.has(loc.systemId.toLowerCase()))
       .filter(loc => {
@@ -1472,8 +1498,15 @@ findOreLocations(oreId: string): Array<{
         if (fromSystem && fromSystem !== loc.systemId) {
           const route = this.findRoute(fromSystem, loc.systemId, blacklistArr);
           jumpsAway = route ? route.length - 1 : 999;
+          // Debug logging for route calculation issues
+          if (jumpsAway === 999 && fromSystem && loc.systemId) {
+            const fromSys = this.getSystem(fromSystem);
+            const toSys = this.getSystem(loc.systemId);
+            console.log(`[ROUTE_DEBUG] findBestMiningLocation: fromSystem="${fromSystem}" toSystem="${loc.systemId}" fromExists=${!!fromSys} toExists=${!!toSys} fromName="${fromSys?.name}" toName="${toSys?.name}"`);
+            console.log(`[ROUTE_DEBUG] findBestMiningLocation: fromConnections=${fromSys?.connections?.length || 0} toConnections=${toSys?.connections?.length || 0}`);
+          }
         }
-
+        
         // Score components:
         // 1. Resource abundance — based on TOTAL remaining, not percentage
         // This way, 19K remaining beats 8K remaining regardless of percentage mined
@@ -1644,7 +1677,7 @@ findOreLocations(oreId: string): Array<{
       let jumpsAway = 0;
       if (fromSystem && fromSystem !== loc.systemId) {
         const route = this.findRoute(fromSystem, loc.systemId, blacklistArr);
-        jumpsAway = route ? route.length - 1 : 999;
+        jumpsAway = route ? route.length - 1 : -1;
       }
 
       results.push({
@@ -1691,21 +1724,48 @@ findOreLocations(oreId: string): Array<{
 
   /** BFS pathfinding between two systems using known connections. Returns system IDs in order, or null if no path. */
   findRoute(fromSystemId: string, toSystemId: string, blacklist?: string[]): string[] | null {
+    const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
+    const useNoPirate = blacklistArr.length > 0;
+    return this.findRouteWithMode(fromSystemId, toSystemId, blacklist, useNoPirate);
+  }
+
+  /** Pathfinding with mode selection: useNoPirate=false for full routes (cloaked bots), useNoPirate=true for pirate-avoiding routes. */
+  findRouteWithMode(fromSystemId: string, toSystemId: string, blacklist?: string[], useNoPirate: boolean = false): string[] | null {
     if (fromSystemId === toSystemId) return [fromSystemId];
 
     const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
     const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
     
-    // First, check if we can use a wormhole as a shortcut
-    const wormholeRoute = this.tryFindWormholeRoute(fromSystemId, toSystemId, blacklistArr);
+    const fromId = this.findSystemIdCaseInsensitive(fromSystemId);
+    const toId = this.findSystemIdCaseInsensitive(toSystemId);
+    
+    if (!fromId || !toId) {
+      return null;
+    }
+
+    const precalcRoutes = useNoPirate ? this.precalcNoPirateRoutes : this.precalcRoutes;
+    if (precalcRoutes[fromId] && precalcRoutes[fromId][toId] !== undefined) {
+      const route = precalcRoutes[fromId][toId];
+      if (route && !route.some(s => blacklistSet.has(s.toLowerCase()))) {
+        return route;
+      }
+    }
+    
+    const fromSys = this.data.systems[fromId];
+    const toSys = this.data.systems[toId];
+    
+    if (!fromSys || !toSys) {
+      return null;
+    }
+    
+    const wormholeRoute = this.tryFindWormholeRoute(fromId, toId, blacklistArr);
     if (wormholeRoute) {
       return wormholeRoute;
     }
     
-    // Fall back to regular BFS
-    const visited = new Set<string>([fromSystemId]);
+    const visited = new Set<string>([fromId]);
     const queue: Array<{ id: string; path: string[] }> = [
-      { id: fromSystemId, path: [fromSystemId] },
+      { id: fromId, path: [fromId] },
     ];
 
     while (queue.length > 0) {
@@ -1713,28 +1773,127 @@ findOreLocations(oreId: string): Array<{
       const conns = this.data.systems[current.id]?.connections ?? [];
 
       for (const conn of conns) {
-        const nextId = conn.system_id;
+        const nextId = typeof conn === 'string' ? conn : (this.findSystemIdCaseInsensitive(conn.system_id) || conn.system_id);
         if (!nextId || visited.has(nextId)) continue;
-        // Skip blacklisted systems
         if (blacklistSet.has(nextId.toLowerCase())) continue;
 
         const newPath = [...current.path, nextId];
-        if (nextId === toSystemId) return newPath;
+        if (nextId === toId) {
+          return newPath;
+        }
 
         visited.add(nextId);
         queue.push({ id: nextId, path: newPath });
       }
     }
 
-    return null; // No path found in known map
+    return null;
+  }
+  
+  /** Find system ID with case-insensitive matching. Returns the actual stored ID or null if not found. */
+  private findSystemIdCaseInsensitive(systemId: string): string | null {
+    if (!systemId) return null;
+    const lower = systemId.toLowerCase();
+    // First try exact match (most common case)
+    if (this.data.systems[systemId]) return systemId;
+    // Then try case-insensitive match
+    for (const id of Object.keys(this.data.systems)) {
+      if (id.toLowerCase() === lower) return id;
+    }
+    return null;
   }
 
-  /**
-   * Try to find a route using wormholes as shortcuts.
-   * Strategy: Check if we can reach a wormhole entrance, jump through, then reach the destination.
-   */
+  /** Debug function: Get detailed explanation of why a route wasn't found. */
+  getRouteDebugInfo(fromSystemId: string, toSystemId: string, blacklist?: string[]): {
+    fromExists: boolean;
+    toExists: boolean;
+    fromHasConnections: boolean;
+    blacklist: string[];
+    blockedSystems: string[];
+    reachableSystems: string[];
+    message: string;
+  } {
+    const blacklistArr = Array.isArray(blacklist) ? blacklist : [];
+    const blacklistSet = new Set(blacklistArr.map(s => s.toLowerCase()));
+    
+    // Normalize system IDs for case-insensitive matching
+    const fromId = this.findSystemIdCaseInsensitive(fromSystemId);
+    const toId = this.findSystemIdCaseInsensitive(toSystemId);
+    
+    const fromSys = fromId ? this.data.systems[fromId] : null;
+    const toSys = toId ? this.data.systems[toId] : null;
+    
+    const fromExists = !!fromSys;
+    const toExists = !!toSys;
+    const fromHasConnections = !!(fromSys?.connections?.length);
+    
+    // Find blocked systems (blacklisted or pirate)
+    const blockedSystems: string[] = [];
+    for (const [sysId, sys] of Object.entries(this.data.systems)) {
+      if (blacklistSet.has(sysId.toLowerCase()) || this.isPirateSystem(sysId)) {
+        blockedSystems.push(sysId);
+      }
+    }
+    
+    // Find reachable systems from fromSystem
+    const reachableSystems: string[] = [];
+    if (fromSys && fromId) {
+      const visited = new Set<string>();
+      const queue = [fromId];
+      visited.add(fromId);
+      while (queue.length > 0 && reachableSystems.length < 50) {
+        const current = queue.shift()!;
+        const conns = this.data.systems[current]?.connections ?? [];
+        for (const conn of conns) {
+          const nextId = this.findSystemIdCaseInsensitive(conn.system_id) || conn.system_id;
+          if (nextId && !visited.has(nextId) && !blacklistSet.has(nextId.toLowerCase()) && !this.isPirateSystem(nextId)) {
+            visited.add(nextId);
+            reachableSystems.push(nextId);
+            queue.push(nextId);
+          }
+        }
+      }
+    }
+    
+    let message = "";
+    if (fromId === toId) {
+      message = "Already in destination system";
+    } else if (!fromExists) {
+      message = `From system "${fromSystemId}" not found in map`;
+    } else if (!toExists) {
+      message = `To system "${toSystemId}" not found in map`;
+    } else if (!fromHasConnections) {
+      message = `From system "${fromSystemId}" has no known connections`;
+    } else if (reachableSystems.length === 0) {
+      message = `From system "${fromSystemId}" has all connections blocked (blacklist or pirate systems)`;
+    } else if (!reachableSystems.includes(toId!)) {
+      message = `Destination "${toSystemId}" not reachable from "${fromSystemId}" - no connection path found`;
+    } else {
+      message = "Route should be reachable";
+    }
+    
+    return {
+      fromExists,
+      toExists,
+      fromHasConnections,
+      blacklist: blacklistArr,
+      blockedSystems,
+      reachableSystems,
+      message,
+    };
+  }
+
+/**
+    * Try to find a route using wormholes as shortcuts.
+    * Strategy: Check if we can reach a wormhole entrance, jump through, then reach the destination.
+    */
   private tryFindWormholeRoute(fromSystemId: string, toSystemId: string, blacklist: string[]): string[] | null {
     const blacklistSet = new Set(blacklist.map(s => s.toLowerCase()));
+    
+    // Normalize system IDs
+    const fromId = this.findSystemIdCaseInsensitive(fromSystemId);
+    const toId = this.findSystemIdCaseInsensitive(toSystemId);
+    if (!fromId || !toId) return null;
     
     // Get all active wormholes
     const activeWormholes = this.getActiveWormholes();
@@ -1758,8 +1917,8 @@ findOreLocations(oreId: string): Array<{
       if (blacklistSet.has(exitSystem.toLowerCase())) continue;
       
       // Calculate path segments
-      const toEntrance = this.findRegularBfsRoute(fromSystemId, entranceSystem, blacklist);
-      const fromExitToDest = this.findRegularBfsRoute(exitSystem, toSystemId, blacklist);
+      const toEntrance = this.findRegularBfsRoute(fromId, entranceSystem, blacklist);
+      const fromExitToDest = this.findRegularBfsRoute(exitSystem, toId, blacklist);
       
       if (toEntrance && fromExitToDest) {
         // Valid wormhole route
@@ -1778,8 +1937,8 @@ findOreLocations(oreId: string): Array<{
       
       // Strategy 2: Maybe the destination IS the entrance system
       // Route: fromSystem -> entrance -> (wormhole) -> exit (= destination)
-      if (toSystemId === entranceSystem) {
-        const toEntrance = this.findRegularBfsRoute(fromSystemId, entranceSystem, blacklist);
+      if (toId === entranceSystem) {
+        const toEntrance = this.findRegularBfsRoute(fromId, entranceSystem, blacklist);
         if (toEntrance && toEntrance.length < bestRouteLength) {
           // Actually, no wormhole needed - just go directly
           // But we could still use the wormhole if it creates a shortcut
@@ -1805,7 +1964,7 @@ findOreLocations(oreId: string): Array<{
       const conns = this.data.systems[current.id]?.connections ?? [];
 
       for (const conn of conns) {
-        const nextId = conn.system_id;
+        const nextId = this.findSystemIdCaseInsensitive(conn.system_id) || conn.system_id;
         if (!nextId || visited.has(nextId)) continue;
         if (blacklistSet.has(nextId.toLowerCase())) continue;
 
@@ -2324,6 +2483,31 @@ findOreLocations(oreId: string): Array<{
       total,
       visited: visitedCount,
       unvisited: total - visitedCount,
+    };
+  }
+
+  /** Check if the map has any systems with connections (i.e., is seeded). */
+  isMapSeeded(): boolean {
+    return Object.keys(this.data.systems).length > 0;
+  }
+
+  /** Get debug info about the map state. */
+  getDebugInfo(): {
+    totalSystems: number;
+    systemsWithConnections: number;
+    systemsWithPOIs: number;
+    sampleSystems: string[];
+  } {
+    const systems = Object.values(this.data.systems);
+    const systemsWithConnections = systems.filter(s => s.connections && s.connections.length > 0).length;
+    const systemsWithPOIs = systems.filter(s => s.pois && s.pois.length > 0).length;
+    const sampleSystems = systems.slice(0, 5).map(s => `${s.id} (${s.connections?.length || 0} conns, ${s.pois?.length || 0} POIs)`);
+    
+    return {
+      totalSystems: systems.length,
+      systemsWithConnections,
+      systemsWithPOIs,
+      sampleSystems,
     };
   }
 }

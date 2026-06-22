@@ -1217,7 +1217,12 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           const toDest = estimateFuelCost(bot.system, bestBuyer.systemId, settings.fuelCostPerJump);
           const returnHome = estimateFuelCost(bestBuyer.systemId, settings.homeSystem || bot.system, settings.fuelCostPerJump);
           const roundTripJumps = toDest.jumps + (returnHome.jumps < 999 ? returnHome.jumps : 0);
+          const roundTripFuel = toDest.cost + (returnHome.jumps < 999 ? returnHome.cost : 0);
           const qty = Math.min(item.quantity, bestBuyer.quantity, maxItemsForCargo(cargoCapacity, item.itemId));
+
+          const totalRevenue = qty * bestBuyer.price;
+          const costPerUnit = roundTripJumps > 0 ? roundTripFuel / qty : 0;
+          const totalProfit = totalRevenue - costPerUnit;
 
           cargoRoutes.push({
             itemId: item.itemId,
@@ -1230,13 +1235,13 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
             sellQty: qty,
             jumps: toDest.jumps,
             roundTripJumps,
-            totalRevenue: qty * bestBuyer.price,
-            totalProfit: qty * bestBuyer.price, // No acquisition cost for recovered cargo
+            totalRevenue,
+            totalProfit,
           });
         }
 
         if (cargoRoutes.length > 0) {
-          cargoRoutes.sort((a, b) => b.totalRevenue - a.totalRevenue);
+          cargoRoutes.sort((a, b) => b.totalProfit - a.totalProfit);
           route = cargoRoutes[0];
           ctx.log("trade", `Recovery route: ${route.sellQty}x ${route.itemName} → ${route.destPoiName} (${route.sellPrice}cr/ea)`);
           // Skip to selling this cargo
@@ -1761,37 +1766,10 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
         await bot.refreshStatus();
         await recordMarketData(ctx);
         bot.stats.totalTrades++;
-        bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + totalRevenue);
-        ctx.log("trade", `Faction sale complete: ${totalSold}x ${route!.itemName} — ${totalRevenue}cr revenue (actual)`);
-        await factionDonateProfit(ctx, totalRevenue);
-        // Complete trade session for in-station sale
-        const session = createTradeSession({
-          botUsername: bot.username,
-          route: {
-            itemId: route!.itemId,
-            itemName: route!.itemName,
-            sourceSystem: bot.system,
-            sourcePoi: bot.poi,
-            sourcePoiName: bot.poi || "Unknown",
-            buyPrice: 0,
-            buyQty: totalSold,
-            destSystem: route!.destSystem,
-            destPoi: route!.destPoi,
-            destPoiName: route!.destPoiName,
-            sellPrice: route!.sellPrice,
-            sellQty: totalSold,
-            jumps: 0,
-            profitPerUnit: route!.sellPrice,
-            totalProfit: totalRevenue,
-          },
-          isFactionRoute: true,
-          isCargoRoute: false,
-          investedCredits: 0,
-        });
-        session.state = "completed";
-        session.completedAt = new Date().toISOString();
-        await startTradeSession(session);
-        ctx.log("trade", `In-station trade session completed: ${totalSold}x ${route!.itemName}`);
+        bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
+        ctx.log("trade", `Faction sale complete: ${totalSold}x ${route!.itemName} — ${totalRevenue}cr revenue, ${route!.totalProfit}cr profit`);
+        await factionDonateProfit(ctx, route!.totalProfit);
+        await completeTradeSession(bot.username, totalRevenue, route!.totalProfit);
       } else if (route) {
         // No items sold - fail any existing session
         const session = getActiveSession(bot.username);
@@ -1938,7 +1916,7 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
           sellPrice: route!.sellPrice,
           sellQty: route!.sellQty,
           jumps: route!.jumps,
-          profitPerUnit: route!.sellPrice,
+          profitPerUnit: route!.sellQty > 0 ? route!.totalProfit / route!.sellQty : 0,
           totalProfit: route!.totalProfit,
         },
         isFactionRoute: !personalMode,
@@ -2127,21 +2105,17 @@ export const factionTraderRoutine: Routine = async function* (ctx: RoutineContex
               }
               const revenue = actualRevenue;
               bot.stats.totalTrades++;
-              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + revenue);
-              ctx.log("trade", `Sold ${marketCheck.sellQty}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue (actual)`);
-              await factionDonateProfit(ctx, revenue);
-              // Complete trade session
-              const actualProfit = revenue; // No acquisition cost for faction items
-              await completeTradeSession(bot.username, revenue, actualProfit);
+              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
+              ctx.log("trade", `Sold ${marketCheck.sellQty}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue, ${route!.totalProfit}cr profit`);
+              await factionDonateProfit(ctx, route!.totalProfit);
+              await completeTradeSession(bot.username, revenue, route!.totalProfit);
             } else {
               const revenue = sanitizeCredits(actualRevenue > 0 ? actualRevenue : actuallySold * marketCheck.weightedAvgPrice);
               bot.stats.totalTrades++;
-              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + revenue);
-              ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue (actual)`);
-              await factionDonateProfit(ctx, revenue);
-              // Complete trade session
-              const actualProfit = revenue; // No acquisition cost for faction items
-              await completeTradeSession(bot.username, revenue, actualProfit);
+              bot.stats.totalProfit = sanitizeCredits(bot.stats.totalProfit + route!.totalProfit);
+              ctx.log("trade", `Sold ${actuallySold}x ${route!.itemName} at ${route!.destPoiName} — ${revenue}cr revenue, ${route!.totalProfit}cr profit`);
+              await factionDonateProfit(ctx, route!.totalProfit);
+              await completeTradeSession(bot.username, revenue, route!.totalProfit);
 
               // Release buy order lock
               const completedSession = getActiveSession(bot.username);

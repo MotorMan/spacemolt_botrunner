@@ -18710,6 +18710,11 @@ When responding:
           ? '<div style="color:var(--yellow);font-size:11px;margin-bottom:12px">Bot must be docked at a station to manage facilities.</div>'
           : "";
 
+        factionFacilityTypes = getCatalogFacilitiesByCategory(factionFacilityCategory);
+
+        const types = factionFacilityTypes;
+        const factionCount = types.length;
+
         return `
     ${dockWarning}
     <div class="faction-section">
@@ -18723,9 +18728,10 @@ When responding:
       <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
         <button class="sm" id="ff-cat-faction" style="background:var(--accent);color:#fff" onclick="switchFactionFacilityCategory('faction','${esc(username)}')">Faction</button>
         <button class="sm" id="ff-cat-production" onclick="switchFactionFacilityCategory('production','${esc(username)}')">Production</button>
+        <span id="ff-category-info" style="font-size:11px;color:var(--text-dim);margin-left:auto">${factionCount} types</span>
       </div>
       <div id="factionBuildableTypes">
-        <button class="sm" onclick="fetchFactionBuildableTypes('${esc(username)}')" ${!docked ? "disabled" : ""}>Show Available Types</button>
+        ${types.length > 0 ? renderFactionBuildableTypesListHtml(types, username) : `<button class="sm" onclick="fetchFactionBuildableTypes('${esc(username)}')" ${!docked ? "disabled" : ""}>Show Available Types</button>`}
       </div>
     </div>
     <div class="faction-section" style="margin-top:16px">
@@ -19073,6 +19079,12 @@ When responding:
       let factionFacilityPageSize = 20;
       let factionFacilityCategory = "faction";
 
+      let personalFacilityTypes = [];
+      let personalFacilityCategory = "personal";
+      let personalFacilityPage = 0;
+      let personalFacilityPageSize = 20;
+      let personalFacilityLoadComplete = false;
+
       function fetchFactionBuildableTypes(username) {
         const container = document.getElementById("factionBuildableTypes");
         if (!container) return;
@@ -19099,16 +19111,140 @@ When responding:
         container.innerHTML = types
           .map((t) => {
             const typeId = t.facility_type || t.type || t.id || "";
-            const detail = personalFacilityDetails[typeId] || t;
+            const catalogDetail = getCatalogFacility(typeId);
+            const detail = catalogDetail || t;
+            const cost = detail.cost ?? detail.credits ?? detail.price ?? detail.build_cost ?? 0;
+            const costStr = cost ? `${Number(cost).toLocaleString()}cr` : "";
             return `<div id="fac-type-${esc(typeId)}" class="faction-card" style="opacity: 1">
       <div class="fc-name">${esc(detail.name || typeId)}</div>
-      <div class="fc-detail">${esc(detail.description || "")}</div>
+      <div class="fc-detail">${esc(detail.description || "")}${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${costStr}</span>` : ""}</div>
       <div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; font-size: 11px">
-        <span style="color: var(--text-dim)">Click for build options</span>
+        <button class="sm" onclick="showFactionBuildableTypeDetails('${esc(username)}','${esc(typeId)}')">Details</button>
       </div>
     </div>`;
           })
           .join("");
+      }
+
+      function renderFactionBuildableTypesListHtml(types, username) {
+        return types
+          .map((t) => {
+            const typeId = t.facility_type || t.type || t.id || "";
+            const catalogDetail = getCatalogFacility(typeId);
+            const detail = catalogDetail || t;
+            const cost = detail.cost ?? detail.credits ?? detail.price ?? detail.build_cost ?? 0;
+            const costStr = cost ? `${Number(cost).toLocaleString()}cr` : "";
+            return `<div id="fac-type-${esc(typeId)}" class="faction-card" style="opacity: 1">
+      <div class="fc-name">${esc(detail.name || typeId)}</div>
+      <div class="fc-detail">${esc(detail.description || "")}${costStr ? `<span style="color:var(--yellow);margin-left:6px;font-size:11px">${costStr}</span>` : ""}</div>
+      <div style="margin-top: 8px; display: flex; gap: 8px; align-items: center; font-size: 11px">
+        <button class="sm" onclick="showFactionBuildableTypeDetails('${esc(username)}','${esc(typeId)}')">Details</button>
+      </div>
+    </div>`;
+          })
+          .join("");
+      }
+
+      function showFactionBuildableTypeDetails(username, typeId) {
+        const container = document.getElementById("factionBuildableTypes");
+        if (!container) return;
+
+        const catalogDetail = getCatalogFacility(typeId);
+        if (catalogDetail) {
+          renderFactionBuildableTypeDetailCard(container, username, typeId, catalogDetail);
+          return;
+        }
+
+        container.innerHTML = `<div class="faction-no-data">Loading details...</div>`;
+        sendExec(
+          username,
+          "facility",
+          { action: "types", facility_type: typeId },
+          (result) => {
+            let detail = { facility_type: typeId };
+            if (result.ok && result.data) {
+              const dd = result.data;
+              detail = Array.isArray(dd) ? dd[0] : dd.type || dd.facility || dd;
+            }
+            renderFactionBuildableTypeDetailCard(container, username, typeId, detail);
+          },
+        );
+      }
+
+      function renderFactionBuildableTypeDetailCard(container, username, typeId, detail) {
+        if (!detail) {
+          container.innerHTML = '<div class="faction-no-data">No details available</div>';
+          return;
+        }
+
+        const name = detail.name || detail.facility_type || typeId;
+        const desc = detail.description || detail.desc || "";
+        const level = detail.level ?? detail.tier ?? "";
+        const levelStr = level ? ` Level ${level}` : "";
+        const hint = detail.hint || "";
+        const buildable = detail.buildable !== false;
+
+        const buildCost = detail.build_cost ?? detail.cost ?? detail.credits ?? detail.price ?? 0;
+        const buildCostStr = buildCost ? `${Number(buildCost).toLocaleString()}cr` : "";
+        const laborCost = detail.labor_cost ?? 0;
+        const laborCostStr = laborCost ? `${laborCost} labor` : "";
+        const buildTime = detail.build_time ?? 0;
+        const buildTimeStr = buildTime ? `${buildTime}s` : "";
+
+        const mats = detail.build_materials || detail.materials || detail.requirements || detail.components || [];
+        let matsHtml = "";
+        if (Array.isArray(mats) && mats.length > 0) {
+          matsHtml = '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
+            mats.map((m) => {
+              const mName = m.name || m.item_name || m.item_id || m.resource || "?";
+              const mQty = m.quantity || m.count || m.amount || 1;
+              return `<span style="color:var(--text)">${mQty}x ${esc(mName)}</span>`;
+            }).join(", ") + "</div>";
+        } else if (typeof mats === "object" && !Array.isArray(mats) && Object.keys(mats).length > 0) {
+          matsHtml = '<div style="margin-top:6px;font-size:11px"><span style="color:var(--text-dim)">Materials required:</span> ' +
+            Object.entries(mats).map(([k, v]) => `<span style="color:var(--text)">${v}x ${esc(k)}</span>`).join(", ") + "</div>";
+        }
+
+        const stats = [];
+        if (detail.capacity) stats.push(`Capacity: ${detail.capacity}`);
+        if (detail.storage_capacity) stats.push(`Storage: ${detail.storage_capacity}`);
+        if (detail.production_rate) stats.push(`Production: ${detail.production_rate}`);
+        let statsHtml = "";
+        if (stats.length > 0) {
+          statsHtml = `<div style="margin-top:6px;font-size:11px;color:var(--cyan)">${stats.join(" | ")}</div>`;
+        }
+
+        const warningHtml = hint ? `<div style="margin-top:6px;font-size:11px;color:var(--orange)">${esc(hint)}</div>` : "";
+        const notBuildableHtml = !buildable ? `<div style="margin-top:6px;font-size:11px;color:var(--red)">Cannot build directly - ${esc(hint || "must upgrade existing facility")}</div>` : "";
+
+        const detailHtml = `
+    <div class="faction-card" style="padding:12px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px">
+        <div>
+          <div style="font-size:14px;font-weight:700;color:var(--text-bright)">${esc(name)}${esc(levelStr)}</div>
+          <div style="font-size:11px;color:var(--text-dim)">Faction Facility Type</div>
+        </div>
+        <button class="sm" onclick="renderFactionBuildableTypesList('${esc(username)}')">Back to List</button>
+      </div>
+      <div style="font-size:12px;color:var(--text);margin-top:8px">${esc(desc)}</div>
+      ${buildCostStr ? `<div style="font-size:12px;color:var(--yellow);margin-top:8px">Build Cost: ${esc(buildCostStr)}</div>` : ""}
+      ${laborCostStr ? `<div style="font-size:11px;color:var(--yellow);margin-top:2px">${esc(laborCostStr)}</div>` : ""}
+      ${buildTimeStr ? `<div style="font-size:11px;color:var(--text-dim);margin-top:2px">Build Time: ${esc(buildTimeStr)}</div>` : ""}
+      ${matsHtml}
+      ${statsHtml}
+      ${warningHtml}
+      ${notBuildableHtml}
+      ${buildable ? `
+      <div style="margin-top:12px;padding-top:12px;border-top:1px solid var(--border)">
+        <button class="primary sm" style="width:100%" onclick="factionBuildFacility('${esc(username)}','${esc(typeId)}')">Build Facility</button>
+      </div>
+      <div style="font-size:10px;color:var(--text-dim);margin-top:8px">
+        This will withdraw required materials from faction storage and build the facility using faction_build.
+      </div>
+      ` : ""}
+    </div>
+  `;
+        container.innerHTML = detailHtml;
       }
 
       function renderFacilityTypeCard(t, username) {
@@ -19242,13 +19378,13 @@ When responding:
         const container = document.getElementById("factionBuildableTypes");
         if (!container) return;
 
-        // Check cached details first
-        if (personalFacilityDetails[facilityType]) {
+        const catalogDetail = getCatalogFacility(facilityType);
+        if (catalogDetail) {
           renderFactionProductionDetailCard(
             container,
             username,
             facilityType,
-            personalFacilityDetails[facilityType],
+            catalogDetail,
           );
           return;
         }
@@ -19267,19 +19403,16 @@ When responding:
             }
 
             if (detail) {
-              personalFacilityDetails[facilityType] = detail;
-              // Save to cache
-              if (personalFacilityVersion) {
-                saveFacilitiesCache();
-              }
+              renderFactionProductionDetailCard(
+                container,
+                username,
+                facilityType,
+                detail,
+              );
+            } else {
+              container.innerHTML =
+                '<div class="faction-no-data">No details available</div>';
             }
-
-            renderFactionProductionDetailCard(
-              container,
-              username,
-              facilityType,
-              detail,
-            );
           },
         );
       }
@@ -19722,6 +19855,51 @@ When responding:
           ? '<div style="color:var(--yellow);font-size:11px;margin-bottom:12px">Bot must be docked at a station to manage personal facilities.</div>'
           : "";
 
+        personalFacilityCategory = "personal";
+        personalFacilityPage = 0;
+        personalFacilityTypes = getCatalogFacilitiesByCategory("personal");
+        personalFacilityLoadComplete = true;
+
+        const personalCount = personalFacilityTypes.length;
+
+        const types = personalFacilityTypes.filter(
+          (t) => t.category === personalFacilityCategory,
+        );
+        const totalItems = types.length;
+        const totalPages = Math.ceil(totalItems / personalFacilityPageSize) || 1;
+        const startIdx = personalFacilityPage * personalFacilityPageSize;
+        const endIdx = Math.min(startIdx + personalFacilityPageSize, totalItems);
+        const pageItems = types.slice(startIdx, endIdx);
+
+        let facilityListHtml = "";
+        if (totalItems === 0) {
+          facilityListHtml = '<div class="faction-no-data">No personal facility types found</div>';
+        } else {
+          facilityListHtml = `
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
+        <span>${totalItems} personal facility types</span>
+        <span>Page ${personalFacilityPage + 1} of ${totalPages}</span>
+      </div>
+      <div id="personalFacilityListScroll" style="flex:1;min-height:0;overflow-y:auto">
+        ${pageItems
+          .map((t) => {
+            const typeId = t.facility_type || t.type || t.id || "";
+            const name = t.name || typeId || "?";
+            const desc = t.description || t.desc || "";
+            return `<div class="faction-card" style="padding:8px;margin-bottom:4px;cursor:pointer" onclick="showPersonalFacilityDetails('${esc(username)}','${esc(typeId)}')">
+            <div style="font-size:12px;font-weight:600;color:var(--text-bright)">${esc(name)}</div>
+            <div style="font-size:11px;color:var(--text-dim)">${esc(desc.substring(0, 100))}${desc.length > 100 ? "..." : ""}</div>
+          </div>`;
+          })
+          .join("")}
+      </div>
+      <div style="display:flex;justify-content:center;gap:8px;margin-top:8px;padding:8px 0;border-top:1px solid var(--border)">
+        <button class="sm" onclick="changePersonalFacilityPage(${personalFacilityPage - 1}, '${esc(username)}')" ${personalFacilityPage <= 0 ? "disabled" : ""}>&lt; Prev</button>
+        <button class="sm" onclick="changePersonalFacilityPage(${personalFacilityPage + 1}, '${esc(username)}')" ${personalFacilityPage >= totalPages - 1 ? "disabled" : ""}>Next &gt;</button>
+      </div>
+    `;
+        }
+
         return `
     ${dockWarning}
     <div style="display:flex;flex-direction:column;flex:1;min-height:0;gap:16px">
@@ -19734,12 +19912,12 @@ When responding:
       <div class="faction-section" style="flex:1;display:flex;flex-direction:column;min-height:0">
         <div class="faction-section-title">Available Personal Facilities</div>
         <div style="display:flex;gap:8px;margin-bottom:8px;align-items:center">
-          <button class="sm" id="pf-cat-personal" style="background:var(--accent);color:#fff" onclick="switchPersonalFacilityCategory('personal','${esc(username)}')">Personal</button>
+          <button class="sm" id="pf-cat-personal" style="background:var(--accent);color:#fff">Personal</button>
           <button class="sm" id="pf-cat-production" onclick="switchPersonalFacilityCategory('production','${esc(username)}')">Production</button>
-          <span id="pf-category-info" style="font-size:11px;color:var(--text-dim);margin-left:auto"></span>
+          <span id="pf-category-info" style="font-size:11px;color:var(--text-dim);margin-left:auto">${personalCount} personal types</span>
         </div>
         <div id="personalFacilityTypes" style="flex:1;min-height:0;overflow-y:auto">
-          <button class="sm" onclick="fetchPersonalFacilityTypes('${esc(username)}')" ${!docked ? "disabled" : ""}>Load Available Types</button>
+          ${facilityListHtml}
         </div>
       </div>
     </div>
@@ -19758,7 +19936,6 @@ When responding:
 
         personalFacilityTypes = getCatalogFacilitiesByCategory("personal");
         personalFacilityLoadComplete = true;
-        personalFacilityVersion = catalog.lastFetched;
 
         const container = document.createElement("div");
         container.style.cssText =
@@ -19816,10 +19993,53 @@ When responding:
         personalFacilityPage = 0;
         personalFacilityTypes = getCatalogFacilitiesByCategory(category);
         personalFacilityLoadComplete = true;
-        personalFacilityVersion = catalog.lastFetched;
+
+        const types = personalFacilityTypes.filter(
+          (t) => t.category === personalFacilityCategory,
+        );
+        const totalItems = types.length;
+        const totalPages = Math.ceil(totalItems / personalFacilityPageSize) || 1;
+        const startIdx = personalFacilityPage * personalFacilityPageSize;
+        const endIdx = Math.min(startIdx + personalFacilityPageSize, totalItems);
+        const pageItems = types.slice(startIdx, endIdx);
+
         const container = document.getElementById("personalFacilityTypes");
-        if (container) {
-          renderPersonalFacilityList(container, username);
+        if (!container) return;
+
+        let facilityListHtml = "";
+        if (totalItems === 0) {
+          facilityListHtml = '<div class="faction-no-data">No facility types found</div>';
+        } else {
+          facilityListHtml = `
+      <div style="font-size:11px;color:var(--text-dim);margin-bottom:8px;display:flex;justify-content:space-between;align-items:center">
+        <span>${totalItems} ${personalFacilityCategory} facility types</span>
+        <span>Page ${personalFacilityPage + 1} of ${totalPages}</span>
+      </div>
+      <div id="personalFacilityListScroll" style="flex:1;min-height:0;overflow-y:auto">
+        ${pageItems
+          .map((t) => {
+            const typeId = t.facility_type || t.type || t.id || "";
+            const name = t.name || typeId || "?";
+            const desc = t.description || t.desc || "";
+            return `<div class="faction-card" style="padding:8px;margin-bottom:4px;cursor:pointer" onclick="showPersonalFacilityDetails('${esc(username)}','${esc(typeId)}')">
+            <div style="font-size:12px;font-weight:600;color:var(--text-bright)">${esc(name)}</div>
+            <div style="font-size:11px;color:var(--text-dim)">${esc(desc.substring(0, 100))}${desc.length > 100 ? "..." : ""}</div>
+          </div>`;
+          })
+          .join("")}
+      </div>
+      <div style="display:flex;justify-content:center;gap:8px;margin-top:8px;padding:8px 0;border-top:1px solid var(--border)">
+        <button class="sm" onclick="changePersonalFacilityPage(${personalFacilityPage - 1}, '${esc(username)}')" ${personalFacilityPage <= 0 ? "disabled" : ""}>&lt; Prev</button>
+        <button class="sm" onclick="changePersonalFacilityPage(${personalFacilityPage + 1}, '${esc(username)}')" ${personalFacilityPage >= totalPages - 1 ? "disabled" : ""}>Next &gt;</button>
+      </div>
+    `;
+        }
+
+        container.innerHTML = facilityListHtml;
+
+        const infoEl = document.getElementById("pf-category-info");
+        if (infoEl) {
+          infoEl.textContent = `${totalItems} ${personalFacilityCategory} types`;
         }
       }
 
@@ -19845,6 +20065,10 @@ When responding:
             productionBtn.style.background = "";
             productionBtn.style.color = "";
           }
+        }
+        const infoEl = document.getElementById("ff-category-info");
+        if (infoEl) {
+          infoEl.textContent = `${factionFacilityTypes.length} types`;
         }
         renderFactionBuildableTypesList(username);
       }
@@ -20584,7 +20808,6 @@ async function fetchPersonalFacilityTypes(username) {
         personalFacilityPage = 0;
         personalFacilityTypes = getCatalogFacilitiesByCategory("personal");
         personalFacilityLoadComplete = true;
-        personalFacilityVersion = catalog.lastFetched;
 
         console.log("Using catalog personal facility types:", personalFacilityTypes.length);
         renderPersonalFacilityList(container, username);

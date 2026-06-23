@@ -338,9 +338,8 @@ async function waitForCompletion(
   tracker.save();
 
   const progress = tracker.getProgress(recipeId);
-  const queuedItems = progress.queued * outputQty;
   const completedItems = progress.completed * outputQty;
-  if (queuedItems >= quantityItems) {
+  if (completedItems >= quantityItems) {
     return true;
   }
 
@@ -702,10 +701,28 @@ export const crafterRoutine: Routine = async function* (ctx: RoutineContext) {
 
     const parts: string[] = [];
     if (craftedSummary.length > 0) parts.push(`Crafted ${craftedSummary.join(", ")}`);
-    if (parts.length > 0) {
-      ctx.log("craft", parts.join(". "));
+
+    if (parts.length === 0) {
+      const recipeNames = new Map<string, string>();
+      for (const r of recipes) {
+        recipeNames.set(r.recipe_id, r.name);
+      }
+      const progressSummaries: string[] = [];
+      for (const [recipeId, progress] of Array.from(tracker.getProgressByRecipe().entries())) {
+        const outputQty = recipes.find(r => r.recipe_id === recipeId)?.output_quantity || 1;
+        const completed = progress.completed * outputQty;
+        const queued = progress.queued * outputQty;
+        const remaining = progress.remaining;
+        const name = recipeNames.get(recipeId) || recipeId;
+        progressSummaries.push(`${completed}/${queued} ${name} (${remaining} remaining)`);
+      }
+      if (progressSummaries.length > 0) {
+        ctx.log("craft", `In progress: ${progressSummaries.join(", ")}`);
+      } else {
+        ctx.log("info", "Nothing crafted this cycle");
+      }
     } else {
-      ctx.log("craft", "Nothing crafted this cycle");
+      ctx.log("craft", parts.join(". "));
     }
 
     yield "refuel";

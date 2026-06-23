@@ -774,16 +774,6 @@ constructor(port: number = 3000) {
         if (url.pathname === "/api/catalog") {
           return Response.json(catalogStore.getAll());
         }
-        // TEMPORARY: Ship loadout sim uses catalogHasModules.json which has modules
-        if (url.pathname === "/api/catalog-with-modules") {
-          const catalogPath = join(DATA_DIR, "catalogHasModules.json");
-          if (existsSync(catalogPath)) {
-            const raw = readFileSync(catalogPath, "utf-8");
-            const data = JSON.parse(raw);
-            return Response.json(data);
-          }
-          return Response.json({ error: "Catalog with modules file not found" }, { status: 404 });
-        }
         if (url.pathname === "/data/catalog.json") {
           const catalogPath = join(DATA_DIR, "catalog.json");
           if (existsSync(catalogPath)) {

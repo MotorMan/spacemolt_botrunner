@@ -88,6 +88,14 @@ export class CraftQueueTracker {
     return { queued, completed, remaining: queued - completed };
   }
 
+  getProgressByRecipe(): Map<string, { queued: number; completed: number; remaining: number }> {
+    const result = new Map<string, { queued: number; completed: number; remaining: number }>();
+    for (const [recipeId] of Array.from(this.recipeIndex.entries())) {
+      result.set(recipeId, this.getProgress(recipeId));
+    }
+    return result;
+  }
+
   hasPendingJob(recipeId: string, quantity: number): boolean {
     const ids = this.recipeIndex.get(recipeId) || [];
     let remainingRuns = 0;

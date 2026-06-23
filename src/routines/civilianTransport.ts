@@ -382,38 +382,6 @@ function loadCatalog(): Record<string, CatalogShip> {
   return {};
 }
 
-let moduleCatalogCache: Record<string, Record<string, unknown>> | null = null;
-
-function loadModuleCatalog(): Record<string, Record<string, unknown>> | null {
-  if (moduleCatalogCache) return moduleCatalogCache;
-  try {
-    const catalogPath = path.join(process.cwd(), "data/catalogHasModules.json");
-    if (fs.existsSync(catalogPath)) {
-      const raw = fs.readFileSync(catalogPath, "utf-8");
-      const data = JSON.parse(raw) as Record<string, unknown>;
-      const itemsData = data.items as Record<string, Record<string, unknown>> | { id?: unknown }[] | undefined;
-      
-      const items: Record<string, Record<string, unknown>> = {};
-      if (Array.isArray(itemsData)) {
-        for (const item of itemsData) {
-          const id = item?.id;
-          if (typeof id === "string") items[id] = item as Record<string, unknown>;
-        }
-      } else if (itemsData && typeof itemsData === "object") {
-        for (const [id, item] of Object.entries(itemsData)) {
-          items[id] = item as Record<string, unknown>;
-        }
-      }
-      
-      moduleCatalogCache = items;
-      return items;
-    }
-  } catch {
-    // silent fail
-  }
-  return null;
-}
-
 // ── Types ────────────────────────────────────────────────────
 
 interface TransportPassenger {
@@ -1004,23 +972,22 @@ async function getCurrentShipInfo(ctx: RoutineContext, shipId: string): Promise<
         if (instanceId && typeId) instanceIdToType.set(instanceId, typeId);
       }
     }
-    const moduleCatalog = loadModuleCatalog();
-    if (moduleCatalog) {
-      const moduleObjects: unknown[] = [];
-      for (const id of shipModuleIds) {
-        const idStr = (typeof id === "string") ? id.toLowerCase() : "";
-        const typeId = instanceIdToType.get(idStr);
-        if (typeId && moduleCatalog[typeId]) {
-          moduleObjects.push(moduleCatalog[typeId]);
-        } else if (idStr && moduleCatalog[idStr]) {
-          moduleObjects.push(moduleCatalog[idStr]);
-        }
+    const moduleObjects: unknown[] = [];
+    for (const id of shipModuleIds) {
+      const idStr = (typeof id === "string") ? id.toLowerCase() : "";
+      const typeId = instanceIdToType.get(idStr);
+      if (typeId) {
+        const modItem = catalogStore.getItem(typeId);
+        if (modItem) moduleObjects.push(modItem);
+      } else if (idStr) {
+        const modItem = catalogStore.getItem(idStr);
+        if (modItem) moduleObjects.push(modItem);
       }
-      if (moduleObjects.length > 0) {
-        const fromMods = countPassengerModules(moduleObjects);
-        if (totalBerths(fromMods) > 0) {
-          berths = fromMods;
-        }
+    }
+    if (moduleObjects.length > 0) {
+      const fromMods = countPassengerModules(moduleObjects);
+      if (totalBerths(fromMods) > 0) {
+        berths = fromMods;
       }
     }
   }

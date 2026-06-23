@@ -35,6 +35,48 @@ import {
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { join } from "path";
 
+/** Temporary pirate blacklist with expiration (in-memory) */
+const temporaryPirateBlacklist = new Map<string, number>(); // systemId -> expiresAt timestamp
+
+/**
+ * Add a system to the temporary pirate blacklist.
+ * @param systemId System to blacklist
+ * @param durationMinutes How long to blacklist (default: 30 minutes)
+ */
+function addTemporaryPirateBlacklist(systemId: string, durationMinutes: number = 30): void {
+  const expiresAt = Date.now() + durationMinutes * 60 * 1000;
+  temporaryPirateBlacklist.set(systemId, expiresAt);
+  console.log(`[BLACKLIST] Added ${systemId} to temporary pirate blacklist for ${durationMinutes} minutes`);
+}
+
+/**
+ * Check if a system is temporarily blacklisted due to recent pirate activity.
+ */
+function isTemporarilyBlacklisted(systemId: string): boolean {
+  const expiresAt = temporaryPirateBlacklist.get(systemId);
+  if (!expiresAt) return false;
+  
+  // Remove expired entries
+  if (Date.now() > expiresAt) {
+    temporaryPirateBlacklist.delete(systemId);
+    return false;
+  }
+  
+  return true;
+}
+
+/**
+ * Clean up expired temporary blacklists (call periodically).
+ */
+function cleanupTemporaryBlacklist(): void {
+  const now = Date.now();
+  for (const [systemId, expiresAt] of temporaryPirateBlacklist.entries()) {
+    if (now > expiresAt) {
+      temporaryPirateBlacklist.delete(systemId);
+    }
+  }
+}
+
 /** Minimum fuel % before heading back to refuel. */
 const FUEL_SAFETY_PCT = 40;
 
@@ -4689,48 +4731,6 @@ async function recordPirateSighting(
     mapStore.recordPirate(systemId, {
       name: pirateName,
     });
-  }
-}
-
-/** Temporary pirate blacklist with expiration (in-memory) */
-const temporaryPirateBlacklist = new Map<string, number>(); // systemId -> expiresAt timestamp
-
-/**
- * Add a system to the temporary pirate blacklist.
- * @param systemId System to blacklist
- * @param durationMinutes How long to blacklist (default: 30 minutes)
- */
-function addTemporaryPirateBlacklist(systemId: string, durationMinutes: number = 30): void {
-  const expiresAt = Date.now() + durationMinutes * 60 * 1000;
-  temporaryPirateBlacklist.set(systemId, expiresAt);
-  console.log(`[BLACKLIST] Added ${systemId} to temporary pirate blacklist for ${durationMinutes} minutes`);
-}
-
-/**
- * Check if a system is temporarily blacklisted due to recent pirate activity.
- */
-function isTemporarilyBlacklisted(systemId: string): boolean {
-  const expiresAt = temporaryPirateBlacklist.get(systemId);
-  if (!expiresAt) return false;
-  
-  // Remove expired entries
-  if (Date.now() > expiresAt) {
-    temporaryPirateBlacklist.delete(systemId);
-    return false;
-  }
-  
-  return true;
-}
-
-/**
- * Clean up expired temporary blacklists (call periodically).
- */
-function cleanupTemporaryBlacklist(): void {
-  const now = Date.now();
-  for (const [systemId, expiresAt] of temporaryPirateBlacklist.entries()) {
-    if (now > expiresAt) {
-      temporaryPirateBlacklist.delete(systemId);
-    }
   }
 }
 }

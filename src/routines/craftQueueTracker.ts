@@ -15,6 +15,8 @@ export interface ServerJobInfo {
   jobId: string;
   recipeId: string;
   quantity: number;
+  runsDone: number;
+  runsRemaining: number;
 }
 
 export class CraftQueueTracker {
@@ -87,13 +89,15 @@ export class CraftQueueTracker {
   }
 
   hasPendingJob(recipeId: string, quantity: number): boolean {
-    const active = this.jobs.size > 0 ? this.getActiveJobs() : [];
-    for (const job of active) {
-      if (job.recipeId === recipeId && (job.quantity - job.completed) >= quantity) {
-        return true;
+    const ids = this.recipeIndex.get(recipeId) || [];
+    let remainingRuns = 0;
+    for (const id of ids) {
+      const job = this.jobs.get(id);
+      if (job) {
+        remainingRuns += job.quantity - job.completed;
       }
     }
-    return false;
+    return remainingRuns >= quantity;
   }
 
   syncWithServer(serverJobs: ServerJobInfo[]): void {
@@ -110,9 +114,9 @@ export class CraftQueueTracker {
           jobId: serverJob.jobId,
           recipeId: serverJob.recipeId,
           quantity: serverJob.quantity,
-          completed: 0,
-          deposited: 0,
-          runsRemaining: serverJob.quantity,
+          completed: serverJob.runsDone,
+          deposited: serverJob.runsDone,
+          runsRemaining: serverJob.runsRemaining,
           startedAt: Date.now(),
           lastUpdate: Date.now(),
         };
@@ -122,6 +126,12 @@ export class CraftQueueTracker {
           existing.push(serverJob.jobId);
           this.recipeIndex.set(serverJob.recipeId, existing);
         }
+      } else {
+        const job = this.jobs.get(serverJob.jobId)!;
+        job.completed = serverJob.runsDone;
+        job.deposited = serverJob.runsDone;
+        job.runsRemaining = serverJob.runsRemaining;
+        job.lastUpdate = Date.now();
       }
     }
   }

@@ -1852,6 +1852,14 @@ export const minerRoutine: Routine = async function* (ctx: RoutineContext) {
           }
         }
       }
+      
+      // CRITICAL: Refuel to 100% when docked at home - miners need full fuel before leaving
+      const fuelPct = bot.maxFuel > 0 ? Math.round((bot.fuel / bot.maxFuel) * 100) : 100;
+      if (fuelPct < 100) {
+        ctx.log("mining", `Refueling at home (${fuelPct}% -> 100%) before departure...`);
+        await tryRefuel(ctx, { skipApprovedCheck: true });
+        await bot.refreshShip();
+      }
     }
 
     // ── Check for field_test mission (early game mining mission) ──

@@ -831,69 +831,74 @@ export const explorerRoutine: Routine = async function* (ctx: RoutineContext) {
         const { parseNearbyForPirates } = await import("./common.js");
         const pirateResult = parseNearbyForPirates(nearbyResp.result);
         
-        if (pirateResult.hasPirates) {
-          ctx.log("combat", `[CRITICAL] Pirates detected near stronghold! ${pirateResult.pirateCount} pirate(s) spotted. Fleeing immediately!`);
-          
-          // Record pirate sighting with names
-          await recordPirateSighting(ctx, systemId, pirateResult.pirates);
+        // Skip pirate flee if cloaked and ignorePirateFleeWhenCloaked is enabled
+        if (!bot.isCloaked || !cloakSettings.ignorePirateFleeWhenCloaked) {
+          if (pirateResult.hasPirates) {
+            ctx.log("combat", `[CRITICAL] Pirates detected near stronghold! ${pirateResult.pirateCount} pirate(s) spotted. Fleeing immediately!`);
+            
+            // Record pirate sighting with names
+            await recordPirateSighting(ctx, systemId, pirateResult.pirates);
 
-          // Add temporary blacklist for this system
-          addTemporaryPirateBlacklist(systemId, 10); // 10 minutes
+            // Add temporary blacklist for this system
+            addTemporaryPirateBlacklist(systemId, 10); // 10 minutes
 
-          // CRITICAL: Verify actual current system before fleeing
-          // During cascade emergency jumps, lastSystem can get out of sync
-          await bot.refreshLocation();
-          const actualSystemId = bot.system;
-          ctx.log("combat", `Verified actual position before flee: system=${actualSystemId}, lastSystem=${lastSystem}`);
+            // CRITICAL: Verify actual current system before fleeing
+            // During cascade emergency jumps, lastSystem can get out of sync
+            await bot.refreshLocation();
+            const actualSystemId = bot.system;
+            ctx.log("combat", `Verified actual position before flee: system=${actualSystemId}, lastSystem=${lastSystem}`);
 
-          // Flee back the way we came using the path stack
-          if (path.length > 1) {
-            const fleeTarget = path[path.length - 2]; // The system before the current one
-            const fleeTargetConnected = connections.some(c => c.id === fleeTarget);
+            // Flee back the way we came using the path stack
+            if (path.length > 1) {
+              const fleeTarget = path[path.length - 2]; // The system before the current one
+              const fleeTargetConnected = connections.some(c => c.id === fleeTarget);
 
-            if (fleeTargetConnected) {
-              ctx.log("combat", `Fleeing back to ${fleeTarget} (exact reverse path)...`);
-              await ensureUndocked(ctx);
-              const fleeJump = await bot.exec("jump", { target_system: fleeTarget });
+              if (fleeTargetConnected) {
+                ctx.log("combat", `Fleeing back to ${fleeTarget} (exact reverse path)...`);
+                await ensureUndocked(ctx);
+                const fleeJump = await bot.exec("jump", { target_system: fleeTarget });
 
-              // Check for battle interrupt on flee jump
-              if (fleeJump.error) {
-                const fleeMsg = fleeJump.error.message.toLowerCase();
-                if (fleeJump.error.code === "battle_interrupt" || fleeMsg.includes("interrupted by battle") || fleeMsg.includes("interrupted by combat")) {
-                  ctx.log("combat", `Flee jump interrupted by battle! ${fleeJump.error.message} - using emergency flee!`);
-                  const { emergencyFleeFromPirates } = await import("./common.js");
-                  await emergencyFleeFromPirates(ctx, pirateResult);
+                // Check for battle interrupt on flee jump
+                if (fleeJump.error) {
+                  const fleeMsg = fleeJump.error.message.toLowerCase();
+                  if (fleeJump.error.code === "battle_interrupt" || fleeMsg.includes("interrupted by battle") || fleeMsg.includes("interrupted by combat")) {
+                    ctx.log("combat", `Flee jump interrupted by battle! ${fleeJump.error.message} - using emergency flee!`);
+                    const { emergencyFleeFromPirates } = await import("./common.js");
+                    await emergencyFleeFromPirates(ctx, pirateResult);
+                  } else {
+                    ctx.log("error", `Failed to flee to ${fleeTarget}: ${fleeJump.error.message}`);
+                    // Try emergency flee if jump fails
+                    const { emergencyFleeFromPirates } = await import("./common.js");
+                    await emergencyFleeFromPirates(ctx, pirateResult);
+                  }
                 } else {
-                  ctx.log("error", `Failed to flee to ${fleeTarget}: ${fleeJump.error.message}`);
-                  // Try emergency flee if jump fails
-                  const { emergencyFleeFromPirates } = await import("./common.js");
-                  await emergencyFleeFromPirates(ctx, pirateResult);
+                  ctx.log("combat", `Successfully fled to ${fleeTarget}`);
+                  bot.stats.totalSystems++;
+                  // Update path: remove the current system from path since we fled from it
+                  path.pop();
+                  // Update lastSystem to the system we fled from (for avoidance logic)
+                  lastSystem = actualSystemId;
+                  // Continue to next iteration to rescan new system
+                  await ctx.sleep(5000);
+                  continue;
                 }
               } else {
-                ctx.log("combat", `Successfully fled to ${fleeTarget}`);
-                bot.stats.totalSystems++;
-                // Update path: remove the current system from path since we fled from it
-                path.pop();
-                // Update lastSystem to the system we fled from (for avoidance logic)
-                lastSystem = actualSystemId;
-                // Continue to next iteration to rescan new system
-                await ctx.sleep(5000);
-                continue;
+                ctx.log("error", `Flee target ${fleeTarget} is not connected to current system (${actualSystemId}) - using emergency flee.`);
+                const { emergencyFleeFromPirates } = await import("./common.js");
+                await emergencyFleeFromPirates(ctx, pirateResult);
               }
             } else {
-              ctx.log("error", `Flee target ${fleeTarget} is not connected to current system (${actualSystemId}) - using emergency flee.`);
+              // No previous system in path - use emergency flee
+              ctx.log("combat", "No previous system in path to flee to - using emergency flee");
               const { emergencyFleeFromPirates } = await import("./common.js");
               await emergencyFleeFromPirates(ctx, pirateResult);
             }
-          } else {
-            // No previous system in path - use emergency flee
-            ctx.log("combat", "No previous system in path to flee to - using emergency flee");
-            const { emergencyFleeFromPirates } = await import("./common.js");
-            await emergencyFleeFromPirates(ctx, pirateResult);
-          }
           
-          await ctx.sleep(5000);
-          continue;
+            await ctx.sleep(5000);
+            continue;
+          }
+        } else if (pirateResult.hasPirates && bot.isCloaked && cloakSettings.ignorePirateFleeWhenCloaked) {
+          ctx.log("combat", `[INFO] Pirates detected but cloaked - ignoring flee (ignorePirateFleeWhenCloaked enabled)`);
         }
       }
     }
@@ -2056,14 +2061,16 @@ async function* visitOtherPoi(
     // Track player names from nearby scan
     bot.trackNearbyPlayers(nearbyResp.result);
 
-    // Check for pirates and flee if detected
+    // Check for pirates and flee if detected (skip if cloaked and ignorePirateFleeWhenCloaked is enabled)
     const { checkAndFleeFromPirates } = await import("./common.js");
-    const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-    if (fled) {
-      // We've fled - mark this system as hostile and abort this POI scan
-      fledFromSystems.add(systemId);
-      mapStore.markExplored(systemId, poi.id);
-      return;
+    const settings = getExplorerSettings(bot.username);
+    if (!bot.isCloaked || !settings.ignorePirateFleeWhenCloaked) {
+      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+      if (fled) {
+        // We've fled - mark this system as hostile and abort this POI scan
+        fledFromSystems.add(systemId);
+        return;
+      }
     }
   }
 

@@ -1164,8 +1164,8 @@ export function findFirstAvailableQuotaTarget(
       const sys = mapStore.getSystem(loc.systemId);
       const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
       if (!poi) return true;
-      // Only filter by hidden status - trust map data for ore/gas/ice types
-      if (miningType === "ore") return true; // All non-hidden POIs are valid for ore
+      // No filtering by POI type - trust map data for ore/gas/ice types
+      if (miningType === "ore") return true;
       if (miningType === "radioactive") {
         if (poi.hidden === true && !canMineHiddenRadioactive) return false;
         return true;
@@ -1180,31 +1180,8 @@ export function findFirstAvailableQuotaTarget(
       }
       return true;
     });
-    const depletionFiltered = poiFiltered.filter((loc: any) => {
-      // Skip depleted ores (unless depletion has expired or ignoreDepletion is enabled)
-      if (settings.ignoreDepletion) {
-        // Even with ignoreDepletion, skip completely exhausted POIs (0 remaining)
-        if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
-          return false;
-        }
-        return true;
-      }
-      const sys = mapStore.getSystem(loc.systemId);
-      const poi = sys?.pois.find((p: any) => p.id === loc.poiId);
-      // Check both ores_found (mining history) AND resources (scan data) for depletion status
-      // Hidden POIs often only have data in resources (from get_poi scans)
-      const oreEntry = poi?.ores_found.find((o: any) => o.item_id === entry.resourceId);
-      const resourceEntry = poi?.resources?.find((r: any) => r.resource_id === entry.resourceId);
-      
-      // If resourceEntry exists and shows depleted, check expiry
-      if (resourceEntry?.depleted) {
-        return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
-      }
-      // Otherwise check ores_found depletion
-      if (!oreEntry?.depleted) return true;
-      // Depleted but expired - can re-check
-      return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
-    });
+    // No depletion filtering - trust the map data
+    const depletionFiltered = poiFiltered;
 
     if (depletionFiltered.length > 0) {
       console.log(`[DEBUG] findFirstAvailableQuotaTarget: Selected ${entry.resourceId} with ${depletionFiltered.length} locations`);
@@ -1326,14 +1303,9 @@ if (miningType === "ice") {
     return oreBelt ? { id: oreBelt.id, name: oreBelt.name } : null;
   } else if (miningType === "ore") {
     // Ore mining - trust map data, only filter by hidden status
-    // Gas clouds (nebula) can also contain regular ores like energy_crystal
     if (targetResource) {
       for (const poi of pois) {
-        const isOreBelt = isOreBeltPoi(poi.type) || isGasCloudPoi(poi.type) ||
-                          (poi.name && (poi.name.toLowerCase().includes('belt') ||
-                                        poi.name.toLowerCase().includes('mineral field') ||
-                                        poi.name.toLowerCase().includes('asteroid')));
-        const isAllowedPoi = isOreBelt ||
+        const isAllowedPoi = !poi.hidden ||
                               (allowHiddenPois && poi.hidden === true) ||
                               (poi.hidden === true && ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(poi.id));
         if (isAllowedPoi) {
@@ -1346,16 +1318,12 @@ if (miningType === "ice") {
       }
       return null; // No POI with target ore available
     }
-    // Fallback: any ore belt or gas cloud (nebula can contain regular ores) or hidden POI
-    const oreBelt = pois.find(p => {
-      const isOreBelt = isOreBeltPoi(p.type) || isGasCloudPoi(p.type) ||
-                        (p.name && (p.name.toLowerCase().includes('belt') ||
-                                    p.name.toLowerCase().includes('mineral field') ||
-                                    p.name.toLowerCase().includes('asteroid')));
-      return isOreBelt || (allowHiddenPois && p.hidden === true) ||
+    // Fallback: any non-hidden POI (or hidden POI if allowed)
+    const orePoi = pois.find(p => {
+      return !p.hidden || (allowHiddenPois && p.hidden === true) ||
              (p.hidden === true && ALLOWED_HIDDEN_POIS_FOR_PARTIAL_MINERS.has(p.id));
     });
-    return oreBelt ? { id: oreBelt.id, name: oreBelt.name } : null;
+    return orePoi ? { id: orePoi.id, name: orePoi.name } : null;
   } else {
     // Gas harvesting
     if (targetResource) {
@@ -3569,8 +3537,8 @@ if (configuredSystem) {
         const canMineHere = (() => {
           if (miningType === "ore") {
             if (isDeepCoreOre(effectiveTarget)) return deepCoreCap.canMineVisibleDeepCore;
-            // Gas clouds (nebula) can also contain regular ores like energy_crystal
-            return isOreBeltPoi(currentPoi.type) || isGasCloudPoi(currentPoi.type);
+            // Trust map data - any POI can contain regular ores
+            return true;
           }
           if (miningType === "gas") return isGasCloudPoi(currentPoi.type);
           if (miningType === "ice") return isIceFieldPoi(currentPoi.type) || (isHidden && canMineHiddenIce);
@@ -3626,8 +3594,8 @@ if (configuredSystem) {
       // POI was depleted — search for alternative in current system first
       ctx.log("mining", "Target POI depleted — searching for alternative in current system...");
       const altPoi = pois.find(p => {
-        // For ore mining, accept both ore belts AND gas clouds (nebula can contain regular ores)
-        const isMatchingPoi = (miningType === "ore" && (isOreBeltPoi(p.type) || isGasCloudPoi(p.type) || p.hidden === true)) ||
+        // No filtering by POI type - trust the map data
+        const isMatchingPoi = (miningType === "ore") ||
           (miningType === "radioactive" && (isOreBeltPoi(p.type) || p.hidden === true)) ||
           (miningType === "gas" && isGasCloudPoi(p.type)) ||
           (miningType === "ice" && isIceFieldPoi(p.type));
@@ -3666,40 +3634,25 @@ if (configuredSystem) {
           const sys = mapStore.getSystem(loc.systemId);
           const poi = sys?.pois.find(p => p.id === loc.poiId);
           if (!poi) return true;
-          // For ore mining, accept both ore belts AND gas clouds (nebula can contain regular ores)
-          if (miningType === "ore") return isOreBeltPoi(poi?.type || "") || isGasCloudPoi(poi?.type || "");
-                if (miningType === "radioactive") {
-                  const isOreBelt = isOreBeltPoi(poi?.type || "") ||
-                                    (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
-                                                     loc.poiName.toLowerCase().includes('mineral field') ||
-                                                     loc.poiName.toLowerCase().includes('asteroid')));
-                  return canMineBasicRadioactive && (
-                    isOreBelt ||
-                    (!poi?.hidden && canMineDeepCoreRadioactive) ||
-                    (poi?.hidden && canMineHiddenRadioactive)
-                  );
-                }
+          // No filtering by POI type - trust the map data from findOreLocations
+          if (miningType === "ore") return true;
+          if (miningType === "radioactive") {
+            const isOreBelt = isOreBeltPoi(poi?.type || "") ||
+                              (loc.poiName && (loc.poiName.toLowerCase().includes('belt') || 
+                                               loc.poiName.toLowerCase().includes('mineral field') ||
+                                               loc.poiName.toLowerCase().includes('asteroid')));
+            return canMineBasicRadioactive && (
+              isOreBelt ||
+              (!poi?.hidden && canMineDeepCoreRadioactive) ||
+              (poi?.hidden && canMineHiddenRadioactive)
+            );
+          }
           if (miningType === "gas") return isGasCloudPoi(poi?.type || "");
           if (miningType === "ice") return isIceFieldPoi(poi?.type || "");
           return true;
         }).filter(loc => {
-          // Skip completely exhausted POIs
-          if (loc.remaining !== undefined && loc.remaining <= 0 && loc.maxRemaining !== undefined && loc.maxRemaining > 0) {
-            return false;
-          }
-          if (settings.ignoreDepletion) return true;
-          const sys = mapStore.getSystem(loc.systemId);
-          const poi = sys?.pois.find(p => p.id === loc.poiId);
-          // Check both ores_found (mining history) AND resources (scan data) for depletion status
-          const oreEntry = poi?.ores_found.find(o => o.item_id === searchTarget);
-          const resourceEntry = poi?.resources?.find(r => r.resource_id === searchTarget);
-          // If resourceEntry exists and shows depleted, check expiry
-          if (resourceEntry?.depleted) {
-            return isDepletionExpired(resourceEntry.depleted_at, depletionTimeoutMs);
-          }
-          // Otherwise check ores_found depletion
-          if (!oreEntry?.depleted) return true;
-          return isDepletionExpired(oreEntry.depleted_at, depletionTimeoutMs);
+          // No depletion filtering - trust the map data
+          return true;
         });
 
         ctx.log("debug", `[BROADER_SEARCH] raw=${broaderLocationsRaw.length} afterPOIType+depletion=${broaderLocations.length} searchTarget=${searchTarget} miningType=${miningType}`);

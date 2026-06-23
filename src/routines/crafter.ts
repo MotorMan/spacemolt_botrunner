@@ -42,7 +42,10 @@ async function getCrafterSettings(): Promise<{
   blacklistedRecipes: string[];
   useQueuedCrafting: boolean;
 }> {
-  const text = await Bun.file(`${import.meta.dir}/../../data/settings.json`).text();
+  const { join } = require("path");
+  const { readFileSync, existsSync } = require("fs");
+  const file = join(process.cwd(), "data", "settings.json");
+  const text = existsSync(file) ? readFileSync(file, "utf-8") : "";
   const raw = JSON.parse(text || "{}");
   const c = (raw.crafter as Record<string, unknown>) || {};
 

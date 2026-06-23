@@ -24,7 +24,7 @@ export class CraftQueueTracker {
   private recipeIndex: Map<string, string[]> = new Map();
   private bot: Bot;
 
-  private static CRAFTING_STATE_FILE = "data/crafting-state.json";
+  private static CRAFTING_STATE_FILE = "crafting-state.json";
 
   constructor(bot: Bot) {
     this.bot = bot;
@@ -187,23 +187,24 @@ export class CraftQueueTracker {
 
   private async load(): Promise<void> {
     try {
-      const path = `${import.meta.dir}/../../${CraftQueueTracker.CRAFTING_STATE_FILE}`;
-      const exists = await Bun.file(path).exists();
-      if (!exists) return;
-      const raw = await Bun.file(path).text();
+      const { join } = require("path");
+      const { existsSync, readFileSync } = require("fs");
+      const path = join(process.cwd(), "data", CraftQueueTracker.CRAFTING_STATE_FILE);
+      if (!existsSync(path)) return;
+      const raw = readFileSync(path, "utf-8");
       const data = JSON.parse(raw);
-const loaded = (data.jobs as Array<{ jobId: string; recipeId: string; quantity: number; completed: number; deposited?: number; runsRemaining?: number; startedAt: number; lastUpdate: number }>) || [];
-       for (const j of loaded) {
-         const job: QueuedJob = {
-           jobId: j.jobId,
-           recipeId: j.recipeId,
-           quantity: j.quantity,
-           completed: j.completed,
-           deposited: j.deposited ?? 0,
-           runsRemaining: j.runsRemaining ?? j.quantity,
-           startedAt: j.startedAt,
-           lastUpdate: j.lastUpdate,
-         };
+      const loaded = (data.jobs as Array<{ jobId: string; recipeId: string; quantity: number; completed: number; deposited?: number; runsRemaining?: number; startedAt: number; lastUpdate: number }>) || [];
+      for (const j of loaded) {
+        const job: QueuedJob = {
+          jobId: j.jobId,
+          recipeId: j.recipeId,
+          quantity: j.quantity,
+          completed: j.completed,
+          deposited: j.deposited ?? 0,
+          runsRemaining: j.runsRemaining ?? j.quantity,
+          startedAt: j.startedAt,
+          lastUpdate: j.lastUpdate,
+        };
         this.jobs.set(job.jobId, job);
         const existing = this.recipeIndex.get(job.recipeId) || [];
         if (!existing.includes(job.jobId)) {
@@ -218,9 +219,12 @@ const loaded = (data.jobs as Array<{ jobId: string; recipeId: string; quantity: 
 
   save(): void {
     try {
+      const { join, dirname } = require("path");
+      const { writeFileSync, mkdirSync, existsSync } = require("fs");
+      const path = join(process.cwd(), "data", CraftQueueTracker.CRAFTING_STATE_FILE);
+      if (!existsSync(dirname(path))) mkdirSync(dirname(path), { recursive: true });
       const payload = JSON.stringify(this.toJSON(), null, 2);
-      const path = `${import.meta.dir}/../../${CraftQueueTracker.CRAFTING_STATE_FILE}`;
-      Bun.write(path, payload);
+      writeFileSync(path, payload);
     } catch {
       // ignore write failures
     }

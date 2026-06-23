@@ -13060,6 +13060,7 @@
         currentProfile.craftLimits = JSON.parse(JSON.stringify(loadout));
 
         renderCrafterSettings(document.getElementById("settingsContent"));
+        saveCrafterSettings();
       }
 
       async function deleteLoadout() {

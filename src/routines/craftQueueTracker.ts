@@ -88,6 +88,32 @@ export class CraftQueueTracker {
     return { queued, completed, remaining: queued - completed };
   }
 
+  getDetailedProgress(recipeId: string): { 
+    queued: number; 
+    completed: number; 
+    remaining: number; 
+    jobs: Array<{ jobId: string; quantity: number; completed: number; runsRemaining: number }>
+  } {
+    const ids = this.recipeIndex.get(recipeId) || [];
+    let queued = 0;
+    let completed = 0;
+    const jobDetails: Array<{ jobId: string; quantity: number; completed: number; runsRemaining: number }> = [];
+    for (const id of ids) {
+      const job = this.jobs.get(id);
+      if (job) {
+        queued += job.quantity;
+        completed += job.completed;
+        jobDetails.push({
+          jobId: job.jobId,
+          quantity: job.quantity,
+          completed: job.completed,
+          runsRemaining: job.runsRemaining,
+        });
+      }
+    }
+    return { queued, completed, remaining: queued - completed, jobs: jobDetails };
+  }
+
   hasPendingJob(recipeId: string, quantity: number): boolean {
     const ids = this.recipeIndex.get(recipeId) || [];
     let remainingRuns = 0;

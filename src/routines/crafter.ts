@@ -215,12 +215,27 @@ async function checkCraftingQueue(bot: any, recipes: Recipe[]): Promise<ServerJo
   const result = resp.result as Record<string, unknown> | undefined;
   const jobs = (result?.jobs as Array<Record<string, unknown>>) || [];
   const recipeNameToId = new Map<string, string>();
+  const recipeOutputNameToId = new Map<string, string>();
+  const recipeOutputItemToId = new Map<string, string>();
+  const recipeIdToId = new Map<string, string>();
   for (const r of recipes) {
-    recipeNameToId.set(r.name, r.recipe_id);
+    recipeNameToId.set(r.name.toLowerCase(), r.recipe_id);
+    if (r.output_name) {
+      recipeOutputNameToId.set(r.output_name.toLowerCase(), r.recipe_id);
+    }
+    if (r.output_item_id) {
+      recipeOutputItemToId.set(r.output_item_id.toLowerCase(), r.recipe_id);
+    }
+    recipeIdToId.set(r.recipe_id, r.recipe_id);
   }
   return jobs.map((job: Record<string, unknown>) => {
-    const recipeName = (job.recipe as string) || "";
-    const recipeId = recipeNameToId.get(recipeName) || recipeName;
+    const recipeName = ((job.recipe as string) || "").toLowerCase();
+    const recipeFromId = (job.recipe as string) || "";
+    const recipeId = recipeNameToId.get(recipeName) 
+      || recipeOutputNameToId.get(recipeName) 
+      || recipeOutputItemToId.get(recipeName)
+      || recipeIdToId.get(recipeFromId)
+      || recipeFromId;
     return {
       jobId: (job.job_id as string) || "",
       recipeId,
@@ -239,6 +254,10 @@ async function getEstimatedCraftingTime(recipeId: string, recipes: Recipe[]): Pr
 async function syncCraftingQueue(ctx: RoutineContext, tracker: CraftQueueTracker, recipes: Recipe[]): Promise<void> {
   const { bot } = ctx;
   const serverJobs = await checkCraftingQueue(bot, recipes);
+  ctx.log("craft", `DEBUG: syncCraftingQueue - Found ${serverJobs.length} jobs from server`);
+  for (const job of serverJobs) {
+    ctx.log("craft", `DEBUG:   Job ${job.jobId.substring(0, 8)}... recipe=${job.recipeId}, quantity=${job.quantity}, done=${job.runsDone}, remaining=${job.runsRemaining}`);
+  }
   tracker.syncWithServer(serverJobs);
   tracker.save();
 }
@@ -257,6 +276,12 @@ async function queueCraftJob(
   const outputQty = recipe?.output_quantity || 1;
   const runs = Math.ceil(quantity / outputQty);
 
+  if (tracker.hasPendingJob(recipeId, runs)) {
+    return { success: true, error: "Job already queued" };
+  }
+
+  const serverJobs = await checkCraftingQueue(bot, recipes || []);
+  tracker.syncWithServer(serverJobs);
   if (tracker.hasPendingJob(recipeId, runs)) {
     return { success: true, error: "Job already queued" };
   }
@@ -363,22 +388,33 @@ async function executeCraftingPlan(
 
   ctx.log("craft", `Queue-based crafting plan: ${planItems.length} steps`);
 
-for (const item of planItems) {
+  await syncCraftingQueue(ctx, tracker, recipes);
+
+  for (const item of planItems) {
     if (bot.state !== "running") break;
 
     const outputQty = item.recipe.output_quantity || 1;
     const progress = tracker.getProgress(item.recipe.recipe_id);
     const queuedItems = progress.queued * outputQty;
     const completedItems = progress.completed * outputQty;
+    const totalScheduledItems = queuedItems + completedItems;
+
+    const detailedProgress = tracker.getDetailedProgress(item.recipe.recipe_id);
+    ctx.log("craft", `DEBUG: Recipe=${item.recipe.recipe_id}, Item=${item.recipe.output_name}, OutputQty=${outputQty}`);
+    ctx.log("craft", `DEBUG:   Total: queuedRuns=${progress.queued}, completedRuns=${progress.completed}, queuedItems=${queuedItems}, completedItems=${completedItems}, TotalScheduled=${totalScheduledItems}, Goal=${item.quantityToCraft}`);
+    for (const job of detailedProgress.jobs) {
+      const jobItems = job.quantity * outputQty;
+      ctx.log("craft", `DEBUG:   Job ${job.jobId.substring(0, 8)}... runs=${job.quantity}, done=${job.completed}, remaining=${job.runsRemaining}, produces=${jobItems} items`);
+    }
 
     if (queuedItems >= item.quantityToCraft) {
       ctx.log("craft", `Already queued: ${item.recipe.name} (${queuedItems} items queued)`);
       continue;
     }
 
-    const remainingItems = item.quantityToCraft - completedItems;
+    const remainingItems = item.quantityToCraft - completedItems - queuedItems;
     if (remainingItems <= 0) {
-      ctx.log("craft", `Already completed: ${item.recipe.name}`);
+      ctx.log("craft", `Already completed or queued: ${item.recipe.name}`);
       continue;
     }
 

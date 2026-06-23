@@ -2004,7 +2004,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ─-
           const { getSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
-          const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+          const runtimeBlacklist = getSystemBlacklist();
+          const blacklist = settings.ignoreBlacklist ? [] : runtimeBlacklist;
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           
           const isBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
@@ -2045,7 +2046,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
                 if (routeData.found && serverRoute && serverRoute.length >= 1) {
                   const blacklistedOnRoute = serverRoute.find(r => 
-                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                    runtimeBlacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
                   );
                   if (!blacklistedOnRoute) viableRoute = true;
                 }
@@ -5103,7 +5104,8 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
 // ── BLACKLIST & ROUTE CHECK: Verify target is reachable before accepting ──
           const { getSystemBlacklist } = await import("../web/server.js");
           const { mapStore } = await import("../mapstore.js");
-          const blacklist = settings.ignoreBlacklist ? [] : getSystemBlacklist();
+          const runtimeBlacklist = getSystemBlacklist();
+          const blacklist = settings.ignoreBlacklist ? [] : runtimeBlacklist;
           const normalizeSysName = (name: string) => name.toLowerCase().replace(/_/g, ' ').trim();
           
           const isBlacklisted = !settings.ignoreBlacklist && blacklist.some(b => normalizeSysName(b) === normalizeSysName(mayday.system));
@@ -5144,7 +5146,7 @@ IMPORTANT: This is a HARD DECLINE. You are NOT coming to rescue them. Make this 
                 const serverRoute = routeData.route as Array<{ system_id: string; name: string }> | undefined;
                 if (routeData.found && serverRoute && serverRoute.length >= 1) {
                   const blacklistedOnRoute = serverRoute.find(r => 
-                    blacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
+                    runtimeBlacklist.some(b => normalizeSysName(b) === normalizeSysName(r.system_id))
                   );
                   if (!blacklistedOnRoute) viableRoute = true;
                 }

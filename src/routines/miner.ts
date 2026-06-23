@@ -4023,6 +4023,18 @@ if (configuredSystem) {
       }
     }
 
+    // Check for pirates in nearby response (skip if cloaked with cloakIgnoreBlacklist)
+    const isCloakedIgnoringBlacklist = bot.isCloaked && settings.cloakIgnoreBlacklist;
+    if (!isCloakedIgnoringBlacklist && nearbyResp.result && typeof nearbyResp.result === "object") {
+      const { checkAndFleeFromPirates } = await import("./common.js");
+      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
+      if (fled) {
+        ctx.log("error", "Pirates detected - fled mining location, will retry");
+        await ctx.sleep(30000);
+        continue;
+      }
+    }
+
     // Also check battle status directly (in case we missed notifications)
     // CRITICAL: Check WebSocket state FIRST for fastest detection
     if (bot.isInBattle()) {
@@ -4085,16 +4097,6 @@ if (configuredSystem) {
       ctx.log("error", "Battle detected via status check - fled, will retry mining");
       await ctx.sleep(30000);
       continue;
-    }
-
-    if (nearbyResp.result && typeof nearbyResp.result === "object") {
-      const { checkAndFleeFromPirates } = await import("./common.js");
-      const fled = await checkAndFleeFromPirates(ctx, nearbyResp.result);
-      if (fled) {
-        ctx.log("error", "Pirates detected - fled mining location, will retry");
-        await ctx.sleep(30000);
-        continue;
-      }
     }
 
     // CRITICAL FIX: Verify we're at the intended hidden POI before mining

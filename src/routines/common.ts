@@ -98,7 +98,7 @@ export function isMinablePoi(type: string): boolean {
 /** Check if a POI is an ore belt (asteroid belt/field/ring — NOT gas clouds, ice fields, or hidden POIs). */
 export function isOreBeltPoi(type: string): boolean {
   const t = type.toLowerCase();
-  if (t.includes("gas") || t.includes("cloud") || t.includes("ice") || t.includes("shimmer") || t.includes("nexus")) return false;
+  if (t.includes("gas") || t.includes("cloud") || t.includes("ice") || t.includes("residue") || t.includes("shimmer") || t.includes("nexus")) return false;
   return t.includes("asteroid") || t.includes("belt") || t.includes("ring")
     || t.includes("field") || t.includes("resource");
 }
@@ -107,7 +107,7 @@ export function isOreBeltPoi(type: string): boolean {
 export function isGasCloudPoi(type: string): boolean {
   const t = type.toLowerCase();
   return t.includes("gas") || t.includes("cloud") || t.includes("nebula") ||
-         t.includes("shimmer") || t.includes("nexus") ||
+         t.includes("residue") || t.includes("shimmer") || t.includes("nexus") ||
          t.includes("hydrogen") || t.includes("helium") || t.includes("argon") ||
          t.includes("neon") || t.includes("chlorine") || t.includes("nitrogen") ||
          t.includes("oxygen") || t.includes("compressed");
@@ -116,7 +116,8 @@ export function isGasCloudPoi(type: string): boolean {
 /** Check if a POI is a gas cloud by name (fallback when type is not recognized). */
 export function isGasCloudByName(name: string): boolean {
   const n = name.toLowerCase();
-  return n.includes("cloud") || n.includes("gas") || n.includes("shimmer") || n.includes("nexus") || n.includes("nebula");
+  return n.includes("cloud") || n.includes("gas") || n.includes("residue") ||
+         n.includes("shimmer") || n.includes("nexus") || n.includes("nebula");
 }
 
 /** Check if a POI is a gas cloud (by type or name). */
@@ -4105,8 +4106,6 @@ export async function emergencyFleeFromPirates(
   }
 
   // Get blacklist and filter out blacklisted systems
-  // CRITICAL: Always use blacklist for escape routes - we MUST get to safety when fleeing from pirates
-  // Cloaking allows entry to pirate systems, but fleeing requires escaping THEM
   const blacklist = getSystemBlacklist();
   const safeConnections = connections.filter(c =>
     c.id && !blacklist.some(b => b.toLowerCase() === c.id!.toLowerCase())
